@@ -4,7 +4,7 @@ import polars.selectors as cs
 from cpra.mp.data.exceptions import SchemaValidationError
 from cpra.mp.data.schema import SCHEMA
 
-BASE_PATH = "/home/mjyoder/cpra.mp.data/data"
+BASE_PATH = "/ocean/projects/bcs200002p/shared/data"
 
 
 def write_data(
