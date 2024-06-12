@@ -1,0 +1,16 @@
+__pycache__/
+build/
+dist/
+env/
+venv/
+
+*.pyc
+*.egg-info
+.env
+token.txt
+
+*.~lock*
+/test_*.py
+
+scripts/
+/data/

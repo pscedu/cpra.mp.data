@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cpra.mp.data"
+dynamic = ["version"]
+description = "Tools for reading and writing data from Louisiana's Coastal Master Plan"
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = []
+authors = [
+  { name = "Matt Yoder", email = "mjyoder@psc.edu" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "pandas",
+  "polars",
+  "pyarrow"
+]
+
+[tool.hatch.version]
+path = "CHANGELOG.md"
+pattern = '#+ \[?(?P<version>\d+\.\d+\.\d+)\]?'
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/cpra",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "/cpra",
+]
