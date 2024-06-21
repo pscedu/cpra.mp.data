@@ -1,6 +1,7 @@
 import polars as pl
 
 from cpra.mp.data.exceptions import SchemaValidationError
+from cpra.mp.data.variables import VARIABLES
 
 
 class SchemaLevel:
@@ -68,32 +69,8 @@ SCHEMA = [
         name="Variable",
         dtype=pl.String,
         partition=True,
-        values=[
-            "annual_exceedance_damages_dollars",
-            "expected_annual_damages_dollars",
-            "expected_annual_structural_damage",
-            "exposure_asset_count",
-            "exposure_critical_infrastructure_count",
-            "exposure_historic_properties_count",
-            "flood_depth",
-            "land_change",
-            "nonstructural_expected_annual_damage_dollars",
-            "nonstructural_expected_annual_structural_damage",
-            "population_change",
-            "population",
-            "salinity",
-            "surge_water_surface_elevations_by_exceedance",
-            "surge_water_surface_elevations_by_storm",
-            "temperature",
-            "total_suspended_solids",
-            "vegetation_coverage_area",
-            "vegetation_type_ffibs",
-            "vegetation_type_vct",
-            "water_level_variability",
-            "water_level",
-            "wave_heights_by_exceedance",
-            "wave_heights_by_storm",
-        ],
+        values=list(VARIABLES.keys()),
+        labels=[variable.label for variable in VARIABLES.values()],
     ),
     SchemaLevel(
         column="geographic_unit",
@@ -106,6 +83,7 @@ SCHEMA = [
             "ecoregion",
             "extraction_point",
             "hydro_compartment",
+            "icm_raster",
             "parish",
         ],
         labels=[
@@ -114,6 +92,7 @@ SCHEMA = [
             "Ecoregion",
             "Extraction Point",
             "Hydro Compartment",
+            "ICM Raster",
             "Parish",
         ],
     ),
@@ -134,16 +113,16 @@ SCHEMA = [
     SchemaLevel(
         column="model_group",
         name="Plan Implementation Scenario",
-        dtype=pl.String,
+        dtype=pl.Int32,
         min_value=100,
-        max_value=999
+        max_value=999,
     ),
     SchemaLevel(
         column="scenario",
         name="Environmental Scenario",
-        dtype=pl.String,
+        dtype=pl.Int32,
         min_value=1,
-        max_value=100
+        max_value=100,
     ),
     SchemaLevel(
         column="aep",
@@ -380,12 +359,27 @@ SCHEMA = [
         name="Percentile",
         dtype=pl.Int8,
         partition=False,
-        required=True,
+        required=(
+            pl.col("variable")
+            .is_in(
+                [
+                    "expected_annual_damages_dollars",
+                    "expected_annual_structural_damage",
+                    "annual_exceedance_damages_dollars",
+                    "nonstructural_expected_annual_damage_dollars",
+                    "nonstructural_expected_annual_structural_damage",
+                    "surge_water_surface_elevations_by_exceedance",
+                    "wave_heights_by_exceedance",
+                    "population_change",
+                ]
+            )
+            .any()
+        ),
     ),
     SchemaLevel(
         column="calendar_year",
         name="Year",
-        dtype=pl.Date,
+        dtype=pl.Int32,
         partition=False,
         required=(
             pl.col("time_unit")

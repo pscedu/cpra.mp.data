@@ -24,9 +24,17 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "pandas",
+  "numpy",
   "polars",
-  "pyarrow"
+  "pyarrow",
+  "rasterio",
+  "scipy"
+]
+
+[tool.hatch.envs.scripts]
+dependencies = [
+  "connectorx",
+  "python-dotenv"
 ]
 
 [tool.hatch.version]
