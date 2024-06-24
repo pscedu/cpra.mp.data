@@ -1,6 +1,7 @@
 import json
 import re
 from cpra.mp.data.schema import SCHEMA
+from cpra.mp.data.schema import VARIABLES
 
 
 def table_row(values):
@@ -54,6 +55,18 @@ def level_rows(levels):
     return rows
 
 
+def variable_row(variable):
+    """Create a variable summary row from a Variable instance."""
+
+    return [
+        f"`{variable.name}`",
+        variable.label,
+        f"`{str(variable.dtype)}`",
+        variable.unit or "",
+        f"`{variable.legend.name}`" if variable.legend else "",
+    ]
+
+
 def replace_table(table_id, content, markdown):
     """Replace a dynamic table with a new version."""
     return re.sub(
@@ -89,6 +102,14 @@ def update_docs():
         markdown = replace_table(
             f"{dimension_type}_dimensions", table(header, level_rows(levels)), markdown
         )
+
+    # Update variables table.
+    variable_header = ["Variable", "Description", "Data Type", "Unit", "Legend"]
+    variable_names = sorted(list(VARIABLES.keys()))
+    variable_rows = [variable_row(VARIABLES[name]) for name in variable_names]
+    markdown = replace_table(
+        "variables", table(variable_header, variable_rows), markdown
+    )
 
     with open("docs/index.md", "w") as output_file:
         output_file.write(markdown)

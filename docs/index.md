@@ -69,3 +69,44 @@ While they do not use partitioning, COGs are saved in the same directory structu
 ```
 
 The nested directories create the data structure needed for the catalog. By traversing the catalog tree (and in some cases, summarizing specific columns from the Parquet files selected through the traversal), the catalog API can respond to queries about available data and valid choices at each level of the catalog hierarchy.
+
+## Variables
+
+<!--BEGIN TABLE variables-->
+| Variable | Description | Data Type | Unit | Legend |
+| --- | --- | --- | --- | --- |
+| `annual_exceedance_damages_dollars` | Annual Exceedance Damages, Dollars | `Int32` | $ | `eadd` |
+| `deep_subsidence` | Deep Subsidence | `Int32` | mm/yr | `subsidence_deep` |
+| `elevation` | Elevation | `Int32` | NAVD88 m | `elevation` |
+| `expected_annual_damages_dollars` | Expected Annual Damages, Dollars | `Int32` | $ | `eadd` |
+| `expected_annual_structural_damage` | Expected Annual Structural Damage | `Int32` | structures | `eadd` |
+| `exposure_asset_count` | Exposure: Asset Count | `Int32` | structures | `exposure_asset_count` |
+| `exposure_critical_infrastructure_count` | Exposure: Critical Infrastructure Count | `Int32` | structures | `exposure_exposed_structures` |
+| `exposure_historic_properties_count` | Exposure: Historic Properties Count | `Int32` | structures | `exposure_exposed_structures` |
+| `flood_depth` | Flood Depth | `Int32` | ft | `flood_depth` |
+| `inundation_depth` | Inundation Depth | `Int32` | m | `inundation_depth` |
+| `land_change` | Land Change | `Int32` |  | `land_change` |
+| `land_type` | Land Type | `Int32` |  | `land_type` |
+| `mineral_accretion` | Mineral Accretion | `Int32` | cm | `accretion` |
+| `mineral_deposition` | Mineral Deposition | `Int32` | g/cm^2-yr | `mineral_deposition` |
+| `nonstructural_expected_annual_damage_dollars` | Nonstructural Expected Annual Damage, Dollars | `Int32` | $ | `eadd` |
+| `nonstructural_expected_annual_structural_damage` | Nonstructural Expected Annual Structural Damage | `Int32` | structure equivalents | `easd` |
+| `organic_accretion` | Organic Accretion | `Int32` | cm | `accretion` |
+| `organic_accumulation` | Organic Accumulation | `Int32` | g/cm^2-yr | `organic_accumulation` |
+| `population` | Population | `Int32` | persons | `population` |
+| `population_change` | Population Change | `Int32` | persons | `population_change` |
+| `salinity` | Salinity | `Int32` | ppt | `salinity` |
+| `shallow_subsidence` | Shallow Subsidence | `Int32` | mm/yr | `subsidence_shallow` |
+| `surge_water_surface_elevations_by_exceedance` | Surge Water Surface Elevations by Exceedance | `Int32` | NAVD88 ft | `surge_water_surface_elevations` |
+| `surge_water_surface_elevations_by_storm` | Surge Water Surface Elevations by Storm | `Int32` | NAVD88 ft | `surge_water_surface_elevations` |
+| `temperature` | Temperature | `Int32` | °C | `temperature` |
+| `total_suspended_solids` | Total Suspended Solids | `Int32` | mg/L | `total_suspended_solids` |
+| `vegetation_coverage_area` | Vegetation Coverage Area | `Int32` | square m | `vegetation_coverage_area` |
+| `vegetation_type_ffibs` | Vegetation Type: FFIBS | `Int32` |  | `ffibs` |
+| `vegetation_type_ffibs_extraction_point` | Vegetation Type: FFIBS (Extraction Point) | `Int32` |  | `ffibs_score` |
+| `vegetation_type_vct` | Vegetation Type: VCT | `Int32` |  | `vct` |
+| `water_level` | Water Level | `Int32` | NAVD88 m | `water_level` |
+| `water_level_variability` | Water Level Variability | `Int32` | m | `water_level_variability` |
+| `wave_heights_by_exceedance` | Wave Heights by Exceedance | `Int32` | ft | `wave_heights` |
+| `wave_heights_by_storm` | Wave Heights by Storm | `Int32` | ft | `wave_heights` |
+<!--END TABLE-->
