@@ -12,5 +12,5 @@ token.txt
 *.~lock*
 /test_*.py
 
-scripts/
 /data/
+/scratch/
