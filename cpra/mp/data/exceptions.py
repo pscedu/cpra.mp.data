@@ -1,2 +1,2 @@
-class SchemaValidationError(Exception):
-    """An error that occurs during schema validation."""
+class ValidationError(Exception):
+    """An error that occurs during data validation."""

@@ -1,7 +1,7 @@
 import polars as pl
 import rasterio as rio
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.schema import SCHEMA
+from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import cast_columns, validate_data_frame
 from pathlib import Path
 from rasterio.transform import from_bounds
@@ -26,11 +26,11 @@ def cog_path_expression(df, base_path="", separator="/"):
                 [pl.lit(base_path)]
                 + [
                     pl.concat_str(
-                        [pl.lit(level.column), pl.col(level.column).cast(pl.String)],
+                        [pl.lit(dim.column), pl.col(dim.column).cast(pl.String)],
                         separator="=",
                     )
-                    for level in SCHEMA
-                    if level.column in df.columns
+                    for dim in DIMENSIONS
+                    if dim.column in df.columns
                 ],
                 separator=separator,
             ),

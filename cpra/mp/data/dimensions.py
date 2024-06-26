@@ -1,10 +1,10 @@
 import polars as pl
 
-from cpra.mp.data.exceptions import SchemaValidationError
+from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.variables import VARIABLES
 
 
-class SchemaLevel:
+class Dimension:
     def __init__(
         self,
         column,
@@ -35,12 +35,12 @@ class SchemaLevel:
         """Validate that a Polars series conforms to the specification for this level."""
 
         if series.dtype != self.dtype:
-            raise SchemaValidationError(
+            raise ValidationError(
                 f"Series {series.name} has dtype {series.dtype!s}, expected {self.dtype!s}"
             )
 
         if (not self.null) and series.is_null().any():
-            raise SchemaValidationError(f"Series {series.name} contains null values")
+            raise ValidationError(f"Series {series.name} contains null values")
 
         # Allowed values have to be made into a series so they can be cast to the correct
         # dtype for comparison.
@@ -48,25 +48,25 @@ class SchemaLevel:
             self.values
             and not series.is_in(pl.Series(self.values).cast(self.dtype)).all()
         ):
-            raise SchemaValidationError(f"Series {series.name} has invalid values")
+            raise ValidationError(f"Series {series.name} has invalid values")
 
         if self.min_value is not None:
             min_value = series.min()
             if min_value < self.min_value:
-                raise SchemaValidationError(
+                raise ValidationError(
                     f"Series {series.name} has an invalid minimum value: {min_value}"
                 )
 
         if self.max_value is not None:
             max_value = series.max()
             if max_value > self.max_value:
-                raise SchemaValidationError(
+                raise ValidationError(
                     f"Series {series.name} has an invalid maximum value: {max_value}"
                 )
 
 
-SCHEMA = [
-    SchemaLevel(
+DIMENSIONS = [
+    Dimension(
         column="variable",
         name="Variable",
         dtype=pl.String,
@@ -75,7 +75,7 @@ SCHEMA = [
         labels=[variable.label for variable in VARIABLES.values()],
         example_value="salinity_mean",
     ),
-    SchemaLevel(
+    Dimension(
         column="geographic_unit",
         name="Geography",
         dtype=pl.String,
@@ -100,7 +100,7 @@ SCHEMA = [
         ],
         example_value="hydro_compartment",
     ),
-    SchemaLevel(
+    Dimension(
         column="time_unit",
         name="Time Unit",
         dtype=pl.String,
@@ -109,14 +109,14 @@ SCHEMA = [
         labels=["Annual", "Daily", "Decadal"],
         example_value="daily",
     ),
-    SchemaLevel(
+    Dimension(
         column="plan_version",
         name="Plan Version",
         dtype=pl.String,
         partition=True,
         example_value="2023.0.0",
     ),
-    SchemaLevel(
+    Dimension(
         column="model_group_id",
         name="Plan Implementation Scenario",
         dtype=pl.Int32,
@@ -124,7 +124,7 @@ SCHEMA = [
         max_value=999,
         example_value=500,
     ),
-    SchemaLevel(
+    Dimension(
         column="scenario_id",
         name="Environmental Scenario",
         dtype=pl.Int32,
@@ -132,7 +132,7 @@ SCHEMA = [
         max_value=100,
         example_value=7,
     ),
-    SchemaLevel(
+    Dimension(
         column="aep_ratio",
         name="Annual Exceedance Probability",
         dtype=pl.Float32,
@@ -155,7 +155,7 @@ SCHEMA = [
         labels=["20.0", "10.0", "2.0", "1.0", "0.2", "0.1"],
         example_value=0.02,
     ),
-    SchemaLevel(
+    Dimension(
         column="storm_id",
         name="Synthetic Storm ID",
         dtype=pl.Int32,
@@ -168,7 +168,7 @@ SCHEMA = [
         max_value=1000,
         example_value=182,
     ),
-    SchemaLevel(
+    Dimension(
         column="pumping_id",
         name="Pumping Scenario",
         dtype=pl.Float32,
@@ -192,7 +192,7 @@ SCHEMA = [
         labels=["No Pumping", "50% Pumping Capacity", "Full Pumping Capacity"],
         example_value=0.5,
     ),
-    SchemaLevel(
+    Dimension(
         column="fragility_scenario",
         name="Fragility Scenario",
         dtype=pl.Int8,
@@ -216,7 +216,7 @@ SCHEMA = [
         labels=["No Fragility", "IPET Fragility"],
         example_value=0,
     ),
-    SchemaLevel(
+    Dimension(
         column="asset_type",
         name="Asset Type",
         dtype=pl.Int8,
@@ -244,7 +244,7 @@ SCHEMA = [
         ],
         example_value=3,
     ),
-    SchemaLevel(
+    Dimension(
         column="category",
         name="Category",
         dtype=pl.String,
@@ -285,7 +285,7 @@ SCHEMA = [
         ],
         example_value="public_schools",
     ),
-    SchemaLevel(
+    Dimension(
         column="exposure_type",
         name="Exposure Type",
         dtype=pl.String,
@@ -304,7 +304,7 @@ SCHEMA = [
         labels=["Exposure", "Moderate Exposure", "Severe Exposure"],
         example_value="moderate_exposure",
     ),
-    SchemaLevel(
+    Dimension(
         column="ns_project_id",
         name="Nonstructural Project",
         dtype=pl.Int8,
@@ -321,7 +321,7 @@ SCHEMA = [
         values=[1, 3],
         example_value=3,
     ),
-    SchemaLevel(
+    Dimension(
         column="participation_rate",
         name="Participation Rate",
         dtype=pl.Float32,
@@ -339,7 +339,7 @@ SCHEMA = [
         labels=["50% Participation", "75% Participation", "Full Participation"],
         example_value=0.75,
     ),
-    SchemaLevel(
+    Dimension(
         column="migration",
         name="Migration",
         dtype=pl.String,
@@ -357,7 +357,7 @@ SCHEMA = [
         labels=["BASE", "MIG"],
         example_value="base",
     ),
-    SchemaLevel(
+    Dimension(
         column="ssp",
         name="Shared Socioeconomic Pathway",
         dtype=pl.Int8,
@@ -374,7 +374,7 @@ SCHEMA = [
         values=[1, 2, 3, 4, 5],
         example_value=4,
     ),
-    SchemaLevel(
+    Dimension(
         column="vegetation_code",
         name="Vegetation Type",
         dtype=pl.String,
@@ -391,7 +391,7 @@ SCHEMA = [
         ],
         example_value="brm",
     ),
-    SchemaLevel(
+    Dimension(
         column="percentile",
         name="Percentile",
         dtype=pl.Int8,
@@ -416,7 +416,7 @@ SCHEMA = [
         max_value=100,
         example_value=50,
     ),
-    SchemaLevel(
+    Dimension(
         column="calendar_year",
         name="Year",
         dtype=pl.Int32,
@@ -435,7 +435,7 @@ SCHEMA = [
         max_value=2100,
         example_value=2030,
     ),
-    SchemaLevel(
+    Dimension(
         column="calendar_day",
         name="Date",
         dtype=pl.Date,

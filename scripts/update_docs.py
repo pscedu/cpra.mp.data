@@ -1,7 +1,7 @@
 import json
 import re
-from cpra.mp.data.schema import SCHEMA
-from cpra.mp.data.schema import VARIABLES
+from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.dimensions import VARIABLES
 
 
 def table_row(values):
@@ -40,21 +40,17 @@ def expression(exp):
     return f'`{inner[0]["Column"]}` in ({", ".join([f'"{v}"' for v in values])})'
 
 
-def level_rows(levels):
-    """Convert schema levels to Markdown table rows."""
+def dimension_row(dim):
+    """Convert a dimension to a Markdown table row."""
 
-    rows = []
-    for level in levels:
-        cells = [f"`{level.column}`", level.name, f"`{str(level.dtype)}`"]
+    cells = [f"`{dim.column}`", dim.name, f"`{str(dim.dtype)}`"]
 
-        example_value = level.example_value
-        if example_value is None and level.values:
-            example_value = level.values[0]
+    example_value = dim.example_value
+    if example_value is None and dim.values:
+        example_value = dim.values[0]
 
-        cells.append(str(example_value or ""))
-
-        rows.append(cells)
-    return rows
+    cells.append(str(example_value or ""))
+    return cells
 
 
 def variable_row(variable):
@@ -93,29 +89,27 @@ def update_docs():
         "Example Value",
     ]
     dimension_tables = {
-        "dataset": [level for level in SCHEMA if level.partition is True],
-        "partition": [
-            level for level in SCHEMA if not isinstance(level.partition, bool)
-        ],
-        "nonpartition": [level for level in SCHEMA if level.partition is False],
+        "dataset": [dim for dim in DIMENSIONS if dim.partition is True],
+        "partition": [dim for dim in DIMENSIONS if not isinstance(dim.partition, bool)],
+        "nonpartition": [dim for dim in DIMENSIONS if dim.partition is False],
     }
-    for dimension_type, levels in dimension_tables.items():
-        dimension_content = table(header, level_rows(levels))
+    for dimension_type, dims in dimension_tables.items():
+        dimension_content = table(header, [dimension_row(d) for d in dims])
         dimension_content += "\n"
-        for level in levels:
-            dimension_content += f"#### {level.name}\n\n"
-            dimension_content += f"**Column:** `{level.column}`  \n"
-            dimension_content += f"**Data Type:** `{str(level.dtype)}`  \n"
+        for dim in dims:
+            dimension_content += f"#### {dim.name}\n\n"
+            dimension_content += f"**Column:** `{dim.column}`  \n"
+            dimension_content += f"**Data Type:** `{str(dim.dtype)}`  \n"
             dimension_content += (
-                f"**Required Condition:** {expression(level.required)}  \n"
+                f"**Required Condition:** {expression(dim.required)}  \n"
             )
-            if level.min_value:
-                dimension_content += f"**Minimum Value:** {level.min_value}  \n"
-            if level.max_value:
-                dimension_content += f"**Maximum Value:** {level.max_value}  \n"
-            if level.values:
+            if dim.min_value:
+                dimension_content += f"**Minimum Value:** {dim.min_value}  \n"
+            if dim.max_value:
+                dimension_content += f"**Maximum Value:** {dim.max_value}  \n"
+            if dim.values:
                 dimension_content += table(
-                    ["Value", "Label"], zip(level.values, level.labels or level.values)
+                    ["Value", "Label"], zip(dim.values, dim.labels or dim.values)
                 )
             dimension_content += "\n"
 

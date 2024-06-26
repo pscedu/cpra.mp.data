@@ -1,7 +1,7 @@
 import numpy as np
 import polars as pl
-from cpra.mp.data.exceptions import SchemaValidationError
-from cpra.mp.data.schema import SCHEMA
+from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.variables import VARIABLES
 from scipy.io import FortranFile
 
@@ -11,13 +11,13 @@ def required_columns(df):
 
     return [
         col.name
-        for col in df.select(**{level.column: level.required for level in SCHEMA})
+        for col in df.select(**{dim.column: dim.required for dim in DIMENSIONS})
         if col.any()
     ]
 
 
 def validate_data_frame(df, required_cols=None):
-    """Ensure that the provided data frame complies with the schema."""
+    """Ensure that the provided data frame complies with the validation conditions."""
 
     if required_cols is None:
         required_cols = required_columns(df)
@@ -25,24 +25,24 @@ def validate_data_frame(df, required_cols=None):
     # Raise an exception if required columns are missing.
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        raise SchemaValidationError(
+        raise ValidationError(
             f"Required columns are missing: {', '.join(missing_cols)}"
         )
 
     # Validate required columns.
-    for level in SCHEMA:
-        if level.column in required_cols:
-            level.validate_series(df.get_column(level.column))
+    for dim in DIMENSIONS:
+        if dim.column in required_cols:
+            dim.validate_series(df.get_column(dim.column))
 
 
 def cast_columns(df):
-    """Cast all schema columns in the given dataframe to the correct dtype."""
+    """Cast all dimension columns in the given dataframe to the correct dtype."""
 
     return df.with_columns(
         **{
-            level.column: pl.col(level.column).cast(level.dtype)
-            for level in SCHEMA
-            if level.column in df.columns
+            dim.column: pl.col(dim.column).cast(dim.dtype)
+            for dim in DIMENSIONS
+            if dim.column in df.columns
         }
     )
 

@@ -1,7 +1,7 @@
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.schema import SCHEMA
+from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import required_columns, validate_data_frame
 
 
@@ -51,7 +51,7 @@ def write_parquet(
     partition_cols = [
         col.name
         for col in df.select(
-            **{level.column: level.partition & level.required for level in SCHEMA}
+            **{dim.column: dim.partition & dim.required for dim in DIMENSIONS}
         )
         if col.any()
     ]
