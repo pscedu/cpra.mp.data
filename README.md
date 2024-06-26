@@ -8,7 +8,7 @@ See the [data structure documentation](docs/index.md) for details about variable
 
 ## Writing Data
 
-To write data using the library, prepare it as a data frame in the wide format, with dates/years as rows, and geographies as columns:
+To write tabular data using the library, prepare it as a data frame in the wide format, with dates/years as rows, and geographies as columns:
 
 ```python
 import polars as pl
@@ -37,6 +37,31 @@ write_data(
     plan_version="2023.0.0",
     model_group_id=500,
     scenario_id=7
+)
+```
+
+Raster data can be written to a COG using values from a NumPy array:
+
+```python
+from cpra.mp.data import read_fortran_array, write_data
+
+# Read a Fortran binary dump into a NumPy array. The variable keyword argument is used
+# to determine the data type of the array.
+raster_array = read_fortran_array(
+    "MP2023_S07_G520_C000_U00_V00_SLA_N_52_52_W_lndtyp30.xyz.b",
+    variable="land_type",
+)
+
+# Write the data to a COG.
+write_data(
+    raster_array,
+    variable="land_type",
+    geographic_unit="icm_raster",
+    time_unit="annual",
+    plan_version="2023.0.0",
+    model_group_id=520,
+    scenario_id=7,
+    calendar_year=2070,
 )
 ```
 
