@@ -67,6 +67,8 @@ write_data(
 
 ## Reading Data
 
+🚧 **TODO:** Data reading is not implemented yet. The examples below describe the anticipated functionality.
+
 To read the data, use the same keyword arguments used when it was written:
 
 ```python
