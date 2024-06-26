@@ -99,9 +99,9 @@ Partition dimensions are used to partition daily data stored in Parquet files, a
 <!--BEGIN SECTION partition_dimensions-->
 | Column | Description | Data Type | Example Value |
 | --- | --- | --- | --- |
-| `model_group` | Plan Implementation Scenario | `Int32` | 500 |
-| `scenario` | Environmental Scenario | `Int32` | 7 |
-| `aep` | Annual Exceedance Probability | `Float32` | 0.2 |
+| `model_group_id` | Plan Implementation Scenario | `Int32` | 500 |
+| `scenario_id` | Environmental Scenario | `Int32` | 7 |
+| `aep_ratio` | Annual Exceedance Probability | `Float32` | 0.02 |
 | `storm_id` | Synthetic Storm ID | `Int32` | 182 |
 | `pumping_id` | Pumping Scenario | `Float32` | 0.5 |
 | `fragility_scenario` | Fragility Scenario | `Int8` |  |
@@ -116,7 +116,7 @@ Partition dimensions are used to partition daily data stored in Parquet files, a
 
 #### Plan Implementation Scenario
 
-**Column:** `model_group`  
+**Column:** `model_group_id`  
 **Data Type:** `Int32`  
 **Required Condition:** `True`  
 **Minimum Value:** 100  
@@ -124,7 +124,7 @@ Partition dimensions are used to partition daily data stored in Parquet files, a
 
 #### Environmental Scenario
 
-**Column:** `scenario`  
+**Column:** `scenario_id`  
 **Data Type:** `Int32`  
 **Required Condition:** `True`  
 **Minimum Value:** 1  
@@ -132,17 +132,17 @@ Partition dimensions are used to partition daily data stored in Parquet files, a
 
 #### Annual Exceedance Probability
 
-**Column:** `aep`  
+**Column:** `aep_ratio`  
 **Data Type:** `Float32`  
 **Required Condition:** `variable` in ("annual_exceedance_damages_dollars", "exposure_asset_count", "exposure_critical_infrastructure_count", "exposure_historic_properties_count", "flood_depth", "surge_water_surface_elevations_by_exceedance", "wave_heights_by_exceedance")  
 | Value | Label |
 | --- | --- |
-| 20 | 20.0 |
-| 10 | 10.0 |
-| 2 | 2.0 |
-| 1 | 1.0 |
-| 0.2 | 0.2 |
-| 0.1 | 0.1 |
+| 0.2 | 20.0 |
+| 0.1 | 10.0 |
+| 0.02 | 2.0 |
+| 0.01 | 1.0 |
+| 0.002 | 0.2 |
+| 0.001 | 0.1 |
 
 #### Synthetic Storm ID
 
@@ -180,7 +180,6 @@ Partition dimensions are used to partition daily data stored in Parquet files, a
 **Required Condition:** `variable` in ("annual_exceedance_damages_dollars", "expected_annual_damages_dollars", "expected_annual_structural_damage", "exposure_asset_count", "nonstructural_expected_annual_damage_dollars", "nonstructural_expected_annual_structural_damage")  
 | Value | Label |
 | --- | --- |
-| 6 | All Asset Types |
 | 1 | Small Residential (single-family, manufactured homes, or duplex) |
 | 2 | Other Multi-family Residential |
 | 3 | Commercial, Industrial, or Agricultural |

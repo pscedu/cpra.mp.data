@@ -117,7 +117,7 @@ SCHEMA = [
         example_value="2023.0.0",
     ),
     SchemaLevel(
-        column="model_group",
+        column="model_group_id",
         name="Plan Implementation Scenario",
         dtype=pl.Int32,
         min_value=100,
@@ -125,7 +125,7 @@ SCHEMA = [
         example_value=500,
     ),
     SchemaLevel(
-        column="scenario",
+        column="scenario_id",
         name="Environmental Scenario",
         dtype=pl.Int32,
         min_value=1,
@@ -133,7 +133,7 @@ SCHEMA = [
         example_value=7,
     ),
     SchemaLevel(
-        column="aep",
+        column="aep_ratio",
         name="Annual Exceedance Probability",
         dtype=pl.Float32,
         required=(
@@ -151,9 +151,9 @@ SCHEMA = [
             )
             .any()
         ),
-        values=[20, 10, 2, 1, 0.2, 0.1],
+        values=[0.2, 0.1, 0.02, 0.01, 0.002, 0.001],
         labels=["20.0", "10.0", "2.0", "1.0", "0.2", "0.1"],
-        example_value=0.2,
+        example_value=0.02,
     ),
     SchemaLevel(
         column="storm_id",
@@ -234,9 +234,8 @@ SCHEMA = [
             )
             .any()
         ),
-        values=[6, 1, 2, 3, 4, 5],
+        values=[1, 2, 3, 4, 5],
         labels=[
-            "All Asset Types",
             "Small Residential (single-family, manufactured homes, or duplex)",
             "Other Multi-family Residential",
             "Commercial, Industrial, or Agricultural",
@@ -437,7 +436,7 @@ SCHEMA = [
         example_value=2030,
     ),
     SchemaLevel(
-        column="calendar_date",
+        column="calendar_day",
         name="Date",
         dtype=pl.Date,
         partition=False,
