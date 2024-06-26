@@ -373,3 +373,27 @@ The nested directories create the data structure needed for the catalog. By trav
 | `wave_heights_by_exceedance` | Wave Heights by Exceedance | `Float32` | ft | `wave_heights` |
 | `wave_heights_by_storm` | Wave Heights by Storm | `Float64` | ft | `wave_heights` |
 <!--END SECTION-->
+
+## Grids
+
+Grids represent the spatial units for master plan data. Each grid is associated with a geographic unit and one or more plan versions.
+
+### Raster Grids
+
+<!--BEGIN SECTION raster_grids-->
+| Geographic Unit | Plan Version | Bounds | Height | Width | CRS |
+| --- | --- | --- | --- | --- | --- |
+| icm_raster | 2023.0.0 | (404500, 3187060, 1024720, 3435010) | 8285 | 20674 | EPSG:26915 |
+<!--END SECTION-->
+
+### Vector Grids
+
+<!--BEGIN SECTION vector_grids-->
+| Geographic Unit | Plan Version | CRS |
+| --- | --- | --- |
+| block_group | 2023.0.0 | EPSG:26915 |
+| ecoregion | 2023.0.0 | EPSG:26915 |
+| extraction_point | 2023.0.0 | EPSG:26915 |
+| hydro_compartment | 2023.0.0 | EPSG:26915 |
+| parish | 2023.0.0 | EPSG:26915 |
+<!--END SECTION-->

@@ -1,7 +1,7 @@
-import numpy as np
 import polars as pl
-from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.grids import get_grid
 from cpra.mp.data.variables import VARIABLES
 from scipy.io import FortranFile
 
@@ -33,6 +33,43 @@ def validate_data_frame(df, required_cols=None):
     for dim in DIMENSIONS:
         if dim.column in required_cols:
             dim.validate_series(df.get_column(dim.column))
+
+
+def extract_dimension_value(column, data, **kwargs):
+    """Extract a dimension value from keyword arguments or a data source."""
+
+    if column in kwargs:
+        return kwargs[column]
+
+    if isinstance(data, dict) and column in data:
+        return data[column]
+
+    if isinstance(data, pl.DataFrame) and column in data and len(data[column]):
+        return data[column][0]
+
+    return None
+
+
+def validate_grid(data, **kwargs):
+    """Validate that there is a grid for the given geographic unit and plan version."""
+
+    geographic_unit = extract_dimension_value("geographic_unit", data, **kwargs)
+    plan_version = extract_dimension_value("plan_version", data, **kwargs)
+
+    if geographic_unit is None:
+        msg = "Geographic unit is required."
+        raise ValidationError(msg)
+
+    if plan_version is None:
+        msg = "Plan version is required."
+        raise ValidationError(msg)
+
+    grid = get_grid(geographic_unit, plan_version)
+    if grid is None:
+        msg = f"No grid for geographic unit {geographic_unit} and plan version {plan_version}."
+        raise ValidationError(msg)
+
+    return grid
 
 
 def cast_columns(df):

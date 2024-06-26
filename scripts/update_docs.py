@@ -1,7 +1,8 @@
 import json
 import re
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.dimensions import VARIABLES
+from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.variables import VARIABLES
 
 
 def table_row(values):
@@ -123,6 +124,49 @@ def update_docs():
     variable_rows = [variable_row(VARIABLES[name]) for name in variable_names]
     markdown = replace_section(
         "variables", table(variable_header, variable_rows), markdown
+    )
+
+    # Update grids tables.
+    raster_header = [
+        "Geographic Unit",
+        "Plan Version",
+        "Bounds",
+        "Height",
+        "Width",
+        "CRS",
+    ]
+    raster_rows = []
+    vector_header = ["Geographic Unit", "Plan Version", "CRS"]
+    vector_rows = []
+
+    for gu in GRIDS.values():
+        for plan_version, grid in gu.items():
+            if grid.grid_type == "raster":
+                raster_rows.append(
+                    [
+                        grid.geographic_unit,
+                        plan_version,
+                        grid.bounds,
+                        grid.height,
+                        grid.width,
+                        grid.crs.upper(),
+                    ]
+                )
+            else:
+                vector_rows.append(
+                    [
+                        grid.geographic_unit,
+                        plan_version,
+                        grid.crs.upper(),
+                    ]
+                )
+
+    markdown = replace_section(
+        "raster_grids", table(raster_header, raster_rows), markdown
+    )
+
+    markdown = replace_section(
+        "vector_grids", table(vector_header, vector_rows), markdown
     )
 
     with open("docs/index.md", "w") as output_file:
