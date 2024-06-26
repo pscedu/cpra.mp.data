@@ -320,7 +320,7 @@ Non-partition dimensions are present in Parquet data files but are not used to c
 Parquet and COG files are saved in nested directories corresponding to the dataset and partition dimensions:
 
 ```
-.../master_plan=2029/variable=salinity/geographic_unit=hydro_compartment/aggregate=mean/time_unit=daily/model_group=500/scenario=7/4f3b1a8418a74c6dacb41378fd69ec26-0.parquet
+.../variable=salinity_mean/geographic_unit=hydro_compartment/time_unit=daily/plan_version=2023.0.0/model_group_id=500/scenario_id=7/4f3b1a8418a74c6dacb41378fd69ec26-0.parquet
 ```
 
 The partitioned Parquet dataset lives within the `aggregate=mean` directory. The directories above and including this level are just filesystem directories, while the directories below it (`model_group=500` and `scenario=7`) are partition directories that can be used by the Parquet reader to understand the structure of the full daily mean hydro compartment salinity dataset.
@@ -328,7 +328,7 @@ The partitioned Parquet dataset lives within the `aggregate=mean` directory. The
 While they do not use partitioning, COGs are saved in the same directory structure:
 
 ```
-.../master_plan=2029/variable=flood_depth/time_unit=decadal/model_group=500/scenario=7/aep=10.0/calendar_year=2030.tiff
+.../variable=flood_depth/geographic_unit=icm_raster/time_unit=decadal/plan_version=2023.0.0/model_group_id=500/scenario_id=7/aep_ratio=0.1/calendar_year=2030.tiff
 ```
 
 The nested directories create the data structure needed for the catalog. By traversing the catalog tree (and in some cases, summarizing specific columns from the Parquet files selected through the traversal), the catalog API can respond to queries about available data and valid choices at each level of the catalog hierarchy.
