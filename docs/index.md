@@ -11,10 +11,16 @@ Together, the dataset dimensions define a single Parquet dataset. They are also 
 <!--BEGIN SECTION dataset_dimensions-->
 | Column | Description | Data Type | Example Value |
 | --- | --- | --- | --- |
+| `plan_version` | Plan Version | `String` | 2023.0.0 |
 | `variable` | Variable | `String` | salinity_mean |
 | `geographic_unit` | Geography | `String` | hydro_compartment |
 | `time_unit` | Time Unit | `String` | daily |
-| `plan_version` | Plan Version | `String` | 2023.0.0 |
+
+#### Plan Version
+
+**Column:** `plan_version`  
+**Data Type:** `String`  
+**Required Condition:** `True`  
 
 #### Variable
 
@@ -83,12 +89,6 @@ Together, the dataset dimensions define a single Parquet dataset. They are also 
 | annual | Annual |
 | daily | Daily |
 | decadal | Decadal |
-
-#### Plan Version
-
-**Column:** `plan_version`  
-**Data Type:** `String`  
-**Required Condition:** `True`  
 
 <!--END SECTION-->
 

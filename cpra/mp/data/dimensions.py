@@ -67,6 +67,13 @@ class Dimension:
 
 DIMENSIONS = [
     Dimension(
+        column="plan_version",
+        name="Plan Version",
+        dtype=pl.String,
+        partition=True,
+        example_value="2023.0.0",
+    ),
+    Dimension(
         column="variable",
         name="Variable",
         dtype=pl.String,
@@ -108,13 +115,6 @@ DIMENSIONS = [
         values=["annual", "daily", "decadal"],
         labels=["Annual", "Daily", "Decadal"],
         example_value="daily",
-    ),
-    Dimension(
-        column="plan_version",
-        name="Plan Version",
-        dtype=pl.String,
-        partition=True,
-        example_value="2023.0.0",
     ),
     Dimension(
         column="model_group_id",
