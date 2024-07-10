@@ -1,4 +1,5 @@
 import polars as pl
+import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
@@ -8,6 +9,52 @@ from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
 
 
+def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwargs):
+    """Read tabular data into a data frame from a Parquet file."""
+
+    filter_kwargs = kwargs.copy()
+    dataset_path = Path(base_path)
+    dataset_cols = []
+    dataset_exprs = []
+
+    # Iterate over dataset dimensions and update the dataset path.
+    for dimension in DIMENSIONS:
+        if dimension.partition is not True:
+            break
+
+        dimension_value = kwargs.get(dimension.column)
+        if dimension_value is None:
+            msg = f"Required dataset dimension {dimension.column} is missing"
+            raise ValueError(msg)
+
+        dataset_path = dataset_path / f"{dimension.column}={str(dimension_value)}"
+        dataset_cols.append(dimension.column)
+        dataset_exprs.append(
+            pl.lit(dimension_value).cast(dimension.dtype).alias(dimension.column)
+        )
+        del filter_kwargs[dimension.column]
+
+    # TODO: Provide Hive partitioning schema since this is known in advance.
+    lf = pl.scan_parquet(dataset_path, cache=cache)
+
+    # Filter based on keyword arguments.
+    if filter_kwargs:
+        lf = lf.filter(**filter_kwargs)
+
+    # TODO: Handle advanced filters.
+    if filters is not None:
+        msg = "Advanced filters are not yet implemented"
+        raise NotImplementedError(msg)
+
+    # Sort columns and add dataset values.
+    required_cols = required_columns(pl.DataFrame(kwargs))
+    lf = lf.select(
+        *dataset_exprs,
+        *[pl.col(col) for col in required_cols if col not in dataset_cols],
+        cs.digit(),
+    )
+
+    return lf if lazy else lf.collect()
 
 
 def write_parquet(

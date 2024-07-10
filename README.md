@@ -67,8 +67,6 @@ write_data(
 
 ## Reading Data
 
-🚧 **TODO:** Data reading is not implemented yet. The examples below describe the anticipated functionality.
-
 To read the data, use the same keyword arguments used when it was written:
 
 ```python
@@ -87,6 +85,8 @@ shape: (3, 1795)
 ```
 
 For more advanced Parquet filtering, you can also provide a `filters` argument in the same [format used by `pyarrow`](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.read_table.html):
+
+🚧 **TODO:** Advanced filtering is not yet implemented.
 
 ```python
 # In the filters argument, elements in the inner lists are joined with AND,
@@ -107,3 +107,4 @@ df3 = read_data(
 )
 ```
 
+🚧 **TODO:** Reading raster data is not yet implemented.

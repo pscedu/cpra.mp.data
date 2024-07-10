@@ -35,7 +35,7 @@ def validate_data_frame(df, required_cols=None):
             dim.validate_series(df.get_column(dim.column))
 
 
-def extract_dimension_value(column, data, **kwargs):
+def extract_dimension_value(column, data=None, **kwargs):
     """Extract a dimension value from keyword arguments or a data source."""
 
     if column in kwargs:
@@ -50,7 +50,7 @@ def extract_dimension_value(column, data, **kwargs):
     return None
 
 
-def validate_grid(data, **kwargs):
+def validate_grid(data=None, **kwargs):
     """Validate that there is a grid for the given geographic unit and plan version."""
 
     geographic_unit = extract_dimension_value("geographic_unit", data, **kwargs)
