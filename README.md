@@ -67,11 +67,12 @@ write_data(
 
 ## Reading Data
 
-To read the data, use the same keyword arguments used when it was written:
+To read the data, use the same keyword arguments used when it was written. For tabular data, `read_data` returns a Polars [`LazyFame`](https://docs.pola.rs/api/python/stable/reference/lazyframe/index.html). To materialize the data frame, use the `.collect()` method.:
 
 ```python
->>> df2 = read_data(variable="salinity", geographic_unit="hydro_compartment", aggregate="mean", time_unit="daily", plan_version="2023.0.0", model_group_id=500, scenario_id=7)
->>> df2
+>>> from cpra.mp.data import read_data
+>>> lf = read_data(variable="salinity", geographic_unit="hydro_compartment", aggregate="mean", time_unit="daily", plan_version="2023.0.0", model_group_id=500, scenario_id=7)
+>>> lf.collect()
 shape: (3, 1795)
 ┌──────────┬───────────────────┬───────────┬───────────┬───┬───────┬───────┬───────┬───────┐
 │ variable ┆ geographic_unit   ┆ aggregate ┆ time_unit ┆ … ┆ g1784 ┆ g1785 ┆ g1786 ┆ g1787 │
@@ -84,27 +85,22 @@ shape: (3, 1795)
 └──────────┴───────────────────┴───────────┴───────────┴───┴───────┴───────┴───────┴───────┘
 ```
 
-For more advanced Parquet filtering, you can also provide a `filters` argument in the same [format used by `pyarrow`](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.read_table.html):
-
-🚧 **TODO:** Advanced filtering is not yet implemented.
+Since the `LazyFrame` returned by `read_data` has not yet been materialized, additional Polars filters expressions can be used to achieve advanced filtering logic (using logical operators, etc.) without a performance penalty:
 
 ```python
-# In the filters argument, elements in the inner lists are joined with AND,
-# while elements in the outer list are joined with OR. All keyword arguments
-# passed to read_data are added to the inner lists (i.e., joined to the 
-# explicit filter arguments using AND).
-df3 = read_data(
+import polars as pl
+from cpra.mp.data import read_data
+from datetime import date
+g520_ip1 = p.col("model_group_id") == 520 & pl.col("calendar_day") < date(2040, 1, 1)
+g521_ip2 = p.col("model_group_id") == 521 & pl.col("calendar_day") >= date(2040, 1, 1)
+lf2 = read_data(
     variable="salinity",
     geographic_unit="hydro_compartment",
     aggregate="mean",
     time_unit="daily",
     plan_version="2029.0.0",
     scenario_id=7,
-    filters=[
-        [("model_group_id", "==", 520), ("calendar_day", "<", "2040-01-01")],
-        [("model_group_id", "==", 521), ("calendar_day", ">=", "2040-01-01")],
-    ]
-)
+).filter(g520_ip1 | g521_ip2)
 ```
 
 🚧 **TODO:** Reading raster data is not yet implemented.

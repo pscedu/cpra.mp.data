@@ -9,7 +9,7 @@ from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
 
 
-def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwargs):
+def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
     filter_kwargs = kwargs.copy()
@@ -46,11 +46,6 @@ def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwa
     if filter_kwargs:
         lf = lf.filter(**filter_kwargs)
 
-    # TODO: Handle advanced filters.
-    if filters is not None:
-        msg = "Advanced filters are not yet implemented"
-        raise NotImplementedError(msg)
-
     # Sort columns and add dataset values.
     required_cols = required_columns(input_df)
     lf = lf.select(
@@ -59,7 +54,7 @@ def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwa
         cs.digit(),
     )
 
-    return lf if lazy else lf.collect()
+    return lf
 
 
 def write_parquet(
