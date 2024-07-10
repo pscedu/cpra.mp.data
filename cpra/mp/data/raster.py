@@ -8,13 +8,13 @@ from pathlib import Path
 from rasterio.transform import from_bounds
 
 
-def cog_path_expression(df, base_path="", separator="/"):
+def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
     """Generate a COG path from a data frame containing dimensions and values."""
 
     return pl.concat_str(
         [
             pl.concat_str(
-                [pl.lit(base_path)]
+                [pl.lit(str(base_path))]
                 + [
                     pl.concat_str(
                         [pl.lit(dim.column), pl.col(dim.column).cast(pl.String)],

@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
 
@@ -11,5 +12,5 @@ def get_config(name, default_value):
     return os.environ.get(f"CPRA_MP_DATA_{name}", default_value)
 
 
-BASE_PATH = get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data")
+BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
