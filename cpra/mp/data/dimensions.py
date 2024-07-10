@@ -35,9 +35,8 @@ class Dimension:
         """Validate that a Polars series conforms to the specification for this level."""
 
         if series.dtype != self.dtype:
-            raise ValidationError(
-                f"Series {series.name} has dtype {series.dtype!s}, expected {self.dtype!s}"
-            )
+            msg = f"Series {series.name} has dtype {series.dtype!s}, expected {self.dtype!s}"
+            raise ValidationError(msg)
 
         if (not self.null) and series.is_null().any():
             raise ValidationError(f"Series {series.name} contains null values")
