@@ -6,6 +6,22 @@ from cpra.mp.data.variables import VARIABLES
 from scipy.io import FortranFile
 
 
+def partition_columns(df, include_dataset=True):
+    """Get a list of partition columns based on the values in the data frame."""
+
+    return [
+        col.name
+        for col in df.select(
+            **{
+                dim.column: dim.partition & dim.required
+                for dim in DIMENSIONS
+                if include_dataset or dim.partition is not True
+            }
+        )
+        if col.any()
+    ]
+
+
 def required_columns(df):
     """Get a list of required columns based on the values in the data frame."""
 

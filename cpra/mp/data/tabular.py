@@ -4,7 +4,7 @@ from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
-from cpra.mp.data.utils import required_columns, validate_data_frame
+from cpra.mp.data.utils import partition_columns, required_columns, validate_data_frame
 from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
 
@@ -34,8 +34,13 @@ def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwa
         )
         del filter_kwargs[dimension.column]
 
-    # TODO: Provide Hive partitioning schema since this is known in advance.
-    lf = pl.scan_parquet(dataset_path, cache=cache)
+    # Provide Hive partitioning schema since this is known in advance.
+    input_df = pl.DataFrame(kwargs)
+    partition_cols = partition_columns(input_df, include_dataset=True)
+    hive_schema = {d.column: d.dtype for d in DIMENSIONS if d.column in partition_cols}
+    lf = pl.scan_parquet(
+        dataset_path, cache=cache, hive_partitioning=True, hive_schema=hive_schema
+    )
 
     # Filter based on keyword arguments.
     if filter_kwargs:
@@ -47,7 +52,7 @@ def read_parquet(base_path=BASE_PATH, lazy=True, filters=None, cache=True, **kwa
         raise NotImplementedError(msg)
 
     # Sort columns and add dataset values.
-    required_cols = required_columns(pl.DataFrame(kwargs))
+    required_cols = required_columns(input_df)
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in dataset_cols],
@@ -114,13 +119,7 @@ def write_parquet(
             df = df.select(*all_cols).sort(*required_cols)
 
     # Get partition columns.
-    partition_cols = [
-        col.name
-        for col in df.select(
-            **{dim.column: dim.partition & dim.required for dim in DIMENSIONS}
-        )
-        if col.any()
-    ]
+    partition_cols = partition_columns(df)
 
     # Write the partitioned file.
     df.write_parquet(
