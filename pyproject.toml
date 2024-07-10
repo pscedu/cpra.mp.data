@@ -25,17 +25,15 @@ classifiers = [
 ]
 dependencies = [
   "numpy",
-  "polars",
+  "polars>=1.1.0",
   "pyarrow",
+  "python-dotenv",
   "rasterio",
   "scipy"
 ]
 
 [tool.hatch.envs.scripts]
-dependencies = [
-  "connectorx",
-  "python-dotenv"
-]
+dependencies = []
 
 [tool.hatch.version]
 path = "CHANGELOG.md"
