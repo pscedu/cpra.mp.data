@@ -15,6 +15,19 @@ class VectorGrid(BaseGrid):
 
     grid_type = "vector"
 
+    def __init__(
+        self, geographic_unit, plan_versions, geographies=None, crs="epsg:26915"
+    ):
+        super().__init__(
+            geographic_unit=geographic_unit, plan_versions=plan_versions, crs=crs
+        )
+        if isinstance(geographies, int):
+            self.geographies = list(range(1, geographies + 1))
+        elif geographies:
+            self.geographies = list(geographies)
+        else:
+            self.geographies = []
+
 
 class RasterGrid(BaseGrid):
     """Raster grid."""
@@ -62,5 +75,11 @@ add_grid(
 add_grid(VectorGrid(geographic_unit="block_group", plan_versions=["2023.0.0"]))
 add_grid(VectorGrid(geographic_unit="ecoregion", plan_versions=["2023.0.0"]))
 add_grid(VectorGrid(geographic_unit="extraction_point", plan_versions=["2023.0.0"]))
-add_grid(VectorGrid(geographic_unit="hydro_compartment", plan_versions=["2023.0.0"]))
+add_grid(
+    VectorGrid(
+        geographic_unit="hydro_compartment",
+        plan_versions=["2023.0.0"],
+        geographies=1787,
+    )
+)
 add_grid(VectorGrid(geographic_unit="parish", plan_versions=["2023.0.0"]))
