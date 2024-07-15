@@ -83,19 +83,20 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     glob_pattern = "/".join(dimension_patterns) + ".tif"
 
     # Create a data frame from the COG paths.
-    # TODO: Sort the resulting data frame.
-    return pl.DataFrame(
-        {"path": [str(p) for p in dataset_dir.glob(glob_pattern)]}
-    ).select(
-        [
-            pl.col("path")
-            .str.extract(f"{d.column}=([^/]+)(/|\\.tif)", 1)
-            .cast(d.dtype)
-            .alias(d.column)
-            for d in DIMENSIONS
-            if d.column in required_cols
-        ]
-        + [pl.col("path").cast(pl.String)]
+    return (
+        pl.DataFrame({"path": [str(p) for p in dataset_dir.glob(glob_pattern)]})
+        .select(
+            [
+                pl.col("path")
+                .str.extract(f"{d.column}=([^/]+)(/|\\.tif)", 1)
+                .cast(d.dtype)
+                .alias(d.column)
+                for d in DIMENSIONS
+                if d.column in required_cols
+            ]
+            + [pl.col("path").cast(pl.String)]
+        )
+        .sort(required_cols)
     )
 
 
