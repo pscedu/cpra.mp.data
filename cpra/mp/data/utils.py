@@ -1,8 +1,9 @@
 import polars as pl
-from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.variables import VARIABLES
+from pathlib import Path
 from scipy.io import FortranFile
 
 
@@ -64,6 +65,18 @@ def extract_dimension_value(column, data=None, **kwargs):
         return data[column][0]
 
     return None
+
+
+def dataset_path(base_path, **kwargs):
+    """Generate a dataset directory path from keyword arguments."""
+
+    dataset_path = Path(base_path)
+    for dimension in DATASET_DIMENSIONS:
+        dataset_path = (
+            dataset_path / f"{dimension.column}={str(kwargs[dimension.column])}"
+        )
+
+    return dataset_path
 
 
 def validate_grid(data=None, **kwargs):

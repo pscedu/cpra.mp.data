@@ -103,4 +103,26 @@ lf2 = read_data(
 ).filter(g520_ip1 | g521_ip2)
 ```
 
-🚧 **TODO:** Reading raster data is not yet implemented.
+Reading raster data is a two-step process. Calling `read_data` for a raster-grid variable returns a DataFrame containing information about matching COGs. The `path` column contains the path to the COGs, and the other columns contain dimension values for the COGs. The dimension columns can be used to perform advanced filtering using the Polars API.
+
+The second step is to use a library like [Rasterio](https://rasterio.readthedocs.io/en/stable/) to open the COG paths and access the image data. A common access pattern is to create a [VRT dataset](https://gdal.org/drivers/raster/vrt.html) that merges several single-band COGs into a virtual multiband image. The `vrt` helper function takes an iterable containing COG paths and returns an XML string describing a VRT dataset that can be opened using GDAL or Rasterio.
+
+```python
+import rasterio as rio
+from cpra.mp.data import vrt, read_data
+
+# Generate a data frame containing information about matching COGs.
+cog_df = read_data(
+    variable="land_type",
+    geographic_unit="icm_raster",
+    time_unit="annual",
+    plan_version="2023.0.0",
+    model_group_id=520,
+    scenario_id=7,
+)
+
+# Create a virtual dataset (VRT) from the COG paths so that they
+# can be accessed as a single multiband image.
+with rio.open(vrt(cog_df["path"])) as multiband:
+    print(multiband.profile)
+```

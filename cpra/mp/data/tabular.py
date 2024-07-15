@@ -1,45 +1,38 @@
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_COLUMNS, DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
-from cpra.mp.data.utils import partition_columns, required_columns, validate_data_frame
+from cpra.mp.data.utils import (
+    dataset_path,
+    partition_columns,
+    required_columns,
+    validate_data_frame,
+)
 from cpra.mp.data.variables import VARIABLES
-from pathlib import Path
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
-    filter_kwargs = kwargs.copy()
-    dataset_path = Path(base_path)
-    dataset_cols = []
-    dataset_exprs = []
+    # Validate the input keyword arguments.
+    input_df = pl.DataFrame(kwargs)
+    validate_data_frame(input_df, required_cols=DATASET_COLUMNS)
 
-    # Iterate over dataset dimensions and update the dataset path.
-    for dimension in DIMENSIONS:
-        if dimension.partition is not True:
-            break
-
-        dimension_value = kwargs.get(dimension.column)
-        if dimension_value is None:
-            msg = f"Required dataset dimension {dimension.column} is missing"
-            raise ValueError(msg)
-
-        dataset_path = dataset_path / f"{dimension.column}={str(dimension_value)}"
-        dataset_cols.append(dimension.column)
-        dataset_exprs.append(
-            pl.lit(dimension_value).cast(dimension.dtype).alias(dimension.column)
-        )
-        del filter_kwargs[dimension.column]
+    # Calculate the dataset directory path and expressions.
+    dataset_dir = dataset_path(base_path, **kwargs)
+    dataset_exprs = [
+        pl.lit(kwargs[d.column]).cast(d.dtype).alias(d.column)
+        for d in DATASET_DIMENSIONS
+    ]
+    filter_kwargs = {k: v for k, v in kwargs.items() if k not in DATASET_COLUMNS}
 
     # Provide Hive partitioning schema since this is known in advance.
-    input_df = pl.DataFrame(kwargs)
     partition_cols = partition_columns(input_df, include_dataset=True)
     hive_schema = {d.column: d.dtype for d in DIMENSIONS if d.column in partition_cols}
     lf = pl.scan_parquet(
-        dataset_path, cache=cache, hive_partitioning=True, hive_schema=hive_schema
+        dataset_dir, cache=cache, hive_partitioning=True, hive_schema=hive_schema
     )
 
     # Filter based on keyword arguments.
@@ -50,7 +43,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     required_cols = required_columns(input_df)
     lf = lf.select(
         *dataset_exprs,
-        *[pl.col(col) for col in required_cols if col not in dataset_cols],
+        *[pl.col(col) for col in required_cols if col not in DATASET_COLUMNS],
         cs.digit(),
     )
 

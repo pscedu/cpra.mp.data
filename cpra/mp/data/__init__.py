@@ -1,4 +1,4 @@
-from cpra.mp.data.raster import write_cog
+from cpra.mp.data.raster import read_cog, vrt, write_cog  # noqa
 from cpra.mp.data.tabular import read_parquet, write_parquet
 from cpra.mp.data.utils import read_fortran_array, validate_grid  # noqa
 
@@ -9,8 +9,7 @@ def read_data(**kwargs):
     grid = validate_grid(**kwargs)
 
     if grid.grid_type == "raster":
-        msg = "Reading raster data is not yet implemented"
-        raise NotImplementedError(msg)
+        return read_cog(**kwargs)
     else:
         return read_parquet(**kwargs)
 

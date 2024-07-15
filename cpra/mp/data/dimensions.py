@@ -443,3 +443,6 @@ DIMENSIONS = [
         example_value="2030-01-01",
     ),
 ]
+
+DATASET_DIMENSIONS = [d for d in DIMENSIONS if d.partition is True]
+DATASET_COLUMNS = [d.column for d in DATASET_DIMENSIONS]

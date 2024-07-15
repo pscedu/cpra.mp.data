@@ -1,10 +1,19 @@
 import polars as pl
 import rasterio as rio
+
+import xml.etree.ElementTree
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_COLUMNS, DIMENSIONS
 from cpra.mp.data.grids import get_grid
-from cpra.mp.data.utils import cast_columns, validate_data_frame
+from cpra.mp.data.utils import (
+    cast_columns,
+    dataset_path,
+    required_columns,
+    validate_data_frame,
+)
 from pathlib import Path
+from rasterio.io import MemoryFile
+from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
 
@@ -30,6 +39,66 @@ def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
     )
 
 
+def vrt(paths):
+    """Create a VRT dataset from the given COG paths."""
+
+    # Create individual band VRTs, and combine them.
+    # Adapted from: https://gis.stackexchange.com/a/421687
+    out_el = None
+    for path_idx, path in enumerate(paths, start=1):
+        with rio.open(path) as raster, MemoryFile() as memory:
+            copy(raster, memory.name, driver="VRT")
+            dataset_el = xml.etree.ElementTree.fromstring(memory.read().decode("utf-8"))
+
+            if out_el is None:
+                out_el = dataset_el
+            else:
+                # TODO: Verify that the dimensions etc. of this band match the output raster.
+                band_el = dataset_el.find("VRTRasterBand")
+                # TODO: Raise an error if there isn't a band?
+                if band_el:
+                    band_el.set("band", str(path_idx))
+                    out_el.append(band_el)
+
+    return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
+
+
+def read_cog(base_path=BASE_PATH, **kwargs):
+    """Locate matching COG paths."""
+
+    # Validate the input keyword arguments.
+    input_df = pl.DataFrame(kwargs)
+    validate_data_frame(input_df, required_cols=DATASET_COLUMNS)
+
+    # Calculate the dataset directory path.
+    dataset_dir = dataset_path(base_path, **kwargs)
+
+    # Construct the glob pattern.
+    required_cols = required_columns(input_df)
+    dimension_patterns = [
+        f"{col}={str(kwargs[col])}" if col in kwargs else "*"
+        for col in required_cols
+        if col not in DATASET_COLUMNS
+    ]
+    glob_pattern = "/".join(dimension_patterns) + ".tif"
+
+    # Create a data frame from the COG paths.
+    # TODO: Sort the resulting data frame.
+    return pl.DataFrame(
+        {"path": [str(p) for p in dataset_dir.glob(glob_pattern)]}
+    ).select(
+        [
+            pl.col("path")
+            .str.extract(f"{d.column}=([^/]+)(/|\\.tif)", 1)
+            .cast(d.dtype)
+            .alias(d.column)
+            for d in DIMENSIONS
+            if d.column in required_cols
+        ]
+        + [pl.col("path")]
+    )
+
+
 def write_cog(
     data,
     base_path=BASE_PATH,
@@ -38,6 +107,7 @@ def write_cog(
     compression_level=6,
     **kwargs,
 ):
+    """Write data from a NumPy array to a COG."""
     df = cast_columns(pl.DataFrame(kwargs))
     if validate:
         validate_data_frame(df)
