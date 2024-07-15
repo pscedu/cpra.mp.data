@@ -85,6 +85,9 @@ shape: (3, 1795)
 └──────────┴───────────────────┴───────────┴───────────┴───┴───────┴───────┴───────┴───────┘
 ```
 
+> [!TIP]
+> Calling `LazyFrame.collect()` when the underlying Parquet files do not exist (e.g., filtering on a model group that has not yet been run) will raise `FileNotFoundError`. Applications where the filter parameters are user-supplied should handle this exception.
+
 Since the `LazyFrame` returned by `read_data` has not yet been materialized, additional Polars filters expressions can be used to achieve advanced filtering logic (using logical operators, etc.) without a performance penalty:
 
 ```python
