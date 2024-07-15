@@ -95,7 +95,7 @@ def read_cog(base_path=BASE_PATH, **kwargs):
             for d in DIMENSIONS
             if d.column in required_cols
         ]
-        + [pl.col("path")]
+        + [pl.col("path").cast(pl.String)]
     )
 
 
