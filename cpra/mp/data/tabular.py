@@ -1,7 +1,7 @@
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_COLUMNS, DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
@@ -18,19 +18,21 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)
-    validate_data_frame(input_df, required_cols=DATASET_COLUMNS)
+    validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Calculate the dataset directory path and expressions.
     dataset_dir = dataset_path(base_path, **kwargs)
     dataset_exprs = [
-        pl.lit(kwargs[d.column]).cast(d.dtype).alias(d.column)
-        for d in DATASET_DIMENSIONS
+        pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name)
+        for dim in DATASET_DIMENSIONS.values()
     ]
-    filter_kwargs = {k: v for k, v in kwargs.items() if k not in DATASET_COLUMNS}
+    filter_kwargs = {k: v for k, v in kwargs.items() if k not in DATASET_DIMENSIONS}
 
     # Provide Hive partitioning schema since this is known in advance.
     partition_cols = partition_columns(input_df, include_dataset=True)
-    hive_schema = {d.column: d.dtype for d in DIMENSIONS if d.column in partition_cols}
+    hive_schema = {
+        dim.name: dim.dtype for dim in DIMENSIONS.values() if dim.name in partition_cols
+    }
     lf = pl.scan_parquet(
         dataset_dir, cache=cache, hive_partitioning=True, hive_schema=hive_schema
     )
@@ -43,7 +45,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     required_cols = required_columns(input_df)
     lf = lf.select(
         *dataset_exprs,
-        *[pl.col(col) for col in required_cols if col not in DATASET_COLUMNS],
+        *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
         cs.digit(),
     )
 

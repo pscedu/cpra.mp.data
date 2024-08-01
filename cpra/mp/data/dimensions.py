@@ -1,448 +1,113 @@
 import polars as pl
-
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.structure import read_structure_csv
 from cpra.mp.data.variables import VARIABLES
 
 
 class Dimension:
     def __init__(
         self,
-        column,
         name,
+        label,
+        type,
         dtype,
-        partition=(pl.col("time_unit") == "daily").any(),
         required=True,
         values=None,
-        labels=None,
         min_value=None,
         max_value=None,
         null=False,
         example_value=None,
+        scope=None,
     ):
-        self.column = column
         self.name = name
-        self.dtype = dtype
-        self.partition = partition
+        self.label = label
+        self.type = type
+        self.dtype = getattr(pl, dtype)
         self.values = values
-        self.labels = labels
-        self.min_value = min_value
-        self.max_value = max_value
+        self.min_value = self.cast(min_value)
+        self.max_value = self.cast(max_value)
         self.null = null
         self.required = required
-        self.example_value = example_value
+        self.example_value = self.cast(example_value)
+        self.scope = scope
 
-    def validate_series(self, series):
-        """Validate that a Polars series conforms to the specification for this level."""
+    @property
+    def partition(self):
+        """Partition expression."""
+        if self.type == "nonpartition":
+            return False
+        if self.type == "partition":
+            return True
+        return (pl.col("time_unit") == "daily").any()
+
+    @property
+    def validation_expressions(self):
+        exprs = {}
+        if not self.null:
+            exprs[f"{self.name}_is_not_null"] = pl.col(self.name).is_not_null()
+
+        if self.values is not None:
+            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"])
+
+        if self.min_value is not None:
+            exprs[f"{self.name}_minimum_value"] = pl.col(self.name) >= self.min_value
+
+        if self.max_value is not None:
+            exprs[f"{self.name}_maximum_value"] = pl.col(self.name) <= self.max_value
+
+        return exprs
+
+    def cast(self, value):
+        """Cast a value to this dimension's data type."""
+        return (
+            None if value is None else pl.select(pl.lit(value).cast(self.dtype)).item()
+        )
+
+    def validate_dtype(self, series):
+        """Validate that a Polars series has the expected data type."""
 
         if series.dtype != self.dtype:
             msg = f"Series {series.name} has dtype {series.dtype!s}, expected {self.dtype!s}"
             raise ValidationError(msg)
 
-        if (not self.null) and series.is_null().any():
-            raise ValidationError(f"Series {series.name} contains null values")
 
-        # Allowed values have to be made into a series so they can be cast to the correct
-        # dtype for comparison.
-        if (
-            self.values
-            and not series.is_in(pl.Series(self.values).cast(self.dtype)).all()
-        ):
-            raise ValidationError(f"Series {series.name} has invalid values")
+def make_dimensions():
+    dim_values_df = read_structure_csv("dimension_values")
+    dimensions = []
 
-        if self.min_value is not None:
-            min_value = series.min()
-            if min_value < self.min_value:
-                raise ValidationError(
-                    f"Series {series.name} has an invalid minimum value: {min_value}"
+    for row in (
+        read_structure_csv("dimensions")
+        .with_columns(pl.col("required").cast(pl.Boolean))
+        .iter_rows(named=True)
+    ):
+        values = dim_values_df.filter(dimension=row["name"]).with_columns(
+            pl.col("value").cast(getattr(pl, row["dtype"]))
+        )
+        if row["required"] is None:
+            row["required"] = (
+                pl.col("variable")
+                .is_in(
+                    [
+                        v.name
+                        for v in VARIABLES
+                        if row["name"] in (v.required_dimensions or [])
+                    ]
                 )
+                .any()
+            )
+        dimensions.append(Dimension(values=(values if len(values) else None), **row))
 
-        if self.max_value is not None:
-            max_value = series.max()
-            if max_value > self.max_value:
-                raise ValidationError(
-                    f"Series {series.name} has an invalid maximum value: {max_value}"
-                )
+    return dimensions
 
 
-DIMENSIONS = [
-    Dimension(
-        column="plan_version",
-        name="Plan Version",
-        dtype=pl.String,
-        partition=True,
-        example_value="2023.0.0",
-    ),
-    Dimension(
-        column="variable",
-        name="Variable",
-        dtype=pl.String,
-        partition=True,
-        values=list(VARIABLES.keys()),
-        labels=[variable.label for variable in VARIABLES.values()],
-        example_value="salinity_mean",
-    ),
-    Dimension(
-        column="geographic_unit",
-        name="Geography",
-        dtype=pl.String,
-        partition=True,
-        values=[
-            "block_group",
-            "clara",
-            "ecoregion",
-            "extraction_point",
-            "hydro_compartment",
-            "icm_raster",
-            "parish",
-        ],
-        labels=[
-            "Census Block Group",
-            "Clara Community",
-            "Ecoregion",
-            "Extraction Point",
-            "Hydro Compartment",
-            "ICM Raster",
-            "Parish",
-        ],
-        example_value="hydro_compartment",
-    ),
-    Dimension(
-        column="time_unit",
-        name="Time Unit",
-        dtype=pl.String,
-        partition=True,
-        values=["annual", "daily", "decadal"],
-        labels=["Annual", "Daily", "Decadal"],
-        example_value="daily",
-    ),
-    Dimension(
-        column="model_group_id",
-        name="Plan Implementation Scenario",
-        dtype=pl.Int32,
-        min_value=100,
-        max_value=999,
-        example_value=500,
-    ),
-    Dimension(
-        column="scenario_id",
-        name="Environmental Scenario",
-        dtype=pl.Int32,
-        min_value=1,
-        max_value=100,
-        example_value=7,
-    ),
-    Dimension(
-        column="aep_ratio",
-        name="Annual Exceedance Probability",
-        dtype=pl.Float32,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "flood_depth",
-                    "annual_exceedance_damages_dollars",
-                    "surge_water_surface_elevations_by_exceedance",
-                    "wave_heights_by_exceedance",
-                    "exposure_asset_count",
-                    "exposure_critical_infrastructure_count",
-                    "exposure_historic_properties_count",
-                ]
-            )
-            .any()
-        ),
-        values=[0.2, 0.1, 0.02, 0.01, 0.002, 0.001],
-        labels=["20.0", "10.0", "2.0", "1.0", "0.2", "0.1"],
-        example_value=0.02,
-    ),
-    Dimension(
-        column="storm_id",
-        name="Synthetic Storm ID",
-        dtype=pl.Int32,
-        required=(
-            pl.col("variable")
-            .is_in(["surge_water_surface_elevations_by_storm", "wave_heights_by_storm"])
-            .any()
-        ),
-        min_value=1,
-        max_value=1000,
-        example_value=182,
-    ),
-    Dimension(
-        column="pumping_id",
-        name="Pumping Scenario",
-        dtype=pl.Float32,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "annual_exceedance_damages_dollars",
-                    "expected_annual_damages_dollars",
-                    "expected_annual_structural_damage",
-                    "exposure_asset_count",
-                    "exposure_critical_infrastructure_count",
-                    "exposure_historic_properties_count",
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                ]
-            )
-            .any()
-        ),
-        values=[0, 0.5, 1],
-        labels=["No Pumping", "50% Pumping Capacity", "Full Pumping Capacity"],
-        example_value=0.5,
-    ),
-    Dimension(
-        column="fragility_scenario",
-        name="Fragility Scenario",
-        dtype=pl.Int8,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "annual_exceedance_damages_dollars",
-                    "expected_annual_damages_dollars",
-                    "expected_annual_structural_damage",
-                    "exposure_asset_count",
-                    "exposure_critical_infrastructure_count",
-                    "exposure_historic_properties_count",
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                ]
-            )
-            .any()
-        ),
-        values=[0, 1],
-        labels=["No Fragility", "IPET Fragility"],
-        example_value=0,
-    ),
-    Dimension(
-        column="asset_type",
-        name="Asset Type",
-        dtype=pl.Int8,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "annual_exceedance_damages_dollars",
-                    "expected_annual_damages_dollars",
-                    "expected_annual_structural_damage",
-                    "exposure_asset_count",
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                ]
-            )
-            .any()
-        ),
-        values=[1, 2, 3, 4, 5],
-        labels=[
-            "Small Residential (single-family, manufactured homes, or duplex)",
-            "Other Multi-family Residential",
-            "Commercial, Industrial, or Agricultural",
-            "Other Structural (public, education, or religion)",
-            "Non-structural (crops, vehicles, or roads)",
-        ],
-        example_value=3,
-    ),
-    Dimension(
-        column="category",
-        name="Category",
-        dtype=pl.String,
-        required=(pl.col("variable") == "exposure_critical_infrastructure_count").any(),
-        values=[
-            "daycares",
-            "drink_water_sources",
-            "drinking_water_treatment_plants",
-            "electric_substations",
-            "emergency_medical_service_stations",
-            "fire_stations",
-            "gas_stations",
-            "hospitals",
-            "local_emergency_operations_centers",
-            "local_law_enforcement",
-            "nursing_homes",
-            "nursing_residential_care_facilities",
-            "power_plants",
-            "public_schools",
-            "veterans_health_administration_medical_facilities",
-        ],
-        labels=[
-            "Daycares",
-            "Drink Water Sources",
-            "Drinking Water Treatment Plants",
-            "Electric Substations",
-            "Emergency Medical Service Stations",
-            "Fire Stations",
-            "Gas Stations",
-            "Hospitals",
-            "Local Emergency Operations Centers",
-            "Local Law Enforcement",
-            "Nursing Homes",
-            "Nursing Residential Care Facilities",
-            "Power Plants",
-            "Public Schools",
-            "Veterans Health Administration Medical Facilities",
-        ],
-        example_value="public_schools",
-    ),
-    Dimension(
-        column="exposure_type",
-        name="Exposure Type",
-        dtype=pl.String,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "exposure_asset_count",
-                    "exposure_critical_infrastructure_count",
-                    "exposure_historic_properties_count",
-                ]
-            )
-            .any()
-        ),
-        values=["exposure", "moderate_exposure", "severe_exposure"],
-        labels=["Exposure", "Moderate Exposure", "Severe Exposure"],
-        example_value="moderate_exposure",
-    ),
-    Dimension(
-        column="ns_project_id",
-        name="Nonstructural Project",
-        dtype=pl.Int8,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                ]
-            )
-            .any()
-        ),
-        values=[1, 3],
-        example_value=3,
-    ),
-    Dimension(
-        column="participation_rate",
-        name="Participation Rate",
-        dtype=pl.Float32,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                ]
-            )
-            .any()
-        ),
-        values=[0.5, 0.75, 1],
-        labels=["50% Participation", "75% Participation", "Full Participation"],
-        example_value=0.75,
-    ),
-    Dimension(
-        column="migration",
-        name="Migration",
-        dtype=pl.String,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "population",
-                    "population_change",
-                ]
-            )
-            .any()
-        ),
-        values=["base", "mig"],
-        labels=["BASE", "MIG"],
-        example_value="base",
-    ),
-    Dimension(
-        column="ssp",
-        name="Shared Socioeconomic Pathway",
-        dtype=pl.Int8,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "population",
-                    "population_change",
-                ]
-            )
-            .any()
-        ),
-        values=[1, 2, 3, 4, 5],
-        example_value=4,
-    ),
-    Dimension(
-        column="vegetation_code",
-        name="Vegetation Type",
-        dtype=pl.String,
-        required=(pl.col("variable") == "vegetation_coverage_area").any(),
-        values=["brm", "for", "frm", "inm", "sam", "upl", "wat"],
-        labels=[
-            "Brackish Marsh",
-            "Fresh Forest",
-            "Fresh Marsh",
-            "Intermediate Marsh",
-            "Saline Marsh",
-            "Upland",
-            "Water",
-        ],
-        example_value="brm",
-    ),
-    Dimension(
-        column="percentile",
-        name="Percentile",
-        dtype=pl.Int8,
-        partition=False,
-        required=(
-            pl.col("variable")
-            .is_in(
-                [
-                    "expected_annual_damages_dollars",
-                    "expected_annual_structural_damage",
-                    "annual_exceedance_damages_dollars",
-                    "nonstructural_expected_annual_damage_dollars",
-                    "nonstructural_expected_annual_structural_damage",
-                    "surge_water_surface_elevations_by_exceedance",
-                    "wave_heights_by_exceedance",
-                    "population_change",
-                ]
-            )
-            .any()
-        ),
-        min_value=0,
-        max_value=100,
-        example_value=50,
-    ),
-    Dimension(
-        column="calendar_year",
-        name="Year",
-        dtype=pl.Int32,
-        partition=False,
-        required=(
-            pl.col("time_unit")
-            .is_in(
-                [
-                    "annual",
-                    "decadal",
-                ]
-            )
-            .any()
-        ),
-        min_value=2000,
-        max_value=2100,
-        example_value=2030,
-    ),
-    Dimension(
-        column="calendar_day",
-        name="Date",
-        dtype=pl.Date,
-        partition=False,
-        required=(pl.col("time_unit") == "daily").any(),
-        example_value="2030-01-01",
-    ),
-]
+DIMENSIONS = {d.name: d for d in make_dimensions()}
+DATASET_DIMENSIONS = {d.name: d for d in DIMENSIONS.values() if d.type == "dataset"}
 
-DATASET_DIMENSIONS = [d for d in DIMENSIONS if d.partition is True]
-DATASET_COLUMNS = [d.column for d in DATASET_DIMENSIONS]
+# Override the default required expressions for time dimensions.
+DIMENSIONS["variable"].values = pl.DataFrame(
+    {"value": list(VARIABLES.keys()), "label": [var.name for var in VARIABLES.values()]}
+).with_columns(pl.lit("variable").alias("dimension"))
+DIMENSIONS["calendar_year"].required = (
+    pl.col("time_unit").is_in(["annual", "decadal"]).any()
+)
+DIMENSIONS["calendar_day"].required = (pl.col("time_unit") == "daily").any()

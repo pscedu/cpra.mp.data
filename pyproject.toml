@@ -34,7 +34,9 @@ dependencies = [
 ]
 
 [tool.hatch.envs.scripts]
-dependencies = []
+dependencies = [
+  "fastexcel",
+]
 
 [tool.hatch.version]
 path = "CHANGELOG.md"

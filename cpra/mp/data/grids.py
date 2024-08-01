@@ -1,4 +1,6 @@
+import polars as pl
 from collections import defaultdict
+from cpra.mp.data.structure import read_structure_csv
 
 
 class BaseGrid:
@@ -48,13 +50,6 @@ class RasterGrid(BaseGrid):
 GRIDS = defaultdict(dict)
 
 
-def add_grid(grid):
-    """Add a grid to the index."""
-
-    for version in grid.plan_versions:
-        GRIDS[grid.geographic_unit][version] = grid
-
-
 def get_grid(geographic_unit, plan_version):
     """Get the grid for the given geographic unit and plan version."""
 
@@ -63,23 +58,31 @@ def get_grid(geographic_unit, plan_version):
     return GRIDS[geographic_unit].get(plan_version)
 
 
-add_grid(
-    RasterGrid(
-        geographic_unit="icm_raster",
-        plan_versions=["2023.0.0"],
-        bounds=(404500, 3187060, 1024720, 3435010),
-        height=8285,
-        width=20674,
+for row in (
+    read_structure_csv("grids")
+    .with_columns(
+        pl.col("plan_versions").str.split(", "),
+        pl.col("bounds").str.split(", ").cast(pl.List(pl.Int32)),
+        pl.col("height", "width", "geographies").cast(pl.Int32),
     )
-)
-add_grid(VectorGrid(geographic_unit="block_group", plan_versions=["2023.0.0"]))
-add_grid(VectorGrid(geographic_unit="ecoregion", plan_versions=["2023.0.0"]))
-add_grid(VectorGrid(geographic_unit="extraction_point", plan_versions=["2023.0.0"]))
-add_grid(
-    VectorGrid(
-        geographic_unit="hydro_compartment",
-        plan_versions=["2023.0.0"],
-        geographies=1787,
-    )
-)
-add_grid(VectorGrid(geographic_unit="parish", plan_versions=["2023.0.0"]))
+    .iter_rows(named=True)
+):
+    if row["type"] == "raster":
+        grid = RasterGrid(
+            geographic_unit=row["geographic_unit"],
+            plan_versions=row["plan_versions"],
+            bounds=row["bounds"],
+            height=row["height"],
+            width=row["width"],
+            crs=row["crs"],
+        )
+    else:
+        grid = VectorGrid(
+            geographic_unit=row["geographic_unit"],
+            plan_versions=row["plan_versions"],
+            geographies=row["geographies"],
+            crs=row["crs"],
+        )
+
+    for version in grid.plan_versions:
+        GRIDS[grid.geographic_unit][version] = grid

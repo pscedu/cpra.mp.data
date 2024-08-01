@@ -14,8 +14,8 @@ def partition_columns(df, include_dataset=True):
         col.name
         for col in df.select(
             **{
-                dim.column: dim.partition & dim.required
-                for dim in DIMENSIONS
+                dim.name: dim.partition & dim.required
+                for dim in DIMENSIONS.values()
                 if include_dataset or dim.partition is not True
             }
         )
@@ -28,7 +28,7 @@ def required_columns(df):
 
     return [
         col.name
-        for col in df.select(**{dim.column: dim.required for dim in DIMENSIONS})
+        for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
         if col.any()
     ]
 
@@ -46,10 +46,44 @@ def validate_data_frame(df, required_cols=None):
             f"Required columns are missing: {', '.join(missing_cols)}"
         )
 
-    # Validate required columns.
-    for dim in DIMENSIONS:
-        if dim.column in required_cols:
-            dim.validate_series(df.get_column(dim.column))
+    expressions = {}
+
+    # Validate required columns, and add dimension validation expressions.
+    for col in required_cols:
+        dim = DIMENSIONS[col]
+        dim.validate_dtype(df[col])
+        expressions.update(dim.validation_expressions)
+
+    # Add validation expressions for variable-geographic_unit and variable-time_unit.
+    expressions["variable_matches_geographic_unit"] = pl.any_horizontal(
+        *[
+            (
+                (pl.col("variable") == n)
+                & pl.col("geographic_unit").is_in(v.geographic_units)
+            )
+            for n, v in VARIABLES.items()
+        ]
+    )
+    expressions["variable_matches_time_unit"] = pl.any_horizontal(
+        *[
+            ((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units))
+            for n, v in VARIABLES.items()
+        ]
+    )
+
+    results = df.select(**expressions).with_columns(
+        valid=pl.all_horizontal(pl.col("*"))
+    )
+
+    if not results["valid"].all():
+        failed_row_count = results["valid"].len() - results["valid"].sum()
+        failed_cols = [
+            series.name
+            for series in results
+            if not series.all() and not series.name == "valid"
+        ]
+        msg = f"{failed_row_count} rows failed validation: {", ".join(failed_cols)}"
+        raise ValidationError(msg)
 
 
 def extract_dimension_value(column, data=None, **kwargs):
@@ -71,10 +105,8 @@ def dataset_path(base_path, **kwargs):
     """Generate a dataset directory path from keyword arguments."""
 
     dataset_path = Path(base_path)
-    for dimension in DATASET_DIMENSIONS:
-        dataset_path = (
-            dataset_path / f"{dimension.column}={str(kwargs[dimension.column])}"
-        )
+    for dim in DATASET_DIMENSIONS.values():
+        dataset_path = dataset_path / f"{dim.name}={str(kwargs[dim.name])}"
 
     return dataset_path
 
@@ -106,9 +138,9 @@ def cast_columns(df):
 
     return df.with_columns(
         **{
-            dim.column: pl.col(dim.column).cast(dim.dtype)
-            for dim in DIMENSIONS
-            if dim.column in df.columns
+            dim.name: pl.col(dim.name).cast(dim.dtype)
+            for dim in DIMENSIONS.values()
+            if dim.name in df.columns
         }
     )
 

@@ -3,7 +3,7 @@ import rasterio as rio
 
 import xml.etree.ElementTree
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_COLUMNS, DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
     cast_columns,
@@ -26,11 +26,11 @@ def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
                 [pl.lit(str(base_path))]
                 + [
                     pl.concat_str(
-                        [pl.lit(dim.column), pl.col(dim.column).cast(pl.String)],
+                        [pl.lit(dim.name), pl.col(dim.name).cast(pl.String)],
                         separator="=",
                     )
-                    for dim in DIMENSIONS
-                    if dim.column in df.columns
+                    for dim in DIMENSIONS.values()
+                    if dim.name in df.columns
                 ],
                 separator=separator,
             ),
@@ -68,7 +68,7 @@ def read_cog(base_path=BASE_PATH, **kwargs):
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)
-    validate_data_frame(input_df, required_cols=DATASET_COLUMNS)
+    validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Calculate the dataset directory path.
     dataset_dir = dataset_path(base_path, **kwargs)
@@ -78,7 +78,7 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     dimension_patterns = [
         f"{col}={str(kwargs[col])}" if col in kwargs else "*"
         for col in required_cols
-        if col not in DATASET_COLUMNS
+        if col not in DATASET_DIMENSIONS
     ]
     glob_pattern = "/".join(dimension_patterns) + ".tif"
 
@@ -88,11 +88,11 @@ def read_cog(base_path=BASE_PATH, **kwargs):
         .select(
             [
                 pl.col("path")
-                .str.extract(f"{d.column}=([^/]+)(/|\\.tif)", 1)
-                .cast(d.dtype)
-                .alias(d.column)
-                for d in DIMENSIONS
-                if d.column in required_cols
+                .str.extract(f"{dim.name}=([^/]+)(/|\\.tif)", 1)
+                .cast(dim.dtype)
+                .alias(dim.name)
+                for dim in DIMENSIONS.values()
+                if dim.name in required_cols
             ]
             + [pl.col("path").cast(pl.String)]
         )

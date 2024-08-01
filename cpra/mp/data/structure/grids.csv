@@ -1,0 +1,4 @@
+type,geographic_unit,plan_versions,crs,bounds,height,width,geographies
+raster,morph_pixel,2023.0.0,epsg:26915,"404500, 3187060, 1024720, 3435010",8285,20674,
+vector,veg_grid_cell,2023.0.0,epsg:26915,,,,
+vector,hydro_compartment,2023.0.0,epsg:26915,,,,1787

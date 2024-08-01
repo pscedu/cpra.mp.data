@@ -18,12 +18,11 @@ TIME_UNIT_MAP = {
     "CalendarDay": "daily",
 }
 VARIABLE_MAP = {
-    "MeanWaterLevel_m": "water_level",
-    "Salinity_ppt": "salinity",
-    "Temperature_C": "temperature",
-    # TODO: Add tidal range to variables.
-    # "TidalRange_m": "tidal_range",
-    "TotalSuspendedSolids_mgperL": "total_suspended_solids",
+    "MeanWaterLevel_m": "stg",
+    "Salinity_ppt": "sal",
+    "Temperature_C": "tmp",
+    "TidalRange_m": "trg",
+    "TotalSuspendedSolids_mgperL": "tss",
 }
 
 
@@ -46,7 +45,7 @@ def convert_parquet(dump_path, plan_version):
 
     variables = get_columns(lf_columns, VARIABLE_MAP, VARIABLES)
     dimensions = get_columns(
-        lf_columns, DIMENSION_MAP, {d.column: d for d in DIMENSIONS}
+        lf_columns, DIMENSION_MAP, {dim.name: dim for dim in DIMENSIONS.values()}
     )
     geographies = get_columns(lf_columns, GEOGRAPHY_MAP)
     time_units = get_columns(lf_columns, TIME_UNIT_MAP)
@@ -62,7 +61,7 @@ def convert_parquet(dump_path, plan_version):
     for value_column, variable in variables:
         print(f"Reading {variable.label} from {dump_path}...")
         df = lf.select(
-            **{dim.column: col_name for col_name, dim in dimensions},
+            **{dim.name: col_name for col_name, dim in dimensions},
             geography=pl.col(geographies[0][0]),
             value=pl.col(value_column).cast(variable.dtype),
         ).collect()

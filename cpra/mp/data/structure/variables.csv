@@ -1,0 +1,22 @@
+label,name,model,subroutine,dtype,geographic_units,time_units,unit,legend,required_dimensions
+Habitat Suitability Index,hsi,icm,hsi,Float32,veg_grid_cell,annual,,hsi,
+Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, annual",ppt,sal,aggregate_type
+Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, annual",NAVD88 m,stg,
+Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, annual",degrees C,tmp,
+Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,daily,m,,
+Growing Season Mean Tidal Range,trg_gs,icm,hydro,Float32,hydro_compartment,annual,m,,
+Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, annual",mg/L,tss,
+Water Level Variability,wlv,icm,hydro,Float32,hydro_compartment,annual,m,wlv,
+Vegetation Type: FFIBS,ffibs,icm,lavegmod,Int32,veg_grid_cell,annual,,ffibs,
+Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_grid_cell,annual,,vct,
+Vegetation Coverage Area,veg_area,icm,lavegmod,Int64,veg_grid_cell,annual,square m,veg_area,vegetation_code
+Ground Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
+Inundation Depth,inun,icm,morph,Float64,morph_pixel,annual,m,inun,
+Land Change ID,lnd_chng_id,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
+Land Type ID,lnd_type_id,icm,morph,Int32,morph_pixel,annual,,lnd_type_id,
+Mineral Accretion,mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
+Mineral Deposition Rate,mnrl_dep,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,mnrl_dep,
+Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,omar,
+Organic Accretion,org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
+Shallow Soil Factors,ssf,icm,morph,Float32,hydro_compartment,annual,mm/yr,ssf,
+Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
