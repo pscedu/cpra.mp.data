@@ -1,4 +1,5 @@
 dimension,value,label
+plan_version,2023.0.0,2023.0.0
 geographic_unit,hydro_compartment,Hydro Compartment
 geographic_unit,morph_pixel,Morph Pixel
 geographic_unit,veg_grid_cell,Veg Grid Cell

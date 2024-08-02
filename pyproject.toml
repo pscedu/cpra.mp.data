@@ -26,11 +26,16 @@ classifiers = [
 dependencies = [
   "click",
   "numpy",
-  "polars>=1.1.0",
+  "polars>=1.3.0",
   "pyarrow",
   "python-dotenv",
   "rasterio",
   "scipy"
+]
+
+[tool.hatch.envs.api]
+dependencies = [
+  "fastapi[standard]"
 ]
 
 [tool.hatch.envs.scripts]
