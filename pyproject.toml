@@ -33,14 +33,18 @@ dependencies = [
   "scipy"
 ]
 
-[tool.hatch.envs.api]
-dependencies = [
+[project.optional-dependencies]
+api = [
   "fastapi[standard]"
 ]
-
-[tool.hatch.envs.scripts]
-dependencies = [
+scripts = [
   "fastexcel",
+]
+
+[tool.hatch.envs.default]
+features = [
+  "api",
+  "scripts"
 ]
 
 [tool.hatch.version]
