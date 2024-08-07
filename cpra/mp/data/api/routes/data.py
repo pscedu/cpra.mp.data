@@ -5,7 +5,7 @@ from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from datetime import date
 from enum import Enum
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import create_model
+from pydantic import create_model, ConfigDict
 
 data = APIRouter(tags=["Data and Analysis"])
 
@@ -43,7 +43,11 @@ dimension_params = {
     for dim in DIMENSIONS.values()
     if dim.type != "dataset"
 }
-DimensionsQuery = create_model("DimensionsQuery", **dimension_params)
+DimensionsQuery = create_model(
+    "DimensionsQuery",
+    model_config=ConfigDict(protected_namespaces=()),
+    **dimension_params,
+)
 
 
 @data.get("/{plan_version}/{variable}/{geographic_unit}/{time_unit}.{format}")
