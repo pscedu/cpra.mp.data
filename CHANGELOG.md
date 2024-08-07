@@ -1,1 +1,46 @@
-# [0.0.0]
+# Changelog
+
+## 0.1.0 (2024-08-07)
+
+
+### Features
+
+* **api:** add route for reading tabular data ([9c4a556](https://github.com/pscedu/cpra.mp.data/commit/9c4a5565c85c5b0336fb76aa631181bd525d73a3))
+* **api:** add title and description ([73e35aa](https://github.com/pscedu/cpra.mp.data/commit/73e35aa314b2693dfe8d19701ceee8a684787cea))
+* **cli:** add convert command for MP2023 data ([9b761ba](https://github.com/pscedu/cpra.mp.data/commit/9b761ba30f1e349476a6581b2f9f59746e2648f1))
+* **config:** allow setting config with environment variables ([ba31b29](https://github.com/pscedu/cpra.mp.data/commit/ba31b293e2109037e86fd6e32e4aab759c01140d))
+* **grids:** add raster and vector grid classes ([2541dcf](https://github.com/pscedu/cpra.mp.data/commit/2541dcf44adf759f264317011d2f0fe29c848e16))
+* **grids:** set geography IDs for 2023 hydro compartments ([040e6da](https://github.com/pscedu/cpra.mp.data/commit/040e6da81fd18f7769b6e0f89ea2c669901150b6))
+* **raster:** add COG writing function ([c65905e](https://github.com/pscedu/cpra.mp.data/commit/c65905e1d0401d51467b7ff60d2b946be47399a2))
+* **raster:** add function to find matching COGs ([aa0c7ae](https://github.com/pscedu/cpra.mp.data/commit/aa0c7ae6e1c42519553fa4212e09d262cc1b1816))
+* **raster:** sort the COG data frame ([326fe7b](https://github.com/pscedu/cpra.mp.data/commit/326fe7b8d52741b02466d3ee050a81a5489c1e77))
+* **schema:** add schema and initial write implementation ([188415e](https://github.com/pscedu/cpra.mp.data/commit/188415ecf51868fedaca8af05ad6d258a0e2c00a))
+* **scripts:** add script to update documentation tables ([b35ae1e](https://github.com/pscedu/cpra.mp.data/commit/b35ae1e0c0e17ebf0e4e71b059177b58f928feb5))
+* **tabular:** add function for reading Parquet data ([44086dd](https://github.com/pscedu/cpra.mp.data/commit/44086dd92a42a9cb5d76cd54249dabeb165a6cfb))
+* **tabular:** add validation of geometry columns ([8e46144](https://github.com/pscedu/cpra.mp.data/commit/8e46144106d658dadeb581414d273f6756546a2b))
+
+
+### Bug Fixes
+
+* **api:** disable warning about protected namespaces ([5e319be](https://github.com/pscedu/cpra.mp.data/commit/5e319be73614e9cfab262315713bb11ed40523b7))
+* **dimensions:** make plan_version the top-level dimension ([669d299](https://github.com/pscedu/cpra.mp.data/commit/669d299d62cd8c1651be2c3b1a24a6a609ae29c1))
+* **raster:** cast path column to a string for empty data frames ([0099dc9](https://github.com/pscedu/cpra.mp.data/commit/0099dc99793fae122b9759ab5ad71afaccfe9a4d))
+* **variables:** update variable data types ([b7fbaf7](https://github.com/pscedu/cpra.mp.data/commit/b7fbaf7b2f8387f07cbec9203a96be64e8cefaaa))
+* **write:** update default base path ([e01aecb](https://github.com/pscedu/cpra.mp.data/commit/e01aecbe30550d5b7155a9795cdfa65ce4c4ca6b))
+
+
+### Performance Improvements
+
+* **tabular:** precalculate Hive partition schema for reads ([f751649](https://github.com/pscedu/cpra.mp.data/commit/f751649de7e701cf07810ef66e587f530f8df79e))
+
+
+### Documentation
+
+* add dimension details ([c9f7e5e](https://github.com/pscedu/cpra.mp.data/commit/c9f7e5ed422c4fc7f3acac3dca47b29028ebc743))
+* add note that data reading is not implemented ([c2b3524](https://github.com/pscedu/cpra.mp.data/commit/c2b3524c6fda8e0b18ca8d19d707699fda4fc766))
+* add variables summary table ([659e4c1](https://github.com/pscedu/cpra.mp.data/commit/659e4c11e0a42255b46f8da82e9c433da42fe402))
+* **raster:** add example for writing a COG ([c10373a](https://github.com/pscedu/cpra.mp.data/commit/c10373a4e6b2cc8058f242837b977c0a18b1ba2d))
+* **tabular:** add note about missing data exceptions ([182cfdb](https://github.com/pscedu/cpra.mp.data/commit/182cfdb7caca3100696ce6ac0f761fbad8486eff))
+* update file path examples ([18d23ce](https://github.com/pscedu/cpra.mp.data/commit/18d23ce05864e843bc3a31e307779ad7d1ebecb0))
+
+## [0.0.0]
