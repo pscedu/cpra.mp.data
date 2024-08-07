@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cpra.mp.data"
-dynamic = ["version"]
+version = "0.1.0"
 description = "Tools for reading and writing data from Louisiana's Coastal Master Plan"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -46,10 +46,6 @@ features = [
   "api",
   "scripts"
 ]
-
-[tool.hatch.version]
-path = "CHANGELOG.md"
-pattern = '#+ \[?(?P<version>\d+\.\d+\.\d+)\]?'
 
 [tool.hatch.build.targets.sdist]
 include = [
