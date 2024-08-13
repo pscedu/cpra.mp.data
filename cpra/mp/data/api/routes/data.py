@@ -11,7 +11,7 @@ data = APIRouter(tags=["Data and Analysis"])
 
 
 class ResponseFormat(str, Enum):
-    arrow = "arrow"
+    # arrow = "arrow"
     csv = "csv"
     ndjson = "ndjson"
     parquet = "parquet"
