@@ -4,6 +4,7 @@ import tempfile
 import threading
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
+from time import time
 
 
 class PolarsStreamingResponse(Response):
@@ -34,6 +35,7 @@ class PolarsStreamingResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             with tempfile.NamedTemporaryFile() as fp:
+                start = time()
                 write_thread = threading.Thread(
                     target=stream_to_file,
                     name="stream_to_file",
@@ -54,6 +56,7 @@ class PolarsStreamingResponse(Response):
                                     "more_body": more_body,
                                 }
                             )
+                print(f"Download took {time() - start} seconds")
 
 
 def stream_to_file(lf, out_path, format):
@@ -64,4 +67,6 @@ def stream_to_file(lf, out_path, format):
         "parquet": "sink_parquet",
     }[format]
     # TODO: Set parquet compression and row group parameters.
+    start = time()
     getattr(lf, sink_method)(out_path)
+    print(f"Save took {time() - start} seconds")
