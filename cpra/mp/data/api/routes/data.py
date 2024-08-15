@@ -1,6 +1,7 @@
 from cpra.mp.data import read_data
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.api.raster import RasterioStreamingResponse
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from datetime import date
 from enum import Enum
@@ -15,6 +16,7 @@ class ResponseFormat(str, Enum):
     csv = "csv"
     ndjson = "ndjson"
     parquet = "parquet"
+    tif = "tif"
 
 
 def dimension_type(dim_name):
@@ -75,4 +77,8 @@ async def get_model_data(
     except ValidationError as err:
         # TODO: Also handle directory does not exist errors.
         raise HTTPException(status_code=422, detail=str(err))
+
+    # The presence of a path column indicates that this is a raster.
+    if "path" in lf.columns:
+        return RasterioStreamingResponse(lf, format, compression_level=6)
     return PolarsStreamingResponse(lf, format)

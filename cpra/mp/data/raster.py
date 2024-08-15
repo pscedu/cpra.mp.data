@@ -97,6 +97,7 @@ def read_cog(base_path=BASE_PATH, **kwargs):
             + [pl.col("path").cast(pl.String)]
         )
         .sort(required_cols)
+        .lazy()
     )
 
 
