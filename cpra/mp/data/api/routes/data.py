@@ -1,6 +1,8 @@
 from cpra.mp.data import read_data
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.api.raster import RasterioStreamingResponse
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from datetime import date
@@ -9,6 +11,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import create_model, ConfigDict
 
 data = APIRouter(tags=["Data and Analysis"])
+
+
+class AggregateFunction(str, Enum):
+    difference = "difference"
+    max = "max"
+    mean = "mean"
+    min = "min"
+    sum = "sum"
 
 
 class ResponseFormat(str, Enum):
@@ -39,6 +49,11 @@ PlanVersion = dimension_type("plan_version")
 Variable = dimension_type("variable")
 GeographicUnit = dimension_type("geographic_unit")
 TimeUnit = dimension_type("time_unit")
+ColorMap = Enum("ColorMap", {str(k): k for k in LEGENDS.keys()})
+VectorGeographicUnit = Enum(
+    "GeographicUnit",
+    {str(k): k for k, v in GRIDS.items() if list(v.values())[0].grid_type == "vector"},
+)
 
 dimension_params = {
     dim.name: (dimension_type(dim.name) | None, None)
@@ -59,6 +74,17 @@ async def get_model_data(
     geographic_unit: GeographicUnit,
     time_unit: TimeUnit,
     format: ResponseFormat,
+    geography: str | None = None,
+    where: str | None = None,
+    presort: str | None = None,
+    group_by: str | None = None,
+    group_aggregate: AggregateFunction | None = None,
+    color_map: ColorMap | None = None,
+    melt: bool = False,
+    summarize_by: VectorGeographicUnit | None = None,
+    summarize_aggregate: AggregateFunction | None = None,
+    summarize_geography: str | None = None,
+    sort: str | None = None,
     dimensions: DimensionsQuery = Depends(),
 ):
     dimension_kwargs = {
@@ -80,5 +106,5 @@ async def get_model_data(
 
     # The presence of a path column indicates that this is a raster.
     if "path" in lf.columns:
-        return RasterioStreamingResponse(lf, format, compression_level=6)
+        return RasterioStreamingResponse(lf, format)
     return PolarsStreamingResponse(lf, format)
