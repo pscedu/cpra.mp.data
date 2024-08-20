@@ -1,6 +1,8 @@
 import asyncio
+import itertools
 import numpy as np
 import rasterio as rio
+from rasterio import windows
 from cpra.mp.data import read_data
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.api.types import (
@@ -85,7 +87,12 @@ class Dataset:
             output = stack.enter_context(rio.open(out_path, "w", **profile))
 
             loop = asyncio.get_running_loop()
-            for ji, window in inputs[0].block_windows(1):
+            # Group raster blocks by row, and read an entire row of blocks at once.
+            groups = itertools.groupby(
+                inputs[0].block_windows(1), key=lambda bw: bw[0][0]
+            )
+            for _group_row, group in groups:
+                window = windows.union(*[w for ji, w in group])
                 data = np.vstack(
                     await asyncio.gather(
                         *[
