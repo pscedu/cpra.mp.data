@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import numpy as np
 import rasterio as rio
 from cpra.mp.data import read_data
@@ -16,6 +18,10 @@ from cpra.mp.data.api.utils import enum_value, timing
 from contextlib import ExitStack
 
 from fastapi import Depends, HTTPException
+
+
+def read_window(input, window):
+    return input.read(window=window)
 
 
 class Dataset:
@@ -68,7 +74,7 @@ class Dataset:
             raise HTTPException(status_code=422, detail=str(err))
 
     @timing
-    def write_raster(self, out_path, **kwargs):
+    async def write_raster(self, out_path, **kwargs):
         """Write a raster dataset to a file using windowed reading and writing
         to conserve memory."""
 
@@ -78,6 +84,16 @@ class Dataset:
             profile = inputs[0].profile.copy()
             profile.update(kwargs)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
+
+            loop = asyncio.get_running_loop()
             for ji, window in inputs[0].block_windows(1):
-                data = np.vstack([input.read(window=window) for input in inputs])
-                output.write(np.diff(data, axis=0), window=window)
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    data = np.vstack(
+                        await asyncio.gather(
+                            *[
+                                loop.run_in_executor(pool, read_window, input, window)
+                                for input in inputs
+                            ]
+                        )
+                    )
+                    output.write(np.diff(data, axis=0), window=window)

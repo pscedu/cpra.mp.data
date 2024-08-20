@@ -19,7 +19,7 @@ class RasterioStreamingResponse(FileResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         with tempfile.NamedTemporaryFile() as fp:
-            self.dataset.write_raster(fp.name, **self.profile_options)
+            await self.dataset.write_raster(fp.name, **self.profile_options)
             self.path = fp.name
             self.stat_result = None
             self.status_code = 200
