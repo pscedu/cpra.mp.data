@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.0](https://github.com/pscedu/cpra.mp.data/compare/v0.1.0...v0.2.0) (2024-08-20)
+
+
+### Features
+
+* **api:** add analysis parameters ([aa7106e](https://github.com/pscedu/cpra.mp.data/commit/aa7106e4a21480618a7747627022afbf406a34b6))
+* **api:** add proof of concept raster differencing ([805fe6d](https://github.com/pscedu/cpra.mp.data/commit/805fe6d6a1179e8f99e44c9393670bb15569eb1c))
+* **api:** temporarily enable CORS for testing ([8b7b735](https://github.com/pscedu/cpra.mp.data/commit/8b7b73597063c60380b338459e1ea3b29274bccd))
+
+
+### Bug Fixes
+
+* **api:** temporarily disable Arrow format ([bb9a5f6](https://github.com/pscedu/cpra.mp.data/commit/bb9a5f6691b2be70511922ee26e25de14078e621))
+* **raster:** use nearest neighbor resampling for COGs ([c9d48f5](https://github.com/pscedu/cpra.mp.data/commit/c9d48f53726d1cbf48bf68b685d0572ab9fb8ae7))
+
+
+### Performance Improvements
+
+* **api:** read input rasters in parallel ([97b9ef1](https://github.com/pscedu/cpra.mp.data/commit/97b9ef133269c91d54cd30f32c58036af5ce1728))
+* **api:** use the default thread pool for reading rasters ([4af16a9](https://github.com/pscedu/cpra.mp.data/commit/4af16a94b1ddb1c2e6d2625a06d99e712444edcd))
+
 ## 0.1.0 (2024-08-07)
 
 
