@@ -1,5 +1,4 @@
 import asyncio
-import concurrent.futures
 import numpy as np
 import rasterio as rio
 from cpra.mp.data import read_data
@@ -87,13 +86,12 @@ class Dataset:
 
             loop = asyncio.get_running_loop()
             for ji, window in inputs[0].block_windows(1):
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    data = np.vstack(
-                        await asyncio.gather(
-                            *[
-                                loop.run_in_executor(pool, read_window, input, window)
-                                for input in inputs
-                            ]
-                        )
+                data = np.vstack(
+                    await asyncio.gather(
+                        *[
+                            loop.run_in_executor(None, read_window, input, window)
+                            for input in inputs
+                        ]
                     )
-                    output.write(np.diff(data, axis=0), window=window)
+                )
+                output.write(np.diff(data, axis=0), window=window)
