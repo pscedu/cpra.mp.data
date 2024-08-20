@@ -9,19 +9,18 @@ def enum_value(inst):
     return inst.value if isinstance(inst, Enum) else inst
 
 
-def timing(f):
-    """Time a function call in debug mode."""
-    # Adapted from: https://stackoverflow.com/questions/1622943/timeit-versus-timing-decorator
+def timing(func):
+    """Time an asynchronous function call."""
 
-    @wraps(f)
-    def wrap(*args, **kw):
+    @wraps(func)
+    async def wrapped(*args, **kwargs):
         start = time()
-        result = f(*args, **kw)
+        result = await func(*args, **kwargs)
         if DEBUG:
             print(
                 "func:%r args:[%r, %r] took: %2.4f sec"
-                % (f.__name__, args, kw, time() - start)
+                % (func.__name__, args, kwargs, time() - start)
             )
         return result
 
-    return wrap
+    return wrapped
