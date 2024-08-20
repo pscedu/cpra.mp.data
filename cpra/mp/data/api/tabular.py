@@ -1,7 +1,7 @@
 import anyio
-import polars as pl
 import tempfile
 import threading
+from cpra.mp.data.api.dataset import Dataset
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 from time import time
@@ -17,8 +17,8 @@ class PolarsStreamingResponse(Response):
         "parquet": "application/vnd.apache.parquet",
     }
 
-    def __init__(self, lf: pl.LazyFrame, format: str = "csv") -> None:
-        self.lf = lf
+    def __init__(self, dataset: Dataset, format: str = "csv") -> None:
+        self.dataset = dataset
         self.format = format
         self.media_type = self.mime_types[format]
         self.init_headers()
@@ -39,7 +39,7 @@ class PolarsStreamingResponse(Response):
                 write_thread = threading.Thread(
                     target=stream_to_file,
                     name="stream_to_file",
-                    args=[self.lf, fp.name, self.format],
+                    args=[self.dataset.lf, fp.name, self.format],
                 )
                 write_thread.start()
                 async with await anyio.open_file(fp.name, mode="rb") as file:

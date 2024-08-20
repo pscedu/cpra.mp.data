@@ -15,5 +15,5 @@ async def get_model_data(
 ):
     # The presence of a path column indicates that this is a raster.
     if "path" in dataset.lf.columns:
-        return RasterioStreamingResponse(dataset.lf, format)
-    return PolarsStreamingResponse(dataset.lf, format)
+        return RasterioStreamingResponse(dataset, format)
+    return PolarsStreamingResponse(dataset, format)

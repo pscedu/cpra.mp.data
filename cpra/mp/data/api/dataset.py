@@ -1,3 +1,5 @@
+import numpy as np
+import rasterio as rio
 from cpra.mp.data import read_data
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.api.types import (
@@ -10,13 +12,10 @@ from cpra.mp.data.api.types import (
     Variable,
     VectorGeographicUnit,
 )
-from enum import Enum
+from cpra.mp.data.api.utils import enum_value, timing
+from contextlib import ExitStack
+
 from fastapi import Depends, HTTPException
-
-
-def enum_value(inst):
-    """Get the value from an enum."""
-    return inst.value if isinstance(inst, Enum) else inst
 
 
 class Dataset:
@@ -67,3 +66,18 @@ class Dataset:
         except ValidationError as err:
             # TODO: Also handle directory does not exist errors.
             raise HTTPException(status_code=422, detail=str(err))
+
+    @timing
+    def write_raster(self, out_path, **kwargs):
+        """Write a raster dataset to a file using windowed reading and writing
+        to conserve memory."""
+
+        df = self.lf.collect()
+        with ExitStack() as stack:
+            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            profile = inputs[0].profile.copy()
+            profile.update(kwargs)
+            output = stack.enter_context(rio.open(out_path, "w", **profile))
+            for ji, window in inputs[0].block_windows(1):
+                data = np.vstack([input.read(window=window) for input in inputs])
+                output.write(np.diff(data, axis=0), window=window)
