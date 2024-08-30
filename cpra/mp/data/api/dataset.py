@@ -3,6 +3,7 @@ import itertools
 import mercantile
 import numpy as np
 import rasterio as rio
+from cachetools import cached, TTLCache
 from io import BytesIO
 from PIL import Image
 from rasterio import windows
@@ -23,8 +24,12 @@ from cpra.mp.data.api.types import (
 )
 from cpra.mp.data.api.utils import enum_value, timing
 from contextlib import ExitStack
-
 from fastapi import Depends, HTTPException
+
+
+@cached(cache=TTLCache(maxsize=128, ttl=600))
+def read_data_cached(*args, **kwargs):
+    return read_data(*args, **kwargs)
 
 
 def read_window(input, window):
@@ -70,7 +75,7 @@ class Dataset:
         self.dataset_bounds = None
 
         try:
-            self.lf = read_data(
+            self.lf = read_data_cached(
                 plan_version=self.plan_version,
                 variable=self.variable,
                 geographic_unit=self.geographic_unit,
