@@ -32,8 +32,22 @@ def read_data_cached(*args, **kwargs):
     return read_data(*args, **kwargs)
 
 
-def read_window(input, window):
-    return input.read(window=window)
+def read_window(dataset, window, out_shape=None, resampling=Resampling.nearest):
+    return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
+
+
+async def parallel_read_rasters(
+    datasets, window=None, out_shape=None, resampling=Resampling.nearest
+):
+    loop = asyncio.get_running_loop()
+    return await asyncio.gather(
+        *[
+            loop.run_in_executor(
+                None, read_window, dataset, window, out_shape, resampling
+            )
+            for dataset in datasets
+        ]
+    )
 
 
 class Dataset:
@@ -129,16 +143,7 @@ class Dataset:
             )
             window = vrts[0].window(*read_bounds)
 
-            data = np.vstack(
-                [
-                    vrt.read(
-                        window=window,
-                        out_shape=out_shape,
-                        resampling=Resampling.nearest,
-                    )
-                    for vrt in vrts
-                ]
-            )
+            data = np.vstack(await parallel_read_rasters(vrts, window, out_shape))
             pixel_values = np.diff(data, axis=0)
 
             breaks = (-2, -1, 0, 1, 2, 3)
@@ -179,19 +184,11 @@ class Dataset:
             profile.update(kwargs)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
 
-            loop = asyncio.get_running_loop()
             # Group raster blocks by row, and read an entire row of blocks at once.
             groups = itertools.groupby(
                 inputs[0].block_windows(1), key=lambda bw: bw[0][0]
             )
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
-                data = np.vstack(
-                    await asyncio.gather(
-                        *[
-                            loop.run_in_executor(None, read_window, input, window)
-                            for input in inputs
-                        ]
-                    )
-                )
+                data = np.vstack(await parallel_read_rasters(inputs, window))
                 output.write(np.diff(data, axis=0), window=window)
