@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/pscedu/cpra.mp.data/compare/v0.2.0...v0.3.0) (2024-08-30)
+
+
+### Features
+
+* **api:** add raster tile proof-of-concept ([89a6c9c](https://github.com/pscedu/cpra.mp.data/commit/89a6c9cfc995ec11294e17be0f435a8b634122e6))
+* **api:** return 404 response for out-of-bounds tiles ([635630a](https://github.com/pscedu/cpra.mp.data/commit/635630a9aac4e9bb3b558b56ba599e02b1d79914))
+
+
+### Bug Fixes
+
+* **api:** update timing helper for async functions ([ae5d7c3](https://github.com/pscedu/cpra.mp.data/commit/ae5d7c3f1200d5cbc5276b4eecc773279cb2fc15))
+
+
+### Performance Improvements
+
+* **api:** read rasters by row of blocks ([79adcda](https://github.com/pscedu/cpra.mp.data/commit/79adcda4f702e09832ed82eac1c1dafb5684b6ee))
+
 ## [0.2.0](https://github.com/pscedu/cpra.mp.data/compare/v0.1.0...v0.2.0) (2024-08-20)
 
 
