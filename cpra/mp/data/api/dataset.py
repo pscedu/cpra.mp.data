@@ -67,7 +67,7 @@ class Dataset:
         self.summarize_geography = summarize_geography
         self.sort = sort
         self.dimensions = {k: enum_value(v) for k, v in dimensions if v is not None}
-        self.web_mercator_bounds = None
+        self.dataset_bounds = None
 
         try:
             self.lf = read_data(
@@ -82,13 +82,11 @@ class Dataset:
             raise HTTPException(status_code=422, detail=str(err))
 
     @timing
-    async def get_tile(self, x, y, z, **kwargs):
+    async def get_tile(self, x, y, z, tile_size=256, **kwargs):
         """Get a map tile image."""
 
         tile_bounds = BoundingBox(*mercantile.xy_bounds(x, y, z))
-        if self.web_mercator_bounds and disjoint_bounds(
-            self.web_mercator_bounds, tile_bounds
-        ):
+        if self.dataset_bounds and disjoint_bounds(self.dataset_bounds, tile_bounds):
             return None
 
         df = self.lf.collect()
@@ -107,16 +105,37 @@ class Dataset:
                 for dataset in inputs
             ]
 
-            if not self.web_mercator_bounds:
-                self.web_mercator_bounds = vrts[0].bounds
-                if disjoint_bounds(self.web_mercator_bounds, tile_bounds):
+            if not self.dataset_bounds:
+                self.dataset_bounds = vrts[0].bounds
+                if disjoint_bounds(self.dataset_bounds, tile_bounds):
                     return None
 
-            window = vrts[0].window(*tile_bounds)
-            data = np.vstack(
-                [vrt.read(window=window, out_shape=(1, 256, 256)) for vrt in vrts]
+            read_bounds = BoundingBox(
+                max(tile_bounds.left, self.dataset_bounds.left),
+                max(tile_bounds.bottom, self.dataset_bounds.bottom),
+                min(tile_bounds.right, self.dataset_bounds.right),
+                min(tile_bounds.top, self.dataset_bounds.top),
             )
-            diff = np.diff(data, axis=0)
+            scale = tile_size / abs(tile_bounds.right - tile_bounds.left)
+            out_shape = (
+                1,
+                round(scale * abs(read_bounds.top - read_bounds.bottom)),
+                round(scale * abs(read_bounds.right - read_bounds.left)),
+            )
+            window = vrts[0].window(*read_bounds)
+
+            data = np.vstack(
+                [
+                    vrt.read(
+                        window=window,
+                        out_shape=out_shape,
+                        resampling=Resampling.nearest,
+                    )
+                    for vrt in vrts
+                ]
+            )
+            pixel_values = np.diff(data, axis=0)
+
             breaks = (-2, -1, 0, 1, 2, 3)
             colors = (
                 (0, 0, 0, 255),
@@ -127,9 +146,18 @@ class Dataset:
                 (200, 200, 200, 255),
                 (240, 240, 240, 255),
             )
-            color_idx = np.digitize(diff, breaks)
+            color_idx = np.digitize(pixel_values, breaks)
             color = np.take(colors, color_idx, axis=0)[0].astype("uint8")
             image = Image.fromarray(color, mode="RGBA")
+
+            # If the image is smaller than the tile size, pad it with empty pixels.
+            if image.size != (tile_size, tile_size):
+                left_offset = round(abs(read_bounds.left - tile_bounds.left) * scale)
+                top_offset = round(abs(tile_bounds.top - read_bounds.top) * scale)
+                padded_image = Image.new(image.mode, (tile_size, tile_size))
+                padded_image.paste(image, (left_offset, top_offset), mask=image)
+                image = padded_image
+
             with BytesIO() as memfile:
                 image.save(memfile, format="PNG")
                 return memfile.getvalue()
