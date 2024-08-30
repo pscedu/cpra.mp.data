@@ -1,8 +1,13 @@
 import asyncio
 import itertools
+import mercantile
 import numpy as np
 import rasterio as rio
+from io import BytesIO
+from PIL import Image
 from rasterio import windows
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
 from cpra.mp.data import read_data
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.api.types import (
@@ -73,6 +78,49 @@ class Dataset:
         except ValidationError as err:
             # TODO: Also handle directory does not exist errors.
             raise HTTPException(status_code=422, detail=str(err))
+
+    @timing
+    async def get_tile(self, x, y, z, **kwargs):
+        """Get a map tile image."""
+
+        bounds = mercantile.xy_bounds(x, y, z)
+
+        df = self.lf.collect()
+        with ExitStack() as stack:
+            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            vrts = [
+                WarpedVRT(
+                    dataset,
+                    crs="EPSG:3857",
+                    nodata=-9999,
+                    add_alpha=False,
+                    src_nodata=-9999,
+                    dtype=dataset.dtypes[0],
+                    resampling=Resampling.nearest,
+                )
+                for dataset in inputs
+            ]
+            window = vrts[0].window(*bounds)
+            data = np.vstack(
+                [vrt.read(window=window, out_shape=(1, 256, 256)) for vrt in vrts]
+            )
+            diff = np.diff(data, axis=0)
+            breaks = (-2, -1, 0, 1, 2, 3)
+            colors = (
+                (0, 0, 0, 255),
+                (40, 40, 40, 255),
+                (80, 80, 80, 255),
+                (120, 120, 120, 255),
+                (160, 160, 160, 255),
+                (200, 200, 200, 255),
+                (240, 240, 240, 255),
+            )
+            color_idx = np.digitize(diff, breaks)
+            color = np.take(colors, color_idx, axis=0)[0].astype("uint8")
+            image = Image.fromarray(color, mode="RGBA")
+            with BytesIO() as memfile:
+                image.save(memfile, format="PNG")
+                return memfile.getvalue()
 
     @timing
     async def write_raster(self, out_path, **kwargs):

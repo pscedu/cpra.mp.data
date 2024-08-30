@@ -1,7 +1,7 @@
 from cpra.mp.data.api.dataset import Dataset
-from cpra.mp.data.api.raster import RasterioStreamingResponse
+from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.types import DataFormat
+from cpra.mp.data.api.types import DataFormat, TileFormat
 from fastapi import APIRouter, Depends
 
 
@@ -17,3 +17,16 @@ async def get_model_data(
     if "path" in dataset.lf.columns:
         return RasterioStreamingResponse(dataset, format)
     return PolarsStreamingResponse(dataset, format)
+
+
+@data.get(
+    "/{plan_version}/{variable}/{geographic_unit}/{time_unit}/{z}/{x}/{y}.{format}"
+)
+async def get_model_tile(
+    format: TileFormat,
+    z: int,
+    x: int,
+    y: int,
+    dataset: Dataset = Depends(),
+):
+    return RasterioTileResponse(dataset, x, y, z, format)

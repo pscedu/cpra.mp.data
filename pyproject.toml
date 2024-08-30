@@ -25,7 +25,9 @@ classifiers = [
 ]
 dependencies = [
   "click",
+  "mercantile",
   "numpy",
+  "Pillow",
   "polars>=1.3.0",
   "pyarrow",
   "python-dotenv",

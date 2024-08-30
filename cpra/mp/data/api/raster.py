@@ -1,6 +1,6 @@
 import tempfile
 from cpra.mp.data.api.dataset import Dataset
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, Response
 from starlette.types import Receive, Scope, Send
 
 
@@ -24,3 +24,28 @@ class RasterioStreamingResponse(FileResponse):
             self.stat_result = None
             self.status_code = 200
             await super().__call__(scope, receive, send)
+
+
+class RasterioTileResponse(Response):
+    background = None
+    mime_types = {"png": "image/png"}
+    status_code = 200
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        x: int,
+        y: int,
+        z: int,
+        format: str = "png",
+        **kwargs,
+    ) -> None:
+        self.dataset = dataset
+        self.format = format
+        self.tile = (x, y, z) if x is not None else None
+        self.media_type = self.mime_types[format]
+        self.init_headers()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.body = await self.dataset.get_tile(*self.tile)
+        await super().__call__(scope, receive, send)
