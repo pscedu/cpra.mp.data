@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/pscedu/cpra.mp.data/compare/v0.3.0...v0.3.1) (2024-08-30)
+
+
+### Bug Fixes
+
+* **api:** add scaling and padding of tile images ([6631353](https://github.com/pscedu/cpra.mp.data/commit/6631353ae716fef86dd2830b06a25e9d85fe5611))
+
+
+### Performance Improvements
+
+* **api:** cache LazyFrames for 10 minutes ([8f8ca0c](https://github.com/pscedu/cpra.mp.data/commit/8f8ca0c7c6c09d0038704230d6db1be80e8a8ac6))
+
 ## [0.3.0](https://github.com/pscedu/cpra.mp.data/compare/v0.2.0...v0.3.0) (2024-08-30)
 
 
