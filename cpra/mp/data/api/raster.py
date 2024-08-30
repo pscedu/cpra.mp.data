@@ -1,5 +1,6 @@
 import tempfile
 from cpra.mp.data.api.dataset import Dataset
+from fastapi import HTTPException
 from starlette.responses import FileResponse, Response
 from starlette.types import Receive, Scope, Send
 
@@ -48,4 +49,9 @@ class RasterioTileResponse(Response):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         self.body = await self.dataset.get_tile(*self.tile)
+
+        # Handle tile requests that are outside the dataset bounds.
+        if self.body is None:
+            raise HTTPException(status_code=404, detail="Tile does not exist")
+
         await super().__call__(scope, receive, send)

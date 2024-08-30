@@ -6,6 +6,7 @@ import rasterio as rio
 from io import BytesIO
 from PIL import Image
 from rasterio import windows
+from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from cpra.mp.data import read_data
@@ -66,6 +67,7 @@ class Dataset:
         self.summarize_geography = summarize_geography
         self.sort = sort
         self.dimensions = {k: enum_value(v) for k, v in dimensions if v is not None}
+        self.web_mercator_bounds = None
 
         try:
             self.lf = read_data(
@@ -83,7 +85,11 @@ class Dataset:
     async def get_tile(self, x, y, z, **kwargs):
         """Get a map tile image."""
 
-        bounds = mercantile.xy_bounds(x, y, z)
+        tile_bounds = BoundingBox(*mercantile.xy_bounds(x, y, z))
+        if self.web_mercator_bounds and disjoint_bounds(
+            self.web_mercator_bounds, tile_bounds
+        ):
+            return None
 
         df = self.lf.collect()
         with ExitStack() as stack:
@@ -100,7 +106,13 @@ class Dataset:
                 )
                 for dataset in inputs
             ]
-            window = vrts[0].window(*bounds)
+
+            if not self.web_mercator_bounds:
+                self.web_mercator_bounds = vrts[0].bounds
+                if disjoint_bounds(self.web_mercator_bounds, tile_bounds):
+                    return None
+
+            window = vrts[0].window(*tile_bounds)
             data = np.vstack(
                 [vrt.read(window=window, out_shape=(1, 256, 256)) for vrt in vrts]
             )
