@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import mercantile
 import numpy as np
+import polars.selectors as cs
 import rasterio as rio
 from cachetools import cached, TTLCache
 from io import BytesIO
@@ -50,6 +51,20 @@ async def parallel_read_rasters(
             for dataset in datasets
         ]
     )
+
+
+def unpack_values(values_str, param_name, choices=None, separator=","):
+    """Unpack values from a comma-separated list."""
+    values = [val.strip() for val in values_str.split(separator)]
+
+    # Validate choices.
+    if choices:
+        invalid_values = [val for val in values if val not in choices]
+        if invalid_values:
+            msg = f"Invalid values for {param_name}: {", ".join(invalid_values)}"
+            raise HTTPException(status_code=400, detail=msg)
+
+    return values
 
 
 class Dataset:
@@ -110,6 +125,17 @@ class Dataset:
         """Apply filter parameters to the LazyFrame."""
         if self.where:
             self.lf = self.lf.sql(f"select * from self where {self.where}")
+
+        if self.geography:
+            if self.grid.grid_type == "vector":
+                geography_ids = unpack_values(
+                    self.geography,
+                    "geography",
+                    choices=[str(geo_id) for geo_id in self.grid.geographies],
+                )
+                self.lf = self.lf.select(cs.matches(r"^[a-z]"), *geography_ids)
+            else:
+                pass
 
     def _materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
