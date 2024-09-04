@@ -6,11 +6,13 @@ import rasterio as rio
 from cachetools import cached, TTLCache
 from io import BytesIO
 from PIL import Image
+from polars.exceptions import ColumnNotFoundError
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from cpra.mp.data import read_data
+from cpra.mp.data.grids import get_grid
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.api.types import (
     AggregateFunction,
@@ -100,6 +102,23 @@ class Dataset:
             # TODO: Also handle directory does not exist errors.
             raise HTTPException(status_code=422, detail=str(err))
 
+        self.grid = get_grid(self.geographic_unit, self.plan_version)
+
+        self._apply_filter_params()
+
+    def _apply_filter_params(self):
+        """Apply filter parameters to the LazyFrame."""
+        if self.where:
+            self.lf = self.lf.sql(f"select * from self where {self.where}")
+
+    def _materialize(self, method="collect", *args, **kwargs):
+        """Materialize the LazyFrame with error handling."""
+
+        try:
+            return getattr(self.lf, method)(*args, **kwargs)
+        except ColumnNotFoundError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+
     @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):
         """Get a map tile image."""
@@ -108,7 +127,7 @@ class Dataset:
         if self.dataset_bounds and disjoint_bounds(self.dataset_bounds, tile_bounds):
             return None
 
-        df = self.lf.collect()
+        df = self._materialize()
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             vrts = [
@@ -181,14 +200,14 @@ class Dataset:
             "parquet": "sink_parquet",
         }[format]
         # TODO: Set parquet compression and row group parameters.
-        getattr(self.lf, sink_method)(out_path)
+        self._materialize(sink_method, out_path)
 
     @asynctiming
     async def write_raster(self, out_path, **kwargs):
         """Write a raster dataset to a file using windowed reading and writing
         to conserve memory."""
 
-        df = self.lf.collect()
+        df = self._materialize()
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             profile = inputs[0].profile.copy()

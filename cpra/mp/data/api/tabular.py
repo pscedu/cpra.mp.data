@@ -1,13 +1,32 @@
 import anyio
 import tempfile
-import threading
 from cpra.mp.data.api.dataset import Dataset
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
+from threading import Thread
 
 
 def stream_to_file(dataset, out_path, format):
     dataset.stream_tabular(out_path, format)
+
+
+class StreamingThread(Thread):
+    def __init__(self, dataset, out_path, format, **kwargs):
+        kwargs.update(
+            {
+                "target": stream_to_file,
+                "name": "stream_to_file",
+                "args": [dataset, out_path, format],
+            }
+        )
+        self.exception = None
+        super().__init__(**kwargs)
+
+    def run(self):
+        try:
+            super().run()
+        except Exception as err:
+            self.exception = err
 
 
 class PolarsStreamingResponse(Response):
@@ -27,23 +46,13 @@ class PolarsStreamingResponse(Response):
         self.init_headers()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": self.raw_headers,
-            }
-        )
         if scope["method"].upper() == "HEAD":
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             with tempfile.NamedTemporaryFile() as fp:
-                write_thread = threading.Thread(
-                    target=stream_to_file,
-                    name="stream_to_file",
-                    args=[self.dataset, fp.name, self.format],
-                )
+                write_thread = StreamingThread(self.dataset, fp.name, self.format)
                 write_thread.start()
+                sent_headers = False
                 async with await anyio.open_file(fp.name, mode="rb") as file:
                     more_body = True
                     while more_body:
@@ -51,6 +60,19 @@ class PolarsStreamingResponse(Response):
                         chunk_has_data = len(chunk) > 0
                         more_body = chunk_has_data or write_thread.is_alive()
                         if chunk_has_data or not more_body:
+                            if not sent_headers:
+                                sent_headers = True
+                                err = write_thread.exception
+                                await send(
+                                    {
+                                        "type": "http.response.start",
+                                        "status": err.status_code if err else 200,
+                                        "headers": self.raw_headers,
+                                    }
+                                )
+                                if err:
+                                    chunk = err.detail.encode("utf-8")
+                                    more_body = False
                             await send(
                                 {
                                     "type": "http.response.body",
