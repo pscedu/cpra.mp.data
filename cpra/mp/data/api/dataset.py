@@ -22,7 +22,7 @@ from cpra.mp.data.api.types import (
     Variable,
     VectorGeographicUnit,
 )
-from cpra.mp.data.api.utils import enum_value, timing
+from cpra.mp.data.api.utils import asynctiming, enum_value, timing
 from contextlib import ExitStack
 from fastapi import Depends, HTTPException
 
@@ -100,7 +100,7 @@ class Dataset:
             # TODO: Also handle directory does not exist errors.
             raise HTTPException(status_code=422, detail=str(err))
 
-    @timing
+    @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):
         """Get a map tile image."""
 
@@ -173,6 +173,17 @@ class Dataset:
                 return memfile.getvalue()
 
     @timing
+    def stream_tabular(self, out_path, format):
+        sink_method = {
+            "arrow": "sink_ipc",
+            "csv": "sink_csv",
+            "ndjson": "sink_ndjson",
+            "parquet": "sink_parquet",
+        }[format]
+        # TODO: Set parquet compression and row group parameters.
+        getattr(self.lf, sink_method)(out_path)
+
+    @asynctiming
     async def write_raster(self, out_path, **kwargs):
         """Write a raster dataset to a file using windowed reading and writing
         to conserve memory."""

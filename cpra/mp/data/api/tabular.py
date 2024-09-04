@@ -4,7 +4,10 @@ import threading
 from cpra.mp.data.api.dataset import Dataset
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
-from time import time
+
+
+def stream_to_file(dataset, out_path, format):
+    dataset.stream_tabular(out_path, format)
 
 
 class PolarsStreamingResponse(Response):
@@ -35,11 +38,10 @@ class PolarsStreamingResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             with tempfile.NamedTemporaryFile() as fp:
-                start = time()
                 write_thread = threading.Thread(
                     target=stream_to_file,
                     name="stream_to_file",
-                    args=[self.dataset.lf, fp.name, self.format],
+                    args=[self.dataset, fp.name, self.format],
                 )
                 write_thread.start()
                 async with await anyio.open_file(fp.name, mode="rb") as file:
@@ -56,17 +58,3 @@ class PolarsStreamingResponse(Response):
                                     "more_body": more_body,
                                 }
                             )
-                print(f"Download took {time() - start} seconds")
-
-
-def stream_to_file(lf, out_path, format):
-    sink_method = {
-        "arrow": "sink_ipc",
-        "csv": "sink_csv",
-        "ndjson": "sink_ndjson",
-        "parquet": "sink_parquet",
-    }[format]
-    # TODO: Set parquet compression and row group parameters.
-    start = time()
-    getattr(lf, sink_method)(out_path)
-    print(f"Save took {time() - start} seconds")

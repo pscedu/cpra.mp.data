@@ -9,13 +9,30 @@ def enum_value(inst):
     return inst.value if isinstance(inst, Enum) else inst
 
 
-def timing(func):
+def asynctiming(func):
     """Time an asynchronous function call."""
 
     @wraps(func)
     async def wrapped(*args, **kwargs):
         start = time()
         result = await func(*args, **kwargs)
+        if DEBUG:
+            print(
+                "func:%r args:[%r, %r] took: %2.4f sec"
+                % (func.__name__, args, kwargs, time() - start)
+            )
+        return result
+
+    return wrapped
+
+
+def timing(func):
+    """Time a synchronous function call."""
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        start = time()
+        result = func(*args, **kwargs)
         if DEBUG:
             print(
                 "func:%r args:[%r, %r] took: %2.4f sec"
