@@ -6,6 +6,12 @@ Tools for reading and writing data from [Louisiana's Coastal Master Plan](https:
 
 See the [data structure documentation](docs/index.md) for details about variables, dimensions, and validation conditions.
 
+## APIs
+
+Several APIs that depend on the Python library are implemented in the `cpra.mp.data.api` submodule:
+
+* [Data and Analysis API](docs/data-analysis-api.md)
+
 ## Writing Data
 
 To write tabular data using the library, prepare it as a data frame in the wide format, with dates/years as rows, and geographies as columns:
