@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/pscedu/cpra.mp.data/compare/v0.3.1...v0.4.0) (2024-09-05)
+
+
+### Features
+
+* **api:** add geography filtering for tabular data ([0542b9b](https://github.com/pscedu/cpra.mp.data/commit/0542b9b8a0e5d8af35b22f1cd97d3e9714f4957f))
+* **api:** add raster sampling ([4f8c0de](https://github.com/pscedu/cpra.mp.data/commit/4f8c0ded5494b64c8706fc776541ec0058da4ca3))
+* **api:** add support for SQL where clauses ([f6dcac0](https://github.com/pscedu/cpra.mp.data/commit/f6dcac00e526773d730491c1aa0f37da03895b55))
+
+
+### Performance Improvements
+
+* **api:** read tile images in parallel ([6eccdba](https://github.com/pscedu/cpra.mp.data/commit/6eccdba527cc7e79da360addd1ce7bb4e61c5243))
+
+
+### Documentation
+
+* **data-analysis-api:** migrate docs from cpra-documentation repository ([524c6d2](https://github.com/pscedu/cpra.mp.data/commit/524c6d2d79ec22a4ec0e5870fb59ea5098b4e740))
+
 ## [0.3.1](https://github.com/pscedu/cpra.mp.data/compare/v0.3.0...v0.3.1) (2024-08-30)
 
 
