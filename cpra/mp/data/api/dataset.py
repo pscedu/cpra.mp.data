@@ -10,8 +10,10 @@ from PIL import Image
 from polars.exceptions import ColumnNotFoundError
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
+from rasterio.warp import transform
 from cpra.mp.data import read_data
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.exceptions import ValidationError
@@ -20,6 +22,7 @@ from cpra.mp.data.api.types import (
     ColorMap,
     DimensionsQuery,
     GeographicUnit,
+    OutputType,
     PlanVersion,
     TimeUnit,
     Variable,
@@ -48,6 +51,20 @@ async def parallel_read_rasters(
             loop.run_in_executor(
                 None, read_window, dataset, window, out_shape, resampling
             )
+            for dataset in datasets
+        ]
+    )
+
+
+def sample_raster(dataset, coordinates):
+    return list(dataset.sample(coordinates))
+
+
+async def parallel_sample_rasters(datasets, coordinates):
+    loop = asyncio.get_running_loop()
+    return await asyncio.gather(
+        *[
+            loop.run_in_executor(None, sample_raster, dataset, coordinates)
             for dataset in datasets
         ]
     )
@@ -119,31 +136,91 @@ class Dataset:
 
         self.grid = get_grid(self.geographic_unit, self.plan_version)
 
-        self._apply_filter_params()
+    @property
+    def output_type(self) -> OutputType:
+        """Get the output type for this dataset based on its parameters."""
+        if self.grid.grid_type == "vector" or self.geography:
+            return OutputType.vector
+        return OutputType.raster
 
-    def _apply_filter_params(self):
+    async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame."""
         if self.where:
             self.lf = self.lf.sql(f"select * from self where {self.where}")
 
         if self.geography:
             if self.grid.grid_type == "vector":
-                geography_ids = unpack_values(
-                    self.geography,
-                    "geography",
-                    choices=[str(geo_id) for geo_id in self.grid.geographies],
-                )
-                self.lf = self.lf.select(cs.matches(r"^[a-z]"), *geography_ids)
+                await self._apply_geography_vector()
             else:
-                pass
+                await self._apply_geography_raster()
+
+    async def _apply_geography_vector(self):
+        """Apply the geography filter to a vector-grid dataset."""
+        geography_ids = unpack_values(
+            self.geography,
+            "geography",
+            choices=[str(geo_id) for geo_id in self.grid.geographies],
+        )
+        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *geography_ids)
+
+    async def _apply_geography_raster(self):
+        """Apply the geography filter to a raster-grid dataset."""
+        # Check that coordinates are numeric and that there are an even number.
+        try:
+            coords = [
+                float(coord) for coord in unpack_values(self.geography, "geography")
+            ]
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="geography contains non-numeric coordinates"
+            )
+
+        coords_len = len(coords)
+        if coords_len % 2:
+            raise HTTPException(
+                status_code=400,
+                detail="geography contain an even number of coordinates",
+            )
+
+        # Extract lng,lat pairs.
+        lngs = []
+        lats = []
+        for start_idx in range(0, coords_len, 2):
+            lng, lat = coords[start_idx : (start_idx + 2)]
+            if abs(lng) > 180 or abs(lat) > 90:
+                msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
+                raise HTTPException(status_code=400, detail=msg)
+            lngs.append(lng)
+            lats.append(lat)
+
+        # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
+        df = self._materialize()
+        with ExitStack() as stack:
+            datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            src_crs = CRS.from_epsg(4326)
+            dst_crs = datasets[0].crs
+            projected_pairs = list(zip(*transform(src_crs, dst_crs, lngs, lats)))
+            samples = await parallel_sample_rasters(datasets, projected_pairs)
+
+        # Add the resulting values to the LazyFrame, and remove the path column.
+        columns = [np.concatenate(col) for col in zip(*samples)]
+        column_labels = [f"{str(x)},{str(y)}" for x, y in zip(lngs, lats)]
+        self.lf = (
+            df.with_columns(**dict(zip(column_labels, columns)))
+            .select(cs.exclude("path"))
+            .lazy()
+        )
 
     def _materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
-
         try:
             return getattr(self.lf, method)(*args, **kwargs)
         except ColumnNotFoundError as err:
             raise HTTPException(status_code=400, detail=str(err))
+
+    async def apply_params(self):
+        """Apply the query parameters to the LazyFrame."""
+        await self._apply_filter_params()
 
     @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):

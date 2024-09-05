@@ -38,6 +38,11 @@ class DataFormat(str, Enum):
     tif = "tif"
 
 
+class OutputType(str, Enum):
+    raster = "raster"
+    vector = "vector"
+
+
 class TileFormat(str, Enum):
     jpg = "jpg"
     png = "png"

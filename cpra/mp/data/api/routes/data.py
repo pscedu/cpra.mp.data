@@ -1,7 +1,7 @@
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.types import DataFormat, TileFormat
+from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
 from fastapi import APIRouter, Depends
 
 
@@ -13,8 +13,8 @@ async def get_model_data(
     format: DataFormat,
     dataset: Dataset = Depends(),
 ):
-    # The presence of a path column indicates that this is a raster.
-    if dataset.grid.grid_type == "raster":
+    await dataset.apply_params()
+    if dataset.output_type == OutputType.raster:
         return RasterioStreamingResponse(dataset, format)
     return PolarsStreamingResponse(dataset, format)
 
@@ -29,4 +29,5 @@ async def get_model_tile(
     y: int,
     dataset: Dataset = Depends(),
 ):
+    await dataset.apply_params()
     return RasterioTileResponse(dataset, x, y, z, format)
