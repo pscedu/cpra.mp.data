@@ -15,6 +15,7 @@ from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
 from cpra.mp.data import read_data
+from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.api.types import (
@@ -31,6 +32,10 @@ from cpra.mp.data.api.types import (
 from cpra.mp.data.api.utils import asynctiming, enum_value, timing
 from contextlib import ExitStack
 from fastapi import Depends, HTTPException
+
+SORT_CHOICES = list(DIMENSIONS.keys()) + [
+    f"-{dim_name}" for dim_name in DIMENSIONS.keys()
+]
 
 
 @cached(cache=TTLCache(maxsize=128, ttl=600))
@@ -211,6 +216,16 @@ class Dataset:
             .lazy()
         )
 
+    def _apply_sort_param(self, order: str, param_name: str):
+        """Apply a sort parameter to the LazyFrame."""
+        if order is None:
+            return
+
+        parts = unpack_values(order, param_name, SORT_CHOICES)
+        cols = [part.replace("-", "") for part in parts]
+        desc = [part.startswith("-") for part in parts]
+        self.lf = self.lf.sort(cols, descending=desc)
+
     def _materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
         try:
@@ -221,6 +236,9 @@ class Dataset:
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
         await self._apply_filter_params()
+        self._apply_sort_param(self.presort, "presort")
+
+        self._apply_sort_param(self.sort, "sort")
 
     @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):

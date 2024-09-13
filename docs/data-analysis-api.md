@@ -31,10 +31,10 @@ Without any query string parameters, each endpoint returns the full dataset by d
 | Order | Operation | Implementation Status |
 |---|---|---|
 | 1 | [Filter](#filter) | ✅ Implemented |
-| 2 | [Presort](#presort) | ❌ Not Implemented |
+| 2 | [Presort](#presort) | ✅ Implemented |
 | 3 | [Group and Aggregate](#group-and-aggregate) | ❌ Not Implemented |
 | 4 | [Transform and Extract](#transform-and-extract) | ❌ Not Implemented |
-| 5 | [Sort](#sort) | ❌ Not Implemented |
+| 5 | [Sort](#sort) | ✅ Implemented |
 
 ### Filter
 
