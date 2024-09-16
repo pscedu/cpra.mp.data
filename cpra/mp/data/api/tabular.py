@@ -66,12 +66,16 @@ class PolarsStreamingResponse(Response):
                                 await send(
                                     {
                                         "type": "http.response.start",
-                                        "status": err.status_code if err else 200,
+                                        "status": getattr(err, "status_code", 500)
+                                        if err
+                                        else 200,
                                         "headers": self.raw_headers,
                                     }
                                 )
                                 if err:
-                                    chunk = err.detail.encode("utf-8")
+                                    chunk = getattr(err, "detail", str(err)).encode(
+                                        "utf-8"
+                                    )
                                     more_body = False
                             await send(
                                 {
