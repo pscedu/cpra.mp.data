@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/pscedu/cpra.mp.data/compare/v0.4.0...v0.5.0) (2024-09-17)
+
+
+### Features
+
+* **api:** add calculate and group params for vector data ([a1a0adc](https://github.com/pscedu/cpra.mp.data/commit/a1a0adc022f4a08084ff2d3049e7f61428ccad20))
+* **api:** implement presort and sort params ([2130634](https://github.com/pscedu/cpra.mp.data/commit/213063493af7a43e9a380f236e73902827f1514e))
+
+
+### Bug Fixes
+
+* **api:** fix reporting of unhandled errors while streaming ([542d2cb](https://github.com/pscedu/cpra.mp.data/commit/542d2cb6d4fef0340445d559a984cb986d74ffbd))
+
 ## [0.4.0](https://github.com/pscedu/cpra.mp.data/compare/v0.3.1...v0.4.0) (2024-09-05)
 
 
