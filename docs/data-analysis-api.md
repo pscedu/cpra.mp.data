@@ -28,13 +28,13 @@ Additional example URIs for raster-grid (COG) data are:
 
 Without any query string parameters, each endpoint returns the full dataset by default. To obtain a subset of the data or to perform transformation and analysis operations, query string parameters can be added. There are six query operations, which are always performed in the same order:
 
-| Order | Operation | Implementation Status |
-|---|---|---|
-| 1 | [Filter](#filter) | ✅ Implemented |
-| 2 | [Presort](#presort) | ✅ Implemented |
-| 3 | [Group and Aggregate](#group-and-aggregate) | ❌ Not Implemented |
-| 4 | [Transform and Extract](#transform-and-extract) | ❌ Not Implemented |
-| 5 | [Sort](#sort) | ✅ Implemented |
+| Order | Operation | Vector-Grid Status | Raster-Grid Status |
+|---|---|---|---|
+| 1 | [Filter](#filter) | ✅ Implemented | ✅ Implemented |
+| 2 | [Calculate](#calculate) | ✅ Implemented | ❌ Not Implemented |
+| 3 | [Group and Aggregate](#group-and-aggregate) | ✅ Implemented | ❌ Not Implemented |
+| 4 | [Transform and Extract](#transform-and-extract) | ❌ Not Implemented | ❌ Not Implemented |
+| 5 | [Sort](#sort) | ✅ Implemented | ❌ Not Implemented |
 
 ### Filter
 
@@ -44,30 +44,30 @@ For vector-grid data, the `geography` parameter accepts a comma-separated list o
 
 For raster-grid data, when the `geography` parameter is not provided, the full images are used. Each COG becomes a band in the resulting image. These bands can be aggregated using the `group_by` and `group_aggregate` parameters below. Due to memory constrains, a maximum of 10 bands can be loaded from COGs. Additional matches beyond the first 10 COGs are ignored.
 
-🚧 **TODO:** We still need to determine how `plan_version` will interact with the other filters. Ideally the API would be able to query data across multiple plan versions (applying geographic crosswalks as necessary), but this functionality would add considerable technical complexity.
-
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
 | Partition and Non-Partition Dimensions | Any dimension from the partition and non-partition tables above | ✅ | ✅ | `aep=0.2` |
 | `geography` | Geographies to include | ✅ | ✅ | `geography=24,81` |
 | `where` | Advanced filters in SQL where-clause format | ✅ | ✅ | `where=calendar_year%3E2040` |
 
-### Presort
+### Calculate
 
-The presort parameter sorts the filtered results prior to aggregation. This is usually only necessary when using an aggregation method where the order of values is important (e.g., difference). The parameter can accept multiple dimensions in a comma-separated list. Dimensions are sorted in ascending order by default unless prefixed with a minus sign (`-`) for descending order.
+Calculate parameters change the values of individual table cells or raster pixels prior to aggregation. They are intended to support comparison operations, such as calculating the difference between two scenarios or concatenating digits to highlight changes. See the examples below for specific applications of these parameters.
 
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
-| `presort` | Presort order | ✅ | ✅ | `presort=-calendar_date` |
+| `negate` | SQL expression for rows/bands where the value should be multiplied by -1 | ✅ | ✅ | `negate=scenario_id%3D8` |
+| `multiply10` | SQL expression for rows/bands where the value should be multiplied by 10 | ✅ | ✅ | `multiply10=scenario_id%3D8%20AND%20calendar_year%3D2030` |
+| `multiply100` | SQL expression for rows/bands where the value should be multiplied by 100 | ✅ | ✅ | `multiply100=scenario_id%3D8%20AND%20calendar_year%3D2040` |
 
 ### Group and Aggregate
 
-Group and aggregate parameters allow multiple rows or bands to be summarized as a single row or band. Unlike the geographic aggregations in the transformation step below, these aggregations operate on a single vector geography or raster pixel.
+Group and aggregate parameters allow multiple rows or bands to be summarized as a single row or band. Unlike the geographic aggregations in the transformation step below, these aggregations operate on a single vector geography or raster pixel. For differences, use `group_aggregate=sum` with the `negate` parameter.
 
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
 | `group_by` | Group by dimensions | ✅ | ✅ | `group_by=model_group,scenario,aep` |
-| `group_aggregate` | Aggregate function: one of `sum`, `difference`, `max`, `min`, or `mean` | ✅ | ✅ | `group_aggregate=difference` |
+| `group_aggregate` | Aggregate function: one of `sum`, `max`, `min`, or `mean` | ✅ | ✅ | `group_aggregate=sum` |
 
 
 ### Transform and Extract
@@ -110,7 +110,7 @@ GET /data/v1/salinity_mean/extraction_point/daily.arrow?model_group=500&scenario
 This request returns the difference in daily mean salinity for two model groups on the same date in the Arrow IPC format.
 
 ```
-GET /data/v1/salinity_mean/extraction_point/daily.arrow?model_group=500,501&scenario=7&calendar_date=2030-01-01&presort=-model_group&group_by=true&group_aggregate=difference
+GET /data/v1/salinity_mean/extraction_point/daily.arrow?scenario_id=7&calendar_day=2030-01-01&where=model_group_id%20in%20(500%2C%20501)&negate=model_group_id=500&group_by=calendar_date&group_aggregate=sum
 ```
 
 #### Basic Time Series Query

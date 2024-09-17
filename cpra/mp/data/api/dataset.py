@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import mercantile
 import numpy as np
+import polars as pl
 import polars.selectors as cs
 import rasterio as rio
 from cachetools import cached, TTLCache
@@ -18,6 +19,7 @@ from cpra.mp.data import read_data
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.api.aggregate import GROUP_BY_AGGREGATES
 from cpra.mp.data.api.types import (
     AggregateFunction,
     ColorMap,
@@ -33,9 +35,9 @@ from cpra.mp.data.api.utils import asynctiming, enum_value, timing
 from contextlib import ExitStack
 from fastapi import Depends, HTTPException
 
-SORT_CHOICES = list(DIMENSIONS.keys()) + [
-    f"-{dim_name}" for dim_name in DIMENSIONS.keys()
-]
+DIMENSION_CHOICES = list(DIMENSIONS.keys())
+SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
+VALUE_COLUMNS = cs.matches(r"^[0-9]")
 
 
 @cached(cache=TTLCache(maxsize=128, ttl=600))
@@ -98,7 +100,9 @@ class Dataset:
         time_unit: TimeUnit,
         geography: str | None = None,
         where: str | None = None,
-        presort: str | None = None,
+        negate: str | None = None,
+        multiply10: str | None = None,
+        multiply100: str | None = None,
         group_by: str | None = None,
         group_aggregate: AggregateFunction | None = None,
         color_map: ColorMap | None = None,
@@ -115,9 +119,11 @@ class Dataset:
         self.time_unit = time_unit.value
         self.geography = geography
         self.where = where
-        self.presort = presort
+        self.negate = negate
+        self.multiply10 = multiply10
+        self.multiply100 = multiply100
         self.group_by = group_by
-        self.group_aggregate = group_aggregate
+        self.group_aggregate = enum_value(group_aggregate)
         self.color_map = enum_value(color_map)
         self.melt = melt
         self.summarize_by = enum_value(summarize_by)
@@ -216,6 +222,26 @@ class Dataset:
             .lazy()
         )
 
+    def _apply_calculate_params(self):
+        """Apply calculate parameters to the LazyFrame."""
+        if self.negate is None and self.multiply10 is None and self.multiply100 is None:
+            return
+
+        if self.output_type == OutputType.vector:
+            sql_expressions = [self.negate, self.multiply10, self.multiply100]
+            factors = [-1, 10, 100]
+
+            when_expression = pl
+            for sql_expression, factor in zip(sql_expressions, factors):
+                if sql_expression is None:
+                    continue
+                when_expression = when_expression.when(
+                    pl.sql_expr(sql_expression)
+                ).then(VALUE_COLUMNS * factor)
+
+            when_expression = when_expression.otherwise(VALUE_COLUMNS)
+            self.lf = self.lf.with_columns(when_expression)
+
     def _apply_sort_param(self, order: str, param_name: str):
         """Apply a sort parameter to the LazyFrame."""
         if order is None:
@@ -225,6 +251,19 @@ class Dataset:
         cols = [part.replace("-", "") for part in parts]
         desc = [part.startswith("-") for part in parts]
         self.lf = self.lf.sort(cols, descending=desc)
+
+    def _apply_group_params(self):
+        """Apply group and aggregate parameters to the LazyFrame or image."""
+        if self.group_by is None and self.group_aggregate is None:
+            return
+
+        if self.group_by is None or self.group_aggregate is None:
+            msg = "group_by and group_aggregate parameters must be used together"
+            raise HTTPException(status_code=400, detail=msg)
+
+        if self.output_type == OutputType.vector:
+            group_cols = unpack_values(self.group_by, "group_by", DIMENSION_CHOICES)
+            self.lf = getattr(self.lf.group_by(*group_cols), self.group_aggregate)()
 
     def _materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
@@ -236,8 +275,8 @@ class Dataset:
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
         await self._apply_filter_params()
-        self._apply_sort_param(self.presort, "presort")
-
+        self._apply_calculate_params()
+        self._apply_group_params()
         self._apply_sort_param(self.sort, "sort")
 
     @asynctiming
