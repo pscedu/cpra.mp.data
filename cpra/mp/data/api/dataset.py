@@ -36,6 +36,7 @@ from fastapi import Depends, HTTPException
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
+DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
 VALUE_COLUMNS = cs.matches(r"^[0-9]")
 
 
@@ -264,6 +265,24 @@ class Dataset:
             group_cols = unpack_values(self.group_by, "group_by", DIMENSION_CHOICES)
             self.lf = getattr(self.lf.group_by(*group_cols), self.group_aggregate)()
 
+    def _apply_transform_params(self):
+        """Apply transform and extract parameters to the LazyFrame or image."""
+        if self.output_type == OutputType.vector:
+            self._apply_transform_params_vector()
+        else:
+            self._apply_transform_params_raster()
+
+    def _apply_transform_params_vector(self):
+        """Apply transform and extract parameters to the LazyFrame."""
+
+        if self.melt:
+            self.lf = self.lf.unpivot(
+                index=DIMENSION_COLUMNS, variable_name="geography"
+            )
+
+    def _apply_transform_params_raster(self):
+        """Apply transform and extract parameters to the image."""
+
     def _materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
         try:
@@ -276,6 +295,7 @@ class Dataset:
         await self._apply_filter_params()
         self._apply_calculate_params()
         self._apply_group_params()
+        self._apply_transform_params()
         self._apply_sort_param(self.sort, "sort")
 
     @asynctiming
