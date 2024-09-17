@@ -19,7 +19,6 @@ from cpra.mp.data import read_data
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.exceptions import ValidationError
-from cpra.mp.data.api.aggregate import GROUP_BY_AGGREGATES
 from cpra.mp.data.api.types import (
     AggregateFunction,
     ColorMap,
