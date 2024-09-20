@@ -4,6 +4,7 @@ from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
+from polars.exceptions import ColumnNotFoundError
 from scipy.io import FortranFile
 
 
@@ -95,10 +96,10 @@ def extract_dimension_value(column, data=None, **kwargs):
     if isinstance(data, dict) and column in data:
         return data[column]
 
-    if isinstance(data, pl.DataFrame) and column in data and len(data[column]):
+    try:
         return data[column][0]
-
-    return None
+    except (KeyError, IndexError, ValueError, ColumnNotFoundError):
+        return None
 
 
 def dataset_path(base_path, **kwargs):
