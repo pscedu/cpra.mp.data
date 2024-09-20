@@ -6,6 +6,7 @@ from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
+    build_glob_pattern,
     cast_columns,
     dataset_path,
     required_columns,
@@ -75,12 +76,9 @@ def read_cog(base_path=BASE_PATH, **kwargs):
 
     # Construct the glob pattern.
     required_cols = required_columns(input_df)
-    dimension_patterns = [
-        f"{col}={str(kwargs[col])}" if col in kwargs else "*"
-        for col in required_cols
-        if col not in DATASET_DIMENSIONS
-    ]
-    glob_pattern = "/".join(dimension_patterns) + ".tif"
+    glob_pattern = build_glob_pattern(
+        input_df, extension="tif", required_cols=required_cols, **kwargs
+    )
 
     # Create a data frame from the COG paths.
     return (

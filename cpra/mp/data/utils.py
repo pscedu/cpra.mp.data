@@ -164,3 +164,15 @@ def read_fortran_array(filename, dtype=None, variable=None):
 
     with FortranFile(filename, "r") as array_file:
         return array_file.read_record(dtype)
+
+
+def build_glob_pattern(input_df, extension, required_cols=None, **kwargs):
+    """Build a glob pattern for selecting files from a dataset directory."""
+
+    required_cols = required_cols or required_columns(input_df)
+    dimension_patterns = [
+        f"{col}={str(kwargs[col])}" if col in kwargs else "*"
+        for col in required_cols
+        if col not in DATASET_DIMENSIONS
+    ]
+    return "/".join(dimension_patterns) + f".{extension}"

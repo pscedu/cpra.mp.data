@@ -5,12 +5,14 @@ from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
+    build_glob_pattern,
     dataset_path,
     partition_columns,
     required_columns,
     validate_data_frame,
 )
 from cpra.mp.data.variables import VARIABLES
+from pathlib import Path
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
@@ -122,3 +124,72 @@ def write_parquet(
             use_dictionary=use_dictionary, partition_cols=partition_cols
         ),
     )
+
+
+def compact_parquet(
+    base_path=BASE_PATH,
+    sort=True,
+    compression="zstd",
+    compression_level=6,
+    row_group_size=5000,
+    use_dictionary=False,
+    **kwargs,
+):
+    """Rewrite Parquet datasets with with one file per dataset."""
+
+    # Validate the input keyword arguments.
+    input_df = pl.DataFrame(kwargs)
+    validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
+
+    # Calculate the dataset directory path.
+    dataset_dir = dataset_path(base_path, **kwargs)
+
+    # Construct the glob pattern.
+    glob_pattern = build_glob_pattern(input_df, extension="parquet", **kwargs)
+    paths = list(dataset_dir.glob(glob_pattern))
+
+    # Group by directory, and extract dimension values for directories with
+    # more than one file.
+    partitions_df = (
+        pl.DataFrame(
+            {
+                "directory": [str(p.parent) for p in paths],
+                "file": [str(p.name) for p in paths],
+            }
+        )
+        .group_by(pl.col("directory"))
+        .agg(pl.col("file"))
+        .filter(pl.col("file").list.len() > 1)
+        .with_columns(
+            [
+                pl.col("directory")
+                .str.extract(f"{dim.name}=([^/]+)(/|$)", 1)
+                .cast(dim.dtype)
+                .alias(dim.name)
+                for dim in DIMENSIONS.values()
+                if dim.name in partition_columns(input_df)
+            ]
+        )
+    )
+
+    # Iterate over the directories, read the data, and rewrite it
+    # as a single file.
+    for partition in partitions_df.iter_rows(named=True):
+        read_kwargs = partition.copy()
+        del read_kwargs["directory"]
+        del read_kwargs["file"]
+
+        write_parquet(
+            read_parquet(**read_kwargs).collect(),
+            validate=False,
+            sort=sort,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+            use_dictionary=use_dictionary,
+        )
+
+        # Delete the original files from the partition directory.
+        directory = Path(partition["directory"])
+        for file in partition["file"]:
+            (directory / file).unlink()
