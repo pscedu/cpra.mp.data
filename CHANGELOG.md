@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.6.0](https://github.com/pscedu/cpra.mp.data/compare/v0.5.0...v0.6.0) (2024-10-01)
+
+
+### Features
+
+* **api:** add melting of vector tables ([6400cfb](https://github.com/pscedu/cpra.mp.data/commit/6400cfb1f8126ad3ac73952dc36225100a752ed7))
+* **tabular:** add function for compacting Parquet partitions ([73a5c13](https://github.com/pscedu/cpra.mp.data/commit/73a5c13360214f9d53c5d2b6d4b0065e052cee19))
+
+
+### Bug Fixes
+
+* **api:** remove bad import ([b828eaf](https://github.com/pscedu/cpra.mp.data/commit/b828eafcc5d22fcc10f45172ff9f04805cdc6d0a))
+* **utils:** allow dimension extraction from Pandas data frames ([65a64fc](https://github.com/pscedu/cpra.mp.data/commit/65a64fc963871d54e7891cf3568814f422df1a8f))
+
+
+### Documentation
+
+* **tabular:** remove extra word in compact_parquet docstring ([41f8ff3](https://github.com/pscedu/cpra.mp.data/commit/41f8ff3773b3283bea1a5c620b0a045c58707a51))
+
 ## [0.5.0](https://github.com/pscedu/cpra.mp.data/compare/v0.4.0...v0.5.0) (2024-09-17)
 
 
