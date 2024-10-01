@@ -135,7 +135,7 @@ def compact_parquet(
     use_dictionary=False,
     **kwargs,
 ):
-    """Rewrite Parquet datasets with with one file per dataset."""
+    """Rewrite Parquet datasets with one file per dataset."""
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)
