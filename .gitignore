@@ -12,5 +12,7 @@ token.txt
 *.~lock*
 /test_*.py
 
+/cpra/mp/data/crosswalk/
+/cpra/mp/data/geometry/
 /data/
 /scratch/

@@ -7,6 +7,7 @@ import polars.selectors as cs
 import rasterio as rio
 from cachetools import cached, TTLCache
 from io import BytesIO
+from pathlib import Path
 from PIL import Image
 from polars.exceptions import ColumnNotFoundError
 from rasterio import windows
@@ -118,6 +119,7 @@ class Dataset:
         self.geographic_unit = geographic_unit.value
         self.time_unit = time_unit.value
         self.geography = geography
+        self.geography_ids = None
         self.where = where
         self.negate = negate
         self.multiply10 = multiply10
@@ -129,6 +131,7 @@ class Dataset:
         self.summarize_by = enum_value(summarize_by)
         self.summarize_aggregate = enum_value(summarize_aggregate)
         self.summarize_geography = summarize_geography
+        self.summarize_geography_ids = None
         self.sort = sort
         self.dimensions = {k: enum_value(v) for k, v in dimensions if v is not None}
         self.dataset_bounds = None
@@ -167,12 +170,12 @@ class Dataset:
 
     async def _apply_geography_vector(self):
         """Apply the geography filter to a vector-grid dataset."""
-        geography_ids = unpack_values(
+        self.geography_ids = unpack_values(
             self.geography,
             "geography",
             choices=[str(geo_id) for geo_id in self.grid.geographies],
         )
-        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *geography_ids)
+        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
@@ -279,6 +282,77 @@ class Dataset:
             self.lf = self.lf.unpivot(
                 index=DIMENSION_COLUMNS, variable_name="geography"
             )
+
+        if self.summarize_by is None and self.summarize_aggregate is None:
+            return
+
+        if self.summarize_by is None or self.summarize_aggregate is None:
+            msg = (
+                "summarize_by and summarize_aggregate parameters must be used together"
+            )
+            raise HTTPException(status_code=400, detail=msg)
+
+        # Extract and validate summary geography IDs, if present.
+        if self.summarize_geography:
+            summarize_grid = get_grid(self.summarize_by, self.plan_version)
+            self.summarize_geography_ids = [
+                int(geo_id)
+                for geo_id in unpack_values(
+                    self.summarize_geography,
+                    "summarize_geography",
+                    choices=[str(geo_id) for geo_id in summarize_grid.geographies],
+                )
+            ]
+
+        # Generate column expressions.
+        crosswalk_name = (
+            f"{self.plan_version}__{self.geographic_unit}__"
+            f"{self.plan_version}__{self.summarize_by}.parquet"
+        )
+        crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
+
+        try:
+            crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
+        except FileNotFoundError:
+            msg = (
+                f"No crosswalk from {self.geographic_unit} to {self.summarize_by} "
+                f"for plan version {self.plan_version}"
+            )
+            raise HTTPException(status_code=400, detail=msg)
+
+        if self.geography_ids:
+            crosswalk_lf = crosswalk_lf.filter(
+                pl.col("src_id").is_in(self.geography_ids)
+            )
+
+        if self.summarize_geography_ids:
+            crosswalk_lf = crosswalk_lf.filter(
+                pl.col("dst_id").is_in(self.summarize_geography_ids)
+            )
+
+        crosswalk_df = (
+            crosswalk_lf.select(
+                "dst_id", summarize_columns=pl.struct("src_id", "scale_factor")
+            )
+            .group_by(pl.col("dst_id"))
+            .agg("summarize_columns")
+            .sort("dst_id")
+            .collect()
+        )
+
+        agg_function = getattr(pl, f"{self.summarize_aggregate}_horizontal")
+        self.lf = self.lf.select(
+            DIMENSION_COLUMNS,
+            **{
+                str(row["dst_id"]): agg_function(
+                    *[
+                        pl.col(str(col["src_id"])) * col["scale_factor"]
+                        for col in row["summarize_columns"]
+                    ]
+                )
+                for row in crosswalk_df.iter_rows(named=True)
+            },
+        ).with_columns(geographic_unit=pl.lit(self.summarize_by))
 
     def _apply_transform_params_raster(self):
         """Apply transform and extract parameters to the image."""

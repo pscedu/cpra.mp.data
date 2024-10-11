@@ -33,7 +33,7 @@ Without any query string parameters, each endpoint returns the full dataset by d
 | 1 | [Filter](#filter) | ✅ Implemented | ✅ Implemented |
 | 2 | [Calculate](#calculate) | ✅ Implemented | ❌ Not Implemented |
 | 3 | [Group and Aggregate](#group-and-aggregate) | ✅ Implemented | ❌ Not Implemented |
-| 4 | [Transform and Extract](#transform-and-extract) | ❌ Not Implemented | ❌ Not Implemented |
+| 4 | [Transform and Extract](#transform-and-extract) | ✅ Implemented | ❌ Not Implemented |
 | 5 | [Sort](#sort) | ✅ Implemented | ❌ Not Implemented |
 
 ### Filter
