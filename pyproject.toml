@@ -38,7 +38,7 @@ dependencies = [
 
 [project.optional-dependencies]
 api = [
-  "fastapi[standard]"
+  "fastapi[standard]>=0.115.0"
 ]
 scripts = [
   "fastexcel",

@@ -68,3 +68,13 @@ DimensionsQuery = create_model(
     model_config=ConfigDict(protected_namespaces=()),
     **dimension_params,
 )
+
+catalog_params = {
+    dim.name: (list[dimension_type(dim.name)] | None, None)
+    for dim in DIMENSIONS.values()
+}
+BaseCatalogQuery = create_model(
+    "CatalogQuery",
+    model_config=ConfigDict(protected_namespaces=()),
+    **catalog_params,
+)
