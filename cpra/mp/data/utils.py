@@ -1,4 +1,5 @@
 import polars as pl
+from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import get_grid
@@ -24,13 +25,13 @@ def partition_columns(df, include_dataset=True):
     ]
 
 
-def required_columns(df):
+def required_columns(df, include_dataset=True):
     """Get a list of required columns based on the values in the data frame."""
 
     return [
         col.name
         for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
-        if col.any()
+        if col.any() and (include_dataset or col.name not in DATASET_DIMENSIONS)
     ]
 
 
@@ -166,13 +167,36 @@ def read_fortran_array(filename, dtype=None, variable=None):
         return array_file.read_record(dtype)
 
 
-def build_glob_pattern(input_df, extension, required_cols=None, **kwargs):
+def build_glob_pattern(required_cols, extension=None, **kwargs):
     """Build a glob pattern for selecting files from a dataset directory."""
 
-    required_cols = required_cols or required_columns(input_df)
     dimension_patterns = [
-        f"{col}={str(kwargs[col])}" if col in kwargs else "*"
-        for col in required_cols
-        if col not in DATASET_DIMENSIONS
+        f"{col}={str(kwargs[col]) if col in kwargs else "*"}" for col in required_cols
     ]
-    return "/".join(dimension_patterns) + f".{extension}"
+    return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
+
+
+def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs):
+    """Create a LazyFrame with information about matched paths."""
+
+    glob_pattern = build_glob_pattern(
+        required_cols=required_cols, extension=extension, **kwargs
+    )
+    suffix = f"\\.{extension}" if extension else "$"
+
+    return (
+        pl.DataFrame({"path": [str(p) for p in base_path.glob(glob_pattern)]})
+        .select(
+            [
+                pl.col("path")
+                .str.extract(f"{dim.name}=([^/]+)(/|{suffix})", 1)
+                .cast(dim.dtype)
+                .alias(dim.name)
+                for dim in DIMENSIONS.values()
+                if dim.name in required_cols
+            ]
+            + [pl.col("path").cast(pl.String)]
+        )
+        .sort(required_cols)
+        .lazy()
+    )

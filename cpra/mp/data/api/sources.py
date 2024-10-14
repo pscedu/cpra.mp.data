@@ -1,0 +1,26 @@
+from cpra.mp.data.api.utils import timing
+from fastapi import HTTPException
+from polars.exceptions import ColumnNotFoundError
+
+
+class LazyFrameSource:
+    def __init__(self, lf):
+        self.lf = lf
+
+    def materialize(self, method="collect", *args, **kwargs):
+        """Materialize the LazyFrame with error handling."""
+        try:
+            return getattr(self.lf, method)(*args, **kwargs)
+        except ColumnNotFoundError as err:
+            raise HTTPException(status_code=400, detail=str(err))
+
+    @timing
+    def stream_tabular(self, out_path, format):
+        sink_method = {
+            "arrow": "sink_ipc",
+            "csv": "sink_csv",
+            "ndjson": "sink_ndjson",
+            "parquet": "sink_parquet",
+        }[format]
+        # TODO: Set parquet compression and row group parameters.
+        self.materialize(sink_method, out_path)

@@ -1,6 +1,4 @@
 import re
-from cpra.mp.data.api.types import BaseCatalogQuery
-from cpra.mp.data.api.utils import enum_value
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from fastapi import HTTPException
@@ -8,11 +6,11 @@ from fastapi import HTTPException
 TIF_EXTENSION = re.compile(r"\.tif$")
 
 
-class CatalogQuery(BaseCatalogQuery):
+class Catalog:
     """Data catalog query."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, dimensions):
+        self.dimensions = dimensions
         self._choices = {}
         self._results = {}
 
@@ -58,9 +56,9 @@ class CatalogQuery(BaseCatalogQuery):
         # from the available choices.
         selected_values = [self._choices[dimension_name][0]]
 
-        prop_value = getattr(self, dimension_name)
+        prop_value = getattr(self.dimensions, dimension_name)
         if prop_value:
-            selected_values = sorted([dtype(enum_value(val)) for val in prop_value])
+            selected_values = sorted([dtype(val) for val in prop_value])
             missing_values = [
                 val
                 for val in selected_values
@@ -76,6 +74,7 @@ class CatalogQuery(BaseCatalogQuery):
 
     def execute(self):
         """Execute a query for data."""
+        datatsets = []
         for root, dirs, files in BASE_PATH.walk():
             if dirs:
                 self._update(dirs)

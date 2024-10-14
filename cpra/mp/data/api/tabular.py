@@ -1,22 +1,22 @@
 import anyio
 import tempfile
-from cpra.mp.data.api.dataset import Dataset
+from cpra.mp.data.api.sources import LazyFrameSource
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 from threading import Thread
 
 
-def stream_to_file(dataset, out_path, format):
-    dataset.stream_tabular(out_path, format)
+def stream_to_file(source, out_path, format):
+    source.stream_tabular(out_path, format)
 
 
 class StreamingThread(Thread):
-    def __init__(self, dataset, out_path, format, **kwargs):
+    def __init__(self, source, out_path, format, **kwargs):
         kwargs.update(
             {
                 "target": stream_to_file,
                 "name": "stream_to_file",
-                "args": [dataset, out_path, format],
+                "args": [source, out_path, format],
             }
         )
         self.exception = None
@@ -39,8 +39,8 @@ class PolarsStreamingResponse(Response):
         "parquet": "application/vnd.apache.parquet",
     }
 
-    def __init__(self, dataset: Dataset, format: str = "csv") -> None:
-        self.dataset = dataset
+    def __init__(self, source: LazyFrameSource, format: str = "csv") -> None:
+        self.source = source
         self.format = format
         self.media_type = self.mime_types[format]
         self.init_headers()
@@ -50,7 +50,7 @@ class PolarsStreamingResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             with tempfile.NamedTemporaryFile() as fp:
-                write_thread = StreamingThread(self.dataset, fp.name, self.format)
+                write_thread = StreamingThread(self.source, fp.name, self.format)
                 write_thread.start()
                 sent_headers = False
                 async with await anyio.open_file(fp.name, mode="rb") as file:

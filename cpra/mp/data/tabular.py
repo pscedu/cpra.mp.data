@@ -139,13 +139,16 @@ def compact_parquet(
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)
-    validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
+    validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS)
 
     # Calculate the dataset directory path.
     dataset_dir = dataset_path(base_path, **kwargs)
 
     # Construct the glob pattern.
-    glob_pattern = build_glob_pattern(input_df, extension="parquet", **kwargs)
+    required_cols = required_columns(input_df, include_dataset=False)
+    glob_pattern = build_glob_pattern(
+        required_cols=required_cols, extension="parquet", **kwargs
+    )
     paths = list(dataset_dir.glob(glob_pattern))
 
     # Group by directory, and extract dimension values for directories with
