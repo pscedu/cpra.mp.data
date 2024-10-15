@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/pscedu/cpra.mp.data/compare/v0.6.0...v0.7.0) (2024-10-15)
+
+
+### Features
+
+* **api:** add geographic summary for tabular data ([e5cc111](https://github.com/pscedu/cpra.mp.data/commit/e5cc111a4f4454a5ebeb66afa7b025faaa116917))
+* **api:** add tree-walking catalog query ([fe6f809](https://github.com/pscedu/cpra.mp.data/commit/fe6f8090c65d1b93f1235f269e6ecca5c753487b))
+* **dimensions:** require calendar_day for monthly data ([ac578d7](https://github.com/pscedu/cpra.mp.data/commit/ac578d78f768c6ccf5434fe904f614f7a95a3d20))
+* **structure:** update data structure from spreadsheet ([8a0c4e3](https://github.com/pscedu/cpra.mp.data/commit/8a0c4e35ee0796c6e792f6c3bd1729753098aa1d))
+* **update_structure:** ignore sheets and columns starting with _ ([610b33d](https://github.com/pscedu/cpra.mp.data/commit/610b33db0a95e87c884f5ab455abc68030aff4f4))
+
 ## [0.6.0](https://github.com/pscedu/cpra.mp.data/compare/v0.5.0...v0.6.0) (2024-10-01)
 
 
