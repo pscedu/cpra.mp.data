@@ -6,7 +6,15 @@ geographic_unit,veg_grid_cell,Veg Grid Cell
 time_unit,annual,Annual
 time_unit,daily,Daily
 time_unit,decadal,Decadal
+time_unit,monthly,Monthly
 aggregate_type,mean,Mean
+aggregate_type,mean_oct_apr,Mean October to April
+aggregate_type,mean_sep_mar,Mean September to March
+aggregate_type,mean_summer,Mean Summer
+aggregate_type,growing_season,Growing Season
+aggregate_type,max,Max
+aggregate_type,var_summer,Variance Summer
+aggregate_type,std_dev,Standard Deviation
 aggregate_type,2_wk_max,Two Week Maximum
 aep,20,20
 aep,10,10

@@ -1,23 +1,23 @@
-label,name,type,dtype,required,min_value,max_value,example_value,scope
-Plan Version,plan_version,dataset,String,true,,,2023.0.0,
-Variable,variable,dataset,String,true,,,salinity_mean,
-Geography,geographic_unit,dataset,String,true,,,hydro_compartment,
-Time Unit,time_unit,dataset,String,true,,,daily,
-Plan Implementation Scenario,model_group_id,parition,Int32,true,100,999,500,
-Environmental Scenario,scenario_id,parition,Int32,true,1,100,7,
-Aggregate Type,aggregate_type,partition,String,false,,,2_wk_max,
-Annual Exceedance Probability,aep,parition,Float32,false,,,2,
-Synthetic Storm ID,storm_id,parition,Int32,false,1,1000,182,
-Pumping Scenario,pumping_id,parition,Float32,false,,,0.5,
-Fragility Scenario,fragility_scenario,parition,Int8,false,,,0,
-Asset Type,asset_type,parition,Int8,false,,,3,
-Infrastructure Category,infrastructure_category,parition,String,false,,,public_schools,
-Exposure Type,exposure_type,parition,String,false,,,moderate_exposure,
-Nonstructural Project,ns_project_id,parition,Int8,false,,,3,
-Participation Rate,participation_rate,parition,Float32,false,,,0.75,
-Migration,migration,parition,String,false,,,base,
-Shared Socioeconomic Pathway,ssp,parition,Int8,false,,,4,
-Vegetation Type,vegetation_code,parition,String,false,,,brm,
-Percentile,percentile,nonpartition,Int8,false,0,100,50,
-Year,calendar_year,nonpartition,Int32,false,2000,2100,2030,
-Date,calendar_day,nonpartition,Date,false,,,2030-01-01,
+label,name,type,dtype,required,min_value,max_value,example_value
+Plan Version,plan_version,dataset,String,true,,,2023.0.0
+Variable,variable,dataset,String,true,,,sal
+Geography,geographic_unit,dataset,String,true,,,hydro_compartment
+Time Unit,time_unit,dataset,String,true,,,daily
+Plan Implementation Scenario,model_group_id,parition,Int32,true,100,999,500
+Environmental Scenario,scenario_id,parition,Int32,true,1,100,7
+Aggregate Type,aggregate_type,partition,String,false,,,2_wk_max
+Annual Exceedance Probability,aep,parition,Float32,false,,,2
+Synthetic Storm ID,storm_id,parition,Int32,false,1,1000,182
+Pumping Scenario,pumping_id,parition,Float32,false,,,0.5
+Fragility Scenario,fragility_scenario,parition,Int8,false,,,0
+Asset Type,asset_type,parition,Int8,false,,,3
+Infrastructure Category,infrastructure_category,parition,String,false,,,public_schools
+Exposure Type,exposure_type,parition,String,false,,,moderate_exposure
+Nonstructural Project,ns_project_id,parition,Int8,false,,,3
+Participation Rate,participation_rate,parition,Float32,false,,,0.75
+Migration,migration,parition,String,false,,,base
+Shared Socioeconomic Pathway,ssp,parition,Int8,false,,,4
+Vegetation Type,vegetation_code,parition,String,false,,,brm
+Percentile,percentile,nonpartition,Int8,false,0,100,50
+Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
+Date,calendar_day,nonpartition,Date,false,,,2030-01-01
