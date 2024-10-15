@@ -110,4 +110,6 @@ DIMENSIONS["variable"].values = pl.DataFrame(
 DIMENSIONS["calendar_year"].required = (
     pl.col("time_unit").is_in(["annual", "decadal"]).any()
 )
-DIMENSIONS["calendar_day"].required = (pl.col("time_unit") == "daily").any()
+DIMENSIONS["calendar_day"].required = (
+    pl.col("time_unit").is_in(["daily", "monthly"]).any()
+)
