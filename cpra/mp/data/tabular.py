@@ -28,7 +28,11 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
         pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name)
         for dim in DATASET_DIMENSIONS.values()
     ]
-    filter_kwargs = {k: v for k, v in kwargs.items() if k not in DATASET_DIMENSIONS}
+    filter_args = [
+        pl.col(k).is_in(v) if isinstance(v, (list, tuple)) else pl.col(k) == v
+        for k, v in kwargs.items()
+        if k not in DATASET_DIMENSIONS
+    ]
 
     # Provide Hive partitioning schema since this is known in advance.
     partition_cols = partition_columns(input_df, include_dataset=True)
@@ -40,8 +44,8 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     )
 
     # Filter based on keyword arguments.
-    if filter_kwargs:
-        lf = lf.filter(**filter_kwargs)
+    if filter_args:
+        lf = lf.filter(*filter_args)
 
     # Sort columns and add dataset values.
     required_cols = required_columns(input_df)

@@ -16,7 +16,7 @@ from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
 from cpra.mp.data import read_data
-from cpra.mp.data.api.models import Dimensions, Options
+from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.utils import asynctiming
 from cpra.mp.data.api.types import OutputType
@@ -84,34 +84,50 @@ def unpack_values(values_str, param_name, choices=None, separator=","):
 
 
 class Dataset(LazyFrameSource):
-    def __init__(self, dimensions: Dimensions, options: Options):
-        self.dimensions = dimensions
+    def __init__(
+        self,
+        dataset_dimensions: DatasetDimensions,
+        filter_dimensions: FilterDimensions,
+        options: Options,
+    ):
+        self.dataset_dimensions = dataset_dimensions
+        self.filter_dimensions = filter_dimensions
         self.options = options
         self.dataset_bounds = None
+        self.geography_ids = None
+        self.summarize_geography_ids = None
 
         try:
             self.lf = read_data_cached(
-                **self.dimensions,
+                **dict(self.dataset_dimensions),
+                **{
+                    k: tuple(v)
+                    for (k, v) in dict(self.filter_dimensions).items()
+                    if isinstance(v, list)
+                },
             )
         except ValidationError as err:
             # TODO: Also handle directory does not exist errors.
             raise HTTPException(status_code=422, detail=str(err))
 
-        self.grid = get_grid(self.geographic_unit, self.plan_version)
+        self.grid = get_grid(
+            self.dataset_dimensions.geographic_unit,
+            self.dataset_dimensions.plan_version,
+        )
 
     @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.geography:
+        if self.grid.grid_type == "vector" or self.options.geography:
             return OutputType.vector
         return OutputType.raster
 
     async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame."""
-        if self.where:
-            self.lf = self.lf.sql(f"select * from self where {self.where}")
+        if self.options.where:
+            self.lf = self.lf.sql(f"select * from self where {self.options.where}")
 
-        if self.geography:
+        if self.options.geography:
             if self.grid.grid_type == "vector":
                 await self._apply_geography_vector()
             else:
@@ -120,7 +136,7 @@ class Dataset(LazyFrameSource):
     async def _apply_geography_vector(self):
         """Apply the geography filter to a vector-grid dataset."""
         self.geography_ids = unpack_values(
-            self.geography,
+            self.options.geography,
             "geography",
             choices=[str(geo_id) for geo_id in self.grid.geographies],
         )
@@ -131,7 +147,8 @@ class Dataset(LazyFrameSource):
         # Check that coordinates are numeric and that there are an even number.
         try:
             coords = [
-                float(coord) for coord in unpack_values(self.geography, "geography")
+                float(coord)
+                for coord in unpack_values(self.options.geography, "geography")
             ]
         except ValueError:
             raise HTTPException(
@@ -176,11 +193,19 @@ class Dataset(LazyFrameSource):
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
-        if self.negate is None and self.multiply10 is None and self.multiply100 is None:
+        if (
+            self.options.negate is None
+            and self.options.multiply10 is None
+            and self.options.multiply100 is None
+        ):
             return
 
         if self.output_type == OutputType.vector:
-            sql_expressions = [self.negate, self.multiply10, self.multiply100]
+            sql_expressions = [
+                self.options.negate,
+                self.options.multiply10,
+                self.options.multiply100,
+            ]
             factors = [-1, 10, 100]
 
             when_expression = pl
@@ -206,16 +231,20 @@ class Dataset(LazyFrameSource):
 
     def _apply_group_params(self):
         """Apply group and aggregate parameters to the LazyFrame or image."""
-        if self.group_by is None and self.group_aggregate is None:
+        if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
-        if self.group_by is None or self.group_aggregate is None:
+        if self.options.group_by is None or self.options.group_aggregate is None:
             msg = "group_by and group_aggregate parameters must be used together"
             raise HTTPException(status_code=400, detail=msg)
 
         if self.output_type == OutputType.vector:
-            group_cols = unpack_values(self.group_by, "group_by", DIMENSION_CHOICES)
-            self.lf = getattr(self.lf.group_by(*group_cols), self.group_aggregate)()
+            group_cols = unpack_values(
+                self.options.group_by, "group_by", DIMENSION_CHOICES
+            )
+            self.lf = getattr(
+                self.lf.group_by(*group_cols), self.options.group_aggregate
+            )()
 
     def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
@@ -227,27 +256,35 @@ class Dataset(LazyFrameSource):
     def _apply_transform_params_vector(self):
         """Apply transform and extract parameters to the LazyFrame."""
 
-        if self.melt:
+        if self.options.melt:
             self.lf = self.lf.unpivot(
                 index=DIMENSION_COLUMNS, variable_name="geography"
             )
 
-        if self.summarize_by is None and self.summarize_aggregate is None:
+        if (
+            self.options.summarize_by is None
+            and self.options.summarize_aggregate is None
+        ):
             return
 
-        if self.summarize_by is None or self.summarize_aggregate is None:
+        if (
+            self.options.summarize_by is None
+            or self.options.summarize_aggregate is None
+        ):
             msg = (
                 "summarize_by and summarize_aggregate parameters must be used together"
             )
             raise HTTPException(status_code=400, detail=msg)
 
         # Extract and validate summary geography IDs, if present.
-        if self.summarize_geography:
-            summarize_grid = get_grid(self.summarize_by, self.plan_version)
+        if self.options.summarize_geography:
+            summarize_grid = get_grid(
+                self.options.summarize_by, self.dataset_dimensions.plan_version
+            )
             self.summarize_geography_ids = [
                 int(geo_id)
                 for geo_id in unpack_values(
-                    self.summarize_geography,
+                    self.options.summarize_geography,
                     "summarize_geography",
                     choices=[str(geo_id) for geo_id in summarize_grid.geographies],
                 )
@@ -255,8 +292,8 @@ class Dataset(LazyFrameSource):
 
         # Generate column expressions.
         crosswalk_name = (
-            f"{self.plan_version}__{self.geographic_unit}__"
-            f"{self.plan_version}__{self.summarize_by}.parquet"
+            f"{self.dataset_dimensions.plan_version}__{self.dataset_dimensions.geographic_unit}__"
+            f"{self.dataset_dimensions.plan_version}__{self.options.summarize_by}.parquet"
         )
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
 
@@ -264,7 +301,7 @@ class Dataset(LazyFrameSource):
             crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
         except FileNotFoundError:
             msg = (
-                f"No crosswalk from {self.geographic_unit} to {self.summarize_by} "
+                f"No crosswalk from {self.geographic_unit} to {self.options.summarize_by} "
                 f"for plan version {self.plan_version}"
             )
             raise HTTPException(status_code=400, detail=msg)
@@ -289,7 +326,7 @@ class Dataset(LazyFrameSource):
             .collect()
         )
 
-        agg_function = getattr(pl, f"{self.summarize_aggregate}_horizontal")
+        agg_function = getattr(pl, f"{self.options.summarize_aggregate}_horizontal")
         self.lf = self.lf.select(
             DIMENSION_COLUMNS,
             **{
@@ -301,7 +338,7 @@ class Dataset(LazyFrameSource):
                 )
                 for row in crosswalk_df.iter_rows(named=True)
             },
-        ).with_columns(geographic_unit=pl.lit(self.summarize_by))
+        ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
 
     def _apply_transform_params_raster(self):
         """Apply transform and extract parameters to the image."""
@@ -312,7 +349,7 @@ class Dataset(LazyFrameSource):
         self._apply_calculate_params()
         self._apply_group_params()
         self._apply_transform_params()
-        self._apply_sort_param(self.sort, "sort")
+        self._apply_sort_param(self.options.sort, "sort")
 
     @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):

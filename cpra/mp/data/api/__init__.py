@@ -1,14 +1,18 @@
 import polars.selectors as cs
-from cpra.mp.data.api.catalog import Catalog
+from cpra.mp.data.api.catalog import DatasetCatalog
 from cpra.mp.data.api.dataset import Dataset
-from cpra.mp.data.api.models import Dimensions, Options
+from cpra.mp.data.api.models import (
+    DatasetDimensions,
+    FilterDimensions,
+    FilterDimensionsAndOptions,
+)
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS
 from cpra.mp.data.utils import glob_lazy_frame
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Annotated
@@ -43,10 +47,11 @@ async def catalog_datasets(
     tags=["Catalog"],
 )
 async def catalog_query(
-    dimensions: Annotated[Dimensions, Query()],
+    filter_dimensions: Annotated[FilterDimensions, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    catalog = Catalog(dimensions)
-    return JSONResponse(content=catalog.execute())
+    catalog = DatasetCatalog(dataset_dimensions, filter_dimensions)
+    return JSONResponse(content=catalog.query())
 
 
 @app.get(
@@ -55,10 +60,10 @@ async def catalog_query(
 )
 async def get_model_data(
     format: DataFormat,
-    dimensions: Annotated[Dimensions, Query()],
-    options: Annotated[Options, Query()],
+    query: Annotated[FilterDimensionsAndOptions, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    dataset = Dataset(dimensions, options)
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
         return RasterioStreamingResponse(dataset, format)
@@ -74,9 +79,9 @@ async def get_model_tile(
     z: int,
     x: int,
     y: int,
-    dimensions: Annotated[Dimensions, Query()],
-    options: Annotated[Options, Query()],
+    query: Annotated[FilterDimensionsAndOptions, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    dataset = Dataset(dimensions, options)
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     return RasterioTileResponse(dataset, x, y, z, format)

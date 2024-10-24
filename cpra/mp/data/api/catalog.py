@@ -1,16 +1,18 @@
 import re
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.utils import dataset_path, validate_grid
 from fastapi import HTTPException
 
 TIF_EXTENSION = re.compile(r"\.tif$")
 
 
-class Catalog:
+class DatasetCatalog:
     """Data catalog query."""
 
-    def __init__(self, dimensions):
-        self.dimensions = dimensions
+    def __init__(self, dataset_dimensions, filter_dimensions):
+        self.dataset_dimensions = dataset_dimensions
+        self.filter_dimensions = filter_dimensions
         self._choices = {}
         self._results = {}
 
@@ -72,10 +74,13 @@ class Catalog:
         self._results[dimension_name] = selected_values
         items[:] = [f"{dimension_name}={str(val)}" for val in selected_values]
 
-    def execute(self):
+    def query(self):
         """Execute a query for data."""
-        datatsets = []
-        for root, dirs, files in BASE_PATH.walk():
+        dataset_dict = dict(self.dataset_dimensions)
+        grid = validate_grid(**dataset_dict)
+        dataset_base_path = dataset_path(BASE_PATH, **dataset_dict)
+
+        for root, dirs, files in dataset_base_path.walk():
             if dirs:
                 self._update(dirs)
             elif files:

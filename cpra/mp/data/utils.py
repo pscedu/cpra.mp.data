@@ -169,9 +169,16 @@ def read_fortran_array(filename, dtype=None, variable=None):
 
 def build_glob_pattern(required_cols, extension=None, **kwargs):
     """Build a glob pattern for selecting files from a dataset directory."""
-
+    # The values of the keyword arguments can be lists or tuples that contain
+    # multiple values, but for the glob pattern, we can only use single values.
+    single_values = {
+        k: v[0] if isinstance(v, (list, tuple)) else v
+        for k, v in kwargs.items()
+        if not isinstance(v, (list, tuple)) or len(v) == 1
+    }
     dimension_patterns = [
-        f"{col}={str(kwargs[col]) if col in kwargs else "*"}" for col in required_cols
+        f"{col}={str(single_values[col]) if col in single_values else "*"}"
+        for col in required_cols
     ]
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
 

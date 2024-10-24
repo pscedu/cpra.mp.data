@@ -75,7 +75,9 @@ def read_cog(base_path=BASE_PATH, **kwargs):
 
     # Construct the glob lazy frame.
     required_cols = required_columns(input_df, include_dataset=False)
-    return glob_lazy_frame(required_cols=required_cols, base_path=dataset_dir, **kwargs)
+    return glob_lazy_frame(
+        required_cols=required_cols, base_path=dataset_dir, extension="tif", **kwargs
+    )
 
 
 def write_cog(
