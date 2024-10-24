@@ -1,11 +1,9 @@
-import asyncio
 import itertools
 import mercantile
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import rasterio as rio
-from cachetools import cached, TTLCache
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
@@ -15,14 +13,18 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
-from cpra.mp.data import read_data
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
-from cpra.mp.data.api.utils import asynctiming
+from cpra.mp.data.api.utils import (
+    asynctiming,
+    get_lazy_frame,
+    parallel_read_rasters,
+    parallel_sample_rasters,
+    unpack_values,
+)
 from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
-from cpra.mp.data.exceptions import ValidationError
 from contextlib import ExitStack
 from fastapi import HTTPException
 
@@ -30,57 +32,6 @@ DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
 VALUE_COLUMNS = cs.matches(r"^[0-9]")
-
-
-@cached(cache=TTLCache(maxsize=128, ttl=600))
-def read_data_cached(*args, **kwargs):
-    return read_data(*args, **kwargs)
-
-
-def read_window(dataset, window, out_shape=None, resampling=Resampling.nearest):
-    return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
-
-
-async def parallel_read_rasters(
-    datasets, window=None, out_shape=None, resampling=Resampling.nearest
-):
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[
-            loop.run_in_executor(
-                None, read_window, dataset, window, out_shape, resampling
-            )
-            for dataset in datasets
-        ]
-    )
-
-
-def sample_raster(dataset, coordinates):
-    return list(dataset.sample(coordinates))
-
-
-async def parallel_sample_rasters(datasets, coordinates):
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[
-            loop.run_in_executor(None, sample_raster, dataset, coordinates)
-            for dataset in datasets
-        ]
-    )
-
-
-def unpack_values(values_str, param_name, choices=None, separator=","):
-    """Unpack values from a comma-separated list."""
-    values = [val.strip() for val in values_str.split(separator)]
-
-    # Validate choices.
-    if choices:
-        invalid_values = [val for val in values if val not in choices]
-        if invalid_values:
-            msg = f"Invalid values for {param_name}: {", ".join(invalid_values)}"
-            raise HTTPException(status_code=400, detail=msg)
-
-    return values
 
 
 class Dataset(LazyFrameSource):
@@ -97,19 +48,7 @@ class Dataset(LazyFrameSource):
         self.geography_ids = None
         self.summarize_geography_ids = None
 
-        try:
-            self.lf = read_data_cached(
-                **dict(self.dataset_dimensions),
-                **{
-                    k: tuple(v)
-                    for (k, v) in dict(self.filter_dimensions).items()
-                    if isinstance(v, list)
-                },
-            )
-        except ValidationError as err:
-            # TODO: Also handle directory does not exist errors.
-            raise HTTPException(status_code=422, detail=str(err))
-
+        self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
         self.grid = get_grid(
             self.dataset_dimensions.geographic_unit,
             self.dataset_dimensions.plan_version,
