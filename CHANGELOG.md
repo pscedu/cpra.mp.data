@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/pscedu/cpra.mp.data/compare/v0.8.0...v0.8.1) (2024-10-25)
+
+
+### Documentation
+
+* **api:** update catalog API example response ([682a202](https://github.com/pscedu/cpra.mp.data/commit/682a202d5d1426613ebc6de94d0fe3d68816dae2))
+
 ## [0.8.0](https://github.com/pscedu/cpra.mp.data/compare/v0.7.0...v0.8.0) (2024-10-25)
 
 
