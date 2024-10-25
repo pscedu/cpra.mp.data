@@ -3,7 +3,6 @@ from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
 from datetime import date
 from enum import Enum
-from pydantic import create_model, ConfigDict
 
 
 def dimension_type(dim_name):
@@ -56,25 +55,4 @@ ColorMap = Enum("ColorMap", {str(k): k for k in LEGENDS.keys()})
 VectorGeographicUnit = Enum(
     "GeographicUnit",
     {str(k): k for k, v in GRIDS.items() if list(v.values())[0].grid_type == "vector"},
-)
-
-dimension_params = {
-    dim.name: (dimension_type(dim.name) | None, None)
-    for dim in DIMENSIONS.values()
-    if dim.type != "dataset"
-}
-DimensionsQuery = create_model(
-    "DimensionsQuery",
-    model_config=ConfigDict(protected_namespaces=()),
-    **dimension_params,
-)
-
-catalog_params = {
-    dim.name: (list[dimension_type(dim.name)] | None, None)
-    for dim in DIMENSIONS.values()
-}
-BaseCatalogQuery = create_model(
-    "CatalogQuery",
-    model_config=ConfigDict(protected_namespaces=()),
-    **catalog_params,
 )

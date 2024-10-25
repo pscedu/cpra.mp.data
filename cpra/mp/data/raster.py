@@ -1,14 +1,13 @@
 import polars as pl
 import rasterio as rio
-
 import xml.etree.ElementTree
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
-    build_glob_pattern,
     cast_columns,
     dataset_path,
+    glob_lazy_frame,
     required_columns,
     validate_data_frame,
 )
@@ -74,28 +73,10 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     # Calculate the dataset directory path.
     dataset_dir = dataset_path(base_path, **kwargs)
 
-    # Construct the glob pattern.
-    required_cols = required_columns(input_df)
-    glob_pattern = build_glob_pattern(
-        input_df, extension="tif", required_cols=required_cols, **kwargs
-    )
-
-    # Create a data frame from the COG paths.
-    return (
-        pl.DataFrame({"path": [str(p) for p in dataset_dir.glob(glob_pattern)]})
-        .select(
-            [
-                pl.col("path")
-                .str.extract(f"{dim.name}=([^/]+)(/|\\.tif)", 1)
-                .cast(dim.dtype)
-                .alias(dim.name)
-                for dim in DIMENSIONS.values()
-                if dim.name in required_cols
-            ]
-            + [pl.col("path").cast(pl.String)]
-        )
-        .sort(required_cols)
-        .lazy()
+    # Construct the glob lazy frame.
+    required_cols = required_columns(input_df, include_dataset=False)
+    return glob_lazy_frame(
+        required_cols=required_cols, base_path=dataset_dir, extension="tif", **kwargs
     )
 
 

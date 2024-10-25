@@ -1,6 +1,4 @@
 import re
-from cpra.mp.data.api.types import BaseCatalogQuery
-from cpra.mp.data.api.utils import enum_value
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from fastapi import HTTPException
@@ -8,11 +6,12 @@ from fastapi import HTTPException
 TIF_EXTENSION = re.compile(r"\.tif$")
 
 
-class CatalogQuery(BaseCatalogQuery):
+class CatalogQuery:
     """Data catalog query."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, dataset_dimensions, filter_dimensions):
+        self.dataset_dimensions = dataset_dimensions
+        self.filter_dimensions = filter_dimensions
         self._choices = {}
         self._results = {}
 
@@ -27,30 +26,17 @@ class CatalogQuery(BaseCatalogQuery):
 
         # Update choices with the dimension values.
         if dimension_name in self._choices:
-            # Geographic unit and time unit are special cases, because the values don't
-            # have to match. For these dimensions, we use OR instead of AND.
-            if dimension_name in ("geographic_unit", "time_unit"):
-                self._choices[dimension_name].extend(
-                    [
-                        val
-                        for val in dimension_values
-                        if val not in self._choices[dimension_name]
-                    ]
-                )
+            # Calculate choices that are common to this branch and previous branches.
+            common_choices = [
+                val for val in self._choices[dimension_name] if val in dimension_values
+            ]
+            # If there are common choices, assign them as the choices for
+            # this dimension. Otherwise, return an error.
+            if common_choices:
+                self._choices[dimension_name] = common_choices
             else:
-                # Calculate choices that are common to this branch and previous branches.
-                common_choices = [
-                    val
-                    for val in self._choices[dimension_name]
-                    if val in dimension_values
-                ]
-                # If there are common choices, assign them as the choices for
-                # this dimension. Otherwise, return an error.
-                if common_choices:
-                    self._choices[dimension_name] = common_choices
-                else:
-                    msg = f"No common values for dimension {dimension_name}"
-                    raise HTTPException(status_code=404, detail=msg)
+                msg = f"No common values for dimension {dimension_name}"
+                raise HTTPException(status_code=404, detail=msg)
         else:
             self._choices[dimension_name] = dimension_values
 
@@ -58,9 +44,16 @@ class CatalogQuery(BaseCatalogQuery):
         # from the available choices.
         selected_values = [self._choices[dimension_name][0]]
 
-        prop_value = getattr(self, dimension_name)
+        prop_value = getattr(
+            self.dataset_dimensions
+            if dimension.type == "dataset"
+            else self.filter_dimensions,
+            dimension_name,
+        )
         if prop_value:
-            selected_values = sorted([dtype(enum_value(val)) for val in prop_value])
+            if not isinstance(prop_value, (list, tuple)):
+                prop_value = (prop_value,)
+            selected_values = sorted([dtype(val) for val in prop_value])
             missing_values = [
                 val
                 for val in selected_values

@@ -1,39 +1,32 @@
-import asyncio
 import itertools
 import mercantile
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import rasterio as rio
-from cachetools import cached, TTLCache
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
-from polars.exceptions import ColumnNotFoundError
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
-from cpra.mp.data import read_data
+from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+from cpra.mp.data.api.sources import LazyFrameSource
+from cpra.mp.data.api.utils import (
+    asynctiming,
+    get_lazy_frame,
+    parallel_read_rasters,
+    parallel_sample_rasters,
+    unpack_values,
+)
+from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
-from cpra.mp.data.exceptions import ValidationError
-from cpra.mp.data.api.types import (
-    AggregateFunction,
-    ColorMap,
-    DimensionsQuery,
-    GeographicUnit,
-    OutputType,
-    PlanVersion,
-    TimeUnit,
-    Variable,
-    VectorGeographicUnit,
-)
-from cpra.mp.data.api.utils import asynctiming, enum_value, timing
 from contextlib import ExitStack
-from fastapi import Depends, HTTPException
+from fastapi import HTTPException
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
@@ -41,128 +34,39 @@ DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
 VALUE_COLUMNS = cs.matches(r"^[0-9]")
 
 
-@cached(cache=TTLCache(maxsize=128, ttl=600))
-def read_data_cached(*args, **kwargs):
-    return read_data(*args, **kwargs)
-
-
-def read_window(dataset, window, out_shape=None, resampling=Resampling.nearest):
-    return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
-
-
-async def parallel_read_rasters(
-    datasets, window=None, out_shape=None, resampling=Resampling.nearest
-):
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[
-            loop.run_in_executor(
-                None, read_window, dataset, window, out_shape, resampling
-            )
-            for dataset in datasets
-        ]
-    )
-
-
-def sample_raster(dataset, coordinates):
-    return list(dataset.sample(coordinates))
-
-
-async def parallel_sample_rasters(datasets, coordinates):
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[
-            loop.run_in_executor(None, sample_raster, dataset, coordinates)
-            for dataset in datasets
-        ]
-    )
-
-
-def unpack_values(values_str, param_name, choices=None, separator=","):
-    """Unpack values from a comma-separated list."""
-    values = [val.strip() for val in values_str.split(separator)]
-
-    # Validate choices.
-    if choices:
-        invalid_values = [val for val in values if val not in choices]
-        if invalid_values:
-            msg = f"Invalid values for {param_name}: {", ".join(invalid_values)}"
-            raise HTTPException(status_code=400, detail=msg)
-
-    return values
-
-
-class Dataset:
+class Dataset(LazyFrameSource):
     def __init__(
         self,
-        plan_version: PlanVersion,
-        variable: Variable,
-        geographic_unit: GeographicUnit,
-        time_unit: TimeUnit,
-        geography: str | None = None,
-        where: str | None = None,
-        negate: str | None = None,
-        multiply10: str | None = None,
-        multiply100: str | None = None,
-        group_by: str | None = None,
-        group_aggregate: AggregateFunction | None = None,
-        color_map: ColorMap | None = None,
-        melt: bool = False,
-        summarize_by: VectorGeographicUnit | None = None,
-        summarize_aggregate: AggregateFunction | None = None,
-        summarize_geography: str | None = None,
-        sort: str | None = None,
-        dimensions: DimensionsQuery = Depends(),
+        dataset_dimensions: DatasetDimensions,
+        filter_dimensions: FilterDimensions,
+        options: Options,
     ):
-        self.plan_version = plan_version.value
-        self.variable = variable.value
-        self.geographic_unit = geographic_unit.value
-        self.time_unit = time_unit.value
-        self.geography = geography
-        self.geography_ids = None
-        self.where = where
-        self.negate = negate
-        self.multiply10 = multiply10
-        self.multiply100 = multiply100
-        self.group_by = group_by
-        self.group_aggregate = enum_value(group_aggregate)
-        self.color_map = enum_value(color_map)
-        self.melt = melt
-        self.summarize_by = enum_value(summarize_by)
-        self.summarize_aggregate = enum_value(summarize_aggregate)
-        self.summarize_geography = summarize_geography
-        self.summarize_geography_ids = None
-        self.sort = sort
-        self.dimensions = {k: enum_value(v) for k, v in dimensions if v is not None}
+        self.dataset_dimensions = dataset_dimensions
+        self.filter_dimensions = filter_dimensions
+        self.options = options
         self.dataset_bounds = None
+        self.geography_ids = None
+        self.summarize_geography_ids = None
 
-        try:
-            self.lf = read_data_cached(
-                plan_version=self.plan_version,
-                variable=self.variable,
-                geographic_unit=self.geographic_unit,
-                time_unit=self.time_unit,
-                **self.dimensions,
-            )
-        except ValidationError as err:
-            # TODO: Also handle directory does not exist errors.
-            raise HTTPException(status_code=422, detail=str(err))
-
-        self.grid = get_grid(self.geographic_unit, self.plan_version)
+        self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
+        self.grid = get_grid(
+            self.dataset_dimensions.geographic_unit,
+            self.dataset_dimensions.plan_version,
+        )
 
     @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.geography:
+        if self.grid.grid_type == "vector" or self.options.geography:
             return OutputType.vector
         return OutputType.raster
 
     async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame."""
-        if self.where:
-            self.lf = self.lf.sql(f"select * from self where {self.where}")
+        if self.options.where:
+            self.lf = self.lf.sql(f"select * from self where {self.options.where}")
 
-        if self.geography:
+        if self.options.geography:
             if self.grid.grid_type == "vector":
                 await self._apply_geography_vector()
             else:
@@ -171,7 +75,7 @@ class Dataset:
     async def _apply_geography_vector(self):
         """Apply the geography filter to a vector-grid dataset."""
         self.geography_ids = unpack_values(
-            self.geography,
+            self.options.geography,
             "geography",
             choices=[str(geo_id) for geo_id in self.grid.geographies],
         )
@@ -182,7 +86,8 @@ class Dataset:
         # Check that coordinates are numeric and that there are an even number.
         try:
             coords = [
-                float(coord) for coord in unpack_values(self.geography, "geography")
+                float(coord)
+                for coord in unpack_values(self.options.geography, "geography")
             ]
         except ValueError:
             raise HTTPException(
@@ -208,7 +113,7 @@ class Dataset:
             lats.append(lat)
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
-        df = self._materialize()
+        df = self.materialize()
         with ExitStack() as stack:
             datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
             src_crs = CRS.from_epsg(4326)
@@ -227,11 +132,19 @@ class Dataset:
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
-        if self.negate is None and self.multiply10 is None and self.multiply100 is None:
+        if (
+            self.options.negate is None
+            and self.options.multiply10 is None
+            and self.options.multiply100 is None
+        ):
             return
 
         if self.output_type == OutputType.vector:
-            sql_expressions = [self.negate, self.multiply10, self.multiply100]
+            sql_expressions = [
+                self.options.negate,
+                self.options.multiply10,
+                self.options.multiply100,
+            ]
             factors = [-1, 10, 100]
 
             when_expression = pl
@@ -257,16 +170,20 @@ class Dataset:
 
     def _apply_group_params(self):
         """Apply group and aggregate parameters to the LazyFrame or image."""
-        if self.group_by is None and self.group_aggregate is None:
+        if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
-        if self.group_by is None or self.group_aggregate is None:
+        if self.options.group_by is None or self.options.group_aggregate is None:
             msg = "group_by and group_aggregate parameters must be used together"
             raise HTTPException(status_code=400, detail=msg)
 
         if self.output_type == OutputType.vector:
-            group_cols = unpack_values(self.group_by, "group_by", DIMENSION_CHOICES)
-            self.lf = getattr(self.lf.group_by(*group_cols), self.group_aggregate)()
+            group_cols = unpack_values(
+                self.options.group_by, "group_by", DIMENSION_CHOICES
+            )
+            self.lf = getattr(
+                self.lf.group_by(*group_cols), self.options.group_aggregate
+            )()
 
     def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
@@ -278,27 +195,35 @@ class Dataset:
     def _apply_transform_params_vector(self):
         """Apply transform and extract parameters to the LazyFrame."""
 
-        if self.melt:
+        if self.options.melt:
             self.lf = self.lf.unpivot(
                 index=DIMENSION_COLUMNS, variable_name="geography"
             )
 
-        if self.summarize_by is None and self.summarize_aggregate is None:
+        if (
+            self.options.summarize_by is None
+            and self.options.summarize_aggregate is None
+        ):
             return
 
-        if self.summarize_by is None or self.summarize_aggregate is None:
+        if (
+            self.options.summarize_by is None
+            or self.options.summarize_aggregate is None
+        ):
             msg = (
                 "summarize_by and summarize_aggregate parameters must be used together"
             )
             raise HTTPException(status_code=400, detail=msg)
 
         # Extract and validate summary geography IDs, if present.
-        if self.summarize_geography:
-            summarize_grid = get_grid(self.summarize_by, self.plan_version)
+        if self.options.summarize_geography:
+            summarize_grid = get_grid(
+                self.options.summarize_by, self.dataset_dimensions.plan_version
+            )
             self.summarize_geography_ids = [
                 int(geo_id)
                 for geo_id in unpack_values(
-                    self.summarize_geography,
+                    self.options.summarize_geography,
                     "summarize_geography",
                     choices=[str(geo_id) for geo_id in summarize_grid.geographies],
                 )
@@ -306,8 +231,8 @@ class Dataset:
 
         # Generate column expressions.
         crosswalk_name = (
-            f"{self.plan_version}__{self.geographic_unit}__"
-            f"{self.plan_version}__{self.summarize_by}.parquet"
+            f"{self.dataset_dimensions.plan_version}__{self.dataset_dimensions.geographic_unit}__"
+            f"{self.dataset_dimensions.plan_version}__{self.options.summarize_by}.parquet"
         )
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
 
@@ -315,7 +240,7 @@ class Dataset:
             crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
         except FileNotFoundError:
             msg = (
-                f"No crosswalk from {self.geographic_unit} to {self.summarize_by} "
+                f"No crosswalk from {self.geographic_unit} to {self.options.summarize_by} "
                 f"for plan version {self.plan_version}"
             )
             raise HTTPException(status_code=400, detail=msg)
@@ -340,7 +265,7 @@ class Dataset:
             .collect()
         )
 
-        agg_function = getattr(pl, f"{self.summarize_aggregate}_horizontal")
+        agg_function = getattr(pl, f"{self.options.summarize_aggregate}_horizontal")
         self.lf = self.lf.select(
             DIMENSION_COLUMNS,
             **{
@@ -352,17 +277,10 @@ class Dataset:
                 )
                 for row in crosswalk_df.iter_rows(named=True)
             },
-        ).with_columns(geographic_unit=pl.lit(self.summarize_by))
+        ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
 
     def _apply_transform_params_raster(self):
         """Apply transform and extract parameters to the image."""
-
-    def _materialize(self, method="collect", *args, **kwargs):
-        """Materialize the LazyFrame with error handling."""
-        try:
-            return getattr(self.lf, method)(*args, **kwargs)
-        except ColumnNotFoundError as err:
-            raise HTTPException(status_code=400, detail=str(err))
 
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
@@ -370,7 +288,7 @@ class Dataset:
         self._apply_calculate_params()
         self._apply_group_params()
         self._apply_transform_params()
-        self._apply_sort_param(self.sort, "sort")
+        self._apply_sort_param(self.options.sort, "sort")
 
     @asynctiming
     async def get_tile(self, x, y, z, tile_size=256, **kwargs):
@@ -380,7 +298,7 @@ class Dataset:
         if self.dataset_bounds and disjoint_bounds(self.dataset_bounds, tile_bounds):
             return None
 
-        df = self._materialize()
+        df = self.materialize()
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             vrts = [
@@ -444,23 +362,12 @@ class Dataset:
                 image.save(memfile, format="PNG")
                 return memfile.getvalue()
 
-    @timing
-    def stream_tabular(self, out_path, format):
-        sink_method = {
-            "arrow": "sink_ipc",
-            "csv": "sink_csv",
-            "ndjson": "sink_ndjson",
-            "parquet": "sink_parquet",
-        }[format]
-        # TODO: Set parquet compression and row group parameters.
-        self._materialize(sink_method, out_path)
-
     @asynctiming
     async def write_raster(self, out_path, **kwargs):
         """Write a raster dataset to a file using windowed reading and writing
         to conserve memory."""
 
-        df = self._materialize()
+        df = self.materialize()
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             profile = inputs[0].profile.copy()
