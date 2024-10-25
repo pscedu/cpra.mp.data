@@ -7,6 +7,7 @@ from cpra.mp.data.grids import get_grid
 from cpra.mp.data.utils import (
     build_glob_pattern,
     dataset_path,
+    get_filter_expressions,
     partition_columns,
     required_columns,
     validate_data_frame,
@@ -28,11 +29,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
         pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name)
         for dim in DATASET_DIMENSIONS.values()
     ]
-    filter_args = [
-        pl.col(k).is_in(v) if isinstance(v, (list, tuple)) else pl.col(k) == v
-        for k, v in kwargs.items()
-        if k not in DATASET_DIMENSIONS
-    ]
+    filter_args = get_filter_expressions(**kwargs)
 
     # Provide Hive partitioning schema since this is known in advance.
     partition_cols = partition_columns(input_df, include_dataset=True)

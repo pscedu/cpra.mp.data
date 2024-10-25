@@ -207,3 +207,24 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
         .sort(required_cols)
         .lazy()
     )
+
+
+def get_input_data_frame(**kwargs):
+    """Create an input data frame from keyword arguments."""
+    df = None
+    for key, value in kwargs.items():
+        if df is None:
+            df = pl.DataFrame({key: value})
+        else:
+            df = df.join(pl.DataFrame({key: value}), how="cross")
+
+    return df
+
+
+def get_filter_expressions(**kwargs):
+    """Generate a list of Polars filter expressions."""
+    return [
+        pl.col(k).is_in(v) if isinstance(v, (list, tuple)) else pl.col(k) == v
+        for k, v in kwargs.items()
+        if k not in DATASET_DIMENSIONS
+    ]
