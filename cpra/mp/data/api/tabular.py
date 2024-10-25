@@ -56,9 +56,13 @@ class PolarsStreamingResponse(Response):
                 async with await anyio.open_file(fp.name, mode="rb") as file:
                     more_body = True
                     while more_body:
+                        # Check whether the thread is alive *before* attempting to read data
+                        # to avoid a race condition where the thread terminates immediately
+                        # after the failed read attempt but before calling .is_alive().
+                        is_alive = write_thread.is_alive()
                         chunk = await file.read(self.chunk_size)
                         chunk_has_data = len(chunk) > 0
-                        more_body = chunk_has_data or write_thread.is_alive()
+                        more_body = chunk_has_data or is_alive
                         if chunk_has_data or not more_body:
                             if not sent_headers:
                                 sent_headers = True
