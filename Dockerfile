@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.6-slim
 LABEL maintainer="mjyoder@psc.edu"
 LABEL org.opencontainers.image.source="https://github.com/pscedu/cpra.mp.data"
 
