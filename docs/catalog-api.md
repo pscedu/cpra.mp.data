@@ -34,22 +34,21 @@ GET /v1/datasets/2029.1.0/sal/hydro_compartment/daily/catalog.json?model_group_i
 ```json
 {
   "choices": {
-	"variable": ["annual_exceedance_damages_dollars", "expected_annual_damages_dollars", ...],
-	"geographic_unit": ["extraction_point", "hydro_compartment"],
+	"plan_version": ["2023.0.2", "2029.1.0"],
+	"variable": ["aedd", "eadd", ...],
+	"geographic_unit": ["hydro_compartment"],
 	"time_unit": ["annual", "daily"],
-    "plan_version": ["2023.0.2", "2029.1.0"],
 	"model_group": [500, 521],
 	"scenario": [7, 8],
 	"calendar_date": [["2025-01-01", "2044-12-31"], ["2050-01-01", "2070-12-31"]]
   },
   "dataset": {
-	"metric": "salinity_mean",
+	"metric": "sal",
 	"geographic_unit": "hydro_compartment",
 	"time_unit": "daily",
 	"model_group": 500,
 	"scenario": 7,
 	"calendar_date": "2030-01-01"
-  },
-  "exactMatch": true
+  }
 }
 ```
