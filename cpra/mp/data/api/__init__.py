@@ -1,5 +1,5 @@
 import polars.selectors as cs
-from cpra.mp.data.api.catalog import DatasetCatalog
+from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     DatasetDimensions,
@@ -50,8 +50,8 @@ async def catalog_query(
     filter_dimensions: Annotated[FilterDimensions, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    catalog = DatasetCatalog(dataset_dimensions, filter_dimensions)
-    return JSONResponse(content=catalog.query())
+    catalog_query = CatalogQuery(dataset_dimensions, filter_dimensions)
+    return JSONResponse(content=catalog_query.execute())
 
 
 @app.get(
