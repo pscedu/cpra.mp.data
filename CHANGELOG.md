@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/pscedu/cpra.mp.data/compare/v0.7.0...v0.8.0) (2024-10-25)
+
+
+### Features
+
+* allow dimensions to have multiple values ([fee5cd5](https://github.com/pscedu/cpra.mp.data/commit/fee5cd524b394b9ffbc6c76b192cfd6de5908dec))
+
+
+### Documentation
+
+* **api:** update API routes ([6f50257](https://github.com/pscedu/cpra.mp.data/commit/6f502570f56dee92128060fea3d9a0b1f51e3b2d))
+
 ## [0.7.0](https://github.com/pscedu/cpra.mp.data/compare/v0.6.0...v0.7.0) (2024-10-15)
 
 
