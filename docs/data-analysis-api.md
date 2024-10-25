@@ -5,23 +5,23 @@ The data and analysis API provides a RESTful interface for accessing and transfo
 All of the API endpoints use the general format:
 
 ```
-/data/<api_version>/<variable>/<geographic_unit>/<time_unit>.<format>
+/<api_version>/datasets/<variable>/<geographic_unit>/<time_unit>/data.<format>
 ```
 
 Example URIs for vector-grid (Parquet) data are:
 
 ```
-/data/v1/salinity_mean/hydro_compartment/daily.arrow
-/data/v1/salinity_mean/hydro_compartment/daily.csv
-/data/v1/salinity_mean/hydro_compartment/daily.ndjson
-/data/v1/salinity_mean/hydro_compartment/daily.parquet
+/v1/datasets/sal/hydro_compartment/daily/data.arrow
+/v1/datasets/sal/hydro_compartment/daily/data.csv
+/v1/datasets/sal/hydro_compartment/daily/data.ndjson
+/v1/datasets/sal/hydro_compartment/daily/data.parquet
 ```
 
 Additional example URIs for raster-grid (COG) data are:
 
 ```
-/data/v1/flood_depth/icm_raster/annual.tif
-/data/v1/flood_depth/icm_raster/annual/{z}/{x}/{y}.png
+/v1/datasets/inun/morph_pixel/annual/data.tif
+/v1/datasets/inun/morph_pixel/annual/{z}/{x}/{y}/data.png
 ```
 
 ## Query Operations
@@ -118,7 +118,7 @@ GET /data/v1/salinity_mean/extraction_point/daily.arrow?scenario_id=7&calendar_d
 This request returns daily time series data for three extraction points in the arrow IPC format.
 
 ```
-GET /data/v1/salinity_mean/extraction_point/daily.arrow?model_group=500&scenario=7&geography=79,842,1003&sort=calendar_date
+GET /v1/datasets/salinity_mean/extraction_point/daily/data.arrow?model_group=500&scenario=7&geography=79,842,1003&sort=calendar_date
 ```
 
 #### Query with Additional Dimensions
@@ -126,7 +126,7 @@ GET /data/v1/salinity_mean/extraction_point/daily.arrow?model_group=500&scenario
 This request returns annual exceedance damage, dollars (AEDD) for a single decade as newline-delimited JSON. Since the `aep`, `asset_type`, and `percentile` parameters are not provided, the query matches all available values for these dimensions. The results are summed across `asset_type` to provide the total damage for each AEP-percentile combination.
 
 ```
-GET /data/v1/annual_exceedance_damages_dollars/clara/decadal.ndjson?model_group=500&scenario=7&pumping_id=0&fragility_scenario=0geography=12&group_by=aep,percentile&group_aggregate=sum&sort=aep,percentile
+GET /v1/datasets/annual_exceedance_damages_dollars/clara/decadal/data.ndjson?model_group=500&scenario=7&pumping_id=0&fragility_scenario=0geography=12&group_by=aep,percentile&group_aggregate=sum&sort=aep,percentile
 ```
 
 ### Raster-Grid Data
@@ -136,7 +136,7 @@ GET /data/v1/annual_exceedance_damages_dollars/clara/decadal.ndjson?model_group=
 This request returns colorized FFIBS data for a single year as PNG map tiles.
 
 ```
-GET /data/v1/vegetation_type_ffibs/icm_raster/annual/{z}/{x}/{y}.png?model_group=500&scenario=7&calendar_year=2045&color_map=ffibs
+GET /v1/datasets/vegetation_type_ffibs/icm_raster/annual/{z}/{x}/{y}/data.png?model_group=500&scenario=7&calendar_year=2045&color_map=ffibs
 ```
 
 #### Map Query Comparing Two Years
@@ -144,7 +144,7 @@ GET /data/v1/vegetation_type_ffibs/icm_raster/annual/{z}/{x}/{y}.png?model_group
 This request returns the colorized flood depth difference between two years as PNG map tiles.
 
 ```
-GET /data/v1/flood_depth/icm_raster/annual/{z}/{x}/{y}.png?model_group=500&scenario=7&calendar_year=2045,2050&presort=-calendar_year&group_by=true&group_aggregate=difference&color_map=flood_depth_difference
+GET /v1/datasets/flood_depth/icm_raster/annual/{z}/{x}/{y}/data.png?model_group=500&scenario=7&calendar_year=2045,2050&presort=-calendar_year&group_by=true&group_aggregate=difference&color_map=flood_depth_difference
 ```
 
 #### Time Series Query at Specific Points
@@ -152,7 +152,7 @@ GET /data/v1/flood_depth/icm_raster/annual/{z}/{x}/{y}.png?model_group=500&scena
 This request returns a flood depth time series at three longitude-latitude pairs as a melted (long format) CSV.
 
 ```
-GET /data/v1/flood_depth/icm_raster/annual.csv?model_group=500&scenario=7&geography=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&melt=true&sort=calendar_year,geography
+GET /v1/datasets/flood_depth/icm_raster/annual/data.csv?model_group=500&scenario=7&geography=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&melt=true&sort=calendar_year,geography
 ```
 
 #### Single Year Query Summarized by Hydro Compartment
@@ -160,5 +160,5 @@ GET /data/v1/flood_depth/icm_raster/annual.csv?model_group=500&scenario=7&geogra
 This request returns a flood depths for a single year summarized by hydro compartment as a melted (long format) Parquet file.
 
 ```
-GET /data/v1/flood_depth/icm_raster/annual.parquet?model_group=500&scenario=7&calendar_year=2050&summarize_by=hydro_compartment&summarize_aggregate=mean&melt=true&sort=calendar_year,geography
+GET /v1/datasets/flood_depth/icm_raster/annual/data.parquet?model_group=500&scenario=7&calendar_year=2050&summarize_by=hydro_compartment&summarize_aggregate=mean&melt=true&sort=calendar_year,geography
 ```

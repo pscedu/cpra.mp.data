@@ -6,10 +6,29 @@ For dataset and partition dimensions, the catalog uses the data directory tree t
 
 🚧 **TODO:** We still need to finalize how to represent `calendar_date` ranges in the response without specifying each individual date. The syntax in the example below is one possibility.
 
-## Example
+## Examples
+
+### Get Available Datasets
 
 ```
-GET /catalog/v1?variable=salinity_mean&geographic_unit=hydro_compartment&time_unit=daily&plan_version=2029.1.0&model_group=500&scenario=7&calendar_date=2030-01-01
+GET /v1/datasets.csv
+```
+
+```json
+plan_version,variable,geographic_unit,time_unit
+2023.0.0,elev,morph_pixel,annual
+2023.0.0,sal,hydro_compartment,daily
+2023.0.0,stg,hydro_compartment,daily
+2023.0.0,tmp,hydro_compartment,daily
+2023.0.0,trg,hydro_compartment,daily
+2023.0.0,tss,hydro_compartment,daily
+...
+```
+
+### Query a Dataset Catalog
+
+```
+GET /v1/datasets/2029.1.0/sal/hydro_compartment/daily/catalog.json?model_group_id=500&scenario_id=7&calendar_date=2030-01-01
 ```
 
 ```json
