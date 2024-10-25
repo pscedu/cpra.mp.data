@@ -1,9 +1,18 @@
+import polars as pl
 import re
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.utils import get_input_data_frame, required_columns
 from fastapi import HTTPException
 
 TIF_EXTENSION = re.compile(r"\.tif$")
+RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
+RANGE_KWARGS = {
+    "daily": {"interval": "1d"},
+    "monthly": {"interval": "1m"},
+    "annual": {"step": 1},
+    "decadal": {"step": 10},
+}
 
 
 class CatalogQuery:
@@ -15,14 +24,18 @@ class CatalogQuery:
         self._choices = {}
         self._results = {}
 
-    def _update(self, items):
+    def _update(self, dimension_name=None, dimension_values=None, items=None):
         # Ignore items that don't follow our naming scheme.
-        items[:] = [item for item in items if "=" in item]
+        if items is not None:
+            items[:] = [item for item in items if "=" in item]
+            if dimension_name is None:
+                dimension_name = items[0].split("=")[0]
 
-        dimension_name = items[0].split("=")[0]
         dimension = DIMENSIONS.get(dimension_name)
         dtype = dimension.dtype.to_python()
-        dimension_values = [dtype(d.split("=")[1]) for d in items]
+
+        if items is not None:
+            dimension_values = sorted([dtype(d.split("=")[1]) for d in items])
 
         # Update choices with the dimension values.
         if dimension_name in self._choices:
@@ -65,19 +78,96 @@ class CatalogQuery:
                 raise HTTPException(status_code=404, detail=msg)
 
         self._results[dimension_name] = selected_values
-        items[:] = [f"{dimension_name}={str(val)}" for val in selected_values]
+
+        # Updates items to prevent walking unnecessary directories.
+        if items is not None:
+            items[:] = [f"{dimension_name}={str(val)}" for val in selected_values]
+
+    def _compress(self):
+        """Compress date/time values into continuous [start, end] intervals."""
+        for dimension_name, values in self._choices.items():
+            if dimension_name in ("calendar_day", "calendar_year"):
+                if not isinstance(values, pl.Series):
+                    values = pl.Series(values)
+                if dimension_name in ("calendar_day", "calendar_year"):
+                    range_function = RANGE_FUNCTIONS[dimension_name]
+                    range_kwargs = RANGE_KWARGS[self.dataset_dimensions.time_unit]
+                    range_end = (
+                        values.max()
+                        if dimension_name == "calendar_day"
+                        else values.max() + 1
+                    )
+                    groups = (
+                        pl.DataFrame(
+                            {
+                                "value": values,
+                                "seq": range_function(
+                                    values.min(),
+                                    range_end,
+                                    eager=True,
+                                    **range_kwargs,
+                                )[: len(values)],
+                            }
+                        )
+                        .group_by(offset=(pl.col("value") - pl.col("seq")))
+                        .agg(start=pl.col("value").min(), end=pl.col("value").max())
+                        .sort(pl.col("offset"))
+                    )
+                    if dimension_name == "calendar_day":
+                        groups = groups.with_columns(
+                            pl.col("start").cast(pl.String),
+                            pl.col("end").cast(pl.String),
+                        )
+                        self._results[dimension_name] = [
+                            str(v) for v in self._results[dimension_name]
+                        ]
+
+                    self._choices[dimension_name] = [
+                        row["start"]
+                        if row["start"] == row["end"]
+                        else [row["start"], row["end"]]
+                        for row in groups.iter_rows(named=True)
+                    ]
+                elif isinstance(values, pl.Series):
+                    self._choices[dimension_name] = values.to_list()
 
     def execute(self):
         """Execute a query for data."""
+        input_df = get_input_data_frame(
+            **dict(self.dataset_dimensions), **dict(self.filter_dimensions)
+        )
+        required_cols = required_columns(input_df)
+
+        parquet_paths = []
         for root, dirs, files in BASE_PATH.walk():
             if dirs:
-                self._update(dirs)
+                self._update(items=dirs)
             elif files:
                 if files[0].endswith(".tif"):
-                    self._update([TIF_EXTENSION.sub("", file) for file in files])
+                    self._update(items=[TIF_EXTENSION.sub("", file) for file in files])
                 if files[0].endswith(".parquet"):
-                    pass
+                    parquet_paths.extend([root / file for file in files])
 
+        if parquet_paths:
+            lf = pl.scan_parquet(*parquet_paths, include_file_paths="path")
+            path_col = pl.col("path")
+            expected_len = len(parquet_paths)
+            for col in required_cols:
+                if col in self._results:
+                    continue
+
+                dim_col = pl.col(col)
+                self._update(
+                    dimension_name=col,
+                    dimension_values=lf.group_by(dim_col)
+                    .agg(path_col)
+                    .filter(path_col.list.len() == expected_len)
+                    .select(dim_col)
+                    .sort(dim_col)
+                    .collect()[col],
+                )
+
+        self._compress()
         return {
             "choices": self._choices,
             "results": self._results,
