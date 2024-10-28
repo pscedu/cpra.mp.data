@@ -23,6 +23,7 @@ class CatalogQuery:
         self.filter_dimensions = filter_dimensions
         self._choices = {}
         self._results = {}
+        self._exact = True
 
     def _update(self, dimension_name=None, dimension_values=None, items=None):
         # Ignore items that don't follow our naming scheme.
@@ -53,10 +54,7 @@ class CatalogQuery:
         else:
             self._choices[dimension_name] = dimension_values
 
-        # TODO: Add more sophisticated logic for selecting a default value
-        # from the available choices.
-        selected_values = [self._choices[dimension_name][0]]
-
+        selected_values = []
         prop_value = getattr(
             self.dataset_dimensions
             if dimension.type == "dataset"
@@ -66,16 +64,19 @@ class CatalogQuery:
         if prop_value:
             if not isinstance(prop_value, (list, tuple)):
                 prop_value = (prop_value,)
-            selected_values = sorted([dtype(val) for val in prop_value])
-            missing_values = [
-                val
-                for val in selected_values
-                if val not in self._choices[dimension_name]
-            ]
-            if missing_values:
-                missing_str = ", ".join([str(val) for val in missing_values])
-                msg = f"Dimension {dimension_name} is missing requested values: {missing_str}"
-                raise HTTPException(status_code=404, detail=msg)
+            selected_values = sorted(
+                [val for val in
+                [dtype(val) for val in prop_value]
+                if val in self._choices[dimension_name]]
+            )
+            if len(selected_values) < len(prop_value):
+                self._exact = False
+
+        if not selected_values:
+            # TODO: Add more sophisticated logic for selecting a default value
+            # from the available choices.
+            selected_values = [self._choices[dimension_name][0]]
+            self._exact = False
 
         self._results[dimension_name] = selected_values
 
@@ -171,4 +172,5 @@ class CatalogQuery:
         return {
             "choices": self._choices,
             "results": self._results,
+            "exact": self._exact
         }
