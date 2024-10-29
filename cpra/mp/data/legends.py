@@ -5,7 +5,7 @@ from cpra.mp.data.structure import read_structure_csv
 class Legend:
     def __init__(self, name, df):
         self.name = name
-        self._df = df
+        self.break_points = df
 
 
 LEGENDS = {

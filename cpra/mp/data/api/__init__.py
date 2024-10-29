@@ -3,14 +3,22 @@ from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     DatasetDimensions,
+    Dimension,
+    DimensionValue,
     FilterDimensions,
     FilterDimensionsAndOptions,
+    Grid,
+    Legend,
+    Variable,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.legends import LEGENDS
+from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.utils import glob_lazy_frame
 from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,8 +41,80 @@ app.add_middleware(
 )
 
 
+@app.get("/v1/variables.json", tags=["Catalog"])
+def variables() -> list[Variable]:
+    return [
+        Variable(
+            name=var.name,
+            label=var.label,
+            dtype=str(var.dtype),
+            legend=(var.legend.name if var.legend else None),
+            model=var.model,
+            subroutine=var.subroutine,
+            unit=var.unit,
+            geographic_units=var.geographic_units,
+            time_units=var.time_units,
+            required_dimensions=var.required_dimensions,
+        )
+        for var in VARIABLES.values()
+    ]
+
+
+@app.get("/v1/dimensions.json", tags=["Catalog"])
+def dimensions() -> list[Dimension]:
+    return [
+        Dimension(
+            name=dim.name,
+            label=dim.label,
+            type=dim.type,
+            dtype=str(dim.dtype),
+            required=(True if dim.required is True else False),
+            null=dim.null,
+            min_value=dim.min_value,
+            max_value=dim.max_value,
+            values=(
+                dim.values.select("value", "label").iter_rows(named=True)
+                if dim.values is not None
+                else None
+            ),
+        )
+        for dim in DIMENSIONS.values()
+    ]
+
+
+@app.get("/v1/grids.json", tags=["Catalog"])
+def grids() -> list[Grid]:
+    # TODO: Eliminate duplicates for grids that have more than one plan version.
+    # TODO: Compress geography IDs into ranges.
+    return [
+        Grid(
+            grid_type=grid.grid_type,
+            geographic_unit=grid.geographic_unit,
+            plan_versions=grid.plan_versions,
+            crs=grid.crs,
+            geographies=getattr(grid, "geographies", None),
+            bounds=getattr(grid, "bounds", None),
+            height=getattr(grid, "height", None),
+            width=getattr(grid, "width", None),
+        )
+        for gu_grids in GRIDS.values()
+        for grid in gu_grids.values()
+    ]
+
+
+@app.get("/v1/legends.json", tags=["Catalog"])
+def legends() -> list[Legend]:
+    return [
+        Legend(
+            name=legend.name,
+            break_points=legend.break_points.iter_rows(named=True),
+        )
+        for legend in LEGENDS.values()
+    ]
+
+
 @app.get("/v1/datasets.{format}", tags=["Catalog"])
-async def catalog_datasets(
+async def datasets(
     format: DataFormat,
 ):
     lf = glob_lazy_frame(required_cols=DATASET_DIMENSIONS).select(cs.exclude("path"))
@@ -46,7 +126,7 @@ async def catalog_datasets(
     "/v1/datasets/{plan_version}/{variable}/{geographic_unit}/{time_unit}/catalog.json",
     tags=["Catalog"],
 )
-async def catalog_query(
+async def query_catalog(
     filter_dimensions: Annotated[FilterDimensions, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):

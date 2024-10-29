@@ -6,6 +6,7 @@ from cpra.mp.data.api.types import (
     VectorGeographicUnit,
 )
 from pydantic import create_model, BaseModel, ConfigDict
+from typing import Any
 
 BaseDatasetDimensions = create_model(
     "BaseDatasetDimensions",
@@ -70,3 +71,55 @@ class FilterDimensionsAndOptions(Options, FilterDimensions):
     @property
     def options(self):
         return Options(**dict(self))
+
+
+class DimensionValue(BaseModel):
+    value: Any
+    label: str | None
+
+
+class Dimension(BaseModel):
+    name: str
+    label: str
+    type: str
+    dtype: str
+    required: bool
+    null: bool
+    values: list[DimensionValue] | None
+    min_value: Any | None
+    max_value: Any | None
+
+
+class Variable(BaseModel):
+    name: str
+    label: str
+    dtype: str
+    model: str
+    subroutine: str
+    unit: str | None
+    legend: str | None
+    geographic_units: list[str] | None
+    time_units: list[str] | None
+    required_dimensions: list[str] | None
+
+
+class Grid(BaseModel):
+    grid_type: str
+    geographic_unit: str
+    plan_versions: list[str]
+    crs: str
+    geographies: Any | None
+    bounds: list[int] | None
+    height: int | None
+    width: int | None
+
+
+class LegendBreakPoint(BaseModel):
+    label: str
+    color: str
+    upper_bound: int | float | None
+
+
+class Legend(BaseModel):
+    name: str
+    break_points: list[LegendBreakPoint]
