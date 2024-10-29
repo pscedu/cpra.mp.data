@@ -25,6 +25,8 @@ from cpra.mp.data.api.utils import (
 from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import get_grid
+from cpra.mp.data.legends import Legend, LEGENDS
+from cpra.mp.data.variables import Variable, VARIABLES
 from contextlib import ExitStack
 from fastapi import HTTPException
 
@@ -55,11 +57,23 @@ class Dataset(LazyFrameSource):
         )
 
     @property
+    def legend(self) -> Legend:
+        return (
+            LEGENDS.get(self.options.color_map)
+            or self.variable.legend
+            or LEGENDS["default"]
+        )
+
+    @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
         if self.grid.grid_type == "vector" or self.options.geography:
             return OutputType.vector
         return OutputType.raster
+
+    @property
+    def variable(self) -> Variable:
+        return VARIABLES[self.dataset_dimensions.variable]
 
     async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame."""
@@ -334,20 +348,9 @@ class Dataset(LazyFrameSource):
             window = vrts[0].window(*read_bounds)
 
             data = np.vstack(await parallel_read_rasters(vrts, window, out_shape))
-            pixel_values = np.diff(data, axis=0)
-
-            breaks = (-2, -1, 0, 1, 2, 3)
-            colors = (
-                (0, 0, 0, 255),
-                (40, 40, 40, 255),
-                (80, 80, 80, 255),
-                (120, 120, 120, 255),
-                (160, 160, 160, 255),
-                (200, 200, 200, 255),
-                (240, 240, 240, 255),
-            )
-            color_idx = np.digitize(pixel_values, breaks)
-            color = np.take(colors, color_idx, axis=0)[0].astype("uint8")
+            # TODO: Handle multiple raster layers.
+            # pixel_values = np.diff(data, axis=0)
+            color = self.legend.colorize_pixels(data)
             image = Image.fromarray(color, mode="RGBA")
 
             # If the image is smaller than the tile size, pad it with empty pixels.
