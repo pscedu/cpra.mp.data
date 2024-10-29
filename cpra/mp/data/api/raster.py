@@ -29,7 +29,7 @@ class RasterioStreamingResponse(FileResponse):
 
 class RasterioTileResponse(Response):
     background = None
-    mime_types = {"png": "image/png"}
+    mime_types = {"jpg": "image/jpeg", "png": "image/png"}
     status_code = 200
 
     def __init__(
@@ -48,7 +48,7 @@ class RasterioTileResponse(Response):
         self.init_headers()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        self.body = await self.dataset.get_tile(*self.tile)
+        self.body = await self.dataset.get_tile(*self.tile, self.format)
 
         # Handle tile requests that are outside the dataset bounds.
         if self.body is None:

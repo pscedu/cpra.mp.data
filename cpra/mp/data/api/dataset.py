@@ -305,7 +305,7 @@ class Dataset(LazyFrameSource):
         self._apply_sort_param(self.options.sort, "sort")
 
     @asynctiming
-    async def get_tile(self, x, y, z, tile_size=256, **kwargs):
+    async def get_tile(self, x, y, z, format, tile_size=256, **kwargs):
         """Get a map tile image."""
 
         tile_bounds = BoundingBox(*mercantile.xy_bounds(x, y, z))
@@ -351,7 +351,10 @@ class Dataset(LazyFrameSource):
             # TODO: Handle multiple raster layers.
             # pixel_values = np.diff(data, axis=0)
             color = self.legend.colorize_pixels(data)
-            image = Image.fromarray(color, mode="RGBA")
+            image = Image.fromarray(
+                color[:, :, :3] if format == "jpg" else color,
+                mode=("RGB" if format == "jpg" else "RGBA"),
+            )
 
             # If the image is smaller than the tile size, pad it with empty pixels.
             if image.size != (tile_size, tile_size):
@@ -362,7 +365,7 @@ class Dataset(LazyFrameSource):
                 image = padded_image
 
             with BytesIO() as memfile:
-                image.save(memfile, format="PNG")
+                image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))
                 return memfile.getvalue()
 
     @asynctiming

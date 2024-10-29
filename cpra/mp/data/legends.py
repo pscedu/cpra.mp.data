@@ -9,6 +9,7 @@ class Legend:
         self.break_points = df
 
     def colorize_pixels(self, pixel_values):
+        """Apply a color ramp to an array of pixels."""
         breaks = self.break_points.filter(pl.col("upper_bound").is_not_null())[
             "upper_bound"
         ].to_numpy()
