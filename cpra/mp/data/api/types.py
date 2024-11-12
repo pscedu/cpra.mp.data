@@ -22,7 +22,6 @@ def dimension_type(dim_name):
 
 
 class AggregateFunction(str, Enum):
-    difference = "difference"
     max = "max"
     mean = "mean"
     min = "min"

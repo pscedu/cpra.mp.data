@@ -146,6 +146,13 @@ class Dataset(LazyFrameSource):
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
+
+        if self.output_type == OutputType.raster:
+            self.lf = self.lf.with_columns(multiplier=pl.lit(1))
+            value_cols = pl.col("multiplier")
+        else:
+            value_cols = VALUE_COLUMNS
+
         if (
             self.options.negate is None
             and self.options.multiply10 is None
@@ -153,24 +160,23 @@ class Dataset(LazyFrameSource):
         ):
             return
 
-        if self.output_type == OutputType.vector:
-            sql_expressions = [
-                self.options.negate,
-                self.options.multiply10,
-                self.options.multiply100,
-            ]
-            factors = [-1, 10, 100]
+        sql_expressions = [
+            self.options.negate,
+            self.options.multiply10,
+            self.options.multiply100,
+        ]
+        factors = [-1, 10, 100]
 
-            when_expression = pl
-            for sql_expression, factor in zip(sql_expressions, factors):
-                if sql_expression is None:
-                    continue
-                when_expression = when_expression.when(
-                    pl.sql_expr(sql_expression)
-                ).then(VALUE_COLUMNS * factor)
+        when_expression = pl
+        for sql_expression, factor in zip(sql_expressions, factors):
+            if sql_expression is None:
+                continue
+            when_expression = when_expression.when(pl.sql_expr(sql_expression)).then(
+                value_cols * factor
+            )
 
-            when_expression = when_expression.otherwise(VALUE_COLUMNS)
-            self.lf = self.lf.with_columns(when_expression)
+        when_expression = when_expression.otherwise(value_cols)
+        self.lf = self.lf.with_columns(when_expression)
 
     def _apply_sort_param(self, order: str, param_name: str):
         """Apply a sort parameter to the LazyFrame."""
@@ -182,21 +188,25 @@ class Dataset(LazyFrameSource):
         desc = [part.startswith("-") for part in parts]
         self.lf = self.lf.sort(cols, descending=desc)
 
+    def _get_group_by_columns(self):
+        """Get a list of group_by column names."""
+        if self.options.group_by is not None and self.options.group_aggregate is None:
+            msg = "group_aggregate must be specified when group_by is used"
+            raise HTTPException(status_code=400, detail=msg)
+
+        if self.options.group_by is None:
+            return [True]
+        return unpack_values(self.options.group_by, "group_by", DIMENSION_CHOICES)
+
     def _apply_group_params(self):
         """Apply group and aggregate parameters to the LazyFrame or image."""
         if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
-        if self.options.group_by is None or self.options.group_aggregate is None:
-            msg = "group_by and group_aggregate parameters must be used together"
-            raise HTTPException(status_code=400, detail=msg)
-
         if self.output_type == OutputType.vector:
-            group_cols = unpack_values(
-                self.options.group_by, "group_by", DIMENSION_CHOICES
-            )
             self.lf = getattr(
-                self.lf.group_by(*group_cols), self.options.group_aggregate
+                self.lf.group_by(*self._get_group_by_columns()),
+                self.options.group_aggregate,
             )()
 
     def _apply_transform_params(self):
@@ -304,10 +314,36 @@ class Dataset(LazyFrameSource):
         self._apply_transform_params()
         self._apply_sort_param(self.options.sort, "sort")
 
+    async def get_raster_array(self, df, rasters, window, out_shape=None):
+        """Read a raster array and apply the operations specified
+        in the index DataFrame."""
+        data = np.vstack(await parallel_read_rasters(rasters, window, out_shape))
+
+        # Apply multipliers from calculate parameters.
+        if not (df["multiplier"] == 1).all():
+            data = data * df["multiplier"].to_numpy()[..., np.newaxis, np.newaxis]
+
+        # Apply group and aggregate parameters.
+        if (
+            self.options.group_by is not None
+            or self.options.group_aggregate is not None
+        ):
+            df = df.group_by(*self._get_group_by_columns()).agg(
+                row_idxs=pl.col("path").agg_groups()
+            )
+            aggregate_fn = getattr(np, self.options.group_aggregate)
+            data = np.vstack(
+                [
+                    aggregate_fn(data[row_idxs, :, :], axis=0, keepdims=True)
+                    for row_idxs in df["row_idxs"]
+                ]
+            )
+
+        return data
+
     @asynctiming
     async def get_tile(self, x, y, z, format, tile_size=256, **kwargs):
         """Get a map tile image."""
-
         tile_bounds = BoundingBox(*mercantile.xy_bounds(x, y, z))
         if self.dataset_bounds and disjoint_bounds(self.dataset_bounds, tile_bounds):
             return None
@@ -347,9 +383,7 @@ class Dataset(LazyFrameSource):
             )
             window = vrts[0].window(*read_bounds)
 
-            data = np.vstack(await parallel_read_rasters(vrts, window, out_shape))
-            # TODO: Handle multiple raster layers.
-            # pixel_values = np.diff(data, axis=0)
+            data = await self.get_raster_array(df, vrts, window, out_shape)
             color = self.legend.colorize_pixels(data)
             image = Image.fromarray(
                 color[:, :, :3] if format == "jpg" else color,
@@ -386,5 +420,5 @@ class Dataset(LazyFrameSource):
             )
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
-                data = np.vstack(await parallel_read_rasters(inputs, window))
-                output.write(np.diff(data, axis=0), window=window)
+                data = await self.get_raster_array(df, inputs, window)
+                output.write(data, window=window)
