@@ -4,7 +4,6 @@ from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     DatasetDimensions,
     Dimension,
-    DimensionValue,
     FilterDimensions,
     FilterDimensionsAndOptions,
     Grid,
@@ -84,21 +83,18 @@ def dimensions() -> list[Dimension]:
 
 @app.get("/v1/grids.json", tags=["Catalog"])
 def grids() -> list[Grid]:
-    # TODO: Eliminate duplicates for grids that have more than one plan version.
     # TODO: Compress geography IDs into ranges.
     return [
         Grid(
+            name=grid.name,
             grid_type=grid.grid_type,
-            geographic_unit=grid.geographic_unit,
-            plan_versions=grid.plan_versions,
             crs=grid.crs,
             geographies=getattr(grid, "geographies", None),
             bounds=getattr(grid, "bounds", None),
             height=getattr(grid, "height", None),
             width=getattr(grid, "width", None),
         )
-        for gu_grids in GRIDS.values()
-        for grid in gu_grids.values()
+        for grid in GRIDS.values()
     ]
 
 
@@ -123,7 +119,7 @@ async def datasets(
 
 
 @app.get(
-    "/v1/datasets/{plan_version}/{variable}/{geographic_unit}/{time_unit}/catalog.json",
+    "/v1/datasets/{variable}/{grid}/{time_unit}/catalog.json",
     tags=["Catalog"],
 )
 async def query_catalog(
@@ -135,7 +131,7 @@ async def query_catalog(
 
 
 @app.get(
-    "/v1/datasets/{plan_version}/{variable}/{geographic_unit}/{time_unit}/data.{format}",
+    "/v1/datasets/{variable}/{grid}/{time_unit}/data.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_data(
@@ -151,7 +147,7 @@ async def get_model_data(
 
 
 @app.get(
-    "/v1/datasets/{plan_version}/{variable}/{geographic_unit}/{time_unit}/data/{z}/{x}/{y}.{format}",
+    "/v1/datasets/{variable}/{grid}/{time_unit}/data/{z}/{x}/{y}.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_tile(

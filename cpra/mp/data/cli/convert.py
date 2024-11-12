@@ -11,8 +11,8 @@ DIMENSION_MAP = {
     "ModelGroup": "model_group_id",
     "Scenario": "scenario_id",
 }
-GEOGRAPHY_MAP = {
-    "HydroCompID": "hydro_compartment",
+GRID_MAP = {
+    "HydroCompID": "hydro_compartment_v1",
 }
 TIME_UNIT_MAP = {
     "CalendarDay": "daily",
@@ -35,7 +35,7 @@ def get_columns(lf_columns, map_dict, obj_dict=None):
     ]
 
 
-def convert_parquet(dump_path, plan_version):
+def convert_parquet(dump_path, model):
     """
     Write variables to the new Parquet data format from a Parquet dump of a PDD table.
     """
@@ -47,11 +47,11 @@ def convert_parquet(dump_path, plan_version):
     dimensions = get_columns(
         lf_columns, DIMENSION_MAP, {dim.name: dim for dim in DIMENSIONS.values()}
     )
-    geographies = get_columns(lf_columns, GEOGRAPHY_MAP)
+    grids = get_columns(lf_columns, GRID_MAP)
     time_units = get_columns(lf_columns, TIME_UNIT_MAP)
 
-    if len(geographies) != 1:
-        msg = f"Expected exactly one geography column, found {', '.join(geographies)}"
+    if len(grids) != 1:
+        msg = f"Expected exactly one geography column, found {', '.join(grids)}"
         raise ValueError(msg)
 
     if len(time_units) != 1:
@@ -62,25 +62,18 @@ def convert_parquet(dump_path, plan_version):
         print(f"Reading {variable.label} from {dump_path}...")
         df = lf.select(
             **{dim.name: col_name for col_name, dim in dimensions},
-            geography=pl.col(geographies[0][0]),
+            geography=pl.col(grids[0][0]),
             value=pl.col(value_column).cast(variable.dtype),
         ).collect()
 
         print(f"Writing {variable.label}...")
         write_data(
             df,
-            plan_version=plan_version,
+            model=model,
             variable=variable.name,
-            geographic_unit=geographies[0][1],
+            grid=grids[0][1],
             time_unit=time_units[0][1],
         )
-
-
-def validate_plan_version(ctx, param, value):
-    """Validate the provided plan version."""
-    if re.match(r"^\d{4}\.\d+\.\d+$", value) is None:
-        raise click.BadParameter("format must be YYYY.minor.patch")
-    return value
 
 
 def validate_filename(ctx, param, value):
@@ -92,19 +85,18 @@ def validate_filename(ctx, param, value):
 
 @cli.command()
 @click.option(
-    "--plan-version",
-    default="2023.0.0",
-    help="Plan version",
-    callback=validate_plan_version,
+    "--model",
+    default="icm_v2023.0.0",
+    help="Model",
 )
 @click.argument(
     "filename", type=click.Path(exists=True), nargs=1, callback=validate_filename
 )
-def convert(plan_version, filename):
+def convert(model, filename):
     """Convert MP2023 data to the MP2029 data format."""
 
     if filename.endswith(".parquet"):
-        convert_parquet(filename, plan_version)
+        convert_parquet(filename, model)
     else:
         msg = "Raster conversion is not yet implemented."
         raise NotImplementedError(msg)

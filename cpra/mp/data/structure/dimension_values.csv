@@ -1,12 +1,10 @@
 dimension,value,label
-plan_version,2023.0.0,2023.0.0
-geographic_unit,hydro_compartment,Hydro Compartment
-geographic_unit,morph_pixel,Morph Pixel
-geographic_unit,veg_grid_cell,Veg Grid Cell
-time_unit,annual,Annual
-time_unit,daily,Daily
-time_unit,decadal,Decadal
-time_unit,monthly,Monthly
+aep,20,20
+aep,10,10
+aep,2,2
+aep,1,1
+aep,0.2,0.2
+aep,0.1,0.1
 aggregate_type,mean,Mean
 aggregate_type,mean_oct_apr,Mean October to April
 aggregate_type,mean_sep_mar,Mean September to March
@@ -16,22 +14,16 @@ aggregate_type,max,Max
 aggregate_type,var_summer,Variance Summer
 aggregate_type,std_dev,Standard Deviation
 aggregate_type,2_wk_max,Two Week Maximum
-aep,20,20
-aep,10,10
-aep,2,2
-aep,1,1
-aep,0.2,0.2
-aep,0.1,0.1
-pumping_id,0,No Pumping
-pumping_id,0.5,50% Pumping Capacity
-pumping_id,1,Full Pumping Capacity
-fragility_scenario,0,No Fragility
-fragility_scenario,1,IPET Fragility
 asset_type,1,"Small Residential (single-family, manufactured homes, or duplex)"
 asset_type,2,Other Multi-family Residential
 asset_type,3,"Commercial, Industrial, or Agricultural"
 asset_type,4,"Other Structural (public, education, or religion)"
 asset_type,5,"Non-structural (crops, vehicles, or roads)"
+exposure_type,exposure,Exposure
+exposure_type,moderate_exposure,Moderate Exposure
+exposure_type,severe_exposure,Severe Exposure
+fragility_scenario,0,No Fragility
+fragility_scenario,1,IPET Fragility
 infrastructure_category,daycares,Daycares
 infrastructure_category,drink_water_sources,Drink Water Sources
 infrastructure_category,drinking_water_treatment_plants,Drinking Water Treatment Plants
@@ -47,21 +39,26 @@ infrastructure_category,nursing_residential_care_facilities,Nursing Residential 
 infrastructure_category,power_plants,Power Plants
 infrastructure_category,public_schools,Public Schools
 infrastructure_category,veterans_health_administration_medical_facilities,Veterans Health Administration Medical Facilities
-exposure_type,exposure,Exposure
-exposure_type,moderate_exposure,Moderate Exposure
-exposure_type,severe_exposure,Severe Exposure
+migration,base,BASE
+migration,mig,MIG
+model,icm_v2023.0.0,ICM v2023.0.0
 ns_project_id,1,
 ns_project_id,3,
 participation_rate,0.5,50% Participation
 participation_rate,0.75,75% Participation
 participation_rate,1,Full Participation
-migration,base,BASE
-migration,mig,MIG
+pumping_id,0,No Pumping
+pumping_id,0.5,50% Pumping Capacity
+pumping_id,1,Full Pumping Capacity
 ssp,1,
 ssp,2,
 ssp,3,
 ssp,4,
 ssp,5,
+time_unit,annual,Annual
+time_unit,daily,Daily
+time_unit,decadal,Decadal
+time_unit,monthly,Monthly
 vegetation_code,brm,Brackish Marsh
 vegetation_code,for,Fresh Forest
 vegetation_code,frm,Fresh Marsh

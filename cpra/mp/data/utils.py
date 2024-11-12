@@ -1,8 +1,8 @@
 import polars as pl
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
-from cpra.mp.data.grids import get_grid
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
 from polars.exceptions import ColumnNotFoundError
@@ -25,13 +25,15 @@ def partition_columns(df, include_dataset=True):
     ]
 
 
-def required_columns(df, include_dataset=True):
+def required_columns(df, include_dataset=True, include_metadata=True):
     """Get a list of required columns based on the values in the data frame."""
 
     return [
         col.name
         for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
-        if col.any() and (include_dataset or col.name not in DATASET_DIMENSIONS)
+        if col.any()
+        and (include_dataset or col.name not in DATASET_DIMENSIONS)
+        and (include_metadata or col.name not in METADATA_DIMENSIONS)
     ]
 
 
@@ -57,11 +59,11 @@ def validate_data_frame(df, required_cols=None):
         expressions.update(dim.validation_expressions)
 
     # Add validation expressions for variable-geographic_unit and variable-time_unit.
-    expressions["variable_matches_geographic_unit"] = pl.any_horizontal(
+    expressions["variable_matches_grid"] = pl.any_horizontal(
         *[
             (
                 (pl.col("variable") == n)
-                & pl.col("geographic_unit").is_in(v.geographic_units)
+                & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units)
             )
             for n, v in VARIABLES.items()
         ]
@@ -116,20 +118,15 @@ def dataset_path(base_path, **kwargs):
 def validate_grid(data=None, **kwargs):
     """Validate that there is a grid for the given geographic unit and plan version."""
 
-    geographic_unit = extract_dimension_value("geographic_unit", data, **kwargs)
-    plan_version = extract_dimension_value("plan_version", data, **kwargs)
+    grid_name = extract_dimension_value("grid", data, **kwargs)
 
-    if geographic_unit is None:
-        msg = "Geographic unit is required."
+    if grid_name is None:
+        msg = "Grid is required."
         raise ValidationError(msg)
 
-    if plan_version is None:
-        msg = "Plan version is required."
-        raise ValidationError(msg)
-
-    grid = get_grid(geographic_unit, plan_version)
+    grid = GRIDS.get(grid_name, None)
     if grid is None:
-        msg = f"No grid for geographic unit {geographic_unit} and plan version {plan_version}."
+        msg = f"{grid_name} is not a valid grid."
         raise ValidationError(msg)
 
     return grid

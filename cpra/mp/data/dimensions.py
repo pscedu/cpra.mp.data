@@ -1,5 +1,6 @@
 import polars as pl
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.structure import read_structure_csv
 from cpra.mp.data.variables import VARIABLES
 
@@ -34,7 +35,7 @@ class Dimension:
     @property
     def partition(self):
         """Partition expression."""
-        if self.type == "nonpartition":
+        if self.type in ("metadata", "nonpartition"):
             return False
         if self.type == "partition":
             return True
@@ -100,13 +101,23 @@ def make_dimensions():
     return dimensions
 
 
+def values_df_from_dict(dimension, values_dict, attr="label"):
+    """Generate a dimension values DataFrame from a dictionary of objects."""
+    return pl.DataFrame(
+        {
+            "value": list(values_dict.keys()),
+            "label": [getattr(obj, attr) for obj in values_dict.values()],
+        }
+    ).with_columns(pl.lit("variable").alias(dimension))
+
+
 DIMENSIONS = {d.name: d for d in make_dimensions()}
 DATASET_DIMENSIONS = {d.name: d for d in DIMENSIONS.values() if d.type == "dataset"}
+METADATA_DIMENSIONS = {d.name: d for d in DIMENSIONS.values() if d.type == "metadata"}
 
 # Override the default required expressions for time dimensions.
-DIMENSIONS["variable"].values = pl.DataFrame(
-    {"value": list(VARIABLES.keys()), "label": [var.name for var in VARIABLES.values()]}
-).with_columns(pl.lit("variable").alias("dimension"))
+DIMENSIONS["variable"].values = values_df_from_dict("variable", VARIABLES)
+DIMENSIONS["grid"].values = values_df_from_dict("grid", GRIDS, "name")
 DIMENSIONS["calendar_year"].required = (
     pl.col("time_unit").is_in(["annual", "decadal"]).any()
 )

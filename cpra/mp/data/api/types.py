@@ -46,12 +46,11 @@ class TileFormat(str, Enum):
     png = "png"
 
 
-PlanVersion = dimension_type("plan_version")
 Variable = dimension_type("variable")
-GeographicUnit = dimension_type("geographic_unit")
+Grid = dimension_type("grid")
 TimeUnit = dimension_type("time_unit")
 ColorMap = Enum("ColorMap", {str(k): k for k in LEGENDS.keys()})
-VectorGeographicUnit = Enum(
-    "GeographicUnit",
-    {str(k): k for k, v in GRIDS.items() if list(v.values())[0].grid_type == "vector"},
+VectorGrid = Enum(
+    "VectorGrid",
+    {str(k): k for k, v in GRIDS.items() if v.grid_type == "vector"},
 )

@@ -3,7 +3,7 @@ import rasterio as rio
 import xml.etree.ElementTree
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
-from cpra.mp.data.grids import get_grid
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
     cast_columns,
     dataset_path,
@@ -32,7 +32,7 @@ def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
                         separator="=",
                     )
                     for dim in DIMENSIONS.values()
-                    if dim.name in df.columns
+                    if dim.name in df.columns and dim.type != "metadata"
                 ],
                 separator=separator,
             ),
@@ -76,7 +76,9 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     dataset_dir = dataset_path(base_path, **kwargs)
 
     # Construct the glob lazy frame.
-    required_cols = required_columns(input_df, include_dataset=False)
+    required_cols = required_columns(
+        input_df, include_dataset=False, include_metadata=False
+    )
     return glob_lazy_frame(
         required_cols=required_cols, base_path=dataset_dir, extension="tif", **kwargs
     ).filter(get_filter_expressions(**kwargs))
@@ -103,7 +105,7 @@ def write_cog(
     cog_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create a transform based on the raster grid.
-    grid = get_grid(kwargs["geographic_unit"], kwargs["plan_version"])
+    grid = GRIDS[kwargs["grid"]]
     dst_transform = from_bounds(*grid.bounds, width=grid.width, height=grid.height)
 
     dst_profile = {
@@ -121,4 +123,5 @@ def write_cog(
     }
 
     with rio.open(cog_path, "w", **dst_profile) as dst:
+        dst.update_tags(**kwargs)
         dst.write(data.reshape((grid.height, grid.width)), 1)

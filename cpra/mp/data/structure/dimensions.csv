@@ -1,7 +1,6 @@
 label,name,type,dtype,required,min_value,max_value,example_value
-Plan Version,plan_version,dataset,String,true,,,2023.0.0
 Variable,variable,dataset,String,true,,,sal
-Geography,geographic_unit,dataset,String,true,,,hydro_compartment
+Grid,grid,dataset,String,true,,,hydro_compartment_v1
 Time Unit,time_unit,dataset,String,true,,,daily
 Plan Implementation Scenario,model_group_id,parition,Int32,true,100,999,500
 Environmental Scenario,scenario_id,parition,Int32,true,1,100,7
@@ -21,3 +20,4 @@ Vegetation Type,vegetation_code,parition,String,false,,,brm
 Percentile,percentile,nonpartition,Int8,false,0,100,50
 Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
+Model,model,metadata,String,true,,,icm_v2023.0.0

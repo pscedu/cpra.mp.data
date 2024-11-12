@@ -1,9 +1,9 @@
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
-from cpra.mp.data.grids import get_grid
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
     build_glob_pattern,
     dataset_path,
@@ -86,7 +86,7 @@ def write_parquet(
             validate_data_frame(df, required_cols=required_cols)
 
         # Validate geography column names.
-        grid = get_grid(df["geographic_unit"][0], df["plan_version"][0])
+        grid = GRIDS[kwargs["grid"]]
         geography_cols = [str(geo) for geo in sorted(grid.geographies)]
         all_cols = required_cols + geography_cols
 
@@ -146,7 +146,9 @@ def compact_parquet(
     dataset_dir = dataset_path(base_path, **kwargs)
 
     # Construct the glob pattern.
-    required_cols = required_columns(input_df, include_dataset=False)
+    required_cols = required_columns(
+        input_df, include_dataset=False, include_metadata=False
+    )
     glob_pattern = build_glob_pattern(
         required_cols=required_cols, extension="parquet", **kwargs
     )

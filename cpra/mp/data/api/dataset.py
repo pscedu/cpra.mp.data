@@ -24,7 +24,7 @@ from cpra.mp.data.api.utils import (
 )
 from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.grids import get_grid
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import Legend, LEGENDS
 from cpra.mp.data.variables import Variable, VARIABLES
 from contextlib import ExitStack
@@ -51,10 +51,7 @@ class Dataset(LazyFrameSource):
         self.summarize_geography_ids = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
-        self.grid = get_grid(
-            self.dataset_dimensions.geographic_unit,
-            self.dataset_dimensions.plan_version,
-        )
+        self.grid = GRIDS[self.dataset_dimensions.grid]
 
     @property
     def legend(self) -> Legend:
@@ -241,9 +238,7 @@ class Dataset(LazyFrameSource):
 
         # Extract and validate summary geography IDs, if present.
         if self.options.summarize_geography:
-            summarize_grid = get_grid(
-                self.options.summarize_by, self.dataset_dimensions.plan_version
-            )
+            summarize_grid = GRIDS[self.options.summarize_by]
             self.summarize_geography_ids = [
                 int(geo_id)
                 for geo_id in unpack_values(
@@ -255,18 +250,14 @@ class Dataset(LazyFrameSource):
 
         # Generate column expressions.
         crosswalk_name = (
-            f"{self.dataset_dimensions.plan_version}__{self.dataset_dimensions.geographic_unit}__"
-            f"{self.dataset_dimensions.plan_version}__{self.options.summarize_by}.parquet"
+            f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
         )
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
 
         try:
             crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
         except FileNotFoundError:
-            msg = (
-                f"No crosswalk from {self.geographic_unit} to {self.options.summarize_by} "
-                f"for plan version {self.plan_version}"
-            )
+            msg = f"No crosswalk from {self.grid} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)
 
         if self.geography_ids:

@@ -3,7 +3,7 @@ from cpra.mp.data.api.types import (
     dimension_type,
     AggregateFunction,
     ColorMap,
-    VectorGeographicUnit,
+    VectorGrid,
 )
 from pydantic import create_model, BaseModel, ConfigDict
 from typing import Any
@@ -26,7 +26,7 @@ BaseFilterDimensions = create_model(
             None,
         )
         for dim in DIMENSIONS.values()
-        if dim.type != "dataset"
+        if dim.type not in ("dataset", "metadata")
     },
 )
 
@@ -51,7 +51,7 @@ class Options(BaseModel):
     group_aggregate: AggregateFunction | None = None
     color_map: ColorMap | None = None
     melt: bool = False
-    summarize_by: VectorGeographicUnit | None = None
+    summarize_by: VectorGrid | None = None
     summarize_aggregate: AggregateFunction | None = None
     summarize_geography: str | None = None
     sort: str | None = None
@@ -104,9 +104,8 @@ class Variable(BaseModel):
 
 
 class Grid(BaseModel):
+    name: str
     grid_type: str
-    geographic_unit: str
-    plan_versions: list[str]
     crs: str
     geographies: Any | None
     bounds: list[int] | None

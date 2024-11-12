@@ -139,7 +139,7 @@ class CatalogQuery:
         input_df = get_input_data_frame(
             **dict(self.dataset_dimensions), **dict(self.filter_dimensions)
         )
-        required_cols = required_columns(input_df)
+        required_cols = required_columns(input_df, include_metadata=False)
 
         parquet_paths = []
         for root, dirs, files in BASE_PATH.walk():
@@ -152,7 +152,7 @@ class CatalogQuery:
                     parquet_paths.extend([root / file for file in files])
 
         if parquet_paths:
-            lf = pl.scan_parquet(*parquet_paths, include_file_paths="path")
+            lf = pl.scan_parquet(parquet_paths, include_file_paths="path")
             path_col = pl.col("path")
             expected_len = len(parquet_paths)
             for col in required_cols:
