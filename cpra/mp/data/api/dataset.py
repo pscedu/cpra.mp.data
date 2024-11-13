@@ -399,6 +399,9 @@ class Dataset(LazyFrameSource):
         to conserve memory."""
 
         df = self.materialize()
+        if not len(df):
+            return False
+
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             profile = inputs[0].profile.copy()
@@ -413,3 +416,5 @@ class Dataset(LazyFrameSource):
                 window = windows.union(*[w for ji, w in group])
                 data = await self.get_raster_array(df, inputs, window)
                 output.write(data, window=window)
+
+        return True

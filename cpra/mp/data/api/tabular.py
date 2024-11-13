@@ -1,22 +1,35 @@
 import anyio
 import tempfile
+from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.sources import LazyFrameSource
+from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 from threading import Thread
 
 
-def stream_to_file(source, out_path, format):
-    source.stream_tabular(out_path, format)
+def stream_to_file(source, out_path, format, compression):
+    stream_kwargs = {}
+    if format == DataFormat.parquet:
+        uncompressed = compression.compression_algorithm == CompressionAlgorithm.none
+        stream_kwargs = {
+            "compression": "uncompressed"
+            if uncompressed
+            else compression.compression_algorithm.value,
+            "compression_level": None
+            if uncompressed
+            else compression.compression_level,
+        }
+    source.stream_tabular(out_path, format, **stream_kwargs)
 
 
 class StreamingThread(Thread):
-    def __init__(self, source, out_path, format, **kwargs):
+    def __init__(self, source, out_path, format, compression, **kwargs):
         kwargs.update(
             {
                 "target": stream_to_file,
                 "name": "stream_to_file",
-                "args": [source, out_path, format],
+                "args": [source, out_path, format, compression],
             }
         )
         self.exception = None
@@ -39,9 +52,12 @@ class PolarsStreamingResponse(Response):
         "parquet": "application/vnd.apache.parquet",
     }
 
-    def __init__(self, source: LazyFrameSource, format: str = "csv") -> None:
+    def __init__(
+        self, source: LazyFrameSource, format: str, compression: Compression
+    ) -> None:
         self.source = source
         self.format = format
+        self.compression = compression
         self.media_type = self.mime_types[format]
         self.init_headers()
 
@@ -50,7 +66,9 @@ class PolarsStreamingResponse(Response):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             with tempfile.NamedTemporaryFile() as fp:
-                write_thread = StreamingThread(self.source, fp.name, self.format)
+                write_thread = StreamingThread(
+                    self.source, fp.name, self.format, self.compression
+                )
                 write_thread.start()
                 sent_headers = False
                 async with await anyio.open_file(fp.name, mode="rb") as file:

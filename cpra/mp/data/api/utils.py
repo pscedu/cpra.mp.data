@@ -1,6 +1,7 @@
 import asyncio
 from cachetools import cached, TTLCache
 from cpra.mp.data import read_data
+from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.config import DEBUG
 from cpra.mp.data.exceptions import ValidationError
 from enum import Enum
@@ -8,6 +9,22 @@ from fastapi import HTTPException
 from functools import wraps
 from rasterio.enums import Resampling
 from time import time
+
+
+RASTER_COMPRESSION_ALGORITHMS = [
+    CompressionAlgorithm.deflate,
+    CompressionAlgorithm.lzw,
+    CompressionAlgorithm.lzma,
+    CompressionAlgorithm.none,
+    CompressionAlgorithm.zstd,
+]
+
+TABULAR_COMPRESSION_ALGORITHMS = [
+    CompressionAlgorithm.gzip,
+    CompressionAlgorithm.lz4,
+    CompressionAlgorithm.none,
+    CompressionAlgorithm.zstd,
+]
 
 
 def enum_value(inst):
@@ -118,3 +135,31 @@ def get_lazy_frame(dataset_dimensions, filter_dimensions):
     except ValidationError as err:
         # TODO: Also handle directory does not exist errors.
         raise HTTPException(status_code=422, detail=str(err))
+
+
+def validate_compression(compression, format):
+    """Validate that the compression algorithm matches the requested data format."""
+    # TODO: Also validate compression level.
+    if format == DataFormat.tif:
+        if compression.compression_algorithm in RASTER_COMPRESSION_ALGORITHMS:
+            return True
+        allowed_algorithms = RASTER_COMPRESSION_ALGORITHMS
+    else:
+        if compression.compression_algorithm in TABULAR_COMPRESSION_ALGORITHMS:
+            return True
+        allowed_algorithms = TABULAR_COMPRESSION_ALGORITHMS
+
+    algs_str = ", ".join([alg.value for alg in allowed_algorithms])
+    msg = f"Compression algorithm for format {format.value} must be one of: {algs_str}"
+    raise HTTPException(status_code=400, detail=msg)
+
+
+def validate_format(format, output_type):
+    """Validate that the specified data format matches the expected output type."""
+    if output_type == OutputType.raster and format != DataFormat.tif:
+        msg = "Format for raster output must be tif"
+        raise HTTPException(status_code=400, detail=msg)
+    elif output_type == OutputType.vector and format == DataFormat.tif:
+        formats_str = ", ".join([f.value for f in DataFormat if f != DataFormat.tif])
+        msg = f"Format for vector output must be one of: {formats_str}"
+        raise HTTPException(status_code=400, detail=msg)

@@ -1,8 +1,16 @@
 import tempfile
 from cpra.mp.data.api.dataset import Dataset
+from cpra.mp.data.api.models import Compression
+from cpra.mp.data.api.types import CompressionAlgorithm
 from fastapi import HTTPException
 from starlette.responses import FileResponse, Response
 from starlette.types import Receive, Scope, Send
+
+COMPRESSION_LEVEL_ALGORITHMS = [
+    CompressionAlgorithm.deflate,
+    CompressionAlgorithm.lzma,
+    CompressionAlgorithm.zstd,
+]
 
 
 class RasterioStreamingResponse(FileResponse):
@@ -10,21 +18,31 @@ class RasterioStreamingResponse(FileResponse):
     chunk_size = 64 * 1024
     mime_types = {"tif": "image/tiff; application=geotiff"}
 
-    def __init__(self, dataset: Dataset, format: str = "tif", **kwargs) -> None:
+    def __init__(
+        self, dataset: Dataset, format: str, compression: Compression, **kwargs
+    ) -> None:
         self.dataset = dataset
         self.format = format
+        self.compression = compression
         self.media_type = self.mime_types[format]
         self.init_headers()
-        self.profile_options = {"compression_level": 6}
-        self.profile_options.update(kwargs)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         with tempfile.NamedTemporaryFile() as fp:
-            await self.dataset.write_raster(fp.name, **self.profile_options)
-            self.path = fp.name
-            self.stat_result = None
-            self.status_code = 200
-            await super().__call__(scope, receive, send)
+            profile_options = {
+                "compress": self.compression.compression_algorithm.value.upper()
+            }
+            if self.compression.compression_algorithm in COMPRESSION_LEVEL_ALGORITHMS:
+                profile_options["level"] = self.compression.compression_level
+
+            if await self.dataset.write_raster(fp.name, **profile_options):
+                self.path = fp.name
+                self.stat_result = None
+                self.status_code = 200
+                await super().__call__(scope, receive, send)
+
+            else:
+                raise HTTPException(status_code=404, detail="Source data do not exist")
 
 
 class RasterioTileResponse(Response):

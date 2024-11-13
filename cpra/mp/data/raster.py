@@ -79,9 +79,13 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     required_cols = required_columns(
         input_df, include_dataset=False, include_metadata=False
     )
-    return glob_lazy_frame(
+    lf = glob_lazy_frame(
         required_cols=required_cols, base_path=dataset_dir, extension="tif", **kwargs
-    ).filter(get_filter_expressions(**kwargs))
+    )
+    filter_exps = get_filter_expressions(**kwargs)
+    if filter_exps:
+        lf = lf.filter(*filter_exps)
+    return lf
 
 
 def write_cog(

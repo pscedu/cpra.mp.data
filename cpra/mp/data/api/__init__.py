@@ -2,18 +2,20 @@ import polars.selectors as cs
 from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
+    DataQuery,
     DatasetDimensions,
     Dimension,
     FilterDimensions,
-    FilterDimensionsAndOptions,
     Grid,
     Legend,
+    TileQuery,
     Variable,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
+from cpra.mp.data.api.utils import validate_compression, validate_format
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
@@ -136,14 +138,17 @@ async def query_catalog(
 )
 async def get_model_data(
     format: DataFormat,
-    query: Annotated[FilterDimensionsAndOptions, Query()],
+    query: Annotated[DataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
+    compression = query.compression
+    validate_compression(compression, format)
     dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    validate_format(format, dataset.output_type)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
-        return RasterioStreamingResponse(dataset, format)
-    return PolarsStreamingResponse(dataset, format)
+        return RasterioStreamingResponse(dataset, format, compression)
+    return PolarsStreamingResponse(dataset, format, compression)
 
 
 @app.get(
@@ -155,7 +160,7 @@ async def get_model_tile(
     z: int,
     x: int,
     y: int,
-    query: Annotated[FilterDimensionsAndOptions, Query()],
+    query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)

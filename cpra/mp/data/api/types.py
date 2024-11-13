@@ -28,6 +28,16 @@ class AggregateFunction(str, Enum):
     sum = "sum"
 
 
+class CompressionAlgorithm(str, Enum):
+    deflate = "deflate"
+    gzip = "gzip"
+    lz4 = "lz4"
+    lzma = "lzma"
+    lzw = "lzw"
+    none = "none"
+    zstd = "zstd"
+
+
 class DataFormat(str, Enum):
     # arrow = "arrow"
     csv = "csv"

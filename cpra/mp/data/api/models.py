@@ -3,6 +3,7 @@ from cpra.mp.data.api.types import (
     dimension_type,
     AggregateFunction,
     ColorMap,
+    CompressionAlgorithm,
     VectorGrid,
 )
 from pydantic import create_model, BaseModel, ConfigDict
@@ -60,7 +61,12 @@ class Options(BaseModel):
         use_enum_values = True
 
 
-class FilterDimensionsAndOptions(Options, FilterDimensions):
+class Compression(BaseModel):
+    compression_algorithm: CompressionAlgorithm = CompressionAlgorithm.zstd
+    compression_level: int = 6
+
+
+class TileQuery(Options, FilterDimensions):
     class Config:
         use_enum_values = True
 
@@ -71,6 +77,15 @@ class FilterDimensionsAndOptions(Options, FilterDimensions):
     @property
     def options(self):
         return Options(**dict(self))
+
+
+class DataQuery(TileQuery, Compression):
+    class Config:
+        use_enum_values = True
+
+    @property
+    def compression(self):
+        return Compression(**dict(self))
 
 
 class DimensionValue(BaseModel):

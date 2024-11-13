@@ -15,7 +15,7 @@ class LazyFrameSource:
             raise HTTPException(status_code=400, detail=str(err))
 
     @timing
-    def stream_tabular(self, out_path, format):
+    def stream_tabular(self, out_path, format, *args, **kwargs):
         sink_method = {
             "arrow": "sink_ipc",
             "csv": "sink_csv",
@@ -23,4 +23,4 @@ class LazyFrameSource:
             "parquet": "sink_parquet",
         }[format]
         # TODO: Set parquet compression and row group parameters.
-        self.materialize(sink_method, out_path)
+        self.materialize(sink_method, out_path, *args, **kwargs)

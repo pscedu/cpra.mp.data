@@ -190,6 +190,7 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
 
     return (
         pl.DataFrame({"path": [str(p) for p in base_path.glob(glob_pattern)]})
+        .with_columns(path=pl.col("path").cast(pl.String))
         .select(
             [
                 pl.col("path")
@@ -199,7 +200,7 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
                 for dim in DIMENSIONS.values()
                 if dim.name in required_cols
             ]
-            + [pl.col("path").cast(pl.String)]
+            + [pl.col("path")]
         )
         .sort(required_cols)
         .lazy()
