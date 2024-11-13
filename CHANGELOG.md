@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.0](https://github.com/pscedu/cpra.mp.data/compare/v0.8.1...v0.9.0) (2024-11-13)
+
+
+### Features
+
+* **api:** add compression parameters to data endpoint ([17c7be5](https://github.com/pscedu/cpra.mp.data/commit/17c7be53ee920668e1887c9953bacc5ae9a638ea))
+* **api:** add data structure endpoints to catalog ([92005db](https://github.com/pscedu/cpra.mp.data/commit/92005dbc9a7d27950596dafb4eafc6617185e348))
+* **api:** add Parquet support and date handling to catalog ([3a21ccc](https://github.com/pscedu/cpra.mp.data/commit/3a21ccc99e0b5bcdacf9483c209b1ef560306da9))
+* **dataset:** add group and aggregate parameters for raster data ([e142fb4](https://github.com/pscedu/cpra.mp.data/commit/e142fb4151e4c82b6cd2e1eb81f78269a6b356c6))
+* **legend:** add function to colorize a pixel array ([9a26b6e](https://github.com/pscedu/cpra.mp.data/commit/9a26b6e68eb9e253464a5cee33317d038f85cfe0))
+* **raster:** add support for JPG tile output ([222fd10](https://github.com/pscedu/cpra.mp.data/commit/222fd10767355adccf56f9eb8ff6e48d9ceb21e0))
+* **structure:** remove plan_version and add grid ([9b1b361](https://github.com/pscedu/cpra.mp.data/commit/9b1b3616218f5a1d3ceab6fb7fe7c256af415dbc))
+* **structure:** update grid versions ([1395f9b](https://github.com/pscedu/cpra.mp.data/commit/1395f9b2991ce04ba5a8eed85833d2f6c692ca2c))
+
+
+### Bug Fixes
+
+* **api:** allow catalog to override choices with defaults ([6c49e79](https://github.com/pscedu/cpra.mp.data/commit/6c49e79e52146e06cef02571c5dc3f5ad98311f3))
+* **api:** fix race condition in streaming response ([346f98b](https://github.com/pscedu/cpra.mp.data/commit/346f98b7dcda1ed46ae063378f5941d9f39152cb))
+* **raster:** allow multiple dimension values and fix filtering ([1ceb44c](https://github.com/pscedu/cpra.mp.data/commit/1ceb44c03536768a43f1115bc2b33d0f4056854a))
+
 ## [0.8.1](https://github.com/pscedu/cpra.mp.data/compare/v0.8.0...v0.8.1) (2024-10-25)
 
 
