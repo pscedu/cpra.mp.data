@@ -1,6 +1,5 @@
 import click
 import polars as pl
-import re
 from cpra.mp.data import write_data
 from cpra.mp.data.cli import cli
 from cpra.mp.data.dimensions import DIMENSIONS
@@ -12,7 +11,7 @@ DIMENSION_MAP = {
     "Scenario": "scenario_id",
 }
 GRID_MAP = {
-    "HydroCompID": "hydro_compartment_v1",
+    "HydroCompID": "hydro_compartment_v001",
 }
 TIME_UNIT_MAP = {
     "CalendarDay": "daily",
