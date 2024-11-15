@@ -90,12 +90,12 @@ def write_parquet(
         geography_cols = [str(geo) for geo in sorted(grid.geographies)]
         all_cols = required_cols + geography_cols
 
-        invalid_cols = set(all_cols) - set(df.columns)
+        invalid_cols = set(df.columns) - set(all_cols)
         if invalid_cols:
             msg = f"Invalid columns: {', '.join(list(invalid_cols))}"
             raise ValidationError(msg)
 
-        missing_cols = set(df.columns) - set(all_cols)
+        missing_cols = set(all_cols) - set(df.columns)
         if missing_cols:
             msg = f"Missing columns: {', '.join(list(missing_cols))}"
             raise ValidationError(msg)
