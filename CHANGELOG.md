@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/pscedu/cpra.mp.data/compare/v0.9.0...v0.9.1) (2024-11-15)
+
+
+### Bug Fixes
+
+* **dimensions:** fix required for variable-specific dimensions ([f31a3ef](https://github.com/pscedu/cpra.mp.data/commit/f31a3efde9c1fc98beb365e18544e36cd582d0aa))
+* **tabular:** fix validation message for missing/invalid columns ([1781777](https://github.com/pscedu/cpra.mp.data/commit/17817770aaf2d775f6ad53779d2392ed78ddef2e))
+
 ## [0.9.0](https://github.com/pscedu/cpra.mp.data/compare/v0.8.1...v0.9.0) (2024-11-13)
 
 
