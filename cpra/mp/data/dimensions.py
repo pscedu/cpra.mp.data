@@ -84,13 +84,13 @@ def make_dimensions():
         values = dim_values_df.filter(dimension=row["name"]).with_columns(
             pl.col("value").cast(getattr(pl, row["dtype"]))
         )
-        if row["required"] is None:
+        if row["required"] is False:
             row["required"] = (
                 pl.col("variable")
                 .is_in(
                     [
                         v.name
-                        for v in VARIABLES
+                        for v in VARIABLES.values()
                         if row["name"] in (v.required_dimensions or [])
                     ]
                 )
