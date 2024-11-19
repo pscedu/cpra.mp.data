@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/pscedu/cpra.mp.data/compare/v0.9.1...v0.9.2) (2024-11-19)
+
+
+### Bug Fixes
+
+* **structure:** fix number of hydro compartment geometries ([7a2be2f](https://github.com/pscedu/cpra.mp.data/commit/7a2be2fa4cd65858d10392e101a34513c01f538e))
+
 ## [0.9.1](https://github.com/pscedu/cpra.mp.data/compare/v0.9.0...v0.9.1) (2024-11-15)
 
 
