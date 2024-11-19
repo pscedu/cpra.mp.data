@@ -1,8 +1,9 @@
 name,type,crs,geographies,bounds,height,width
 morph_pixel_v001,raster,epsg:26915,,"404500, 3187060, 1024720, 3435010",8285,20674
 veg_grid_cell_v001,vector,epsg:26915,,,,
-hydro_compartment_v001,vector,epsg:26915,1787,,,
+hydro_compartment_v001,vector,epsg:26915,1657,,,
 ecoregion_v001,vector,epsg:26915,32,,,
 block_group_v2020,vector,epsg:26915,,,,
 clara_community_v001,vector,epsg:26915,,,,
 parish_v2020,vector,epsg:26915,,,,
+clara_grid_cell_v001,vector,epsg:26915,,,,

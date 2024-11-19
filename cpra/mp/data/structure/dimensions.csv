@@ -1,6 +1,6 @@
 label,name,type,dtype,required,min_value,max_value,example_value
 Variable,variable,dataset,String,true,,,sal
-Grid,grid,dataset,String,true,,,hydro_compartment_v1
+Grid,grid,dataset,String,true,,,hydro_compartment_v001
 Time Unit,time_unit,dataset,String,true,,,daily
 Plan Implementation Scenario,model_group_id,parition,Int32,true,100,999,500
 Environmental Scenario,scenario_id,parition,Int32,true,1,100,7
