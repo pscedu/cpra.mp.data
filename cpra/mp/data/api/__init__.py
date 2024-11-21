@@ -2,6 +2,7 @@ import polars.selectors as cs
 from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
+    Compression,
     DataQuery,
     DatasetDimensions,
     Dimension,
@@ -112,12 +113,11 @@ def legends() -> list[Legend]:
 
 
 @app.get("/v1/datasets.{format}", tags=["Catalog"])
-async def datasets(
-    format: DataFormat,
-):
+async def datasets(format: DataFormat, compression: Annotated[Compression, Query()]):
+    validate_compression(compression, format)
     lf = glob_lazy_frame(required_cols=DATASET_DIMENSIONS).select(cs.exclude("path"))
     source = LazyFrameSource(lf)
-    return PolarsStreamingResponse(source, format)
+    return PolarsStreamingResponse(source, format, compression)
 
 
 @app.get(
