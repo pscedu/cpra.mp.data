@@ -31,7 +31,7 @@
 
 A hierarchy of dimensions is used to store and catalog Parquet and COG files. The table below summarizes the columns that define these dimensions, as well as the data types and conditions under which the dimensions are required.
 
-**Dataset dimensions** define a single Parquet dataset. They are also used to create the directory structure for COGs (see File Paths below). **Partition dimensions** are used to partition daily data stored in Parquet files, as well as all COGs. **Non-partition dimensions** are present in Parquet data files but are not used to create partition directories.
+**Dataset dimensions** define a single Parquet dataset. They are also used to create the directory structure for COGs (see File Paths below). **Partition dimensions** are used to partition daily and monthly data stored in Parquet files, as well as all COGs. **Non-partition dimensions** are present in Parquet data files but are not used to create partition directories.
 
 <!--BEGIN SECTION dimensions-->
 | Label | Name | Type | Dtype | Required | Min Value | Max Value | Example Value |
