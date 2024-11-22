@@ -18,7 +18,7 @@ def partition_columns(df, include_dataset=True):
             **{
                 dim.name: dim.partition & dim.required
                 for dim in DIMENSIONS.values()
-                if include_dataset or dim.partition is not True
+                if (include_dataset or dim.name not in DATASET_DIMENSIONS)
             }
         )
         if col.any()

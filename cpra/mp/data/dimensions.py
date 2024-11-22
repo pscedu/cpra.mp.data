@@ -37,7 +37,7 @@ class Dimension:
         """Partition expression."""
         if self.type in ("metadata", "nonpartition"):
             return False
-        if self.type == "partition":
+        if self.type == "dataset":
             return True
         return (pl.col("time_unit") == "daily").any()
 
