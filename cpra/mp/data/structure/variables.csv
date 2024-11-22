@@ -1,4 +1,7 @@
 label,name,model,subroutine,dtype,geographic_units,time_units,unit,legend,required_dimensions
+Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
+"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
+Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, asset_type"
 Vegetation Type: VCT,ann,icm,lavegmod,Int32,veg_grid_cell,annual,,vct,
 Ground Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Vegetation Type: FFIBS,ffibs,icm,lavegmod,Int32,veg_grid_cell,annual,,ffibs,

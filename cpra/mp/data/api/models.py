@@ -110,7 +110,7 @@ class Variable(BaseModel):
     label: str
     dtype: str
     model: str
-    subroutine: str
+    subroutine: str | None
     unit: str | None
     legend: str | None
     geographic_units: list[str] | None
