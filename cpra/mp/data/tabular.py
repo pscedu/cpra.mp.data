@@ -1,7 +1,7 @@
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
     build_glob_pattern,
@@ -31,13 +31,25 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     ]
     filter_args = get_filter_expressions(**kwargs)
 
+    # Default to an un-partitioned dataset.
+    hive_partitioning = False
+    hive_schema = None
+
     # Provide Hive partitioning schema since this is known in advance.
-    partition_cols = partition_columns(input_df, include_dataset=True)
-    hive_schema = {
-        dim.name: dim.dtype for dim in DIMENSIONS.values() if dim.name in partition_cols
-    }
+    partition_cols = partition_columns(input_df, include_dataset=False)
+    if partition_cols:
+        hive_partitioning = True
+        hive_schema = {
+            dim.name: dim.dtype
+            for dim in DIMENSIONS.values()
+            if dim.name in partition_cols
+        }
+
     lf = pl.scan_parquet(
-        dataset_dir, cache=cache, hive_partitioning=True, hive_schema=hive_schema
+        dataset_dir,
+        cache=cache,
+        hive_partitioning=hive_partitioning,
+        hive_schema=hive_schema,
     )
 
     # Filter based on keyword arguments.
