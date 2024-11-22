@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/pscedu/cpra.mp.data/compare/v0.9.3...v0.9.4) (2024-11-22)
+
+
+### Bug Fixes
+
+* **tabular:** fix reading of un-partitioned datasets ([7a72dd0](https://github.com/pscedu/cpra.mp.data/commit/7a72dd01ac62e94e1eb5eb8dd41a15a5dce9e0eb))
+
 ## [0.9.3](https://github.com/pscedu/cpra.mp.data/compare/v0.9.2...v0.9.3) (2024-11-22)
 
 
