@@ -3,7 +3,6 @@ import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
-from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
     build_glob_pattern,
     dataset_path,
@@ -11,6 +10,7 @@ from cpra.mp.data.utils import (
     partition_columns,
     required_columns,
     validate_data_frame,
+    validate_grid,
 )
 from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
@@ -86,7 +86,7 @@ def write_parquet(
             validate_data_frame(df, required_cols=required_cols)
 
         # Validate geography column names.
-        grid = GRIDS[kwargs["grid"]]
+        grid = validate_grid(df, **kwargs)
         geography_cols = [str(geo) for geo in sorted(grid.geographies)]
         all_cols = required_cols + geography_cols
 
