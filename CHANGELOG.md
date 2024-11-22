@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/pscedu/cpra.mp.data/compare/v0.9.4...v0.10.0) (2024-11-22)
+
+
+### Features
+
+* **structure:** add three CLARA variables ([1ddca18](https://github.com/pscedu/cpra.mp.data/commit/1ddca18158f1aa946ffcdf6865663fc585e617c4))
+
+
+### Bug Fixes
+
+* pin Polars to 1.13.1 to work around a panic ([cb109c2](https://github.com/pscedu/cpra.mp.data/commit/cb109c24fe6555ece202907f2212dab86aff661c))
+
 ## [0.9.4](https://github.com/pscedu/cpra.mp.data/compare/v0.9.3...v0.9.4) (2024-11-22)
 
 
