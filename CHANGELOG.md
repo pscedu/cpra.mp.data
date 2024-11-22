@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.3](https://github.com/pscedu/cpra.mp.data/compare/v0.9.2...v0.9.3) (2024-11-22)
+
+
+### Bug Fixes
+
+* **api:** add compression parameter for datasets ([d17d0b6](https://github.com/pscedu/cpra.mp.data/commit/d17d0b6a505fab5cd47d8c72428b4b5fca9f17cb))
+* **dimensions:** always partition by dataset dimensions ([dbcbaf0](https://github.com/pscedu/cpra.mp.data/commit/dbcbaf0feb4bcaaa280686b833fdbea73fd0a1b2))
+* **dimensions:** use partition columns for monthly data ([fe0ee00](https://github.com/pscedu/cpra.mp.data/commit/fe0ee0034f1523b99557dd8b62826440d55368b1))
+* **tabular:** read grid from data frame, if present ([ba6153b](https://github.com/pscedu/cpra.mp.data/commit/ba6153b3ebf1f6ac65d4cec72c84e0d0b7f5104a))
+
 ## [0.9.2](https://github.com/pscedu/cpra.mp.data/compare/v0.9.1...v0.9.2) (2024-11-19)
 
 
