@@ -42,6 +42,7 @@ api = [
 ]
 scripts = [
   "fastexcel",
+  "tippecanoe"
 ]
 
 [tool.hatch.envs.default]

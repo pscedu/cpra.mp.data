@@ -62,4 +62,4 @@ def generate_crosswalks(grid):
 
 
 if __name__ == "__main__":
-    generate_crosswalks("hydro_compartment_v1")
+    generate_crosswalks("hydro_compartment_v001")
