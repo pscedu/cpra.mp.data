@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/pscedu/cpra.mp.data/compare/v0.10.0...v0.11.0) (2024-12-17)
+
+
+### Features
+
+* **scripts:** generate pmtiles from model grids ([84dd00d](https://github.com/pscedu/cpra.mp.data/commit/84dd00d11e2e9bba31e81c9b50fce542c15eefee))
+
+
+### Bug Fixes
+
+* **catalog:** fix getting choices from Parquet ([168631e](https://github.com/pscedu/cpra.mp.data/commit/168631e523afefa440fab4a403d45eff92145641))
+
 ## [0.10.0](https://github.com/pscedu/cpra.mp.data/compare/v0.9.4...v0.10.0) (2024-11-22)
 
 
