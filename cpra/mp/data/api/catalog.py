@@ -164,10 +164,10 @@ class CatalogQuery:
                     dimension_name=col,
                     dimension_values=lf.group_by(dim_col)
                     .agg(path_col)
-                    .filter(path_col.list.len() == expected_len)
+                    .filter(path_col.list.n_unique() == expected_len)
                     .select(dim_col)
                     .sort(dim_col)
-                    .collect()[col],
+                    .collect()[col].to_list(),
                 )
 
         self._compress()
