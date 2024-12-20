@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/pscedu/cpra.mp.data/compare/v0.11.0...v0.12.0) (2024-12-20)
+
+
+### Features
+
+* **structure:** update variables and dimensions ([2867284](https://github.com/pscedu/cpra.mp.data/commit/2867284b5a9165dabcbbee0383786ce21a151d8a))
+
 ## [0.11.0](https://github.com/pscedu/cpra.mp.data/compare/v0.10.0...v0.11.0) (2024-12-17)
 
 
