@@ -1,11 +1,15 @@
 label,name,model,subroutine,dtype,geographic_units,time_units,unit,legend,required_dimensions
-Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
-"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
-Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, asset_type"
-Vegetation Type: VCT,ann,icm,lavegmod,Int32,veg_grid_cell,annual,,vct,
-Ground Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Vegetation Type: FFIBS,ffibs,icm,lavegmod,Int32,veg_grid_cell,annual,,ffibs,
 Habitat Suitability Index,hsi,icm,hsi,Float32,veg_grid_cell,annual,,hsi,
+Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",ppt,sal,aggregate_type
+Shallow Soil Factors,ssf,icm,morph,Float32,hydro_compartment,annual,mm/yr,ssf,
+Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",NAVD88 m,stg,aggregate_type
+Water Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",degrees C,tmp,aggregate_type
+Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
+Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
+Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_grid_cell,annual,,vct,vegetation_coverage_type
+Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_grid_cell,annual,square m,veg_area,habitat_code
+Ground Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
 Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
 Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type_id,
@@ -13,12 +17,8 @@ Mineral Accretion,mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 Mineral Deposition Rate,mnrl_dep,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,mnrl_dep,
 Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,omar,
 Organic Accretion,org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
-Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",ppt,sal,aggregate_type
-Shallow Soil Factors,ssf,icm,morph,Float32,hydro_compartment,annual,mm/yr,ssf,
-Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",NAVD88 m,stg,aggregate_type
-Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
-Water Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",degrees C,tmp,aggregate_type
-Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
-Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
-Vegetation Coverage Area,veg_area,icm,lavegmod,Int64,veg_grid_cell,annual,square m,veg_area,vegetation_code
 Water Level Variability,wlv,icm,hydro,Float32,hydro_compartment,annual,m,wlv,
+Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
+Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
+"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
+Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, asset_type"
