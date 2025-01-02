@@ -165,4 +165,5 @@ async def get_model_tile(
 ):
     dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
+    dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)

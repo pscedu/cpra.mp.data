@@ -49,6 +49,7 @@ class Dataset(LazyFrameSource):
         self.dataset_bounds = None
         self.geography_ids = None
         self.summarize_geography_ids = None
+        self.raster_groups = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
         self.grid = GRIDS[self.dataset_dimensions.grid]
@@ -205,6 +206,10 @@ class Dataset(LazyFrameSource):
                 self.lf.group_by(*self._get_group_by_columns()),
                 self.options.group_aggregate,
             )()
+        else:
+            self.raster_groups = self.lf.group_by(*self._get_group_by_columns()).agg(
+                row_idxs=pl.col("path").agg_groups()
+            )
 
     def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
@@ -305,6 +310,23 @@ class Dataset(LazyFrameSource):
         self._apply_transform_params()
         self._apply_sort_param(self.options.sort, "sort")
 
+    def validate_tile(self):
+        """Validate that the tile is raster and will have a single band."""
+
+        if self.output_type == OutputType.vector:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid output type for tile: vector",
+            )
+
+        group_lf = self.raster_groups if self.raster_groups is not None else self.lf
+        groups = group_lf.select(pl.len()).collect().item()
+        if groups > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"tile contains more than one band: {groups} bands found",
+            )
+
     async def get_raster_array(self, df, rasters, window, out_shape=None):
         """Read a raster array and apply the operations specified
         in the index DataFrame."""
@@ -315,18 +337,12 @@ class Dataset(LazyFrameSource):
             data = data * df["multiplier"].to_numpy()[..., np.newaxis, np.newaxis]
 
         # Apply group and aggregate parameters.
-        if (
-            self.options.group_by is not None
-            or self.options.group_aggregate is not None
-        ):
-            df = df.group_by(*self._get_group_by_columns()).agg(
-                row_idxs=pl.col("path").agg_groups()
-            )
+        if self.raster_groups is not None:
             aggregate_fn = getattr(np, self.options.group_aggregate)
             data = np.vstack(
                 [
                     aggregate_fn(data[row_idxs, :, :], axis=0, keepdims=True)
-                    for row_idxs in df["row_idxs"]
+                    for row_idxs in self.raster_groups.collect()["row_idxs"]
                 ]
             )
 
