@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/pscedu/cpra.mp.data/compare/v0.12.0...v0.13.0) (2025-01-03)
+
+
+### Features
+
+* **api:** add validation for tile bands and output type ([11747c7](https://github.com/pscedu/cpra.mp.data/commit/11747c7956bf005cfea550af15e100ad42c54a87))
+
+
+### Bug Fixes
+
+* **api:** fix type coercion for catalog parameters ([03cfdec](https://github.com/pscedu/cpra.mp.data/commit/03cfdec87956e2c7e8d2db549a9e18093624e1cb))
+
 ## [0.12.0](https://github.com/pscedu/cpra.mp.data/compare/v0.11.0...v0.12.0) (2024-12-20)
 
 
