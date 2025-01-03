@@ -65,11 +65,7 @@ class CatalogQuery:
             if not isinstance(prop_value, (list, tuple)):
                 prop_value = (prop_value,)
             selected_values = sorted(
-                [
-                    val
-                    for val in [dtype(val) for val in prop_value]
-                    if val in self._choices[dimension_name]
-                ]
+                [val for val in prop_value if val in self._choices[dimension_name]]
             )
             if len(selected_values) < len(prop_value):
                 self._exact = False
@@ -167,7 +163,8 @@ class CatalogQuery:
                     .filter(path_col.list.n_unique() == expected_len)
                     .select(dim_col)
                     .sort(dim_col)
-                    .collect()[col].to_list(),
+                    .collect()[col]
+                    .to_list(),
                 )
 
         self._compress()
