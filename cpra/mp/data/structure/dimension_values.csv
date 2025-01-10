@@ -25,6 +25,13 @@ exposure_type,moderate_exposure,Moderate Exposure
 exposure_type,severe_exposure,Severe Exposure
 fragility_scenario,0,No Fragility
 fragility_scenario,1,IPET Fragility
+habitat_code,brm,Brackish Marsh
+habitat_code,for,Fresh Forest
+habitat_code,frm,Fresh Marsh
+habitat_code,inm,Intermediate Marsh
+habitat_code,sam,Saline Marsh
+habitat_code,upl,Upland
+habitat_code,wat,Water
 infrastructure_category,daycares,Daycares
 infrastructure_category,drink_water_sources,Drink Water Sources
 infrastructure_category,drinking_water_treatment_plants,Drinking Water Treatment Plants
@@ -43,6 +50,7 @@ infrastructure_category,veterans_health_administration_medical_facilities,Vetera
 migration,base,BASE
 migration,mig,MIG
 model,icm_v2023.0.0,ICM v2023.0.0
+model,clara_v2023.0.0,CLARA v2023.0.0
 ns_project_id,1,
 ns_project_id,3,
 participation_rate,0.5,50% Participation
@@ -60,13 +68,6 @@ time_unit,annual,Annual
 time_unit,daily,Daily
 time_unit,decadal,Decadal
 time_unit,monthly,Monthly
-habitat_code,brm,Brackish Marsh
-habitat_code,for,Fresh Forest
-habitat_code,frm,Fresh Marsh
-habitat_code,inm,Intermediate Marsh
-habitat_code,sam,Saline Marsh
-habitat_code,upl,Upland
-habitat_code,wat,Water
 vegetation_coverage_type,qula3,Quercus laurifolia Michx. (Laurel Oak)
 vegetation_coverage_type,qule,Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak)
 vegetation_coverage_type,quni,Quercus nigra L. (Water Oak)
