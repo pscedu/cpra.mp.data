@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/pscedu/cpra.mp.data/compare/v0.13.0...v0.14.0) (2025-01-10)
+
+
+### Features
+
+* **structure:** update data structure from spreadsheet ([2faa50c](https://github.com/pscedu/cpra.mp.data/commit/2faa50c6b1ab320631bf94224ae62b8107bf74b3))
+
 ## [0.13.0](https://github.com/pscedu/cpra.mp.data/compare/v0.12.0...v0.13.0) (2025-01-03)
 
 
