@@ -25,24 +25,24 @@ from cpra.mp.data import read_data, write_data
 # Define a Polars data frame containing the data to write. Pandas data frames are also supported as input data.
 df1 = pl.DataFrame({
     "calendar_day": [date(2030, 1, 1), date(2030, 1, 2), date(2030, 1, 3)],
-    "g1": [0.4, 0.4, 0.5],
-    "g2": [2.1, 2.2, 2.3],
+    "1": [0.4, 0.4, 0.5],
+    "2": [2.1, 2.2, 2.3],
     ...
-    "g1786": [1.8, 1.8, 1.8],
-    "g1787": [6.4, 6.6, 6.5],
+    "1786": [1.8, 1.8, 1.8],
+    "1787": [6.4, 6.6, 6.5],
 })
 
 # Write the data to a Parquet file. Keyword arguments passed to write_data are added to the input
 # data frame as columns.
 write_data(
     df1,
-    variable="salinity",
-    geographic_unit="hydro_compartment",
-    aggregate="mean",
+    variable="sal",
+    grid="hydro_compartment_v001",
     time_unit="daily",
-    plan_version="2023.0.0",
     model_group_id=500,
-    scenario_id=7
+    scenario_id=7,
+    aggregate="mean",
+    model="icm_v2023.0.0",
 )
 ```
 
@@ -55,19 +55,19 @@ from cpra.mp.data import read_fortran_array, write_data
 # to determine the data type of the array.
 raster_array = read_fortran_array(
     "MP2023_S07_G520_C000_U00_V00_SLA_N_52_52_W_lndtyp30.xyz.b",
-    variable="land_type",
+    variable="lnd_type",
 )
 
 # Write the data to a COG.
 write_data(
     raster_array,
-    variable="land_type",
-    geographic_unit="icm_raster",
+    variable="lnd_type",
+    grid="morph_pixel_v001",
     time_unit="annual",
-    plan_version="2023.0.0",
     model_group_id=520,
     scenario_id=7,
     calendar_year=2070,
+    model="icm_v2023.0.0",
 )
 ```
 
@@ -77,18 +77,18 @@ To read the data, use the same keyword arguments used when it was written. For t
 
 ```python
 >>> from cpra.mp.data import read_data
->>> lf = read_data(variable="salinity", geographic_unit="hydro_compartment", aggregate="mean", time_unit="daily", plan_version="2023.0.0", model_group_id=500, scenario_id=7)
+>>> lf = read_data(variable="sal", grid="hydro_compartment_v001", time_unit="daily", aggregate="mean", model_group_id=500, scenario_id=7)
 >>> lf.collect()
 shape: (3, 1795)
-┌──────────┬───────────────────┬───────────┬───────────┬───┬───────┬───────┬───────┬───────┐
-│ variable ┆ geographic_unit   ┆ aggregate ┆ time_unit ┆ … ┆ g1784 ┆ g1785 ┆ g1786 ┆ g1787 │
-│ ---      ┆ ---               ┆ ---       ┆ ---       ┆   ┆ ---   ┆ ---   ┆ ---   ┆ ---   │
-│ str      ┆ str               ┆ str       ┆ str       ┆   ┆ f64   ┆ f64   ┆ f64   ┆ f64   │
-╞══════════╪═══════════════════╪═══════════╪═══════════╪═══╪═══════╪═══════╪═══════╪═══════╡
-│ salinity ┆ hydro_compartment ┆ mean      ┆ daily     ┆ … ┆ 10.1  ┆ 7.9   ┆ 1.8   ┆ 6.4   │
-│ salinity ┆ hydro_compartment ┆ mean      ┆ daily     ┆ … ┆ 10.2  ┆ 8.0   ┆ 1.8   ┆ 6.6   │
-│ salinity ┆ hydro_compartment ┆ mean      ┆ daily     ┆ … ┆ 10.0  ┆ 8.0   ┆ 1.8   ┆ 6.5   │
-└──────────┴───────────────────┴───────────┴───────────┴───┴───────┴───────┴───────┴───────┘
+┌──────────┬────────────────────────┬───────────┬───┬───────┬───────┬───────┬───────┐
+│ variable ┆ grid                   ┆ time_unit ┆ … ┆ 1784  ┆ 1785  ┆ 1786  ┆ 1787  │
+│ ---      ┆ ---                    ┆ ---       ┆   ┆ ---   ┆  ---  ┆ ---   ┆ ---   │
+│ str      ┆ str                    ┆ str       ┆   ┆ f64   ┆ f64   ┆ f64   ┆ f64   │
+╞══════════╪════════════════════════╪═══════════╪═══╪═══════╪═══════╪═══════╪═══════╡
+│ sal      ┆ hydro_compartment_v001 ┆ daily     ┆ … ┆ 10.1  ┆ 7.9   ┆ 1.8   ┆ 6.4   │
+│ sal      ┆ hydro_compartment_v001 ┆ daily     ┆ … ┆ 10.2  ┆ 8.0   ┆ 1.8   ┆ 6.6   │
+│ sal      ┆ hydro_compartment_v001 ┆ daily     ┆ … ┆ 10.0  ┆ 8.0   ┆ 1.8   ┆ 6.5   │
+└──────────┴────────────────────────┴───────────┴───┴───────┴───────┴───────┴───────┘
 ```
 
 > [!TIP]
@@ -103,11 +103,10 @@ from datetime import date
 g520_ip1 = p.col("model_group_id") == 520 & pl.col("calendar_day") < date(2040, 1, 1)
 g521_ip2 = p.col("model_group_id") == 521 & pl.col("calendar_day") >= date(2040, 1, 1)
 lf2 = read_data(
-    variable="salinity",
-    geographic_unit="hydro_compartment",
-    aggregate="mean",
+    variable="sal",
+    grid="hydro_compartment_v001",
     time_unit="daily",
-    plan_version="2029.0.0",
+    aggregate="mean",
     scenario_id=7,
 ).filter(g520_ip1 | g521_ip2)
 ```
@@ -122,10 +121,9 @@ from cpra.mp.data import vrt, read_data
 
 # Generate a data frame containing information about matching COGs.
 cog_df = read_data(
-    variable="land_type",
-    geographic_unit="icm_raster",
+    variable="lnd_type",
+    grid="hydro_compartment_v001",
     time_unit="annual",
-    plan_version="2023.0.0",
     model_group_id=520,
     scenario_id=7,
 )
