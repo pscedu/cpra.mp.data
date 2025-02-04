@@ -39,7 +39,7 @@ class Dimension:
             return False
         if self.type == "dataset":
             return True
-        return pl.col("time_unit").is_in(("daily", "monthly")).any()
+        return (pl.col("time_unit") == "daily").any()
 
     @property
     def validation_expressions(self):
