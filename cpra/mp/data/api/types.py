@@ -9,15 +9,19 @@ def dimension_type(dim_name):
     """Create an enum with the values for a dimension."""
     dim = DIMENSIONS[dim_name]
     dtype_name = str(dim.dtype)
-    if dim.values is not None:
-        type_name = "".join(x.capitalize() for x in dim_name.lower().split("_"))
-        return Enum(type_name, {str(v): v for v in dim.values["value"]})
-    elif dtype_name.startswith("Int"):
+    if dtype_name.startswith("Int"):
         return int
     elif dtype_name.startswith("Float"):
         return float
     elif dtype_name.startswith("Date"):
         return date
+    elif dim.values is not None:
+        # Only create enums for string dimensions for now. It looks like
+        # it's possible to get Pydantic/FastAPI to work with non-string
+        # enums, but it requires some gymnastics. See:
+        # https://github.com/fastapi/fastapi/issues/3247
+        type_name = "".join(x.capitalize() for x in dim_name.lower().split("_"))
+        return Enum(type_name, {str(v): v for v in dim.values["value"]})
     return str
 
 
