@@ -110,7 +110,7 @@ def unpack_values(values_str, param_name, choices=None, separator=","):
     if choices:
         invalid_values = [val for val in values if val not in choices]
         if invalid_values:
-            msg = f"Invalid values for {param_name}: {", ".join(invalid_values)}"
+            msg = f"Invalid values for {param_name}: {', '.join(invalid_values)}"
             raise HTTPException(status_code=400, detail=msg)
 
     return values

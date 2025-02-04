@@ -13,6 +13,8 @@ class LazyFrameSource:
             return getattr(self.lf, method)(*args, **kwargs)
         except ColumnNotFoundError as err:
             raise HTTPException(status_code=400, detail=str(err))
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Dataset does not exist")
 
     @timing
     def stream_tabular(self, out_path, format, *args, **kwargs):
