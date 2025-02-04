@@ -5,46 +5,47 @@
 <!--BEGIN SECTION variables-->
 | Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Legend | Required Dimensions |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, asset_type |
-| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, asset_type |
-| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | easd | pumping_id, fragility_scenario, asset_type |
+| Soluble phosphorus | sph | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Total Carbon | toc | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Total Phosphorus | tph | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Total Kjedhal Nitrogen | tkn | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | mg/L |  | aggregate_type |
 | Green Algae | alg | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Detritus | det | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Dissolved Inorganic Nitrogen | din | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Dissolved Oxygen | do | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Dissolved Organic Nitrogen | don | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
-| Ground Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | elev |  |
-| Vegetation Type: FFIBS | ffibs | icm | lavegmod | Int32 | veg_grid_cell | annual |  | ffibs |  |
 | Flowrate | flo | icm | hydro | Float32 | hydro_compartment | daily | cms |  | aggregate_type |
-| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  | aggregate_type |
+| Ammonium Nitrogen | nh4 | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Nitrate-nitrite Nitrogen | no3 | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Denitrification | nrm | icm | hydro | Float32 | hydro_compartment | daily | g/m2/yr |  | aggregate_type |
+| Oxygen Saturation | o2sat | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Organic Nitrogen | orgn | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, asset_type |
+| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, asset_type |
+| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | easd | pumping_id, fragility_scenario, asset_type |
+| Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | elev |  |
 | Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m | inun |  |
 | Land Change | lnd_chng | icm | morph | Int32 | morph_pixel | annual |  | lnd_chng_id |  |
 | Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  | lnd_type_id |  |
 | Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm | accr |  |
 | Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | mnrl_dep |  |
-| Ammonium Nitrogen | nh4 | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
-| Nitrate-nitrite Nitrogen | no3 | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
-| Denitrification | nrm | icm | hydro | Float32 | hydro_compartment | daily | g/m2/yr |  | aggregate_type |
-| Oxygen Saturation | o2sat | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Organic Matter Accumulation Rate | omar | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | omar |  |
 | Organic Accretion | org_accr | icm | morph | Float64 | morph_pixel | annual | cm | accr |  |
-| Organic Nitrogen | orgn | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  | aggregate_type |
 | Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt | sal | aggregate_type |
 | Sediment Accumulation in Open Water | sedacc | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
 | Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
 | Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
-| Soluble phosphorus | sph | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
 | Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m | stg | aggregate_type |
 | Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m |  | aggregate_type |
 | Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m |  | aggregate_type |
-| Total Kjedhal Nitrogen | tkn | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | mg/L |  | aggregate_type |
-| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | degrees C | tmp | aggregate_type |
-| Total Carbon | toc | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
-| Total Phosphorus | tph | icm | hydro | Float32 | hydro_compartment | daily | mg/L |  | aggregate_type |
+| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C | tmp | aggregate_type |
 | Daily Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m |  | aggregate_type |
 | Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L | tss | aggregate_type |
+| Vegetation Type: FFIBS | ffibs | icm | lavegmod | Float32 | veg_grid_cell | annual |  | ffibs | ffibs_component |
 | Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_grid_cell | annual |  | vct | vegetation_coverage_type |
 | Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_grid_cell | annual | square m | veg_area | habitat_code |
+| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  | vegetation_species_type |
 <!--END SECTION-->
 
 ## Dimensions
@@ -74,7 +75,9 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Migration | migration | partition | String | False |  |  | base |
 | Shared Socioeconomic Pathway | ssp | partition | Int8 | False |  |  | 4 |
 | Vegetation: Habitat Type | habitat_code | partition | String | False |  |  | brm |
-| Vegetation: Coverage Type | vegetation_coverage_type | partition | String | False |  |  | coes |
+| Vegetation: Coverage Type | vegetation_coverage_type | partition | String | False |  |  |  |
+| Vegetation: Species | vegetation_species_type | nonpartition | String | False |  |  | coes |
+| FFIBS Component | ffibs_component | nonpartition | String | False |  |  | 0.5 |
 | Percentile | percentile | nonpartition | Int8 | False | 0 | 100 | 50 |
 | Year | calendar_year | nonpartition | Int32 | False | 2000 | 2100 | 2030 |
 | Date | calendar_day | nonpartition | Date | False |  |  | 2030-01-01 |
@@ -226,7 +229,7 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | wat | Water |
 
 
- ### Vegetation: Coverage Type Values
+ ### Vegetation: Species Values
 
 | Value | Label |
 | --- | --- |
@@ -276,6 +279,19 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | baregrnd_new | New Bareground |
 | baregrnd_flt | Flotant Bareground |
 | dead_flt | Dead Flotant |
+
+
+ ### FFIBS Component Values
+
+| Value | Label |
+| --- | --- |
+| ffibs | FFIBS |
+| pl_bf | Bottomland Hardwood Forest |
+| pl_sf | Swamp Forest |
+| pl_fm | Fresh Marsh |
+| pl_im | Intermediate Marsh |
+| pl_bm | Brackish Marsh |
+| pl_sm | Saline Marsh |
 
 
  ### Model Values
@@ -347,45 +363,6 @@ Legends determine the breakpoints and colors used to map a variable.
 | Flotant | #8cf0f0 |  |
 
 
-### `easd` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to 49 | #FEDB9E | 50.0 |
-| 50 to 99 | #FBBC76 | 100.0 |
-| 100 to 249 | #F7903B | 250.0 |
-| 250 to 499 | #F36F41 | 500.0 |
-| 500 to 999 | #DC4840 | 1000.0 |
-| 1,000 to 4,999 | #BA233E | 5000.0 |
-| 5,000 or more | #701231 |  |
-
-
-### `tmp` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| Less than 19 | #d53e4f | 19.0 |
-| 19 to < 20 | #f46d43 | 20.0 |
-| 20 to < 21 | #fdae61 | 21.0 |
-| 21 to < 22 | #fee08b | 22.0 |
-| 22 to < 23 | #ffffbf | 23.0 |
-| 23 to < 24 | #e6f598 | 24.0 |
-| 24 to < 25 | #abdda4 | 25.0 |
-| 25 to < 26 | #66c2a5 | 26.0 |
-| 27 or more | #3288bd |  |
-
-
-### `accr` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to < 2 | #feebe2 | 2.0 |
-| 2 to < 4 | #fbb4b9 | 4.0 |
-| 4 to < 6 | #f768a1 | 6.0 |
-| 6 to < 8 | #c51b8a | 8.0 |
-| 8 to 10 | #7a0177 |  |
-
-
 ### `default` Legend
 
 | Label | Color | Upper Bound |
@@ -397,71 +374,6 @@ Legends determine the breakpoints and colors used to map a variable.
 | 500 to 999 | #e6f598 | 1000.0 |
 | 1,000 to 4,999 | #99d594 | 5000.0 |
 | 5,000 or more | #3288bd |  |
-
-
-### `ffibs` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| Fresh Forest | #5E823A |  |
-| Fresh Marsh | #DAE86D |  |
-| Intermediate Marsh | #92CBE8 |  |
-| Brackish Marsh | #735753 |  |
-| Saline Marsh | #0679D2 |  |
-
-
-### `population` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to 9,999 | #9e0142 | 10000.0 |
-| 10,000 to 19,999 | #d53e4f | 20000.0 |
-| 20,000 to 29,999 | #f46d43 | 30000.0 |
-| 30,000 to 39,999 | #fdae61 | 40000.0 |
-| 40,000 to 49,999 | #fee08b | 50000.0 |
-| 50,000 to 74,999 | #ffffbf | 75000.0 |
-| 75,000 to 99,999 | #e6f598 | 100000.0 |
-| 100,000 to 199,999 | #abdda4 | 200000.0 |
-| 200,000 to 499,999 | #66c2a5 | 500000.0 |
-| 500,000 to 999,999 | #3288bd | 1000000.0 |
-| 1,000,000 or more | #5e4fa2 |  |
-
-
-### `wave_heights` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0.99 or less | #d7191c | 1.0 |
-| 1.00 to 1.99 | #fdae61 | 2.0 |
-| 2.00 to 4.99 | #ffffbf | 5.0 |
-| 5.00 to 9.99 | #abdda4 | 10.0 |
-| 10.0 or more | #2b83ba |  |
-
-
-### `wlv` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0.09 or less | #d53e4f | 0.1 |
-| 0.10 to 0.19 | #fc8d59 | 0.2 |
-| 0.20 to 0.29 | #fee08b | 0.3 |
-| 0.30 to 0.39 | #e6f598 | 0.4 |
-| 0.40 to 0.49 | #99d594 | 0.5 |
-| 0.50 or more | #3288bd |  |
-
-
-### `tss` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to < 10 | #d53e4f | 10.0 |
-| 10 to < 50 | #f46d43 | 50.0 |
-| 50 to < 100 | #fdae61 | 100.0 |
-| 100 to < 200 | #fee08b | 200.0 |
-| 200 to < 300 | #e6f598 | 300.0 |
-| 300 to < 400 | #abdda4 | 400.0 |
-| 400 to < 500 | #66c2a5 | 500.0 |
-| 500 or more | #3288bd |  |
 
 
 ### `stg` Legend
@@ -480,44 +392,41 @@ Legends determine the breakpoints and colors used to map a variable.
 | 5.0 or more | #5e4fa2 |  |
 
 
-### `sal` Legend
+### `mnrl_dep` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 to < 0.1 | #d53e4f | 0.1 |
-| 0.1 to < 0.5 | #f46d43 | 0.5 |
-| 0.5 to < 1.0 | #fdae61 | 1.0 |
-| 1.0 to < 2.0 | #fee08b | 2.0 |
-| 2.0 to < 5.0 | #e6f598 | 5.0 |
-| 5.0 to < 10.0 | #abdda4 | 10.0 |
-| 10.0 to < 20.0 | #66c2a5 | 20.0 |
-| 20.0 to 35.0 | #3288bd |  |
+| 0 to < 1 | #feebe2 | 1.0 |
+| 1 to < 10 | #fbb4b9 | 10.0 |
+| 10 to < 100 | #f768a1 | 100.0 |
+| 100 to 1,000 | #ae017e |  |
 
 
-### `exposure_exposed_structures` Legend
+### `easd` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| No structures | #00000000 |  |
-| 0 structures exposed | #d53e4f | 1.0 |
-| 1 structure exposed | #fc8d59 | 2.0 |
-| 2 structures exposed | #fee08b | 3.0 |
-| 3 to 5 structures exposed | #e6f598 | 6.0 |
-| 6 to 9 structures exposed | #99d594 | 10.0 |
-| 10 or more structures exposed | #3288bd |  |
+| 0 to 49 | #FEDB9E | 50.0 |
+| 50 to 99 | #FBBC76 | 100.0 |
+| 100 to 249 | #F7903B | 250.0 |
+| 250 to 499 | #F36F41 | 500.0 |
+| 500 to 999 | #DC4840 | 1000.0 |
+| 1,000 to 4,999 | #BA233E | 5000.0 |
+| 5,000 or more | #701231 |  |
 
 
-### `eadd` Legend
+### `inun` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| $0 to < $1M | #DDC5E0 | 1000000.0 |
-| $1M to < $10M | #CCAAD1 | 10000000.0 |
-| $10M to < $50M | #B282BA | 50000000.0 |
-| $50M to < $100M | #A064A9 | 100000000.0 |
-| $100M to < $500M | #5D4795 | 500000000.0 |
-| $500M to < $1B | #423575 | 1000000000.0 |
-| $1B or more | #221F53 |  |
+| -2.00 to < -1.00 | #d53e4f | -1.0 |
+| -1.00 to < -0.50 | #f46d43 | -0.5 |
+| -0.50 to < -0.25 | #fdae61 | -0.25 |
+| -0.25 to < 0.00 | #fee08b | 0.0 |
+| 0.00 to < 0.25 | #e6f598 | 0.25 |
+| 0.25 to < 0.50 | #abdda4 | 0.5 |
+| 0.50 to < 1.00 | #66c2a5 | 1.0 |
+| 1.00 or more | #3288bd |  |
 
 
 ### `population_change` Legend
@@ -535,79 +444,66 @@ Legends determine the breakpoints and colors used to map a variable.
 | 5,000 or more | #3288bd |  |
 
 
-### `hsi` Legend
+### `eadd` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 | #9e0142 | 1.0 |
-| 1 to 49 | #d53e4f | 50.0 |
-| 50 to 100 | #f46d43 | 100.0 |
-| 100 to 499 | #fdae61 | 500.0 |
-| 500 to 999 | #fee08b | 1000.0 |
-| 1,000 to 1,499 | #e6f598 | 1500.0 |
-| 1,500 to 1,999 | #abdda4 | 2000.0 |
-| 2,000 to 2,499 | #66c2a5 | 2500.0 |
-| 2,500 to 2,999 | #3288bd | 3000.0 |
-| 3,000 or more | #5e4fa2 |  |
+| $0 to < $1M | #DDC5E0 | 1000000.0 |
+| $1M to < $10M | #CCAAD1 | 10000000.0 |
+| $10M to < $50M | #B282BA | 50000000.0 |
+| $50M to < $100M | #A064A9 | 100000000.0 |
+| $100M to < $500M | #5D4795 | 500000000.0 |
+| $500M to < $1B | #423575 | 1000000000.0 |
+| $1B or more | #221F53 |  |
 
 
-### `sub` Legend
+### `exposure_asset_count` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| No Data | #00000000 | 0.0 |
-| 0 to < 4 | #feebe2 | 4.0 |
-| 4 to < 8 | #fbb4b9 | 8.0 |
-| 8 to < 12 | #f768a1 | 12.0 |
-| 12 to < 16 | #c51b8a | 16.0 |
-| 16 to 20 | #7a0177 |  |
+| 0 to 9 | #d53e4f | 10.0 |
+| 10 to 49 | #f46d43 | 50.0 |
+| 50 to 99 | #fdae61 | 100.0 |
+| 100 to 249 | #fee08b | 250.0 |
+| 250 to 499 | #e6f598 | 500.0 |
+| 500 to 999 | #abdda4 | 1000.0 |
+| 1,000 to 9,999 | #66c2a5 | 10000.0 |
+| 10,000 or more | #3288bd |  |
 
 
-### `elev` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| Less than -2.0 | #d53e4f | -2.0 |
-| -2.0 to < -1.0 | #f46d43 | -1.0 |
-| -1.0 to < -0.5 | #fdae61 | -0.5 |
-| -0.5 to < 0.0 | #fee08b | 0.0 |
-| 0.0 to < 0.5 | #e6f598 | 0.5 |
-| 0.5 to < 1.0 | #abdda4 | 1.0 |
-| 1.0 to < 2.0 | #66c2a5 | 2.0 |
-| 2.0 or greater | #3288bd |  |
-
-
-### `lnd_type_id` Legend
+### `tss` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| No Data | #00000000 | 1.0 |
-| Vegetated Wetland | #008000 | 2.0 |
-| Open Water | #6495ed | 3.0 |
-| Bare/Unvegetated Wetland | #8b4513 | 4.0 |
-| Upland/Developed Areas | #999999 | 5.0 |
-| Flotant Marsh | #afeeee |  |
+| 0 to < 10 | #d53e4f | 10.0 |
+| 10 to < 50 | #f46d43 | 50.0 |
+| 50 to < 100 | #fdae61 | 100.0 |
+| 100 to < 200 | #fee08b | 200.0 |
+| 200 to < 300 | #e6f598 | 300.0 |
+| 300 to < 400 | #abdda4 | 400.0 |
+| 400 to < 500 | #66c2a5 | 500.0 |
+| 500 or more | #3288bd |  |
 
 
-### `mnrl_dep` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to < 1 | #feebe2 | 1.0 |
-| 1 to < 10 | #fbb4b9 | 10.0 |
-| 10 to < 100 | #f768a1 | 100.0 |
-| 100 to 1,000 | #ae017e |  |
-
-
-### `ssf` Legend
+### `lnd_chng_id` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| No Data | #00000000 | 0.0 |
-| 0 to < 2 | #feebe2 | 2.0 |
-| 2 to < 4 | #fbb4b9 | 4.0 |
-| 4 to < 6 | #f768a1 | 6.0 |
-| 6 to < 8 | #ae017e |  |
+| Land Loss | #4591ac |  |
+| Induced Loss | #00f0f0 |  |
+| Land Maintained | #99c104 |  |
+| Land Gain | #265118 |  |
+
+
+### `omar` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 0.05 to < 0.07 | #feebe2 | 0.07 |
+| 0.07 to < 0.09 | #fbb4b9 | 0.09 |
+| 0.09 to < 0.11 | #f768a1 | 0.11 |
+| 0.11 to < 0.13 | #c51b8a | 0.13 |
+| 0.13 to 0.15 | #7a0177 |  |
 
 
 ### `ffibs_score` Legend
@@ -620,6 +516,53 @@ Legends determine the breakpoints and colors used to map a variable.
 | Intermediate Marsh | #92CBE8 | 5.0 |
 | Brackish Marsh | #735753 | 17.0 |
 | Saline Marsh | #0679D2 |  |
+
+
+### `flood_depth` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 1 to < 4 feet | #728D97 |  |
+| 4 to < 7 feet | #73B7EA |  |
+| 7 to < 10 feet | #99D9A7 |  |
+| 10 to < 13 feet | #F8D88B |  |
+| 13 to < 16 feet | #E9B023 |  |
+| 16 to < 21 feet | #E56524 |  |
+| 21+ feet | #B73865 |  |
+
+
+### `ffibs` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| Fresh Forest | #5E823A |  |
+| Fresh Marsh | #DAE86D |  |
+| Intermediate Marsh | #92CBE8 |  |
+| Brackish Marsh | #735753 |  |
+| Saline Marsh | #0679D2 |  |
+
+
+### `wlv` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 0.09 or less | #d53e4f | 0.1 |
+| 0.10 to 0.19 | #fc8d59 | 0.2 |
+| 0.20 to 0.29 | #fee08b | 0.3 |
+| 0.30 to 0.39 | #e6f598 | 0.4 |
+| 0.40 to 0.49 | #99d594 | 0.5 |
+| 0.50 or more | #3288bd |  |
+
+
+### `accr` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 0 to < 2 | #feebe2 | 2.0 |
+| 2 to < 4 | #fbb4b9 | 4.0 |
+| 4 to < 6 | #f768a1 | 6.0 |
+| 6 to < 8 | #c51b8a | 8.0 |
+| 8 to 10 | #7a0177 |  |
 
 
 ### `veg_area` Legend
@@ -639,55 +582,89 @@ Legends determine the breakpoints and colors used to map a variable.
 | 500,000,000 or more | #5e4fa2 |  |
 
 
-### `flood_depth` Legend
+### `sub` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 1 to < 4 feet | #728D97 |  |
-| 4 to < 7 feet | #73B7EA |  |
-| 7 to < 10 feet | #99D9A7 |  |
-| 10 to < 13 feet | #F8D88B |  |
-| 13 to < 16 feet | #E9B023 |  |
-| 16 to < 21 feet | #E56524 |  |
-| 21+ feet | #B73865 |  |
+| No Data | #00000000 | 0.0 |
+| 0 to < 4 | #feebe2 | 4.0 |
+| 4 to < 8 | #fbb4b9 | 8.0 |
+| 8 to < 12 | #f768a1 | 12.0 |
+| 12 to < 16 | #c51b8a | 16.0 |
+| 16 to 20 | #7a0177 |  |
 
 
-### `exposure_asset_count` Legend
-
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| 0 to 9 | #d53e4f | 10.0 |
-| 10 to 49 | #f46d43 | 50.0 |
-| 50 to 99 | #fdae61 | 100.0 |
-| 100 to 249 | #fee08b | 250.0 |
-| 250 to 499 | #e6f598 | 500.0 |
-| 500 to 999 | #abdda4 | 1000.0 |
-| 1,000 to 9,999 | #66c2a5 | 10000.0 |
-| 10,000 or more | #3288bd |  |
-
-
-### `lnd_chng_id` Legend
+### `sal` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| Land Loss | #4591ac |  |
-| Induced Loss | #00f0f0 |  |
-| Land Maintained | #99c104 |  |
-| Land Gain | #265118 |  |
+| 0 to < 0.1 | #d53e4f | 0.1 |
+| 0.1 to < 0.5 | #f46d43 | 0.5 |
+| 0.5 to < 1.0 | #fdae61 | 1.0 |
+| 1.0 to < 2.0 | #fee08b | 2.0 |
+| 2.0 to < 5.0 | #e6f598 | 5.0 |
+| 5.0 to < 10.0 | #abdda4 | 10.0 |
+| 10.0 to < 20.0 | #66c2a5 | 20.0 |
+| 20.0 to 35.0 | #3288bd |  |
 
 
-### `inun` Legend
+### `hsi` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| -2.00 to < -1.00 | #d53e4f | -1.0 |
-| -1.00 to < -0.50 | #f46d43 | -0.5 |
-| -0.50 to < -0.25 | #fdae61 | -0.25 |
-| -0.25 to < 0.00 | #fee08b | 0.0 |
-| 0.00 to < 0.25 | #e6f598 | 0.25 |
-| 0.25 to < 0.50 | #abdda4 | 0.5 |
-| 0.50 to < 1.00 | #66c2a5 | 1.0 |
-| 1.00 or more | #3288bd |  |
+| 0 | #9e0142 | 1.0 |
+| 1 to 49 | #d53e4f | 50.0 |
+| 50 to 100 | #f46d43 | 100.0 |
+| 100 to 499 | #fdae61 | 500.0 |
+| 500 to 999 | #fee08b | 1000.0 |
+| 1,000 to 1,499 | #e6f598 | 1500.0 |
+| 1,500 to 1,999 | #abdda4 | 2000.0 |
+| 2,000 to 2,499 | #66c2a5 | 2500.0 |
+| 2,500 to 2,999 | #3288bd | 3000.0 |
+| 3,000 or more | #5e4fa2 |  |
+
+
+### `population` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 0 to 9,999 | #9e0142 | 10000.0 |
+| 10,000 to 19,999 | #d53e4f | 20000.0 |
+| 20,000 to 29,999 | #f46d43 | 30000.0 |
+| 30,000 to 39,999 | #fdae61 | 40000.0 |
+| 40,000 to 49,999 | #fee08b | 50000.0 |
+| 50,000 to 74,999 | #ffffbf | 75000.0 |
+| 75,000 to 99,999 | #e6f598 | 100000.0 |
+| 100,000 to 199,999 | #abdda4 | 200000.0 |
+| 200,000 to 499,999 | #66c2a5 | 500000.0 |
+| 500,000 to 999,999 | #3288bd | 1000000.0 |
+| 1,000,000 or more | #5e4fa2 |  |
+
+
+### `lnd_type_id` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No Data | #00000000 | 1.0 |
+| Vegetated Wetland | #008000 | 2.0 |
+| Open Water | #6495ed | 3.0 |
+| Bare/Unvegetated Wetland | #8b4513 | 4.0 |
+| Upland/Developed Areas | #999999 | 5.0 |
+| Flotant Marsh | #afeeee |  |
+
+
+### `elev` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| Less than -2.0 | #d53e4f | -2.0 |
+| -2.0 to < -1.0 | #f46d43 | -1.0 |
+| -1.0 to < -0.5 | #fdae61 | -0.5 |
+| -0.5 to < 0.0 | #fee08b | 0.0 |
+| 0.0 to < 0.5 | #e6f598 | 0.5 |
+| 0.5 to < 1.0 | #abdda4 | 1.0 |
+| 1.0 to < 2.0 | #66c2a5 | 2.0 |
+| 2.0 or greater | #3288bd |  |
 
 
 ### `surge_water_surface_elevations` Legend
@@ -705,13 +682,52 @@ Legends determine the breakpoints and colors used to map a variable.
 | 5.00 or more | #3288bd |  |
 
 
-### `omar` Legend
+### `wave_heights` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0.05 to < 0.07 | #feebe2 | 0.07 |
-| 0.07 to < 0.09 | #fbb4b9 | 0.09 |
-| 0.09 to < 0.11 | #f768a1 | 0.11 |
-| 0.11 to < 0.13 | #c51b8a | 0.13 |
-| 0.13 to 0.15 | #7a0177 |  |
+| 0.99 or less | #d7191c | 1.0 |
+| 1.00 to 1.99 | #fdae61 | 2.0 |
+| 2.00 to 4.99 | #ffffbf | 5.0 |
+| 5.00 to 9.99 | #abdda4 | 10.0 |
+| 10.0 or more | #2b83ba |  |
+
+
+### `ssf` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No Data | #00000000 | 0.0 |
+| 0 to < 2 | #feebe2 | 2.0 |
+| 2 to < 4 | #fbb4b9 | 4.0 |
+| 4 to < 6 | #f768a1 | 6.0 |
+| 6 to < 8 | #ae017e |  |
+
+
+### `tmp` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| Less than 19 | #d53e4f | 19.0 |
+| 19 to < 20 | #f46d43 | 20.0 |
+| 20 to < 21 | #fdae61 | 21.0 |
+| 21 to < 22 | #fee08b | 22.0 |
+| 22 to < 23 | #ffffbf | 23.0 |
+| 23 to < 24 | #e6f598 | 24.0 |
+| 24 to < 25 | #abdda4 | 25.0 |
+| 25 to < 26 | #66c2a5 | 26.0 |
+| 27 or more | #3288bd |  |
+
+
+### `exposure_exposed_structures` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No structures | #00000000 |  |
+| 0 structures exposed | #d53e4f | 1.0 |
+| 1 structure exposed | #fc8d59 | 2.0 |
+| 2 structures exposed | #fee08b | 3.0 |
+| 3 to 5 structures exposed | #e6f598 | 6.0 |
+| 6 to 9 structures exposed | #99d594 | 10.0 |
+| 10 or more structures exposed | #3288bd |  |
 <!--END SECTION-->

@@ -68,49 +68,56 @@ time_unit,annual,Annual
 time_unit,daily,Daily
 time_unit,decadal,Decadal
 time_unit,monthly,Monthly
-vegetation_coverage_type,qula3,Quercus laurifolia Michx. (Laurel Oak)
-vegetation_coverage_type,qule,Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak)
-vegetation_coverage_type,quni,Quercus nigra L. (Water Oak)
-vegetation_coverage_type,qute,Quercus texana Buckley (Texas Red Oak)
-vegetation_coverage_type,quvi,Quercus virginiana Mill. (Live oak)
-vegetation_coverage_type,ulam,Ulmus Americana L. (American Elm)
-vegetation_coverage_type,nyaq2,Nyssa aquatica L. (Tupelo)
-vegetation_coverage_type,sani,Salix nigra Marsh. (Black Willow)
-vegetation_coverage_type,tadi2,Taxodium distichum (L.) Rich. (Cypress)
-vegetation_coverage_type,elba2_flt,Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating)
-vegetation_coverage_type,pahe2_flt,Panicum hemitomon Schult. (Maidencane - floating)
-vegetation_coverage_type,moce2,Morella cerifera (L.) Small (Wax myrtle)
-vegetation_coverage_type,pahe2,Panicum hemitomon Schult. (Maidencane)
-vegetation_coverage_type,sala2,Sagittaria latifolia Willd. (Arrowhead)
-vegetation_coverage_type,zimi,Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass)
-vegetation_coverage_type,clma10,Cladium mariscus (L.) Pohl (Sawgrass)
-vegetation_coverage_type,elce,Eleocharis cellulose (Gulf Coast Spikerush)
-vegetation_coverage_type,ivfr,Iva frutescens L. (Marsh-elder)
-vegetation_coverage_type,pava,Paspalum vaginatum Sw. (Paspalum)
-vegetation_coverage_type,phau7,Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane)
-vegetation_coverage_type,popu5,Polygonum punctatum (Dotted Smartweed)
-vegetation_coverage_type,sala,Sagittaria lancifolia L. (Bulltongue)
-vegetation_coverage_type,scca11,Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip)
-vegetation_coverage_type,tydo,Typha domingensis Pers. (Cattail)
-vegetation_coverage_type,scam6,Schoenoplectus americanus (Chainmaker's bulrush)
-vegetation_coverage_type,scro5,Schoenoplectus robustus (Salt-Marsh bulrush)
-vegetation_coverage_type,spcy,Spartina cynosuroides (Big Cordgrass)
-vegetation_coverage_type,sppa,Spartina patens (Aiton) Muhl. (Wiregrass)
-vegetation_coverage_type,avge,Avicennia germinans (L.) L. (Black Mangrove)
-vegetation_coverage_type,disp,Distichlis spicata (L.) Greene (Saltgrass)
-vegetation_coverage_type,juro,Juncus roemerianus Scheele (Needlegrass)
-vegetation_coverage_type,spal,Spartina alterniflora Loisel. (Oystergrass)
-vegetation_coverage_type,bahabi,Baccharis halimifolia L. (Baccharis - Barrier Island)
-vegetation_coverage_type,dispbi,Distichlis spicata (L.) Greene (Saltgrass - Barrier Island)
-vegetation_coverage_type,paam2,Panicum amarum Elliott (Beachgrass – Barrier Island)
-vegetation_coverage_type,sose,Solidago sempervirens L. (Seaside goldenrod)
-vegetation_coverage_type,sppabi,Spartina patens (Aiton) Muhl. (Wiregrass – Barrier Island)
-vegetation_coverage_type,spvi3,Sporobolus virginicus (L.) Kunth (Seashore dropseed)
-vegetation_coverage_type,sthe9,Strophostyles helvola (L.) Elliott (Amberique bean)
-vegetation_coverage_type,unpa,Uniola paniculata L. (Seaoats – Barrier Island)
-vegetation_coverage_type,water,Water
-vegetation_coverage_type,notmod,Not Modeled Coverage
-vegetation_coverage_type,baregrnd_old,Old Bareground
-vegetation_coverage_type,baregrnd_new,New Bareground
-vegetation_coverage_type,baregrnd_flt,Flotant Bareground
-vegetation_coverage_type,dead_flt,Dead Flotant
+vegetation_species_type,qula3,Quercus laurifolia Michx. (Laurel Oak)
+vegetation_species_type,qule,Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak)
+vegetation_species_type,quni,Quercus nigra L. (Water Oak)
+vegetation_species_type,qute,Quercus texana Buckley (Texas Red Oak)
+vegetation_species_type,quvi,Quercus virginiana Mill. (Live oak)
+vegetation_species_type,ulam,Ulmus Americana L. (American Elm)
+vegetation_species_type,nyaq2,Nyssa aquatica L. (Tupelo)
+vegetation_species_type,sani,Salix nigra Marsh. (Black Willow)
+vegetation_species_type,tadi2,Taxodium distichum (L.) Rich. (Cypress)
+vegetation_species_type,elba2_flt,Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating)
+vegetation_species_type,pahe2_flt,Panicum hemitomon Schult. (Maidencane - floating)
+vegetation_species_type,moce2,Morella cerifera (L.) Small (Wax myrtle)
+vegetation_species_type,pahe2,Panicum hemitomon Schult. (Maidencane)
+vegetation_species_type,sala2,Sagittaria latifolia Willd. (Arrowhead)
+vegetation_species_type,zimi,Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass)
+vegetation_species_type,clma10,Cladium mariscus (L.) Pohl (Sawgrass)
+vegetation_species_type,elce,Eleocharis cellulose (Gulf Coast Spikerush)
+vegetation_species_type,ivfr,Iva frutescens L. (Marsh-elder)
+vegetation_species_type,pava,Paspalum vaginatum Sw. (Paspalum)
+vegetation_species_type,phau7,Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane)
+vegetation_species_type,popu5,Polygonum punctatum (Dotted Smartweed)
+vegetation_species_type,sala,Sagittaria lancifolia L. (Bulltongue)
+vegetation_species_type,scca11,Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip)
+vegetation_species_type,tydo,Typha domingensis Pers. (Cattail)
+vegetation_species_type,scam6,Schoenoplectus americanus (Chainmaker's bulrush)
+vegetation_species_type,scro5,Schoenoplectus robustus (Salt-Marsh bulrush)
+vegetation_species_type,spcy,Spartina cynosuroides (Big Cordgrass)
+vegetation_species_type,sppa,Spartina patens (Aiton) Muhl. (Wiregrass)
+vegetation_species_type,avge,Avicennia germinans (L.) L. (Black Mangrove)
+vegetation_species_type,disp,Distichlis spicata (L.) Greene (Saltgrass)
+vegetation_species_type,juro,Juncus roemerianus Scheele (Needlegrass)
+vegetation_species_type,spal,Spartina alterniflora Loisel. (Oystergrass)
+vegetation_species_type,bahabi,Baccharis halimifolia L. (Baccharis - Barrier Island)
+vegetation_species_type,dispbi,Distichlis spicata (L.) Greene (Saltgrass - Barrier Island)
+vegetation_species_type,paam2,Panicum amarum Elliott (Beachgrass – Barrier Island)
+vegetation_species_type,sose,Solidago sempervirens L. (Seaside goldenrod)
+vegetation_species_type,sppabi,Spartina patens (Aiton) Muhl. (Wiregrass – Barrier Island)
+vegetation_species_type,spvi3,Sporobolus virginicus (L.) Kunth (Seashore dropseed)
+vegetation_species_type,sthe9,Strophostyles helvola (L.) Elliott (Amberique bean)
+vegetation_species_type,unpa,Uniola paniculata L. (Seaoats – Barrier Island)
+vegetation_species_type,water,Water
+vegetation_species_type,notmod,Not Modeled Coverage
+vegetation_species_type,baregrnd_old,Old Bareground
+vegetation_species_type,baregrnd_new,New Bareground
+vegetation_species_type,baregrnd_flt,Flotant Bareground
+vegetation_species_type,dead_flt,Dead Flotant
+ffibs_component,ffibs,FFIBS
+ffibs_component,pl_bf,Bottomland Hardwood Forest
+ffibs_component,pl_sf,Swamp Forest
+ffibs_component,pl_fm,Fresh Marsh
+ffibs_component,pl_im,Intermediate Marsh
+ffibs_component,pl_bm,Brackish Marsh
+ffibs_component,pl_sm,Saline Marsh

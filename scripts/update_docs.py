@@ -69,8 +69,8 @@ def update_docs():
         values_df = dimension_values.filter(dimension=dim["name"])
         if not len(values_df):
             continue
-        dimensions_content += f"\n\n ### {dim["label"]} Values"
-        dimensions_content += f"\n\n{table(values_df.select("value", "label"))}"
+        dimensions_content += f"\n\n ### {dim['label']} Values"
+        dimensions_content += f"\n\n{table(values_df.select('value', 'label'))}"
     markdown = replace_section("dimensions", dimensions_content, markdown)
 
     markdown = replace_section(
@@ -79,7 +79,7 @@ def update_docs():
 
     legends_content = "\n\n".join(
         [
-            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude("name")))}"
+            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')))}"
             for group, legend_df in legends.group_by("name")
         ]
     )

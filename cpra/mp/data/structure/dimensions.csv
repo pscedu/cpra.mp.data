@@ -17,7 +17,9 @@ Participation Rate,participation_rate,partition,Float32,false,,,0.75
 Migration,migration,partition,String,false,,,base
 Shared Socioeconomic Pathway,ssp,partition,Int8,false,,,4
 Vegetation: Habitat Type,habitat_code,partition,String,false,,,brm
-Vegetation: Coverage Type,vegetation_coverage_type,partition,String,false,,,coes
+Vegetation: Coverage Type,vegetation_coverage_type,partition,String,false,,,
+Vegetation: Species,vegetation_species_type,nonpartition,String,false,,,coes
+FFIBS Component,ffibs_component,nonpartition,String,false,,,0.5
 Percentile,percentile,nonpartition,Int8,false,0,100,50
 Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
