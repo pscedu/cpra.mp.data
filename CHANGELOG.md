@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.15.0](https://github.com/pscedu/cpra.mp.data/compare/v0.14.0...v0.15.0) (2025-02-04)
+
+
+### Features
+
+* **api:** handle missing Parquet datasets ([6e8c34e](https://github.com/pscedu/cpra.mp.data/commit/6e8c34e329af2e0b1a2e6f740b4a576f624aa4c9))
+* **dimensions:** only partition daily data (not monthly) ([3429cf6](https://github.com/pscedu/cpra.mp.data/commit/3429cf621049a99622bd76df3931a85210d98043))
+* **structure:** update data structure ([397589c](https://github.com/pscedu/cpra.mp.data/commit/397589c4cdf26cbac05a30ba30ba7ea83215b985))
+
+
+### Bug Fixes
+
+* **api:** limit enums to string dimensions ([438300d](https://github.com/pscedu/cpra.mp.data/commit/438300d059c73b9c443875cfae335b58df1d3cd0))
+
+
+### Documentation
+
+* **readme:** update example dimensions and values ([f428ae4](https://github.com/pscedu/cpra.mp.data/commit/f428ae4bce66664dee88e0dc0bcb4fd522036ddf))
+* **structure:** update data structure documentation ([223810a](https://github.com/pscedu/cpra.mp.data/commit/223810a7aad3627777ae4aa575f756b502bc20c0))
+
 ## [0.14.0](https://github.com/pscedu/cpra.mp.data/compare/v0.13.0...v0.14.0) (2025-01-10)
 
 
