@@ -9,6 +9,8 @@ Annual Exceedance Probability,aep,partition,Float32,false,,,2
 Synthetic Storm ID,storm_id,partition,Int32,false,1,1000,182
 Pumping Scenario,pumping_id,partition,Float32,false,,,0.5
 Fragility Scenario,fragility_scenario,partition,Int8,false,,,0
+Population Variant,population_variant,partition,Int8,false,,,0
+CLARA Variant,clara_variant,partition,Int8,false,,,0
 Asset Type,asset_type,partition,Int8,false,,,3
 Infrastructure Category,infrastructure_category,partition,String,false,,,public_schools
 Exposure Type,exposure_type,partition,String,false,,,moderate_exposure
@@ -20,7 +22,7 @@ Vegetation: Habitat Type,habitat_code,partition,String,false,,,brm
 Vegetation: Coverage Type,vegetation_coverage_type,partition,String,false,,,
 Vegetation: Species,vegetation_species_type,nonpartition,String,false,,,coes
 FFIBS Component,ffibs_component,nonpartition,String,false,,,0.5
-Percentile,percentile,nonpartition,Int8,false,0,100,50
+Percentile,percentile,partition,Int8,false,0,100,50
 Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
 Model,model,metadata,String,true,,,icm_v2023.0.0

@@ -14,9 +14,9 @@ Nitrate-nitrite Nitrogen,no3,icm,hydro,Float32,hydro_compartment,daily,mg/L,,agg
 Denitrification,nrm,icm,hydro,Float32,hydro_compartment,daily,g/m2/yr,,aggregate_type
 Oxygen Saturation,o2sat,icm,hydro,Float32,hydro_compartment,daily,mg/L,,aggregate_type
 Organic Nitrogen,orgn,icm,hydro,Float32,hydro_compartment,daily,mg/L,,aggregate_type
-Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
-"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, asset_type"
-Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, asset_type"
+Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
 Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
 Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
