@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.0](https://github.com/pscedu/cpra.mp.data/compare/v0.15.0...v0.16.0) (2025-02-12)
+
+
+### Features
+
+* **grids:** validate geographies based on min, max, and count ([1ca44b8](https://github.com/pscedu/cpra.mp.data/commit/1ca44b80d940201ef3bb047fad3472ab1fe164e9))
+* **structure:** update data structure ([f76f1d2](https://github.com/pscedu/cpra.mp.data/commit/f76f1d26afe6fcdfaa92a1072110c32a47344b9f))
+
 ## [0.15.0](https://github.com/pscedu/cpra.mp.data/compare/v0.14.0...v0.15.0) (2025-02-04)
 
 
