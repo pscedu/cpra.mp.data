@@ -86,11 +86,8 @@ class Dataset(LazyFrameSource):
 
     async def _apply_geography_vector(self):
         """Apply the geography filter to a vector-grid dataset."""
-        self.geography_ids = unpack_values(
-            self.options.geography,
-            "geography",
-            choices=[str(geo_id) for geo_id in self.grid.geographies],
-        )
+        # TODO: Validate that the given IDs fall within the grid min and max.
+        self.geography_ids = unpack_values(self.options.geography, "geography")
         self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
 
     async def _apply_geography_raster(self):
@@ -243,13 +240,12 @@ class Dataset(LazyFrameSource):
 
         # Extract and validate summary geography IDs, if present.
         if self.options.summarize_geography:
-            summarize_grid = GRIDS[self.options.summarize_by]
+            # summarize_grid = GRIDS[self.options.summarize_by]
+            # TODO: Validate that the given IDs fall within the grid min and max.
             self.summarize_geography_ids = [
                 int(geo_id)
                 for geo_id in unpack_values(
-                    self.options.summarize_geography,
-                    "summarize_geography",
-                    choices=[str(geo_id) for geo_id in summarize_grid.geographies],
+                    self.options.summarize_geography, "summarize_geography"
                 )
             ]
 

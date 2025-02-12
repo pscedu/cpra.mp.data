@@ -16,14 +16,11 @@ class VectorGrid(BaseGrid):
 
     grid_type = "vector"
 
-    def __init__(self, name, geographies=None, crs="epsg:26915"):
+    def __init__(self, name, id_min=None, id_max=None, id_count=None, crs="epsg:26915"):
         super().__init__(name=name, crs=crs)
-        if isinstance(geographies, int):
-            self.geographies = list(range(1, geographies + 1))
-        elif geographies:
-            self.geographies = list(geographies)
-        else:
-            self.geographies = []
+        self.id_min = id_min
+        self.id_max = id_max
+        self.id_count = id_count
 
 
 class RasterGrid(BaseGrid):
@@ -45,7 +42,7 @@ for row in (
     read_structure_csv("grids")
     .with_columns(
         pl.col("bounds").str.split(", ").cast(pl.List(pl.Int32)),
-        pl.col("height", "width", "geographies").cast(pl.Int32),
+        pl.col("height", "width", "id_min", "id_max", "id_count").cast(pl.Int32),
     )
     .iter_rows(named=True)
 ):
@@ -60,7 +57,9 @@ for row in (
     else:
         grid = VectorGrid(
             name=row["name"],
-            geographies=row["geographies"],
+            id_min=row["id_min"],
+            id_max=row["id_max"],
+            id_count=row["id_count"],
             crs=row["crs"],
         )
 

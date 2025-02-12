@@ -122,7 +122,9 @@ class Grid(BaseModel):
     name: str
     grid_type: str
     crs: str
-    geographies: Any | None
+    id_min: int | None
+    id_max: int | None
+    id_count: int | None
     bounds: list[int] | None
     height: int | None
     width: int | None

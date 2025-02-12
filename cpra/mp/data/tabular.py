@@ -1,3 +1,4 @@
+import re
 import polars as pl
 import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
@@ -14,6 +15,10 @@ from cpra.mp.data.utils import (
 )
 from cpra.mp.data.variables import VARIABLES
 from pathlib import Path
+
+
+ALPHA_COLUMN = re.compile(r"^[a-z]")
+NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
@@ -97,30 +102,44 @@ def write_parquet(
         if validate:
             validate_data_frame(df, required_cols=required_cols)
 
-        # Validate geography column names.
+        # Validate column names.
         grid = validate_grid(df, **kwargs)
-        geography_cols = [str(geo) for geo in sorted(grid.geographies)]
-        all_cols = required_cols + geography_cols
 
-        invalid_cols = set(df.columns) - set(all_cols)
+        alpha_cols = [col for col in df.columns if ALPHA_COLUMN.match(col)]
+        numeric_cols = [col for col in df.columns if NUMERIC_COLUMN.match(col)]
+
+        invalid_cols = set(alpha_cols) - set(required_cols)
         if invalid_cols:
             msg = f"Invalid columns: {', '.join(list(invalid_cols))}"
             raise ValidationError(msg)
 
-        missing_cols = set(all_cols) - set(df.columns)
+        missing_cols = set(required_cols) - set(alpha_cols)
         if missing_cols:
             msg = f"Missing columns: {', '.join(list(missing_cols))}"
             raise ValidationError(msg)
 
-        # Validate geometry column data types.
+        if grid.id_count is not None and len(numeric_cols) != grid.id_count:
+            msg = (
+                "Wrong number of geography columns: "
+                f"expected {grid.id_count}, found {len(numeric_cols)}"
+            )
+            raise ValidationError(msg)
+
+        # Validate geometry column data type and min/max ID.
         variable = VARIABLES[df["variable"][0]]
-        for col in geography_cols:
+        for col in numeric_cols:
+            if (grid.id_min is not None and int(col) < grid.id_min) or (
+                grid.id_max is not None and int(col) > grid.id_max
+            ):
+                msg = f"Invalid geography ID for grid {grid.name}: {col}"
+                raise ValidationError(msg)
             if df[col].dtype != variable.dtype:
                 msg = f"Series {col} has dtype {df[col].dtype!s}, expected {variable.dtype!s}"
                 raise ValidationError(msg)
 
         # Sort columns and rows.
         if sort:
+            all_cols = required_cols + list(map(str, sorted(map(int, numeric_cols))))
             df = df.select(*all_cols).sort(*required_cols)
 
     # Get partition columns.
