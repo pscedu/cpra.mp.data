@@ -2,12 +2,14 @@ __pycache__/
 build/
 dist/
 env/
+geojson/
 venv/
 
 *.pyc
 *.egg-info
 .env
 token.txt
+*.html
 
 *.~lock*
 /test_*.py

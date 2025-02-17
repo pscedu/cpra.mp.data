@@ -42,13 +42,18 @@ api = [
 ]
 scripts = [
   "fastexcel",
-  "tippecanoe"
+  "tippecanoe",
+]
+visualization = [
+  "altair[all]",
+  "bokeh",
 ]
 
 [tool.hatch.envs.default]
 features = [
   "api",
-  "scripts"
+  "scripts",
+  "visualization"
 ]
 
 [tool.hatch.build.targets.sdist]
