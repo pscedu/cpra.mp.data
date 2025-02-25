@@ -102,13 +102,22 @@ async def parallel_sample_rasters(datasets, coordinates):
     )
 
 
-def unpack_values(values_str, param_name, choices=None, separator=","):
+def unpack_values(values_str, param_name, choices=None, separator=",", dtype=None):
     """Unpack values from a comma-separated list."""
     values = [val.strip() for val in values_str.split(separator)]
 
+    if dtype:
+        try:
+            values = [dtype(val) for val in values]
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{param_name} contains values that cannot be converted to type {dtype.__name__}",
+            )
+
     # Validate choices.
     if choices:
-        invalid_values = [val for val in values if val not in choices]
+        invalid_values = [str(val) for val in values if val not in choices]
         if invalid_values:
             msg = f"Invalid values for {param_name}: {', '.join(invalid_values)}"
             raise HTTPException(status_code=400, detail=msg)

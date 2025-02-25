@@ -3,7 +3,6 @@ import re
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
-from fastapi import HTTPException
 
 TIF_EXTENSION = re.compile(r"\.tif$")
 RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
@@ -40,17 +39,9 @@ class CatalogQuery:
 
         # Update choices with the dimension values.
         if dimension_name in self._choices:
-            # Calculate choices that are common to this branch and previous branches.
-            common_choices = [
-                val for val in self._choices[dimension_name] if val in dimension_values
-            ]
-            # If there are common choices, assign them as the choices for
-            # this dimension. Otherwise, return an error.
-            if common_choices:
-                self._choices[dimension_name] = common_choices
-            else:
-                msg = f"No common values for dimension {dimension_name}"
-                raise HTTPException(status_code=404, detail=msg)
+            self._choices[dimension_name] = sorted(
+                list(set(self._choices[dimension_name]) | set(dimension_values))
+            )
         else:
             self._choices[dimension_name] = dimension_values
 
@@ -148,24 +139,27 @@ class CatalogQuery:
                     parquet_paths.extend([root / file for file in files])
 
         if parquet_paths:
-            lf = pl.scan_parquet(parquet_paths, include_file_paths="path")
-            path_col = pl.col("path")
-            expected_len = len(parquet_paths)
+            lf = pl.scan_parquet(parquet_paths)
+            prev_col = None
             for col in required_cols:
                 if col in self._results:
                     continue
 
+                # Filter the lazy frame by the previous column.
+                if prev_col:
+                    lf = lf.filter(pl.col(prev_col).is_in(self._results[prev_col]))
+
                 dim_col = pl.col(col)
                 self._update(
                     dimension_name=col,
-                    dimension_values=lf.group_by(dim_col)
-                    .agg(path_col)
-                    .filter(path_col.list.n_unique() == expected_len)
-                    .select(dim_col)
+                    dimension_values=lf.select(dim_col)
+                    .unique()
                     .sort(dim_col)
                     .collect()[col]
                     .to_list(),
                 )
+
+                prev_col = col
 
         self._compress()
         return {

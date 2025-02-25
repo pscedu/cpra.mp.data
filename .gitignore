@@ -14,6 +14,10 @@ token.txt
 
 /cpra/mp/data/crosswalk/
 /cpra/mp/data/geometry/
+/cpra/mp/data/geojson/
 /data/
+/data-*/
+/iceberg/
+/iceberg-*/
 /scratch/
 /tiles/

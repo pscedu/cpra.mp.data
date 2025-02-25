@@ -87,22 +87,15 @@ class Dataset(LazyFrameSource):
     async def _apply_geography_vector(self):
         """Apply the geography filter to a vector-grid dataset."""
         # TODO: Validate that the given IDs fall within the grid min and max.
-        self.geography_ids = unpack_values(self.options.geography, "geography")
-        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
+        self.geography_ids = unpack_values(
+            self.options.geography, "geography", dtype=int
+        )
+        self.lf = self.lf.filter(pl.col("geography").is_in(self.geography_ids))
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
         # Check that coordinates are numeric and that there are an even number.
-        try:
-            coords = [
-                float(coord)
-                for coord in unpack_values(self.options.geography, "geography")
-            ]
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="geography contains non-numeric coordinates"
-            )
-
+        coords = unpack_values(self.options.geography, "geography", dtype=float)
         coords_len = len(coords)
         if coords_len % 2:
             raise HTTPException(
@@ -242,12 +235,9 @@ class Dataset(LazyFrameSource):
         if self.options.summarize_geography:
             # summarize_grid = GRIDS[self.options.summarize_by]
             # TODO: Validate that the given IDs fall within the grid min and max.
-            self.summarize_geography_ids = [
-                int(geo_id)
-                for geo_id in unpack_values(
-                    self.options.summarize_geography, "summarize_geography"
-                )
-            ]
+            self.summarize_geography_ids = unpack_values(
+                self.options.summarize_geography, "summarize_geography", dtype=int
+            )
 
         # Generate column expressions.
         crosswalk_name = (
