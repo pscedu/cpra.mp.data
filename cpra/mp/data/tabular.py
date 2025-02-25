@@ -1,6 +1,5 @@
 import re
 import polars as pl
-import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
@@ -66,7 +65,8 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        cs.digit(),
+        pl.col("geography"),
+        pl.col("value"),
     )
 
     return lf
