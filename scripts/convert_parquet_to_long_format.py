@@ -27,17 +27,7 @@ def write_long(
 
     partition_cols = partition_columns(df)
     required_cols = required_columns(df)
-    calendar_idx = required_cols.index(
-        *[c for c in required_cols if c.startswith("calendar_")]
-    )
-    all_cols = (
-        required_cols[:calendar_idx]
-        + ["geography"]
-        + required_cols[calendar_idx:]
-        + ["value"]
-    )
-
-    breakpoint()
+    all_cols = required_cols + ["geography", "value"]
 
     (
         df.unpivot(index=DIMENSION_COLUMNS, variable_name="geography")
@@ -53,7 +43,6 @@ def write_long(
             pyarrow_options=dict(
                 use_dictionary=use_dictionary,
                 partition_cols=partition_cols,
-                use_byte_stream_split=["value"],
             ),
         )
     )
