@@ -56,6 +56,7 @@ class Options(BaseModel):
     summarize_aggregate: AggregateFunction | None = None
     summarize_geography: str | None = None
     sort: str | None = None
+    select: str | None = None
 
     class Config:
         use_enum_values = True
