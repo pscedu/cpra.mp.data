@@ -29,7 +29,7 @@ dependencies = [
   "mercantile",
   "numpy",
   "Pillow",
-  "polars",
+  "polars==1.22.0",
   "pyarrow",
   "python-dotenv",
   "rasterio",
