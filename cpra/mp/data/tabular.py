@@ -1,5 +1,6 @@
 import re
 import polars as pl
+import polars.selectors as cs
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
@@ -20,7 +21,7 @@ ALPHA_COLUMN = re.compile(r"^[a-z]")
 NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
-def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
+def read_parquet(base_path=BASE_PATH, cache=True, wide_format=False, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
     # Validate the input keyword arguments.
@@ -65,8 +66,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        pl.col("geography"),
-        pl.col("value"),
+        *([cs.digit()] if wide_format else [pl.col("geography"), pl.col("value")]),
     )
 
     return lf
