@@ -1,5 +1,7 @@
 import polars as pl
 import polars.selectors as cs
+import pyarrow.parquet as pq
+import sys
 from pathlib import Path
 from polars.exceptions import ColumnNotFoundError
 from cpra.mp.data import read_data
@@ -12,7 +14,7 @@ from cpra.mp.data.utils import (
 )
 
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
-LONG_BASE_PATH = Path("/home/mjyoder/cpra.mp.data/data-long")
+LONG_BASE_PATH = Path("/ocean/projects/bcs200002p/shared/data")
 
 
 def write_long(
@@ -26,14 +28,14 @@ def write_long(
     """Write a data frame in long format."""
 
     partition_cols = partition_columns(df)
-    required_cols = required_columns(df)
-    all_cols = required_cols + ["geography", "value"]
+    all_cols = required_columns(df, include_geography=True, include_value=True)
+    sort_cols = required_columns(df, include_metadata=False, include_geography=True)
 
     (
         df.unpivot(index=DIMENSION_COLUMNS, variable_name="geography")
         .with_columns(pl.col("geography").cast(pl.Int32))
         .select(*all_cols)
-        .sort(*all_cols)
+        .sort(*sort_cols)
         .write_parquet(
             base_path,
             compression=compression,
@@ -43,15 +45,17 @@ def write_long(
             pyarrow_options=dict(
                 use_dictionary=use_dictionary,
                 partition_cols=partition_cols,
+                sorting_columns=[pq.SortingColumn(i) for i in range(len(sort_cols))],
             ),
         )
     )
 
 
-def convert_to_long_format():
+def convert_to_long_format(**kwargs):
     """Convert Parquet datasets to long format."""
 
-    datasets = glob_lazy_frame(required_cols=DATASET_DIMENSIONS).collect()
+    glob_kwargs = dict(required_cols=DATASET_DIMENSIONS, **kwargs)
+    datasets = glob_lazy_frame(**glob_kwargs).collect()
 
     for dataset_dict in datasets.iter_rows(named=True):
         src_path = Path(dataset_dict["path"])
@@ -86,11 +90,11 @@ def convert_to_long_format():
                 .collect()
             )
             for row in dataset_dimensions.iter_rows(named=True):
-                df = read_data(**row).collect()
+                df = read_data(**row, wide_format=True).collect()
                 write_long(df)
         else:
             try:
-                df = read_data(**dataset_dict).collect()
+                df = read_data(**dataset_dict, wide_format=True).collect()
             except ColumnNotFoundError:
                 # Handle monthly datasets that are still partitioned.
                 df = pl.read_parquet(src_path).with_columns(
@@ -100,4 +104,8 @@ def convert_to_long_format():
 
 
 if __name__ == "__main__":
-    convert_to_long_format()
+    kwargs = {}
+    if len(sys.argv) > 1:
+        kwargs["variable"] = sys.argv[1]
+
+    convert_to_long_format(**kwargs)
