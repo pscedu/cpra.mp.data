@@ -25,16 +25,28 @@ def partition_columns(df, include_dataset=True):
     ]
 
 
-def required_columns(df, include_dataset=True, include_metadata=True):
+def required_columns(
+    df,
+    include_dataset=True,
+    include_metadata=True,
+    include_geography=False,
+    include_value=False,
+):
     """Get a list of required columns based on the values in the data frame."""
 
-    return [
-        col.name
-        for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
-        if col.any()
-        and (include_dataset or col.name not in DATASET_DIMENSIONS)
-        and (include_metadata or col.name not in METADATA_DIMENSIONS)
-    ]
+    return (
+        [
+            col.name
+            for col in df.select(
+                **{dim.name: dim.required for dim in DIMENSIONS.values()}
+            )
+            if col.any()
+            and (include_dataset or col.name not in DATASET_DIMENSIONS)
+            and (include_metadata or col.name not in METADATA_DIMENSIONS)
+        ]
+        + (["geography"] if include_geography else [])
+        + (["value"] if include_value else [])
+    )
 
 
 def validate_data_frame(df, required_cols=None):
@@ -86,7 +98,7 @@ def validate_data_frame(df, required_cols=None):
             for series in results
             if not series.all() and not series.name == "valid"
         ]
-        msg = f"{failed_row_count} rows failed validation: {", ".join(failed_cols)}"
+        msg = f"{failed_row_count} rows failed validation: {', '.join(failed_cols)}"
         raise ValidationError(msg)
 
 
@@ -174,7 +186,7 @@ def build_glob_pattern(required_cols, extension=None, **kwargs):
         if not isinstance(v, (list, tuple)) or len(v) == 1
     }
     dimension_patterns = [
-        f"{col}={str(single_values[col]) if col in single_values else "*"}"
+        f"{col}={str(single_values[col]) if col in single_values else '*'}"
         for col in required_cols
     ]
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")

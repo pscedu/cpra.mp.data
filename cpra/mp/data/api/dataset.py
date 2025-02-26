@@ -26,6 +26,7 @@ from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import Legend, LEGENDS
+from cpra.mp.data.utils import get_input_data_frame, required_columns
 from cpra.mp.data.variables import Variable, VARIABLES
 from contextlib import ExitStack
 from fastapi import HTTPException
@@ -173,15 +174,22 @@ class Dataset(LazyFrameSource):
         when_expression = when_expression.otherwise(value_cols)
         self.lf = self.lf.with_columns(when_expression)
 
-    def _apply_sort_param(self, order: str, param_name: str):
-        """Apply a sort parameter to the LazyFrame."""
-        if order is None:
-            return
+    def _apply_sort_params(self):
+        """Apply sort and select parameters to the LazyFrame."""
+        if self.options.sort is not None:
+            parts = unpack_values(self.options.sort, "sort", SORT_CHOICES)
+            cols = [part.replace("-", "") for part in parts]
+            desc = [part.startswith("-") for part in parts]
+            self.lf = self.lf.sort(cols, descending=desc)
 
-        parts = unpack_values(order, param_name, SORT_CHOICES)
-        cols = [part.replace("-", "") for part in parts]
-        desc = [part.startswith("-") for part in parts]
-        self.lf = self.lf.sort(cols, descending=desc)
+        if self.options.select is not None:
+            required_cols = required_columns(
+                get_input_data_frame(**dict(self.dataset_dimensions)),
+                include_geography=True,
+                include_value=True,
+            )
+            select_cols = unpack_values(self.options.select, "select", required_cols)
+            self.lf = self.lf.select(select_cols)
 
     def _get_group_by_columns(self):
         """Get a list of group_by column names."""
@@ -304,7 +312,7 @@ class Dataset(LazyFrameSource):
         self._apply_calculate_params()
         self._apply_group_params()
         self._apply_transform_params()
-        self._apply_sort_param(self.options.sort, "sort")
+        self._apply_sort_params()
 
     def validate_tile(self):
         """Validate that the tile is raster and will have a single band."""
