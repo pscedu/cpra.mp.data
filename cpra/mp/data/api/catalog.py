@@ -129,7 +129,7 @@ class CatalogQuery:
         required_cols = required_columns(input_df, include_metadata=False)
 
         parquet_paths = []
-        for root, dirs, files in BASE_PATH.walk():
+        for root, dirs, files in BASE_PATH.walk(follow_symlinks=True):
             if dirs:
                 self._update(items=dirs)
             elif files:
