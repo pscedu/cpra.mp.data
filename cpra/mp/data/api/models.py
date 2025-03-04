@@ -139,3 +139,8 @@ class LegendBreakPoint(BaseModel):
 class Legend(BaseModel):
     name: str
     break_points: list[LegendBreakPoint]
+
+
+class Visualization(BaseModel):
+    name: str
+    label: str

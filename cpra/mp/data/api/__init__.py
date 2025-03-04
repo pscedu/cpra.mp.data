@@ -21,8 +21,9 @@ from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.variables import VARIABLES
+from cpra.mp.data.visualizations import VISUALIZATIONS
 from cpra.mp.data.utils import glob_lazy_frame
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Annotated
@@ -169,3 +170,24 @@ async def get_model_tile(
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
+
+
+@app.get(
+    "/v1/datasets/{variable}/{grid}/{time_unit}/visualization/{visualization_type}.json",
+    tags=["Visualization"],
+)
+async def get_visualization(
+    request: Request,
+    visualization_type,
+    query: Annotated[DataQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    VisualizationClass = VISUALIZATIONS[visualization_type]
+    visualization = VisualizationClass(
+        variable=dataset_dimensions.variable,
+        grid=dataset_dimensions.grid,
+        time_unit=dataset_dimensions.time_unit,
+        request=request,
+        **dict(query),
+    )
+    return JSONResponse(visualization.spec)
