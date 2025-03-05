@@ -24,6 +24,9 @@ class BaseVisualization:
         )
         select = [self.get_time_column(time_unit), "geography", "value"]
 
+        # Force melt to be true.
+        kwargs["melt"] = True
+
         params = []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
