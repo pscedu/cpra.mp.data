@@ -38,6 +38,7 @@ dependencies = [
 
 [project.optional-dependencies]
 api = [
+  "altair",
   "fastapi[standard]>=0.115.0"
 ]
 scripts = [
