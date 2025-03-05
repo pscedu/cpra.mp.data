@@ -1,8 +1,10 @@
 import altair as alt
+import polars as pl
 from functools import cached_property
 from urllib.parse import urlencode
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.utils import required_columns
 from cpra.mp.data.variables import VARIABLES
 
 
@@ -17,15 +19,23 @@ class BaseVisualization:
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
+        required_cols = required_columns(
+            pl.DataFrame({"variable": variable, "grid": grid, "time_unit": time_unit})
+        )
+        select = [self.get_time_column(time_unit), "geography", "value"]
+
         params = []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
                 for value in param_values:
                     params.append((param_name, value))
+                if param_name in required_cols and len(param_values) > 1:
+                    select.append(param_name)
             elif param_values is not None:
                 params.append((param_name, param_values))
 
-        # TODO: Set select param to limit columns returned.
+        # Set select param to limit columns returned.
+        params.append(("select", ",".join(select)))
 
         if self.request:
             dataset_url = self.request.url_for(
@@ -42,6 +52,10 @@ class BaseVisualization:
             )
 
         return f"{dataset_url}?{urlencode(params)}"
+
+    def get_time_column(self, time_unit):
+        """Get the name of the time column."""
+        return "calendar_year" if time_unit in ("decadal", "annual") else "calendar_day"
 
     @property
     def spec(self):
@@ -82,11 +96,7 @@ class DatasetVisualization(BaseVisualization):
     @cached_property
     def time_column(self):
         """Get the name of the time column."""
-        return (
-            "calendar_year"
-            if self.time_unit in ("decadal", "annual")
-            else "calendar_day"
-        )
+        return self.get_time_column(self.time_unit)
 
     @cached_property
     def title(self):
