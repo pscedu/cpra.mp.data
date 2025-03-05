@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.17.0](https://github.com/pscedu/cpra.mp.data/compare/v0.16.0...v0.17.0) (2025-03-05)
+
+
+### Features
+
+* **api:** add select parameter to limit returned columns ([491eeed](https://github.com/pscedu/cpra.mp.data/commit/491eeed5b0b359e4ce3d28c981c07e1dcde9013b))
+* **visualization:** add time series line and visualization endpoint ([1ee0154](https://github.com/pscedu/cpra.mp.data/commit/1ee01540eac0501f7baa7f6e86cbe55558868733))
+
+
+### Bug Fixes
+
+* **visualization:** melt visualization data ([5a4b138](https://github.com/pscedu/cpra.mp.data/commit/5a4b138de6afd2e9fabdecfcb05526a75ccdb025))
+
+
+### Performance Improvements
+
+* **visualizations:** limit the columns in data requests ([d6fe43b](https://github.com/pscedu/cpra.mp.data/commit/d6fe43b8f8f29c01e74d82949af3f6db940e2b2d))
+
 ## [0.16.0](https://github.com/pscedu/cpra.mp.data/compare/v0.15.0...v0.16.0) (2025-02-12)
 
 
