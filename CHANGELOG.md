@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.0](https://github.com/pscedu/cpra.mp.data/compare/v0.17.0...v0.18.0) (2025-03-07)
+
+
+### Features
+
+* **grids:** add label field ([7340b0d](https://github.com/pscedu/cpra.mp.data/commit/7340b0d44c84bac59ea9384cfa1b8c358624a75d))
+* **structure:** update grids ([62a7638](https://github.com/pscedu/cpra.mp.data/commit/62a7638e96b8f7f38d8750a8639426e4fc526a47))
+
 ## [0.17.0](https://github.com/pscedu/cpra.mp.data/compare/v0.16.0...v0.17.0) (2025-03-05)
 
 
