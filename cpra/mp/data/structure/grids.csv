@@ -1,9 +1,9 @@
-name,type,crs,id_min,id_max,id_count,bounds,height,width
-morph_pixel_v001,raster,epsg:26915,,,,"404500, 3187060, 1024720, 3435010",8285,20674
-veg_grid_cell_v001,vector,epsg:26915,1,173897,173897,,,
-hydro_compartment_v001,vector,epsg:26915,1,1657,1657,,,
-ecoregion_v001,vector,epsg:26915,1,32,32,,,
-block_group_v2020,vector,epsg:26915,,,,,,
-clara_community_v001,vector,epsg:26915,,,,,,
-parish_v2020,vector,epsg:26915,,,,,,
-clara_grid_cell_v001,vector,epsg:26915,1,126172,73298,,,
+label,name,type,crs,id_min,id_max,id_count,bounds,height,width
+Morphology Pixel,morph_pixel_v001,raster,epsg:26915,,,,"404500, 3187060, 1024720, 3435010",8285,20674
+Vegetation Grid Cell,veg_grid_cell_v001,vector,epsg:26915,1,173898,173898,,,
+Hydro Compartment,hydro_compartment_v001,vector,epsg:26915,1,1657,1657,,,
+Ecoregion,ecoregion_v001,vector,epsg:26915,1,32,32,,,
+Block Group,block_group_v2020,vector,epsg:26915,,,,,,
+CLARA Community,clara_community_v001,vector,epsg:26915,,,,,,
+Parish,parish_v2020,vector,epsg:26915,,,,,,
+CLARA Grid Cell,clara_grid_cell_v001,vector,epsg:26915,1,126172,73298,,,
