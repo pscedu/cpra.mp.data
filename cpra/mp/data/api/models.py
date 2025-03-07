@@ -121,6 +121,7 @@ class Variable(BaseModel):
 
 class Grid(BaseModel):
     name: str
+    label: str
     grid_type: str
     crs: str
     id_min: int | None
