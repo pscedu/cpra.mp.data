@@ -91,6 +91,7 @@ def grids() -> list[Grid]:
     return [
         Grid(
             name=grid.name,
+            label=grid.label,
             grid_type=grid.grid_type,
             crs=grid.crs,
             id_min=getattr(grid, "id_min", None),

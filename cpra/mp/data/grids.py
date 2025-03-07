@@ -6,8 +6,9 @@ from cpra.mp.data.structure import read_structure_csv
 class BaseGrid:
     """Base class for geographic grids."""
 
-    def __init__(self, name, crs="epsg:26915"):
+    def __init__(self, name, label, crs="epsg:26915"):
         self.name = name
+        self.label = label
         self.crs = crs
 
 
@@ -16,8 +17,10 @@ class VectorGrid(BaseGrid):
 
     grid_type = "vector"
 
-    def __init__(self, name, id_min=None, id_max=None, id_count=None, crs="epsg:26915"):
-        super().__init__(name=name, crs=crs)
+    def __init__(
+        self, name, label, id_min=None, id_max=None, id_count=None, crs="epsg:26915"
+    ):
+        super().__init__(name=name, label=label, crs=crs)
         self.id_min = id_min
         self.id_max = id_max
         self.id_count = id_count
@@ -28,8 +31,8 @@ class RasterGrid(BaseGrid):
 
     grid_type = "raster"
 
-    def __init__(self, name, bounds, height, width, crs="epsg:26915"):
-        super().__init__(name=name, crs=crs)
+    def __init__(self, name, label, bounds, height, width, crs="epsg:26915"):
+        super().__init__(name=name, label=label, crs=crs)
         self.bounds = bounds
         self.height = height
         self.width = width
@@ -49,6 +52,7 @@ for row in (
     if row["type"] == "raster":
         grid = RasterGrid(
             name=row["name"],
+            label=row["label"],
             bounds=row["bounds"],
             height=row["height"],
             width=row["width"],
@@ -57,6 +61,7 @@ for row in (
     else:
         grid = VectorGrid(
             name=row["name"],
+            label=row["label"],
             id_min=row["id_min"],
             id_max=row["id_max"],
             id_count=row["id_count"],
