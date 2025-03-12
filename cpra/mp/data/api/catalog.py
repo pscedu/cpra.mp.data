@@ -1,5 +1,7 @@
-import polars as pl
 import re
+from math import floor
+
+import polars as pl
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
@@ -82,6 +84,13 @@ class CatalogQuery:
                 if dimension_name in ("calendar_day", "calendar_year"):
                     range_function = RANGE_FUNCTIONS[dimension_name]
                     range_kwargs = RANGE_KWARGS[self.dataset_dimensions.time_unit]
+                    # Account for decadal data that don't start on an even decade.
+                    # TODO: Handle monthly data that don't start on the first of the month.
+                    range_start = (
+                        floor(values.min() / 10) * 10
+                        if self._choices.get("time_unit", None) == ["decadal"]
+                        else values.min()
+                    )
                     range_end = (
                         values.max()
                         if dimension_name == "calendar_day"
@@ -92,7 +101,7 @@ class CatalogQuery:
                             {
                                 "value": values,
                                 "seq": range_function(
-                                    values.min(),
+                                    range_start,
                                     range_end,
                                     eager=True,
                                     **range_kwargs,
@@ -101,7 +110,7 @@ class CatalogQuery:
                         )
                         .group_by(offset=(pl.col("value") - pl.col("seq")))
                         .agg(start=pl.col("value").min(), end=pl.col("value").max())
-                        .sort(pl.col("offset"))
+                        .sort(pl.col("start"))
                     )
                     if dimension_name == "calendar_day":
                         groups = groups.with_columns(
