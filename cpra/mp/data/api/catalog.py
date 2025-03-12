@@ -157,24 +157,20 @@ class CatalogQuery:
                     parquet_paths.extend([root / file for file in files])
 
         if parquet_paths:
-            lf = pl.scan_parquet(parquet_paths, include_file_paths="path")
-            path_col = pl.col("path")
-            expected_len = len(parquet_paths)
-            for col in required_cols:
-                if col in self._results:
-                    continue
+            filter_cols = [col for col in required_cols if col not in self._results]
+            df = pl.scan_parquet(parquet_paths).select(filter_cols).unique().collect()
+            prev_col = None
+            for col in filter_cols:
+                # Filter the lazy frame by the previous column.
+                if prev_col:
+                    df = df.filter(pl.col(prev_col).is_in(self._results[prev_col]))
 
-                dim_col = pl.col(col)
                 self._update(
                     dimension_name=col,
-                    dimension_values=lf.group_by(dim_col)
-                    .agg(path_col)
-                    .filter(path_col.list.n_unique() == expected_len)
-                    .select(dim_col)
-                    .sort(dim_col)
-                    .collect()[col]
-                    .to_list(),
+                    dimension_values=df.select(col).unique().sort(col)[col].to_list(),
                 )
+
+                prev_col = col
 
         self._compress()
         return {
