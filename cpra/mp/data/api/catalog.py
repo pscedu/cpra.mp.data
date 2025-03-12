@@ -11,7 +11,7 @@ TIF_EXTENSION = re.compile(r"\.tif$")
 RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
 RANGE_KWARGS = {
     "daily": {"interval": "1d"},
-    "monthly": {"interval": "1m"},
+    "monthly": {"interval": "1mo"},
     "annual": {"step": 1},
     "decadal": {"step": 10},
 }
