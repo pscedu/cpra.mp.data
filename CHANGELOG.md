@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.20.0](https://github.com/pscedu/cpra.mp.data/compare/v0.19.0...v0.20.0) (2025-03-26)
+
+
+### Features
+
+* **structure:** update data structure ([a160189](https://github.com/pscedu/cpra.mp.data/commit/a1601897299d2e76032e0fd16447f4777e1574b0))
+
+
+### Bug Fixes
+
+* **api:** allow catalog to handle decadal inconsistencies ([2f1ca55](https://github.com/pscedu/cpra.mp.data/commit/2f1ca55ebfc107db7b50e87dff4cecdadb02e2ad))
+* **api:** fix monthly interval in catalog compression ([452c45f](https://github.com/pscedu/cpra.mp.data/commit/452c45fdba1c7827ebb473485e5d74c3ee489512))
+
+
+### Performance Improvements
+
+* **api:** compute catalog Parquet choices in memory ([aefac47](https://github.com/pscedu/cpra.mp.data/commit/aefac470d5741dfafb5733c656e19688eb6f9096))
+
 ## [0.19.0](https://github.com/pscedu/cpra.mp.data/compare/v0.18.0...v0.19.0) (2025-03-10)
 
 
