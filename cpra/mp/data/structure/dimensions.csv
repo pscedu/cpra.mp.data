@@ -2,8 +2,8 @@ label,name,type,dtype,required,min_value,max_value,example_value
 Variable,variable,dataset,String,true,,,sal
 Grid,grid,dataset,String,true,,,hydro_compartment_v001
 Time Unit,time_unit,dataset,String,true,,,daily
-Plan Implementation Scenario,model_group_id,partition,Int32,true,100,999,500
-Environmental Scenario,scenario_id,partition,Int32,true,1,100,7
+Plan Implementation Scenario,model_group_id,partition,Int32,true,0,999,500
+Environmental Scenario,scenario_id,partition,Int32,true,0,100,7
 Aggregate Type,aggregate_type,partition,String,false,,,2_wk_max
 Annual Exceedance Probability,aep,partition,Float32,false,,,2
 Synthetic Storm ID,storm_id,partition,Int32,false,1,1000,182
