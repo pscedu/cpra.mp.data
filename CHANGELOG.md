@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.0](https://github.com/pscedu/cpra.mp.data/compare/v0.20.0...v0.21.0) (2025-03-27)
+
+
+### Features
+
+* **scripts:** add conversion of veg grid data to raster format ([0cdd562](https://github.com/pscedu/cpra.mp.data/commit/0cdd562fd2372c501f1cf85cdd0c3717efdc17f1))
+* **structure:** update grids ([e8e0684](https://github.com/pscedu/cpra.mp.data/commit/e8e06843e1940130c82721358ef0fe77dadf4dea))
+
 ## [0.20.0](https://github.com/pscedu/cpra.mp.data/compare/v0.19.0...v0.20.0) (2025-03-26)
 
 
