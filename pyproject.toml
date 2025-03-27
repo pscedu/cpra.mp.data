@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cpra.mp.data"
-version = "0.20.0"
+version = "0.21.0"
 description = "Tools for reading and writing data from Louisiana's Coastal Master Plan"
 readme = "README.md"
 requires-python = ">=3.8"
