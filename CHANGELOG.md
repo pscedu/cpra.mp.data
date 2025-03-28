@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/pscedu/cpra.mp.data/compare/v0.21.0...v0.21.1) (2025-03-28)
+
+
+### Bug Fixes
+
+* **structure:** replace veg_grid_cell with veg_pixel ([1df5ed2](https://github.com/pscedu/cpra.mp.data/commit/1df5ed233b8db6ce6e973cec416d44435c7f8847))
+
 ## [0.21.0](https://github.com/pscedu/cpra.mp.data/compare/v0.20.0...v0.21.0) (2025-03-27)
 
 
