@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.2](https://github.com/pscedu/cpra.mp.data/compare/v0.21.1...v0.21.2) (2025-03-28)
+
+
+### Bug Fixes
+
+* **api:** update model config property name for Pydantic ([b2de1a8](https://github.com/pscedu/cpra.mp.data/commit/b2de1a8018e5b646b0a3a5b92c89fa734a587a76))
+
 ## [0.21.1](https://github.com/pscedu/cpra.mp.data/compare/v0.21.0...v0.21.1) (2025-03-28)
 
 
