@@ -11,7 +11,7 @@ from typing import Any
 
 BaseDatasetDimensions = create_model(
     "BaseDatasetDimensions",
-    model_config=ConfigDict(protected_namespaces=()),
+    __config__=ConfigDict(protected_namespaces=()),
     **{
         dim.name: (dimension_type(dim.name), None)
         for dim in DATASET_DIMENSIONS.values()
@@ -20,7 +20,7 @@ BaseDatasetDimensions = create_model(
 
 BaseFilterDimensions = create_model(
     "BaseFilterDimensions",
-    model_config=ConfigDict(protected_namespaces=()),
+    __config__=ConfigDict(protected_namespaces=()),
     **{
         dim.name: (
             list[dimension_type(dim.name)] | None,
