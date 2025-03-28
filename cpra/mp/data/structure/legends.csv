@@ -48,17 +48,12 @@ exposure_exposed_structures,2 structures exposed,#fee08b,3.0
 exposure_exposed_structures,3 to 5 structures exposed,#e6f598,6.0
 exposure_exposed_structures,6 to 9 structures exposed,#99d594,10.0
 exposure_exposed_structures,10 or more structures exposed,#3288bd,
-ffibs,Fresh Forest,#5E823A,
-ffibs,Fresh Marsh,#DAE86D,
-ffibs,Intermediate Marsh,#92CBE8,
-ffibs,Brackish Marsh,#735753,
+ffibs,No Data,#00000000,0.0
+ffibs,Fresh Forest,#5E823A,0.2
+ffibs,Fresh Marsh,#DAE86D,2.0
+ffibs,Intermediate Marsh,#92CBE8,5.0
+ffibs,Brackish Marsh,#735753,17.0
 ffibs,Saline Marsh,#0679D2,
-ffibs_score,No Data,#00000000,0.0
-ffibs_score,Fresh Forest,#5E823A,0.2
-ffibs_score,Fresh Marsh,#DAE86D,2.0
-ffibs_score,Intermediate Marsh,#92CBE8,5.0
-ffibs_score,Brackish Marsh,#735753,17.0
-ffibs_score,Saline Marsh,#0679D2,
 flood_depth,1 to < 4 feet,#728D97,
 flood_depth,4 to < 7 feet,#73B7EA,
 flood_depth,7 to < 10 feet,#99D9A7,
