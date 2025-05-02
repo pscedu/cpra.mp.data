@@ -108,7 +108,7 @@ def values_df_from_dict(dimension, values_dict, attr="label"):
             "value": list(values_dict.keys()),
             "label": [getattr(obj, attr) for obj in values_dict.values()],
         }
-    ).with_columns(pl.lit("variable").alias(dimension))
+    ).with_columns(pl.lit(dimension).alias("dimension")).select("dimension", "value", "label")
 
 
 DIMENSIONS = {d.name: d for d in make_dimensions()}
