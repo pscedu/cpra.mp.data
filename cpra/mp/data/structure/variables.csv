@@ -25,8 +25,8 @@ Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,v
 Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,vegetation_species_type
 Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
-Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
-Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type_id,
+Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng,
+Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type,
 Mineral Accretion,mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 Mineral Deposition Rate,mnrl_dep,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,mnrl_dep,
 Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,omar,

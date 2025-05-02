@@ -48,6 +48,17 @@ def replace_section(section_id, content, markdown):
     )
 
 
+def pluralize(noun):
+    """Make noun plural."""
+    if noun.endswith("s"):
+        return noun
+
+    if noun.endswith("y") and noun[-2] not in "aeiou":
+        return noun[:-1] + "ies"
+
+    return noun + "s"
+
+
 def update_docs():
     """Update documenation Markdown."""
 
@@ -60,27 +71,29 @@ def update_docs():
     legends = read_structure_csv("legends")
     variables = read_structure_csv("variables")
 
+    markdown = replace_section("dimensions", table(dimensions), markdown)
     markdown = replace_section(
         "variables", table(variables, column_aliases={"dtype": "Data Type"}), markdown
     )
+    markdown = replace_section(
+        "grids", table(grids, column_aliases={"crs": "CRS"}), markdown
+    )
 
-    dimensions_content = table(dimensions)
+    dimensions_values_content = ""
     for dim in dimensions.iter_rows(named=True):
         values_df = dimension_values.filter(dimension=dim["name"])
         if not len(values_df):
             continue
-        dimensions_content += f"\n\n ### {dim['label']} Values"
-        dimensions_content += f"\n\n{table(values_df.select('value', 'label'))}"
-    markdown = replace_section("dimensions", dimensions_content, markdown)
-
+        dimensions_values_content += f"\n\n## {pluralize(dim['label'])}"
+        dimensions_values_content += f"\n\n{table(values_df.select('value', 'label'))}"
     markdown = replace_section(
-        "grids", table(grids, column_aliases={"crs": "CRS"}), markdown
+        "dimension_values", dimensions_values_content, markdown
     )
 
     legends_content = "\n\n".join(
         [
             f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')))}"
-            for group, legend_df in legends.group_by("name")
+            for group, legend_df in sorted(legends.group_by("name"))
         ]
     )
 

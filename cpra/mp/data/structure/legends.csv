@@ -79,16 +79,16 @@ inun,0.00 to < 0.25,#e6f598,0.25
 inun,0.25 to < 0.50,#abdda4,0.5
 inun,0.50 to < 1.00,#66c2a5,1.0
 inun,1.00 or more,#3288bd,
-lnd_chng_id,Land Loss,#4591ac,
-lnd_chng_id,Induced Loss,#00f0f0,
-lnd_chng_id,Land Maintained,#99c104,
-lnd_chng_id,Land Gain,#265118,
-lnd_type_id,No Data,#00000000,1.0
-lnd_type_id,Vegetated Wetland,#008000,2.0
-lnd_type_id,Open Water,#6495ed,3.0
-lnd_type_id,Bare/Unvegetated Wetland,#8b4513,4.0
-lnd_type_id,Upland/Developed Areas,#999999,5.0
-lnd_type_id,Flotant Marsh,#afeeee,
+lnd_chng,Land Loss,#4591ac,
+lnd_chng,Induced Loss,#00f0f0,
+lnd_chng,Land Maintained,#99c104,
+lnd_chng,Land Gain,#265118,
+lnd_type,No Data,#00000000,1.0
+lnd_type,Vegetated Wetland,#008000,2.0
+lnd_type,Open Water,#6495ed,3.0
+lnd_type,Bare/Unvegetated Wetland,#8b4513,4.0
+lnd_type,Upland/Developed Areas,#999999,5.0
+lnd_type,Flotant Marsh,#afeeee,
 mnrl_dep,0 to < 1,#feebe2,1.0
 mnrl_dep,1 to < 10,#fbb4b9,10.0
 mnrl_dep,10 to < 100,#f768a1,100.0
