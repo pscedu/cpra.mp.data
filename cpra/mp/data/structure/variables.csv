@@ -1,35 +1,35 @@
 label,name,model,subroutine,dtype,geographic_units,time_units,unit,legend,required_dimensions
-Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
-Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
-Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type_id,
-Vegetation Type: FFIBS,ffibs,icm,lavegmod,Float32,veg_pixel,annual,,ffibs,ffibs_component
-Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
+Damage by Return Period in Dollars,damage,clara,,Float64,clara_grid_cell,decadal,$,,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+"Nonstructural Expected Annual Damage, Dollars",eadd_ns,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
+"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+Nonstructural Expected Annual Structural Damage,eadd_str_ns,clara,,Float64,clara_grid_cell,decadal,$,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
+Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
+Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
+Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,exposure_asset_count,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type"
+Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile"
+Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,aggregate_type
 Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",ppt,sal,aggregate_type
-Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
-Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",NAVD88 m,stg,aggregate_type
 Sediment Accumulation in Open Water,sedacc,icm,hydro,Float32,hydro_compartment,"daily, annual",g/m2/yr,,aggregate_type
 Sediment Accumulation at Marsh Edge,sedacc_marshedge,icm,hydro,Float32,hydro_compartment,"daily, annual",g/m2/yr,,aggregate_type
 Sediment Accumulation at Marsh Interior,sedacc_marshint,icm,hydro,Float32,hydro_compartment,"daily, annual",g/m2/yr,,aggregate_type
-Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,aggregate_type
+Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",NAVD88 m,stg,aggregate_type
+Hourly Stage (Water Level),stghr,icm,hydro,Float32,hydro_compartment,annual,NAVD88 m,,aggregate_type
 Stage (Water Level) in Marsh,stgm,icm,hydro,Float32,hydro_compartment,"daily, annual",NAVD88 m,,aggregate_type
-Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
 Water Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, annual",degrees C,tmp,aggregate_type
+Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
+Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
+Vegetation Type: FFIBS,ffibs,icm,lavegmod,Float32,veg_pixel,annual,,ffibs,ffibs_component
+Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_pixel,annual,,vct,vegetation_coverage_type
+Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,veg_area,habitat_code
+Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,vegetation_species_type
+Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
+Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
+Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng_id,
+Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type_id,
 Mineral Accretion,mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 Mineral Deposition Rate,mnrl_dep,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,mnrl_dep,
 Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,omar,
 Organic Accretion,org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
-Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,veg_area,habitat_code
-Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_pixel,annual,,vct,vegetation_coverage_type
-Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,vegetation_species_type
 Shallow Soil Factors,ssf,icm,morph,Float32,,annual,mm/yr,ssf,
 Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
-Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
-"Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
-Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
-Damage by Return Period in Dollars,damage,clara,,Float64,clara_grid_cell,decadal,$,,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile"
-Hourly Stage (Water Level),stghr,icm,hydro,Float32,hydro_compartment,annual,NAVD88 m,,aggregate_type
-Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,exposure_asset_count,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type"
-Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile"
-"Nonstructural Expected Annual Damage, Dollars",eadd_ns,clara,,Float64,clara_grid_cell,decadal,$,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
-Nonstructural Expected Annual Structural Damage,eadd_str_ns,clara,,Float64,clara_grid_cell,decadal,$,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
-Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
