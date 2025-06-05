@@ -24,8 +24,8 @@ class BaseVisualization:
         )
         select = [self.get_time_column(time_unit), "geography", "value"]
 
-        # Force melt to be true.
-        kwargs["melt"] = True
+        # Force unpivot to be true.
+        kwargs["unpivot"] = True
 
         params = []
         for param_name, param_values in kwargs.items():

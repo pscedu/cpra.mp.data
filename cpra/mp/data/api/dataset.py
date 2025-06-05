@@ -222,14 +222,10 @@ class Dataset(LazyFrameSource):
             self._apply_transform_params_vector()
         else:
             self._apply_transform_params_raster()
+        self._apply_unpivot_param()
 
     def _apply_transform_params_vector(self):
         """Apply transform and extract parameters to the LazyFrame."""
-
-        if self.options.melt:
-            self.lf = self.lf.unpivot(
-                index=DIMENSION_COLUMNS, variable_name="geography"
-            )
 
         if (
             self.options.summarize_by is None
@@ -305,6 +301,14 @@ class Dataset(LazyFrameSource):
 
     def _apply_transform_params_raster(self):
         """Apply transform and extract parameters to the image."""
+
+    def _apply_unpivot_param(self):
+        """Apply the unpivot parameter."""
+
+        if self.options.unpivot:
+            self.lf = self.lf.unpivot(
+                index=DIMENSION_COLUMNS, variable_name="geography"
+            )
 
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""

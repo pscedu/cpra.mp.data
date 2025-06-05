@@ -40,7 +40,7 @@ Without any query string parameters, each endpoint returns the full dataset by d
 
 Filter parameters are used to limit the rows, columns, or bands of the dataset to those matching specific criteria. Any dimension from the partition and non-partition dimensions can be used as a filter parameter. Multiple values can be provided in a comma-separated list. For advanced filtering of vector-grid data, a `where` parameter can be used to specify complex filtering logic in SQL where-clause format. Note that special characters in the where clause should be [percent-encoded](https://developer.mozilla.org/en-US/docs/Glossary/Percent-encoding) (e.g., using [`encodeURIComponent`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent)).
 
-For vector-grid data, the `geography` parameter accepts a comma-separated list of source geography IDs. For raster-grid data, it accepts a comma-separated list of coordinate pairs (in the format `x,y`) at which values are extracted from the COGs. When specifying coordinate pairs for a raster-grid dataset, the result is a tabular dataset that can be transformed in the same way as Parquet data (e.g., using the `melt` parameter below).
+For vector-grid data, the `geography` parameter accepts a comma-separated list of source geography IDs. For raster-grid data, it accepts a comma-separated list of coordinate pairs (in the format `x,y`) at which values are extracted from the COGs. When specifying coordinate pairs for a raster-grid dataset, the result is a tabular dataset that can be transformed in the same way as Parquet data (e.g., using the `unpivot` parameter below).
 
 For raster-grid data, when the `geography` parameter is not provided, the full images are used. Each COG becomes a band in the resulting image. These bands can be aggregated using the `group_by` and `group_aggregate` parameters below. Due to memory constrains, a maximum of 10 bands can be loaded from COGs. Additional matches beyond the first 10 COGs are ignored.
 
@@ -77,7 +77,7 @@ Transform and extract parameters can be used to change the shape or format of th
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
 | `color_map` | Apply the given color map to raster data | ❌ | ✅ | `color_map=ffibs` |
-| `melt` | Melt results so that the resulting table has a geography column and a value column instead of a separate column for each geography | ✅ | ❌ | `melt=true` |
+| `unpivot` | Change the data shape from wide to long, giving the resulting table a geography column and a value column instead of a separate column for each geography | ✅ | ❌ | `unpivot=true` |
 | `summarize_by` | Summarize by geographic unit | ✅ | ✅ | `summarize_by=hydro_compartment` |
 | `summarize_aggregate` | Aggregate function: one of `sum`, `difference`, `max`, `min`, or `mean` | ✅ | ✅ | `summarize_aggregate=max` |
 | `summarize_geography` | Limit the summary geographies to the provided IDs | ✅ | ✅ | `summarize_geography=659,680,700` |
@@ -149,16 +149,16 @@ GET /v1/datasets/flood_depth/icm_raster/annual/{z}/{x}/{y}/data.png?model_group=
 
 #### Time Series Query at Specific Points
 
-This request returns a flood depth time series at three longitude-latitude pairs as a melted (long format) CSV.
+This request returns a flood depth time series at three longitude-latitude pairs as a unpivoted (long format) CSV.
 
 ```
-GET /v1/datasets/flood_depth/icm_raster/annual/data.csv?model_group=500&scenario=7&geography=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&melt=true&sort=calendar_year,geography
+GET /v1/datasets/flood_depth/icm_raster/annual/data.csv?model_group=500&scenario=7&geography=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&unpivot=true&sort=calendar_year,geography
 ```
 
 #### Single Year Query Summarized by Hydro Compartment
 
-This request returns a flood depths for a single year summarized by hydro compartment as a melted (long format) Parquet file.
+This request returns a flood depths for a single year summarized by hydro compartment as a unpivoted (long format) Parquet file.
 
 ```
-GET /v1/datasets/flood_depth/icm_raster/annual/data.parquet?model_group=500&scenario=7&calendar_year=2050&summarize_by=hydro_compartment&summarize_aggregate=mean&melt=true&sort=calendar_year,geography
+GET /v1/datasets/flood_depth/icm_raster/annual/data.parquet?model_group=500&scenario=7&calendar_year=2050&summarize_by=hydro_compartment&summarize_aggregate=mean&unpivot=true&sort=calendar_year,geography
 ```

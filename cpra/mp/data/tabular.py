@@ -90,7 +90,7 @@ def write_parquet(
     # Add keyword arguments to the dataframe as columns.
     df = df.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
-    # If this is long-format data (i.e., with a geography column), unmelt it.
+    # If this is long-format data (i.e., with a geography column), pivot it.
     if "geography" in df and "value" in df:
         df = df.pivot("geography", values="value")
 

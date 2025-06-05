@@ -51,7 +51,7 @@ class Options(BaseModel):
     group_by: str | None = None
     group_aggregate: AggregateFunction | None = None
     color_map: ColorMap | None = None
-    melt: bool = False
+    unpivot: bool = False
     summarize_by: VectorGrid | None = None
     summarize_aggregate: AggregateFunction | None = None
     summarize_geography: str | None = None
