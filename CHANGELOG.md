@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/pscedu/cpra.mp.data/compare/v0.22.0...v0.22.1) (2025-06-05)
+
+
+### Bug Fixes
+
+* **jupyter:** install package from wheel ([c8aa1af](https://github.com/pscedu/cpra.mp.data/commit/c8aa1afd71d1e9c6b0c44330b3686817311b5424))
+
 ## [0.22.0](https://github.com/pscedu/cpra.mp.data/compare/v0.21.2...v0.22.0) (2025-06-05)
 
 
