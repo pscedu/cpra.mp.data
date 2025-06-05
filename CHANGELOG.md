@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.22.0](https://github.com/pscedu/cpra.mp.data/compare/v0.21.2...v0.22.0) (2025-06-05)
+
+
+### Features
+
+* **image:** add Jupyter image ([ca50567](https://github.com/pscedu/cpra.mp.data/commit/ca50567aab336f2ae395bba1d7ac27df631939e4))
+* **structure:** sort variables during import ([eea27e2](https://github.com/pscedu/cpra.mp.data/commit/eea27e2560bcea64c924a38d47bb2d45b6530b07))
+
+
+### Bug Fixes
+
+* **dimensions:** use consistent column names for dimension values ([77d8a92](https://github.com/pscedu/cpra.mp.data/commit/77d8a92467c18215be5c338fdbf079a54053c327))
+* **structure:** update FFIBS legend ([4b36ec4](https://github.com/pscedu/cpra.mp.data/commit/4b36ec4199d9135de9a2a78b36bbf22fcae27944))
+
+
+### Documentation
+
+* **structure:** reorganize data structure docs ([c378e64](https://github.com/pscedu/cpra.mp.data/commit/c378e64ae13d17f58c055810b607b726d886bbd8))
+
 ## [0.21.2](https://github.com/pscedu/cpra.mp.data/compare/v0.21.1...v0.21.2) (2025-03-28)
 
 
