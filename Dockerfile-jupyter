@@ -1,0 +1,31 @@
+FROM quay.io/jupyter/scipy-notebook:python-3.12
+
+ENV JUPYTER_VERSION="3.2.3"
+
+# Change user to root for software installation.
+USER root
+
+# Install any packages required for the kernel-wrapper.  If the image
+# does not contain the target kernel (i.e., IPython, IRkernel, etc.,
+# it should be installed as well.
+RUN pip install pycrypto
+
+# Download and extract the enterprise gateway kernel launchers and bootstrap
+# files and deploy to /usr/local/bin. Change permissions to NB_UID:NB_GID.
+RUN wget https://github.com/jupyter-server/enterprise_gateway/releases/download/v$JUPYTER_VERSION/jupyter_enterprise_gateway_kernel_image_files-$JUPYTER_VERSION.tar.gz &&\
+    tar -xvf jupyter_enterprise_gateway_kernel_image_files-$JUPYTER_VERSION.tar.gz -C /usr/local/bin &&\
+    rm -f jupyter_enterprise_gateway_kernel_image_files-$JUPYTER_VERSION.tar.gz &&\
+    fix-permissions /usr/local/bin
+
+# Install cpra.mp.data and dependencies.
+WORKDIR /opt/cpra.mp.data
+COPY pyproject.toml \
+    README.md ./
+RUN mkdir -p cpra/mp/data \
+    && pip install -e .
+COPY cpra/ ./cpra
+
+# Switch user back to jovyan and setup language and default CMD
+USER $NB_UID
+ENV KERNEL_LANGUAGE="python"
+CMD /usr/local/bin/bootstrap-kernel.sh
