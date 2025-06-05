@@ -9,55 +9,40 @@ description = "Tools for reading and writing data from Louisiana's Coastal Maste
 readme = "README.md"
 requires-python = ">=3.8"
 keywords = []
-authors = [
-  { name = "Matt Yoder", email = "mjyoder@psc.edu" },
-]
+authors = [{ name = "Matt Yoder", email = "mjyoder@psc.edu" }]
 classifiers = [
-  "Development Status :: 4 - Beta",
-  "Programming Language :: Python",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "cachetools",
-  "click",
-  "mercantile",
-  "numpy",
-  "Pillow",
-  "polars",
-  "pyarrow",
-  "python-dotenv",
-  "rasterio",
-  "scipy"
+    "cachetools",
+    "click",
+    "mercantile",
+    "numpy",
+    "Pillow",
+    "polars",
+    "pyarrow",
+    "python-dotenv",
+    "rasterio",
+    "scipy",
 ]
 
 [project.optional-dependencies]
-api = [
-  "altair",
-  "fastapi[standard]>=0.115.0"
-]
-scripts = [
-  "fastexcel",
-  "tippecanoe"
-]
+api = ["altair", "fastapi[standard]>=0.115.0"]
+scripts = ["fastexcel", "tippecanoe"]
 
 [tool.hatch.envs.default]
-features = [
-  "api",
-  "scripts"
-]
+features = ["api", "scripts"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-    "/cpra",
-]
+include = ["/cpra"]
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    "/cpra",
-]
+packages = ["/cpra"]

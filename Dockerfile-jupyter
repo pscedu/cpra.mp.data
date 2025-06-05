@@ -1,5 +1,17 @@
-FROM quay.io/jupyter/scipy-notebook:python-3.12
+FROM python:3.12 AS build
 
+# Install cpra.mp.data and dependencies.
+WORKDIR /build
+COPY pyproject.toml \
+    README.md \
+    /build/
+COPY cpra /build/cpra
+RUN pip install --upgrade build \
+    && python3 -m build \
+    && pip install dist/*.whl
+
+
+FROM quay.io/jupyter/scipy-notebook:python-3.12
 ENV JUPYTER_VERSION="3.2.3"
 
 # Change user to root for software installation.
@@ -17,13 +29,9 @@ RUN wget https://github.com/jupyter-server/enterprise_gateway/releases/download/
     rm -f jupyter_enterprise_gateway_kernel_image_files-$JUPYTER_VERSION.tar.gz &&\
     fix-permissions /usr/local/bin
 
-# Install cpra.mp.data and dependencies.
-WORKDIR /opt/cpra.mp.data
-COPY pyproject.toml \
-    README.md ./
-RUN mkdir -p cpra/mp/data \
-    && pip install -e .
-COPY cpra/ ./cpra
+WORKDIR /opt/cpra
+COPY --from=build /build/dist/*.whl /opt/cpra/
+RUN pip install *.whl
 
 # Switch user back to jovyan and setup language and default CMD
 USER $NB_UID
