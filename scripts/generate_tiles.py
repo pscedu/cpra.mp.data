@@ -46,6 +46,8 @@ def generate_tiles():
                     "-o",
                     str(tiles_path.absolute()),
                     "--drop-densest-as-needed",
+                    "--use-attribute-for-id=id",
+                    "--convert-stringified-ids-to-numbers",
                     "-L",
                     f"boundary:{str(boundary_path.absolute())}",
                     "-L",
