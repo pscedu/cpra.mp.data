@@ -214,7 +214,7 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
             ]
             + [pl.col("path")]
         )
-        .sort(required_cols)
+        .sort(*required_cols)
         .lazy()
     )
 
