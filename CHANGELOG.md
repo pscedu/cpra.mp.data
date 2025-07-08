@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.0](https://github.com/pscedu/cpra.mp.data/compare/v0.22.1...v0.23.0) (2025-07-08)
+
+
+### Features
+
+* **scripts:** promote ID field in tiles ([7ca3aca](https://github.com/pscedu/cpra.mp.data/commit/7ca3aca7ff8129dde833d46522a80eea8c8e45f4))
+* **structure:** update data structure ([7045031](https://github.com/pscedu/cpra.mp.data/commit/704503146294a701d0ebb86a389dd852af91cab6))
+
 ## [0.22.1](https://github.com/pscedu/cpra.mp.data/compare/v0.22.0...v0.22.1) (2025-06-05)
 
 
