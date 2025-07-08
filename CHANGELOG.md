@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.1](https://github.com/pscedu/cpra.mp.data/compare/v0.23.0...v0.23.1) (2025-07-08)
+
+
+### Bug Fixes
+
+* **utils:** pass sort order as kwargs ([a7aca09](https://github.com/pscedu/cpra.mp.data/commit/a7aca090047a372e3db14dd4eb03cbf42416da47))
+
 ## [0.23.0](https://github.com/pscedu/cpra.mp.data/compare/v0.22.1...v0.23.0) (2025-07-08)
 
 
