@@ -8,6 +8,7 @@ Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell
 Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile"
 Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,exposure_asset_count,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type"
 Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile"
+Habitat Suitability Index,hsi,icm,hsi,Float32,veg_pixel,annual,,hsi,
 Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,aggregate_type
 Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",ppt,sal,aggregate_type
 Sediment Accumulation in Open Water,sedacc,icm,hydro,Float32,hydro_compartment,"daily, annual",g/m2/yr,,aggregate_type
@@ -17,12 +18,13 @@ Stage (Water Level),stg,icm,hydro,Float32,hydro_compartment,"daily, monthly, ann
 Hourly Stage (Water Level),stghr,icm,hydro,Float32,hydro_compartment,annual,NAVD88 m,,aggregate_type
 Stage (Water Level) in Marsh,stgm,icm,hydro,Float32,hydro_compartment,"daily, annual",NAVD88 m,,aggregate_type
 Water Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, annual",degrees C,tmp,aggregate_type
-Daily Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
+Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
 Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
-Vegetation Type: FFIBS,ffibs,icm,lavegmod,Float32,veg_pixel,annual,,ffibs,ffibs_component
-Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_pixel,annual,,vct,vegetation_coverage_type
-Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,veg_area,habitat_code
-Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,vegetation_species_type
+Vegetation Type: FFIBS Coverage,ffibs_coverage_ratio,icm,lavegmod,Float32,veg_pixel,annual,,,
+Vegetation Type: FFIBS,ffibs_score,icm,lavegmod,Float32,veg_pixel,annual,,ffibs,
+Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_pixel,annual,,vct,
+Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,veg_area,
+Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,
 Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
 Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng,

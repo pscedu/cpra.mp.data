@@ -114,13 +114,12 @@ vegetation_species_type,baregrnd_old,Old Bareground
 vegetation_species_type,baregrnd_new,New Bareground
 vegetation_species_type,baregrnd_flt,Flotant Bareground
 vegetation_species_type,dead_flt,Dead Flotant
-ffibs_component,ffibs,FFIBS
-ffibs_component,pl_bf,Bottomland Hardwood Forest
-ffibs_component,pl_sf,Swamp Forest
-ffibs_component,pl_fm,Fresh Marsh
-ffibs_component,pl_im,Intermediate Marsh
-ffibs_component,pl_bm,Brackish Marsh
-ffibs_component,pl_sm,Saline Marsh
+ffibs_coverage_type,pl_bf,Bottomland Hardwood Forest
+ffibs_coverage_type,pl_sf,Swamp Forest
+ffibs_coverage_type,pl_fm,Fresh Marsh
+ffibs_coverage_type,pl_im,Intermediate Marsh
+ffibs_coverage_type,pl_bm,Brackish Marsh
+ffibs_coverage_type,pl_sm,Saline Marsh
 percentile,10,10th Percentile
 percentile,50,50th Percentile
 percentile,90,90th Percentile
