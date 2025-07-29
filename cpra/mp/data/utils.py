@@ -238,3 +238,8 @@ def get_filter_expressions(**kwargs):
         for k, v in kwargs.items()
         if k not in DATASET_DIMENSIONS
     ]
+
+
+def get_time_column(time_unit: str):
+    """Get the name of the time column."""
+    return "calendar_year" if time_unit in ("decadal", "annual") else "calendar_day"

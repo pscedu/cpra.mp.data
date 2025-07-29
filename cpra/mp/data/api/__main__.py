@@ -1,4 +1,5 @@
 import uvicorn
-from cpra.mp.data.api import app
+from cpra.mp.data.config import DEBUG
 
-uvicorn.run(app, host="0.0.0.0", port=8000)
+
+uvicorn.run("cpra.mp.data.api:app", host="0.0.0.0", port=8000, reload=False)

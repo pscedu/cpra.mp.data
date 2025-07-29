@@ -4,6 +4,7 @@ from cpra.mp.data.api.types import (
     AggregateFunction,
     ColorMap,
     CompressionAlgorithm,
+    TimeUnit,
     VectorGrid,
 )
 from pydantic import create_model, BaseModel, ConfigDict
@@ -45,6 +46,8 @@ class FilterDimensions(BaseFilterDimensions):
 class Options(BaseModel):
     geography: str | None = None
     where: str | None = None
+    time_by: TimeUnit | None = None
+    time_aggregate: AggregateFunction | None = None
     negate: str | None = None
     multiply10: str | None = None
     multiply100: str | None = None

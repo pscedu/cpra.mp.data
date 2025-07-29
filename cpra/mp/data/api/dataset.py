@@ -26,7 +26,7 @@ from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import Legend, LEGENDS
-from cpra.mp.data.utils import get_input_data_frame, required_columns
+from cpra.mp.data.utils import get_input_data_frame, get_time_column, required_columns
 from cpra.mp.data.variables import Variable, VARIABLES
 from contextlib import ExitStack
 from fastapi import HTTPException
@@ -35,7 +35,17 @@ DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
 VALUE_COLUMNS = cs.matches(r"^[0-9]")
-
+TIME_UNIT_ORDER = ["daily", "monthly", "annual", "decadal"]
+TIME_EXPRESSIONS = {
+    "calendar_day": {
+        "monthly": pl.col("calendar_day").dt.month_start(),
+        "annual": pl.col("calendar_day").dt.year(),
+        "decadal": (pl.col("calendar_day").dt.year() / 10).floor() * 10
+    },
+    "calendar_year": {
+        "decadal": (pl.col("calendar_year") / 10).floor() * 10
+    }
+}
 
 class Dataset(LazyFrameSource):
     def __init__(
@@ -139,6 +149,46 @@ class Dataset(LazyFrameSource):
             .select(cs.exclude("path"))
             .lazy()
         )
+
+    def _apply_time_params(self):
+        """Apply time parameters to the LazyFrame."""
+        src_time_unit = self.dataset_dimensions.time_unit
+        dst_time_unit = self.options.time_by
+        time_agg = self.options.time_aggregate
+
+        if dst_time_unit is None and time_agg is None:
+            return
+
+        if dst_time_unit is None:
+            msg = "time_aggregate must be specified when time_by is used"
+            raise HTTPException(status_code=400, detail=msg)
+
+        if time_agg is None:
+            msg = "time_by must be specified when time_aggregate is used"
+            raise HTTPException(status_code=400, detail=msg)
+
+        if src_time_unit == dst_time_unit:
+            return
+
+        if TIME_UNIT_ORDER.index(src_time_unit) > TIME_UNIT_ORDER.index(dst_time_unit):
+            msg = f"cannot temporally aggregate {src_time_unit} data into {dst_time_unit} groups"
+            raise HTTPException(status_code=400, detail=msg)
+
+        src_col = get_time_column(src_time_unit)
+        dst_col = get_time_column(dst_time_unit)
+
+        group_by_args = [col for col in required_columns(get_input_data_frame(**dict(self.dataset_dimensions))) if col != src_col]
+        group_by_kwargs = {
+            dst_col: TIME_EXPRESSIONS[src_col][dst_time_unit]
+        }
+
+        if self.output_type == OutputType.vector:
+            self.lf = getattr(
+                self.lf.group_by(*group_by_args, **group_by_kwargs),
+                time_agg,
+            )()
+        else:
+            raise NotImplementedError
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
@@ -313,6 +363,7 @@ class Dataset(LazyFrameSource):
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
         await self._apply_filter_params()
+        self._apply_time_params()
         self._apply_calculate_params()
         self._apply_group_params()
         self._apply_transform_params()
