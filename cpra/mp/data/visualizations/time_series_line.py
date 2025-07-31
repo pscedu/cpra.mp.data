@@ -26,7 +26,7 @@ class TimeSeriesLine(DatasetVisualization):
             .encode(
                 alt.X(f"{self.time_column}:T").title("Date"),
                 alt.Y("value:Q").title(self.variable_label),
-                alt.Color("geography:N").title(self.grid.name),
+                alt.Color("geography:N").title(self.grid.label),
             )
             .properties(title=f"{self.time_unit.title()} {self.title}", width=800)
         )
