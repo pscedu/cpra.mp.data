@@ -1,0 +1,23 @@
+// Folder-specific settings
+//
+// For a full list of overridable settings, and general information on folder-specific settings,
+// see the documentation: https://zed.dev/docs/configuring-zed#settings-files
+{
+  "languages": {
+    "Python": {
+      "formatter": {
+        "external": {
+          "command": "hatch",
+          "arguments": [
+            "fmt",
+            "--formatter",
+            "--stdin-filename",
+            "{buffer_path}",
+            "-"
+          ]
+        }
+      },
+      "format_on_save": "on"
+    }
+  }
+}
