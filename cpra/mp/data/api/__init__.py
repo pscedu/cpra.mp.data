@@ -1,9 +1,11 @@
+from collections import defaultdict
 from typing import Annotated
 
 import polars.selectors as cs
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
@@ -12,9 +14,11 @@ from cpra.mp.data.api.models import (
     DataQuery,
     DatasetDimensions,
     Dimension,
+    DimensionValue,
     FilterDimensions,
     Grid,
     Legend,
+    MPDDimensionValue,
     TileQuery,
     Variable,
 )
@@ -23,12 +27,21 @@ from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
 from cpra.mp.data.api.utils import validate_compression, validate_format
+from cpra.mp.data.config import MPD_URI
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.utils import glob_lazy_frame
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations import VISUALIZATIONS
+
+MPD_ENGINE = create_engine(MPD_URI)
+
+def get_mpd_session():
+    with Session(MPD_ENGINE) as session:
+        yield session
+
+MPDSession = Annotated[Session, Depends(get_mpd_session)]
 
 app = FastAPI(
     title="CPRA Master Plan APIs",
@@ -65,7 +78,11 @@ def variables() -> list[Variable]:
 
 
 @app.get("/v1/dimensions.json", tags=["Catalog"])
-def dimensions() -> list[Dimension]:
+def dimensions(session: MPDSession) -> list[Dimension]:
+    mpd_dimension_values = defaultdict(list)
+    for dv in session.exec(select(MPDDimensionValue)).all():
+        mpd_dimension_values[dv.dimension].append(DimensionValue(value=dv.value_int, label=dv.label))
+
     return [
         Dimension(
             name=dim.name,
@@ -79,7 +96,7 @@ def dimensions() -> list[Dimension]:
             values=(
                 dim.values.select("value", "label").iter_rows(named=True)
                 if dim.values is not None
-                else None
+                else mpd_dimension_values.get(dim.name, None)
             ),
         )
         for dim in DIMENSIONS.values()

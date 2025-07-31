@@ -35,11 +35,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-api = ["altair", "fastapi[standard]>=0.115.0"]
+api = ["altair", "fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel"]
 scripts = ["fastexcel", "tippecanoe"]
 
 [tool.hatch.envs.default]
 features = ["api", "scripts"]
+
+[tool.hatch.envs.default.scripts]
+dev = "DEBUG=true python3 -m cpra.mp.data.api"
+start = "python3 -m cpra.mp.data.api"
 
 [tool.hatch.build.targets.sdist]
 include = ["/cpra"]

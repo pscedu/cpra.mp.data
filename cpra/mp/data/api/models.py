@@ -1,6 +1,7 @@
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
+from sqlmodel import Field, SQLModel
 
 from cpra.mp.data.api.types import (
     AggregateFunction,
@@ -148,3 +149,11 @@ class Legend(BaseModel):
 class Visualization(BaseModel):
     name: str
     label: str
+
+
+class MPDDimensionValue(SQLModel, table=True):
+    """Model group from the MPD."""
+    __tablename__ = "vw_a_portal_dimension_value"
+    dimension: str = Field(primary_key=True)
+    value_int: str | None = None
+    label: str = Field(primary_key=True)

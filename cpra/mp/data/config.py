@@ -15,3 +15,4 @@ def get_config(name, default_value):
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
+MPD_URI = get_config("MPD_URI", "")
