@@ -1,5 +1,7 @@
-import altair as alt
 import datetime as dt
+
+import altair as alt
+
 from cpra.mp.data.visualizations.base import DatasetVisualization
 
 

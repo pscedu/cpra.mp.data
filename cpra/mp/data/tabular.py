@@ -1,6 +1,9 @@
 import re
+from pathlib import Path
+
 import polars as pl
 import polars.selectors as cs
+
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
@@ -14,8 +17,6 @@ from cpra.mp.data.utils import (
     validate_grid,
 )
 from cpra.mp.data.variables import VARIABLES
-from pathlib import Path
-
 
 ALPHA_COLUMN = re.compile(r"^[a-z]")
 NUMERIC_COLUMN = re.compile(r"^[0-9]")

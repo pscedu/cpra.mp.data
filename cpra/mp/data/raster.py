@@ -1,6 +1,12 @@
+import xml.etree.ElementTree
+from pathlib import Path
+
 import polars as pl
 import rasterio as rio
-import xml.etree.ElementTree
+from rasterio.io import MemoryFile
+from rasterio.shutil import copy
+from rasterio.transform import from_bounds
+
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -13,10 +19,6 @@ from cpra.mp.data.utils import (
     required_columns,
     validate_data_frame,
 )
-from pathlib import Path
-from rasterio.io import MemoryFile
-from rasterio.shutil import copy
-from rasterio.transform import from_bounds
 
 
 def cog_path_expression(df, base_path=BASE_PATH, separator="/"):

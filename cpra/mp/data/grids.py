@@ -1,5 +1,6 @@
+
 import polars as pl
-from collections import defaultdict
+
 from cpra.mp.data.structure import read_structure_csv
 
 

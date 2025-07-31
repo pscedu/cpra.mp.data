@@ -1,5 +1,6 @@
 import polars as pl
-from cpra.mp.data.legends import Legend, LEGENDS
+
+from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.structure import read_structure_csv
 
 

@@ -1,4 +1,10 @@
+from typing import Annotated
+
 import polars.selectors as cs
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
@@ -20,14 +26,9 @@ from cpra.mp.data.api.utils import validate_compression, validate_format
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
+from cpra.mp.data.utils import glob_lazy_frame
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations import VISUALIZATIONS
-from cpra.mp.data.utils import glob_lazy_frame
-from fastapi import Depends, FastAPI, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import Annotated
-
 
 app = FastAPI(
     title="CPRA Master Plan APIs",

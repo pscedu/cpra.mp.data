@@ -1,6 +1,8 @@
 import re
-from cpra.mp.data.structure import read_structure_csv
+
 import polars.selectors as cs
+
+from cpra.mp.data.structure import read_structure_csv
 
 
 def table_row(values):
@@ -62,7 +64,7 @@ def pluralize(noun):
 def update_docs():
     """Update documenation Markdown."""
 
-    with open("docs/index.md", "r") as input_file:
+    with open("docs/index.md") as input_file:
         markdown = input_file.read()
 
     dimensions = read_structure_csv("dimensions")

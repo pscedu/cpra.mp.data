@@ -1,7 +1,7 @@
 import re
 import subprocess
 import sys
-import xml.etree.cElementTree as ET
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 GEOMETRY_PATH = Path("cpra/mp/data/geometry")
@@ -55,7 +55,7 @@ def generate_crosswalks(grid):
             (str(vrt_path.absolute())),
         ]
 
-        result = subprocess.run(cmd, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, check=False)
         if result.stderr:
             print(result.stderr, file=sys.stderr)
             sys.exit(1)

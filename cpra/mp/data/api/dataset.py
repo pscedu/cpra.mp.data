@@ -1,11 +1,14 @@
 import itertools
+from contextlib import ExitStack
+from io import BytesIO
+from pathlib import Path
+
 import mercantile
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import rasterio as rio
-from io import BytesIO
-from pathlib import Path
+from fastapi import HTTPException
 from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
@@ -13,8 +16,10 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
+
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
+from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.api.utils import (
     asynctiming,
     get_lazy_frame,
@@ -22,14 +27,11 @@ from cpra.mp.data.api.utils import (
     parallel_sample_rasters,
     unpack_values,
 )
-from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.legends import Legend, LEGENDS
+from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.utils import get_input_data_frame, required_columns
-from cpra.mp.data.variables import Variable, VARIABLES
-from contextlib import ExitStack
-from fastapi import HTTPException
+from cpra.mp.data.variables import VARIABLES, Variable
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
@@ -133,7 +135,7 @@ class Dataset(LazyFrameSource):
 
         # Add the resulting values to the LazyFrame, and remove the path column.
         columns = [np.concatenate(col) for col in zip(*samples)]
-        column_labels = [f"{str(x)},{str(y)}" for x, y in zip(lngs, lats)]
+        column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
         self.lf = (
             df.with_columns(**dict(zip(column_labels, columns)))
             .select(cs.exclude("path"))

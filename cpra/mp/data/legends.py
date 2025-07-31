@@ -1,5 +1,6 @@
 import numpy as np
 import polars as pl
+
 from cpra.mp.data.structure import read_structure_csv
 
 

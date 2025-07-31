@@ -1,13 +1,15 @@
-from cpra.mp.data.dimensions import DIMENSIONS, DATASET_DIMENSIONS
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, create_model
+
 from cpra.mp.data.api.types import (
-    dimension_type,
     AggregateFunction,
     ColorMap,
     CompressionAlgorithm,
     VectorGrid,
+    dimension_type,
 )
-from pydantic import create_model, BaseModel, ConfigDict
-from typing import Any
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 
 BaseDatasetDimensions = create_model(
     "BaseDatasetDimensions",

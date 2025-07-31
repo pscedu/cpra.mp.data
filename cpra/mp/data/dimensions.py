@@ -1,4 +1,5 @@
 import polars as pl
+
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.structure import read_structure_csv

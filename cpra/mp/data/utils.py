@@ -1,12 +1,14 @@
+from pathlib import Path
+
 import polars as pl
+from polars.exceptions import ColumnNotFoundError
+from scipy.io import FortranFile
+
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
-from pathlib import Path
-from polars.exceptions import ColumnNotFoundError
-from scipy.io import FortranFile
 
 
 def partition_columns(df, include_dataset=True):
@@ -96,7 +98,7 @@ def validate_data_frame(df, required_cols=None):
         failed_cols = [
             series.name
             for series in results
-            if not series.all() and not series.name == "valid"
+            if not series.all() and series.name != "valid"
         ]
         msg = f"{failed_row_count} rows failed validation: {', '.join(failed_cols)}"
         raise ValidationError(msg)
@@ -122,7 +124,7 @@ def dataset_path(base_path, **kwargs):
 
     dataset_path = Path(base_path)
     for dim in DATASET_DIMENSIONS.values():
-        dataset_path = dataset_path / f"{dim.name}={str(kwargs[dim.name])}"
+        dataset_path = dataset_path / f"{dim.name}={kwargs[dim.name]!s}"
 
     return dataset_path
 

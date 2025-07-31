@@ -1,15 +1,16 @@
 import asyncio
-from cachetools import cached, TTLCache
+from enum import Enum
+from functools import wraps
+from time import time
+
+from cachetools import TTLCache, cached
+from fastapi import HTTPException
+from rasterio.enums import Resampling
+
 from cpra.mp.data import read_data
 from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.config import DEBUG
 from cpra.mp.data.exceptions import ValidationError
-from enum import Enum
-from fastapi import HTTPException
-from functools import wraps
-from rasterio.enums import Resampling
-from time import time
-
 
 RASTER_COMPRESSION_ALGORITHMS = [
     CompressionAlgorithm.deflate,

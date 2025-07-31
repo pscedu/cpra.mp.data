@@ -1,5 +1,6 @@
 import click
 import polars as pl
+
 from cpra.mp.data import write_data
 from cpra.mp.data.cli import cli
 from cpra.mp.data.dimensions import DIMENSIONS

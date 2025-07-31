@@ -1,7 +1,9 @@
-import altair as alt
-import polars as pl
 from functools import cached_property
 from urllib.parse import urlencode
+
+import altair as alt
+import polars as pl
+
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns

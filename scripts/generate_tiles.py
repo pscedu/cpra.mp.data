@@ -49,14 +49,14 @@ def generate_tiles():
                     "--use-attribute-for-id=id",
                     "--convert-stringified-ids-to-numbers",
                     "-L",
-                    f"boundary:{str(boundary_path.absolute())}",
+                    f"boundary:{boundary_path.absolute()!s}",
                     "-L",
-                    f"label:{str(label_path.absolute())}",
+                    f"label:{label_path.absolute()!s}",
                 ],
             ]
 
             for cmd in cmds:
-                result = subprocess.run(cmd, stderr=subprocess.PIPE)
+                result = subprocess.run(cmd, stderr=subprocess.PIPE, check=False)
                 if result.returncode:
                     if result.stderr:
                         print(result.stderr, file=sys.stderr)

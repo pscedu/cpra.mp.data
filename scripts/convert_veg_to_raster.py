@@ -1,8 +1,10 @@
+import sys
+
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import rasterio as rio
-import sys
+
 from cpra.mp.data import read_data, write_data
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.variables import VARIABLES
@@ -31,7 +33,7 @@ def convert_veg_to_raster(variable_name, grid_name, time_unit):
         flipped_data[flipped_data == 255] = row
         row_dims = dims[i].to_dicts()[0]
 
-        print(f"Writing data for: {str(row_dims)}...")
+        print(f"Writing data for: {row_dims!s}...")
         write_data(np.flip(flipped_data, 0), validate=False, **row_dims)
 
 

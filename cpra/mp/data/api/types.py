@@ -1,8 +1,9 @@
+from datetime import date
+from enum import Enum
+
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
-from datetime import date
-from enum import Enum
 
 
 def dimension_type(dim_name):

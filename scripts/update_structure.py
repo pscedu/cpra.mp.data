@@ -1,9 +1,10 @@
 """Update data structure CSVs from an Excel spreadsheet."""
 
-import polars as pl
-import polars.selectors as cs
 import sys
 from pathlib import Path
+
+import polars as pl
+import polars.selectors as cs
 
 STRUCTURE_PATH = Path("./cpra/mp/data/structure")
 

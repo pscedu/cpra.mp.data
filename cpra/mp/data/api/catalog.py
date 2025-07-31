@@ -2,10 +2,11 @@ import re
 from math import floor
 
 import polars as pl
+from fastapi import HTTPException
+
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
-from fastapi import HTTPException
 
 TIF_EXTENSION = re.compile(r"\.tif$")
 RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
@@ -82,7 +83,7 @@ class CatalogQuery:
 
         # Updates items to prevent walking unnecessary directories.
         if items is not None:
-            items[:] = [f"{dimension_name}={str(val)}" for val in selected_values]
+            items[:] = [f"{dimension_name}={val!s}" for val in selected_values]
 
     def _compress(self):
         """Compress date/time values into continuous [start, end] intervals."""

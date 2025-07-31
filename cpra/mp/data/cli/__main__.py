@@ -1,5 +1,6 @@
-from cpra.mp.data.cli import cli
-from cpra.mp.data.cli import convert  # noqa
-
+from cpra.mp.data.cli import (
+    cli,
+    convert,  # noqa
+)
 
 cli()
