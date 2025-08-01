@@ -15,10 +15,7 @@ from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 BaseDatasetDimensions = create_model(
     "BaseDatasetDimensions",
     __config__=ConfigDict(protected_namespaces=()),
-    **{
-        dim.name: (dimension_type(dim.name), None)
-        for dim in DATASET_DIMENSIONS.values()
-    },
+    **{dim.name: (dimension_type(dim.name), None) for dim in DATASET_DIMENSIONS.values()},
 )
 
 BaseFilterDimensions = create_model(
@@ -151,8 +148,14 @@ class Visualization(BaseModel):
     label: str
 
 
+class VisualizationQuery(DataQuery):
+    height: int = 400
+    width: int = 600
+
+
 class MPDDimensionValue(SQLModel, table=True):
     """Model group from the MPD."""
+
     __tablename__ = "vw_a_portal_dimension_value"
     dimension: str = Field(primary_key=True)
     value_int: str | None = None

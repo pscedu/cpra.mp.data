@@ -42,8 +42,8 @@ scripts = ["fastexcel", "tippecanoe"]
 features = ["api", "scripts"]
 
 [tool.hatch.envs.default.scripts]
-dev = "DEBUG=true python3 -m cpra.mp.data.api"
-start = "python3 -m cpra.mp.data.api"
+start = "uvicorn --host 0.0.0.0 --port 8000 cpra.mp.data.api:app"
+watch = "uvicorn --host 0.0.0.0 --port 8000 --reload cpra.mp.data.api:app"
 
 [tool.hatch.build.targets.sdist]
 include = ["/cpra"]

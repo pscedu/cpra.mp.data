@@ -21,9 +21,7 @@ class BaseVisualization:
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
-        required_cols = required_columns(
-            pl.DataFrame({"variable": variable, "grid": grid, "time_unit": time_unit})
-        )
+        required_cols = required_columns(pl.DataFrame({"variable": variable, "grid": grid, "time_unit": time_unit}))
         select = [self.get_time_column(time_unit), "geography", "value"]
 
         # Force unpivot to be true.
@@ -51,10 +49,7 @@ class BaseVisualization:
                 format="csv",
             )
         else:
-            dataset_url = (
-                "https://api.mpdp.coastal.la.gov/v1/datasets"
-                f"/{variable}/{grid}/{time_unit}/data.csv"
-            )
+            dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{grid}/{time_unit}/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
 
@@ -72,12 +67,14 @@ class BaseVisualization:
 class DatasetVisualization(BaseVisualization):
     """Visualization for a single dataset."""
 
-    def __init__(self, variable, grid, time_unit, request=None, **kwargs):
+    def __init__(self, variable, grid, time_unit, request=None, height=400, width=600, **kwargs):
         self.variable = VARIABLES[variable]
         self.grid = GRIDS[grid]
         self.time_unit = time_unit
         self.request = request
         self.params = kwargs
+        self.height = height
+        self.width = width
 
     @cached_property
     def data_source(self):
@@ -89,9 +86,7 @@ class DatasetVisualization(BaseVisualization):
             self.time_unit,
             **{k: v for k, v in self.params.items() if v is not None},
         )
-        return alt.UrlData(
-            data_uri, format=alt.CsvDataFormat(type="csv"), name=self.variable.name
-        )
+        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv"), name=self.variable.name)
 
     @cached_property
     def geographies(self):
@@ -109,9 +104,7 @@ class DatasetVisualization(BaseVisualization):
         title = self.variable.label
         aggregate_type = self.params.get("aggregate_type", None)
         if aggregate_type and len(aggregate_type) == 1:
-            aggregate_label = DIMENSIONS["aggregate_type"].values.filter(
-                value=aggregate_type[0]
-            )["label"][0]
+            aggregate_label = DIMENSIONS["aggregate_type"].values.filter(value=aggregate_type[0])["label"][0]
             return f"{aggregate_label} {title}"
         return title
 

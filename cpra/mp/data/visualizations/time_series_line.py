@@ -16,6 +16,10 @@ class TimeSeriesLine(DatasetVisualization):
         start_date = self.params.get("start_date", dt.date(2019, 1, 1))
         end_date = self.params.get("end_date", dt.date(2020, 1, 1))
         initial_date_range = (start_date, end_date)
+        is_daily = self.time_column == "calendar_day"
+
+        chart_height = self.height - (222 if is_daily else 86)
+        chart_width = self.width - 200
 
         nearest = alt.selection_point(nearest=True, on="pointerover", fields=[self.time_column], empty=False)
 
@@ -29,7 +33,7 @@ class TimeSeriesLine(DatasetVisualization):
                 .title(self.grid.label)
                 .scale(domain=[str(geo) for geo in self.geographies], range=MAP_SELECTION),
             )
-            .properties(title=f"{self.time_unit.title()} {self.title}", width=800)
+            .properties(title=f"{self.time_unit.title()} {self.title}", width=chart_width)
         )
 
         when_near = alt.when(nearest)
@@ -48,9 +52,9 @@ class TimeSeriesLine(DatasetVisualization):
             .add_params(nearest)
         )
 
-        viz = (alt.layer(main_line, points, rules)).properties(width="container", height=400)
+        viz = (alt.layer(main_line, points, rules)).properties(width=chart_width, height=chart_height)
 
-        if self.time_column == "calendar_day":
+        if is_daily:
             brush = alt.selection_interval(encodings=["x"], value={"x": initial_date_range})
             viz = viz.transform_filter(brush)
             summary_line = (
@@ -58,9 +62,9 @@ class TimeSeriesLine(DatasetVisualization):
                     alt.X("yearmonth(calendar_day):T").title("Month"),
                     alt.Y("mean(value):Q").title(self.variable_label),
                 )
-                .properties(title=f"Monthly {self.title}", height=60, width="container")
+                .properties(title=f"Monthly {self.title}", height=60, width=chart_width)
                 .add_params(brush)
             )
             viz = viz & summary_line
 
-        return viz.properties(autosize="fit-x")
+        return viz

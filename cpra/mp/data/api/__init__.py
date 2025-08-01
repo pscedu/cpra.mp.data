@@ -21,6 +21,7 @@ from cpra.mp.data.api.models import (
     MPDDimensionValue,
     TileQuery,
     Variable,
+    VisualizationQuery,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -37,9 +38,11 @@ from cpra.mp.data.visualizations import VISUALIZATIONS
 
 MPD_ENGINE = create_engine(MPD_URI)
 
+
 def get_mpd_session():
     with Session(MPD_ENGINE) as session:
         yield session
+
 
 MPDSession = Annotated[Session, Depends(get_mpd_session)]
 
@@ -198,7 +201,7 @@ async def get_model_tile(
 async def get_visualization(
     request: Request,
     visualization_type,
-    query: Annotated[DataQuery, Query()],
+    query: Annotated[VisualizationQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     VisualizationClass = VISUALIZATIONS[visualization_type]
