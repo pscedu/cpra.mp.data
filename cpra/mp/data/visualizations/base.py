@@ -86,7 +86,11 @@ class DatasetVisualization(BaseVisualization):
             self.time_unit,
             **{k: v for k, v in self.params.items() if v is not None},
         )
-        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv"), name=self.variable.name)
+        parse = {
+            self.time_column: "date" if self.time_column == "calendar_day" else "number",
+            "value": "number",
+        }
+        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=self.variable.name)
 
     @cached_property
     def geographies(self):

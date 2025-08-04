@@ -28,7 +28,9 @@ class TimeSeriesLine(DatasetVisualization):
             .mark_line()
             .encode(
                 alt.X(f"{self.time_column}:T").title("Date"),
-                alt.Y("value:Q").title(self.variable_label),
+                alt.Y("value:Q")
+                .title(self.variable_label)
+                .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
                 alt.Color("geography:N")
                 .title(self.grid.label)
                 .scale(domain=[str(geo) for geo in self.geographies], range=MAP_SELECTION),
