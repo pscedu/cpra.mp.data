@@ -99,6 +99,11 @@ class DatasetVisualization(BaseVisualization):
         return self.get_time_column(self.time_unit)
 
     @cached_property
+    def time_dimension(self):
+        """Get the temporal dimension."""
+        return DIMENSIONS[self.time_column]
+
+    @cached_property
     def title(self):
         """Get the chart title."""
         title = self.variable.label

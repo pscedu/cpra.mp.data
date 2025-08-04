@@ -46,7 +46,7 @@ class TimeSeriesLine(DatasetVisualization):
             .encode(
                 x=f"{self.time_column}:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
-                tooltip=[alt.Tooltip(self.time_column, type="temporal")]
+                tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
                 + [alt.Tooltip(str(c), type="quantitative") for c in self.geographies],
             )
             .add_params(nearest)
