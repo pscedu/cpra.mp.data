@@ -18,8 +18,8 @@ class TimeSeriesLine(DatasetVisualization):
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
-        chart_height = self.height - (222 if is_daily else 86)
-        chart_width = self.width - 200
+        chart_height = max(self.height - (222 if is_daily else 86), 50)
+        chart_width = max(self.width - 200, 50)
 
         nearest = alt.selection_point(nearest=True, on="pointerover", fields=[self.time_column], empty=False)
 
