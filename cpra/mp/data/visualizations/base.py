@@ -88,6 +88,7 @@ class DatasetVisualization(BaseVisualization):
         )
         parse = {
             self.time_column: "date" if self.time_column == "calendar_day" else "number",
+            "geography": "number",
             "value": "number",
         }
         return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=self.variable.name)

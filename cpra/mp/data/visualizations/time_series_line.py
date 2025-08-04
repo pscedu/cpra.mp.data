@@ -33,7 +33,7 @@ class TimeSeriesLine(DatasetVisualization):
                 .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
                 alt.Color("geography:N")
                 .title(self.grid.label)
-                .scale(domain=[str(geo) for geo in self.geographies], range=MAP_SELECTION),
+                .scale(domain=[geo for geo in self.geographies], range=MAP_SELECTION),
             )
             .properties(title=f"{self.time_unit.title()} {self.title}", width=chart_width)
         )
@@ -49,7 +49,7 @@ class TimeSeriesLine(DatasetVisualization):
                 x=f"{self.time_column}:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
                 tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
-                + [alt.Tooltip(str(c), type="quantitative") for c in self.geographies],
+                + [alt.Tooltip(str(geo), type="quantitative") for geo in self.geographies],
             )
             .add_params(nearest)
         )
