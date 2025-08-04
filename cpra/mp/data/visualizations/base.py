@@ -91,7 +91,7 @@ class DatasetVisualization(BaseVisualization):
     @cached_property
     def geographies(self):
         """Get the selected geographies."""
-        return map(int, self.params["geography"].split(","))
+        return list(map(int, self.params["geography"].split(",")))
 
     @cached_property
     def time_column(self):
