@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.24.0](https://github.com/pscedu/cpra.mp.data/compare/v0.23.1...v0.24.0) (2025-08-05)
+
+
+### Features
+
+* **api:** get extra dimension values from MPD ([67d879c](https://github.com/pscedu/cpra.mp.data/commit/67d879c1e56fdc3755921dbbea04e30163a4ce8d))
+* **structure:** update vegetation dimensions ([1adb224](https://github.com/pscedu/cpra.mp.data/commit/1adb224b549b4dcd95cd5fa5e4c6177b0d195498))
+* **visualizations:** fix extent for daily chart ([fec92ec](https://github.com/pscedu/cpra.mp.data/commit/fec92ec9dc8ee37b4d205bd047ac69dcecae1fba))
+* **visualizations:** set visualization size in query params ([7af6702](https://github.com/pscedu/cpra.mp.data/commit/7af6702ead1497722a81cec0707aa2fdb254a114))
+* **visualizations:** use grid label in legend ([b613f93](https://github.com/pscedu/cpra.mp.data/commit/b613f93f5bc33b9466fecb3b91267a8383ba67c6))
+* **visualizations:** use selection colors for time series line ([60cf649](https://github.com/pscedu/cpra.mp.data/commit/60cf6499b0bf2948d1621504afcf4197eab8d14e))
+* **visualizations:** use time dimension label in tooltip ([1b4fb7e](https://github.com/pscedu/cpra.mp.data/commit/1b4fb7e5619b391c26e041dc43006d02eddf2f77))
+
+
+### Bug Fixes
+
+* **visualizations:** cache list of geographies instead of map object ([d95bb52](https://github.com/pscedu/cpra.mp.data/commit/d95bb5227f95eea75b65b20b7d3f46ecdf3c5057))
+* **visualizations:** convert geography to a number ([5eededa](https://github.com/pscedu/cpra.mp.data/commit/5eededae5d0f454e55e2552265794793106fab1e))
+* **visualizations:** set min chart height and width ([f14b2d3](https://github.com/pscedu/cpra.mp.data/commit/f14b2d34456cbe0934747ea1d718ab1ebb8412b8))
+
 ## [0.23.1](https://github.com/pscedu/cpra.mp.data/compare/v0.23.0...v0.23.1) (2025-07-08)
 
 
