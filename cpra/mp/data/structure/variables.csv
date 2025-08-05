@@ -20,11 +20,11 @@ Stage (Water Level) in Marsh,stgm,icm,hydro,Float32,hydro_compartment,"daily, an
 Water Temperature,tmp,icm,hydro,Float64,hydro_compartment,"daily, annual",degrees C,tmp,aggregate_type
 Tidal Range,trg,icm,hydro,Float32,hydro_compartment,"daily, annual",m,,aggregate_type
 Total Suspended Solids,tss,icm,hydro,Float64,hydro_compartment,"daily, monthly, annual",mg/L,tss,aggregate_type
-Vegetation Type: FFIBS Coverage,ffibs_coverage_ratio,icm,lavegmod,Float32,veg_pixel,annual,,,
+Vegetation Type: FFIBS Coverage,ffibs_coverage_ratio,icm,lavegmod,Float32,veg_pixel,annual,,,ffibs_type
 Vegetation Type: FFIBS,ffibs_score,icm,lavegmod,Float32,veg_pixel,annual,,ffibs,
 Vegetation Type: VCT,vct,icm,lavegmod,Int32,veg_pixel,annual,,vct,
 Vegetation Type: Habitat,veg_area,icm,lavegmod,Int64,veg_pixel,annual,square m,veg_area,
-Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,
+Vegetation Type: Species,veg_species,icm,lavegmod,Float32,veg_pixel,annual,,,veg_species_code
 Topobathymetric Elevation,elev,icm,morph,Float32,morph_pixel,annual,NAVD88 m,elev,
 Inundation Depth,inun,icm,morph,Float32,morph_pixel,annual,m,inun,
 Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng,
