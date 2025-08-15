@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/pscedu/cpra.mp.data/compare/v0.24.0...v0.25.0) (2025-08-15)
+
+
+### Features
+
+* **structure:** add test accretion variables ([2561d53](https://github.com/pscedu/cpra.mp.data/commit/2561d5335058218415c5a731a80ac28fcdad70bf))
+
 ## [0.24.0](https://github.com/pscedu/cpra.mp.data/compare/v0.23.1...v0.24.0) (2025-08-05)
 
 
