@@ -35,3 +35,5 @@ Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^
 Organic Accretion,org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 Shallow Soil Factors,ssf,icm,morph,Float32,,annual,mm/yr,ssf,
 Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
+TEST Mineral Accretion,test_mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
+TEST Organic Accretion,test_org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
