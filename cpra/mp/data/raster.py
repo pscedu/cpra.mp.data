@@ -74,16 +74,9 @@ def read_cog(base_path=BASE_PATH, **kwargs):
     input_df = get_input_data_frame(**kwargs)
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
-    # Calculate the dataset directory path.
-    dataset_dir = dataset_path(base_path, **kwargs)
-
     # Construct the glob lazy frame.
-    required_cols = required_columns(
-        input_df, include_dataset=False, include_metadata=False
-    )
-    lf = glob_lazy_frame(
-        required_cols=required_cols, base_path=dataset_dir, extension="tif", **kwargs
-    )
+    required_cols = required_columns(input_df, include_metadata=False)
+    lf = glob_lazy_frame(required_cols=required_cols, extension="tif", **kwargs)
     filter_exps = get_filter_expressions(**kwargs)
     if filter_exps:
         lf = lf.filter(*filter_exps)
