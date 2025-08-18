@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/pscedu/cpra.mp.data/compare/v0.25.0...v0.25.1) (2025-08-18)
+
+
+### Bug Fixes
+
+* **raster:** include dataset dimensions in LazyFrame ([5db0f3e](https://github.com/pscedu/cpra.mp.data/commit/5db0f3e2385b3bba941e3fc173f3cc28da859025))
+
 ## [0.25.0](https://github.com/pscedu/cpra.mp.data/compare/v0.24.0...v0.25.0) (2025-08-15)
 
 
