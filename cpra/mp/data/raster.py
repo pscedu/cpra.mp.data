@@ -12,7 +12,6 @@ from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
     cast_columns,
-    dataset_path,
     get_filter_expressions,
     get_input_data_frame,
     glob_lazy_frame,

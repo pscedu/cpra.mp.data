@@ -59,11 +59,7 @@ class Dataset(LazyFrameSource):
 
     @property
     def legend(self) -> Legend:
-        return (
-            LEGENDS.get(self.options.color_map)
-            or self.variable.legend
-            or LEGENDS["default"]
-        )
+        return LEGENDS.get(self.options.color_map) or self.variable.legend or LEGENDS["default"]
 
     @property
     def output_type(self) -> OutputType:
@@ -97,14 +93,9 @@ class Dataset(LazyFrameSource):
         """Apply the geography filter to a raster-grid dataset."""
         # Check that coordinates are numeric and that there are an even number.
         try:
-            coords = [
-                float(coord)
-                for coord in unpack_values(self.options.geography, "geography")
-            ]
+            coords = [float(coord) for coord in unpack_values(self.options.geography, "geography")]
         except ValueError:
-            raise HTTPException(
-                status_code=400, detail="geography contains non-numeric coordinates"
-            )
+            raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
 
         coords_len = len(coords)
         if coords_len % 2:
@@ -136,11 +127,7 @@ class Dataset(LazyFrameSource):
         # Add the resulting values to the LazyFrame, and remove the path column.
         columns = [np.concatenate(col) for col in zip(*samples)]
         column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-        self.lf = (
-            df.with_columns(**dict(zip(column_labels, columns)))
-            .select(cs.exclude("path"))
-            .lazy()
-        )
+        self.lf = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path")).lazy()
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
@@ -151,11 +138,7 @@ class Dataset(LazyFrameSource):
         else:
             value_cols = VALUE_COLUMNS
 
-        if (
-            self.options.negate is None
-            and self.options.multiply10 is None
-            and self.options.multiply100 is None
-        ):
+        if self.options.negate is None and self.options.multiply10 is None and self.options.multiply100 is None:
             return
 
         sql_expressions = [
@@ -169,9 +152,7 @@ class Dataset(LazyFrameSource):
         for sql_expression, factor in zip(sql_expressions, factors):
             if sql_expression is None:
                 continue
-            when_expression = when_expression.when(pl.sql_expr(sql_expression)).then(
-                value_cols * factor
-            )
+            when_expression = when_expression.when(pl.sql_expr(sql_expression)).then(value_cols * factor)
 
         when_expression = when_expression.otherwise(value_cols)
         self.lf = self.lf.with_columns(when_expression)
@@ -229,19 +210,11 @@ class Dataset(LazyFrameSource):
     def _apply_transform_params_vector(self):
         """Apply transform and extract parameters to the LazyFrame."""
 
-        if (
-            self.options.summarize_by is None
-            and self.options.summarize_aggregate is None
-        ):
+        if self.options.summarize_by is None and self.options.summarize_aggregate is None:
             return
 
-        if (
-            self.options.summarize_by is None
-            or self.options.summarize_aggregate is None
-        ):
-            msg = (
-                "summarize_by and summarize_aggregate parameters must be used together"
-            )
+        if self.options.summarize_by is None or self.options.summarize_aggregate is None:
+            msg = "summarize_by and summarize_aggregate parameters must be used together"
             raise HTTPException(status_code=400, detail=msg)
 
         # Extract and validate summary geography IDs, if present.
@@ -249,16 +222,11 @@ class Dataset(LazyFrameSource):
             # summarize_grid = GRIDS[self.options.summarize_by]
             # TODO: Validate that the given IDs fall within the grid min and max.
             self.summarize_geography_ids = [
-                int(geo_id)
-                for geo_id in unpack_values(
-                    self.options.summarize_geography, "summarize_geography"
-                )
+                int(geo_id) for geo_id in unpack_values(self.options.summarize_geography, "summarize_geography")
             ]
 
         # Generate column expressions.
-        crosswalk_name = (
-            f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
-        )
+        crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
 
         try:
@@ -268,19 +236,13 @@ class Dataset(LazyFrameSource):
             raise HTTPException(status_code=400, detail=msg)
 
         if self.geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(
-                pl.col("src_id").is_in(self.geography_ids)
-            )
+            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in(self.geography_ids))
 
         if self.summarize_geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(
-                pl.col("dst_id").is_in(self.summarize_geography_ids)
-            )
+            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_geography_ids))
 
         crosswalk_df = (
-            crosswalk_lf.select(
-                "dst_id", summarize_columns=pl.struct("src_id", "scale_factor")
-            )
+            crosswalk_lf.select("dst_id", summarize_columns=pl.struct("src_id", "scale_factor"))
             .group_by(pl.col("dst_id"))
             .agg("summarize_columns")
             .sort("dst_id")
@@ -292,10 +254,7 @@ class Dataset(LazyFrameSource):
             DIMENSION_COLUMNS,
             **{
                 str(row["dst_id"]): agg_function(
-                    *[
-                        pl.col(str(col["src_id"])) * col["scale_factor"]
-                        for col in row["summarize_columns"]
-                    ]
+                    *[pl.col(str(col["src_id"])) * col["scale_factor"] for col in row["summarize_columns"]]
                 )
                 for row in crosswalk_df.iter_rows(named=True)
             },
@@ -308,9 +267,7 @@ class Dataset(LazyFrameSource):
         """Apply the unpivot parameter."""
 
         if self.options.unpivot:
-            self.lf = self.lf.unpivot(
-                index=DIMENSION_COLUMNS, variable_name="geography"
-            )
+            self.lf = self.lf.unpivot(index=DIMENSION_COLUMNS, variable_name="geography")
 
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
@@ -435,9 +392,7 @@ class Dataset(LazyFrameSource):
             output = stack.enter_context(rio.open(out_path, "w", **profile))
 
             # Group raster blocks by row, and read an entire row of blocks at once.
-            groups = itertools.groupby(
-                inputs[0].block_windows(1), key=lambda bw: bw[0][0]
-            )
+            groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
                 data = await self.get_raster_array(df, inputs, window)
