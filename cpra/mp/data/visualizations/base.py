@@ -11,7 +11,11 @@ from cpra.mp.data.variables import VARIABLES
 
 
 class BaseVisualization:
-    request = None
+    def __init__(self, request=None, height=400, width=600, **kwargs):
+        self.request = request
+        self.height = height
+        self.width = width
+        self.params = kwargs
 
     def chart(self):
         """Build the visualization using Altair."""
@@ -38,7 +42,8 @@ class BaseVisualization:
                 params.append((param_name, param_values))
 
         # Set select param to limit columns returned.
-        params.append(("select", ",".join(select)))
+        if "select" not in kwargs:
+            params.append(("select", ",".join(select)))
 
         if self.request:
             dataset_url = self.request.url_for(
@@ -52,6 +57,26 @@ class BaseVisualization:
             dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{grid}/{time_unit}/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
+
+    def get_data_source(self, variable, grid, time_unit, name=None, parse=None, **kwargs):
+        """Get an Altair data source for the given dataset and query parameters."""
+        data_uri = self.get_data_uri(
+            variable,
+            grid,
+            time_unit,
+            **{k: v for k, v in kwargs.items() if v is not None},
+        )
+
+        if parse is None:
+            parse = {
+                "geography": "number",
+                "value": "number",
+            }
+            time_column = self.get_time_column(time_unit)
+            if time_column == "calendar_day":
+                parse[time_column] = "date"
+
+        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=(name or variable))
 
     def get_time_column(self, time_unit):
         """Get the name of the time column."""
@@ -67,31 +92,16 @@ class BaseVisualization:
 class DatasetVisualization(BaseVisualization):
     """Visualization for a single dataset."""
 
-    def __init__(self, variable, grid, time_unit, request=None, height=400, width=600, **kwargs):
+    def __init__(self, variable, grid, time_unit, **kwargs):
+        super().__init__(**kwargs)
         self.variable = VARIABLES[variable]
         self.grid = GRIDS[grid]
         self.time_unit = time_unit
-        self.request = request
-        self.params = kwargs
-        self.height = height
-        self.width = width
 
     @cached_property
     def data_source(self):
         """Get the Altair data source."""
-
-        data_uri = self.get_data_uri(
-            self.variable.name,
-            self.grid.name,
-            self.time_unit,
-            **{k: v for k, v in self.params.items() if v is not None},
-        )
-        parse = {
-            self.time_column: "date" if self.time_column == "calendar_day" else "number",
-            "geography": "number",
-            "value": "number",
-        }
-        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=self.variable.name)
+        return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **self.params)
 
     @cached_property
     def geographies(self):
