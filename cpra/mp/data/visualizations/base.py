@@ -68,10 +68,9 @@ class BaseVisualization:
         )
 
         if parse is None:
-            parse = {
-                "geography": "number",
-                "value": "number",
-            }
+            parse = {"value": "number"}
+            if GRIDS[grid].grid_type == "vector":
+                parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
             if time_column == "calendar_day":
                 parse[time_column] = "date"
@@ -106,7 +105,14 @@ class DatasetVisualization(BaseVisualization):
     @cached_property
     def geographies(self):
         """Get the selected geographies."""
-        return list(map(int, self.params["geography"].split(",")))
+        raster = self.grid.grid_type == "raster"
+        coord_type = float if raster else int
+        coords = list(map(coord_type, self.params["geography"].split(",")))
+
+        if not raster:
+            return coords
+
+        return [",".join([str(coord) for coord in coords[i : i + 2]]) for i in range(0, len(coords), 2)]
 
     @cached_property
     def time_column(self):
