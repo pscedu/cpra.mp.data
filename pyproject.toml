@@ -29,6 +29,7 @@ dependencies = [
     "Pillow",
     "polars",
     "pyarrow",
+    "pyproj",
     "python-dotenv",
     "rasterio",
     "scipy",

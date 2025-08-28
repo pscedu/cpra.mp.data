@@ -27,7 +27,7 @@ from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileRespo
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
-from cpra.mp.data.api.utils import validate_compression, validate_format
+from cpra.mp.data.api.utils import transform_bounds, validate_compression, validate_format
 from cpra.mp.data.config import MPD_URI
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -107,18 +107,18 @@ def dimensions(session: MPDSession) -> list[Dimension]:
 
 
 @app.get("/v1/grids.json", tags=["Catalog"])
-def grids() -> list[Grid]:
+def grids(crs: str | None = None) -> list[Grid]:
     # TODO: Compress geography IDs into ranges.
     return [
         Grid(
             name=grid.name,
             label=grid.label,
             grid_type=grid.grid_type,
-            crs=grid.crs,
+            crs=grid.crs or crs,
             id_min=getattr(grid, "id_min", None),
             id_max=getattr(grid, "id_max", None),
             id_count=getattr(grid, "id_count", None),
-            bounds=getattr(grid, "bounds", None),
+            bounds=transform_bounds(getattr(grid, "bounds", None), grid.crs, crs),
             height=getattr(grid, "height", None),
             width=getattr(grid, "width", None),
         )

@@ -127,7 +127,7 @@ class Grid(BaseModel):
     id_min: int | None
     id_max: int | None
     id_count: int | None
-    bounds: list[int] | None
+    bounds: list[int | float] | None
     height: int | None
     width: int | None
 
