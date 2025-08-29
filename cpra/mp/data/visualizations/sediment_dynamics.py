@@ -93,6 +93,9 @@ class SedimentDynamics(BaseVisualization):
 
     def chart(self):
         """Build the visualization using Altair."""
+        chart_height = max(self.height - 86, 50)
+        chart_width = max(self.width - 220, 50)
+
         lnd_type_chart = self._lnd_type_chart()
         meter_chart = self._line_chart(self.meter_variables)
 
@@ -121,5 +124,5 @@ class SedimentDynamics(BaseVisualization):
         return (
             alt.layer(lnd_type_chart, alt.layer(meter_chart, points_chart, rule_chart))
             .resolve_scale(y="independent", color="independent")
-            .properties(title="Sediment Dynamics", width=1200, height=600)
+            .properties(title="Sediment Dynamics", width=chart_width, height=chart_height)
         )
