@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.26.0](https://github.com/pscedu/cpra.mp.data/compare/v0.25.1...v0.26.0) (2025-08-29)
+
+
+### Features
+
+* **api:** add endpoint for visualization metadata ([e1490a1](https://github.com/pscedu/cpra.mp.data/commit/e1490a186578686be1c4b5756e43b19b58c7ff9f))
+* **visualization:** add sediment dynamics chart ([159d0ec](https://github.com/pscedu/cpra.mp.data/commit/159d0ecc532b5966bc10b307f6eaa9ea940318ec))
+* **visualizations:** add support for raster grid coordinates ([5618716](https://github.com/pscedu/cpra.mp.data/commit/5618716cf7509f4b1f0686d42bc8175b712f54c1))
+* **visualizations:** set sedment dynamics chart dimensions ([00c2364](https://github.com/pscedu/cpra.mp.data/commit/00c23647812f4f1918e8defeef3d3b4a7a01be64))
+
+
+### Bug Fixes
+
+* **visualization:** merge params in sediment dynamics ([695ae07](https://github.com/pscedu/cpra.mp.data/commit/695ae07dce7ff335c5639cd252ec8a5243af1956))
+
 ## [0.25.1](https://github.com/pscedu/cpra.mp.data/compare/v0.25.0...v0.25.1) (2025-08-18)
 
 
