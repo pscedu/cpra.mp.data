@@ -146,6 +146,9 @@ class Legend(BaseModel):
 class Visualization(BaseModel):
     name: str
     label: str
+    type: str
+    max_geographies: int
+    variables: list[str] | None = None
 
 
 class VisualizationQuery(DataQuery):

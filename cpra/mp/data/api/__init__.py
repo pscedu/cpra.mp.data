@@ -21,13 +21,14 @@ from cpra.mp.data.api.models import (
     MPDDimensionValue,
     TileQuery,
     Variable,
+    Visualization,
     VisualizationQuery,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
-from cpra.mp.data.api.utils import validate_compression, validate_format
+from cpra.mp.data.api.utils import get_visualization_class, validate_compression, validate_format
 from cpra.mp.data.config import MPD_URI
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -194,21 +195,43 @@ async def get_model_tile(
     return RasterioTileResponse(dataset, x, y, z, format)
 
 
+@app.get("/v1/visualizations.json", tags=["Visualization"])
+def visualizations() -> list[Visualization]:
+    return [viz.Meta.__dict__ for viz in VISUALIZATIONS.values()]
+
+
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/visualization/{visualization_type}.json",
+    "/v1/datasets/{variable}/{grid}/{time_unit}/visualization/{visualization_name}.json",
     tags=["Visualization"],
 )
-async def get_visualization(
+async def get_dataset_visualization(
     request: Request,
-    visualization_type,
+    visualization_name,
     query: Annotated[VisualizationQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    VisualizationClass = VISUALIZATIONS[visualization_type]
+    VisualizationClass = get_visualization_class(visualization_name, "dataset")
     visualization = VisualizationClass(
         variable=dataset_dimensions.variable,
         grid=dataset_dimensions.grid,
         time_unit=dataset_dimensions.time_unit,
+        request=request,
+        **dict(query),
+    )
+    return JSONResponse(visualization.spec)
+
+
+@app.get(
+    "/v1/visualizations/{visualization_name}.json",
+    tags=["Visualization"],
+)
+async def get_visualization(
+    request: Request,
+    visualization_name,
+    query: Annotated[VisualizationQuery, Query()],
+):
+    VisualizationClass = get_visualization_class(visualization_name, "custom")
+    visualization = VisualizationClass(
         request=request,
         **dict(query),
     )

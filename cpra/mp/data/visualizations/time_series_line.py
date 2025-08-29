@@ -7,8 +7,11 @@ from cpra.mp.data.visualizations.colors import MAP_SELECTION
 
 
 class TimeSeriesLine(DatasetVisualization):
-    name = "time-series-line"
-    label = "Time Series Line"
+    class Meta:
+        name = "time-series-line"
+        label = "Time Series Line"
+        type = "dataset"
+        max_geographies = 10
 
     def chart(self):
         """Build the visualization using Altair."""

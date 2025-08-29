@@ -6,8 +6,15 @@ from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations.base import BaseVisualization
 
 
-class SedimentDynamicsVisualization(BaseVisualization):
+class SedimentDynamics(BaseVisualization):
     """A chart showing five sediment dynamics variables."""
+
+    class Meta:
+        name = "sediment-dynamics"
+        label = "Sediment Dynamics"
+        type = "custom"
+        max_geographies = 1
+        variables = ["elev", "inun", "lnd_type", "test_mnrl_accr", "test_org_accr"]
 
     def __init__(self, request=None, height=400, width=600, **kwargs):
         super().__init__(request, height, width, **kwargs)

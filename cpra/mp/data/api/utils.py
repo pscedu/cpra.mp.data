@@ -11,6 +11,7 @@ from cpra.mp.data import read_data
 from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.config import DEBUG
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.visualizations import VISUALIZATIONS
 
 RASTER_COMPRESSION_ALGORITHMS = [
     CompressionAlgorithm.deflate,
@@ -41,10 +42,7 @@ def asynctiming(func):
         start = time()
         result = await func(*args, **kwargs)
         if DEBUG:
-            print(
-                "func:%r args:[%r, %r] took: %2.4f sec"
-                % (func.__name__, args, kwargs, time() - start)
-            )
+            print("func:%r args:[%r, %r] took: %2.4f sec" % (func.__name__, args, kwargs, time() - start))
         return result
 
     return wrapped
@@ -58,10 +56,7 @@ def timing(func):
         start = time()
         result = func(*args, **kwargs)
         if DEBUG:
-            print(
-                "func:%r args:[%r, %r] took: %2.4f sec"
-                % (func.__name__, args, kwargs, time() - start)
-            )
+            print("func:%r args:[%r, %r] took: %2.4f sec" % (func.__name__, args, kwargs, time() - start))
         return result
 
     return wrapped
@@ -72,18 +67,11 @@ def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest)
     return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
 
 
-async def parallel_read_rasters(
-    datasets, window=None, out_shape=None, resampling=Resampling.nearest
-):
+async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest):
     """Read several rasters in multiple threads."""
     loop = asyncio.get_running_loop()
     return await asyncio.gather(
-        *[
-            loop.run_in_executor(
-                None, _read_window, dataset, window, out_shape, resampling
-            )
-            for dataset in datasets
-        ]
+        *[loop.run_in_executor(None, _read_window, dataset, window, out_shape, resampling) for dataset in datasets]
     )
 
 
@@ -96,10 +84,7 @@ async def parallel_sample_rasters(datasets, coordinates):
     """Sample several rasters at the given coordinates in multiple threads."""
     loop = asyncio.get_running_loop()
     return await asyncio.gather(
-        *[
-            loop.run_in_executor(None, _sample_raster, dataset, coordinates)
-            for dataset in datasets
-        ]
+        *[loop.run_in_executor(None, _sample_raster, dataset, coordinates) for dataset in datasets]
     )
 
 
@@ -127,11 +112,7 @@ def get_lazy_frame(dataset_dimensions, filter_dimensions):
     try:
         return _read_data_cached(
             **dict(dataset_dimensions),
-            **{
-                k: tuple(v)
-                for (k, v) in dict(filter_dimensions).items()
-                if isinstance(v, list)
-            },
+            **{k: tuple(v) for (k, v) in dict(filter_dimensions).items() if isinstance(v, list)},
         )
     except ValidationError as err:
         # TODO: Also handle directory does not exist errors.
@@ -164,3 +145,19 @@ def validate_format(format, output_type):
         formats_str = ", ".join([f.value for f in DataFormat if f != DataFormat.tif])
         msg = f"Format for vector output must be one of: {formats_str}"
         raise HTTPException(status_code=400, detail=msg)
+
+
+def get_visualization_class(name: str, type: str | None = None):
+    """Get a visualization class by name, and optionally, by type."""
+
+    VisualizationClass = VISUALIZATIONS.get(name, None)
+
+    if VisualizationClass is None:
+        msg = f"Unknown visualization name: {name}"
+        raise HTTPException(status_code=404, detail=msg)
+
+    if type is not None and VisualizationClass.Meta.type != type:
+        msg = f"Invalid visualization type: expected {type}, got {VisualizationClass.Meta.type}"
+        raise HTTPException(status_code=400, detail=msg)
+
+    return VisualizationClass
