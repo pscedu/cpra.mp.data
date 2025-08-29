@@ -27,8 +27,7 @@ class SedimentDynamics(BaseVisualization):
                 variable_name,
                 "morph_pixel_v001",
                 "annual",
-                select=",".join(["calendar_year", "value"]),
-                **self.params,
+                **(self.params | dict(select=",".join(["calendar_year", "value"]))),
             )
             for variable_name in self.variables
         }
