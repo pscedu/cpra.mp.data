@@ -31,9 +31,9 @@ Land Change,lnd_chng,icm,morph,Int32,morph_pixel,annual,,lnd_chng,
 Land Type,lnd_type,icm,morph,Int32,morph_pixel,annual,,lnd_type,
 Mineral Accretion,mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 Mineral Deposition Rate,mnrl_dep,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,mnrl_dep,
-Organic Matter Accumulation Rate,omar,icm,morph,Float64,morph_pixel,annual,g/cm^2-yr,omar,
+Organic Matter Accumulation Rate,omar,icm,morph,Float64,ecoregion,annual,g/cm^2-yr,omar,"ffibs_type, percentile"
 Organic Accretion,org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
-Shallow Soil Factors,ssf,icm,morph,Float32,,annual,mm/yr,ssf,
+Shallow Soil Factors,ssf,icm,morph,Float32,ecoregion,annual,mm/yr,ssf,percentile
 Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,sub,
 TEST Mineral Accretion,test_mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
 TEST Organic Accretion,test_org_accr,icm,morph,Float64,morph_pixel,annual,cm,accr,
