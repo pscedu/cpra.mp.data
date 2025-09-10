@@ -1,6 +1,7 @@
 import datetime as dt
 
 import altair as alt
+import polars as pl
 
 from cpra.mp.data.visualizations.base import DatasetVisualization
 from cpra.mp.data.visualizations.colors import MAP_SELECTION
@@ -44,15 +45,25 @@ class TimeSeriesLine(DatasetVisualization):
         when_near = alt.when(nearest)
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
+        geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
+
         rules = (
             alt.Chart(self.data_source)
-            .transform_pivot("geography", value="value", groupby=[self.time_column])
+            .transform_lookup(  # Transform geography to index to support coordinates
+                "geography",
+                from_=alt.LookupData(
+                    geography_df,
+                    "geography",
+                    ["geography_idx"],
+                ),
+            )
+            .transform_pivot("geography_idx", value="value", groupby=[self.time_column])
             .mark_rule(color="gray")
             .encode(
                 x=f"{self.time_column}:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
                 tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
-                + [alt.Tooltip(str(geo), type="quantitative") for geo in self.geographies],
+                + [alt.Tooltip(str(i), type="quantitative", title=geo) for (i, geo) in geography_df.iter_rows()],
             )
             .add_params(nearest)
         )
