@@ -64,7 +64,7 @@ class TimeSeriesLine(DatasetVisualization):
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
                 tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
                 + [
-                    alt.Tooltip(str(i), type="quantitative", title=geo, format=self.variable.number_format or "")
+                    alt.Tooltip(str(i), type="quantitative", title=str(geo), format=self.variable.number_format or "")
                     for (i, geo) in geography_df.iter_rows()
                 ],
             )
