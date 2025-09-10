@@ -114,7 +114,12 @@ class SedimentDynamics(BaseVisualization):
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
                 tooltip=[alt.Tooltip("calendar_year", type="quantitative", title="Year")]
                 + [
-                    alt.Tooltip(VARIABLES[v].name, type="quantitative", title=VARIABLES[v].label)
+                    alt.Tooltip(
+                        VARIABLES[v].name,
+                        type="quantitative",
+                        title=VARIABLES[v].label,
+                        format=VARIABLES[v].number_format or "",
+                    )
                     for v in self.variables
                 ],
             )

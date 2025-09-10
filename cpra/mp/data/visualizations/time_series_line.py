@@ -63,7 +63,10 @@ class TimeSeriesLine(DatasetVisualization):
                 x=f"{self.time_column}:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
                 tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
-                + [alt.Tooltip(str(i), type="quantitative", title=geo) for (i, geo) in geography_df.iter_rows()],
+                + [
+                    alt.Tooltip(str(i), type="quantitative", title=geo, format=self.variable.number_format or "")
+                    for (i, geo) in geography_df.iter_rows()
+                ],
             )
             .add_params(nearest)
         )
