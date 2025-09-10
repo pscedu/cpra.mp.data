@@ -73,6 +73,7 @@ def variables() -> list[Variable]:
             model=var.model,
             subroutine=var.subroutine,
             unit=var.unit,
+            number_format=var.number_format,
             geographic_units=var.geographic_units,
             time_units=var.time_units,
             required_dimensions=var.required_dimensions,

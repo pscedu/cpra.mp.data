@@ -17,28 +17,24 @@ class Variable:
         model=None,
         subroutine=None,
         unit=None,
+        number_format=None,
     ):
         self.name = name
         self.label = label
         self.dtype = getattr(pl, dtype)
-        self.legend = (
-            legend
-            if isinstance(legend, Legend)
-            else (LEGENDS[legend] if legend else None)
-        )
+        self.legend = legend if isinstance(legend, Legend) else (LEGENDS[legend] if legend else None)
         self.geographic_units = geographic_units
         self.time_units = time_units
         self.required_dimensions = required_dimensions
         self.model = model
         self.subroutine = subroutine
         self.unit = unit
+        self.number_format = number_format
 
 
 VARIABLES = {
     row["name"]: Variable(**row)
     for row in read_structure_csv("variables")
-    .with_columns(
-        pl.col("geographic_units", "time_units", "required_dimensions").str.split(", ")
-    )
+    .with_columns(pl.col("geographic_units", "time_units", "required_dimensions").str.split(", "))
     .iter_rows(named=True)
 }

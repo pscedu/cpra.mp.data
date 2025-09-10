@@ -113,6 +113,7 @@ class Variable(BaseModel):
     model: str
     subroutine: str | None
     unit: str | None
+    number_format: str | None
     legend: str | None
     geographic_units: list[str] | None
     time_units: list[str] | None
