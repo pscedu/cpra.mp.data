@@ -34,8 +34,11 @@ class BaseVisualization:
         params = []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
-                for value in param_values:
-                    params.append((param_name, value))
+                if param_name == "geography":
+                    params.append(("geography", ",".join([str(geo) for geo in param_values])))
+                else:
+                    for value in param_values:
+                        params.append((param_name, value))
                 if param_name in required_cols and len(param_values) > 1:
                     select.append(param_name)
             elif param_values is not None:
@@ -107,7 +110,8 @@ class DatasetVisualization(BaseVisualization):
         """Get the selected geographies."""
         raster = self.grid.grid_type == "raster"
         coord_type = float if raster else int
-        coords = list(map(coord_type, self.params["geography"].split(",")))
+        geos = self.params["geography"]
+        coords = list(map(coord_type, geos.split(",") if isinstance(geos, str) else geos))
 
         if not raster:
             return coords
