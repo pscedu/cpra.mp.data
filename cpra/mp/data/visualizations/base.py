@@ -73,7 +73,7 @@ class BaseVisualization:
                 parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
             if time_column == "calendar_day":
-                parse[time_column] = "date"
+                parse[time_column] = "date:%Y-%m-%d"
 
         return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=(name or variable))
 
