@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.28.0](https://github.com/pscedu/cpra.mp.data/compare/v0.27.0...v0.28.0) (2025-09-11)
+
+
+### Features
+
+* **structure:** update morph grid ([ae347d6](https://github.com/pscedu/cpra.mp.data/commit/ae347d690940bee7bcdeb124af40b413d1bafa8e))
+* **variables:** add number format ([5368380](https://github.com/pscedu/cpra.mp.data/commit/53683807a3bcf4812e740a11d89ff73d7cf1fc16))
+* **visualizations:** allow specifying geographies as a list ([1620224](https://github.com/pscedu/cpra.mp.data/commit/162022475814290a9e0022fd560036c947318737))
+* **visualizations:** use variable number format, if specified ([f123d02](https://github.com/pscedu/cpra.mp.data/commit/f123d02df6de34d315810c1ca43f2916f66be0f9))
+
+
+### Bug Fixes
+
+* **visualizations:** ensure tooltip title is a string ([2d57df5](https://github.com/pscedu/cpra.mp.data/commit/2d57df5053aac887584a70af6727687802ed73bb))
+* **visualizations:** fix tooltips for raster coordinates ([ba3d531](https://github.com/pscedu/cpra.mp.data/commit/ba3d531985aa9f95d6f1ef78ebb9b6a1997e9864))
+* **visualizations:** parse dates in local time ([3c3c934](https://github.com/pscedu/cpra.mp.data/commit/3c3c934210d5c81b48ecc7e2bc7809f5eba91bc4))
+
 ## [0.27.0](https://github.com/pscedu/cpra.mp.data/compare/v0.26.0...v0.27.0) (2025-09-09)
 
 
