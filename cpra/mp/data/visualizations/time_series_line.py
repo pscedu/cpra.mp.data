@@ -25,13 +25,14 @@ class TimeSeriesLine(DatasetVisualization):
         chart_height = max(self.height - (222 if is_daily else 86), 50)
         chart_width = max(self.width - 200, 50)
 
-        nearest = alt.selection_point(nearest=True, on="pointerover", fields=[self.time_column], empty=False)
+        nearest = alt.selection_point(nearest=True, on="pointerover", fields=["date"], empty=False)
+        when_near = alt.when(nearest)
 
         main_line = (
-            alt.Chart(self.data_source)
+            self.get_base_chart(self.data_source, self.time_column)
             .mark_line()
             .encode(
-                alt.X(f"{self.time_column}:T").title("Date"),
+                alt.X("date:T").title(self.time_dimension.label),
                 alt.Y("value:Q")
                 .title(self.variable_label)
                 .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
@@ -42,13 +43,12 @@ class TimeSeriesLine(DatasetVisualization):
             .properties(title=f"{self.time_unit.title()} {self.title}", width=chart_width)
         )
 
-        when_near = alt.when(nearest)
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
         geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
 
         rules = (
-            alt.Chart(self.data_source)
+            self.get_base_chart(self.data_source, self.time_column)
             .transform_lookup(  # Transform geography to index to support coordinates
                 "geography",
                 from_=alt.LookupData(
@@ -57,12 +57,12 @@ class TimeSeriesLine(DatasetVisualization):
                     ["geography_idx"],
                 ),
             )
-            .transform_pivot("geography_idx", value="value", groupby=[self.time_column])
+            .transform_pivot("geography_idx", value="value", groupby=["date", self.time_column])
             .mark_rule(color="gray")
             .encode(
-                x=f"{self.time_column}:T",
+                x="date:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
-                tooltip=[alt.Tooltip(self.time_column, type="temporal", title=self.time_dimension.label)]
+                tooltip=[self.get_time_tooltip(self.time_column)]
                 + [
                     alt.Tooltip(str(i), type="quantitative", title=str(geo), format=self.variable.number_format or "")
                     for (i, geo) in geography_df.iter_rows()

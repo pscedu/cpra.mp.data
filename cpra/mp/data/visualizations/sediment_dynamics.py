@@ -33,19 +33,7 @@ class SedimentDynamics(BaseVisualization):
         }
 
     def _base_chart(self, variables, long=False):
-        chart: alt.Chart = None
-        for variable_name in variables:
-            data_source = self.data_sources[variable_name]
-            if chart is None:
-                chart = alt.Chart(data_source).transform_calculate(
-                    date="toDate(toString(datum.calendar_year))", **{variable_name: "datum.value"}
-                )
-            else:
-                chart = chart.transform_lookup(
-                    "calendar_year",
-                    as_=[variable_name],
-                    from_=alt.LookupData(data_source, "calendar_year", ["value"]),
-                )
+        chart = self.get_base_chart({v: self.data_sources[v] for v in variables}, "calendar_year")
 
         if long:
             chart = chart.transform_fold(variables, as_=["variable", "value"])
@@ -112,7 +100,7 @@ class SedimentDynamics(BaseVisualization):
             .encode(
                 x="date:T",
                 opacity=when_near.then(alt.value(0.3)).otherwise(alt.value(0)),
-                tooltip=[alt.Tooltip("calendar_year", type="quantitative", title="Year")]
+                tooltip=[self.get_time_tooltip("calendar_year")]
                 + [
                     alt.Tooltip(
                         VARIABLES[v].name,

@@ -22,6 +22,48 @@ class BaseVisualization:
 
         raise NotImplementedError
 
+    def get_base_chart(
+        self,
+        data_sources: alt.UrlData | dict[str, alt.UrlData],
+        time_column: str,
+        join_column: str | None = None,
+        date_column: str | None = "date",
+    ):
+        """Generate a base chart from the given data source and options."""
+        chart: alt.Chart = None
+
+        if isinstance(data_sources, alt.UrlData):
+            data_sources = {"value": data_sources}
+
+        for source_name, source in data_sources.items():
+            # If this is the first data source, create the chart.
+            if chart is None:
+                chart = alt.Chart(source)
+
+                # Collect and apply calculate expressions.
+                calculate_exprs = {}
+                if source_name != "value":
+                    calculate_exprs[source_name] = "datum.value"
+
+                if date_column:
+                    if time_column == "calendar_year":
+                        calculate_exprs[date_column] = "toDate(toString(datum.calendar_year))"
+                    else:
+                        calculate_exprs[date_column] = "datum.calendar_day"
+
+                if calculate_exprs:
+                    chart = chart.transform_calculate(**calculate_exprs)
+            # Otherwise, join this data source to the previous chart.
+            else:
+                col = join_column or time_column
+                chart = chart.transform_lookup(
+                    col,
+                    as_=[source_name],
+                    from_=alt.LookupData(source, col, ["value"]),
+                )
+
+        return chart
+
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
@@ -75,14 +117,21 @@ class BaseVisualization:
             if GRIDS[grid].grid_type == "vector":
                 parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
-            if time_column == "calendar_day":
-                parse[time_column] = "date:%Y-%m-%d"
+            parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
 
         return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=(name or variable))
 
     def get_time_column(self, time_unit):
         """Get the name of the time column."""
         return "calendar_year" if time_unit in ("decadal", "annual") else "calendar_day"
+
+    def get_time_tooltip(self, time_column: str):
+        """Create a tooltip for the given time column."""
+        return alt.Tooltip(
+            time_column,
+            type="quantitative" if time_column == "calendar_year" else "temporal",
+            title=DIMENSIONS[time_column].label,
+        )
 
     @property
     def spec(self):
