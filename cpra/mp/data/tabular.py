@@ -11,6 +11,7 @@ from cpra.mp.data.utils import (
     build_glob_pattern,
     dataset_path,
     get_filter_expressions,
+    get_input_data_frame,
     partition_columns,
     required_columns,
     validate_data_frame,
@@ -26,15 +27,12 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
     # Validate the input keyword arguments.
-    input_df = pl.DataFrame(kwargs)
+    input_df = get_input_data_frame(**kwargs)
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Calculate the dataset directory path and expressions.
     dataset_dir = dataset_path(base_path, **kwargs)
-    dataset_exprs = [
-        pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name)
-        for dim in DATASET_DIMENSIONS.values()
-    ]
+    dataset_exprs = [pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()]
     filter_args = get_filter_expressions(**kwargs)
 
     # Default to an un-partitioned dataset.
@@ -45,11 +43,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
     partition_cols = partition_columns(input_df, include_dataset=False)
     if partition_cols:
         hive_partitioning = True
-        hive_schema = {
-            dim.name: dim.dtype
-            for dim in DIMENSIONS.values()
-            if dim.name in partition_cols
-        }
+        hive_schema = {dim.name: dim.dtype for dim in DIMENSIONS.values() if dim.name in partition_cols}
 
     lf = pl.scan_parquet(
         dataset_dir,
@@ -120,10 +114,7 @@ def write_parquet(
             raise ValidationError(msg)
 
         if grid.id_count is not None and len(numeric_cols) != grid.id_count:
-            msg = (
-                "Wrong number of geography columns: "
-                f"expected {grid.id_count}, found {len(numeric_cols)}"
-            )
+            msg = "Wrong number of geography columns: " f"expected {grid.id_count}, found {len(numeric_cols)}"
             raise ValidationError(msg)
 
         # Validate geometry column data type and min/max ID.
@@ -153,9 +144,7 @@ def write_parquet(
         compression_level=compression_level,
         row_group_size=row_group_size,
         use_pyarrow=True,
-        pyarrow_options=dict(
-            use_dictionary=use_dictionary, partition_cols=partition_cols
-        ),
+        pyarrow_options=dict(use_dictionary=use_dictionary, partition_cols=partition_cols),
     )
 
 
@@ -178,12 +167,8 @@ def compact_parquet(
     dataset_dir = dataset_path(base_path, **kwargs)
 
     # Construct the glob pattern.
-    required_cols = required_columns(
-        input_df, include_dataset=False, include_metadata=False
-    )
-    glob_pattern = build_glob_pattern(
-        required_cols=required_cols, extension="parquet", **kwargs
-    )
+    required_cols = required_columns(input_df, include_dataset=False, include_metadata=False)
+    glob_pattern = build_glob_pattern(required_cols=required_cols, extension="parquet", **kwargs)
     paths = list(dataset_dir.glob(glob_pattern))
 
     # Group by directory, and extract dimension values for directories with
@@ -200,10 +185,7 @@ def compact_parquet(
         .filter(pl.col("file").list.len() > 1)
         .with_columns(
             [
-                pl.col("directory")
-                .str.extract(f"{dim.name}=([^/]+)(/|$)", 1)
-                .cast(dim.dtype)
-                .alias(dim.name)
+                pl.col("directory").str.extract(f"{dim.name}=([^/]+)(/|$)", 1).cast(dim.dtype).alias(dim.name)
                 for dim in DIMENSIONS.values()
                 if dim.name in partition_columns(input_df)
             ]
