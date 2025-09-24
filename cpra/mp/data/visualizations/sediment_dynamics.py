@@ -1,3 +1,4 @@
+from typing import final
 import altair as alt
 import polars as pl
 
@@ -9,6 +10,7 @@ from cpra.mp.data.visualizations.base import BaseVisualization
 class SedimentDynamics(BaseVisualization):
     """A chart showing five sediment dynamics variables."""
 
+    @final
     class Meta:
         name = "sediment-dynamics"
         label = "Sediment Dynamics"

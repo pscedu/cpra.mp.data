@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, create_model
@@ -153,7 +154,9 @@ class Visualization(BaseModel):
 
 
 class VisualizationQuery(DataQuery):
+    end_date: date | None = None
     height: int = 400
+    start_date: date | None = None
     width: int = 600
 
 

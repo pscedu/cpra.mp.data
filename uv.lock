@@ -220,7 +220,7 @@ wheels = [
 
 [[package]]
 name = "cpra-mp-data"
-version = "0.27.0"
+version = "0.28.0"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools", version = "5.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },

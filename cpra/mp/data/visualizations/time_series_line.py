@@ -1,4 +1,5 @@
 import datetime as dt
+from typing import final
 
 import altair as alt
 import polars as pl
@@ -8,6 +9,9 @@ from cpra.mp.data.visualizations.colors import MAP_SELECTION
 
 
 class TimeSeriesLine(DatasetVisualization):
+    """Time series line chart for a dataset."""
+
+    @final
     class Meta:
         name = "time-series-line"
         label = "Time Series Line"
@@ -17,15 +21,15 @@ class TimeSeriesLine(DatasetVisualization):
     def chart(self):
         """Build the visualization using Altair."""
 
-        start_date = self.params.get("start_date", dt.date(2019, 1, 1))
-        end_date = self.params.get("end_date", dt.date(2020, 1, 1))
+        start_date = self.params.get("start_date", None) or dt.date(2019, 1, 1)
+        end_date = self.params.get("end_date", None) or dt.date(2020, 1, 1)
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
         chart_height = max(self.height - (222 if is_daily else 86), 50)
         chart_width = max(self.width - 200, 50)
 
-        nearest = alt.selection_point(nearest=True, on="pointerover", fields=["date"], empty=False)
+        nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
 
         main_line = (
@@ -74,7 +78,7 @@ class TimeSeriesLine(DatasetVisualization):
         viz = (alt.layer(main_line, points, rules)).properties(width=chart_width, height=chart_height)
 
         if is_daily:
-            brush = alt.selection_interval(encodings=["x"], value={"x": initial_date_range})
+            brush = alt.selection_interval("date_range", encodings=["x"], value={"x": initial_date_range})
             viz = viz.transform_filter(brush)
             summary_line = (
                 main_line.encode(

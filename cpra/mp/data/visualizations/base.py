@@ -28,9 +28,9 @@ class BaseVisualization:
         time_column: str,
         join_column: str | None = None,
         date_column: str | None = "date",
-    ):
+    ) -> alt.Chart:
         """Generate a base chart from the given data source and options."""
-        chart: alt.Chart = None
+        chart: alt.Chart | None = None
 
         if isinstance(data_sources, alt.UrlData):
             data_sources = {"value": data_sources}
