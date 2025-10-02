@@ -6,10 +6,11 @@ WORKDIR /usr/src/app
 COPY pyproject.toml \
     README.md ./
 
-RUN mkdir -p cpra/mp/data && pip install .[api] \
-    && python -m pip cache purge
-
 COPY cpra/ ./cpra
+
+RUN mkdir -p cpra/mp/data \
+    && pip install .[api] \
+    && python -m pip cache purge
 
 EXPOSE 8000
 CMD ["python3", "-u", "-m", "cpra.mp.data.api"]
