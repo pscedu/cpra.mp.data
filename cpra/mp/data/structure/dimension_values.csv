@@ -20,9 +20,22 @@ asset_type,2,Other Multi-family Residential
 asset_type,3,"Commercial, Industrial, or Agricultural"
 asset_type,4,"Other Structural (public, education, or religion)"
 asset_type,5,"Non-structural (crops, vehicles, or roads)"
+clara_variant,0,No additional variant considered (MP23 data)
 exposure_type,exposure,Exposure
 exposure_type,moderate_exposure,Moderate Exposure
 exposure_type,severe_exposure,Severe Exposure
+ffibs_type,pl_bf,Bottomland Hardwood Forest
+ffibs_type,pl_sf,Swamp Forest
+ffibs_type,pl_fm,Fresh Marsh
+ffibs_type,pl_im,Intermediate Marsh
+ffibs_type,pl_bm,Brackish Marsh
+ffibs_type,pl_sm,Saline Marsh
+ffibs_type,swamp_omar,Swamp Marsh
+ffibs_type,fresh_omar,Fresh Marsh
+ffibs_type,inter_omar,Intermediate Marsh
+ffibs_type,brack_omar,Brackish Marsh
+ffibs_type,saline_omar,Saline Marsh
+ffibs_type,active_fresh_omar,Active Fresh Marsh
 fragility_scenario,0,No Fragility
 fragility_scenario,1,IPET Fragility
 infrastructure_category,daycares,Daycares
@@ -49,6 +62,12 @@ ns_project_id,3,
 participation_rate,0.5,50% Participation
 participation_rate,0.75,75% Participation
 participation_rate,1,Full Participation
+percentile,10,10th Percentile
+percentile,25,25th Percentile
+percentile,50,50th Percentile
+percentile,75,75th Percentile
+percentile,90,90th Percentile
+population_variant,0,No population migration considered (MP23 data)
 pumping_id,0,No Pumping
 pumping_id,0.5,50% Pumping Capacity
 pumping_id,1,Full Pumping Capacity
@@ -107,22 +126,3 @@ veg_species_code,baregrnd_old,Old Bareground
 veg_species_code,baregrnd_new,New Bareground
 veg_species_code,baregrnd_flt,Flotant Bareground
 veg_species_code,dead_flt,Dead Flotant
-ffibs_type,pl_bf,Bottomland Hardwood Forest
-ffibs_type,pl_sf,Swamp Forest
-ffibs_type,pl_fm,Fresh Marsh
-ffibs_type,pl_im,Intermediate Marsh
-ffibs_type,pl_bm,Brackish Marsh
-ffibs_type,pl_sm,Saline Marsh
-percentile,10,10th Percentile
-percentile,25,25th Percentile
-percentile,50,50th Percentile
-percentile,75,75th Percentile
-percentile,90,90th Percentile
-population_variant,0,No population migration considered (MP23 data)
-clara_variant,0,No additional variant considered (MP23 data)
-ffibs_type,swamp_omar,Swamp Marsh
-ffibs_type,fresh_omar,Fresh Marsh
-ffibs_type,inter_omar,Intermediate Marsh
-ffibs_type,brack_omar,Brackish Marsh
-ffibs_type,saline_omar,Saline Marsh
-ffibs_type,active_fresh_omar,Active Fresh Marsh

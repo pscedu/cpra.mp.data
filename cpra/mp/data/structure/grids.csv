@@ -1,6 +1,6 @@
 label,name,type,crs,id_min,id_max,id_count,bounds,height,width
 Morphology Pixel,morph_pixel_v001,raster,epsg:26915,,,,"404500, 3187060, 1024720, 3435010",8265,20674
-Vegetation Pixel,veg_pixel_v001,raster,epsg:26915,,,,"404710, 3199480, 909670, 3374680",365,1052
+Vegetation Grid Cell,veg_grid_cell_v001,raster,epsg:26915,,,,"404710, 3199480, 909670, 3374680",365,1052
 Hydro Compartment,hydro_compartment_v001,vector,epsg:26915,1,1657,1657,,,
 Ecoregion,ecoregion_v001,vector,epsg:26915,1,32,32,,,
 Block Group,block_group_v2020,vector,epsg:26915,,,,,,
