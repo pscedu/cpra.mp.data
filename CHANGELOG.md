@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.1](https://github.com/pscedu/cpra.mp.data/compare/v0.29.0...v0.29.1) (2025-10-02)
+
+
+### Bug Fixes
+
+* **image:** copy module code before installing dependencies ([ec69874](https://github.com/pscedu/cpra.mp.data/commit/ec69874ad1996e5c888bc4b60e028366bab2fe02))
+
 ## [0.29.0](https://github.com/pscedu/cpra.mp.data/compare/v0.28.0...v0.29.0) (2025-10-02)
 
 
