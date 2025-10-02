@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.29.0](https://github.com/pscedu/cpra.mp.data/compare/v0.28.0...v0.29.0) (2025-10-02)
+
+
+### Features
+
+* **structure:** rename veg_pixel_v001 to veg_grid_cell_v001 ([dc7dd1c](https://github.com/pscedu/cpra.mp.data/commit/dc7dd1c962e82105b10498a29099ed3f3ed279d0))
+* **visualizations:** add start and end date parameters ([c1e18c9](https://github.com/pscedu/cpra.mp.data/commit/c1e18c998ebdedefc237107683b6da7fb72919c3))
+
+
+### Bug Fixes
+
+* **tabular:** allow multiple values per dimension ([23fe6c8](https://github.com/pscedu/cpra.mp.data/commit/23fe6c87f615bab678d62c5a7780ce2f468ae75e))
+
 ## [0.28.0](https://github.com/pscedu/cpra.mp.data/compare/v0.27.0...v0.28.0) (2025-09-11)
 
 
