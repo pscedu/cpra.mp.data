@@ -77,6 +77,7 @@ def variables() -> list[Variable]:
             geographic_units=var.geographic_units,
             time_units=var.time_units,
             required_dimensions=var.required_dimensions,
+            difference_legend_limit=var.difference_legend_limit,
         )
         for var in VARIABLES.values()
     ]

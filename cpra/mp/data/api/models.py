@@ -6,7 +6,6 @@ from sqlmodel import Field, SQLModel
 
 from cpra.mp.data.api.types import (
     AggregateFunction,
-    ColorMap,
     CompressionAlgorithm,
     VectorGrid,
     dimension_type,
@@ -51,7 +50,7 @@ class Options(BaseModel):
     multiply100: str | None = None
     group_by: str | None = None
     group_aggregate: AggregateFunction | None = None
-    color_map: ColorMap | None = None
+    color_map: str | None = None
     unpivot: bool = False
     summarize_by: VectorGrid | None = None
     summarize_aggregate: AggregateFunction | None = None
@@ -119,6 +118,7 @@ class Variable(BaseModel):
     geographic_units: list[str] | None
     time_units: list[str] | None
     required_dimensions: list[str] | None
+    difference_legend_limit: float | None
 
 
 class Grid(BaseModel):

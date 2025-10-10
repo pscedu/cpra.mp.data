@@ -57,8 +57,39 @@ class Dataset(LazyFrameSource):
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
         self.grid = GRIDS[self.dataset_dimensions.grid]
 
+    def _error(self, msg, status_code=400):
+        """Raise an exception."""
+        raise HTTPException(status_code=status_code, detail=msg)
+
     @property
     def legend(self) -> Legend:
+        color_map = self.options.color_map or ""
+
+        if ":" in color_map:
+            map_type, color_str = color_map.split(":", 1)
+
+            if map_type not in ["continuous", "discrete"]:
+                self._error(f"invalid color map type: {map_type}")
+
+            color_strs = color_str.split(",")
+
+            try:
+                values = [float(val) for val in color_strs[::2]]
+            except ValueError:
+                self._error("invalid color map values")
+
+            # TODO: Check that these are valid color strings.
+            colors = color_strs[1::2]
+
+            # Add a null upper bound value to discrete color maps.
+            if map_type == "discrete":
+                values += [None]
+
+            if len(values) != len(colors):
+                self._error("mismatched colors and values in color map")
+
+            return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
+
         return LEGENDS.get(self.options.color_map) or self.variable.legend or LEGENDS["default"]
 
     @property

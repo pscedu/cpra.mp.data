@@ -18,6 +18,7 @@ class Variable:
         subroutine=None,
         unit=None,
         number_format=None,
+        difference_legend_limit=None,
     ):
         self.name = name
         self.label = label
@@ -30,6 +31,7 @@ class Variable:
         self.subroutine = subroutine
         self.unit = unit
         self.number_format = number_format
+        self.difference_legend_limit = difference_legend_limit
 
 
 VARIABLES = {

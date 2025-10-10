@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: quay.io/jupyter/scipy-notebook:python-3.12
+
+%arguments
+    CPRA_MP_DATA_VERSION=0.28.0
+    JUPYTER_VERSION=3.2.3
+
+%setup
+    # Create cpra directory
+    mkdir -p $APPTAINER_ROOTFS/opt/cpra
+
+%files
+    # Copy the wheel file
+    dist/*.whl /opt/cpra/
+
+%post
+    # Install any packages required for the kernel-wrapper
+    pip install pycrypto
+
+    # Download and extract the enterprise gateway kernel launchers and bootstrap files
+    wget https://github.com/jupyter-server/enterprise_gateway/releases/download/v{{ JUPYTER_VERSION }}/jupyter_enterprise_gateway_kernel_image_files-{{ JUPYTER_VERSION }}.tar.gz
+    tar -xvf jupyter_enterprise_gateway_kernel_image_files-{{ JUPYTER_VERSION }}.tar.gz -C /usr/local/bin
+    rm -f jupyter_enterprise_gateway_kernel_image_files-{{ JUPYTER_VERSION }}.tar.gz
+    fix-permissions /usr/local/bin
+
+    # Install the wheel file
+    cd /opt/cpra
+    pip install *.whl[jupyter]
+
+%environment
+    export JUPYTER_VERSION="{{ JUPYTER_VERSION }}"
+    export KERNEL_LANGUAGE="python"
+
+%runscript
+    exec /usr/local/bin/bootstrap-kernel.sh "$@"
+
+%startscript
+    /usr/local/bin/bootstrap-kernel.sh

@@ -64,7 +64,6 @@ class TileFormat(str, Enum):
 Variable = dimension_type("variable")
 Grid = dimension_type("grid")
 TimeUnit = dimension_type("time_unit")
-ColorMap = Enum("ColorMap", {str(k): k for k in LEGENDS.keys()})
 VectorGrid = Enum(
     "VectorGrid",
     {str(k): k for k, v in GRIDS.items() if v.grid_type == "vector"},
