@@ -38,6 +38,9 @@ dependencies = [
 api = ["altair", "fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel"]
 scripts = ["fastexcel", "tippecanoe"]
 
+[tool.pyright]
+typeCheckingMode = "off"
+
 [tool.uv.build-backend]
 module-name = "cpra.mp.data"
 module-root = ""
