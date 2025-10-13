@@ -8,8 +8,7 @@ COPY pyproject.toml \
 
 COPY cpra/ ./cpra
 
-RUN mkdir -p cpra/mp/data \
-    && pip install .[api] \
+RUN pip install .[api] \
     && python -m pip cache purge
 
 EXPOSE 8000

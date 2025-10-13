@@ -2,7 +2,6 @@ Bootstrap: docker
 From: quay.io/jupyter/scipy-notebook:python-3.12
 
 %arguments
-    CPRA_MP_DATA_VERSION=0.28.0
     JUPYTER_VERSION=3.2.3
 
 %setup

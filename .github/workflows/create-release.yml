@@ -33,7 +33,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Prepare image
         id: prepare
         run: |
@@ -50,32 +50,35 @@ jobs:
         run: |
           docker push "${{ steps.prepare.outputs.image_tag }}"
 
-  build-image-jupyter:
-    name: Build and Push Jupyter Image
+  build-image-bridges2:
+    name: Build and Push Bridges-2 Image
     runs-on: ubuntu-latest
     needs: release
     if: ${{ needs.release.outputs.release_created }}
     permissions:
       packages: write
       contents: read
+    container:
+      image: ghcr.io/apptainer/apptainer:1.4.3
+      options: --privileged
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Prepare image
         id: prepare
         run: |
           VERSION=$(echo "${{ needs.release.outputs.tag_name }}" | sed -e 's|^v||')
-          echo "image_tag=ghcr.io/${{ github.repository }}/jupyter:$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=ghcr.io/${{ github.repository }}/bridges2:$VERSION" >> $GITHUB_OUTPUT
       - name: Build image
         run: |
-          docker build . -f Dockerfile-jupyter --tag "${{ steps.prepare.outputs.image_tag }}" --label "runnumber=${GITHUB_RUN_ID}"
+          apptainer build bridges2.sif bridges2.def
       - name: Log in to registry
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
-            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            apptainer registry login -u ${{ github.actor }} --password-stdin oras://ghcr.io
       - name: Push image
         run: |
-          docker push "${{ steps.prepare.outputs.image_tag }}"
+          apptainer push bridges2.sif "${{ steps.prepare.outputs.image_tag }}"
 
   build-python:
     name: Build and Upload Python Package
