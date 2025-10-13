@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.30.0](https://github.com/pscedu/cpra.mp.data/compare/v0.29.1...v0.30.0) (2025-10-13)
+
+
+### Features
+
+* build unified Apptainer image ([4605fac](https://github.com/pscedu/cpra.mp.data/commit/4605fac277f6955d8c70fc109c49ef09aaea454f))
+* **legends:** add support for continuous color ramps ([cf7df8e](https://github.com/pscedu/cpra.mp.data/commit/cf7df8e78a36b6f251cf213280dfd65db9557248))
+
 ## [0.29.1](https://github.com/pscedu/cpra.mp.data/compare/v0.29.0...v0.29.1) (2025-10-02)
 
 
