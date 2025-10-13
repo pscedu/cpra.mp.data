@@ -5,12 +5,12 @@ From: quay.io/jupyter/scipy-notebook:python-3.12
     JUPYTER_VERSION=3.2.3
 
 %setup
-    # Create cpra directory
-    mkdir -p $APPTAINER_ROOTFS/opt/cpra
+    mkdir -p $APPTAINER_ROOTFS/usr/src/app
 
 %files
-    # Copy the wheel file
-    dist/*.whl /opt/cpra/
+    pyproject.toml /usr/src/app
+    README.md /usr/src/app
+    cpra /usr/src/app
 
 %post
     # Install any packages required for the kernel-wrapper
@@ -23,8 +23,8 @@ From: quay.io/jupyter/scipy-notebook:python-3.12
     fix-permissions /usr/local/bin
 
     # Install the wheel file
-    cd /opt/cpra
-    pip install *.whl[jupyter]
+    cd /usr/src/app
+    pip install .[bridges2] && python -m pip cache purge
 
 %environment
     export JUPYTER_VERSION="{{ JUPYTER_VERSION }}"
