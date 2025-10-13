@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/pscedu/cpra.mp.data/compare/v0.30.0...v0.30.1) (2025-10-13)
+
+
+### Bug Fixes
+
+* install package from source in Bridges-2 image ([f97a07a](https://github.com/pscedu/cpra.mp.data/commit/f97a07a44ced2e5da86b2388ed423279c0a27394))
+
 ## [0.30.0](https://github.com/pscedu/cpra.mp.data/compare/v0.29.1...v0.30.0) (2025-10-13)
 
 
