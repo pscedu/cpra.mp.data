@@ -4,7 +4,8 @@ LABEL org.opencontainers.image.source="https://github.com/pscedu/cpra.mp.data"
 
 WORKDIR /usr/src/app
 COPY pyproject.toml \
-    README.md ./
+    README.md \
+    uv.lock ./
 
 COPY cpra/ ./cpra
 
