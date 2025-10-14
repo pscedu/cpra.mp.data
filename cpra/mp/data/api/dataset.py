@@ -222,16 +222,12 @@ class Dataset(LazyFrameSource):
 
         group_by_cols = self._get_group_by_columns()
         if self.output_type == OutputType.vector:
-            # Set non-numeric columns to null if they are not part of the group by clause.
+            # Set dimension columns to null if they are not part of the group by clause.
             required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
-            null_cols = [
-                col
-                for col in required_cols
-                if col not in group_by_cols and DIMENSIONS[col].dtype.__name__ in ["String", "Date", "DateTime"]
-            ]
+            null_cols = [col for col in required_cols if col not in group_by_cols]
 
             self.lf = getattr(
-                self.lf.select(pl.exclude(*null_cols)).group_by(*group_by_cols),
+                self.lf.select(pl.exclude(null_cols)).group_by(*group_by_cols),
                 self.options.group_aggregate,
             )()
 
