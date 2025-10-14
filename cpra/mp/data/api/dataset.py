@@ -220,15 +220,26 @@ class Dataset(LazyFrameSource):
         if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
+        group_by_cols = self._get_group_by_columns()
         if self.output_type == OutputType.vector:
+            # Set non-numeric columns to null if they are not part of the group by clause.
+            required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
+            null_cols = [
+                col
+                for col in required_cols
+                if col not in group_by_cols and DIMENSIONS[col].dtype.__name__ in ["String", "Date", "DateTime"]
+            ]
+
             self.lf = getattr(
-                self.lf.group_by(*self._get_group_by_columns()),
+                self.lf.select(pl.exclude(*null_cols)).group_by(*group_by_cols),
                 self.options.group_aggregate,
             )()
+
+            if null_cols:
+                self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
+
         else:
-            self.raster_groups = self.lf.group_by(*self._get_group_by_columns()).agg(
-                row_idxs=pl.col("path").agg_groups()
-            )
+            self.raster_groups = self.lf.group_by(*group_by_cols).agg(row_idxs=pl.col("path").agg_groups())
 
     def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
