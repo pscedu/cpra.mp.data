@@ -36,8 +36,8 @@ class TimeSeriesLine(DatasetVisualization):
             self.get_base_chart(self.data_source, self.time_column)
             .mark_line()
             .encode(
-                alt.X("date:T").title(self.time_dimension.label),
-                alt.Y("value:Q")
+                alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
+                alt.Y("value:Q", axis=alt.Axis(grid=True))
                 .title(self.variable_label)
                 .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
                 alt.Color("geography:N")
@@ -75,7 +75,18 @@ class TimeSeriesLine(DatasetVisualization):
             .add_params(nearest)
         )
 
-        viz = (alt.layer(main_line, points, rules)).properties(width=chart_width, height=chart_height)
+        layer = [main_line, points, rules]
+
+        # Add a horizontal rule at zero for difference charts.
+        if self.params["negate"]:
+            layer.insert(
+                0,
+                self.get_base_chart(self.data_source, self.time_column)
+                .mark_rule(color="lightGray", size=2)
+                .encode(y=alt.datum(0)),
+            )
+
+        viz = (alt.layer(*layer)).properties(width=chart_width, height=chart_height)
 
         if is_daily:
             brush = alt.selection_interval("date_range", encodings=["x"], value={"x": initial_date_range})
