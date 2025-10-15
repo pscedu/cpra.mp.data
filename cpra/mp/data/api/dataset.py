@@ -36,7 +36,7 @@ from cpra.mp.data.variables import VARIABLES, Variable
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
-VALUE_COLUMNS = cs.matches(r"^[0-9]")
+VALUE_COLUMNS = cs.matches(r"^[0-9\-]")
 
 
 class Dataset(LazyFrameSource):
