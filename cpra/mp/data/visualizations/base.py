@@ -155,6 +155,11 @@ class DatasetVisualization(BaseVisualization):
         return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **self.params)
 
     @cached_property
+    def difference_suffix(self):
+        """Suffix for the chart title and y-axis if this is a difference chart."""
+        return "" if self.params["negate"] is None else " Difference"
+
+    @cached_property
     def geographies(self):
         """Get the selected geographies."""
         raster = self.grid.grid_type == "raster"
@@ -184,13 +189,13 @@ class DatasetVisualization(BaseVisualization):
         aggregate_type = self.params.get("aggregate_type", None)
         if aggregate_type and len(aggregate_type) == 1:
             aggregate_label = DIMENSIONS["aggregate_type"].values.filter(value=aggregate_type[0])["label"][0]
-            return f"{aggregate_label} {title}"
-        return title
+            title = f"{aggregate_label} {title}"
+        return f"{self.time_unit.title()} {title}{self.difference_suffix}"
 
     @cached_property
     def variable_label(self):
         """Get the variable label and unit."""
-        label = self.variable.label
+        label = f"{self.variable.label}{self.difference_suffix}"
         if self.variable.unit:
             label += f" ({self.variable.unit})"
         return label

@@ -44,7 +44,7 @@ class TimeSeriesLine(DatasetVisualization):
                 .title(self.grid.label)
                 .scale(domain=[geo for geo in self.geographies], range=MAP_SELECTION),
             )
-            .properties(title=f"{self.time_unit.title()} {self.title}", width=chart_width)
+            .properties(title=self.title, width=chart_width)
         )
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
