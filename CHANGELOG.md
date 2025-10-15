@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.31.0](https://github.com/pscedu/cpra.mp.data/compare/v0.30.1...v0.31.0) (2025-10-15)
+
+
+### Features
+
+* **visualizations:** add difference label to time series line chart ([db66c82](https://github.com/pscedu/cpra.mp.data/commit/db66c82a2d4f36223e28ff8644062eb91767f9fe))
+* **visualizations:** add zero rule to difference charts ([25b516a](https://github.com/pscedu/cpra.mp.data/commit/25b516ac2f2fc5f7edc1674d2fd73f65fea1a12d))
+
+
+### Bug Fixes
+
+* **api:** set all dimension columns to null if they are not part of the ([6c65e58](https://github.com/pscedu/cpra.mp.data/commit/6c65e587445b783d92597f638853f64b69910658))
+* **api:** set non-numeric columns to null during group by ([caf62ee](https://github.com/pscedu/cpra.mp.data/commit/caf62ee2870f89ba391f0570c5fce682ecd2241c))
+* **api:** treat columns starting with a negative number as value columns ([5d66b34](https://github.com/pscedu/cpra.mp.data/commit/5d66b3447185a345f169fbee56690f86a48b89ab))
+* **api:** use uv lock file in building image ([2be11bf](https://github.com/pscedu/cpra.mp.data/commit/2be11bfd6d252f30334435009c7e9f84788bdbc3))
+
 ## [0.30.1](https://github.com/pscedu/cpra.mp.data/compare/v0.30.0...v0.30.1) (2025-10-13)
 
 
