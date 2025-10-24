@@ -73,14 +73,19 @@ class Dataset(LazyFrameSource):
                 self._error(f"invalid color map type: {map_type}")
 
             color_strs = color_str.split(",")
+            if map_type == "continuous":
+                colors = color_strs[1::2]
+                value_strs = color_strs[::2]
+            else:
+                colors = color_strs[::2]
+                value_strs = color_strs[1::2]
+
+            # TODO: Check that the color strings are valid.
 
             try:
-                values = [float(val) for val in color_strs[::2]]
+                values = [float(val) for val in value_strs]
             except ValueError:
                 self._error("invalid color map values")
-
-            # TODO: Check that these are valid color strings.
-            colors = color_strs[1::2]
 
             # Add a null upper bound value to discrete color maps.
             if map_type == "discrete":
