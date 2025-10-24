@@ -10,28 +10,28 @@ from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat
 
 
-def stream_to_file(source, out_path, format, compression):
+def stream_or_write_to_file(source, out_path, format, compression, collect_in_memory):
     stream_kwargs = {}
     if format == DataFormat.parquet:
         uncompressed = compression.compression_algorithm == CompressionAlgorithm.none
         stream_kwargs = {
-            "compression": "uncompressed"
-            if uncompressed
-            else compression.compression_algorithm.value,
-            "compression_level": None
-            if uncompressed
-            else compression.compression_level,
+            "compression": "uncompressed" if uncompressed else compression.compression_algorithm.value,
+            "compression_level": None if uncompressed else compression.compression_level,
         }
-    source.stream_tabular(out_path, format, **stream_kwargs)
+
+    if collect_in_memory:
+        source.write_tabular(out_path, format, **stream_kwargs)
+    else:
+        source.stream_tabular(out_path, format, **stream_kwargs)
 
 
 class StreamingThread(Thread):
-    def __init__(self, source, out_path, format, compression, **kwargs):
+    def __init__(self, source, out_path, format, compression, collect_in_memory=False, **kwargs):
         kwargs.update(
             {
-                "target": stream_to_file,
-                "name": "stream_to_file",
-                "args": [source, out_path, format, compression],
+                "target": stream_or_write_to_file,
+                "name": "stream_or_write_to_file",
+                "args": [source, out_path, format, compression, collect_in_memory],
             }
         )
         self.exception = None
@@ -54,13 +54,12 @@ class PolarsStreamingResponse(Response):
         "parquet": "application/vnd.apache.parquet",
     }
 
-    def __init__(
-        self, source: LazyFrameSource, format: str, compression: Compression
-    ) -> None:
+    def __init__(self, source: LazyFrameSource, format: str, compression: Compression, collect_in_memory=False) -> None:
         self.source = source
         self.format = format
         self.compression = compression
         self.media_type = self.mime_types[format]
+        self.collect_in_memory = collect_in_memory
         self.init_headers()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -69,7 +68,7 @@ class PolarsStreamingResponse(Response):
         else:
             with tempfile.NamedTemporaryFile() as fp:
                 write_thread = StreamingThread(
-                    self.source, fp.name, self.format, self.compression
+                    self.source, fp.name, self.format, self.compression, self.collect_in_memory
                 )
                 write_thread.start()
                 sent_headers = False
@@ -90,16 +89,12 @@ class PolarsStreamingResponse(Response):
                                 await send(
                                     {
                                         "type": "http.response.start",
-                                        "status": getattr(err, "status_code", 500)
-                                        if err
-                                        else 200,
+                                        "status": getattr(err, "status_code", 500) if err else 200,
                                         "headers": self.raw_headers,
                                     }
                                 )
                                 if err:
-                                    chunk = getattr(err, "detail", str(err)).encode(
-                                        "utf-8"
-                                    )
+                                    chunk = getattr(err, "detail", str(err)).encode("utf-8")
                                     more_body = False
                             await send(
                                 {

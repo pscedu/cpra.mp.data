@@ -27,3 +27,15 @@ class LazyFrameSource:
         }[format]
         # TODO: Set parquet compression and row group parameters.
         self.materialize(sink_method, out_path, *args, **kwargs)
+
+    @timing
+    def write_tabular(self, out_path, format, *args, **kwargs):
+        write_method = {
+            "arrow": "write_ipc",
+            "csv": "write_csv",
+            "ndjson": "write_ndjson",
+            "parquet": "write_parquet",
+        }[format]
+        # TODO: Set parquet compression and row group parameters.
+        df = self.materialize()
+        getattr(df, write_method)(out_path, *args, **kwargs)

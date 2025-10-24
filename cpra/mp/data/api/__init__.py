@@ -29,7 +29,7 @@ from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
 from cpra.mp.data.api.utils import get_visualization_class, validate_compression, validate_format
-from cpra.mp.data.config import MPD_URI
+from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
@@ -176,7 +176,10 @@ async def get_model_data(
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
         return RasterioStreamingResponse(dataset, format, compression)
-    return PolarsStreamingResponse(dataset, format, compression)
+
+    data_size = dataset.estimate_data_size()
+    collect_in_memory = data_size is not None and data_size <= (STREAM_THRESHOLD * pow(10, 6))
+    return PolarsStreamingResponse(dataset, format, compression, collect_in_memory)
 
 
 @app.get(

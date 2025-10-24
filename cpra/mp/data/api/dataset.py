@@ -1,4 +1,5 @@
 import itertools
+import re
 from contextlib import ExitStack
 from io import BytesIO
 from pathlib import Path
@@ -314,6 +315,71 @@ class Dataset(LazyFrameSource):
         self._apply_group_params()
         self._apply_transform_params()
         self._apply_sort_params()
+
+    def estimate_data_size(self):
+        """Estimate the size, in bytes, of data. This does not include dimension columns."""
+        required_cols = required_columns(
+            get_input_data_frame(**dict(self.dataset_dimensions)), include_dataset=False, include_metadata=False
+        )
+        group_by_cols = self._get_group_by_columns()
+        has_group_by = self.options.group_aggregate is not None
+
+        # Estimate rows.
+        rows = 1
+        for col in required_cols:
+            # If there is a group by clause, only the group by columns contribute
+            # to the number of output rows.
+            if has_group_by and col not in group_by_cols:
+                continue
+
+            dimension = DIMENSIONS[col]
+
+            value_count = None
+            values = getattr(self.filter_dimensions, col)
+            if values is not None:
+                value_count = len(values)
+            elif dimension.values:
+                value_count = len(dimension.values)
+            elif col == "calendar_year":
+                if self.dataset_dimensions.time_unit == "decadal":
+                    value_count = 6
+                else:
+                    value_count = 52
+            elif col == "calendar_day":
+                if self.dataset_dimensions.time_unit == "monthly":
+                    value_count = 52 * 12
+                else:
+                    value_count = 52 * 365
+
+            if value_count is None:
+                return None
+
+            rows *= value_count
+
+        # Estimate columns.
+        columns = None
+        if self.geography_ids is not None:
+            columns = len(self.geography_ids)
+        else:
+            grid = GRIDS[self.dataset_dimensions.grid]
+            columns = getattr(grid, "id_count", None)
+
+            if columns is None:
+                height = getattr(grid, "height", None)
+                width = getattr(grid, "width", None)
+                if height and width:
+                    columns = height * width
+
+        if columns is None:
+            return None
+
+        # Calculate bytes per value.
+        variable = VARIABLES[self.dataset_dimensions.variable]
+        dtype_digits = re.findall(r"\d+", str(variable.dtype))
+        if len(dtype_digits) != 1:
+            return None
+
+        return rows * columns * int(dtype_digits[0]) / 8
 
     def validate_tile(self):
         """Validate that the tile is raster and will have a single band."""
