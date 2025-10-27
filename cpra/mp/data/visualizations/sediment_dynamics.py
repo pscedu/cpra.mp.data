@@ -21,7 +21,9 @@ class SedimentDynamics(BaseVisualization):
     def __init__(self, request=None, height=400, width=600, **kwargs):
         super().__init__(request, height, width, **kwargs)
         self.meter_variables = ["elev", "inun"]
-        self.centimeter_variables = []
+        self.meter_colors = ["#284D36", "#ED6631"]
+        self.centimeter_variables = ["test_mnrl_accr", "test_org_accr"]
+        self.centimeter_colors = ["#E39F17", "#98C92F"]
         self.line_variables = self.meter_variables + self.centimeter_variables
         self.variables = ["lnd_type"] + self.line_variables
         self.data_sources = {
@@ -29,7 +31,11 @@ class SedimentDynamics(BaseVisualization):
                 variable_name,
                 "morph_pixel_v001",
                 "annual",
-                **(self.params | dict(select=",".join(["calendar_year", "value"]))),
+                **(
+                    self.params
+                    | dict(select=",".join(["calendar_year", "value"]))
+                    | (dict(model_group_id=0, scenario_id=0) if variable_name in self.centimeter_variables else {})
+                ),
             )
             for variable_name in self.variables
         }
@@ -69,7 +75,7 @@ class SedimentDynamics(BaseVisualization):
             )
         )
 
-    def _line_chart(self, variable_names):
+    def _line_chart(self, variable_names, colors, show_label=True):
         variables = [VARIABLES[v] for v in variable_names]
         return (
             self._base_chart(variable_names, long=True)
@@ -77,7 +83,9 @@ class SedimentDynamics(BaseVisualization):
             .encode(
                 alt.X("date:T").title("Year"),
                 alt.Y("value:Q").title(", ".join([f"{v.label} ({v.unit})" for v in variables])),
-                alt.Color("variable_label:N").title("Variable"),
+                alt.Color("variable_label:N")
+                .title("Variable" if show_label else None)
+                .scale(domain=[VARIABLES[v].label for v in variable_names], range=colors),
             )
         )
 
@@ -87,12 +95,18 @@ class SedimentDynamics(BaseVisualization):
         chart_width = max(self.width - 220, 50)
 
         lnd_type_chart = self._lnd_type_chart()
-        meter_chart = self._line_chart(self.meter_variables)
+        meter_chart = self._line_chart(self.meter_variables, self.meter_colors)
+        centimeter_chart = self._line_chart(self.centimeter_variables, self.centimeter_colors, False)
 
         nearest = alt.selection_point(nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
-        points_chart = (
-            self._base_chart(self.line_variables, long=True)
+        meter_points_chart = (
+            self._base_chart(self.meter_variables, long=True)
+            .mark_point(color="black")
+            .encode(alt.X("date:T"), alt.Y("value:Q"), opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
+        )
+        centimeter_points_chart = (
+            self._base_chart(self.centimeter_variables, long=True)
             .mark_point(color="black")
             .encode(alt.X("date:T"), alt.Y("value:Q"), opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
         )
@@ -117,7 +131,11 @@ class SedimentDynamics(BaseVisualization):
         )
 
         return (
-            alt.layer(lnd_type_chart, alt.layer(meter_chart, points_chart, rule_chart))
+            alt.layer(
+                lnd_type_chart,
+                alt.layer(meter_chart, meter_points_chart, rule_chart),
+                alt.layer(centimeter_chart, centimeter_points_chart),
+            )
             .resolve_scale(y="independent", color="independent")
             .properties(title="Sediment Dynamics", width=chart_width, height=chart_height)
         )
