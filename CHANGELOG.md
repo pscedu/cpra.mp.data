@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.32.0](https://github.com/pscedu/cpra.mp.data/compare/v0.31.0...v0.32.0) (2025-10-29)
+
+
+### Features
+
+* **structure:** update data structure ([8e04816](https://github.com/pscedu/cpra.mp.data/commit/8e04816c82f4e96b94be83e40de10471c090f708))
+* **visualizations:** add accretion to sediment dynamics chart ([62c7280](https://github.com/pscedu/cpra.mp.data/commit/62c728091a82d4d7cc699f186e888a3d282c546c))
+
+
+### Bug Fixes
+
+* **api:** change color/value order for discrete color maps ([eee8c00](https://github.com/pscedu/cpra.mp.data/commit/eee8c009952fee0f50a120daffd2977995e92162))
+
+
+### Performance Improvements
+
+* **api:** conditionally collect data frames in memory based on expected ([45c1dc7](https://github.com/pscedu/cpra.mp.data/commit/45c1dc761b16c1d40c510991bc7eff97195af455))
+
 ## [0.31.0](https://github.com/pscedu/cpra.mp.data/compare/v0.30.1...v0.31.0) (2025-10-15)
 
 
