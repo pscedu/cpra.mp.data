@@ -71,6 +71,23 @@ population_variant,0,No population migration considered (MP23 data)
 pumping_id,0,No Pumping
 pumping_id,0.5,50% Pumping Capacity
 pumping_id,1,Full Pumping Capacity
+species_code,allig,American Alligator
+species_code,blucj,Juvenile Blue Crab
+species_code,bshrl,Large Juvenile Brown Shrimp
+species_code,bshrs,Small Juvenile Brown Shrimp
+species_code,crayf,Crayfish
+species_code,eagle,Bald Eagle
+species_code,gadwa,Gadwall
+species_code,gmena,Adult Gulf Menhaden
+species_code,gmenj,Juvenile Gulf Menhaden
+species_code,lmbas,Largemouth Bass
+species_code,motdk,Mottled Duck
+species_code,oyste,Eastern Oyster
+species_code,sparr,Seaside Sparroow
+species_code,spsta,Adult Spotted Seatrout
+species_code,spstj,Juvenile Spotted Seatrout
+species_code,wshrl,Large Juvenile White Shrimp
+species_code,wshrs,Small Juvenile White Shrimp
 ssp,1,
 ssp,2,
 ssp,3,
