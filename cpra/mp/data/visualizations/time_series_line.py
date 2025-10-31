@@ -78,7 +78,7 @@ class TimeSeriesLine(DatasetVisualization):
         layer = [main_line, points, rules]
 
         # Add a horizontal rule at zero for difference charts.
-        if self.params["negate"]:
+        if self.params.get("negate"):
             layer.insert(
                 0,
                 self.get_base_chart(self.data_source, self.time_column)

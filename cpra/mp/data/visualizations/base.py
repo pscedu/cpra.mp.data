@@ -157,7 +157,7 @@ class DatasetVisualization(BaseVisualization):
     @cached_property
     def difference_suffix(self):
         """Suffix for the chart title and y-axis if this is a difference chart."""
-        return "" if self.params["negate"] is None else " Difference"
+        return "" if self.params.get("negate") is None else " Difference"
 
     @cached_property
     def geographies(self):
