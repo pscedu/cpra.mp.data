@@ -31,11 +31,7 @@ class SedimentDynamics(BaseVisualization):
                 variable_name,
                 "morph_pixel_v001",
                 "annual",
-                **(
-                    self.params
-                    | dict(select=",".join(["calendar_year", "value"]))
-                    | (dict(model_group_id=0, scenario_id=0) if variable_name in self.centimeter_variables else {})
-                ),
+                **(self.params | dict(select=",".join(["calendar_year", "value"]))),
             )
             for variable_name in self.variables
         }
