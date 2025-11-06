@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.32.1](https://github.com/pscedu/cpra.mp.data/compare/v0.32.0...v0.32.1) (2025-11-06)
+
+
+### Bug Fixes
+
+* **visualizations:** handle missing negate param ([96f6d90](https://github.com/pscedu/cpra.mp.data/commit/96f6d903e4c5fef79d2224d0c7c764f0ec8c81c3))
+* **visualizations:** use same model group and scenario for accretion ([0198772](https://github.com/pscedu/cpra.mp.data/commit/0198772c2e6cb7715cda813227185087a76cf735))
+
 ## [0.32.0](https://github.com/pscedu/cpra.mp.data/compare/v0.31.0...v0.32.0) (2025-10-29)
 
 
