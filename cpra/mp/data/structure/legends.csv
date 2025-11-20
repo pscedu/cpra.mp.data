@@ -54,13 +54,14 @@ ffibs,Fresh Marsh,#DAE86D,2.0
 ffibs,Intermediate Marsh,#92CBE8,5.0
 ffibs,Brackish Marsh,#735753,17.0
 ffibs,Saline Marsh,#0679D2,
-flood_depth,1 to < 4 feet,#728D97,
-flood_depth,4 to < 7 feet,#73B7EA,
-flood_depth,7 to < 10 feet,#99D9A7,
-flood_depth,10 to < 13 feet,#F8D88B,
-flood_depth,13 to < 16 feet,#E9B023,
-flood_depth,16 to < 21 feet,#E56524,
-flood_depth,21+ feet,#B73865,
+flood_depth,No Data,#00000000,1.0
+flood_depth,1 to < 4 feet,#728d97,4.0
+flood_depth,4 to < 7 feet,#73b7ea,7.0
+flood_depth,7 to < 10 feet,#99d9a7,10.0
+flood_depth,10 to < 13 feet,#f8d88b,13.0
+flood_depth,13 to < 16 feet,#e9b023,16.0
+flood_depth,16 to < 21 feet,#e56524,21.0
+flood_depth,21+ feet,#b73865,
 hsi,0,#9e0142,1.0
 hsi,1 to 49,#d53e4f,50.0
 hsi,50 to 100,#f46d43,100.0
@@ -79,10 +80,51 @@ inun,0.00 to < 0.25,#e6f598,0.25
 inun,0.25 to < 0.50,#abdda4,0.5
 inun,0.50 to < 1.00,#66c2a5,1.0
 inun,1.00 or more,#3288bd,
-lnd_chng,Land Loss,#4591ac,
-lnd_chng,Induced Loss,#00f0f0,
-lnd_chng,Land Maintained,#99c104,
-lnd_chng,Land Gain,#265118,
+lnd_chng,No Data,#00000000,12.0
+lnd_chng,Land Loss,#4591ac,13.0
+lnd_chng,No Data,#00000000,21.0
+lnd_chng,Land Gain,#265118,22.0
+lnd_chng,No Data,#00000000,23.0
+lnd_chng,Land Gain,#265118,31.0
+lnd_chng,No Data,#00000000,32.0
+lnd_chng,Land Loss,#4591ac,33.0
+lnd_chng,No Data,#00000000,52.0
+lnd_chng,Land Loss,#4591ac,55.0
+lnd_chng,No Data,#00000000,112.0
+lnd_chng,Induced Loss,#00f0f0,113.0
+lnd_chng,No Data,#00000000,121.0
+lnd_chng,Land Maintained,#99c104,122.0
+lnd_chng,Land Loss,#4591ac,123.0
+lnd_chng,Land Maintained,#99c104,131.0
+lnd_chng,No Data,#00000000,132.0
+lnd_chng,Induced Loss,#00f0f0,133.0
+lnd_chng,No Data,#00000000,211.0
+lnd_chng,Land Gain,#265118,212.0
+lnd_chng,Induced Loss,#00f0f0,213.0
+lnd_chng,Land Gain,#265118,222.0
+lnd_chng,No Data,#00000000,223.0
+lnd_chng,Land Gain,#265118,232.0
+lnd_chng,Induced Loss,#00f0f0,233.0
+lnd_chng,Land Gain,#265118,311.0
+lnd_chng,No Data,#00000000,312.0
+lnd_chng,Induced Loss,#00f0f0,313.0
+lnd_chng,No Data,#00000000,321.0
+lnd_chng,Land Maintained,#99c104,322.0
+lnd_chng,Land Loss,#4591ac,323.0
+lnd_chng,Land Maintained,#99c104,331.0
+lnd_chng,No Data,#00000000,332.0
+lnd_chng,Induced Loss,#00f0f0,333.0
+lnd_chng,No Data,#00000000,512.0
+lnd_chng,Induced Loss,#00f0f0,513.0
+lnd_chng,No Data,#00000000,521.0
+lnd_chng,Land Maintained,#99c104,522.0
+lnd_chng,Land Loss,#4591ac,523.0
+lnd_chng,Land Maintained,#99c104,531.0
+lnd_chng,No Data,#00000000,532.0
+lnd_chng,Induced Loss,#00f0f0,533.0
+lnd_chng,No Data,#00000000,552.0
+lnd_chng,Induced Loss,#00f0f0,553.0
+lnd_chng,No Data,#00000000,
 lnd_type,No Data,#00000000,1.0
 lnd_type,Vegetated Wetland,#008000,2.0
 lnd_type,Open Water,#6495ed,3.0
@@ -163,21 +205,25 @@ tss,200 to < 300,#e6f598,300.0
 tss,300 to < 400,#abdda4,400.0
 tss,400 to < 500,#66c2a5,500.0
 tss,500 or more,#3288bd,
-vct,Maidencane,#a6cecf,
-vct,Three-Square,#1f78b4,
-vct,Rosseau Cane,#b2df8a,
-vct,Paspalum,#5ba02c,
-vct,Wiregrass,#fb9a99,
-vct,Bulltongue,#e31a1c,
-vct,Needlerush,#fdbf6f,
-vct,Bulrush,#ff7f00,
-vct,Brackish Mix,#cab2d6,
-vct,Oystergrass,#6a3d9a,
-vct,Saltgrass,#ffff99,
-vct,Bottomland Hardwood Forest + Swamp Forest,#005a00,
-vct,Barrier Island Vegetation,#ff80ff,
-vct,Unvegetated,#7f5f1e,
-vct,Flotant,#8cf0f0,
+vct,No Data,#00000000,1.0
+vct,Maidencane,#a6cecf,2.0
+vct,Three-Square,#1f78b4,3.0
+vct,Rosseau Cane,#b2df8a,4.0
+vct,Paspalum,#5ba02c,5.0
+vct,Wiregrass,#fb9a99,6.0
+vct,Bulltongue,#e31a1c,7.0
+vct,Needlerush,#fdbf6f,8.0
+vct,Bulrush,#ff7f00,9.0
+vct,Brackish Mix,#cab2d6,10.0
+vct,Oystergrass,#6a3d9a,11.0
+vct,Saltgrass,#ffff99,12.0
+vct,Bottomland Hardwood Forest + Swamp Forest,#005a00,13.0
+vct,Barrier Island Vegetation,#ff80ff,14.0
+vct,No Data,#ffffff,300.0
+vct,Unvegetated,#7f5f1e,400.0
+vct,No Data,#00000000,500.0
+vct,Flotant,#8cf0f0,9999.0
+vct,No Data,#ffffff,
 veg_area,0,#9e0142,1.0
 veg_area,"1 to 2,499,999",#d53e4f,2500000.0
 veg_area,"2,500,000 to 4,999,999",#f46d43,5000000.0
