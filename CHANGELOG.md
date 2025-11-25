@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.33.0](https://github.com/pscedu/cpra.mp.data/compare/v0.32.1...v0.33.0) (2025-11-25)
+
+
+### Features
+
+* **structure:** convert raster legends from DAP ([39428c1](https://github.com/pscedu/cpra.mp.data/commit/39428c1b1dfa38892ef5f7eaba2d8a3b763a744c))
+* **visualizations:** support multiple values per dimension in time ([32ec14c](https://github.com/pscedu/cpra.mp.data/commit/32ec14cca28bec0961876e35a70d7d542d4b97cb))
+
 ## [0.32.1](https://github.com/pscedu/cpra.mp.data/compare/v0.32.0...v0.32.1) (2025-11-06)
 
 
