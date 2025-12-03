@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.0](https://github.com/pscedu/cpra.mp.data/compare/v0.33.0...v0.34.0) (2025-12-03)
+
+
+### Features
+
+* add geospatial packages to Bridges-2 image ([2c394bf](https://github.com/pscedu/cpra.mp.data/commit/2c394bf4cd8d5c27ce828cbe8b797664b7b9e79a))
+
 ## [0.33.0](https://github.com/pscedu/cpra.mp.data/compare/v0.32.1...v0.33.0) (2025-11-25)
 
 
