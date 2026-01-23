@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.35.0](https://github.com/pscedu/cpra.mp.data/compare/v0.34.0...v0.35.0) (2026-01-23)
+
+
+### Features
+
+* **bridges2:** add connectorx dependency ([d6a4353](https://github.com/pscedu/cpra.mp.data/commit/d6a43531dddd5679eec7318b449245df8e2e4914))
+
 ## [0.34.0](https://github.com/pscedu/cpra.mp.data/compare/v0.33.0...v0.34.0) (2025-12-03)
 
 
