@@ -38,6 +38,7 @@ dependencies = [
 [project.optional-dependencies]
 api = ["fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel"]
 bridges2 = [
+    "connectorx",
     "geojson",
     "geopandas",
     "openpyxl",
