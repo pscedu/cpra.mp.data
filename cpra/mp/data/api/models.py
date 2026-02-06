@@ -160,10 +160,10 @@ class VisualizationQuery(DataQuery):
     width: int = 600
 
     # Map-specific parameters
-    show_projects: bool = False
+    show_projects: bool = True
     show_water: bool = False
     show_grid_labels: bool = False
-    show_grid_lines: bool = False
+    show_grid_lines: bool = True
     is_overlay: bool = True
 
 
