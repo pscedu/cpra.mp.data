@@ -864,3 +864,8 @@ class Map(DatasetVisualization):
             "type": legend.type,
             "steps": steps,
         }
+
+    @property
+    def spec(self):
+        """Get the map style specification."""
+        return self.chart()
