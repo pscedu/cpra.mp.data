@@ -811,7 +811,7 @@ class Map(DatasetVisualization):
 
         # Include legend metadata for UI rendering
         difference = self.params.get("negate") is not None
-        style["state"]["legend"] = {"default": self._get_legend_metadata(difference)}
+        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(difference)]}}
 
         return style
 
