@@ -766,6 +766,7 @@ class Map(DatasetVisualization):
         show_grid_lines = self.params.get("show_grid_lines", False)
 
         calendar_year = self.params.get("calendar_year", [])
+        calendar_day = self.params.get("calendar_day", [])
         model_group_id = self.params.get("model_group_id", [])
 
         is_overlay = self.params.get("is_overlay", True)
@@ -797,10 +798,11 @@ class Map(DatasetVisualization):
             style["layers"].insert(insert_idx + i, layer)
 
         # Add project overlay if requested (above data, below labels)
-        if show_projects and model_group_id:
+        if show_projects and model_group_id and (calendar_year or calendar_day):
             style["sources"]["projects"] = self.projects_source(model_group_id[0])
             project_insert_idx = insert_idx + len(data_layers)
-            for i, layer in enumerate(self.project_layers(calendar_year[0], is_overlay)):
+            project_year = calendar_year[0] if calendar_year else calendar_day[0].year
+            for i, layer in enumerate(self.project_layers(project_year, is_overlay)):
                 style["layers"].insert(project_insert_idx + i, layer)
 
         # Add water overlay if requested (just above data layers)
