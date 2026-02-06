@@ -833,7 +833,7 @@ class Map(DatasetVisualization):
             steps = sorted(
                 [
                     {"color": "#d53e4f", "value": -1 * limit},
-                    {"color": "#ffffff" if limit > 0 else "#3288bd", "value": 0},
+                    {"color": "#ffffff", "value": 0},
                     {"color": "#3288bd", "value": limit},
                 ],
                 key=lambda s: s["value"],
