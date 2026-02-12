@@ -8,6 +8,7 @@ from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
 
 VALUE_EXPR = ["get", ["to-string", ["id"]], ["global-state", "values"]]
+SELECTION_EXPR = ["get", ["to-string", ["id"]], ["global-state", "selectionColors"]]
 
 
 class Map(DatasetVisualization):
@@ -417,7 +418,7 @@ class Map(DatasetVisualization):
                 "paint": {
                     "line-color": [
                         "coalesce",
-                        ["feature-state", "selected"],
+                        SELECTION_EXPR,
                         "transparent",
                     ],
                     "line-offset": 1.5,
@@ -816,6 +817,11 @@ class Map(DatasetVisualization):
         # Include legend metadata for UI rendering
         difference = self.params.get("negate") is not None
         style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(difference)]}}
+
+        # Set an empty object as the default value for selection colors.
+        # TODO: Add support for setting initial selection colors based on the value
+        # of the geographies parameter.
+        style["state"]["selectionColors"] = {"default": {}}
 
         return style
 
