@@ -159,6 +159,13 @@ class VisualizationQuery(DataQuery):
     start_date: date | None = None
     width: int = 600
 
+    # Map-specific parameters
+    show_projects: bool = True
+    show_water: bool = False
+    show_grid_labels: bool = False
+    show_grid_lines: bool = True
+    is_overlay: bool = True
+
 
 class MPDDimensionValue(SQLModel, table=True):
     """Model group from the MPD."""
