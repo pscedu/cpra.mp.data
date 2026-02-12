@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.0](https://github.com/pscedu/cpra.mp.data/compare/v0.35.0...v0.36.0) (2026-02-12)
+
+
+### Features
+
+* **visualizations:** add map visualization ([#51](https://github.com/pscedu/cpra.mp.data/issues/51)) ([c2a9c40](https://github.com/pscedu/cpra.mp.data/commit/c2a9c404725c3851f430f43aeaefbe9fd4e32106))
+
 ## [0.35.0](https://github.com/pscedu/cpra.mp.data/compare/v0.34.0...v0.35.0) (2026-01-23)
 
 
