@@ -1,6 +1,6 @@
 from functools import cached_property
 from typing import Any, final
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
 from cpra.mp.data.legends import LEGENDS, Legend
@@ -59,9 +59,7 @@ class Map(DatasetVisualization):
         )
 
         options_fields = set(Options.model_fields.keys())
-        options = Options(
-            **{k: v for k, v in self.params.items() if k in options_fields and v is not None}
-        )
+        options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
 
         dataset = Dataset(dataset_dimensions, filter_dimensions, options)
         dataset._apply_calculate_params()
@@ -102,9 +100,7 @@ class Map(DatasetVisualization):
                 ramp.append(upper_bound)
         return ["step", VALUE_EXPR, *ramp]
 
-    def difference_breaks_colors(
-        self, variable: Variable, zero_color: str = "#ffffff"
-    ) -> list:
+    def difference_breaks_colors(self, variable: Variable, zero_color: str = "#ffffff") -> list:
         """Generate color breaks for difference visualization.
 
         Args:
@@ -172,7 +168,7 @@ class Map(DatasetVisualization):
         if tile_urls is None:
             tile_urls = []
 
-        tiles = [f"{url}&color_map={color_map}" if color_map else url for url in tile_urls]
+        tiles = [f"{url}&color_map={quote(color_map)}" if color_map else url for url in tile_urls]
 
         return {
             "bounds": bounds,
@@ -182,9 +178,7 @@ class Map(DatasetVisualization):
             "tileSize": tile_size,
         }
 
-    def difference_raster_source(
-        self, variable: Variable, **kwargs
-    ) -> dict[str, Any]:
+    def difference_raster_source(self, **kwargs) -> dict[str, Any]:
         """Generate a raster source for difference visualization.
 
         Args:
@@ -194,7 +188,7 @@ class Map(DatasetVisualization):
         Returns:
             A MapLibre raster source definition with difference color map.
         """
-        breaks = self.difference_breaks_colors(variable, "#00000000")
+        breaks = self.difference_breaks_colors(self.variable, "#00000000")
         color_map = f"continuous:{','.join(str(b) for b in breaks)}"
         return self.raster_source(color_map=color_map, **kwargs)
 
@@ -381,7 +375,7 @@ class Map(DatasetVisualization):
         """
         var = variable or self.variable
 
-        legend = var.legend or LEGENDS.get("default")
+        legend = self._get_legend()
         ramp = self.difference_color_ramp(var) if difference else self.color_ramp(legend)
 
         return [
@@ -395,7 +389,7 @@ class Map(DatasetVisualization):
                         "case",
                         ["==", VALUE_EXPR, None],
                         "transparent",
-                        ramp
+                        ramp,
                     ],
                 },
             },
@@ -447,9 +441,7 @@ class Map(DatasetVisualization):
             },
         ]
 
-    def project_layers(
-        self, year: int, is_overlay: bool, suffix: str = ""
-    ) -> list[dict[str, Any]]:
+    def project_layers(self, year: int, is_overlay: bool, suffix: str = "") -> list[dict[str, Any]]:
         """Generate project layer definitions.
 
         Args:
@@ -479,13 +471,9 @@ class Map(DatasetVisualization):
                 ],
             }
 
-        overlay_stroke_color = self.linear_zoom(
-            "rgba(0, 0, 0, 0.1)", "rgba(0, 0, 0, 0.25)"
-        )
+        overlay_stroke_color = self.linear_zoom("rgba(0, 0, 0, 0.1)", "rgba(0, 0, 0, 0.25)")
         overlay_stroke_width = self.linear_zoom(1, 2)
-        overlay_fill_color = self.linear_zoom(
-            "rgba(0, 0, 0, 0.07)", "rgba(0, 0, 0, 0.15)"
-        )
+        overlay_fill_color = self.linear_zoom("rgba(0, 0, 0, 0.07)", "rgba(0, 0, 0, 0.15)")
 
         return [
             # Diversion polygon fill
@@ -558,9 +546,7 @@ class Map(DatasetVisualization):
                 "paint": {
                     "line-color": overlay(overlay_stroke_color, "#ED6731"),
                     "line-dasharray": [2, 1],
-                    "line-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(2, 6.75)
-                    ),
+                    "line-width": overlay(overlay_stroke_width, self.linear_zoom(2, 6.75)),
                 },
             },
             # Hydrologic restoration line
@@ -569,9 +555,7 @@ class Map(DatasetVisualization):
                 "paint": {
                     "line-color": overlay(overlay_stroke_color, "#1DBEF0"),
                     "line-dasharray": [2, 1],
-                    "line-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(2, 6.75)
-                    ),
+                    "line-width": overlay(overlay_stroke_width, self.linear_zoom(2, 6.75)),
                 },
             },
             # Ridge restoration line
@@ -579,9 +563,7 @@ class Map(DatasetVisualization):
                 **project_layer("Line", "RR", "line"),
                 "paint": {
                     "line-color": overlay(overlay_stroke_color, "#1C4E7F"),
-                    "line-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(1.5, 2.5)
-                    ),
+                    "line-width": overlay(overlay_stroke_width, self.linear_zoom(1.5, 2.5)),
                 },
             },
             # Shoreline protection line
@@ -589,9 +571,7 @@ class Map(DatasetVisualization):
                 **project_layer("Line", "SP", "line"),
                 "paint": {
                     "line-color": overlay(overlay_stroke_color, "#19A598"),
-                    "line-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(3, 4.5)
-                    ),
+                    "line-width": overlay(overlay_stroke_width, self.linear_zoom(3, 4.5)),
                 },
             },
             # Diversion point
@@ -599,13 +579,9 @@ class Map(DatasetVisualization):
                 **project_layer("Point", "DI", "circle"),
                 "paint": {
                     "circle-color": overlay(overlay_fill_color, "#FFFFFF"),
-                    "circle-radius": overlay(
-                        self.linear_zoom(1, 3), self.linear_zoom(2, 5)
-                    ),
+                    "circle-radius": overlay(self.linear_zoom(1, 3), self.linear_zoom(2, 5)),
                     "circle-stroke-color": overlay(overlay_stroke_color, "#ED6731"),
-                    "circle-stroke-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(1.5, 4)
-                    ),
+                    "circle-stroke-width": overlay(overlay_stroke_width, self.linear_zoom(1.5, 4)),
                 },
             },
             # Hydrologic restoration point
@@ -613,13 +589,9 @@ class Map(DatasetVisualization):
                 **project_layer("Point", "HR", "circle"),
                 "paint": {
                     "circle-color": overlay(overlay_fill_color, "#FFFFFF"),
-                    "circle-radius": overlay(
-                        self.linear_zoom(1, 3), self.linear_zoom(2, 5)
-                    ),
+                    "circle-radius": overlay(self.linear_zoom(1, 3), self.linear_zoom(2, 5)),
                     "circle-stroke-color": overlay(overlay_stroke_color, "#1DBEF0"),
-                    "circle-stroke-width": overlay(
-                        overlay_stroke_width, self.linear_zoom(1.5, 4)
-                    ),
+                    "circle-stroke-width": overlay(overlay_stroke_width, self.linear_zoom(1.5, 4)),
                 },
             },
             # Structural risk reduction point
@@ -669,17 +641,28 @@ class Map(DatasetVisualization):
                     "circle-color": [
                         "match",
                         ["get", "project_type_code"],
-                        "BH", "#a2e5e0",
-                        "BS", "#e7a62c",
-                        "DI", "#ea6833",
-                        "HR", "#30bded",
-                        "LB", "#5c913e",
-                        "MC", "#d3df3a",
-                        "NS", "#64668b",
-                        "OR", "#eca583",
-                        "RR", "#204e7e",
-                        "SP", "#18a899",
-                        "SR", "#414143",
+                        "BH",
+                        "#a2e5e0",
+                        "BS",
+                        "#e7a62c",
+                        "DI",
+                        "#ea6833",
+                        "HR",
+                        "#30bded",
+                        "LB",
+                        "#5c913e",
+                        "MC",
+                        "#d3df3a",
+                        "NS",
+                        "#64668b",
+                        "OR",
+                        "#eca583",
+                        "RR",
+                        "#204e7e",
+                        "SP",
+                        "#18a899",
+                        "SR",
+                        "#414143",
                         "#c8c8c8",
                     ],
                     "circle-radius": self.linear_zoom(2, 6),
@@ -718,16 +701,18 @@ class Map(DatasetVisualization):
             A tile URL template with {z}/{x}/{y} placeholders.
         """
         if self.request:
-            base_url = str(self.request.url_for(
-                "get_model_tile",
-                variable=self.variable.name,
-                grid=self.grid.name,
-                time_unit=self.time_unit,
-                z="{z}",
-                x="{x}",
-                y="{y}",
-                format="png",
-            ))
+            base_url = str(
+                self.request.url_for(
+                    "get_model_tile",
+                    variable=self.variable.name,
+                    grid=self.grid.name,
+                    time_unit=self.time_unit,
+                    z="{z}",
+                    x="{x}",
+                    y="{y}",
+                    format="png",
+                )
+            )
         else:
             base_url = (
                 f"https://api.mpdp.coastal.la.gov/v1/datasets"
@@ -772,6 +757,7 @@ class Map(DatasetVisualization):
         calendar_day = self.params.get("calendar_day", [])
         model_group_id = self.params.get("model_group_id", [])
 
+        is_difference = self.params.get("negate") is not None
         is_overlay = self.params.get("is_overlay", True)
 
         # Insert data layers after "initial-conditions-water" so they render
@@ -783,7 +769,11 @@ class Map(DatasetVisualization):
 
         if self.grid.grid_type == "raster":
             tile_url = self._get_tile_url_template()
-            style["sources"]["data"] = self.raster_source(tile_urls=[tile_url])
+            style["sources"]["data"] = (
+                self.difference_raster_source(tile_urls=[tile_url])
+                if is_difference
+                else self.raster_source(tile_urls=[tile_url], color_map=("lnd_chng" if self._is_lnd_chng() else None))
+            )
             data_layers = self.raster_layers("data-layer", "data")
         else:
             style["sources"]["data"] = self.vector_source(self.grid.name)
@@ -791,7 +781,7 @@ class Map(DatasetVisualization):
             data_layers = self.vector_layers(
                 layer_id="data-layer",
                 source_id="data",
-                difference=self.params.get("negate") is not None,
+                difference=is_difference,
                 show_grid_labels=show_grid_labels,
                 show_grid_lines=show_grid_lines,
             )
@@ -825,6 +815,26 @@ class Map(DatasetVisualization):
 
         return style
 
+    def _is_lnd_chng(self) -> bool:
+        """Are we calculating land change?
+
+        Returns:
+            Boolean indicating whether this is land change.
+        """
+        return self.variable.name == "lnd_type" and self.params.get("multiply10") is not None
+
+    def _get_legend(self) -> Legend | None:
+        """Get the current legend.
+
+        Returns:
+            A Legend instance for the current map.
+        """
+        # If we're doing digit concatenation on land type, use the land change
+        # as the variable.
+        if self._is_lnd_chng():
+            return LEGENDS.get("lnd_chng")
+        return self.variable.legend or LEGENDS.get("default")
+
     def _get_legend_metadata(self, difference: bool = False) -> dict[str, Any]:
         """Generate legend metadata for the style response.
 
@@ -853,7 +863,7 @@ class Map(DatasetVisualization):
                 "steps": steps,
             }
 
-        legend = var.legend or LEGENDS.get("default")
+        legend = self._get_legend()
         if legend is None:
             return {}
 
@@ -867,7 +877,7 @@ class Map(DatasetVisualization):
             steps.append(step)
 
         return {
-            "title": var.label,
+            "title": "Land Change" if self._is_lnd_chng() else var.label,
             "unit": var.unit,
             "type": legend.type,
             "steps": steps,
