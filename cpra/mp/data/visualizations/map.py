@@ -7,6 +7,8 @@ from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
 
+VALUE_EXPR = ["get", ["to-string", ["id"]], ["global-state", "values"]]
+
 
 class Map(DatasetVisualization):
     """Map visualization for a dataset using MapLibre GL style specification."""
@@ -97,7 +99,7 @@ class Map(DatasetVisualization):
             ramp.append(color)
             if upper_bound is not None:
                 ramp.append(upper_bound)
-        return ["step", ["get", ["get", "label"], ["global-state", "values"]], *ramp]
+        return ["step", VALUE_EXPR, *ramp]
 
     def difference_breaks_colors(
         self, variable: Variable, zero_color: str = "#ffffff"
@@ -128,7 +130,7 @@ class Map(DatasetVisualization):
         return [
             "interpolate",
             ["linear"],
-            ["get", ["get", "label"], ["global-state", "values"]],
+            VALUE_EXPR,
             *self.difference_breaks_colors(variable),
         ]
 
@@ -390,7 +392,7 @@ class Map(DatasetVisualization):
                 "paint": {
                     "fill-color": [
                         "case",
-                        ["==", ["get", ["get", "label"], ["global-state", "values"]], None],
+                        ["==", VALUE_EXPR, None],
                         "transparent",
                         ramp
                     ],
