@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.1](https://github.com/pscedu/cpra.mp.data/compare/v0.36.0...v0.36.1) (2026-02-18)
+
+
+### Bug Fixes
+
+* temporarily pin Polars to a working version ([30216b3](https://github.com/pscedu/cpra.mp.data/commit/30216b3a9c46fe808b38056d09e032a38a78eaba))
+
 ## [0.36.0](https://github.com/pscedu/cpra.mp.data/compare/v0.35.0...v0.36.0) (2026-02-12)
 
 
