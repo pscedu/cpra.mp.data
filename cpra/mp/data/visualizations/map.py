@@ -858,7 +858,7 @@ class Map(DatasetVisualization):
             )
             return {
                 "title": f"{var.label} Difference",
-                "unit": var.unit,
+                "subtitle": var.unit,
                 "type": "continuous",
                 "steps": steps,
             }
@@ -878,7 +878,7 @@ class Map(DatasetVisualization):
 
         return {
             "title": "Land Change" if self._is_lnd_chng() else var.label,
-            "unit": var.unit,
+            "subtitle": var.unit,
             "type": legend.type,
             "steps": steps,
         }
