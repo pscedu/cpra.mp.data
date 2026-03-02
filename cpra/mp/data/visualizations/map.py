@@ -672,28 +672,6 @@ class Map(DatasetVisualization):
             },
         ]
 
-    def water_overlay_layers(self, source_id: str = "basemap-vector") -> list[dict[str, Any]]:
-        """Generate water overlay layer definitions.
-
-        Args:
-            source_id: The source ID for the water overlay.
-
-        Returns:
-            A list of layer definitions for water overlay.
-        """
-        return [
-            {
-                "id": "water-overlay",
-                "type": "fill",
-                "source": source_id,
-                "source-layer": "water",
-                "paint": {
-                    "fill-color": "#a6cee3",
-                    "fill-opacity": 0.6,
-                },
-            }
-        ]
-
     def _get_tile_url_template(self) -> str:
         """Generate the tile URL template for raster data.
 
@@ -798,11 +776,11 @@ class Map(DatasetVisualization):
             for i, layer in enumerate(self.project_layers(project_year, is_overlay)):
                 style["layers"].insert(project_insert_idx + i, layer)
 
-        # Add water overlay if requested (just above data layers)
+        # If the water overlay is requested, move the initial conditions water layer to
+        # just above data layers.
         if show_water:
             water_insert_idx = insert_idx + len(data_layers)
-            for i, layer in enumerate(self.water_overlay_layers()):
-                style["layers"].insert(water_insert_idx + i, layer)
+            style["layers"].insert(water_insert_idx, style["layers"].pop(insert_idx - 1))
 
         # Include legend metadata for UI rendering
         difference = self.params.get("negate") is not None
