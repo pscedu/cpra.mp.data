@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.36.2](https://github.com/pscedu/cpra.mp.data/compare/v0.36.1...v0.36.2) (2026-03-02)
+
+
+### Bug Fixes
+
+* **visualizations:** use initial conditions water for water overlay ([bedf16d](https://github.com/pscedu/cpra.mp.data/commit/bedf16dba688599d240763fd9309d413574b48fb))
+* **visualizations:** use unit as map legend subtitle ([6389a88](https://github.com/pscedu/cpra.mp.data/commit/6389a88efb95a80d5331e455315dc9a6bcdde360))
+
 ## [0.36.1](https://github.com/pscedu/cpra.mp.data/compare/v0.36.0...v0.36.1) (2026-02-18)
 
 
