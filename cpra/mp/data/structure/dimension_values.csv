@@ -1,20 +1,20 @@
 dimension,value,label
-aep,20,20
-aep,10,10
-aep,2,2
-aep,1,1
-aep,0.2,0.2
 aep,0.1,0.1
+aep,0.2,0.2
+aep,1,1
+aep,2,2
+aep,10,10
+aep,20,20
+aggregate_type,2_wk_max,Two Week Maximum
+aggregate_type,growing_season,Growing Season
+aggregate_type,max,Max
 aggregate_type,mean,Mean
 aggregate_type,mean_oct_apr,Mean October to April
 aggregate_type,mean_sep_mar,Mean September to March
 aggregate_type,mean_summer,Mean Summer
-aggregate_type,growing_season,Growing Season
-aggregate_type,max,Max
-aggregate_type,var_summer,Variance Summer
-aggregate_type,std_dev,Standard Deviation
-aggregate_type,2_wk_max,Two Week Maximum
 aggregate_type,range,Range
+aggregate_type,std_dev,Standard Deviation
+aggregate_type,var_summer,Variance Summer
 asset_type,1,"Small Residential (single-family, manufactured homes, or duplex)"
 asset_type,2,Other Multi-family Residential
 asset_type,3,"Commercial, Industrial, or Agricultural"
@@ -24,18 +24,18 @@ clara_variant,0,No additional variant considered (MP23 data)
 exposure_type,exposure,Exposure
 exposure_type,moderate_exposure,Moderate Exposure
 exposure_type,severe_exposure,Severe Exposure
-ffibs_type,pl_bf,Bottomland Hardwood Forest
-ffibs_type,pl_sf,Swamp Forest
-ffibs_type,pl_fm,Fresh Marsh
-ffibs_type,pl_im,Intermediate Marsh
-ffibs_type,pl_bm,Brackish Marsh
-ffibs_type,pl_sm,Saline Marsh
-ffibs_type,swamp_omar,Swamp Marsh
+ffibs_type,active_fresh_omar,Active Fresh Marsh
+ffibs_type,brack_omar,Brackish Marsh
 ffibs_type,fresh_omar,Fresh Marsh
 ffibs_type,inter_omar,Intermediate Marsh
-ffibs_type,brack_omar,Brackish Marsh
+ffibs_type,pl_bf,Bottomland Hardwood Forest
+ffibs_type,pl_bm,Brackish Marsh
+ffibs_type,pl_fm,Fresh Marsh
+ffibs_type,pl_im,Intermediate Marsh
+ffibs_type,pl_sf,Swamp Forest
+ffibs_type,pl_sm,Saline Marsh
 ffibs_type,saline_omar,Saline Marsh
-ffibs_type,active_fresh_omar,Active Fresh Marsh
+ffibs_type,swamp_omar,Swamp Marsh
 fragility_scenario,0,No Fragility
 fragility_scenario,1,IPET Fragility
 infrastructure_category,daycares,Daycares
@@ -55,8 +55,8 @@ infrastructure_category,public_schools,Public Schools
 infrastructure_category,veterans_health_administration_medical_facilities,Veterans Health Administration Medical Facilities
 migration,base,BASE
 migration,mig,MIG
-model,icm_v2023.0.0,ICM v2023.0.0
 model,clara_v2023.0.0,CLARA v2023.0.0
+model,icm_v2023.0.0,ICM v2023.0.0
 ns_project_id,1,
 ns_project_id,3,
 participation_rate,0.5,50% Participation
@@ -97,49 +97,50 @@ time_unit,annual,Annual
 time_unit,daily,Daily
 time_unit,decadal,Decadal
 time_unit,monthly,Monthly
+veg_species_code,avge,Avicennia germinans (L.) L. (Black Mangrove)
+veg_species_code,bahabi,Baccharis halimifolia L. (Baccharis - Barrier Island)
+veg_species_code,baregrnd_flt,Flotant Bareground
+veg_species_code,baregrnd_new,New Bareground
+veg_species_code,baregrnd_old,Old Bareground
+veg_species_code,coes,Colocasia esculenta (Elephant Ear)
+veg_species_code,clma10,Cladium mariscus (L.) Pohl (Sawgrass)
+veg_species_code,dead_flt,Dead Flotant
+veg_species_code,disp,Distichlis spicata (L.) Greene (Saltgrass)
+veg_species_code,dispbi,Distichlis spicata (L.) Greene (Saltgrass - Barrier Island)
+veg_species_code,elba2_flt,Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating)
+veg_species_code,elce,Eleocharis cellulose (Gulf Coast Spikerush)
+veg_species_code,ivfr,Iva frutescens L. (Marsh-elder)
+veg_species_code,juro,Juncus roemerianus Scheele (Needlegrass)
+veg_species_code,moce2,Morella cerifera (L.) Small (Wax myrtle)
+veg_species_code,notmod,Not Modeled Coverage
+veg_species_code,nyaq2,Nyssa aquatica L. (Tupelo)
+veg_species_code,paam2,Panicum amarum Elliott (Beachgrass – Barrier Island)
+veg_species_code,pahe2,Panicum hemitomon Schult. (Maidencane)
+veg_species_code,pahe2_flt,Panicum hemitomon Schult. (Maidencane - floating)
+veg_species_code,pava,Paspalum vaginatum Sw. (Paspalum)
+veg_species_code,phau7,Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane)
+veg_species_code,popu5,Polygonum punctatum (Dotted Smartweed)
 veg_species_code,qula3,Quercus laurifolia Michx. (Laurel Oak)
 veg_species_code,qule,Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak)
 veg_species_code,quni,Quercus nigra L. (Water Oak)
 veg_species_code,qute,Quercus texana Buckley (Texas Red Oak)
 veg_species_code,quvi,Quercus virginiana Mill. (Live oak)
-veg_species_code,ulam,Ulmus Americana L. (American Elm)
-veg_species_code,nyaq2,Nyssa aquatica L. (Tupelo)
-veg_species_code,sani,Salix nigra Marsh. (Black Willow)
-veg_species_code,tadi2,Taxodium distichum (L.) Rich. (Cypress)
-veg_species_code,elba2_flt,Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating)
-veg_species_code,pahe2_flt,Panicum hemitomon Schult. (Maidencane - floating)
-veg_species_code,moce2,Morella cerifera (L.) Small (Wax myrtle)
-veg_species_code,pahe2,Panicum hemitomon Schult. (Maidencane)
-veg_species_code,sala2,Sagittaria latifolia Willd. (Arrowhead)
-veg_species_code,zimi,Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass)
-veg_species_code,clma10,Cladium mariscus (L.) Pohl (Sawgrass)
-veg_species_code,elce,Eleocharis cellulose (Gulf Coast Spikerush)
-veg_species_code,ivfr,Iva frutescens L. (Marsh-elder)
-veg_species_code,pava,Paspalum vaginatum Sw. (Paspalum)
-veg_species_code,phau7,Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane)
-veg_species_code,popu5,Polygonum punctatum (Dotted Smartweed)
 veg_species_code,sala,Sagittaria lancifolia L. (Bulltongue)
-veg_species_code,scca11,Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip)
-veg_species_code,tydo,Typha domingensis Pers. (Cattail)
+veg_species_code,sala2,Sagittaria latifolia Willd. (Arrowhead)
+veg_species_code,sani,Salix nigra Marsh. (Black Willow)
 veg_species_code,scam6,Schoenoplectus americanus (Chainmaker's bulrush)
+veg_species_code,scca11,Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip)
 veg_species_code,scro5,Schoenoplectus robustus (Salt-Marsh bulrush)
+veg_species_code,sose,Solidago sempervirens L. (Seaside goldenrod)
+veg_species_code,spal,Spartina alterniflora Loisel. (Oystergrass)
 veg_species_code,spcy,Spartina cynosuroides (Big Cordgrass)
 veg_species_code,sppa,Spartina patens (Aiton) Muhl. (Wiregrass)
-veg_species_code,avge,Avicennia germinans (L.) L. (Black Mangrove)
-veg_species_code,disp,Distichlis spicata (L.) Greene (Saltgrass)
-veg_species_code,juro,Juncus roemerianus Scheele (Needlegrass)
-veg_species_code,spal,Spartina alterniflora Loisel. (Oystergrass)
-veg_species_code,bahabi,Baccharis halimifolia L. (Baccharis - Barrier Island)
-veg_species_code,dispbi,Distichlis spicata (L.) Greene (Saltgrass - Barrier Island)
-veg_species_code,paam2,Panicum amarum Elliott (Beachgrass – Barrier Island)
-veg_species_code,sose,Solidago sempervirens L. (Seaside goldenrod)
 veg_species_code,sppabi,Spartina patens (Aiton) Muhl. (Wiregrass – Barrier Island)
 veg_species_code,spvi3,Sporobolus virginicus (L.) Kunth (Seashore dropseed)
 veg_species_code,sthe9,Strophostyles helvola (L.) Elliott (Amberique bean)
+veg_species_code,tadi2,Taxodium distichum (L.) Rich. (Cypress)
+veg_species_code,tydo,Typha domingensis Pers. (Cattail)
+veg_species_code,ulam,Ulmus Americana L. (American Elm)
 veg_species_code,unpa,Uniola paniculata L. (Seaoats – Barrier Island)
 veg_species_code,water,Water
-veg_species_code,notmod,Not Modeled Coverage
-veg_species_code,baregrnd_old,Old Bareground
-veg_species_code,baregrnd_new,New Bareground
-veg_species_code,baregrnd_flt,Flotant Bareground
-veg_species_code,dead_flt,Dead Flotant
+veg_species_code,zimi,Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass)
