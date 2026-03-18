@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.4](https://github.com/pscedu/cpra.mp.data/compare/v0.36.3...v0.36.4) (2026-03-18)
+
+
+### Bug Fixes
+
+* **structure:** update HSI legend ([2e7aa64](https://github.com/pscedu/cpra.mp.data/commit/2e7aa64d279142d1fbe8fb23685e17fba99d638e))
+
 ## [0.36.3](https://github.com/pscedu/cpra.mp.data/compare/v0.36.2...v0.36.3) (2026-03-18)
 
 
