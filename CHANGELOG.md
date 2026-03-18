@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.36.3](https://github.com/pscedu/cpra.mp.data/compare/v0.36.2...v0.36.3) (2026-03-18)
+
+
+### Bug Fixes
+
+* **structure:** update legends for CLARA and HSI ([acd6cff](https://github.com/pscedu/cpra.mp.data/commit/acd6cff36a5ace6ca688f7459e64ae3cf4802379))
+
+
+### Documentation
+
+* **structure:** update data structure docs ([99a1c08](https://github.com/pscedu/cpra.mp.data/commit/99a1c08ea8bb92909baa6e8ff055d19f878d4e0d))
+
 ## [0.36.2](https://github.com/pscedu/cpra.mp.data/compare/v0.36.1...v0.36.2) (2026-03-02)
 
 
