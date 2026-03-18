@@ -506,11 +506,16 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 to < 0.2 | #d7191c | 0.2 |
-| 0.2 to < 0.4 | #fdae61 | 0.4 |
-| 0.4 to < 0.6 | #ffffbf | 0.6 |
-| 0.6 to < 0.8 | #abd9e9 | 0.8 |
-| 0.8 to 1 | #2c7bb6 |  |
+| 0 to < 0.1 | #313695 | 0.1 |
+| 0.1 to < 0.2 | #4575b4 | 0.2 |
+| 0.2 to < 0.3 | #74add1 | 0.3 |
+| 0.3 to < 0.4 | #abd9e9 | 0.4 |
+| 0.4 to < 0.5 | #e0f3f8 | 0.5 |
+| 0.5 to < 0.6 | #fee090 | 0.6 |
+| 0.6 to < 0.7 | #fdae61 | 0.7 |
+| 0.7 to < 0.8 | #f46d43 | 0.8 |
+| 0.8 to < 0.9 | #d73027 | 0.9 |
+| 0.9 to 1 | #a50026 |  |
 
 
 ### `inun` Legend
