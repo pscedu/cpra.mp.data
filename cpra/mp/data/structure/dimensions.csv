@@ -26,3 +26,5 @@ FFIBS: Coverage Type,ffibs_type,nonpartition,String,false,,,0.5
 Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
 Model,model,metadata,String,true,,,icm_v2023.0.0
+Ecoregion,ecoregion,tag,String,false,,,UBA
+Region,region,tag,String,false,,,BA

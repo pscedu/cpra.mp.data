@@ -61,9 +61,7 @@ class Dimension:
 
     def cast(self, value):
         """Cast a value to this dimension's data type."""
-        return (
-            None if value is None else pl.select(pl.lit(value).cast(self.dtype)).item()
-        )
+        return None if value is None else pl.select(pl.lit(value).cast(self.dtype)).item()
 
     def validate_dtype(self, series):
         """Validate that a Polars series has the expected data type."""
@@ -77,24 +75,14 @@ def make_dimensions():
     dim_values_df = read_structure_csv("dimension_values")
     dimensions = []
 
-    for row in (
-        read_structure_csv("dimensions")
-        .with_columns(pl.col("required").cast(pl.Boolean))
-        .iter_rows(named=True)
-    ):
+    for row in read_structure_csv("dimensions").with_columns(pl.col("required").cast(pl.Boolean)).iter_rows(named=True):
         values = dim_values_df.filter(dimension=row["name"]).with_columns(
             pl.col("value").cast(getattr(pl, row["dtype"]))
         )
         if row["required"] is False:
             row["required"] = (
                 pl.col("variable")
-                .is_in(
-                    [
-                        v.name
-                        for v in VARIABLES.values()
-                        if row["name"] in (v.required_dimensions or [])
-                    ]
-                )
+                .is_in([v.name for v in VARIABLES.values() if row["name"] in (v.required_dimensions or [])])
                 .any()
             )
         dimensions.append(Dimension(values=(values if len(values) else None), **row))
@@ -104,12 +92,16 @@ def make_dimensions():
 
 def values_df_from_dict(dimension, values_dict, attr="label"):
     """Generate a dimension values DataFrame from a dictionary of objects."""
-    return pl.DataFrame(
-        {
-            "value": list(values_dict.keys()),
-            "label": [getattr(obj, attr) for obj in values_dict.values()],
-        }
-    ).with_columns(pl.lit(dimension).alias("dimension")).select("dimension", "value", "label")
+    return (
+        pl.DataFrame(
+            {
+                "value": list(values_dict.keys()),
+                "label": [getattr(obj, attr) for obj in values_dict.values()],
+            }
+        )
+        .with_columns(pl.lit(dimension).alias("dimension"))
+        .select("dimension", "value", "label")
+    )
 
 
 DIMENSIONS = {d.name: d for d in make_dimensions()}
