@@ -110,10 +110,6 @@ METADATA_DIMENSIONS = {d.name: d for d in DIMENSIONS.values() if d.type == "meta
 
 # Override the default required expressions for time dimensions.
 DIMENSIONS["variable"].values = values_df_from_dict("variable", VARIABLES)
-DIMENSIONS["grid"].values = values_df_from_dict("grid", GRIDS, "name")
-DIMENSIONS["calendar_year"].required = (
-    pl.col("time_unit").is_in(["annual", "decadal"]).any()
-)
-DIMENSIONS["calendar_day"].required = (
-    pl.col("time_unit").is_in(["daily", "monthly"]).any()
-)
+DIMENSIONS["grid"].values = values_df_from_dict("grid", GRIDS)
+DIMENSIONS["calendar_year"].required = pl.col("time_unit").is_in(["annual", "decadal"]).any()
+DIMENSIONS["calendar_day"].required = pl.col("time_unit").is_in(["daily", "monthly"]).any()
