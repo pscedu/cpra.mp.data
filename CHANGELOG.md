@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.37.0](https://github.com/pscedu/cpra.mp.data/compare/v0.36.4...v0.37.0) (2026-03-26)
+
+
+### Features
+
+* **structure:** add region and ecoregion dimensions ([c2c0c86](https://github.com/pscedu/cpra.mp.data/commit/c2c0c8690c6d870b88cdd97dd02db2ae56b4f4e8))
+
+
+### Bug Fixes
+
+* **structure:** add damage legend and rename asset count legend ([8887b1d](https://github.com/pscedu/cpra.mp.data/commit/8887b1d529ff0099493aa58f1ed151a2656b0110))
+* **structure:** use grid labels ([7f6d5af](https://github.com/pscedu/cpra.mp.data/commit/7f6d5afd25541ceeb274d9a14baebaf71b5c3832))
+
 ## [0.36.4](https://github.com/pscedu/cpra.mp.data/compare/v0.36.3...v0.36.4) (2026-03-18)
 
 
