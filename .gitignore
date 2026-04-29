@@ -21,3 +21,5 @@ token.txt
 /iceberg-*/
 /scratch/
 /tiles/
+
+.idea/

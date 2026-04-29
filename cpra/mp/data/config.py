@@ -7,6 +7,9 @@ load_dotenv()
 
 TRUE_VALUES = ("1", "t", "true", "y", "yes")
 
+os.environ.setdefault("PYGEOAPI_SERVER_URL", "https://mpdp.coastal.la.gov/v1/ogc")
+os.environ.setdefault("PYGEOAPI_CONFIG", "cpra/mp/data/ogc_config.yaml")
+os.environ.setdefault("PYGEOAPI_OPENAPI", "cpra/mp/data/ogc_openapi.yaml")
 
 def get_config(name, default_value):
     """Get a config variable from the environment."""
@@ -14,6 +17,7 @@ def get_config(name, default_value):
 
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
+GRIDS_PATH = Path(get_config("GRIDS_PATH", "/ocean/projects/bcs200002p/shared/grids"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
 MPD_URI = get_config("MPD_URI", "")
 STREAM_THRESHOLD = int(get_config("STREAM_THRESHOLD", "25"))
