@@ -25,6 +25,8 @@ dependencies = [
     "altair",
     "cachetools",
     "click",
+    "jupyterlab>=4.5.7",
+    "maplibre[all]",
     "mercantile",
     "numpy",
     "Pillow",
@@ -53,6 +55,9 @@ scripts = ["fastexcel", "tippecanoe"]
 reportAny = false
 reportExplicitAny = false
 typeCheckingMode = "off"
+
+[tool.uv.sources]
+maplibre = { git = "https://github.com/jpuerto-psc/py-maplibregl" }
 
 [tool.uv.build-backend]
 module-name = "cpra.mp.data"

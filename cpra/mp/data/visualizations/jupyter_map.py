@@ -18,16 +18,6 @@ except ImportError:
     MapWidget = None  # type: ignore[assignment,misc]
 
 
-def _resolve_global_state(obj, values: dict, selection_colors: dict):
-    if isinstance(obj, list):
-        if len(obj) == 2 and obj[0] == "global-state":
-            return ["literal", values if obj[1] == "values" else selection_colors]
-        return [_resolve_global_state(item, values, selection_colors) for item in obj]
-    if isinstance(obj, dict):
-        return {k: _resolve_global_state(v, values, selection_colors) for k, v in obj.items()}
-    return obj
-
-
 class JupyterMap:
     """Jupyter widget that renders a MapLibre GL map from the map visualization API.
 
@@ -44,8 +34,8 @@ class JupyterMap:
     """
 
     def __init__(self, variable: str, grid: str, time_unit: str, **kwargs):
-        # base = MPD_URI or _FALLBACK_BASE
-        base = _FALLBACK_BASE
+        # TODO - Fix this. MPD_URI isn't the right env var since it points to the DB. Could just hardcode to the actual base.
+        base = MPD_URI or _FALLBACK_BASE
         path = f"{base}/v1/datasets/{variable}/{grid}/{time_unit}/visualization/map.json"
 
         params = []
@@ -60,6 +50,13 @@ class JupyterMap:
         self.url = f"{path}?{query}" if query else path
 
     def _make_widget(self) -> "MapWidget":
+        """Fetch the style, build the MapWidget, and initialize global state.
+
+        MapLibre's automatic setGlobalState(style.state) reads e[key].default,
+        but may not fire reliably in the widget context. We explicitly call
+        setGlobalStateProperty for each state key with the flat value dict,
+        queued to run on map load via add_call.
+        """
         with urlopen(self.url) as resp:
             style = json.loads(resp.read())
 
@@ -67,15 +64,16 @@ class JupyterMap:
         values = (state.get("values") or {}).get("default", {})
         selection_colors = (state.get("selectionColors") or {}).get("default", {})
 
-        style = _resolve_global_state(style, values, selection_colors)
-
-        return MapWidget(
+        widget = MapWidget(
             MapOptions(
                 style=style,
                 center=_DEFAULT_CENTER,
                 zoom=_DEFAULT_ZOOM,
             )
         )
+        widget.add_call("setGlobalStateProperty", "values", values)
+        widget.add_call("setGlobalStateProperty", "selectionColors", selection_colors)
+        return widget
 
     def _repr_mimebundle_(self, **kwargs):
         """Jupyter auto-display: renders the map as an ipywidget.
