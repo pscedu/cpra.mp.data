@@ -1,0 +1,57 @@
+.cpra-map-legend {
+  color: black;
+  padding: 10px;
+}
+.cpra-map-legend h2 {
+  font-size: 12px;
+  font-weight: bold;
+  margin: 0 0 4px 0;
+}
+.cpra-map-legend h2 .subtitle {
+  font-weight: normal;
+}
+.cpra-map-legend .entry {
+  margin-bottom: 8px;
+}
+.cpra-map-legend .discrete-step {
+  display: flex;
+  align-items: center;
+  margin-bottom: 2px;
+}
+.cpra-map-legend .discrete-symbol {
+  border: 1px solid #ccc;
+  display: inline-block;
+  height: 1rem;
+  margin: 0 0.5rem 0 0;
+  vertical-align: middle;
+  width: 3rem;
+  flex-shrink: 0;
+}
+.cpra-map-legend .discrete-label {
+  font-size: 11px;
+}
+.cpra-map-legend .continuous-symbol {
+  height: 1rem;
+  min-width: 150px;
+  width: 10vw;
+}
+.cpra-map-legend .continuous-ticks {
+  height: 1.5rem;
+  min-width: 150px;
+  position: relative;
+  width: 10vw;
+}
+.cpra-map-legend .continuous-ticks .tick {
+  position: absolute;
+}
+.cpra-map-legend .continuous-ticks .tick::before {
+  background-color: black;
+  content: "";
+  display: block;
+  height: 0.5rem;
+  width: 1px;
+}
+.cpra-map-legend .continuous-ticks .tick .label {
+  position: relative;
+  font-size: 10px;
+}
