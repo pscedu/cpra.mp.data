@@ -36,6 +36,8 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Year | calendar_year | nonpartition | Int32 | False | 2000 | 2100 | 2030 |
 | Date | calendar_day | nonpartition | Date | False |  |  | 2030-01-01 |
 | Model | model | metadata | String | True |  |  | icm_v2023.0.0 |
+| Ecoregion | ecoregion | tag | String | False |  |  | UBA |
+| Region | region | tag | String | False |  |  | BA |
 <!--END SECTION-->
 
 ## Variables
@@ -45,14 +47,14 @@ Variables represent a type of model output. Each variable has a single data type
 <!--BEGIN SECTION variables-->
 | Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Number Format | Legend | Required Dimensions | Difference Legend Limit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
+| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
 | Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
 | Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
 | Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
 | Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
 | Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
 | Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
-| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | d | exposure_asset_count | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | 1 |
+| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | d | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | 1 |
 | Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft | .1f | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | 1 |
 | Habitat Suitability Index | hsi | icm | hsi | Float32 | veg_grid_cell | annual |  | .2f | hsi | species_code | -1 |
 | Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  |  | aggregate_type | 1 |
@@ -100,6 +102,9 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 | CLARA Community | clara_community_v001 | vector | epsg:26915 |  |  |  |  |  |  |
 | Parish | parish_v2020 | vector | epsg:26915 |  |  |  |  |  |  |
 | CLARA Grid Cell | clara_grid_cell_v001 | vector | epsg:26915 | 1 | 126174 | 126174 |  |  |  |
+| Morphology Pixel | morph_pixel_v002 | raster | epsg:26915 |  |  |  | 410470, 3199960, 909670, 3374680 | 5824 | 16640 |
+| Vegetation Grid Cell | veg_grid_cell_v002 | raster | epsg:26915 |  |  |  | 410470, 3199960, 909670, 3374680 | 364 | 1040 |
+| Hydro Compartment | hydro_compartment_v002 | vector | epsg:26915 | 1 | 1878 | 1878 |  |  |  |
 <!--END SECTION-->
 
 <!--BEGIN SECTION dimension_values-->
@@ -398,6 +403,17 @@ Legends determine the breakpoints and colors used to map a variable.
 | 8 to 10 | #7a0177 |  |
 
 
+### `damage` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| $0 to < $1K | #edf8fb | 1000.0 |
+| $1K to < $10K | #b3cde3 | 10000.0 |
+| $10K to < $100K | #8c96c6 | 100000.0 |
+| $100K to < $1M | #8856a7 | 1000000.0 |
+| $1M or more | #810f7c |  |
+
+
 ### `default` Legend
 
 | Label | Color | Upper Bound |
@@ -449,7 +465,7 @@ Legends determine the breakpoints and colors used to map a variable.
 | 2.0 or greater | #3288bd |  |
 
 
-### `exposure_asset_count` Legend
+### `exposure_count_asset` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
