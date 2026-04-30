@@ -65,6 +65,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+from pygeoapi.flask_app import APP as pygeoapi_app  # noqa: E402
+
+app.mount("/v1/ogc", WSGIMiddleware(pygeoapi_app))
+
 
 @app.get("/v1/variables.json", tags=["Catalog"])
 def variables() -> list[Variable]:

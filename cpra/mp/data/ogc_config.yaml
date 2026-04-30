@@ -1,0 +1,84 @@
+server:
+  bind:
+    host: 0.0.0.0
+    port: 8000
+  # Set PYGEOAPI_SERVER_URL env var to the public base URL + /v1/ogc for each deployment.
+  # Default works for local development.
+  url: ${PYGEOAPI_SERVER_URL}
+  mimetype: application/json; charset=UTF-8
+  encoding: utf-8
+  gzip: false
+  languages:
+    - en-US
+  pretty_print: false
+  limits:
+    default_items: 50
+    max_items: 1000
+    max_distance_x: 25
+    max_distance_y: 25
+    max_distance_units: m
+    on_exceed: throttle  # throttle or error (default=throttle)
+  map:
+    url: https://api.mpdp.coastal.la.gov/tiles/basemap-raster/{z}/{x}/{y}
+  cors: true
+
+logging:
+  level: ERROR
+
+metadata:
+  identification:
+    title:
+      en: CPRA Master Plan Data – OGC API
+    description:
+      en: OGC API - Features endpoint for CPRA Master Plan vector grid data.
+    keywords:
+      en:
+        - Louisiana
+        - Coastal
+        - Master Plan
+    keywords_type: theme
+    terms_of_service: https://creativecommons.org/licenses/by/4.0
+    url: https://coastal.la.gov/our-plan/2023-coastal-master-plan/
+  license:
+    name: CC-BY 4.0 license
+    url: https://creativecommons.org/licenses/by/4.0
+  provider:
+    name: Louisiana Coastal Protection and Restoration Authority
+    url: https://coastal.la.gov
+  contact:
+    name: Louisiana Coastal Protection and Restoration Authority
+    address: 150 Terrace Ave
+    city: Baton Rouge
+    stateorprovince: Louisiana
+    postalcode: '70802'
+    country: USA
+    email: coastal@la.gov
+    url: https://coastal.la.gov
+    role: pointOfContact
+
+resources:
+  master_plan_data:
+    type: collection
+    title: Master Plan Data
+    description: Vector grid data from Louisiana's Coastal Master Plan models.
+    keywords:
+      - Louisiana
+      - coastal
+      - master plan
+    links: []
+    extents:
+      spatial:
+        bbox: [-94.04, 28.85, -88.75, 30.65]
+        crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+    providers:
+      - type: feature
+        name: cpra.mp.data.api.ogc_provider.MasterPlanDataProvider
+        data:
+          source_type: FlatGeobuf
+          source: /Users/jpuerto/jpuerto_scratch_dirs/cpra_data/grids/hydro_compartment_v001.fgb
+          source_capabilities:
+            paging: True
+          gdal_ogr_options:
+            EMPTY_AS_NULL: NO
+        id_field: id
+        layer: hydro_compartment_v001
