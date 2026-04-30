@@ -172,5 +172,6 @@ class MPDDimensionValue(SQLModel, table=True):
 
     __tablename__ = "vw_a_portal_dimension_value"
     dimension: str = Field(primary_key=True)
-    value_int: str | None = None
+    value_int: int | None = None
+    value_str: str | None = None
     label: str = Field(primary_key=True)

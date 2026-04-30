@@ -1,12 +1,12 @@
 label,name,model,subroutine,dtype,geographic_units,time_units,unit,number_format,legend,required_dimensions,difference_legend_limit
-Damage by Return Period in Dollars,damage,clara,,Float64,clara_grid_cell,decadal,$,,,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile",1
+Damage by Return Period in Dollars,damage,clara,,Float64,clara_grid_cell,decadal,$,,damage,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile",1
 Expected Annual Damages in Dollars,eadd,clara,,Float64,clara_grid_cell,decadal,$,,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile",1
 "Nonstructural Expected Annual Damage, Dollars",eadd_ns,clara,,Float64,clara_grid_cell,decadal,$,,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile",1
 "Expected Annual Damages in Dollars, Structural Portion",eadd_str,clara,,Float64,clara_grid_cell,decadal,$,,eadd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile",1
 Nonstructural Expected Annual Structural Damage,eadd_str_ns,clara,,Float64,clara_grid_cell,decadal,$,.2f,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile",1
 Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell,decadal,structure equivalents,.2f,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile",1
 Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,.2f,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile",1
-Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,d,exposure_asset_count,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type",1
+Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,d,exposure_count_asset,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type",1
 Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,.1f,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile",1
 Habitat Suitability Index,hsi,icm,hsi,Float32,veg_grid_cell,annual,,.2f,hsi,species_code,-1
 Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,,aggregate_type,1

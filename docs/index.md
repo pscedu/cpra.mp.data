@@ -28,14 +28,16 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Participation Rate | participation_rate | partition | Float32 | False |  |  | 0.75 |
 | Migration | migration | partition | String | False |  |  | base |
 | Shared Socioeconomic Pathway | ssp | partition | Int8 | False |  |  | 4 |
-| Vegetation: Habitat Type | habitat_code | partition | String | False |  |  | brm |
+| Species | species_code | partition | String | False |  |  |  |
 | Vegetation: Coverage Type | vegetation_coverage_type | partition | String | False |  |  |  |
-| Vegetation: Species | vegetation_species_type | nonpartition | String | False |  |  | coes |
-| FFIBS Component | ffibs_component | nonpartition | String | False |  |  | 0.5 |
 | Percentile | percentile | partition | Int8 | False | 0 | 100 | 50 |
+| Vegetation: Species | veg_species_code | nonpartition | String | False |  |  | coes |
+| FFIBS: Coverage Type | ffibs_type | nonpartition | String | False |  |  | 0.5 |
 | Year | calendar_year | nonpartition | Int32 | False | 2000 | 2100 | 2030 |
 | Date | calendar_day | nonpartition | Date | False |  |  | 2030-01-01 |
 | Model | model | metadata | String | True |  |  | icm_v2023.0.0 |
+| Ecoregion | ecoregion | tag | String | False |  |  | UBA |
+| Region | region | tag | String | False |  |  | BA |
 <!--END SECTION-->
 
 ## Variables
@@ -43,42 +45,46 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 Variables represent a type of model output. Each variable has a single data type and unit. In addition to the dimensions required for all variables (see above), some variables support additional dimensions, as described in the Required Dimensions column below.
 
 <!--BEGIN SECTION variables-->
-| Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Legend | Required Dimensions |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile |
-| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile |
-| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile |
-| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile |
-| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile |
-| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile |
-| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile |
-| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | exposure_asset_count | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type |
-| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile |
-| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  | aggregate_type |
-| Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt | sal | aggregate_type |
-| Sediment Accumulation in Open Water | sedacc | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
-| Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
-| Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  | aggregate_type |
-| Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m | stg | aggregate_type |
-| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m |  | aggregate_type |
-| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m |  | aggregate_type |
-| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C | tmp | aggregate_type |
-| Daily Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m |  | aggregate_type |
-| Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L | tss | aggregate_type |
-| Vegetation Type: FFIBS | ffibs | icm | lavegmod | Float32 | veg_pixel | annual |  | ffibs | ffibs_component |
-| Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_pixel | annual |  | vct | vegetation_coverage_type |
-| Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_pixel | annual | square m | veg_area | habitat_code |
-| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_pixel | annual |  |  | vegetation_species_type |
-| Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | elev |  |
-| Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m | inun |  |
-| Land Change | lnd_chng | icm | morph | Int32 | morph_pixel | annual |  | lnd_chng |  |
-| Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  | lnd_type |  |
-| Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm | accr |  |
-| Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | mnrl_dep |  |
-| Organic Matter Accumulation Rate | omar | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | omar |  |
-| Organic Accretion | org_accr | icm | morph | Float64 | morph_pixel | annual | cm | accr |  |
-| Shallow Soil Factors | ssf | icm | morph | Float32 |  | annual | mm/yr | ssf |  |
-| Subsidence | sub | icm | morph | Float32 | morph_pixel | annual | mm/yr | sub |  |
+| Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Number Format | Legend | Required Dimensions | Difference Legend Limit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
+| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
+| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
+| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
+| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
+| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
+| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
+| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | d | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | 1 |
+| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft | .1f | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | 1 |
+| Habitat Suitability Index | hsi | icm | hsi | Float32 | veg_grid_cell | annual |  | .2f | hsi | species_code | -1 |
+| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  |  | aggregate_type | 1 |
+| Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt | .1f | sal | aggregate_type | -10 |
+| Sediment Accumulation in Open Water | sedacc | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr | d |  | aggregate_type | -1 |
+| Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr | d |  | aggregate_type | -1 |
+| Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr | d |  | aggregate_type | -1 |
+| Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m | .2f | stg | aggregate_type | 1 |
+| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m | .2f |  | aggregate_type | 1 |
+| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m | .2f |  | aggregate_type | 1 |
+| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C | .1f | tmp | aggregate_type | -1 |
+| Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m | .2f |  | aggregate_type | 1 |
+| Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L | .1f | tss | aggregate_type | -1 |
+| Vegetation Type: FFIBS Coverage | ffibs_coverage_ratio | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | ffibs_type | 1 |
+| Vegetation Type: FFIBS | ffibs_score | icm | lavegmod | Float32 | veg_grid_cell | annual |  | .1f | ffibs |  | 1 |
+| Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_grid_cell | annual |  |  | vct |  | 1 |
+| Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_grid_cell | annual | square m |  | veg_area |  | 1 |
+| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | veg_species_code | 1 |
+| Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | .2f | elev |  | 1 |
+| Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m | .2f | inun |  | 1 |
+| Land Change | lnd_chng | icm | morph | Int32 | morph_pixel | annual |  | d | lnd_chng |  | 1 |
+| Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  | d | lnd_type |  | 1 |
+| Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm | .2f | accr |  | -1 |
+| Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | .2f | mnrl_dep |  | -1 |
+| Organic Matter Accumulation Rate | omar | icm | morph | Float64 | ecoregion | annual | g/cm^2-yr | .2f | omar | ffibs_type, percentile | -1 |
+| Organic Accretion | org_accr | icm | morph | Float64 | morph_pixel | annual | cm | .2f | accr |  | -1 |
+| Shallow Soil Factors | ssf | icm | morph | Float32 | ecoregion | annual | mm/yr | .1f | ssf | percentile | 1 |
+| Subsidence | sub | icm | morph | Float32 | morph_pixel | annual | mm/yr | .1f | sub |  | 1 |
+| TEST Mineral Accretion | test_mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm | .2f | accr |  | -1 |
+| TEST Organic Accretion | test_org_accr | icm | morph | Float64 | morph_pixel | annual | cm | .2f | accr |  | -1 |
 <!--END SECTION-->
 
 ## Grids
@@ -88,14 +94,17 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 <!--BEGIN SECTION grids-->
 | Label | Name | Type | CRS | Id Min | Id Max | Id Count | Bounds | Height | Width |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Morphology Pixel | morph_pixel_v001 | raster | epsg:26915 |  |  |  | 404500, 3187060, 1024720, 3435010 | 8285 | 20674 |
-| Vegetation Pixel | veg_pixel_v001 | raster | epsg:26915 |  |  |  | 404710, 3199480, 909670, 3374680 | 365 | 1052 |
+| Morphology Pixel | morph_pixel_v001 | raster | epsg:26915 |  |  |  | 404500, 3187060, 1024720, 3435010 | 8265 | 20674 |
+| Vegetation Grid Cell | veg_grid_cell_v001 | raster | epsg:26915 |  |  |  | 404710, 3199480, 909670, 3374680 | 365 | 1052 |
 | Hydro Compartment | hydro_compartment_v001 | vector | epsg:26915 | 1 | 1657 | 1657 |  |  |  |
 | Ecoregion | ecoregion_v001 | vector | epsg:26915 | 1 | 32 | 32 |  |  |  |
 | Block Group | block_group_v2020 | vector | epsg:26915 |  |  |  |  |  |  |
 | CLARA Community | clara_community_v001 | vector | epsg:26915 |  |  |  |  |  |  |
 | Parish | parish_v2020 | vector | epsg:26915 |  |  |  |  |  |  |
 | CLARA Grid Cell | clara_grid_cell_v001 | vector | epsg:26915 | 1 | 126174 | 126174 |  |  |  |
+| Morphology Pixel | morph_pixel_v002 | raster | epsg:26915 |  |  |  | 410470, 3199960, 909670, 3374680 | 5824 | 16640 |
+| Vegetation Grid Cell | veg_grid_cell_v002 | raster | epsg:26915 |  |  |  | 410470, 3199960, 909670, 3374680 | 364 | 1040 |
+| Hydro Compartment | hydro_compartment_v002 | vector | epsg:26915 | 1 | 1878 | 1878 |  |  |  |
 <!--END SECTION-->
 
 <!--BEGIN SECTION dimension_values-->
@@ -115,28 +124,28 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 
 | Value | Label |
 | --- | --- |
+| 2_wk_max | Two Week Maximum |
+| growing_season | Growing Season |
+| max | Max |
 | mean | Mean |
 | mean_oct_apr | Mean October to April |
 | mean_sep_mar | Mean September to March |
 | mean_summer | Mean Summer |
-| growing_season | Growing Season |
-| max | Max |
-| var_summer | Variance Summer |
-| std_dev | Standard Deviation |
-| 2_wk_max | Two Week Maximum |
 | range | Range |
+| std_dev | Standard Deviation |
+| var_summer | Variance Summer |
 
 
 ## Annual Exceedance Probabilities
 
 | Value | Label |
 | --- | --- |
-| 20 | 20 |
-| 10 | 10 |
-| 2 | 2 |
-| 1 | 1 |
-| 0.2 | 0.2 |
 | 0.1 | 0.1 |
+| 0.2 | 0.2 |
+| 1 | 1 |
+| 2 | 2 |
+| 10 | 10 |
+| 20 | 20 |
 
 
 ## Pumping Scenarios
@@ -247,82 +256,27 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 | 5 |  |
 
 
-## Vegetation: Habitat Types
+## Species
 
 | Value | Label |
 | --- | --- |
-| brm | Brackish Marsh |
-| for | Fresh Forest |
-| frm | Fresh Marsh |
-| inm | Intermediate Marsh |
-| sam | Saline Marsh |
-| upl | Upland |
-| wat | Water |
-
-
-## Vegetation: Species
-
-| Value | Label |
-| --- | --- |
-| qula3 | Quercus laurifolia Michx. (Laurel Oak) |
-| qule | Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak) |
-| quni | Quercus nigra L. (Water Oak) |
-| qute | Quercus texana Buckley (Texas Red Oak) |
-| quvi | Quercus virginiana Mill. (Live oak) |
-| ulam | Ulmus Americana L. (American Elm) |
-| nyaq2 | Nyssa aquatica L. (Tupelo) |
-| sani | Salix nigra Marsh. (Black Willow) |
-| tadi2 | Taxodium distichum (L.) Rich. (Cypress) |
-| elba2_flt | Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating) |
-| pahe2_flt | Panicum hemitomon Schult. (Maidencane - floating) |
-| moce2 | Morella cerifera (L.) Small (Wax myrtle) |
-| pahe2 | Panicum hemitomon Schult. (Maidencane) |
-| sala2 | Sagittaria latifolia Willd. (Arrowhead) |
-| zimi | Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass) |
-| clma10 | Cladium mariscus (L.) Pohl (Sawgrass) |
-| elce | Eleocharis cellulose (Gulf Coast Spikerush) |
-| ivfr | Iva frutescens L. (Marsh-elder) |
-| pava | Paspalum vaginatum Sw. (Paspalum) |
-| phau7 | Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane) |
-| popu5 | Polygonum punctatum (Dotted Smartweed) |
-| sala | Sagittaria lancifolia L. (Bulltongue) |
-| scca11 | Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip) |
-| tydo | Typha domingensis Pers. (Cattail) |
-| scam6 | Schoenoplectus americanus (Chainmaker's bulrush) |
-| scro5 | Schoenoplectus robustus (Salt-Marsh bulrush) |
-| spcy | Spartina cynosuroides (Big Cordgrass) |
-| sppa | Spartina patens (Aiton) Muhl. (Wiregrass) |
-| avge | Avicennia germinans (L.) L. (Black Mangrove) |
-| disp | Distichlis spicata (L.) Greene (Saltgrass) |
-| juro | Juncus roemerianus Scheele (Needlegrass) |
-| spal | Spartina alterniflora Loisel. (Oystergrass) |
-| bahabi | Baccharis halimifolia L. (Baccharis - Barrier Island) |
-| dispbi | Distichlis spicata (L.) Greene (Saltgrass - Barrier Island) |
-| paam2 | Panicum amarum Elliott (Beachgrass – Barrier Island) |
-| sose | Solidago sempervirens L. (Seaside goldenrod) |
-| sppabi | Spartina patens (Aiton) Muhl. (Wiregrass – Barrier Island) |
-| spvi3 | Sporobolus virginicus (L.) Kunth (Seashore dropseed) |
-| sthe9 | Strophostyles helvola (L.) Elliott (Amberique bean) |
-| unpa | Uniola paniculata L. (Seaoats – Barrier Island) |
-| water | Water |
-| notmod | Not Modeled Coverage |
-| baregrnd_old | Old Bareground |
-| baregrnd_new | New Bareground |
-| baregrnd_flt | Flotant Bareground |
-| dead_flt | Dead Flotant |
-
-
-## FFIBS Components
-
-| Value | Label |
-| --- | --- |
-| ffibs | FFIBS |
-| pl_bf | Bottomland Hardwood Forest |
-| pl_sf | Swamp Forest |
-| pl_fm | Fresh Marsh |
-| pl_im | Intermediate Marsh |
-| pl_bm | Brackish Marsh |
-| pl_sm | Saline Marsh |
+| allig | American Alligator |
+| blucj | Juvenile Blue Crab |
+| bshrl | Large Juvenile Brown Shrimp |
+| bshrs | Small Juvenile Brown Shrimp |
+| crayf | Crayfish |
+| eagle | Bald Eagle |
+| gadwa | Gadwall |
+| gmena | Adult Gulf Menhaden |
+| gmenj | Juvenile Gulf Menhaden |
+| lmbas | Largemouth Bass |
+| motdk | Mottled Duck |
+| oyste | Eastern Oyster |
+| sparr | Seaside Sparroow |
+| spsta | Adult Spotted Seatrout |
+| spstj | Juvenile Spotted Seatrout |
+| wshrl | Large Juvenile White Shrimp |
+| wshrs | Small Juvenile White Shrimp |
 
 
 ## Percentiles
@@ -330,16 +284,89 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 | Value | Label |
 | --- | --- |
 | 10 | 10th Percentile |
+| 25 | 25th Percentile |
 | 50 | 50th Percentile |
+| 75 | 75th Percentile |
 | 90 | 90th Percentile |
+
+
+## Vegetation: Species
+
+| Value | Label |
+| --- | --- |
+| avge | Avicennia germinans (L.) L. (Black Mangrove) |
+| bahabi | Baccharis halimifolia L. (Baccharis - Barrier Island) |
+| baregrnd_flt | Flotant Bareground |
+| baregrnd_new | New Bareground |
+| baregrnd_old | Old Bareground |
+| coes | Colocasia esculenta (Elephant Ear) |
+| clma10 | Cladium mariscus (L.) Pohl (Sawgrass) |
+| dead_flt | Dead Flotant |
+| disp | Distichlis spicata (L.) Greene (Saltgrass) |
+| dispbi | Distichlis spicata (L.) Greene (Saltgrass - Barrier Island) |
+| elba2_flt | Eleocharis baldwinii (Torr.) Chapm. (Spikerush - floating) |
+| elce | Eleocharis cellulose (Gulf Coast Spikerush) |
+| ivfr | Iva frutescens L. (Marsh-elder) |
+| juro | Juncus roemerianus Scheele (Needlegrass) |
+| moce2 | Morella cerifera (L.) Small (Wax myrtle) |
+| notmod | Not Modeled Coverage |
+| nyaq2 | Nyssa aquatica L. (Tupelo) |
+| paam2 | Panicum amarum Elliott (Beachgrass – Barrier Island) |
+| pahe2 | Panicum hemitomon Schult. (Maidencane) |
+| pahe2_flt | Panicum hemitomon Schult. (Maidencane - floating) |
+| pava | Paspalum vaginatum Sw. (Paspalum) |
+| phau7 | Phragmites australis (Cav.) Trin. ex Steud. (Roseau Cane) |
+| popu5 | Polygonum punctatum (Dotted Smartweed) |
+| qula3 | Quercus laurifolia Michx. (Laurel Oak) |
+| qule | Quercus xleana Nutt. (pro sp.) [imbricara x velutina] (Hybrid Oak) |
+| quni | Quercus nigra L. (Water Oak) |
+| qute | Quercus texana Buckley (Texas Red Oak) |
+| quvi | Quercus virginiana Mill. (Live oak) |
+| sala | Sagittaria lancifolia L. (Bulltongue) |
+| sala2 | Sagittaria latifolia Willd. (Arrowhead) |
+| sani | Salix nigra Marsh. (Black Willow) |
+| scam6 | Schoenoplectus americanus (Chainmaker's bulrush) |
+| scca11 | Schoenoplectus californicus (C.A. Mey.) Palla (Bullwhip) |
+| scro5 | Schoenoplectus robustus (Salt-Marsh bulrush) |
+| sose | Solidago sempervirens L. (Seaside goldenrod) |
+| spal | Spartina alterniflora Loisel. (Oystergrass) |
+| spcy | Spartina cynosuroides (Big Cordgrass) |
+| sppa | Spartina patens (Aiton) Muhl. (Wiregrass) |
+| sppabi | Spartina patens (Aiton) Muhl. (Wiregrass – Barrier Island) |
+| spvi3 | Sporobolus virginicus (L.) Kunth (Seashore dropseed) |
+| sthe9 | Strophostyles helvola (L.) Elliott (Amberique bean) |
+| tadi2 | Taxodium distichum (L.) Rich. (Cypress) |
+| tydo | Typha domingensis Pers. (Cattail) |
+| ulam | Ulmus Americana L. (American Elm) |
+| unpa | Uniola paniculata L. (Seaoats – Barrier Island) |
+| water | Water |
+| zimi | Zizaniopsis miliacea (Michx.) Döll & Asch. (Giant Cutgrass) |
+
+
+## FFIBS: Coverage Types
+
+| Value | Label |
+| --- | --- |
+| active_fresh_omar | Active Fresh Marsh |
+| brack_omar | Brackish Marsh |
+| fresh_omar | Fresh Marsh |
+| inter_omar | Intermediate Marsh |
+| pl_bf | Bottomland Hardwood Forest |
+| pl_bm | Brackish Marsh |
+| pl_fm | Fresh Marsh |
+| pl_im | Intermediate Marsh |
+| pl_sf | Swamp Forest |
+| pl_sm | Saline Marsh |
+| saline_omar | Saline Marsh |
+| swamp_omar | Swamp Marsh |
 
 
 ## Models
 
 | Value | Label |
 | --- | --- |
-| icm_v2023.0.0 | ICM v2023.0.0 |
 | clara_v2023.0.0 | CLARA v2023.0.0 |
+| icm_v2023.0.0 | ICM v2023.0.0 |
 <!--END SECTION-->
 
 ## File Paths
@@ -376,6 +403,17 @@ Legends determine the breakpoints and colors used to map a variable.
 | 8 to 10 | #7a0177 |  |
 
 
+### `damage` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| $0 to < $1K | #edf8fb | 1000.0 |
+| $1K to < $10K | #b3cde3 | 10000.0 |
+| $10K to < $100K | #8c96c6 | 100000.0 |
+| $100K to < $1M | #8856a7 | 1000000.0 |
+| $1M or more | #810f7c |  |
+
+
 ### `default` Legend
 
 | Label | Color | Upper Bound |
@@ -393,26 +431,24 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| $0 to < $1M | #DDC5E0 | 1000000.0 |
-| $1M to < $10M | #CCAAD1 | 10000000.0 |
-| $10M to < $50M | #B282BA | 50000000.0 |
-| $50M to < $100M | #A064A9 | 100000000.0 |
-| $100M to < $500M | #5D4795 | 500000000.0 |
-| $500M to < $1B | #423575 | 1000000000.0 |
-| $1B or more | #221F53 |  |
+| $0 to < $100 | #feebe2 | 100.0 |
+| $100 to < $1K | #fcc5c0 | 1000.0 |
+| $1K to < $10K | #fa9fb5 | 10000.0 |
+| $10K to < $100K | #f768a1 | 100000.0 |
+| $100K to < $1M | #c51b8a | 1000000.0 |
+| $1M or more | #7a0177 |  |
 
 
 ### `easd` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 to 49 | #FEDB9E | 50.0 |
-| 50 to 99 | #FBBC76 | 100.0 |
-| 100 to 249 | #F7903B | 250.0 |
-| 250 to 499 | #F36F41 | 500.0 |
-| 500 to 999 | #DC4840 | 1000.0 |
-| 1,000 to 4,999 | #BA233E | 5000.0 |
-| 5,000 or more | #701231 |  |
+| 0 to < 0.0001 | #ffffb2 | 0.0001 |
+| 0.0001 to < 0.001 | #fed976 | 0.001 |
+| 0.001 to < 0.01 | #feb24c | 0.01 |
+| 0.01 to < 0.1 | #fd8d3c | 0.1 |
+| 0.1 to < 1 | #f03b20 | 1.0 |
+| 1 or more | #bd0026 |  |
 
 
 ### `elev` Legend
@@ -429,7 +465,7 @@ Legends determine the breakpoints and colors used to map a variable.
 | 2.0 or greater | #3288bd |  |
 
 
-### `exposure_asset_count` Legend
+### `exposure_count_asset` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
@@ -472,29 +508,30 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 1 to < 4 feet | #728D97 |  |
-| 4 to < 7 feet | #73B7EA |  |
-| 7 to < 10 feet | #99D9A7 |  |
-| 10 to < 13 feet | #F8D88B |  |
-| 13 to < 16 feet | #E9B023 |  |
-| 16 to < 21 feet | #E56524 |  |
-| 21+ feet | #B73865 |  |
+| No Data | #00000000 | 1.0 |
+| 1 to < 4 feet | #728d97 | 4.0 |
+| 4 to < 7 feet | #73b7ea | 7.0 |
+| 7 to < 10 feet | #99d9a7 | 10.0 |
+| 10 to < 13 feet | #f8d88b | 13.0 |
+| 13 to < 16 feet | #e9b023 | 16.0 |
+| 16 to < 21 feet | #e56524 | 21.0 |
+| 21+ feet | #b73865 |  |
 
 
 ### `hsi` Legend
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 | #9e0142 | 1.0 |
-| 1 to 49 | #d53e4f | 50.0 |
-| 50 to 100 | #f46d43 | 100.0 |
-| 100 to 499 | #fdae61 | 500.0 |
-| 500 to 999 | #fee08b | 1000.0 |
-| 1,000 to 1,499 | #e6f598 | 1500.0 |
-| 1,500 to 1,999 | #abdda4 | 2000.0 |
-| 2,000 to 2,499 | #66c2a5 | 2500.0 |
-| 2,500 to 2,999 | #3288bd | 3000.0 |
-| 3,000 or more | #5e4fa2 |  |
+| 0 to < 0.1 | #313695 | 0.1 |
+| 0.1 to < 0.2 | #4575b4 | 0.2 |
+| 0.2 to < 0.3 | #74add1 | 0.3 |
+| 0.3 to < 0.4 | #abd9e9 | 0.4 |
+| 0.4 to < 0.5 | #e0f3f8 | 0.5 |
+| 0.5 to < 0.6 | #fee090 | 0.6 |
+| 0.6 to < 0.7 | #fdae61 | 0.7 |
+| 0.7 to < 0.8 | #f46d43 | 0.8 |
+| 0.8 to < 0.9 | #d73027 | 0.9 |
+| 0.9 to 1 | #a50026 |  |
 
 
 ### `inun` Legend
@@ -515,10 +552,51 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| Land Loss | #4591ac |  |
-| Induced Loss | #00f0f0 |  |
-| Land Maintained | #99c104 |  |
-| Land Gain | #265118 |  |
+| No Data | #00000000 | 12.0 |
+| Land Loss | #4591ac | 13.0 |
+| No Data | #00000000 | 21.0 |
+| Land Gain | #265118 | 22.0 |
+| No Data | #00000000 | 23.0 |
+| Land Gain | #265118 | 31.0 |
+| No Data | #00000000 | 32.0 |
+| Land Loss | #4591ac | 33.0 |
+| No Data | #00000000 | 52.0 |
+| Land Loss | #4591ac | 55.0 |
+| No Data | #00000000 | 112.0 |
+| Induced Loss | #00f0f0 | 113.0 |
+| No Data | #00000000 | 121.0 |
+| Land Maintained | #99c104 | 122.0 |
+| Land Loss | #4591ac | 123.0 |
+| Land Maintained | #99c104 | 131.0 |
+| No Data | #00000000 | 132.0 |
+| Induced Loss | #00f0f0 | 133.0 |
+| No Data | #00000000 | 211.0 |
+| Land Gain | #265118 | 212.0 |
+| Induced Loss | #00f0f0 | 213.0 |
+| Land Gain | #265118 | 222.0 |
+| No Data | #00000000 | 223.0 |
+| Land Gain | #265118 | 232.0 |
+| Induced Loss | #00f0f0 | 233.0 |
+| Land Gain | #265118 | 311.0 |
+| No Data | #00000000 | 312.0 |
+| Induced Loss | #00f0f0 | 313.0 |
+| No Data | #00000000 | 321.0 |
+| Land Maintained | #99c104 | 322.0 |
+| Land Loss | #4591ac | 323.0 |
+| Land Maintained | #99c104 | 331.0 |
+| No Data | #00000000 | 332.0 |
+| Induced Loss | #00f0f0 | 333.0 |
+| No Data | #00000000 | 512.0 |
+| Induced Loss | #00f0f0 | 513.0 |
+| No Data | #00000000 | 521.0 |
+| Land Maintained | #99c104 | 522.0 |
+| Land Loss | #4591ac | 523.0 |
+| Land Maintained | #99c104 | 531.0 |
+| No Data | #00000000 | 532.0 |
+| Induced Loss | #00f0f0 | 533.0 |
+| No Data | #00000000 | 552.0 |
+| Induced Loss | #00f0f0 | 553.0 |
+| No Data | #00000000 |  |
 
 
 ### `lnd_type` Legend
@@ -687,21 +765,25 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| Maidencane | #a6cecf |  |
-| Three-Square | #1f78b4 |  |
-| Rosseau Cane | #b2df8a |  |
-| Paspalum | #5ba02c |  |
-| Wiregrass | #fb9a99 |  |
-| Bulltongue | #e31a1c |  |
-| Needlerush | #fdbf6f |  |
-| Bulrush | #ff7f00 |  |
-| Brackish Mix | #cab2d6 |  |
-| Oystergrass | #6a3d9a |  |
-| Saltgrass | #ffff99 |  |
-| Bottomland Hardwood Forest + Swamp Forest | #005a00 |  |
-| Barrier Island Vegetation | #ff80ff |  |
-| Unvegetated | #7f5f1e |  |
-| Flotant | #8cf0f0 |  |
+| No Data | #00000000 | 1.0 |
+| Maidencane | #a6cecf | 2.0 |
+| Three-Square | #1f78b4 | 3.0 |
+| Rosseau Cane | #b2df8a | 4.0 |
+| Paspalum | #5ba02c | 5.0 |
+| Wiregrass | #fb9a99 | 6.0 |
+| Bulltongue | #e31a1c | 7.0 |
+| Needlerush | #fdbf6f | 8.0 |
+| Bulrush | #ff7f00 | 9.0 |
+| Brackish Mix | #cab2d6 | 10.0 |
+| Oystergrass | #6a3d9a | 11.0 |
+| Saltgrass | #ffff99 | 12.0 |
+| Bottomland Hardwood Forest + Swamp Forest | #005a00 | 13.0 |
+| Barrier Island Vegetation | #ff80ff | 14.0 |
+| No Data | #ffffff | 300.0 |
+| Unvegetated | #7f5f1e | 400.0 |
+| No Data | #00000000 | 500.0 |
+| Flotant | #8cf0f0 | 9999.0 |
+| No Data | #ffffff |  |
 
 
 ### `veg_area` Legend

@@ -28,7 +28,11 @@ from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileRespo
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
-from cpra.mp.data.api.utils import get_visualization_class, validate_compression, validate_format
+from cpra.mp.data.api.utils import (
+    get_visualization_class,
+    validate_compression,
+    validate_format,
+)
 from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -87,7 +91,9 @@ def variables() -> list[Variable]:
 def dimensions(session: MPDSession) -> list[Dimension]:
     mpd_dimension_values = defaultdict(list)
     for dv in session.exec(select(MPDDimensionValue)).all():
-        mpd_dimension_values[dv.dimension].append(DimensionValue(value=dv.value_int, label=dv.label))
+        mpd_dimension_values[dv.dimension].append(
+            DimensionValue(value=dv.value_str if dv.value_int is None else dv.value_int, label=dv.label)
+        )
 
     return [
         Dimension(
