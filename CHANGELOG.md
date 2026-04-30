@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.38.0](https://github.com/pscedu/cpra.mp.data/compare/v0.37.0...v0.38.0) (2026-04-30)
+
+
+### Features
+
+* add include_file_paths option to read_data ([67cfe33](https://github.com/pscedu/cpra.mp.data/commit/67cfe33e2f587ac4a089d5fe2e27c1650a8efde0))
+* **structure:** add MP29 grids ([94928e3](https://github.com/pscedu/cpra.mp.data/commit/94928e325a76596d61848d3ce59a1e87ccdaf386))
+
 ## [0.37.0](https://github.com/pscedu/cpra.mp.data/compare/v0.36.4...v0.37.0) (2026-03-26)
 
 
