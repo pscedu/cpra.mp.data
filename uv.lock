@@ -1236,7 +1236,7 @@ wheels = [
 [[package]]
 name = "maplibre"
 version = "0.3.6"
-source = { git = "https://github.com/jpuerto-psc/py-maplibregl#5068c15782d88b141140ed94c8bb2f2e375e6c9f" }
+source = { git = "https://github.com/jpuerto-psc/py-maplibregl#da68570620275386dbf8e18ffeaf2ab6e211f357" }
 dependencies = [
     { name = "branca" },
     { name = "eval-type-backport" },
@@ -1254,6 +1254,22 @@ all = [
     { name = "shiny" },
     { name = "traitlets" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "anywidget", marker = "extra == 'all' or extra == 'anywidget' or extra == 'ipywidget'", specifier = ">=0.9.0" },
+    { name = "branca" },
+    { name = "eval-type-backport" },
+    { name = "geopandas", marker = "extra == 'all'", specifier = ">=0.14.2,<0.15.0" },
+    { name = "htmltools", marker = "extra == 'all' or extra == 'shiny'", specifier = ">=0.5.1" },
+    { name = "jinja2", specifier = ">=3.1.6" },
+    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.1.4,<3.0.0" },
+    { name = "pmtiles", marker = "extra == 'all' or extra == 'pmtiles'" },
+    { name = "pydantic", specifier = ">=2.5.3" },
+    { name = "shiny", marker = "extra == 'all' or extra == 'shiny'", specifier = ">0.7.0" },
+    { name = "traitlets", marker = "extra == 'all' or extra == 'anywidget' or extra == 'ipywidget'" },
+]
+provides-extras = ["all", "anywidget", "ipywidget", "pmtiles", "shiny"]
 
 [[package]]
 name = "markdown-it-py"

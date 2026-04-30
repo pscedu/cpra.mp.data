@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -12,6 +14,16 @@ try:
 except ImportError:
     MapOptions = None  # type: ignore[assignment,misc]
     MapWidget = None  # type: ignore[assignment,misc]
+
+def _ensure_legend_env() -> None:
+    """Point legend env vars at bundled legend.js/css if not already set.
+
+    The fork reads os.path.isfile(val) → reads content → sends inline to JS.
+    JS creates a blob URL for import() and injects CSS as a <style> tag,
+    so no browser URL resolution or CORS is needed.
+    """
+    os.environ.setdefault("PYMAPLIBREGL_LEGEND_JS", str((Path(__file__).parent / "jupyter_assets/legend.js").resolve()))
+    os.environ.setdefault("PYMAPLIBREGL_LEGEND_CSS", str((Path(__file__).parent / "jupyter_assets/legend.css").resolve()))
 
 
 class JupyterMap:
@@ -47,19 +59,15 @@ class JupyterMap:
         self.url = f"{path}?{query}" if query else path
 
     def _make_widget(self) -> "MapWidget":
-        """Fetch the style, build the MapWidget, and initialize global state.
+        _ensure_legend_env()
 
-        MapLibre's automatic setGlobalState(style.state) reads e[key].default,
-        but may not fire reliably in the widget context. We explicitly call
-        setGlobalStateProperty for each state key with the flat value dict,
-        queued to run on map load via add_call.
-        """
         with urlopen(self.url) as resp:
             style = json.loads(resp.read())
 
         state = style.get("state", {})
         values = (state.get("values") or {}).get("default", {})
         selection_colors = (state.get("selectionColors") or {}).get("default", {})
+        legend = (state.get("legend") or {}).get("default", {})
 
         widget = MapWidget(
             MapOptions(
@@ -68,8 +76,10 @@ class JupyterMap:
                 zoom=_DEFAULT_ZOOM,
             )
         )
-        widget.add_call("setGlobalStateProperty", "values", values)
-        widget.add_call("setGlobalStateProperty", "selectionColors", selection_colors)
+        widget.set_global_state_property("values", values)
+        widget.set_global_state_property("selectionColors", selection_colors)
+        widget.set_global_state_property("legend", legend)
+
         return widget
 
     def _repr_mimebundle_(self, **kwargs):
