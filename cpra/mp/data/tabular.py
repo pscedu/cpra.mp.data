@@ -23,7 +23,7 @@ ALPHA_COLUMN = re.compile(r"^[a-z]")
 NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
-def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
+def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
     # Validate the input keyword arguments.
@@ -50,6 +50,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
         cache=cache,
         hive_partitioning=hive_partitioning,
         hive_schema=hive_schema,
+        include_file_paths=include_file_paths,
     )
 
     # Filter based on keyword arguments.
@@ -62,6 +63,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, **kwargs):
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
         cs.digit(),
+        *([pl.col(include_file_paths)] if include_file_paths else []),
     )
 
     return lf
