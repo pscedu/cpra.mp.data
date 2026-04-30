@@ -39,9 +39,7 @@ def required_columns(
     return (
         [
             col.name
-            for col in df.select(
-                **{dim.name: dim.required for dim in DIMENSIONS.values()}
-            )
+            for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
             if col.any()
             and (include_dataset or col.name not in DATASET_DIMENSIONS)
             and (include_metadata or col.name not in METADATA_DIMENSIONS)
@@ -60,9 +58,7 @@ def validate_data_frame(df, required_cols=None):
     # Raise an exception if required columns are missing.
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        raise ValidationError(
-            f"Required columns are missing: {', '.join(missing_cols)}"
-        )
+        raise ValidationError(f"Required columns are missing: {', '.join(missing_cols)}")
 
     expressions = {}
 
@@ -75,31 +71,19 @@ def validate_data_frame(df, required_cols=None):
     # Add validation expressions for variable-geographic_unit and variable-time_unit.
     expressions["variable_matches_grid"] = pl.any_horizontal(
         *[
-            (
-                (pl.col("variable") == n)
-                & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units)
-            )
+            ((pl.col("variable") == n) & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units))
             for n, v in VARIABLES.items()
         ]
     )
     expressions["variable_matches_time_unit"] = pl.any_horizontal(
-        *[
-            ((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units))
-            for n, v in VARIABLES.items()
-        ]
+        *[((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units)) for n, v in VARIABLES.items()]
     )
 
-    results = df.select(**expressions).with_columns(
-        valid=pl.all_horizontal(pl.col("*"))
-    )
+    results = df.select(**expressions).with_columns(valid=pl.all_horizontal(pl.col("*")))
 
     if not results["valid"].all():
         failed_row_count = results["valid"].len() - results["valid"].sum()
-        failed_cols = [
-            series.name
-            for series in results
-            if not series.all() and series.name != "valid"
-        ]
+        failed_cols = [series.name for series in results if not series.all() and series.name != "valid"]
         msg = f"{failed_row_count} rows failed validation: {', '.join(failed_cols)}"
         raise ValidationError(msg)
 
@@ -115,7 +99,7 @@ def extract_dimension_value(column, data=None, **kwargs):
 
     try:
         return data[column][0]
-    except (KeyError, IndexError, ValueError, ColumnNotFoundError):
+    except (KeyError, IndexError, TypeError, ValueError, ColumnNotFoundError):
         return None
 
 
@@ -150,11 +134,7 @@ def cast_columns(df):
     """Cast all dimension columns in the given dataframe to the correct dtype."""
 
     return df.with_columns(
-        **{
-            dim.name: pl.col(dim.name).cast(dim.dtype)
-            for dim in DIMENSIONS.values()
-            if dim.name in df.columns
-        }
+        **{dim.name: pl.col(dim.name).cast(dim.dtype) for dim in DIMENSIONS.values() if dim.name in df.columns}
     )
 
 
@@ -187,19 +167,14 @@ def build_glob_pattern(required_cols, extension=None, **kwargs):
         for k, v in kwargs.items()
         if not isinstance(v, (list, tuple)) or len(v) == 1
     }
-    dimension_patterns = [
-        f"{col}={str(single_values[col]) if col in single_values else '*'}"
-        for col in required_cols
-    ]
+    dimension_patterns = [f"{col}={str(single_values[col]) if col in single_values else '*'}" for col in required_cols]
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
 
 
-def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs):
+def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, include_file_paths="path", **kwargs):
     """Create a LazyFrame with information about matched paths."""
 
-    glob_pattern = build_glob_pattern(
-        required_cols=required_cols, extension=extension, **kwargs
-    )
+    glob_pattern = build_glob_pattern(required_cols=required_cols, extension=extension, **kwargs)
     suffix = f"\\.{extension}" if extension else "$"
 
     return (
@@ -207,14 +182,11 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
         .with_columns(path=pl.col("path").cast(pl.String))
         .select(
             [
-                pl.col("path")
-                .str.extract(f"{dim.name}=([^/]+)(/|{suffix})", 1)
-                .cast(dim.dtype)
-                .alias(dim.name)
+                pl.col("path").str.extract(f"{dim.name}=([^/]+)(/|{suffix})", 1).cast(dim.dtype).alias(dim.name)
                 for dim in DIMENSIONS.values()
                 if dim.name in required_cols
             ]
-            + [pl.col("path")]
+            + ([pl.col("path").alias(include_file_paths)] if include_file_paths else [])
         )
         .sort(*required_cols)
         .lazy()

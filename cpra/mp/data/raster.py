@@ -66,7 +66,7 @@ def vrt(paths):
     return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
 
 
-def read_cog(base_path=BASE_PATH, **kwargs):
+def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
     """Locate matching COG paths."""
 
     # Validate the input keyword arguments.
@@ -75,7 +75,7 @@ def read_cog(base_path=BASE_PATH, **kwargs):
 
     # Construct the glob lazy frame.
     required_cols = required_columns(input_df, include_metadata=False)
-    lf = glob_lazy_frame(required_cols=required_cols, extension="tif", **kwargs)
+    lf = glob_lazy_frame(required_cols=required_cols, extension="tif", include_file_paths=include_file_paths, **kwargs)
     filter_exps = get_filter_expressions(**kwargs)
     if filter_exps:
         lf = lf.filter(*filter_exps)

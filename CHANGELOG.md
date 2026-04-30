@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.38.0](https://github.com/pscedu/cpra.mp.data/compare/v0.37.0...v0.38.0) (2026-04-30)
+
+
+### Features
+
+* add include_file_paths option to read_data ([67cfe33](https://github.com/pscedu/cpra.mp.data/commit/67cfe33e2f587ac4a089d5fe2e27c1650a8efde0))
+* **structure:** add MP29 grids ([94928e3](https://github.com/pscedu/cpra.mp.data/commit/94928e325a76596d61848d3ce59a1e87ccdaf386))
+
+## [0.37.0](https://github.com/pscedu/cpra.mp.data/compare/v0.36.4...v0.37.0) (2026-03-26)
+
+
+### Features
+
+* **structure:** add region and ecoregion dimensions ([c2c0c86](https://github.com/pscedu/cpra.mp.data/commit/c2c0c8690c6d870b88cdd97dd02db2ae56b4f4e8))
+
+
+### Bug Fixes
+
+* **structure:** add damage legend and rename asset count legend ([8887b1d](https://github.com/pscedu/cpra.mp.data/commit/8887b1d529ff0099493aa58f1ed151a2656b0110))
+* **structure:** use grid labels ([7f6d5af](https://github.com/pscedu/cpra.mp.data/commit/7f6d5afd25541ceeb274d9a14baebaf71b5c3832))
+
+## [0.36.4](https://github.com/pscedu/cpra.mp.data/compare/v0.36.3...v0.36.4) (2026-03-18)
+
+
+### Bug Fixes
+
+* **structure:** update HSI legend ([2e7aa64](https://github.com/pscedu/cpra.mp.data/commit/2e7aa64d279142d1fbe8fb23685e17fba99d638e))
+
+## [0.36.3](https://github.com/pscedu/cpra.mp.data/compare/v0.36.2...v0.36.3) (2026-03-18)
+
+
+### Bug Fixes
+
+* **structure:** update legends for CLARA and HSI ([acd6cff](https://github.com/pscedu/cpra.mp.data/commit/acd6cff36a5ace6ca688f7459e64ae3cf4802379))
+
+
+### Documentation
+
+* **structure:** update data structure docs ([99a1c08](https://github.com/pscedu/cpra.mp.data/commit/99a1c08ea8bb92909baa6e8ff055d19f878d4e0d))
+
 ## [0.36.2](https://github.com/pscedu/cpra.mp.data/compare/v0.36.1...v0.36.2) (2026-03-02)
 
 
