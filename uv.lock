@@ -452,8 +452,6 @@ dependencies = [
     { name = "altair" },
     { name = "cachetools" },
     { name = "click" },
-    { name = "jupyterlab" },
-    { name = "maplibre", extra = ["all"] },
     { name = "mercantile" },
     { name = "numpy" },
     { name = "pillow" },
@@ -480,6 +478,10 @@ bridges2 = [
     { name = "sqlalchemy" },
     { name = "topojson" },
 ]
+jupyter = [
+    { name = "jupyterlab" },
+    { name = "maplibre", extra = ["all"] },
+]
 scripts = [
     { name = "fastexcel" },
     { name = "tippecanoe" },
@@ -495,8 +497,8 @@ requires-dist = [
     { name = "fastexcel", marker = "extra == 'scripts'" },
     { name = "geojson", marker = "extra == 'bridges2'" },
     { name = "geopandas", marker = "extra == 'bridges2'" },
-    { name = "jupyterlab", specifier = ">=4.5.7" },
-    { name = "maplibre", extras = ["all"], git = "https://github.com/jpuerto-psc/py-maplibregl" },
+    { name = "jupyterlab", marker = "extra == 'jupyter'", specifier = ">=4.5.7" },
+    { name = "maplibre", extras = ["all"], marker = "extra == 'jupyter'", git = "https://github.com/jpuerto-psc/py-maplibregl" },
     { name = "mercantile" },
     { name = "numpy" },
     { name = "openpyxl", marker = "extra == 'bridges2'" },
@@ -514,7 +516,7 @@ requires-dist = [
     { name = "tippecanoe", marker = "extra == 'scripts'" },
     { name = "topojson", marker = "extra == 'bridges2'" },
 ]
-provides-extras = ["api", "bridges2", "scripts"]
+provides-extras = ["api", "bridges2", "jupyter", "scripts"]
 
 [[package]]
 name = "debugpy"
@@ -1254,22 +1256,6 @@ all = [
     { name = "shiny" },
     { name = "traitlets" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anywidget", marker = "extra == 'all' or extra == 'anywidget' or extra == 'ipywidget'", specifier = ">=0.9.0" },
-    { name = "branca" },
-    { name = "eval-type-backport" },
-    { name = "geopandas", marker = "extra == 'all'", specifier = ">=0.14.2,<0.15.0" },
-    { name = "htmltools", marker = "extra == 'all' or extra == 'shiny'", specifier = ">=0.5.1" },
-    { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "pandas", marker = "extra == 'all'", specifier = ">=2.1.4,<3.0.0" },
-    { name = "pmtiles", marker = "extra == 'all' or extra == 'pmtiles'" },
-    { name = "pydantic", specifier = ">=2.5.3" },
-    { name = "shiny", marker = "extra == 'all' or extra == 'shiny'", specifier = ">0.7.0" },
-    { name = "traitlets", marker = "extra == 'all' or extra == 'anywidget' or extra == 'ipywidget'" },
-]
-provides-extras = ["all", "anywidget", "ipywidget", "pmtiles", "shiny"]
 
 [[package]]
 name = "markdown-it-py"
