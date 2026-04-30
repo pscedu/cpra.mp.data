@@ -2,10 +2,6 @@ import json
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
-from cpra.mp.data.config import MPD_URI
-
-_FALLBACK_BASE = "https://api.mpdp.coastal.la.gov"
-
 # Default center and zoom for Louisiana
 _DEFAULT_CENTER = [-90.756, 29.877]
 _DEFAULT_ZOOM = 7
@@ -34,8 +30,9 @@ class JupyterMap:
     """
 
     def __init__(self, variable: str, grid: str, time_unit: str, **kwargs):
-        # TODO - Fix this. MPD_URI isn't the right env var since it points to the DB. Could just hardcode to the actual base.
-        base = MPD_URI or _FALLBACK_BASE
+        base = "https://api.mpdp.coastal.la.gov"
+        if "base_url" in kwargs:
+            base = kwargs.pop("base_url")
         path = f"{base}/v1/datasets/{variable}/{grid}/{time_unit}/visualization/map.json"
 
         params = []
