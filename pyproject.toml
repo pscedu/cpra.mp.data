@@ -38,6 +38,7 @@ dependencies = [
 [project.optional-dependencies]
 api = ["fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel"]
 bridges2 = [
+    "anywidget",
     "connectorx",
     "geojson",
     "geopandas",
@@ -45,7 +46,8 @@ bridges2 = [
     "pandas",
     "psycopg2-binary",
     "sqlalchemy",
-    "topojson"
+    "topojson",
+    "traitlets",
 ]
 scripts = ["fastexcel", "tippecanoe"]
 
