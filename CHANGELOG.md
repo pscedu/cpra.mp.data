@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.39.0](https://github.com/pscedu/cpra.mp.data/compare/v0.38.0...v0.39.0) (2026-05-01)
+
+
+### Features
+
+* **bridges2:** add anywidget and traitlets packages ([dce2897](https://github.com/pscedu/cpra.mp.data/commit/dce2897074cd2f43e5b7424ea588feae5431181a))
+
+
+### Bug Fixes
+
+* **structure:** remove lnd_chng variable ([45c4445](https://github.com/pscedu/cpra.mp.data/commit/45c4445a40c01d21a9b8c022abdf53241de6da29))
+
 ## [0.38.0](https://github.com/pscedu/cpra.mp.data/compare/v0.37.0...v0.38.0) (2026-04-30)
 
 
