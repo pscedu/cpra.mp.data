@@ -75,7 +75,6 @@ Variables represent a type of model output. Each variable has a single data type
 | Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | veg_species_code | 1 |
 | Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | .2f | elev |  | 1 |
 | Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m | .2f | inun |  | 1 |
-| Land Change | lnd_chng | icm | morph | Int32 | morph_pixel | annual |  | d | lnd_chng |  | 1 |
 | Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  | d | lnd_type |  | 1 |
 | Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm | .2f | accr |  | -1 |
 | Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr | .2f | mnrl_dep |  | -1 |
