@@ -66,11 +66,24 @@ def vrt(paths):
     return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
 
 
-def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
+def delete_cog(data=None, base_path=BASE_PATH, **kwargs):
+    """Delete matching COG paths."""
+    input_df = cast_columns(get_input_data_frame(data, **kwargs))
+
+    # Make sure that all dimensions are defined.
+    validate_data_frame(input_df)
+
+    # Get the COG paths.
+    df = read_cog(input_df, base_path=base_path).select("path").collect()
+    for cog_path in df["path"]:
+        Path(cog_path).unlink()
+
+
+def read_cog(data=None, base_path=BASE_PATH, include_file_paths="path", **kwargs):
     """Locate matching COG paths."""
 
     # Validate the input keyword arguments.
-    input_df = get_input_data_frame(**kwargs)
+    input_df = get_input_data_frame(data, **kwargs)
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Construct the glob lazy frame.

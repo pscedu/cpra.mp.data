@@ -9,6 +9,7 @@ from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
     build_glob_pattern,
+    cast_columns,
     dataset_path,
     get_filter_expressions,
     get_input_data_frame,
@@ -23,11 +24,30 @@ ALPHA_COLUMN = re.compile(r"^[a-z]")
 NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
-def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
+def delete_parquet(data=None, base_path=BASE_PATH, **kwargs):
+    """Delete or rewrite Parquet files."""
+    input_df = cast_columns(get_input_data_frame(data, **kwargs))
+
+    # Make sure that all dimensions are defined.
+    validate_data_frame(input_df)
+
+    # Get the Parquet paths.
+    paths_df = read_parquet(input_df, base_path=base_path, include_file_paths="path").select("path").unique().collect()
+
+    # Write filtered results (with the designated rows removed).
+    data_df = pl.scan_parquet(*paths_df["path"]).join(input_df, on=input_df.columns, how="anti")
+    write_parquet(data_df)
+
+    # Remove rewritten Parquet files.
+    for parquet_path in paths_df["path"]:
+        Path(parquet_path).unlink()
+
+
+def read_parquet(data=None, base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
 
     # Validate the input keyword arguments.
-    input_df = get_input_data_frame(**kwargs)
+    input_df = get_input_data_frame(data, **kwargs)
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Calculate the dataset directory path and expressions.

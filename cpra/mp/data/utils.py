@@ -193,9 +193,9 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, include_
     )
 
 
-def get_input_data_frame(**kwargs):
+def get_input_data_frame(data=None, **kwargs):
     """Create an input data frame from keyword arguments."""
-    df = None
+    df = data
     for key, value in kwargs.items():
         if df is None:
             df = pl.DataFrame({key: value})

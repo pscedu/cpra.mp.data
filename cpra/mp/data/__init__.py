@@ -1,5 +1,5 @@
-from cpra.mp.data.raster import read_cog, vrt, write_cog  # noqa
-from cpra.mp.data.tabular import compact_parquet, read_parquet, write_parquet
+from cpra.mp.data.raster import delete_cog, read_cog, vrt, write_cog  # noqa
+from cpra.mp.data.tabular import compact_parquet, delete_parquet, read_parquet, write_parquet
 from cpra.mp.data.utils import read_fortran_array, validate_grid  # noqa
 
 
@@ -10,6 +10,17 @@ def compact_data(**kwargs):
 
     if grid.grid_type == "vector":
         return compact_parquet(**kwargs)
+
+
+def delete_data(data=None, **kwargs):
+    """Delete model data from disk."""
+
+    grid = validate_grid(data, **kwargs)
+
+    if grid.grid_type == "raster":
+        return delete_cog(data, **kwargs)
+    else
+        return delete_parquet(data, **kwargs)
 
 
 def read_data(**kwargs):
