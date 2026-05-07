@@ -19,7 +19,7 @@ def delete_data(data=None, **kwargs):
 
     if grid.grid_type == "raster":
         return delete_cog(data, **kwargs)
-    else
+    else:
         return delete_parquet(data, **kwargs)
 
 
