@@ -49,7 +49,7 @@ class Dimension:
             exprs[f"{self.name}_is_not_null"] = pl.col(self.name).is_not_null()
 
         if self.values is not None:
-            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"])
+            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"].implode())
 
         if self.min_value is not None:
             exprs[f"{self.name}_minimum_value"] = pl.col(self.name) >= self.min_value
