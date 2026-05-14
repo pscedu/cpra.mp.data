@@ -49,12 +49,19 @@ bridges2 = [
     "topojson",
     "traitlets",
 ]
+jupyter = [
+    "jupyterlab>=4.5.7",
+    "maplibre[all]"
+]
 scripts = ["fastexcel", "tippecanoe"]
 
 [tool.basedpyright]
 reportAny = false
 reportExplicitAny = false
 typeCheckingMode = "off"
+
+[tool.uv.sources]
+maplibre = { git = "https://github.com/jpuerto-psc/py-maplibregl" }
 
 [tool.uv.build-backend]
 module-name = "cpra.mp.data"
