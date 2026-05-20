@@ -50,6 +50,10 @@ bridges2 = [
     "traitlets",
 ]
 scripts = ["fastexcel", "tippecanoe"]
+testing = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.basedpyright]
 reportAny = false

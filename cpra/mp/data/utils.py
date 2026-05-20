@@ -103,12 +103,13 @@ def extract_dimension_value(column, data=None, **kwargs):
         return None
 
 
-def dataset_path(base_path, **kwargs):
+def dataset_path(base_path, data=None, **kwargs):
     """Generate a dataset directory path from keyword arguments."""
 
     dataset_path = Path(base_path)
     for dim in DATASET_DIMENSIONS.values():
-        dataset_path = dataset_path / f"{dim.name}={kwargs[dim.name]!s}"
+        value = extract_dimension_value(dim.name, data, **kwargs)
+        dataset_path = dataset_path / f"{dim.name}={value!s}"
 
     return dataset_path
 

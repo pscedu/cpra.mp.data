@@ -35,8 +35,17 @@ def delete_parquet(data=None, base_path=BASE_PATH, **kwargs):
     paths_df = read_parquet(input_df, base_path=base_path, include_file_paths="path").select("path").unique().collect()
 
     # Write filtered results (with the designated rows removed).
-    data_df = pl.scan_parquet(*paths_df["path"]).join(input_df, on=input_df.columns, how="anti")
-    write_parquet(data_df)
+    dataset_exprs = [
+        pl.lit(input_df[dim.name][0]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()
+    ]
+    data_df = (
+        pl.scan_parquet(list(paths_df["path"]))
+        .select(*dataset_exprs, pl.all())
+        .join(input_df.lazy(), on=input_df.columns, how="anti")
+    ).collect()
+
+    if not data_df.is_empty():
+        write_parquet(data_df, base_path=base_path)
 
     # Remove rewritten Parquet files.
     for parquet_path in paths_df["path"]:
@@ -51,9 +60,10 @@ def read_parquet(data=None, base_path=BASE_PATH, cache=True, include_file_paths=
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
     # Calculate the dataset directory path and expressions.
-    dataset_dir = dataset_path(base_path, **kwargs)
-    dataset_exprs = [pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()]
-    filter_args = get_filter_expressions(**kwargs)
+    dataset_dir = dataset_path(base_path, data, **kwargs)
+    dataset_exprs = [
+        pl.lit(input_df[dim.name][0]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()
+    ]
 
     # Default to an un-partitioned dataset.
     hive_partitioning = False
@@ -73,15 +83,12 @@ def read_parquet(data=None, base_path=BASE_PATH, cache=True, include_file_paths=
         include_file_paths=include_file_paths,
     )
 
-    # Filter based on keyword arguments.
-    if filter_args:
-        lf = lf.filter(*filter_args)
-
-    # Sort columns and add dataset values.
+    # Sort columns and add dataset values. Then filter by the input data frame.
     required_cols = required_columns(input_df)
-    lf = lf.select(
+    non_dataset_cols = [col for col in required_cols if col not in DATASET_DIMENSIONS]
+    lf = lf.join(input_df.lazy(), on=non_dataset_cols, how="semi").select(
         *dataset_exprs,
-        *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
+        *[pl.col(col) for col in non_dataset_cols],
         cs.digit(),
         *([pl.col(include_file_paths)] if include_file_paths else []),
     )
