@@ -4,6 +4,7 @@ accr,2 to < 4,#fbb4b9,4.0
 accr,4 to < 6,#f768a1,6.0
 accr,6 to < 8,#c51b8a,8.0
 accr,8 to 10,#7a0177,
+coverage,No Data,#00000000,0.0
 coverage,0 to < 0.2,#fee5d9,0.2
 coverage,0.2 to < 0.4,#fcae91,0.4
 coverage,0.4 to < 0.6,#fb6a4a,0.6
@@ -70,6 +71,7 @@ flood_depth,10 to < 13 feet,#f8d88b,13.0
 flood_depth,13 to < 16 feet,#e9b023,16.0
 flood_depth,16 to < 21 feet,#e56524,21.0
 flood_depth,21+ feet,#b73865,
+hsi,No Data,#00000000,0.0
 hsi,0 to < 0.1,#313695,0.1
 hsi,0.1 to < 0.2,#4575b4,0.2
 hsi,0.2 to < 0.3,#74add1,0.3
