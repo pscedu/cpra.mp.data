@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.40.0](https://github.com/pscedu/cpra.mp.data/compare/v0.39.0...v0.40.0) (2026-05-27)
+
+
+### Features
+
+* **structure:** add legends for coverage and trg ([3cbb915](https://github.com/pscedu/cpra.mp.data/commit/3cbb9152c3d8eb389278c93596f5f2fe0448d414))
+
+
+### Bug Fixes
+
+* **structure:** reverse colors for salinity ([6d333d8](https://github.com/pscedu/cpra.mp.data/commit/6d333d84889bda8da73de33d1bce14732ab4f0bf))
+
 ## [0.39.0](https://github.com/pscedu/cpra.mp.data/compare/v0.38.0...v0.39.0) (2026-05-01)
 
 
