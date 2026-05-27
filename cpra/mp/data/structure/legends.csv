@@ -4,6 +4,11 @@ accr,2 to < 4,#fbb4b9,4.0
 accr,4 to < 6,#f768a1,6.0
 accr,6 to < 8,#c51b8a,8.0
 accr,8 to 10,#7a0177,
+coverage,0 to < 0.2,#fee5d9,0.2
+coverage,0.2 to < 0.4,#fcae91,0.4
+coverage,0.4 to < 0.6,#fb6a4a,0.6
+coverage,0.6 to < 0.8,#de2d26,0.8
+coverage,0.8 to 1.0,#a50f15,
 damage,$0 to < $1K,#edf8fb,1000.0
 damage,$1K to < $10K,#b3cde3,10000.0
 damage,$10K to < $100K,#8c96c6,100000.0
@@ -199,6 +204,12 @@ tmp,22 to < 23,#ffffbf,23.0
 tmp,23 to < 24,#e6f598,24.0
 tmp,24 to < 25,#abdda4,25.0
 tmp,25 to < 26,#66c2a5,26.0
+trg,0 to < 0.33,#eff3ff,0.33
+trg,0.33 to < 0.67,#c6dbef,0.67
+trg,0.67 to < 1.00,#9ecae1,1.0
+trg,1.00 to < 1.33,#6baed6,1.33
+trg,1.33 to < 1.67,#3182bd,1.67
+trg,1.67 or more,#08519c,
 tmp,27 or more,#3288bd,
 tss,0 to < 10,#d53e4f,10.0
 tss,10 to < 50,#f46d43,50.0
