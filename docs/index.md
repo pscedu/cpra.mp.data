@@ -63,16 +63,16 @@ Variables represent a type of model output. Each variable has a single data type
 | Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr | d |  | aggregate_type | -1 |
 | Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr | d |  | aggregate_type | -1 |
 | Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m | .2f | stg | aggregate_type | 1 |
-| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m | .2f |  | aggregate_type | 1 |
-| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m | .2f |  | aggregate_type | 1 |
+| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m | .2f | stg | aggregate_type | 1 |
+| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m | .2f | stg | aggregate_type | 1 |
 | Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C | .1f | tmp | aggregate_type | -1 |
-| Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m | .2f |  | aggregate_type | 1 |
+| Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m | .2f | trg | aggregate_type | 1 |
 | Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L | .1f | tss | aggregate_type | -1 |
-| Vegetation Type: FFIBS Coverage | ffibs_coverage_ratio | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | ffibs_type | 1 |
+| Vegetation Type: FFIBS Coverage | ffibs_coverage_ratio | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  | coverage | ffibs_type | 1 |
 | Vegetation Type: FFIBS | ffibs_score | icm | lavegmod | Float32 | veg_grid_cell | annual |  | .1f | ffibs |  | 1 |
 | Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_grid_cell | annual |  |  | vct |  | 1 |
 | Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_grid_cell | annual | square m |  | veg_area |  | 1 |
-| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | veg_species_code | 1 |
+| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  | coverage | veg_species_code | 1 |
 | Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m | .2f | elev |  | 1 |
 | Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m | .2f | inun |  | 1 |
 | Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  | d | lnd_type |  | 1 |
@@ -402,6 +402,18 @@ Legends determine the breakpoints and colors used to map a variable.
 | 8 to 10 | #7a0177 |  |
 
 
+### `coverage` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No Data | #00000000 | 0.0 |
+| 0 to < 0.2 | #fee5d9 | 0.2 |
+| 0.2 to < 0.4 | #fcae91 | 0.4 |
+| 0.4 to < 0.6 | #fb6a4a | 0.6 |
+| 0.6 to < 0.8 | #de2d26 | 0.8 |
+| 0.8 to 1.0 | #a50f15 |  |
+
+
 ### `damage` Legend
 
 | Label | Color | Upper Bound |
@@ -521,6 +533,7 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
+| No Data | #00000000 | 0.0 |
 | 0 to < 0.1 | #313695 | 0.1 |
 | 0.1 to < 0.2 | #4575b4 | 0.2 |
 | 0.2 to < 0.3 | #74add1 | 0.3 |
@@ -667,14 +680,14 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| 0 to < 0.1 | #d53e4f | 0.1 |
-| 0.1 to < 0.5 | #f46d43 | 0.5 |
-| 0.5 to < 1.0 | #fdae61 | 1.0 |
-| 1.0 to < 2.0 | #fee08b | 2.0 |
-| 2.0 to < 5.0 | #e6f598 | 5.0 |
-| 5.0 to < 10.0 | #abdda4 | 10.0 |
-| 10.0 to < 20.0 | #66c2a5 | 20.0 |
-| 20.0 to 35.0 | #3288bd |  |
+| 0 to < 0.1 | #3288bd | 0.1 |
+| 0.1 to < 0.5 | #66c2a5 | 0.5 |
+| 0.5 to < 1.0 | #abdda4 | 1.0 |
+| 1.0 to < 2.0 | #e6f598 | 2.0 |
+| 2.0 to < 5.0 | #fee08b | 5.0 |
+| 5.0 to < 10.0 | #fdae61 | 10.0 |
+| 10.0 to < 20.0 | #f46d43 | 20.0 |
+| 20.0 to 35.0 | #d53e4f |  |
 
 
 ### `ssf` Legend
@@ -744,6 +757,18 @@ Legends determine the breakpoints and colors used to map a variable.
 | 24 to < 25 | #abdda4 | 25.0 |
 | 25 to < 26 | #66c2a5 | 26.0 |
 | 27 or more | #3288bd |  |
+
+
+### `trg` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| 0 to < 0.33 | #eff3ff | 0.33 |
+| 0.33 to < 0.67 | #c6dbef | 0.67 |
+| 0.67 to < 1.00 | #9ecae1 | 1.0 |
+| 1.00 to < 1.33 | #6baed6 | 1.33 |
+| 1.33 to < 1.67 | #3182bd | 1.67 |
+| 1.67 or more | #08519c |  |
 
 
 ### `tss` Legend
