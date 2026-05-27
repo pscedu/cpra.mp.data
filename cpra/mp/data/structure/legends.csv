@@ -163,14 +163,14 @@ population_change,250 to 499,#e6f598,500.0
 population_change,500 to 999,#abdda4,1000.0
 population_change,"1,000 to 4,999",#66c2a5,5000.0
 population_change,"5,000 or more",#3288bd,
-sal,0 to < 0.1,#d53e4f,0.1
-sal,0.1 to < 0.5,#f46d43,0.5
-sal,0.5 to < 1.0,#fdae61,1.0
-sal,1.0 to < 2.0,#fee08b,2.0
-sal,2.0 to < 5.0,#e6f598,5.0
-sal,5.0 to < 10.0,#abdda4,10.0
-sal,10.0 to < 20.0,#66c2a5,20.0
-sal,20.0 to 35.0,#3288bd,
+sal,0 to < 0.1,#3288bd,0.1
+sal,0.1 to < 0.5,#66c2a5,0.5
+sal,0.5 to < 1.0,#abdda4,1.0
+sal,1.0 to < 2.0,#e6f598,2.0
+sal,2.0 to < 5.0,#fee08b,5.0
+sal,5.0 to < 10.0,#fdae61,10.0
+sal,10.0 to < 20.0,#f46d43,20.0
+sal,20.0 to 35.0,#d53e4f,
 sub,No Data,#00000000,0.0
 sub,0 to < 4,#feebe2,4.0
 sub,4 to < 8,#fbb4b9,8.0
