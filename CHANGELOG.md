@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.40.1](https://github.com/pscedu/cpra.mp.data/compare/v0.40.0...v0.40.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* **structure:** add no data levels to coverage and hsi legends ([95a1035](https://github.com/pscedu/cpra.mp.data/commit/95a103582cda4287a5447a6a3b45aa28bf92ad70))
+
+
+### Documentation
+
+* **structure:** update legend docs ([0038844](https://github.com/pscedu/cpra.mp.data/commit/0038844a9b5e5cbcccaa8277a891d55a132fae6c))
+
 ## [0.40.0](https://github.com/pscedu/cpra.mp.data/compare/v0.39.0...v0.40.0) (2026-05-27)
 
 
