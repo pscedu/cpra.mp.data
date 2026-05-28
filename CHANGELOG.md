@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.42.0](https://github.com/pscedu/cpra.mp.data/compare/v0.41.0...v0.42.0) (2026-05-28)
+
+
+### Features
+
+* **structure:** add icm_v26.0.0 as a model value ([eb19f20](https://github.com/pscedu/cpra.mp.data/commit/eb19f20937682f7b71e2bc2395e0495e672a6098))
+
 ## [0.41.0](https://github.com/pscedu/cpra.mp.data/compare/v0.40.1...v0.41.0) (2026-05-28)
 
 
