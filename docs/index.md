@@ -366,6 +366,7 @@ Grids represent the spatial units for master plan data. Each grid name includes 
 | --- | --- |
 | clara_v2023.0.0 | CLARA v2023.0.0 |
 | icm_v2023.0.0 | ICM v2023.0.0 |
+| icm_v26.0.0 | ICM v26.0.0 |
 <!--END SECTION-->
 
 ## File Paths

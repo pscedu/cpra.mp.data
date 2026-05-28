@@ -57,6 +57,7 @@ migration,base,BASE
 migration,mig,MIG
 model,clara_v2023.0.0,CLARA v2023.0.0
 model,icm_v2023.0.0,ICM v2023.0.0
+model,icm_v26.0.0,ICM v26.0.0
 ns_project_id,1,
 ns_project_id,3,
 participation_rate,0.5,50% Participation
