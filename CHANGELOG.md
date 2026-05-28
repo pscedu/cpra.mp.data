@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.41.0](https://github.com/pscedu/cpra.mp.data/compare/v0.40.1...v0.41.0) (2026-05-28)
+
+
+### Features
+
+* **image:** add sympy to Bridges-2 image ([b5c8a81](https://github.com/pscedu/cpra.mp.data/commit/b5c8a818087fa54352d0c50dc29d3927d23a80bf))
+
 ## [0.40.1](https://github.com/pscedu/cpra.mp.data/compare/v0.40.0...v0.40.1) (2026-05-27)
 
 
