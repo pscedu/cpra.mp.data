@@ -46,6 +46,7 @@ bridges2 = [
     "pandas",
     "psycopg2-binary",
     "sqlalchemy",
+    "sympy",
     "topojson",
     "traitlets",
 ]
