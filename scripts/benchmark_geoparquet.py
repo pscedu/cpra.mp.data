@@ -9,13 +9,13 @@ Tests three primary query patterns:
   3. Model query: all dates × all geographies     (full model read)
 
 Storage configurations tested:
-  wide        - current wide-format production files (read-only, no write)
-  long_date   - long format, single file, sorted by (date, geography_id)
-  long_geo    - long format, single file, sorted by (geography_id, date)
-  year_date   - long format, year-partitioned, date-sorted within each year
-  year_geo    - long format, year-partitioned, geography-sorted within each year
-  year_bloom  - year-partitioned, date-sorted, Bloom filter on geography_id
-  geoparquet  - year_bloom + embedded geometry column (requires geopandas)
+  wide           - current wide-format production files (read-only, no write)
+  long_date      - long format, single file, sorted by (date, geography_id)
+  long_geo       - long format, single file, sorted by (geography_id, date)
+  year_date      - long format, year-partitioned, date-sorted within each year
+  year_geo       - long format, year-partitioned, geography-sorted within each year
+  geoparquet     - year_date + embedded geometry column (requires geopandas)
+  geoparquet_geo - year_geo + embedded geometry column (requires geopandas)
 
 Usage:
     python scripts/benchmark_geoparquet.py \\
@@ -25,7 +25,8 @@ Usage:
         --scenario-id 7 \\
         --model-group-id 500 \\
         --output-dir /tmp/geoparquet_benchmark \\
-        --runs 3
+        --runs 3 \\
+        --threads 2
 
     # Skip slow single-file configs and geometry join:
     python scripts/benchmark_geoparquet.py ... --skip-unpartitioned --skip-geoparquet
@@ -33,11 +34,20 @@ Usage:
 
 import argparse
 import gc
+import os
 import shutil
 import statistics
 import sys
 import time
 from pathlib import Path
+
+# POLARS_MAX_THREADS must be set before polars initialises its thread pool.
+# Pre-parse --threads here so we can export it before the polars import.
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--threads", type=int, default=None)
+_pre_threads = _pre.parse_known_args()[0].threads
+if _pre_threads:
+    os.environ["POLARS_MAX_THREADS"] = str(_pre_threads)
 
 import polars as pl
 import polars.selectors as cs
@@ -363,6 +373,11 @@ def parse_args():
     p.add_argument("--output-dir", default="/tmp/geoparquet_benchmark")
     p.add_argument("--runs", type=int, default=3, help="Benchmark repetitions per query")
     p.add_argument(
+        "--threads", type=int, default=None,
+        help="Polars thread pool size (set via POLARS_MAX_THREADS before import; "
+             "default: all available cores)",
+    )
+    p.add_argument(
         "--skip-unpartitioned",
         action="store_true",
         help="Skip single-file long_date/long_geo (slow write for large datasets)",
@@ -400,6 +415,7 @@ def main():
     filters = {k: v for k, v in read_kwargs.items() if k not in DATASET_DIMENSIONS}
     print(f"  Filters  : {', '.join(f'{k}={v}' for k,v in filters.items()) or 'none'}")
     print(f"  Runs     : {args.runs}")
+    print(f"  Threads  : {pl.thread_pool_size()} (use --threads N to limit)")
     print(f"  Output   : {output_dir}")
     print()
 
@@ -456,10 +472,10 @@ def main():
 
     if not args.skip_geoparquet:
         if not HAS_GEOPANDAS:
-            print("  Skipping geoparquet (geopandas not installed; install the bridges2 extras)")
+            print("  Skipping geoparquet configs (geopandas not installed; install the bridges2 extras)")
         else:
             p = output_dir / "geoparquet"
-            print(f"  Writing geoparquet (year-partitioned, date-sorted, geometry) …")
+            print(f"  Writing geoparquet     (year-partitioned, date-sorted, geometry) …")
             ok = write_geoparquet(
                 long_year_df, p,
                 grid=args.grid,
@@ -468,9 +484,19 @@ def main():
             )
             if ok:
                 print(f"    {dir_size_mb(p):.1f} MB")
-                # Exclude geometry from read benchmarks so timings are comparable
-                # to the non-spatial configurations.
                 configs["geoparquet"] = (p, True, ["geometry"])
+
+            p = output_dir / "geoparquet_geo"
+            print(f"  Writing geoparquet_geo (year-partitioned, geo-sorted, geometry) …")
+            ok = write_geoparquet(
+                long_year_df, p,
+                grid=args.grid,
+                sort_by=["year", "geography_id", "calendar_day"],
+                bloom_filter_options=None,
+            )
+            if ok:
+                print(f"    {dir_size_mb(p):.1f} MB")
+                configs["geoparquet_geo"] = (p, True, ["geometry"])
 
     # ── Step 4: run benchmarks ─────────────────────────────────────────────
     print("\nStep 4/4: Running benchmarks …")
@@ -494,7 +520,13 @@ def main():
     print(f"  Target date: {target_date}  |  Target geography: {target_geo_int}")
     print(f"  Row group size: {ROW_GROUP_SIZE:,}  |  Compression: {COMPRESSION} level {COMPRESSION_LEVEL}")
     print(f"  Long-format row count: {len(long_df):,}  |  Geographies: {n_geos:,}")
-    print(f"  geoparquet read benchmarks exclude the geometry column for fair comparison")
+    print(f"  Threads: {pl.thread_pool_size()}  |  Use --threads N to isolate format differences from parallelism")
+    print(f"  geoparquet/geoparquet_geo read benchmarks exclude the geometry column for fair comparison")
+    print(f"  year_geo is smaller than long_geo (same sort order) because splitting by year makes the")
+    print(f"    calendar_day column compressible: within each year file the same {len(long_df) // len(wide_df)}-day")
+    print(f"    sequence repeats once per geography, while long_geo has one {len(wide_df):,}-day sequence per geography")
+    print(f"  geoparquet_geo expected to be ~half the size of geoparquet: geo-sorting ensures each unique")
+    print(f"    geometry WKB appears in exactly one row-group dictionary per year file rather than every one")
     if args.runs < 3:
         print("  Tip: use --runs 3 or more for stable medians")
     print()
