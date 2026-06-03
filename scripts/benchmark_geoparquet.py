@@ -9,13 +9,15 @@ Tests three primary query patterns:
   3. Model query: all dates × all geographies     (full model read)
 
 Storage configurations tested:
-  wide           - current wide-format production files (read-only, no write)
-  long_date      - long format, single file, sorted by (date, geography_id)
-  long_geo       - long format, single file, sorted by (geography_id, date)
-  year_date      - long format, year-partitioned, date-sorted within each year
-  year_geo       - long format, year-partitioned, geography-sorted within each year
-  geoparquet     - year_date + embedded geometry column (requires geopandas)
-  geoparquet_geo - year_geo + embedded geometry column (requires geopandas)
+  wide               - current wide-format production files (read-only, no write)
+  long_date          - long format, single file, sorted by (date, geography_id)
+  long_geo           - long format, single file, sorted by (geography_id, date)
+  year_date          - long format, year-partitioned, date-sorted within each year
+  year_geo           - long format, year-partitioned, geography-sorted within each year
+  geoparquet         - year_date + embedded geometry (requires geopandas)
+  geoparquet_geo     - year_geo + embedded geometry (requires geopandas)
+  geoparquet_large_rg - geo-sorted, large row groups (≥ max rows/year) so each
+                        year is one row group → geometry dict stored once per year
 
 Usage:
     python scripts/benchmark_geoparquet.py \\
@@ -149,12 +151,13 @@ def add_year(df: pl.DataFrame) -> pl.DataFrame:
 # ── writers ───────────────────────────────────────────────────────────────────
 
 
-def _pq_write(table, file_path: Path, bloom_filter_options=None, write_statistics=True, **extra):
+def _pq_write(table, file_path: Path, bloom_filter_options=None, write_statistics=True,
+              row_group_size=ROW_GROUP_SIZE, **extra):
     """Write a single PyArrow table to one Parquet file."""
     kwargs = dict(
         compression=COMPRESSION,
         compression_level=COMPRESSION_LEVEL,
-        row_group_size=ROW_GROUP_SIZE,
+        row_group_size=row_group_size,
         write_statistics=write_statistics,
         **extra,
     )
@@ -189,6 +192,7 @@ def write_geoparquet(
     grid: str,
     sort_by: list[str],
     bloom_filter_options: dict | None,
+    row_group_size: int = ROW_GROUP_SIZE,
 ) -> bool:
     import json
 
@@ -260,12 +264,13 @@ def write_geoparquet(
             table,
             year_dir / "data.parquet",
             bloom_filter_options,
+            row_group_size=row_group_size,
             dictionary_pagesize_limit=dict_page_limit,
             write_statistics=non_geo_cols,
         )
 
     print(f"\r    {n_years} year partitions written.                              ")
-    return True
+    return total_wkb_bytes
 
 
 # ── benchmarks ───────────────────────────────────────────────────────────────
@@ -437,7 +442,13 @@ def main():
     print("\nStep 2/4: Converting to long format …", end=" ", flush=True)
     long_df = wide_to_long(wide_df)
     long_year_df = add_year(long_df)
-    print(f"{len(long_df):,} rows × {len(long_df.columns)} columns")
+    # Max rows in any single year × all geographies — used to size row groups so
+    # one year fits in exactly one row group for the large-row-group configs.
+    max_rows_per_year = int(
+        long_year_df.group_by("year").agg(pl.len()).select(pl.col("len").max()).item()
+    )
+    print(f"{len(long_df):,} rows × {len(long_df.columns)} columns  "
+          f"(max {max_rows_per_year:,} rows/year)")
 
     # ── Step 3: write benchmark files ─────────────────────────────────────
     print("\nStep 3/4: Writing benchmark files")
@@ -474,29 +485,50 @@ def main():
         if not HAS_GEOPANDAS:
             print("  Skipping geoparquet configs (geopandas not installed; install the bridges2 extras)")
         else:
+            total_wkb_bytes = None
+
             p = output_dir / "geoparquet"
             print(f"  Writing geoparquet     (year-partitioned, date-sorted, geometry) …")
-            ok = write_geoparquet(
+            result = write_geoparquet(
                 long_year_df, p,
                 grid=args.grid,
                 sort_by=["year", "calendar_day", "geography_id"],
                 bloom_filter_options=None,
             )
-            if ok:
+            if result:
+                total_wkb_bytes = result
                 print(f"    {dir_size_mb(p):.1f} MB")
                 configs["geoparquet"] = (p, True, ["geometry"])
 
             p = output_dir / "geoparquet_geo"
-            print(f"  Writing geoparquet_geo (year-partitioned, geo-sorted, geometry) …")
-            ok = write_geoparquet(
+            print(f"  Writing geoparquet_geo     (year-partitioned, geo-sorted, geometry) …")
+            result = write_geoparquet(
                 long_year_df, p,
                 grid=args.grid,
                 sort_by=["year", "geography_id", "calendar_day"],
                 bloom_filter_options=None,
             )
-            if ok:
+            if result:
+                total_wkb_bytes = total_wkb_bytes or result
                 print(f"    {dir_size_mb(p):.1f} MB")
                 configs["geoparquet_geo"] = (p, True, ["geometry"])
+
+            # Large row groups: one row group per year file so the geometry WKB
+            # dictionary is stored exactly once per year regardless of sort order.
+            large_rg = max_rows_per_year + 100_000
+            p = output_dir / "geoparquet_large_rg"
+            print(f"  Writing geoparquet_large_rg (geo-sorted, row_group_size={large_rg:,}) …")
+            result = write_geoparquet(
+                long_year_df, p,
+                grid=args.grid,
+                sort_by=["year", "geography_id", "calendar_day"],
+                bloom_filter_options=None,
+                row_group_size=large_rg,
+            )
+            if result:
+                total_wkb_bytes = total_wkb_bytes or result
+                print(f"    {dir_size_mb(p):.1f} MB")
+                configs["geoparquet_large_rg"] = (p, True, ["geometry"])
 
     # ── Step 4: run benchmarks ─────────────────────────────────────────────
     print("\nStep 4/4: Running benchmarks …")
@@ -521,12 +553,20 @@ def main():
     print(f"  Row group size: {ROW_GROUP_SIZE:,}  |  Compression: {COMPRESSION} level {COMPRESSION_LEVEL}")
     print(f"  Long-format row count: {len(long_df):,}  |  Geographies: {n_geos:,}")
     print(f"  Threads: {pl.thread_pool_size()}  |  Use --threads N to isolate format differences from parallelism")
-    print(f"  geoparquet/geoparquet_geo read benchmarks exclude the geometry column for fair comparison")
-    print(f"  year_geo is smaller than long_geo (same sort order) because splitting by year makes the")
-    print(f"    calendar_day column compressible: within each year file the same {len(long_df) // len(wide_df)}-day")
-    print(f"    sequence repeats once per geography, while long_geo has one {len(wide_df):,}-day sequence per geography")
-    print(f"  geoparquet_geo expected to be ~half the size of geoparquet: geo-sorting ensures each unique")
-    print(f"    geometry WKB appears in exactly one row-group dictionary per year file rather than every one")
+    days_per_year = max_rows_per_year // n_geos
+    geom_mb_per_year = total_wkb_mb if "total_wkb_mb" in dir() else "?"
+    print(f"  geoparquet* read benchmarks exclude the geometry column for fair comparison")
+    print(f"  year_geo < long_geo: year files limit calendar_day to ~{days_per_year} unique values/row-group")
+    print(f"    vs {len(wide_df):,} in long_geo — the repeating {days_per_year}-day sequence compresses far better")
+    print(f"  geoparquet geometry cost: WKB dictionary duplicated once per row group that contains")
+    print(f"    all {n_geos:,} geographies. geoparquet_geo/large_rg reduce duplicates to 1× per year file.")
+    if "total_wkb_bytes" in dir() and total_wkb_bytes:
+        n_years_data = len(long_year_df["year"].unique())
+        wkb_raw_mb = total_wkb_bytes / 1_048_576
+        wkb_compressed_mb = wkb_raw_mb * 0.70  # ~70% storage ratio observed empirically
+        print(f"  Irreducible geometry overhead ≈ {wkb_compressed_mb:.1f} MB/year × {n_years_data} years"
+              f" ≈ {wkb_compressed_mb * n_years_data:.0f} MB  "
+              f"(raw {wkb_raw_mb:.1f} MB × {n_years_data} × 0.70 compression)")
     if args.runs < 3:
         print("  Tip: use --runs 3 or more for stable medians")
     print()
