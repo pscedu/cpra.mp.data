@@ -278,17 +278,30 @@ def bench_wide(read_kwargs: dict, target_date, target_geo: str, n_runs: int):
     }
 
 
-def bench_long(path: Path, target_date, target_geo: int, n_runs: int, hive: bool = False):
+def bench_long(
+    path: Path,
+    target_date,
+    target_geo: int,
+    n_runs: int,
+    hive: bool = False,
+    exclude_cols: list[str] | None = None,
+):
     scan_kw = dict(hive_partitioning=hive)
 
+    def _scan():
+        lf = pl.scan_parquet(path, **scan_kw)
+        if exclude_cols:
+            lf = lf.select(pl.exclude(exclude_cols))
+        return lf
+
     def map_query():
-        pl.scan_parquet(path, **scan_kw).filter(pl.col("calendar_day") == target_date).collect()
+        _scan().filter(pl.col("calendar_day") == target_date).collect()
 
     def chart_query():
-        pl.scan_parquet(path, **scan_kw).filter(pl.col("geography_id") == target_geo).collect()
+        _scan().filter(pl.col("geography_id") == target_geo).collect()
 
     def model_query():
-        pl.scan_parquet(path, **scan_kw).collect()
+        _scan().collect()
 
     return {
         "map": run_timed(map_query, n_runs),
@@ -410,69 +423,54 @@ def main():
     long_year_df = add_year(long_df)
     print(f"{len(long_df):,} rows × {len(long_df.columns)} columns")
 
-    # Bloom filter options: NDV = number of unique geography IDs.
-    bloom_opts = {"geography_id": {"ndv": n_geos, "fpp": 0.01}}
-
     # ── Step 3: write benchmark files ─────────────────────────────────────
     print("\nStep 3/4: Writing benchmark files")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    configs: dict[str, tuple[Path, bool]] = {}  # name -> (path, is_hive_partitioned)
+    configs: dict[str, tuple[Path, bool, list[str] | None]] = {}  # name -> (path, is_hive, exclude_cols)
 
     if not args.skip_unpartitioned:
         p = output_dir / "long_date"
         print(f"  Writing long_date (single file, date-sorted) …", end=" ", flush=True)
         write_long(long_df, p, sort_by=["calendar_day", "geography_id"])
         print(f"{dir_size_mb(p):.1f} MB")
-        configs["long_date"] = (p, False)
+        configs["long_date"] = (p, False, None)
 
         p = output_dir / "long_geo"
         print(f"  Writing long_geo  (single file, geo-sorted) …", end=" ", flush=True)
         write_long(long_df, p, sort_by=["geography_id", "calendar_day"])
         print(f"{dir_size_mb(p):.1f} MB")
-        configs["long_geo"] = (p, False)
+        configs["long_geo"] = (p, False, None)
 
     p = output_dir / "year_date"
     print(f"  Writing year_date  (year-partitioned, date-sorted) …", end=" ", flush=True)
     write_long(long_year_df, p, sort_by=["year", "calendar_day", "geography_id"], partition_by_year=True)
     print(f"{dir_size_mb(p):.1f} MB")
-    configs["year_date"] = (p, True)
+    configs["year_date"] = (p, True, None)
 
     p = output_dir / "year_geo"
     print(f"  Writing year_geo   (year-partitioned, geo-sorted) …", end=" ", flush=True)
     write_long(long_year_df, p, sort_by=["year", "geography_id", "calendar_day"], partition_by_year=True)
     print(f"{dir_size_mb(p):.1f} MB")
-    configs["year_geo"] = (p, True)
-
-    if HAS_BLOOM:
-        p = output_dir / "year_bloom"
-        print(f"  Writing year_bloom (year-partitioned, date-sorted, Bloom filter) …", end=" ", flush=True)
-        write_long(
-            long_year_df, p,
-            sort_by=["year", "calendar_day", "geography_id"],
-            partition_by_year=True,
-            bloom_filter_options=bloom_opts,
-        )
-        print(f"{dir_size_mb(p):.1f} MB")
-        configs["year_bloom"] = (p, True)
-    else:
-        print("  Skipping year_bloom (bloom_filter_options requires pyarrow >= 24.0.0)")
+    configs["year_geo"] = (p, True, None)
 
     if not args.skip_geoparquet:
         if not HAS_GEOPANDAS:
             print("  Skipping geoparquet (geopandas not installed; install the bridges2 extras)")
         else:
             p = output_dir / "geoparquet"
-            print(f"  Writing geoparquet (year-partitioned, date-sorted, Bloom filter, geometry) …")
+            print(f"  Writing geoparquet (year-partitioned, date-sorted, geometry) …")
             ok = write_geoparquet(
                 long_year_df, p,
                 grid=args.grid,
                 sort_by=["year", "calendar_day", "geography_id"],
-                bloom_filter_options=bloom_opts,
+                bloom_filter_options=None,
             )
             if ok:
                 print(f"    {dir_size_mb(p):.1f} MB")
-                configs["geoparquet"] = (p, True)
+                # Exclude geometry from read benchmarks so timings are comparable
+                # to the non-spatial configurations.
+                configs["geoparquet"] = (p, True, ["geometry"])
 
     # ── Step 4: run benchmarks ─────────────────────────────────────────────
     print("\nStep 4/4: Running benchmarks …")
@@ -483,9 +481,9 @@ def main():
     r["size_mb"] = float("nan")
     results["wide (baseline)"] = r
 
-    for name, (path, is_hive) in configs.items():
+    for name, (path, is_hive, exclude_cols) in configs.items():
         print(f"  Benchmarking: {name}")
-        r = bench_long(path, target_date, target_geo_int, args.runs, hive=is_hive)
+        r = bench_long(path, target_date, target_geo_int, args.runs, hive=is_hive, exclude_cols=exclude_cols)
         r["size_mb"] = dir_size_mb(path)
         results[name] = r
 
@@ -496,10 +494,7 @@ def main():
     print(f"  Target date: {target_date}  |  Target geography: {target_geo_int}")
     print(f"  Row group size: {ROW_GROUP_SIZE:,}  |  Compression: {COMPRESSION} level {COMPRESSION_LEVEL}")
     print(f"  Long-format row count: {len(long_df):,}  |  Geographies: {n_geos:,}")
-    if HAS_BLOOM:
-        print(f"  Bloom filter: geography_id, NDV={n_geos:,}, FPP=0.01")
-    else:
-        print("  Bloom filter: not tested (upgrade pyarrow >= 24.0.0 to enable)")
+    print(f"  geoparquet read benchmarks exclude the geometry column for fair comparison")
     if args.runs < 3:
         print("  Tip: use --runs 3 or more for stable medians")
     print()
