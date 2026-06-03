@@ -139,13 +139,14 @@ def add_year(df: pl.DataFrame) -> pl.DataFrame:
 # ── writers ───────────────────────────────────────────────────────────────────
 
 
-def _pq_write(table, file_path: Path, bloom_filter_options=None):
+def _pq_write(table, file_path: Path, bloom_filter_options=None, write_statistics=True, **extra):
     """Write a single PyArrow table to one Parquet file."""
     kwargs = dict(
         compression=COMPRESSION,
         compression_level=COMPRESSION_LEVEL,
         row_group_size=ROW_GROUP_SIZE,
-        write_statistics=True,
+        write_statistics=write_statistics,
+        **extra,
     )
     if bloom_filter_options:
         kwargs["bloom_filter_options"] = bloom_filter_options
@@ -197,7 +198,19 @@ def write_geoparquet(
         "geography_id": pl.Series(geom_gdf["id"].astype("int32").tolist(), dtype=pl.Int32),
         "geometry": pl.Series(list(geom_gdf.geometry.to_wkb()), dtype=pl.Binary),
     })
-    print(f"{len(wkb_pl):,} geometries")
+    # Compute total WKB bytes so we can set dictionary_pagesize_limit large enough
+    # to hold all unique geometries.  Parquet's default (1 MB) is smaller than the
+    # total WKB for most grids, causing a silent fallback to plain encoding — which
+    # stores the full geometry blob on every row and inflates the file enormously.
+    total_wkb_bytes = int(wkb_pl["geometry"].map_elements(len, return_dtype=pl.Int64).sum())
+    # 25% headroom; Parquet overhead is small but non-zero.
+    dict_page_limit = int(total_wkb_bytes * 1.25)
+    print(f"{len(wkb_pl):,} geometries  ({total_wkb_bytes / 1_048_576:.1f} MB WKB, "
+          f"dict_pagesize_limit={dict_page_limit // 1_048_576} MB)")
+
+    # Non-geometry columns to write statistics for (geometry statistics are
+    # expensive — min/max WKB per row group — and never used for filtering).
+    non_geo_cols = [c for c in long_year_df.columns if c != "geometry"]
 
     # Build the GeoParquet `geo` metadata block (identical for every year file).
     geo_meta = json.dumps({
@@ -233,7 +246,13 @@ def write_geoparquet(
         table = year_with_geom.to_arrow()
         existing_meta = table.schema.metadata or {}
         table = table.replace_schema_metadata({**existing_meta, b"geo": geo_meta})
-        _pq_write(table, year_dir / "data.parquet", bloom_filter_options)
+        _pq_write(
+            table,
+            year_dir / "data.parquet",
+            bloom_filter_options,
+            dictionary_pagesize_limit=dict_page_limit,
+            write_statistics=non_geo_cols,
+        )
 
     print(f"\r    {n_years} year partitions written.                              ")
     return True
