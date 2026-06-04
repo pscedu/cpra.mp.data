@@ -49,7 +49,9 @@ class Dimension:
             exprs[f"{self.name}_is_not_null"] = pl.col(self.name).is_not_null()
 
         if self.values is not None:
-            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"])
+            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(
+                self.values["value"].cast(self.dtype).to_list()
+            )
 
         if self.min_value is not None:
             exprs[f"{self.name}_minimum_value"] = pl.col(self.name) >= self.min_value
@@ -76,8 +78,13 @@ def make_dimensions():
     dimensions = []
 
     for row in read_structure_csv("dimensions").with_columns(pl.col("required").cast(pl.Boolean)).iter_rows(named=True):
+        # Float32 dimensions are cast to Float64 so that canonical values like
+        # "0.1" survive the round-trip intact for display. The storage dtype
+        # (Float32) is preserved on self.dtype and used when building filter
+        # and validation expressions.
+        display_dtype = pl.Float64 if row["dtype"].startswith("Float") else getattr(pl, row["dtype"])
         values = dim_values_df.filter(dimension=row["name"]).with_columns(
-            pl.col("value").cast(getattr(pl, row["dtype"]))
+            pl.col("value").cast(display_dtype)
         )
         if row["required"] is False:
             row["required"] = (

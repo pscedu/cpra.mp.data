@@ -208,7 +208,9 @@ def get_input_data_frame(**kwargs):
 def get_filter_expressions(**kwargs):
     """Generate a list of Polars filter expressions."""
     return [
-        pl.col(k).is_in(v) if isinstance(v, (list, tuple)) else pl.col(k) == v
+        pl.col(k).is_in(pl.Series(list(v), dtype=DIMENSIONS[k].dtype).to_list())
+        if isinstance(v, (list, tuple))
+        else pl.col(k) == pl.lit(v).cast(DIMENSIONS[k].dtype)
         for k, v in kwargs.items()
         if k not in DATASET_DIMENSIONS
     ]

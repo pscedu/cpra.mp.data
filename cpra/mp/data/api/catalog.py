@@ -64,6 +64,19 @@ class CatalogQuery:
         if prop_value:
             if not isinstance(prop_value, (list, tuple)):
                 prop_value = (prop_value,)
+            # For float dimensions with known canonical values, normalise
+            # prop_value through dtype → canonical map so that both a clean
+            # input (0.1) and its float32 repr (0.10000000149011612) resolve
+            # to the same canonical value as the one stored in choices.
+            if dimension.values is not None and str(dimension.dtype).startswith("Float"):
+                canonical_map = dict(zip(
+                    dimension.values["value"].cast(dimension.dtype).to_list(),
+                    dimension.values["value"].to_list(),
+                ))
+                prop_value = [
+                    canonical_map.get(pl.Series([v], dtype=dimension.dtype).to_list()[0], v)
+                    for v in prop_value
+                ]
             choices_set = set(self._choices[dimension_name])
             selected_values = sorted([val for val in prop_value if val in choices_set])
             if len(selected_values) < len(prop_value):
@@ -148,9 +161,24 @@ class CatalogQuery:
             # progressively less data than a single all-columns unique() would.
             lf = pl.scan_parquet(parquet_paths).select(filter_cols)
             for col in filter_cols:
-                values = lf.select(col).unique().sort(col).collect()[col].to_list()
+                raw_values = lf.select(col).unique().sort(col).collect()[col].to_list()
+                # Map float32-repr values (e.g. 0.10000000149011612) back to their
+                # canonical display values (e.g. 0.1) using the dimension's known
+                # values list, so choices/results are consistent with dimensions.json.
+                dim = DIMENSIONS[col]
+                if dim.values is not None and str(dim.dtype).startswith("Float"):
+                    canonical_map = dict(zip(
+                        dim.values["value"].cast(dim.dtype).to_list(),
+                        dim.values["value"].to_list(),
+                    ))
+                    values = [canonical_map.get(v, v) for v in raw_values]
+                else:
+                    values = raw_values
                 self._update(dimension_name=col, dimension_values=values)
-                lf = lf.filter(pl.col(col).is_in(self._results[col]))
+                # Cast results through the storage dtype before is_in so the
+                # Float32 column comparison is exact (avoids deprecation warning).
+                cast_results = pl.Series(self._results[col], dtype=dim.dtype).to_list()
+                lf = lf.filter(pl.col(col).is_in(cast_results))
 
         self._compress()
         return {
