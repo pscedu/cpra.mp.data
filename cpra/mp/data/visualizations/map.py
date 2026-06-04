@@ -7,7 +7,10 @@ from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
 
-VALUE_EXPR = ["get", ["to-string", ["id"]], ["global-state", "values"]]
+# Used when feature IDs are too sparse for array indexing.
+COLOR_OBJECT_EXPR = ["coalesce", ["get", ["to-string", ["id"]], ["global-state", "colors"]], "transparent"]
+# Used when feature IDs are compact integers (1..N); avoids string conversion and hash lookup.
+COLOR_ARRAY_EXPR = ["coalesce", ["at", ["id"], ["global-state", "colors"]], "transparent"]
 SELECTION_EXPR = ["get", ["to-string", ["id"]], ["global-state", "selectionColors"]]
 
 
@@ -29,15 +32,15 @@ class Map(DatasetVisualization):
         max_geographies = 10
 
     @cached_property
-    def feature_values(self) -> dict[int, float]:
-        """Load feature values for vector grids.
+    def feature_colors(self) -> dict[str, str]:
+        """Pre-compute hex colors for all vector grid features.
 
-        Uses the Dataset class to apply filter dimensions, calculation
-        parameters (negate, multiply10, multiply100), and group/aggregate
-        operations, consistent with the API data pipeline.
+        Applies legend classification (step or linear interpolation) in Python
+        so the map style only needs a single global-state lookup per feature
+        rather than a full color expression evaluation per feature per frame.
 
         Returns:
-            A dictionary mapping geography IDs to their values.
+            A dictionary mapping string geography IDs to hex color strings.
         """
         if self.grid.grid_type != "vector":
             return {}
@@ -76,17 +79,21 @@ class Map(DatasetVisualization):
 
         # Take the first row of values (single time point after grouping)
         row = df.select(value_cols).row(0, named=True)
-        return {int(col): val for col, val in row.items() if val is not None}
+        values = {int(col): val for col, val in row.items() if val is not None}
 
-    def color_ramp(self, legend: Legend) -> list[Any]:
-        """Generate a step color ramp expression from a legend.
+        is_difference = self.params.get("negate") is not None
 
-        Args:
-            legend: A Legend object with break_points.
+        if is_difference:
+            stops = self._difference_breaks(self.variable)
+            return {str(fid): self._interpolate_stop_color(val, stops) for fid, val in values.items()}
 
-        Returns:
-            A MapLibre style step expression for color ramp.
-        """
+        legend = self._get_legend()
+        if legend is None:
+            return {}
+        return {str(fid): self._classify_step_color(val, legend) for fid, val in values.items()}
+
+    def _classify_step_color(self, value: float, legend: Legend) -> str:
+        """Classify a value into a color bucket matching the step expression behavior."""
         ramp = []
         found_bound = False
         for row in legend.break_points.iter_rows(named=True):
@@ -98,38 +105,79 @@ class Map(DatasetVisualization):
             ramp.append(color)
             if upper_bound is not None:
                 ramp.append(upper_bound)
-        return ["step", VALUE_EXPR, *ramp]
 
-    def difference_breaks_colors(self, variable: Variable, zero_color: str = "#ffffff") -> list:
-        """Generate color breaks for difference visualization.
+        if not ramp:
+            return "#000000"
 
-        Args:
-            variable: A Variable object with difference_legend_limit.
-            zero_color: The color to use for zero values.
+        result = ramp[0]
+        i = 1
+        while i < len(ramp) - 1:
+            if value < ramp[i]:
+                return result
+            result = ramp[i + 1]
+            i += 2
+        return result
 
-        Returns:
-            A list of [value, color] pairs for interpolation.
-        """
-        limit = variable.difference_legend_limit or 1
-        if limit > 0:
-            return [-1 * limit, "#d53e4f", 0, zero_color, limit, "#3288bd"]
-        return [limit, "#3288bd", 0, zero_color, limit * -1, "#d53e4f"]
-
-    def difference_color_ramp(self, variable: Variable) -> list[Any]:
-        """Generate an interpolated color ramp for difference visualization.
+    def _interpolate_stop_color(self, value: float, stops: list) -> str:
+        """Linearly interpolate a hex color between value-color stops.
 
         Args:
-            variable: A Variable object with difference_legend_limit.
-
-        Returns:
-            A MapLibre style expression for linear color interpolation.
+            value: The numeric value to colorize.
+            stops: Flat list of alternating [v0, c0, v1, c1, ...] pairs sorted by value.
         """
-        return [
-            "interpolate",
-            ["linear"],
-            VALUE_EXPR,
-            *self.difference_breaks_colors(variable),
-        ]
+        pairs = list(zip(stops[::2], stops[1::2]))
+        if value <= pairs[0][0]:
+            return pairs[0][1]
+        if value >= pairs[-1][0]:
+            return pairs[-1][1]
+        for i in range(len(pairs) - 1):
+            v0, c0 = pairs[i]
+            v1, c1 = pairs[i + 1]
+            if v0 <= value <= v1:
+                t = (value - v0) / (v1 - v0)
+                return self._lerp_hex(c0, c1, t)
+        return pairs[-1][1]
+
+    def _lerp_hex(self, c0: str, c1: str, t: float) -> str:
+        """Linearly interpolate between two hex colors."""
+        r0, g0, b0 = int(c0[1:3], 16), int(c0[3:5], 16), int(c0[5:7], 16)
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r = round(r0 + t * (r1 - r0))
+        g = round(g0 + t * (g1 - g0))
+        b = round(b0 + t * (b1 - b0))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _id_step_expr(self, color_array: list[str | None]) -> list | None:
+        """Build a MapLibre step expression over feature ID from a pre-computed color array.
+
+        Compresses runs of the same color so sequential IDs with identical colors
+        are represented by a single entry rather than repeated array elements.
+        When used, the colors are baked into the style expression and no global-state
+        lookup is needed at render time — only a binary search through run boundaries.
+
+        Returns None if run compression is insufficient to justify the switch from
+        the array approach (i.e. step would be at least as large as the array).
+        """
+        first_id = next((i for i, c in enumerate(color_array) if c is not None), None)
+        if first_id is None:
+            return None
+
+        runs: list[tuple[int, str]] = []
+        for i in range(first_id, len(color_array)):
+            c = color_array[i] or "transparent"
+            if not runs or c != runs[-1][1]:
+                runs.append((i, c))
+
+        # Each additional run adds 2 elements (threshold + color) to the step expression.
+        # Only use step if it's meaningfully smaller than the array.
+        if len(runs) * 2 >= len(color_array):
+            return None
+
+        step: list[Any] = ["step", ["id"], runs[0][1]]
+        for start_id, color in runs[1:]:
+            step.append(start_id)
+            step.append(color)
+        return step
 
     def linear_zoom(self, min_val, max_val) -> list[Any]:
         """Generate a linear zoom interpolation expression.
@@ -182,15 +230,21 @@ class Map(DatasetVisualization):
         """Generate a raster source for difference visualization.
 
         Args:
-            variable: A Variable object with difference_legend_limit.
             **kwargs: Additional arguments passed to raster_source.
 
         Returns:
             A MapLibre raster source definition with difference color map.
         """
-        breaks = self.difference_breaks_colors(self.variable, "#00000000")
+        breaks = self._difference_breaks(self.variable, "#00000000")
         color_map = f"continuous:{','.join(str(b) for b in breaks)}"
         return self.raster_source(color_map=color_map, **kwargs)
+
+    def _difference_breaks(self, variable: Variable, zero_color: str = "#ffffff") -> list:
+        """Return flat [value, color, ...] stops for difference visualization."""
+        limit = variable.difference_legend_limit or 1
+        if limit > 0:
+            return [-limit, "#d53e4f", 0, zero_color, limit, "#3288bd"]
+        return [limit, "#3288bd", 0, zero_color, -limit, "#d53e4f"]
 
     def vector_source(self, grid_name: str) -> dict[str, Any]:
         """Generate a vector source definition.
@@ -347,37 +401,26 @@ class Map(DatasetVisualization):
         self,
         layer_id: str,
         source_id: str,
-        difference: bool = False,
+        fill_color: list = COLOR_OBJECT_EXPR,
         line_colors: tuple[str, str] = ("#DDDDDD", "#666666"),
         line_widths: tuple[float, float] = (0.5, 3),
         show_grid_labels: bool = False,
         show_grid_lines: bool = False,
-        variable: Variable | None = None,
     ) -> list[dict[str, Any]]:
-        """Generate vector layer definitions with embedded feature values.
-
-        For vector grids, this method loads the data and pre-computes colors
-        for each geography ID, embedding them directly in the style using
-        match expressions.
+        """Generate vector layer definitions for a grid source.
 
         Args:
             layer_id: Base ID for the layers.
             source_id: The source ID for the vector data.
-            difference: Whether to use difference color ramp.
+            fill_color: MapLibre expression for the fill color.
             line_colors: Tuple of (min_zoom_color, max_zoom_color).
             line_widths: Tuple of (min_zoom_width, max_zoom_width).
             show_grid_labels: Whether to show grid labels.
             show_grid_lines: Whether to show grid lines.
-            variable: Variable object for color ramp (uses self.variable if None).
 
         Returns:
             A list of layer definitions for fill, line, selected, and label.
         """
-        var = variable or self.variable
-
-        legend = self._get_legend()
-        ramp = self.difference_color_ramp(var) if difference else self.color_ramp(legend)
-
         return [
             {
                 "id": f"{layer_id}-fill",
@@ -385,12 +428,7 @@ class Map(DatasetVisualization):
                 "source": source_id,
                 "source-layer": "boundary",
                 "paint": {
-                    "fill-color": [
-                        "case",
-                        ["==", VALUE_EXPR, None],
-                        "transparent",
-                        ramp,
-                    ],
+                    "fill-color": fill_color,
                 },
             },
             {
@@ -755,11 +793,26 @@ class Map(DatasetVisualization):
             data_layers = self.raster_layers("data-layer", "data")
         else:
             style["sources"]["data"] = self.vector_source(self.grid.name)
-            style["state"]["values"] = {"default": self.feature_values}
+            colors = self.feature_colors
+            max_id = max((int(k) for k in colors), default=0)
+            if colors and max_id < len(colors) * 10:
+                color_array: list[str | None] = [None] * (max_id + 1)
+                for k, v in colors.items():
+                    color_array[int(k)] = v
+                step_expr = self._id_step_expr(color_array)
+                if step_expr is not None:
+                    # Colors baked into the expression; no global-state lookup at render time.
+                    fill_color = step_expr
+                else:
+                    style["state"]["colors"] = {"default": color_array}
+                    fill_color = COLOR_ARRAY_EXPR
+            else:
+                style["state"]["colors"] = {"default": colors}
+                fill_color = COLOR_OBJECT_EXPR
             data_layers = self.vector_layers(
                 layer_id="data-layer",
                 source_id="data",
-                difference=is_difference,
+                fill_color=fill_color,
                 show_grid_labels=show_grid_labels,
                 show_grid_lines=show_grid_lines,
             )

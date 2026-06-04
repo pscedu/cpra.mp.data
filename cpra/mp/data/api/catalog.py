@@ -44,9 +44,8 @@ class CatalogQuery:
         # Update choices with the dimension values.
         if dimension_name in self._choices:
             # Calculate choices that are common to this branch and previous branches.
-            common_choices = [
-                val for val in self._choices[dimension_name] if val in dimension_values
-            ]
+            dimension_values_set = set(dimension_values)
+            common_choices = [val for val in self._choices[dimension_name] if val in dimension_values_set]
             # If there are common choices, assign them as the choices for
             # this dimension. Otherwise, return an error.
             if common_choices:
@@ -59,17 +58,14 @@ class CatalogQuery:
 
         selected_values = []
         prop_value = getattr(
-            self.dataset_dimensions
-            if dimension.type == "dataset"
-            else self.filter_dimensions,
+            self.dataset_dimensions if dimension.type == "dataset" else self.filter_dimensions,
             dimension_name,
         )
         if prop_value:
             if not isinstance(prop_value, (list, tuple)):
                 prop_value = (prop_value,)
-            selected_values = sorted(
-                [val for val in prop_value if val in self._choices[dimension_name]]
-            )
+            choices_set = set(self._choices[dimension_name])
+            selected_values = sorted([val for val in prop_value if val in choices_set])
             if len(selected_values) < len(prop_value):
                 self._exact = False
 
@@ -91,60 +87,47 @@ class CatalogQuery:
             if dimension_name in ("calendar_day", "calendar_year"):
                 if not isinstance(values, pl.Series):
                     values = pl.Series(values)
-                if dimension_name in ("calendar_day", "calendar_year"):
-                    range_function = RANGE_FUNCTIONS[dimension_name]
-                    range_kwargs = RANGE_KWARGS[self.dataset_dimensions.time_unit]
-                    # Account for decadal data that don't start on an even decade.
-                    # TODO: Handle monthly data that don't start on the first of the month.
-                    range_start = (
-                        floor(values.min() / 10) * 10
-                        if self._choices.get("time_unit", None) == ["decadal"]
-                        else values.min()
+                range_function = RANGE_FUNCTIONS[dimension_name]
+                range_kwargs = RANGE_KWARGS[self.dataset_dimensions.time_unit]
+                # Account for decadal data that don't start on an even decade.
+                # TODO: Handle monthly data that don't start on the first of the month.
+                range_start = (
+                    floor(values.min() / 10) * 10
+                    if self._choices.get("time_unit", None) == ["decadal"]
+                    else values.min()
+                )
+                range_end = values.max() if dimension_name == "calendar_day" else values.max() + 1
+                groups = (
+                    pl.DataFrame(
+                        {
+                            "value": values,
+                            "seq": range_function(
+                                range_start,
+                                range_end,
+                                eager=True,
+                                **range_kwargs,
+                            )[: len(values)],
+                        }
                     )
-                    range_end = (
-                        values.max()
-                        if dimension_name == "calendar_day"
-                        else values.max() + 1
+                    .group_by(offset=(pl.col("value") - pl.col("seq")))
+                    .agg(start=pl.col("value").min(), end=pl.col("value").max())
+                    .sort(pl.col("start"))
+                )
+                if dimension_name == "calendar_day":
+                    groups = groups.with_columns(
+                        pl.col("start").cast(pl.String),
+                        pl.col("end").cast(pl.String),
                     )
-                    groups = (
-                        pl.DataFrame(
-                            {
-                                "value": values,
-                                "seq": range_function(
-                                    range_start,
-                                    range_end,
-                                    eager=True,
-                                    **range_kwargs,
-                                )[: len(values)],
-                            }
-                        )
-                        .group_by(offset=(pl.col("value") - pl.col("seq")))
-                        .agg(start=pl.col("value").min(), end=pl.col("value").max())
-                        .sort(pl.col("start"))
-                    )
-                    if dimension_name == "calendar_day":
-                        groups = groups.with_columns(
-                            pl.col("start").cast(pl.String),
-                            pl.col("end").cast(pl.String),
-                        )
-                        self._results[dimension_name] = [
-                            str(v) for v in self._results[dimension_name]
-                        ]
+                    self._results[dimension_name] = [str(v) for v in self._results[dimension_name]]
 
-                    self._choices[dimension_name] = [
-                        row["start"]
-                        if row["start"] == row["end"]
-                        else [row["start"], row["end"]]
-                        for row in groups.iter_rows(named=True)
-                    ]
-                elif isinstance(values, pl.Series):
-                    self._choices[dimension_name] = values.to_list()
+                self._choices[dimension_name] = [
+                    row["start"] if row["start"] == row["end"] else [row["start"], row["end"]]
+                    for row in groups.iter_rows(named=True)
+                ]
 
     def execute(self):
         """Execute a query for data."""
-        input_df = get_input_data_frame(
-            **dict(self.dataset_dimensions), **dict(self.filter_dimensions)
-        )
+        input_df = get_input_data_frame(**dict(self.dataset_dimensions), **dict(self.filter_dimensions))
         required_cols = required_columns(input_df, include_metadata=False)
 
         parquet_paths = []
@@ -159,19 +142,15 @@ class CatalogQuery:
 
         if parquet_paths:
             filter_cols = [col for col in required_cols if col not in self._results]
-            df = pl.scan_parquet(parquet_paths).select(filter_cols).unique().collect()
-            prev_col = None
+            # Scan one column at a time and add each selection as a predicate before
+            # reading the next column.  Polars pushes these predicates into parquet
+            # row-group and file statistics, so each subsequent pass reads
+            # progressively less data than a single all-columns unique() would.
+            lf = pl.scan_parquet(parquet_paths).select(filter_cols)
             for col in filter_cols:
-                # Filter the lazy frame by the previous column.
-                if prev_col:
-                    df = df.filter(pl.col(prev_col).is_in(self._results[prev_col]))
-
-                self._update(
-                    dimension_name=col,
-                    dimension_values=df.select(col).unique().sort(col)[col].to_list(),
-                )
-
-                prev_col = col
+                values = lf.select(col).unique().sort(col).collect()[col].to_list()
+                self._update(dimension_name=col, dimension_values=values)
+                lf = lf.filter(pl.col(col).is_in(self._results[col]))
 
         self._compress()
         return {
