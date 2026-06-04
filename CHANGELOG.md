@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.43.0](https://github.com/pscedu/cpra.mp.data/compare/v0.42.0...v0.43.0) (2026-06-04)
+
+
+### Features
+
+* **map:** include number format in legend JSON ([b6c1c6f](https://github.com/pscedu/cpra.mp.data/commit/b6c1c6f5a64aff2abe8e17299a9475325bbebaf9))
+* **structure:** set number format and difference legend for CLARA ([ded4ef0](https://github.com/pscedu/cpra.mp.data/commit/ded4ef082e02092b9d0e03961e1293a85493f731))
+
+
+### Bug Fixes
+
+* **time-series-line:** fix NaN in tooltip for difference charts ([28e4128](https://github.com/pscedu/cpra.mp.data/commit/28e412835627da09a3b9458111a2be1e2688d99b))
+* **time-series-line:** fix NaN in tooltip for zero dimension value ([0f8dba5](https://github.com/pscedu/cpra.mp.data/commit/0f8dba58d3f983ddb66bd8be01fc4d49e56a80c3))
+
+
+### Performance Improvements
+
+* **catalog:** speed up catalog queries ([c1ef43e](https://github.com/pscedu/cpra.mp.data/commit/c1ef43e0510b483eab61fd7004f13511c51413e3))
+* **map:** pre-compute colors server-side ([b8ce0ee](https://github.com/pscedu/cpra.mp.data/commit/b8ce0ee5c7a141c5a93a1670ce7c7358af938f6c))
+
 ## [0.42.0](https://github.com/pscedu/cpra.mp.data/compare/v0.41.0...v0.42.0) (2026-05-28)
 
 
