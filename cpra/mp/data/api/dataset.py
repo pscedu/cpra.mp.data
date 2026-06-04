@@ -404,36 +404,37 @@ class Dataset(LazyFrameSource):
             )
 
     def validate_vector_tile(self):
-        """Validate that the tile is a vector grid with an available geometry file."""
-        from cpra.mp.data.api.vector import GEOMETRY_PATH
+        """Validate that the tile is a vector grid with an available PMTiles file."""
+        from cpra.mp.data.api.vector import TILES_PATH
 
         if self.output_type != OutputType.vector:
             raise HTTPException(status_code=400, detail="invalid output type for vector tile: raster")
 
         grid_name = self.options.summarize_by or self.grid.name
-        if not (GEOMETRY_PATH / f"{grid_name}.fgb").exists():
+        if not (TILES_PATH / f"{grid_name}.pmtiles").exists():
             raise HTTPException(
-                status_code=404, detail=f"no geometry file for grid: {grid_name}"
+                status_code=404, detail=f"no tile file for grid: {grid_name}"
             )
 
     @asynctiming
     async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
-        """Get an MVT tile with geometry joined to dataset values."""
-        from cpra.mp.data.api.vector import encode_mvt, read_tile_geometries
+        """Get an MVT tile with dataset values injected into pre-generated geometry."""
+        from cpra.mp.data.api.vector import _data_to_id_value, inject_and_serialize, parse_tile, read_pmtile
 
         grid_name = self.options.summarize_by or self.grid.name
         tile = mercantile.Tile(x, y, z)
-        gdf = read_tile_geometries(grid_name, tile, self.grid.crs)
-        if gdf is None:
+
+        compressed = read_pmtile(grid_name, tile)
+        if compressed is None:
             return None
 
-        # Narrow to only the geography ID columns present in this tile before
-        # collecting, so Polars' column-projection pushdown limits Parquet I/O
-        # to the handful of columns needed rather than all geography columns.
-        # Avoid collect_schema() on the full plan — for a 100K+ column LazyFrame
-        # that alone costs ~500 ms. Instead infer valid columns from what
-        # apply_params() already recorded about the active ID set.
-        tile_id_strs = [str(int(fid)) for fid in gdf["id"]]
+        # Parse once: get the VectorTile object and boundary feature IDs together.
+        # The parsed object is reused for injection, avoiding a second decompress+parse.
+        vt, raw_ids = parse_tile(compressed)
+        if not raw_ids:
+            return None
+
+        tile_id_strs = [str(fid) for fid in raw_ids]
         if self.summarize_geography_ids is not None:
             valid = {str(gid) for gid in self.summarize_geography_ids}
             val_cols = [c for c in tile_id_strs if c in valid]
@@ -446,13 +447,15 @@ class Dataset(LazyFrameSource):
         if not val_cols:
             return None
 
-        # Select only the value columns — encode_mvt doesn't use dimension columns,
-        # so we avoid collect_schema() and any unnecessary Parquet I/O entirely.
         df = self.lf.select(val_cols).collect()
         if df.is_empty():
             return None
 
-        return encode_mvt(gdf, df, tile)
+        id_values = _data_to_id_value(df)
+        if not id_values:
+            return None
+
+        return inject_and_serialize(vt, id_values)
 
     async def get_raster_array(self, df, rasters, window, out_shape=None):
         """Read a raster array and apply the operations specified

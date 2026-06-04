@@ -15,6 +15,7 @@ def get_config(name, default_value):
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
 GEOMETRY_PATH = Path(__file__).parent / "geometry"
+TILES_PATH = Path(get_config("TILES_PATH", str(Path(__file__).parent.parent.parent.parent / "tiles")))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
 MPD_URI = get_config("MPD_URI", "")
 STREAM_THRESHOLD = int(get_config("STREAM_THRESHOLD", "25"))

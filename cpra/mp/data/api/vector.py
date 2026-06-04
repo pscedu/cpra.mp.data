@@ -1,41 +1,25 @@
-import geopandas as gpd
-import mapbox_vector_tile
+import gzip
+
 import mercantile
 import polars as pl
 import polars.selectors as cs
-import pyproj
-import shapely
 from fastapi import HTTPException
+from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
+from pmtiles.reader import MmapSource, Reader
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from cpra.mp.data.config import GEOMETRY_PATH
-
-TILE_EXTENT = 4096
+from cpra.mp.data.config import TILES_PATH
 
 
-def _tile_bbox_in_crs(tile: mercantile.Tile, crs: str) -> tuple[float, float, float, float]:
-    bounds = mercantile.bounds(tile)
-    if crs.upper() == "EPSG:4326":
-        return (bounds.west, bounds.south, bounds.east, bounds.north)
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    west, south = transformer.transform(bounds.west, bounds.south)
-    east, north = transformer.transform(bounds.east, bounds.north)
-    return (west, south, east, north)
-
-
-def read_tile_geometries(
-    grid_name: str, tile: mercantile.Tile, crs: str = "EPSG:26915"
-) -> gpd.GeoDataFrame | None:
-    """Read FGB features intersecting a tile's bbox, reprojected to EPSG:3857."""
-    fgb_path = GEOMETRY_PATH / f"{grid_name}.fgb"
-    if not fgb_path.exists():
+def read_pmtile(grid_name: str, tile: mercantile.Tile) -> bytes | None:
+    """Return the raw (still gzip-compressed) MVT bytes for a tile, or None."""
+    path = TILES_PATH / f"{grid_name}.pmtiles"
+    if not path.exists():
         return None
-    bbox = _tile_bbox_in_crs(tile, crs)
-    gdf = gpd.read_file(str(fgb_path), bbox=bbox, engine="pyogrio")
-    if gdf.empty:
-        return None
-    return gdf.to_crs("EPSG:3857")
+    with open(path, "rb") as f:
+        data = Reader(MmapSource(f)).get(tile.z, tile.x, tile.y)
+    return data  # may be None if tile not in archive
 
 
 def _data_to_id_value(df: pl.DataFrame) -> dict[int, float]:
@@ -47,64 +31,42 @@ def _data_to_id_value(df: pl.DataFrame) -> dict[int, float]:
     return {int(col): val for col, val in row.items() if val is not None}
 
 
-def encode_mvt(
-    gdf: gpd.GeoDataFrame, df: pl.DataFrame, tile: mercantile.Tile
-) -> bytes | None:
-    """Clip geometries to tile extent, join dataset values, and encode as MVT/PBF."""
-    id_values = _data_to_id_value(df)
-    if not id_values:
-        return None
+def parse_tile(compressed: bytes) -> tuple[VectorTile, list[int]]:
+    """Decompress and parse a gzip-compressed MVT tile once.
 
-    xy_bounds = mercantile.xy_bounds(tile)
-    tile_box = shapely.box(xy_bounds.left, xy_bounds.bottom, xy_bounds.right, xy_bounds.top)
+    Returns the parsed VectorTile object and the feature IDs from the boundary
+    layer. Callers should pass the VectorTile to inject_and_serialize rather than
+    re-parsing from bytes.
+    """
+    vt = VectorTile()
+    vt.ParseFromString(gzip.decompress(compressed))
+    ids = []
+    for layer in vt.layers:
+        if layer.name == "boundary":
+            ids = [f.id for f in layer.features]
+            break
+    return vt, ids
 
-    # Zoom-dependent simplification to reduce tile size at low zoom levels.
-    gdf = gdf.copy()
-    if tile.z < 12:
-        tile_width = xy_bounds.right - xy_bounds.left
-        tolerance = tile_width / TILE_EXTENT
-        gdf["geometry"] = gdf.geometry.simplify(tolerance, preserve_topology=True)
 
-    gdf["geometry"] = gdf.geometry.intersection(tile_box)
-    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
-    if gdf.empty:
-        return None
+def inject_and_serialize(vt: VectorTile, id_values: dict[int, float]) -> bytes:
+    """Inject a 'value' property into each boundary feature and serialize.
 
-    quantize_bounds = (xy_bounds.left, xy_bounds.bottom, xy_bounds.right, xy_bounds.top)
+    Geometry bytes are never decoded — only keys/values/tags are modified — so
+    this is O(features) string/int work rather than O(coordinates) float work.
+    """
+    for layer in vt.layers:
+        if layer.name != "boundary":
+            continue
+        key_idx = len(layer.keys)
+        layer.keys.append("value")
+        for feature in layer.features:
+            v = id_values.get(feature.id)
+            if v is not None:
+                val = layer.values.add()
+                val.double_value = v
+                feature.tags.extend([key_idx, len(layer.values) - 1])
 
-    ids = gdf["id"].to_numpy().astype(int)
-    labels = gdf["label"].to_numpy()
-    geoms = gdf.geometry.to_numpy()
-    centroids = gdf.geometry.centroid.to_numpy()
-
-    boundary_features = []
-    label_features = []
-    for fid, label, geom, centroid in zip(ids, labels, geoms, centroids):
-        fid = int(fid)
-        props: dict = {"id": fid, "label": str(label)}
-        value = id_values.get(fid)
-        if value is not None:
-            props["value"] = value
-        boundary_features.append({"geometry": geom.__geo_interface__, "properties": props})
-        if not centroid.is_empty:
-            label_features.append(
-                {
-                    "geometry": centroid.__geo_interface__,
-                    "properties": {"id": fid, "label": str(label)},
-                }
-            )
-
-    if not boundary_features:
-        return None
-
-    layers = [{"name": "boundary", "features": boundary_features}]
-    if label_features:
-        layers.append({"name": "label", "features": label_features})
-
-    return mapbox_vector_tile.encode(
-        layers,
-        default_options={"extents": TILE_EXTENT, "quantize_bounds": quantize_bounds},
-    )
+    return vt.SerializeToString()
 
 
 class VectorTileResponse(Response):
