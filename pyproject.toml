@@ -29,7 +29,7 @@ dependencies = [
     "numpy",
     "Pillow",
     "pmtiles>=3.7.0",
-    "polars==1.37.1",
+    "polars>=1.41.2",
     "pyarrow",
     "pyogrio>=0.12.1",
     "python-dotenv",
