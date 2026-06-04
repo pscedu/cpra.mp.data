@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.44.2](https://github.com/pscedu/cpra.mp.data/compare/v0.44.1...v0.44.2) (2026-06-04)
+
+
+### Bug Fixes
+
+* **api:** fix AEP precision issues ([8817d4b](https://github.com/pscedu/cpra.mp.data/commit/8817d4b6d4da31cc978a8fbbe66a63a02182a627))
+
 ## [0.44.1](https://github.com/pscedu/cpra.mp.data/compare/v0.44.0...v0.44.1) (2026-06-04)
 
 
