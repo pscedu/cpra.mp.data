@@ -25,6 +25,7 @@ from cpra.mp.data.api.models import (
     VisualizationQuery,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
+from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
@@ -204,6 +205,23 @@ async def get_model_tile(
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
+
+
+@app.get(
+    "/v1/datasets/{variable}/{grid}/{time_unit}/tiles/{z}/{x}/{y}.pbf",
+    tags=["Data and Analysis"],
+)
+async def get_vector_tile(
+    z: int,
+    x: int,
+    y: int,
+    query: Annotated[TileQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    await dataset.apply_params()
+    dataset.validate_vector_tile()
+    return VectorTileResponse(dataset, x, y, z)
 
 
 @app.get("/v1/visualizations.json", tags=["Visualization"])

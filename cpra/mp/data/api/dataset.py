@@ -403,6 +403,60 @@ class Dataset(LazyFrameSource):
                 detail=f"tile contains more than one band: {groups} bands found",
             )
 
+    def validate_vector_tile(self):
+        """Validate that the tile is a vector grid with an available PMTiles file."""
+        from cpra.mp.data.api.vector import TILES_PATH
+
+        if self.output_type != OutputType.vector:
+            raise HTTPException(status_code=400, detail="invalid output type for vector tile: raster")
+
+        grid_name = self.options.summarize_by or self.grid.name
+        if not (TILES_PATH / f"{grid_name}.pmtiles").exists():
+            raise HTTPException(
+                status_code=404, detail=f"no tile file for grid: {grid_name}"
+            )
+
+    @asynctiming
+    async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
+        """Get an MVT tile with dataset values injected into pre-generated geometry."""
+        from cpra.mp.data.api.vector import _data_to_id_value, inject_and_serialize, parse_tile, read_pmtile
+
+        grid_name = self.options.summarize_by or self.grid.name
+        tile = mercantile.Tile(x, y, z)
+
+        compressed = read_pmtile(grid_name, tile)
+        if compressed is None:
+            return None
+
+        # Parse once: get the VectorTile object and boundary feature IDs together.
+        # The parsed object is reused for injection, avoiding a second decompress+parse.
+        vt, raw_ids = parse_tile(compressed)
+        if not raw_ids:
+            return None
+
+        tile_id_strs = [str(fid) for fid in raw_ids]
+        if self.summarize_geography_ids is not None:
+            valid = {str(gid) for gid in self.summarize_geography_ids}
+            val_cols = [c for c in tile_id_strs if c in valid]
+        elif self.geography_ids is not None:
+            valid = {str(gid) for gid in self.geography_ids}
+            val_cols = [c for c in tile_id_strs if c in valid]
+        else:
+            val_cols = tile_id_strs
+
+        if not val_cols:
+            return None
+
+        df = self.lf.select(val_cols).collect()
+        if df.is_empty():
+            return None
+
+        id_values = _data_to_id_value(df)
+        if not id_values:
+            return None
+
+        return inject_and_serialize(vt, id_values)
+
     async def get_raster_array(self, df, rasters, window, out_shape=None):
         """Read a raster array and apply the operations specified
         in the index DataFrame."""

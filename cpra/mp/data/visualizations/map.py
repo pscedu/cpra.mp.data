@@ -249,16 +249,99 @@ class Map(DatasetVisualization):
     def vector_source(self, grid_name: str) -> dict[str, Any]:
         """Generate a vector source definition.
 
+        When a request context is available, points to the dynamic MVT endpoint
+        so tile geometry is joined to dataset values server-side. Falls back to
+        the static PMTiles URL for offline/notebook use.
+
         Args:
             grid_name: Name of the grid for the tile URL.
 
         Returns:
             A MapLibre vector source definition.
         """
+        if self.request:
+            return {
+                "type": "vector",
+                "tiles": [self._get_vector_tile_url_template()],
+                "minzoom": 0,
+                "maxzoom": 14,
+            }
         return {
             "type": "vector",
             "url": f"{STATIC_TILES_BASE_URL}/{grid_name}",
         }
+
+    def _get_vector_tile_url_template(self) -> str:
+        """Generate the tile URL template for the dynamic MVT endpoint."""
+        base_url = str(
+            self.request.url_for(
+                "get_vector_tile",
+                variable=self.variable.name,
+                grid=self.grid.name,
+                time_unit=self.time_unit,
+                z="{z}",
+                x="{x}",
+                y="{y}",
+            )
+        )
+        exclude = {
+            "color_map",
+            "end_date",
+            "height",
+            "is_overlay",
+            "request",
+            "show_grid_labels",
+            "show_grid_lines",
+            "show_projects",
+            "show_water",
+            "start_date",
+            "width",
+        }
+        query_params = []
+        for key, value in self.params.items():
+            if value is None or key in exclude:
+                continue
+            if isinstance(value, (list, tuple)):
+                for v in value:
+                    query_params.append((key, v))
+            else:
+                query_params.append((key, value))
+        if query_params:
+            return f"{base_url}?{urlencode(query_params)}"
+        return base_url
+
+    def _legend_fill_expr(self, is_difference: bool) -> list:
+        """Build a MapLibre color expression from the legend using the 'value' property.
+
+        Returns a 'case' expression that shows 'transparent' for features with
+        no data, and applies a step (or interpolate for difference maps) otherwise.
+        """
+        if is_difference:
+            stops = self._difference_breaks(self.variable)
+            fill_expr: list = ["interpolate", ["linear"], ["get", "value"]] + stops
+        else:
+            legend = self._get_legend()
+            if legend is None:
+                return "transparent"
+
+            ramp: list = []
+            found_bound = False
+            for row in legend.break_points.iter_rows(named=True):
+                color = row["color"]
+                upper_bound = row["upper_bound"]
+                found_bound = found_bound or upper_bound is not None
+                if not found_bound:
+                    continue
+                ramp.append(color)
+                if upper_bound is not None:
+                    ramp.append(upper_bound)
+
+            if not ramp:
+                return "transparent"
+
+            fill_expr = ["step", ["get", "value"]] + ramp
+
+        return ["case", ["has", "value"], fill_expr, "transparent"]
 
     def projects_source(self, model_group_id: int) -> dict[str, Any]:
         """Generate a projects source definition.
@@ -793,22 +876,28 @@ class Map(DatasetVisualization):
             data_layers = self.raster_layers("data-layer", "data")
         else:
             style["sources"]["data"] = self.vector_source(self.grid.name)
-            colors = self.feature_colors
-            max_id = max((int(k) for k in colors), default=0)
-            if colors and max_id < len(colors) * 10:
-                color_array: list[str | None] = [None] * (max_id + 1)
-                for k, v in colors.items():
-                    color_array[int(k)] = v
-                step_expr = self._id_step_expr(color_array)
-                if step_expr is not None:
-                    # Colors baked into the expression; no global-state lookup at render time.
-                    fill_color = step_expr
-                else:
-                    style["state"]["colors"] = {"default": color_array}
-                    fill_color = COLOR_ARRAY_EXPR
+            if self.request:
+                # Dynamic MVT endpoint: colors derived from the 'value' property
+                # embedded in each tile, no global-state lookup needed.
+                fill_color = self._legend_fill_expr(is_difference)
             else:
-                style["state"]["colors"] = {"default": colors}
-                fill_color = COLOR_OBJECT_EXPR
+                # Static PMTiles fallback: pre-compute colors server-side and
+                # pass via global state for the browser to look up per feature.
+                colors = self.feature_colors
+                max_id = max((int(k) for k in colors), default=0)
+                if colors and max_id < len(colors) * 10:
+                    color_array: list[str | None] = [None] * (max_id + 1)
+                    for k, v in colors.items():
+                        color_array[int(k)] = v
+                    step_expr = self._id_step_expr(color_array)
+                    if step_expr is not None:
+                        fill_color = step_expr
+                    else:
+                        style["state"]["colors"] = {"default": color_array}
+                        fill_color = COLOR_ARRAY_EXPR
+                else:
+                    style["state"]["colors"] = {"default": colors}
+                    fill_color = COLOR_OBJECT_EXPR
             data_layers = self.vector_layers(
                 layer_id="data-layer",
                 source_id="data",
