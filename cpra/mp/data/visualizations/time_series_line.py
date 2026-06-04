@@ -1,5 +1,6 @@
 import datetime as dt
 import itertools
+import json
 import re
 from typing import final
 
@@ -44,6 +45,7 @@ class TimeSeriesLine(DatasetVisualization):
             k: compare_dimensions[k] for k in list(compare_dimensions.keys())[: len(compare_channels)]
         }
         compare_choices = list(itertools.product(*compare_dimensions.values()))
+        compare_choice_indices = list(itertools.product(*[range(len(v)) for v in compare_dimensions.values()]))
 
         chart_height = max(self.height - (222 if is_daily else 86), 50)
         chart_width = max(self.width - 200, 50)
@@ -76,29 +78,34 @@ class TimeSeriesLine(DatasetVisualization):
         geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
-                "_".join([str(c) for c in [i] + list(choices)]),
+                "_".join([str(c) for c in [i] + list(idx_choices)]),
                 type="quantitative",
-                title=f"{str(geo)}: {', '.join([str(c) for c in choices])}",
+                title=f"{str(geo)}: {', '.join([str(c) for c in val_choices])}",
                 format=self.variable.number_format or "",
             )
             for (i, geo) in geography_df.iter_rows()
-            for choices in compare_choices
+            for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 
+        # Build the rules chart. Use calculate transforms with loose equality (==)
+        # rather than lookup to map dimension values to indices. Vega's transform_lookup
+        # uses String() coercion on the key, so the number 0 (from JSON's 0.0) becomes
+        # "0" and fails to match the CSV string "0.0". Loose == coerces correctly.
+        rules = self.get_base_chart(self.data_source, self.time_column).transform_lookup(
+            "geography",
+            from_=alt.LookupData(geography_df, "geography", ["geography_idx"]),
+        )
+        for dim_name, dim_values in compare_dimensions.items():
+            idx_expr = " : ".join([
+                f"datum.{dim_name} == {json.dumps(v)} ? {i}"
+                for i, v in enumerate(dim_values)
+            ]) + " : null"
+            rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
+        pivot_key_parts = ["geography_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
         rules = (
-            self.get_base_chart(self.data_source, self.time_column)
-            .transform_lookup(  # Transform geography to index to support coordinates
-                "geography",
-                from_=alt.LookupData(
-                    geography_df,
-                    "geography",
-                    ["geography_idx"],
-                ),
-            )
+            rules
             .transform_calculate(
-                tooltip=" + '_' + ".join(
-                    [f"datum.{col}" for col in ["geography_idx"] + list(compare_dimensions.keys())]
-                )
+                tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts])
             )
             .transform_pivot("tooltip", value="value", groupby=["date", self.time_column])
             .mark_rule(color="gray")
