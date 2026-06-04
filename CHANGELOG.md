@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.44.1](https://github.com/pscedu/cpra.mp.data/compare/v0.44.0...v0.44.1) (2026-06-04)
+
+
+### Bug Fixes
+
+* add missing pmtiles dependency ([c52cc04](https://github.com/pscedu/cpra.mp.data/commit/c52cc041723101b1019d8b56e10d69f107e6959f))
+* **config:** set default tiles path ([e2986dd](https://github.com/pscedu/cpra.mp.data/commit/e2986ddc7cb979cd8e6ed9d8836a5572dd5e98c0))
+
 ## [0.44.0](https://github.com/pscedu/cpra.mp.data/compare/v0.43.0...v0.44.0) (2026-06-04)
 
 
