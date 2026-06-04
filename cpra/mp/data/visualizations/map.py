@@ -838,6 +838,7 @@ class Map(DatasetVisualization):
                 "title": f"{var.label} Difference",
                 "subtitle": var.unit,
                 "type": "continuous",
+                "numberFormat": var.number_format,
                 "steps": steps,
             }
 
