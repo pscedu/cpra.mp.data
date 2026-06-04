@@ -30,13 +30,20 @@ dependencies = [
     "Pillow",
     "polars==1.37.1",
     "pyarrow",
+    "pyogrio>=0.12.1",
     "python-dotenv",
     "rasterio",
     "scipy",
 ]
 
 [project.optional-dependencies]
-api = ["fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel"]
+api = [
+    "fastapi[standard]>=0.115.0",
+    "geopandas>=0.14.4",
+    "mapbox-vector-tile>=2.2.0",
+    "psycopg2-binary",
+    "sqlmodel",
+]
 bridges2 = [
     "anywidget",
     "connectorx",

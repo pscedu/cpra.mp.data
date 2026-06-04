@@ -403,6 +403,57 @@ class Dataset(LazyFrameSource):
                 detail=f"tile contains more than one band: {groups} bands found",
             )
 
+    def validate_vector_tile(self):
+        """Validate that the tile is a vector grid with an available geometry file."""
+        from cpra.mp.data.api.vector import GEOMETRY_PATH
+
+        if self.output_type != OutputType.vector:
+            raise HTTPException(status_code=400, detail="invalid output type for vector tile: raster")
+
+        grid_name = self.options.summarize_by or self.grid.name
+        if not (GEOMETRY_PATH / f"{grid_name}.fgb").exists():
+            raise HTTPException(
+                status_code=404, detail=f"no geometry file for grid: {grid_name}"
+            )
+
+    @asynctiming
+    async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
+        """Get an MVT tile with geometry joined to dataset values."""
+        from cpra.mp.data.api.vector import encode_mvt, read_tile_geometries
+
+        grid_name = self.options.summarize_by or self.grid.name
+        tile = mercantile.Tile(x, y, z)
+        gdf = read_tile_geometries(grid_name, tile, self.grid.crs)
+        if gdf is None:
+            return None
+
+        # Narrow to only the geography ID columns present in this tile before
+        # collecting, so Polars' column-projection pushdown limits Parquet I/O
+        # to the handful of columns needed rather than all geography columns.
+        # Avoid collect_schema() on the full plan — for a 100K+ column LazyFrame
+        # that alone costs ~500 ms. Instead infer valid columns from what
+        # apply_params() already recorded about the active ID set.
+        tile_id_strs = [str(int(fid)) for fid in gdf["id"]]
+        if self.summarize_geography_ids is not None:
+            valid = {str(gid) for gid in self.summarize_geography_ids}
+            val_cols = [c for c in tile_id_strs if c in valid]
+        elif self.geography_ids is not None:
+            valid = {str(gid) for gid in self.geography_ids}
+            val_cols = [c for c in tile_id_strs if c in valid]
+        else:
+            val_cols = tile_id_strs
+
+        if not val_cols:
+            return None
+
+        # Select only the value columns — encode_mvt doesn't use dimension columns,
+        # so we avoid collect_schema() and any unnecessary Parquet I/O entirely.
+        df = self.lf.select(val_cols).collect()
+        if df.is_empty():
+            return None
+
+        return encode_mvt(gdf, df, tile)
+
     async def get_raster_array(self, df, rasters, window, out_shape=None):
         """Read a raster array and apply the operations specified
         in the index DataFrame."""
