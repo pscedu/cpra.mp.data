@@ -1,5 +1,6 @@
 import datetime as dt
 import itertools
+import re
 from typing import final
 
 import altair as alt
@@ -28,10 +29,13 @@ class TimeSeriesLine(DatasetVisualization):
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
+        negate_param = self.params.get("negate")
+        negate_dimension = re.match(r"\w+", negate_param).group() if negate_param else None
+
         compare_dimensions = {
             d: self.params[d]
             for d in DIMENSIONS.keys()
-            if isinstance(self.params.get(d), (list, tuple)) and len(self.params.get(d)) > 1
+            if isinstance(self.params.get(d), (list, tuple)) and len(self.params.get(d)) > 1 and d != negate_dimension
         }
         # Limit compare dimensions to the number of available channels.
         # TODO: Adjust params to remove additional compare dimensions from the data.
