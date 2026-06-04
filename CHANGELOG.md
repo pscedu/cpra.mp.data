@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.44.0](https://github.com/pscedu/cpra.mp.data/compare/v0.43.0...v0.44.0) (2026-06-04)
+
+
+### Features
+
+* **api:** add MVT generation in the data API ([#67](https://github.com/pscedu/cpra.mp.data/issues/67)) ([ec9762d](https://github.com/pscedu/cpra.mp.data/commit/ec9762d36c6f6932994c26c12ef06df0868231dc))
+
 ## [0.43.0](https://github.com/pscedu/cpra.mp.data/compare/v0.42.0...v0.43.0) (2026-06-04)
 
 
