@@ -69,12 +69,15 @@ def validate_data_frame(df, required_cols=None):
         expressions.update(dim.validation_expressions)
 
     # Add validation expressions for variable-geographic_unit and variable-time_unit.
-    expressions["variable_matches_grid"] = pl.any_horizontal(
-        *[
-            ((pl.col("variable") == n) & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units))
-            for n, v in VARIABLES.items()
-        ]
-    )
+    # grid may be absent from the DataFrame (e.g. read_parquet input) when it is
+    # no longer a dataset dimension, so only validate the pairing when it is present.
+    if "grid" in df.columns:
+        expressions["variable_matches_grid"] = pl.any_horizontal(
+            *[
+                ((pl.col("variable") == n) & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units))
+                for n, v in VARIABLES.items()
+            ]
+        )
     expressions["variable_matches_time_unit"] = pl.any_horizontal(
         *[((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units)) for n, v in VARIABLES.items()]
     )
@@ -128,6 +131,21 @@ def validate_grid(data=None, **kwargs):
         raise ValidationError(msg)
 
     return grid
+
+
+def validate_grids(df):
+    """Validate all grid values present in a long-format DataFrame."""
+    for grid_name in df["grid"].unique():
+        grid = GRIDS.get(grid_name)
+        if grid is None:
+            raise ValidationError(f"{grid_name} is not a valid grid.")
+        if grid.id_min is not None or grid.id_max is not None:
+            geo_ids = df.filter(pl.col("grid") == grid_name)["geography_id"]
+            if grid.id_min is not None and (geo_ids < grid.id_min).any():
+                raise ValidationError(f"geography_id below minimum for grid {grid_name}")
+            if grid.id_max is not None and (geo_ids > grid.id_max).any():
+                raise ValidationError(f"geography_id above maximum for grid {grid_name}")
+    return {name: GRIDS[name] for name in df["grid"].unique()}
 
 
 def cast_columns(df):

@@ -1,8 +1,6 @@
-import re
 from pathlib import Path
 
 import polars as pl
-import polars.selectors as cs
 
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
@@ -15,12 +13,9 @@ from cpra.mp.data.utils import (
     partition_columns,
     required_columns,
     validate_data_frame,
-    validate_grid,
+    validate_grids,
 )
 from cpra.mp.data.variables import VARIABLES
-
-ALPHA_COLUMN = re.compile(r"^[a-z]")
-NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
@@ -34,6 +29,12 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
     dataset_dir = dataset_path(base_path, **kwargs)
     dataset_exprs = [pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()]
     filter_args = get_filter_expressions(**kwargs)
+    if "calendar_day" in kwargs:
+        days = kwargs["calendar_day"]
+        if not isinstance(days, (list, tuple)):
+            days = [days]
+        years = list({d.year for d in days})
+        filter_args.append(pl.col("calendar_year").is_in(years))
 
     # Default to an un-partitioned dataset.
     hive_partitioning = False
@@ -62,7 +63,8 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        cs.digit(),
+        pl.col("geography_id"),
+        pl.col("value"),
         *([pl.col(include_file_paths)] if include_file_paths else []),
     )
 
@@ -76,8 +78,7 @@ def write_parquet(
     sort=True,
     compression="zstd",
     compression_level=6,
-    row_group_size=5000,
-    use_dictionary=False,
+    row_group_size=500_000,
     **kwargs,
 ):
     """Write data from a data frame to a Parquet file."""
@@ -87,9 +88,11 @@ def write_parquet(
     # Add keyword arguments to the dataframe as columns.
     df = df.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
-    # If this is long-format data (i.e., with a geography column), pivot it.
-    if "geography" in df and "value" in df:
-        df = df.pivot("geography", values="value")
+    # Derive calendar_year from calendar_day if not already present.
+    if "calendar_year" not in df.columns and "calendar_day" in df.columns:
+        df = df.with_columns(
+            pl.col("calendar_day").dt.year().cast(pl.Int32).alias("calendar_year")
+        )
 
     # Validate and sort the data.
     if validate or sort:
@@ -97,44 +100,25 @@ def write_parquet(
         required_cols = required_columns(df)
 
         if validate:
+            for col in ("geography_id", "value"):
+                if col not in df.columns:
+                    raise ValidationError(f"Required column missing: {col}")
             validate_data_frame(df, required_cols=required_cols)
 
-        # Validate column names.
-        grid = validate_grid(df, **kwargs)
+        # Validate grids and geography IDs.
+        validate_grids(df)
 
-        alpha_cols = [col for col in df.columns if ALPHA_COLUMN.match(col)]
-        numeric_cols = [col for col in df.columns if NUMERIC_COLUMN.match(col)]
-
-        invalid_cols = set(alpha_cols) - set(required_cols)
-        if invalid_cols:
-            msg = f"Invalid columns: {', '.join(list(invalid_cols))}"
-            raise ValidationError(msg)
-
-        missing_cols = set(required_cols) - set(alpha_cols)
-        if missing_cols:
-            msg = f"Missing columns: {', '.join(list(missing_cols))}"
-            raise ValidationError(msg)
-
-        if grid.id_count is not None and len(numeric_cols) != grid.id_count:
-            msg = "Wrong number of geography columns: " f"expected {grid.id_count}, found {len(numeric_cols)}"
-            raise ValidationError(msg)
-
-        # Validate geometry column data type and min/max ID.
+        # Validate value dtype against the variable spec.
         variable = VARIABLES[df["variable"][0]]
-        for col in numeric_cols:
-            if (grid.id_min is not None and int(col) < grid.id_min) or (
-                grid.id_max is not None and int(col) > grid.id_max
-            ):
-                msg = f"Invalid geography ID for grid {grid.name}: {col}"
-                raise ValidationError(msg)
-            if df[col].dtype != variable.dtype:
-                msg = f"Series {col} has dtype {df[col].dtype!s}, expected {variable.dtype!s}"
-                raise ValidationError(msg)
+        if df["value"].dtype != variable.dtype:
+            msg = f"Series value has dtype {df['value'].dtype!s}, expected {variable.dtype!s}"
+            raise ValidationError(msg)
 
         # Sort columns and rows.
         if sort:
-            all_cols = required_cols + list(map(str, sorted(map(int, numeric_cols))))
-            df = df.select(*all_cols).sort(*required_cols)
+            date_col = "calendar_day" if "calendar_day" in df.columns else "calendar_year"
+            sort_keys = partition_columns(df) + ["grid", "geography_id", date_col]
+            df = df.select(*required_cols, "geography_id", "value").sort(*sort_keys)
 
     # Get partition columns.
     partition_cols = partition_columns(df)
@@ -146,7 +130,7 @@ def write_parquet(
         compression_level=compression_level,
         row_group_size=row_group_size,
         use_pyarrow=True,
-        pyarrow_options=dict(use_dictionary=use_dictionary, partition_cols=partition_cols),
+        pyarrow_options=dict(partition_cols=partition_cols),
     )
 
 
@@ -155,8 +139,7 @@ def compact_parquet(
     sort=True,
     compression="zstd",
     compression_level=6,
-    row_group_size=5000,
-    use_dictionary=False,
+    row_group_size=500_000,
     **kwargs,
 ):
     """Rewrite Parquet datasets with one file per dataset."""
@@ -208,7 +191,6 @@ def compact_parquet(
             compression=compression,
             compression_level=compression_level,
             row_group_size=row_group_size,
-            use_dictionary=use_dictionary,
         )
 
         # Delete the original files from the partition directory.

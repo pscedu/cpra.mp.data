@@ -40,6 +40,8 @@ class Dimension:
             return False
         if self.type == "dataset":
             return True
+        if self.name == "calendar_year":
+            return True
         return (pl.col("time_unit") == "daily").any()
 
     @property
@@ -118,5 +120,5 @@ METADATA_DIMENSIONS = {d.name: d for d in DIMENSIONS.values() if d.type == "meta
 # Override the default required expressions for time dimensions.
 DIMENSIONS["variable"].values = values_df_from_dict("variable", VARIABLES)
 DIMENSIONS["grid"].values = values_df_from_dict("grid", GRIDS)
-DIMENSIONS["calendar_year"].required = pl.col("time_unit").is_in(["annual", "decadal"]).any()
+DIMENSIONS["calendar_year"].required = True
 DIMENSIONS["calendar_day"].required = pl.col("time_unit").is_in(["daily", "monthly"]).any()
