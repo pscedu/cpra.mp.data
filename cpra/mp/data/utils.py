@@ -140,11 +140,11 @@ def validate_grids(df):
         if grid is None:
             raise ValidationError(f"{grid_name} is not a valid grid.")
         if grid.id_min is not None or grid.id_max is not None:
-            geo_ids = df.filter(pl.col("grid") == grid_name)["geography_id"]
+            geo_ids = df.filter(pl.col("grid") == grid_name)["grid_cell"]
             if grid.id_min is not None and (geo_ids < grid.id_min).any():
-                raise ValidationError(f"geography_id below minimum for grid {grid_name}")
+                raise ValidationError(f"grid_cell below minimum for grid {grid_name}")
             if grid.id_max is not None and (geo_ids > grid.id_max).any():
-                raise ValidationError(f"geography_id above maximum for grid {grid_name}")
+                raise ValidationError(f"grid_cell above maximum for grid {grid_name}")
     return {name: GRIDS[name] for name in df["grid"].unique()}
 
 

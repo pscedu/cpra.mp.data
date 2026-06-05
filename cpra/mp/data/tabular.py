@@ -63,7 +63,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        pl.col("geography_id"),
+        pl.col("grid_cell"),
         pl.col("value"),
         *([pl.col(include_file_paths)] if include_file_paths else []),
     )
@@ -100,7 +100,7 @@ def write_parquet(
         required_cols = required_columns(df)
 
         if validate:
-            for col in ("geography_id", "value"):
+            for col in ("grid_cell", "value"):
                 if col not in df.columns:
                     raise ValidationError(f"Required column missing: {col}")
             validate_data_frame(df, required_cols=required_cols)
@@ -114,11 +114,14 @@ def write_parquet(
             msg = f"Series value has dtype {df['value'].dtype!s}, expected {variable.dtype!s}"
             raise ValidationError(msg)
 
-        # Sort columns and rows.
+        # Sort columns and rows. calendar_day is placed after grid_cell so rows
+        # are ordered cell-first within each partition (all days for cell N, then
+        # all days for cell N+1), matching the access pattern for spatial queries.
         if sort:
-            date_col = "calendar_day" if "calendar_day" in df.columns else "calendar_year"
-            sort_keys = partition_columns(df) + ["grid", "geography_id", date_col]
-            df = df.select(*required_cols, "geography_id", "value").sort(*sort_keys)
+            day_cols = [c for c in ["calendar_day"] if c in df.columns]
+            non_day_required = [c for c in required_cols if c not in day_cols]
+            sort_keys = non_day_required + ["grid_cell"] + day_cols
+            df = df.select(*required_cols, "grid_cell", "value").sort(*sort_keys)
 
     # Get partition columns.
     partition_cols = partition_columns(df)

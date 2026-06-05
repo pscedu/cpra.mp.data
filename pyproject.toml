@@ -75,3 +75,8 @@ maplibre = { git = "https://github.com/jpuerto-psc/py-maplibregl" }
 [tool.uv.build-backend]
 module-name = "cpra.mp.data"
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

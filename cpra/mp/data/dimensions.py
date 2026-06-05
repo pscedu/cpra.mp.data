@@ -40,7 +40,7 @@ class Dimension:
             return False
         if self.type == "dataset":
             return True
-        if self.name == "calendar_year":
+        if self.name == "grid":
             return True
         return (pl.col("time_unit") == "daily").any()
 

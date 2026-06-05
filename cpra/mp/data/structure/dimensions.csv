@@ -1,6 +1,5 @@
 label,name,type,dtype,required,min_value,max_value,example_value
 Variable,variable,dataset,String,true,,,sal
-Grid,grid,nonpartition,String,true,,,hydro_compartment_v001
 Time Unit,time_unit,dataset,String,true,,,daily
 Plan Implementation Scenario,model_group_id,partition,Int32,true,0,999,500
 Environmental Scenario,scenario_id,partition,Int32,true,0,100,7
@@ -23,6 +22,7 @@ Vegetation: Coverage Type,vegetation_coverage_type,partition,String,false,,,
 Percentile,percentile,partition,Int8,false,0,100,50
 Vegetation: Species,veg_species_code,nonpartition,String,false,,,coes
 FFIBS: Coverage Type,ffibs_type,nonpartition,String,false,,,0.5
+Grid,grid,partition,String,true,,,hydro_compartment_v001
 Year,calendar_year,partition,Int32,true,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
 Model,model,metadata,String,true,,,icm_v2023.0.0

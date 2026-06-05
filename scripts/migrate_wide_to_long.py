@@ -8,8 +8,8 @@ O(100 K) geography columns are handled without OOM.
 Old layout:  variable=X/grid=G/time_unit=T/[hive dims.../]  *.parquet
              rows = one time step, cols = geography IDs "1".."N"
 
-New layout:  variable=X/time_unit=T/[hive dims.../]calendar_year=Y/  *.parquet
-             rows = (grid, geography_id, time step), cols = geography_id + value
+New layout:  variable=X/time_unit=T/[hive dims.../]grid=G/[calendar_year=Y/]  *.parquet
+             rows = (grid_cell, time step), cols = grid_cell + value
 """
 
 import re
@@ -41,9 +41,10 @@ def get_partition_col_names(raw_path_dims: dict[str, str]) -> list[str]:
         dim = DIMENSIONS.get(name)
         if dim:
             dummy[name] = pl.Series([raw]).cast(dim.dtype)
-    # calendar_year is always a partition column; supply a placeholder if the
-    # source path does not include it (e.g. daily data — it will be derived).
-    if "calendar_year" not in dummy:
+    # For daily data, calendar_year is derived from calendar_day and absent from
+    # the source path; supply a placeholder so partition_columns() can evaluate
+    # the time_unit-conditional logic correctly.
+    if "calendar_year" not in dummy and dummy.get("time_unit", pl.Series(["daily"]))[0] == "daily":
         dummy["calendar_year"] = pl.Series([2030], dtype=pl.Int32)
     return partition_columns(pl.DataFrame(dummy))
 
@@ -87,20 +88,20 @@ def convert_directory(leaf_dir: Path, src: Path, dst: Path) -> None:
         lf = lf.with_columns(pl.col("calendar_day").dt.year().cast(pl.Int32).alias("calendar_year"))
         available_cols = available_cols | {"calendar_year"}
 
-    # Unpivot: geography ID columns → geography_id (Int32) + value.
+    # Unpivot: geography ID columns → grid_cell (Int32) + value.
     index_cols = [c for c in lf.collect_schema().names() if c not in geo_cols]
     lf = lf.unpivot(
         on=geo_cols,
         index=index_cols,
-        variable_name="geography_id",
+        variable_name="grid_cell",
         value_name="value",
-    ).with_columns(pl.col("geography_id").cast(pl.Int32))
+    ).with_columns(pl.col("grid_cell").cast(pl.Int32))
 
     # Sort: partition columns first (ensures each partition's rows are contiguous
-    # for the sink), then grid, geography_id, date within each partition file.
+    # for the sink), then grid_cell and date within each partition file.
     part_col_names = get_partition_col_names(raw_path_dims)
     date_col = "calendar_day" if "calendar_day" in available_cols else "calendar_year"
-    trailing = [k for k in ["grid", "geography_id", date_col] if k not in part_col_names]
+    trailing = [k for k in ["grid_cell", date_col] if k not in part_col_names]
     lf = lf.sort(*part_col_names, *trailing)
 
     # Write to disk with hive partitioning. include_key=False keeps partition

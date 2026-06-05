@@ -31,7 +31,7 @@ def _daily_df(
             "aggregate_type": "2_wk_max",
             "model": "icm_v2023.0.0",
             "calendar_day": day,
-            "geography_id": geo_id,
+            "grid_cell": geo_id,
             "value": float(geo_id),
         }
         for geo_id in geo_ids
@@ -40,7 +40,7 @@ def _daily_df(
     return pl.DataFrame(rows).with_columns(
         pl.col("model_group_id").cast(pl.Int32),
         pl.col("scenario_id").cast(pl.Int32),
-        pl.col("geography_id").cast(pl.Int32),
+        pl.col("grid_cell").cast(pl.Int32),
         pl.col("value").cast(pl.Float32),
     )
 
@@ -53,7 +53,7 @@ class TestValidateGrids:
     def _df(self, grid, geo_ids):
         return pl.DataFrame({
             "grid": [grid] * len(geo_ids),
-            "geography_id": pl.Series(geo_ids, dtype=pl.Int32),
+            "grid_cell": pl.Series(geo_ids, dtype=pl.Int32),
         })
 
     def test_valid_single_grid(self):
@@ -80,13 +80,13 @@ class TestValidateGrids:
         with pytest.raises(ValidationError, match="not a valid grid"):
             validate_grids(df)
 
-    def test_geography_id_below_min(self):
+    def test_grid_cell_below_min(self):
         # hydro_compartment_v001 id_min=1
         df = self._df("hydro_compartment_v001", [0])
         with pytest.raises(ValidationError, match="below minimum"):
             validate_grids(df)
 
-    def test_geography_id_above_max(self):
+    def test_grid_cell_above_max(self):
         # hydro_compartment_v001 id_max=1657
         df = self._df("hydro_compartment_v001", [1658])
         with pytest.raises(ValidationError, match="above maximum"):
@@ -120,14 +120,15 @@ class TestWriteParquet:
         assert year_dirs == {"calendar_year=2030", "calendar_year=2031"}
 
     def test_directory_structure(self, tmp_path):
-        """grid= must not appear as a path segment; calendar_year= must."""
+        """grid= must appear as a path segment before calendar_year= for daily data."""
         df = _daily_df()
         write_parquet(df, base_path=tmp_path, validate=False)
         all_paths = [str(p) for p in tmp_path.rglob("*.parquet")]
         assert all_paths, "No parquet files written"
         for path in all_paths:
-            assert "grid=" not in path, f"Unexpected grid= in path: {path}"
+            assert "grid=" in path, f"Missing grid= in path: {path}"
             assert "calendar_year=" in path, f"Missing calendar_year= in path: {path}"
+            assert path.index("grid=") < path.index("calendar_year="), f"grid= must come before calendar_year= in: {path}"
 
     def test_multi_grid_write(self, tmp_path):
         """DataFrames containing two different grids are written without error."""
@@ -138,9 +139,9 @@ class TestWriteParquet:
         write_parquet(df, base_path=tmp_path, validate=False)
         assert any(tmp_path.rglob("*.parquet"))
 
-    def test_missing_geography_id_raises(self, tmp_path):
-        df = _daily_df().drop("geography_id")
-        with pytest.raises(ValidationError, match="geography_id"):
+    def test_missing_grid_cell_raises(self, tmp_path):
+        df = _daily_df().drop("grid_cell")
+        with pytest.raises(ValidationError, match="grid_cell"):
             write_parquet(df, base_path=tmp_path, validate=True, sort=False)
 
     def test_missing_value_raises(self, tmp_path):
@@ -149,17 +150,17 @@ class TestWriteParquet:
             write_parquet(df, base_path=tmp_path, validate=True, sort=False)
 
     def test_sort_order(self, tmp_path):
-        """Rows are stored in (geography_id, calendar_day) order within a year file."""
+        """Rows are stored in (grid_cell, calendar_day) order within a partition file."""
         df = _daily_df(
             geo_ids=[3, 1, 2],
             days=[datetime.date(2030, 1, 2), datetime.date(2030, 1, 1)],
         )
         write_parquet(df, base_path=tmp_path, validate=False)
         files = list(tmp_path.rglob("*.parquet"))
-        # All rows are from 2030 so there is exactly one year partition file.
+        # All rows are from 2030 and one grid, so there is exactly one partition file.
         assert len(files) == 1
         result = pl.read_parquet(files[0])
-        assert result["geography_id"].to_list() == [1, 1, 2, 2, 3, 3]
+        assert result["grid_cell"].to_list() == [1, 1, 2, 2, 3, 3]
         assert result["calendar_day"].to_list() == [
             datetime.date(2030, 1, 1), datetime.date(2030, 1, 2),
             datetime.date(2030, 1, 1), datetime.date(2030, 1, 2),
