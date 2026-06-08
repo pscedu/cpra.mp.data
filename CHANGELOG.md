@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.45.0](https://github.com/pscedu/cpra.mp.data/compare/v0.44.2...v0.45.0) (2026-06-08)
+
+
+### Features
+
+* **raster:** use predictor option for writing COGs ([9d06ca6](https://github.com/pscedu/cpra.mp.data/commit/9d06ca6dd68ab07cbd5b426dceec4041c5811802))
+
 ## [0.44.2](https://github.com/pscedu/cpra.mp.data/compare/v0.44.1...v0.44.2) (2026-06-04)
 
 
