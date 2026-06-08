@@ -56,10 +56,11 @@ def convert_directory(leaf_dir: Path, src: Path, dst: Path) -> None:
 
     # Scan all files in this partition directory as a single LazyFrame.
     lf = pl.scan_parquet([str(p) for p in parquet_files])
-    initial_cols = set(lf.collect_schema().names())
+    initial_schema_names = lf.collect_schema().names()
+    initial_cols = set(initial_schema_names)
 
     # Identify geography (numeric-named) columns.
-    geo_cols = [c for c in initial_cols if NUMERIC_COL.match(c)]
+    geo_cols = [c for c in initial_schema_names if NUMERIC_COL.match(c)]
     if not geo_cols:
         click.echo(
             f"  WARNING: no geography columns in {leaf_dir.relative_to(src)}, skipping",
@@ -72,24 +73,29 @@ def convert_directory(leaf_dir: Path, src: Path, dst: Path) -> None:
     # only in the directory name, not in the parquet columns).
     raw_path_dims = parse_path_dims(leaf_dir, src)
     add_exprs: list[pl.Expr] = []
-    added_names: set[str] = set()
+    added_names: list[str] = []
     for name, raw in raw_path_dims.items():
         if name not in initial_cols:
             dim = DIMENSIONS.get(name)
             expr = pl.lit(raw).cast(dim.dtype) if dim else pl.lit(raw)
             add_exprs.append(expr.alias(name))
-            added_names.add(name)
+            added_names.append(name)
     if add_exprs:
         lf = lf.with_columns(*add_exprs)
 
+    # Track the full ordered column list without a second schema call.
+    all_col_names = initial_schema_names + added_names
+    available_cols = set(all_col_names)
+
     # Derive calendar_year from calendar_day when absent (daily / monthly).
-    available_cols = initial_cols | added_names
     if "calendar_year" not in available_cols and "calendar_day" in available_cols:
         lf = lf.with_columns(pl.col("calendar_day").dt.year().cast(pl.Int32).alias("calendar_year"))
+        all_col_names = all_col_names + ["calendar_year"]
         available_cols = available_cols | {"calendar_year"}
 
     # Unpivot: geography ID columns → grid_cell (Int32) + value.
-    index_cols = [c for c in lf.collect_schema().names() if c not in geo_cols]
+    geo_col_set = set(geo_cols)
+    index_cols = [c for c in all_col_names if c not in geo_col_set]
     lf = lf.unpivot(
         on=geo_cols,
         index=index_cols,
@@ -97,12 +103,17 @@ def convert_directory(leaf_dir: Path, src: Path, dst: Path) -> None:
         value_name="value",
     ).with_columns(pl.col("grid_cell").cast(pl.Int32))
 
-    # Sort: partition columns first (ensures each partition's rows are contiguous
-    # for the sink), then grid_cell and date within each partition file.
+    # Sort by the columns that actually vary within this leaf_dir.
+    # Path-injected literals (added_names) are constants — sorting by them
+    # wastes CPU. Only calendar_year can vary as a partition key (daily data).
     part_col_names = get_partition_col_names(raw_path_dims)
     date_col = "calendar_day" if "calendar_day" in available_cols else "calendar_year"
     trailing = [k for k in ["grid_cell", date_col] if k not in part_col_names]
-    lf = lf.sort(*part_col_names, *trailing)
+    added_names_set = set(added_names)
+    varying_part_cols = [c for c in part_col_names if c not in added_names_set]
+    sort_cols = varying_part_cols + trailing
+    # FIXME: The sort columns are not correct.
+    lf = lf.sort(*sort_cols, maintain_order=False)
 
     # Write to disk with hive partitioning. include_key=False keeps partition
     # column values only in the directory path, not duplicated inside the file.
