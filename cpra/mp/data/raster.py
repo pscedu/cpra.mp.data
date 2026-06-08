@@ -115,6 +115,7 @@ def write_cog(
         "dtype": data.dtype,
         "height": grid.height,
         "nodata": -9999,
+        "predictor": "YES",
         "resampling": "NEAREST",
         "transform": dst_transform,
         "width": grid.width,
