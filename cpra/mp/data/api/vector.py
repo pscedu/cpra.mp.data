@@ -2,7 +2,6 @@ import gzip
 
 import mercantile
 import polars as pl
-import polars.selectors as cs
 from fastapi import HTTPException
 from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from pmtiles.reader import MmapSource, Reader
@@ -23,12 +22,14 @@ def read_pmtile(grid_name: str, tile: mercantile.Tile) -> bytes | None:
 
 
 def _data_to_id_value(df: pl.DataFrame) -> dict[int, float]:
-    """Extract {geography_id: value} from a wide-format DataFrame (first row used)."""
-    value_cols = df.select(cs.matches(r"^[0-9\-]")).columns
-    if not value_cols or df.is_empty():
+    """Extract {geography_id: value} from a long-format DataFrame."""
+    if df.is_empty() or "geography" not in df.columns:
         return {}
-    row = df.select(value_cols).row(0, named=True)
-    return {int(col): val for col, val in row.items() if val is not None}
+    return {
+        geo: val
+        for geo, val in zip(df["geography"].to_list(), df["value"].to_list())
+        if val is not None
+    }
 
 
 def parse_tile(compressed: bytes) -> tuple[VectorTile, list[int]]:

@@ -36,8 +36,8 @@ from cpra.mp.data.variables import VARIABLES, Variable
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
-DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
-VALUE_COLUMNS = cs.matches(r"^[0-9\-]")
+DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("geography", "value")
+VALUE_COLUMNS = cs.by_name("value")
 
 
 class Dataset(LazyFrameSource):
@@ -124,7 +124,7 @@ class Dataset(LazyFrameSource):
         """Apply the geography filter to a vector-grid dataset."""
         # TODO: Validate that the given IDs fall within the grid min and max.
         self.geography_ids = unpack_values(self.options.geography, "geography")
-        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
+        self.lf = self.lf.filter(pl.col("geography").is_in([int(g) for g in self.geography_ids]))
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
@@ -232,10 +232,12 @@ class Dataset(LazyFrameSource):
             required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
             null_cols = [col for col in required_cols if col not in group_by_cols]
 
-            self.lf = getattr(
-                self.lf.select(pl.exclude(null_cols)).group_by(*group_by_cols),
-                self.options.group_aggregate,
-            )()
+            # geography must always be part of the group key in long format since each
+            # row represents a single geography.
+            self.lf = (
+                self.lf.group_by(*group_by_cols, "geography")
+                .agg(getattr(pl.col("value"), self.options.group_aggregate)())
+            )
 
             if null_cols:
                 self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
@@ -280,38 +282,32 @@ class Dataset(LazyFrameSource):
             raise HTTPException(status_code=400, detail=msg)
 
         if self.geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in(self.geography_ids))
+            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in self.geography_ids]))
 
         if self.summarize_geography_ids:
             crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_geography_ids))
 
-        crosswalk_df = (
-            crosswalk_lf.select("dst_id", summarize_columns=pl.struct("src_id", "scale_factor"))
-            .group_by(pl.col("dst_id"))
-            .agg("summarize_columns")
-            .sort("dst_id")
-            .collect()
+        # Join the data on geography == src_id, scale the values, then aggregate
+        # per destination geography. The join replaces the wide-format horizontal
+        # aggregation that was used when each source geography was a column.
+        dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
+        agg_fn = self.options.summarize_aggregate
+        self.lf = (
+            self.lf
+            .join(crosswalk_lf, left_on="geography", right_on="src_id", how="inner")
+            .with_columns(value=pl.col("value") * pl.col("scale_factor"))
+            .group_by(*dim_cols, pl.col("dst_id").alias("geography"))
+            .agg(getattr(pl.col("value"), agg_fn)())
+            .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
         )
-
-        agg_function = getattr(pl, f"{self.options.summarize_aggregate}_horizontal")
-        self.lf = self.lf.select(
-            DIMENSION_COLUMNS,
-            **{
-                str(row["dst_id"]): agg_function(
-                    *[pl.col(str(col["src_id"])) * col["scale_factor"] for col in row["summarize_columns"]]
-                )
-                for row in crosswalk_df.iter_rows(named=True)
-            },
-        ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
 
     def _apply_transform_params_raster(self):
         """Apply transform and extract parameters to the image."""
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""
-
-        if self.options.unpivot:
-            self.lf = self.lf.unpivot(index=DIMENSION_COLUMNS, variable_name="geography")
+        # Data is already in long format on disk; nothing to do here. The parameter
+        # is kept for backward API compatibility.
 
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
@@ -447,7 +443,8 @@ class Dataset(LazyFrameSource):
         if not val_cols:
             return None
 
-        df = self.lf.select(val_cols).collect()
+        tile_ints = [int(c) for c in val_cols]
+        df = self.lf.filter(pl.col("geography").is_in(tile_ints)).collect()
         if df.is_empty():
             return None
 

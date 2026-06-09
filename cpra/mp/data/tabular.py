@@ -1,4 +1,3 @@
-import re
 from pathlib import Path
 
 import polars as pl
@@ -19,8 +18,23 @@ from cpra.mp.data.utils import (
 )
 from cpra.mp.data.variables import VARIABLES
 
-ALPHA_COLUMN = re.compile(r"^[a-z]")
-NUMERIC_COLUMN = re.compile(r"^[0-9]")
+# Days/months per year multiplied by a safety margin to ensure one row group
+# covers at most one calendar year for each time unit.
+_ROWS_PER_YEAR = {"daily": 400, "monthly": 15, "annual": 1, "decadal": 1}
+_MAX_ROW_GROUP_SIZE = 5_000_000
+
+
+def _row_group_size(grid, time_unit):
+    """Return a row group size that aligns row group boundaries to calendar years.
+
+    For daily/monthly data the target is one row group per year, so each row
+    group's calendar_day min/max spans exactly one calendar year and Polars
+    predicate pushdown can skip entire row groups for year-filtered queries.
+    """
+    if grid is None or grid.id_count is None:
+        return 500_000
+    rows_per_year = _ROWS_PER_YEAR.get(time_unit, 1)
+    return min(max(grid.id_count * rows_per_year, 500_000), _MAX_ROW_GROUP_SIZE)
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
@@ -62,7 +76,8 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        cs.digit(),
+        pl.col("geography"),
+        pl.col("value"),
         *([pl.col(include_file_paths)] if include_file_paths else []),
     )
 
@@ -76,7 +91,7 @@ def write_parquet(
     sort=True,
     compression="zstd",
     compression_level=6,
-    row_group_size=5000,
+    row_group_size=None,
     use_dictionary=False,
     **kwargs,
 ):
@@ -87,54 +102,50 @@ def write_parquet(
     # Add keyword arguments to the dataframe as columns.
     df = df.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
-    # If this is long-format data (i.e., with a geography column), pivot it.
-    if "geography" in df and "value" in df:
-        df = df.pivot("geography", values="value")
+    # If this is wide-format data (geography IDs as column names), unpivot to long.
+    numeric_cols = [col for col in df.columns if col[:1].isdigit()]
+    if numeric_cols:
+        alpha_cols = [col for col in df.columns if not col[:1].isdigit()]
+        df = df.unpivot(index=alpha_cols, variable_name="geography", value_name="value").with_columns(
+            pl.col("geography").cast(pl.Int32)
+        )
+
+    grid = validate_grid(df, **kwargs)
+    time_unit = df["time_unit"][0] if "time_unit" in df.columns else kwargs.get("time_unit")
 
     # Validate and sort the data.
     if validate or sort:
-        # Check to make sure that all required columns are present.
         required_cols = required_columns(df)
 
         if validate:
             validate_data_frame(df, required_cols=required_cols)
 
-        # Validate column names.
-        grid = validate_grid(df, **kwargs)
-
-        alpha_cols = [col for col in df.columns if ALPHA_COLUMN.match(col)]
-        numeric_cols = [col for col in df.columns if NUMERIC_COLUMN.match(col)]
-
-        invalid_cols = set(alpha_cols) - set(required_cols)
-        if invalid_cols:
-            msg = f"Invalid columns: {', '.join(list(invalid_cols))}"
-            raise ValidationError(msg)
-
-        missing_cols = set(required_cols) - set(alpha_cols)
-        if missing_cols:
-            msg = f"Missing columns: {', '.join(list(missing_cols))}"
-            raise ValidationError(msg)
-
-        if grid.id_count is not None and len(numeric_cols) != grid.id_count:
-            msg = "Wrong number of geography columns: " f"expected {grid.id_count}, found {len(numeric_cols)}"
-            raise ValidationError(msg)
-
-        # Validate geometry column data type and min/max ID.
-        variable = VARIABLES[df["variable"][0]]
-        for col in numeric_cols:
-            if (grid.id_min is not None and int(col) < grid.id_min) or (
-                grid.id_max is not None and int(col) > grid.id_max
-            ):
-                msg = f"Invalid geography ID for grid {grid.name}: {col}"
+            # Validate geography ID range.
+            if grid.id_min is not None and df["geography"].min() < grid.id_min:
+                msg = f"Geography ID below minimum for grid {grid.name}: {df['geography'].min()}"
                 raise ValidationError(msg)
-            if df[col].dtype != variable.dtype:
-                msg = f"Series {col} has dtype {df[col].dtype!s}, expected {variable.dtype!s}"
+            if grid.id_max is not None and df["geography"].max() > grid.id_max:
+                msg = f"Geography ID above maximum for grid {grid.name}: {df['geography'].max()}"
                 raise ValidationError(msg)
 
-        # Sort columns and rows.
+            # Validate value column dtype.
+            variable = VARIABLES[df["variable"][0]]
+            if df["value"].dtype != variable.dtype:
+                msg = f"Column 'value' has dtype {df['value'].dtype!s}, expected {variable.dtype!s}"
+                raise ValidationError(msg)
+
         if sort:
-            all_cols = required_cols + list(map(str, sorted(map(int, numeric_cols))))
-            df = df.select(*all_cols).sort(*required_cols)
+            if time_unit in ("daily", "monthly"):
+                # Sort so each row group covers one calendar year: year → geography → date.
+                sort_exprs = [pl.col("calendar_day").dt.year(), pl.col("geography"), pl.col("calendar_day")]
+            else:
+                sort_exprs = [pl.col("geography"), pl.col("calendar_year")]
+
+            df = df.select(*required_cols, "geography", "value").sort(*sort_exprs)
+
+    # Compute row group size from grid and time_unit if not provided explicitly.
+    if row_group_size is None:
+        row_group_size = _row_group_size(grid, time_unit)
 
     # Get partition columns.
     partition_cols = partition_columns(df)
@@ -155,7 +166,7 @@ def compact_parquet(
     sort=True,
     compression="zstd",
     compression_level=6,
-    row_group_size=5000,
+    row_group_size=None,
     use_dictionary=False,
     **kwargs,
 ):
