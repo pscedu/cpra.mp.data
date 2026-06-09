@@ -58,7 +58,7 @@ class TimeSeriesLine(DatasetVisualization):
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
             .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
-            alt.Color("geography:N")
+            alt.Color("grid_cell:N")
             .title(self.grid.label)
             .scale(domain=[geo for geo in self.geographies], range=MAP_SELECTION),
         ] + [
@@ -75,7 +75,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
-        geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
+        grid_cell_df = pl.DataFrame(dict(grid_cell=self.geographies)).with_row_index(name="grid_cell_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
@@ -83,7 +83,7 @@ class TimeSeriesLine(DatasetVisualization):
                 title=f"{str(geo)}: {', '.join([str(c) for c in val_choices])}",
                 format=self.variable.number_format or "",
             )
-            for (i, geo) in geography_df.iter_rows()
+            for (i, geo) in grid_cell_df.iter_rows()
             for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 
@@ -92,8 +92,8 @@ class TimeSeriesLine(DatasetVisualization):
         # uses String() coercion on the key, so the number 0 (from JSON's 0.0) becomes
         # "0" and fails to match the CSV string "0.0". Loose == coerces correctly.
         rules = self.get_base_chart(self.data_source, self.time_column).transform_lookup(
-            "geography",
-            from_=alt.LookupData(geography_df, "geography", ["geography_idx"]),
+            "grid_cell",
+            from_=alt.LookupData(grid_cell_df, "grid_cell", ["grid_cell_idx"]),
         )
         for dim_name, dim_values in compare_dimensions.items():
             idx_expr = " : ".join([
@@ -101,7 +101,7 @@ class TimeSeriesLine(DatasetVisualization):
                 for i, v in enumerate(dim_values)
             ]) + " : null"
             rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
-        pivot_key_parts = ["geography_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
+        pivot_key_parts = ["grid_cell_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
         rules = (
             rules
             .transform_calculate(

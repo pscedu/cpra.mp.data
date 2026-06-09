@@ -76,7 +76,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
     lf = lf.select(
         *dataset_exprs,
         *[pl.col(col) for col in required_cols if col not in DATASET_DIMENSIONS],
-        pl.col("geography"),
+        pl.col("grid_cell"),
         pl.col("value"),
         *([pl.col(include_file_paths)] if include_file_paths else []),
     )
@@ -102,12 +102,12 @@ def write_parquet(
     # Add keyword arguments to the dataframe as columns.
     df = df.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
-    # If this is wide-format data (geography IDs as column names), unpivot to long.
+    # If this is wide-format data (grid_cell IDs as column names), unpivot to long.
     numeric_cols = [col for col in df.columns if col[:1].isdigit()]
     if numeric_cols:
         alpha_cols = [col for col in df.columns if not col[:1].isdigit()]
-        df = df.unpivot(index=alpha_cols, variable_name="geography", value_name="value").with_columns(
-            pl.col("geography").cast(pl.Int32)
+        df = df.unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value").with_columns(
+            pl.col("grid_cell").cast(pl.Int32)
         )
 
     grid = validate_grid(df, **kwargs)
@@ -120,12 +120,12 @@ def write_parquet(
         if validate:
             validate_data_frame(df, required_cols=required_cols)
 
-            # Validate geography ID range.
-            if grid.id_min is not None and df["geography"].min() < grid.id_min:
-                msg = f"Geography ID below minimum for grid {grid.name}: {df['geography'].min()}"
+            # Validate grid_cell ID range.
+            if grid.id_min is not None and df["grid_cell"].min() < grid.id_min:
+                msg = f"Geography ID below minimum for grid {grid.name}: {df['grid_cell'].min()}"
                 raise ValidationError(msg)
-            if grid.id_max is not None and df["geography"].max() > grid.id_max:
-                msg = f"Geography ID above maximum for grid {grid.name}: {df['geography'].max()}"
+            if grid.id_max is not None and df["grid_cell"].max() > grid.id_max:
+                msg = f"Geography ID above maximum for grid {grid.name}: {df['grid_cell'].max()}"
                 raise ValidationError(msg)
 
             # Validate value column dtype.
@@ -136,12 +136,12 @@ def write_parquet(
 
         if sort:
             if time_unit in ("daily", "monthly"):
-                # Sort so each row group covers one calendar year: year → geography → date.
-                sort_exprs = [pl.col("calendar_day").dt.year(), pl.col("geography"), pl.col("calendar_day")]
+                # Sort so each row group covers one calendar year: year → grid_cell → date.
+                sort_exprs = [pl.col("calendar_day").dt.year(), pl.col("grid_cell"), pl.col("calendar_day")]
             else:
-                sort_exprs = [pl.col("geography"), pl.col("calendar_year")]
+                sort_exprs = [pl.col("grid_cell"), pl.col("calendar_year")]
 
-            df = df.select(*required_cols, "geography", "value").sort(*sort_exprs)
+            df = df.select(*required_cols, "grid_cell", "value").sort(*sort_exprs)
 
     # Compute row group size from grid and time_unit if not provided explicitly.
     if row_group_size is None:

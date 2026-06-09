@@ -1,8 +1,8 @@
 """Migrate tabular Parquet datasets from wide format to long format.
 
-Each existing wide-format file (one row per time step, geography IDs as column
-names) is converted to long format (one row per time-step × geography pair, with
-explicit `geography` and `value` columns), then rewritten in place with the
+Each existing wide-format file (one row per time step, grid_cell IDs as column
+names) is converted to long format (one row per time-step × grid_cell pair, with
+explicit `grid_cell` and `value` columns), then rewritten in place with the
 correct sort order and row group size for the `long_year_geo` layout.
 
 Usage
@@ -68,7 +68,7 @@ def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> 
     if dry_run:
         schema = pl.read_parquet_schema(parquet_path)
         geo_cols = [n for n in schema if n[:1].isdigit()]
-        print(f"    {len(geo_cols)} geography columns → long format")
+        print(f"    {len(geo_cols)} grid_cell columns → long format")
         return True
 
     t0 = time.perf_counter()
@@ -82,7 +82,7 @@ def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> 
     if hive_dims:
         df = df.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
-    # Identify wide geography columns.
+    # Identify wide grid_cell columns.
     numeric_cols = [col for col in df.columns if col[:1].isdigit()]
     alpha_cols = [col for col in df.columns if not col[:1].isdigit()]
 
@@ -92,9 +92,9 @@ def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> 
     # Unpivot to long format.
     df = df.unpivot(
         index=alpha_cols,
-        variable_name="geography",
+        variable_name="grid_cell",
         value_name="value",
-    ).with_columns(pl.col("geography").cast(pl.Int32))
+    ).with_columns(pl.col("grid_cell").cast(pl.Int32))
 
     # Write back in long format using write_parquet so sort order and row
     # group size are applied correctly.  validate=False because the data

@@ -22,12 +22,12 @@ def read_pmtile(grid_name: str, tile: mercantile.Tile) -> bytes | None:
 
 
 def _data_to_id_value(df: pl.DataFrame) -> dict[int, float]:
-    """Extract {geography_id: value} from a long-format DataFrame."""
-    if df.is_empty() or "geography" not in df.columns:
+    """Extract {grid_cell_id: value} from a long-format DataFrame."""
+    if df.is_empty() or "grid_cell" not in df.columns:
         return {}
     return {
-        geo: val
-        for geo, val in zip(df["geography"].to_list(), df["value"].to_list())
+        cell: val
+        for cell, val in zip(df["grid_cell"].to_list(), df["value"].to_list())
         if val is not None
     }
 

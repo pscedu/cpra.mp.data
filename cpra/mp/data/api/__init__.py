@@ -156,7 +156,7 @@ async def datasets(format: DataFormat, compression: Annotated[Compression, Query
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/catalog.json",
+    "/v1/datasets/{variable}/{time_unit}/catalog.json",
     tags=["Catalog"],
 )
 async def query_catalog(
@@ -168,7 +168,7 @@ async def query_catalog(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/data.{format}",
+    "/v1/datasets/{variable}/{time_unit}/data.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_data(
@@ -190,7 +190,7 @@ async def get_model_data(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/data/{z}/{x}/{y}.{format}",
+    "/v1/datasets/{variable}/{time_unit}/data/{z}/{x}/{y}.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_tile(
@@ -208,7 +208,7 @@ async def get_model_tile(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/tiles/{z}/{x}/{y}.pbf",
+    "/v1/datasets/{variable}/{time_unit}/tiles/{z}/{x}/{y}.pbf",
     tags=["Data and Analysis"],
 )
 async def get_vector_tile(
@@ -230,7 +230,7 @@ def visualizations() -> list[Visualization]:
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/visualization/{visualization_name}.json",
+    "/v1/datasets/{variable}/{time_unit}/visualization/{visualization_name}.json",
     tags=["Visualization"],
 )
 async def get_dataset_visualization(
@@ -240,12 +240,15 @@ async def get_dataset_visualization(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
+    grid_values = query.filter_dimensions.grid
+    grid = grid_values[0] if grid_values else None
+    query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
     visualization = VisualizationClass(
         variable=dataset_dimensions.variable,
-        grid=dataset_dimensions.grid,
+        grid=grid,
         time_unit=dataset_dimensions.time_unit,
         request=request,
-        **dict(query),
+        **query_dict,
     )
     return JSONResponse(visualization.spec)
 

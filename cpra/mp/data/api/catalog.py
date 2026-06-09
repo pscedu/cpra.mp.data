@@ -141,7 +141,7 @@ class CatalogQuery:
     def execute(self):
         """Execute a query for data."""
         input_df = get_input_data_frame(**dict(self.dataset_dimensions), **dict(self.filter_dimensions))
-        required_cols = required_columns(input_df, include_metadata=False)
+        required_cols = required_columns(input_df)
 
         parquet_paths = []
         for root, dirs, files in BASE_PATH.walk():

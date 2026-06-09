@@ -36,7 +36,7 @@ from cpra.mp.data.variables import VARIABLES, Variable
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
-DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("geography", "value")
+DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")
 VALUE_COLUMNS = cs.by_name("value")
 
 
@@ -51,12 +51,17 @@ class Dataset(LazyFrameSource):
         self.filter_dimensions = filter_dimensions
         self.options = options
         self.dataset_bounds = None
-        self.geography_ids = None
-        self.summarize_geography_ids = None
+        self.grid_cell_ids = None
+        self.summarize_grid_cell_ids = None
         self.raster_groups = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
-        self.grid = GRIDS[self.dataset_dimensions.grid]
+        grid_values = filter_dimensions.grid
+        if not grid_values:
+            self._error("grid query parameter is required")
+        self.grid = GRIDS.get(grid_values[0])
+        if self.grid is None:
+            self._error(f"unknown grid: {grid_values[0]}")
 
     def _error(self, msg, status_code=400):
         """Raise an exception."""
@@ -101,7 +106,7 @@ class Dataset(LazyFrameSource):
     @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.options.geography:
+        if self.grid.grid_type == "vector" or self.options.grid_cell:
             return OutputType.vector
         return OutputType.raster
 
@@ -114,31 +119,31 @@ class Dataset(LazyFrameSource):
         if self.options.where:
             self.lf = self.lf.sql(f"select * from self where {self.options.where}")
 
-        if self.options.geography:
+        if self.options.grid_cell:
             if self.grid.grid_type == "vector":
-                await self._apply_geography_vector()
+                await self._apply_grid_cell_vector()
             else:
-                await self._apply_geography_raster()
+                await self._apply_grid_cell_raster()
 
-    async def _apply_geography_vector(self):
-        """Apply the geography filter to a vector-grid dataset."""
+    async def _apply_grid_cell_vector(self):
+        """Apply the grid_cell filter to a vector-grid dataset."""
         # TODO: Validate that the given IDs fall within the grid min and max.
-        self.geography_ids = unpack_values(self.options.geography, "geography")
-        self.lf = self.lf.filter(pl.col("geography").is_in([int(g) for g in self.geography_ids]))
+        self.grid_cell_ids = unpack_values(self.options.grid_cell, "grid_cell")
+        self.lf = self.lf.filter(pl.col("grid_cell").is_in([int(g) for g in self.grid_cell_ids]))
 
-    async def _apply_geography_raster(self):
-        """Apply the geography filter to a raster-grid dataset."""
+    async def _apply_grid_cell_raster(self):
+        """Apply the grid_cell filter to a raster-grid dataset."""
         # Check that coordinates are numeric and that there are an even number.
         try:
-            coords = [float(coord) for coord in unpack_values(self.options.geography, "geography")]
+            coords = [float(coord) for coord in unpack_values(self.options.grid_cell, "grid_cell")]
         except ValueError:
-            raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
+            raise HTTPException(status_code=400, detail="grid_cell contains non-numeric coordinates")
 
         coords_len = len(coords)
         if coords_len % 2:
             raise HTTPException(
                 status_code=400,
-                detail="geography contain an even number of coordinates",
+                detail="grid_cell contain an even number of coordinates",
             )
 
         # Extract lng,lat pairs.
@@ -147,7 +152,7 @@ class Dataset(LazyFrameSource):
         for start_idx in range(0, coords_len, 2):
             lng, lat = coords[start_idx : (start_idx + 2)]
             if abs(lng) > 180 or abs(lat) > 90:
-                msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
+                msg = f"grid_cell contains invalid coordinate pair: {lng}, {lat}"
                 raise HTTPException(status_code=400, detail=msg)
             lngs.append(lng)
             lats.append(lat)
@@ -205,7 +210,7 @@ class Dataset(LazyFrameSource):
         if self.options.select is not None:
             required_cols = required_columns(
                 get_input_data_frame(**dict(self.dataset_dimensions)),
-                include_geography=True,
+                include_grid_cell=True,
                 include_value=True,
             )
             select_cols = unpack_values(self.options.select, "select", required_cols)
@@ -232,10 +237,10 @@ class Dataset(LazyFrameSource):
             required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
             null_cols = [col for col in required_cols if col not in group_by_cols]
 
-            # geography must always be part of the group key in long format since each
-            # row represents a single geography.
+            # grid_cell must always be part of the group key in long format since each
+            # row represents a single grid_cell.
             self.lf = (
-                self.lf.group_by(*group_by_cols, "geography")
+                self.lf.group_by(*group_by_cols, "grid_cell")
                 .agg(getattr(pl.col("value"), self.options.group_aggregate)())
             )
 
@@ -263,16 +268,16 @@ class Dataset(LazyFrameSource):
             msg = "summarize_by and summarize_aggregate parameters must be used together"
             raise HTTPException(status_code=400, detail=msg)
 
-        # Extract and validate summary geography IDs, if present.
-        if self.options.summarize_geography:
+        # Extract and validate summary grid_cell IDs, if present.
+        if self.options.summarize_grid_cell:
             # summarize_grid = GRIDS[self.options.summarize_by]
             # TODO: Validate that the given IDs fall within the grid min and max.
-            self.summarize_geography_ids = [
-                int(geo_id) for geo_id in unpack_values(self.options.summarize_geography, "summarize_geography")
+            self.summarize_grid_cell_ids = [
+                int(geo_id) for geo_id in unpack_values(self.options.summarize_grid_cell, "summarize_grid_cell")
             ]
 
         # Generate column expressions.
-        crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
+        crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.parquet"
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
 
         try:
@@ -281,22 +286,22 @@ class Dataset(LazyFrameSource):
             msg = f"No crosswalk from {self.grid} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)
 
-        if self.geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in self.geography_ids]))
+        if self.grid_cell_ids:
+            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in self.grid_cell_ids]))
 
-        if self.summarize_geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_geography_ids))
+        if self.summarize_grid_cell_ids:
+            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_grid_cell_ids))
 
-        # Join the data on geography == src_id, scale the values, then aggregate
-        # per destination geography. The join replaces the wide-format horizontal
-        # aggregation that was used when each source geography was a column.
+        # Join the data on grid_cell == src_id, scale the values, then aggregate
+        # per destination grid_cell. The join replaces the wide-format horizontal
+        # aggregation that was used when each source grid_cell was a column.
         dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
         agg_fn = self.options.summarize_aggregate
         self.lf = (
             self.lf
-            .join(crosswalk_lf, left_on="geography", right_on="src_id", how="inner")
+            .join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
             .with_columns(value=pl.col("value") * pl.col("scale_factor"))
-            .group_by(*dim_cols, pl.col("dst_id").alias("geography"))
+            .group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
             .agg(getattr(pl.col("value"), agg_fn)())
             .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
         )
@@ -359,11 +364,10 @@ class Dataset(LazyFrameSource):
 
         # Estimate columns.
         columns = None
-        if self.geography_ids is not None:
-            columns = len(self.geography_ids)
+        if self.grid_cell_ids is not None:
+            columns = len(self.grid_cell_ids)
         else:
-            grid = GRIDS[self.dataset_dimensions.grid]
-            columns = getattr(grid, "id_count", None)
+            columns = getattr(self.grid, "id_count", None)
 
             if columns is None:
                 height = getattr(grid, "height", None)
@@ -431,11 +435,11 @@ class Dataset(LazyFrameSource):
             return None
 
         tile_id_strs = [str(fid) for fid in raw_ids]
-        if self.summarize_geography_ids is not None:
-            valid = {str(gid) for gid in self.summarize_geography_ids}
+        if self.summarize_grid_cell_ids is not None:
+            valid = {str(gid) for gid in self.summarize_grid_cell_ids}
             val_cols = [c for c in tile_id_strs if c in valid]
-        elif self.geography_ids is not None:
-            valid = {str(gid) for gid in self.geography_ids}
+        elif self.grid_cell_ids is not None:
+            valid = {str(gid) for gid in self.grid_cell_ids}
             val_cols = [c for c in tile_id_strs if c in valid]
         else:
             val_cols = tile_id_strs
@@ -444,7 +448,7 @@ class Dataset(LazyFrameSource):
             return None
 
         tile_ints = [int(c) for c in val_cols]
-        df = self.lf.filter(pl.col("geography").is_in(tile_ints)).collect()
+        df = self.lf.filter(pl.col("grid_cell").is_in(tile_ints)).collect()
         if df.is_empty():
             return None
 

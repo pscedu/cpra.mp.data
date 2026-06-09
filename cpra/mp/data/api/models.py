@@ -27,7 +27,7 @@ BaseFilterDimensions = create_model(
             None,
         )
         for dim in DIMENSIONS.values()
-        if dim.type not in ("dataset", "metadata")
+        if dim.type not in ("dataset",)
     },
 )
 
@@ -43,7 +43,7 @@ class FilterDimensions(BaseFilterDimensions):
 
 
 class Options(BaseModel):
-    geography: str | None = None
+    grid_cell: str | None = None
     where: str | None = None
     negate: str | None = None
     multiply10: str | None = None
@@ -54,7 +54,7 @@ class Options(BaseModel):
     unpivot: bool = False
     summarize_by: VectorGrid | None = None
     summarize_aggregate: AggregateFunction | None = None
-    summarize_geography: str | None = None
+    summarize_grid_cell: str | None = None
     sort: str | None = None
     select: str | None = None
 

@@ -31,7 +31,7 @@ def required_columns(
     df,
     include_dataset=True,
     include_metadata=True,
-    include_geography=False,
+    include_grid_cell=False,
     include_value=False,
 ):
     """Get a list of required columns based on the values in the data frame."""
@@ -44,7 +44,7 @@ def required_columns(
             and (include_dataset or col.name not in DATASET_DIMENSIONS)
             and (include_metadata or col.name not in METADATA_DIMENSIONS)
         ]
-        + (["geography"] if include_geography else [])
+        + (["grid_cell"] if include_grid_cell else [])
         + (["value"] if include_value else [])
     )
 
@@ -117,6 +117,8 @@ def validate_grid(data=None, **kwargs):
     """Validate that there is a grid for the given geographic unit and plan version."""
 
     grid_name = extract_dimension_value("grid", data, **kwargs)
+    if isinstance(grid_name, (list, tuple)):
+        grid_name = grid_name[0] if grid_name else None
 
     if grid_name is None:
         msg = "Grid is required."

@@ -8,7 +8,7 @@ from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
 from cpra.mp.data.config import BASE_PATH
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
     cast_columns,
@@ -76,7 +76,10 @@ def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
     # Construct the glob lazy frame.
     required_cols = required_columns(input_df, include_metadata=False)
     lf = glob_lazy_frame(required_cols=required_cols, extension="tif", include_file_paths=include_file_paths, **kwargs)
-    filter_exps = get_filter_expressions(**kwargs)
+    # Metadata dimensions (e.g. grid) are in-file columns for tabular data but
+    # are not path components in COG files — exclude them from raster filters.
+    raster_kwargs = {k: v for k, v in kwargs.items() if k not in METADATA_DIMENSIONS}
+    filter_exps = get_filter_expressions(**raster_kwargs)
     if filter_exps:
         lf = lf.filter(*filter_exps)
     return lf

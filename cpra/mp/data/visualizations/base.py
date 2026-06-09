@@ -67,17 +67,17 @@ class BaseVisualization:
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
-        required_cols = required_columns(pl.DataFrame({"variable": variable, "grid": grid, "time_unit": time_unit}))
-        select = [self.get_time_column(time_unit), "geography", "value"]
+        required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit}))
+        select = [self.get_time_column(time_unit), "grid_cell", "value"]
 
         # Force unpivot to be true.
         kwargs["unpivot"] = True
 
-        params = []
+        params = [("grid", grid)] if grid else []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
-                if param_name == "geography":
-                    params.append(("geography", ",".join([str(geo) for geo in param_values])))
+                if param_name == "grid_cell":
+                    params.append(("grid_cell", ",".join([str(geo) for geo in param_values])))
                 else:
                     for value in param_values:
                         params.append((param_name, value))
@@ -94,12 +94,11 @@ class BaseVisualization:
             dataset_url = self.request.url_for(
                 "get_model_data",
                 variable=variable,
-                grid=grid,
                 time_unit=time_unit,
                 format="csv",
             )
         else:
-            dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{grid}/{time_unit}/data.csv"
+            dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{time_unit}/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
 
@@ -115,7 +114,7 @@ class BaseVisualization:
         if parse is None:
             parse = {"value": "number"}
             if GRIDS[grid].grid_type == "vector":
-                parse["geography"] = "number"
+                parse["grid_cell"] = "number"
             time_column = self.get_time_column(time_unit)
             parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
 
@@ -164,7 +163,7 @@ class DatasetVisualization(BaseVisualization):
         """Get the selected geographies."""
         raster = self.grid.grid_type == "raster"
         coord_type = float if raster else int
-        geos = self.params["geography"]
+        geos = self.params["grid_cell"]
         coords = list(map(coord_type, geos.split(",") if isinstance(geos, str) else geos))
 
         if not raster:
