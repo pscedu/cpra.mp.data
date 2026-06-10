@@ -2,20 +2,22 @@
 
 Each existing wide-format file (one row per time step, grid_cell IDs as column
 names) is converted to long format (one row per time-step × grid_cell pair, with
-explicit `grid_cell` and `value` columns), then rewritten in place with the
-correct sort order and row group size for the `long_year_geo` layout.
+explicit `grid_cell` and `value` columns), then written to a separate output
+directory with the correct sort order and row group size for the `long_year_geo`
+layout.  The original wide-format files are left untouched.
 
 Usage
 -----
     # Dry-run: show what would be migrated without writing anything
-    python scripts/migrate_to_long_format.py --dry-run
+    python scripts/migrate_to_long_format.py --dry-run --output-path /tmp/long
 
     # Migrate a single dataset
     python scripts/migrate_to_long_format.py \\
-        --variable sal --grid hydro_compartment_v001 --time-unit daily
+        --variable sal --grid hydro_compartment_v001 --time-unit daily \\
+        --output-path /data/cpra_long
 
     # Migrate all datasets
-    python scripts/migrate_to_long_format.py
+    python scripts/migrate_to_long_format.py --output-path /data/cpra_long
 
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
@@ -54,11 +56,12 @@ def _dimension_cols_from_hive(path: Path) -> dict:
     return parts
 
 
-def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> bool:
-    """Convert one wide-format Parquet file to long format in place.
+def migrate_file(parquet_path: Path, base_path: Path, output_path: Path, dry_run: bool = False) -> bool:
+    """Convert one wide-format Parquet file to long format, writing to output_path.
 
-    Returns True if the file was (or would be) migrated, False if it was
-    already in long format or could not be processed.
+    The source file at parquet_path is not modified.  Returns True if the file
+    was (or would be) migrated, False if it was already in long format or had
+    no numeric columns.
     """
     if not _is_wide(parquet_path):
         return False
@@ -96,16 +99,12 @@ def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> 
         value_name="value",
     ).with_columns(pl.col("grid_cell").cast(pl.Int32))
 
-    # Write back in long format using write_parquet so sort order and row
-    # group size are applied correctly.  validate=False because the data
-    # came from a previously validated file; the write call still sorts.
-    # base_path is always the root data directory so PyArrow reconstructs
-    # the full Hive partition path from the dimension columns in df.
-    write_parquet(df, base_path=base_path, validate=False, sort=True)
-
-    # Remove the original wide-format file now that the long-format version
-    # has been written successfully.
-    parquet_path.unlink()
+    # Write to output_path in long format using write_parquet so sort order
+    # and row group size are applied correctly.  validate=False because the
+    # data came from a previously validated file; the write call still sorts.
+    # PyArrow reconstructs the full Hive partition path under output_path from
+    # the dimension columns in df.
+    write_parquet(df, base_path=output_path, validate=False, sort=True)
 
     elapsed = time.perf_counter() - t0
     rows = len(df)
@@ -133,9 +132,15 @@ def main():
     parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without writing")
     parser.add_argument("--data-path", default=str(BASE_PATH), help=f"Base data path (default: {BASE_PATH})")
+    parser.add_argument("--output-path", required=True, help="Directory to write long-format output (created if absent)")
     args = parser.parse_args()
 
     base_path = Path(args.data_path)
+    output_path = Path(args.output_path)
+
+    if not args.dry_run:
+        output_path.mkdir(parents=True, exist_ok=True)
+
     paths = find_parquet_files(base_path, args.variable, args.grid, args.time_unit)
 
     if not paths:
@@ -143,12 +148,13 @@ def main():
         return
 
     print(f"Found {len(paths)} Parquet file(s) to inspect.")
+    print(f"Output directory: {output_path}")
     migrated = 0
     skipped = 0
 
     for path in paths:
         try:
-            if migrate_file(path, base_path=base_path, dry_run=args.dry_run):
+            if migrate_file(path, base_path=base_path, output_path=output_path, dry_run=args.dry_run):
                 migrated += 1
             else:
                 skipped += 1
