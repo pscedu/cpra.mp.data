@@ -2,13 +2,14 @@ from collections import defaultdict
 from typing import Annotated
 
 import polars.selectors as cs
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.api.catalog import CatalogQuery
-from cpra.mp.data.api.dataset import Dataset
+from cpra.mp.data.api.dataset import Dataset, TabularDataset
+from cpra.mp.data.api.duckdb import get_limiter
 from cpra.mp.data.api.models import (
     Compression,
     DataQuery,
@@ -34,7 +35,7 @@ from cpra.mp.data.api.utils import (
     validate_compression,
     validate_format,
 )
-from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
+from cpra.mp.data.config import MPD_URI
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
@@ -95,7 +96,6 @@ def dimensions(session: MPDSession) -> list[Dimension]:
         mpd_dimension_values[dv.dimension].append(
             DimensionValue(value=dv.value_str if dv.value_int is None else dv.value_int, label=dv.label)
         )
-
     return [
         Dimension(
             name=dim.name,
@@ -118,7 +118,6 @@ def dimensions(session: MPDSession) -> list[Dimension]:
 
 @app.get("/v1/grids.json", tags=["Catalog"])
 def grids() -> list[Grid]:
-    # TODO: Compress geography IDs into ranges.
     return [
         Grid(
             name=grid.name,
@@ -155,10 +154,7 @@ async def datasets(format: DataFormat, compression: Annotated[Compression, Query
     return PolarsStreamingResponse(source, format, compression)
 
 
-@app.get(
-    "/v1/datasets/{variable}/{time_unit}/catalog.json",
-    tags=["Catalog"],
-)
+@app.get("/v1/datasets/{variable}/{time_unit}/catalog.json", tags=["Catalog"])
 async def query_catalog(
     filter_dimensions: Annotated[FilterDimensions, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
@@ -176,17 +172,40 @@ async def get_model_data(
     query: Annotated[DataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
+    """
+    Download model data in the requested format.
+
+    The `sql` parameter accepts a full SQL SELECT statement that operates on a
+    pre-registered view called ``data``.  When `summarize_by` is set a crosswalk
+    view named ``xw`` (columns: src_id, dst_id, scale_factor) is also available.
+
+    Each query runs in an isolated DuckDB connection with a configurable memory
+    limit.  Queries that exceed the limit receive a 507 response.  If the server
+    is at maximum concurrent query capacity the endpoint returns 503.
+    """
+    limiter = get_limiter()
+    if limiter.available_tokens < 1:
+        raise HTTPException(status_code=503, detail="Server is at query capacity — retry shortly")
+
     compression = query.compression
     validate_compression(compression, format)
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
-    validate_format(format, dataset.output_type)
-    await dataset.apply_params()
-    if dataset.output_type == OutputType.raster:
-        return RasterioStreamingResponse(dataset, format, compression)
 
-    data_size = dataset.estimate_data_size()
-    collect_in_memory = data_size is not None and data_size <= (STREAM_THRESHOLD * pow(10, 6))
-    return PolarsStreamingResponse(dataset, format, compression, collect_in_memory)
+    async with limiter:
+        dataset = TabularDataset(dataset_dimensions, query)
+        await dataset.apply_params()
+
+        if dataset.output_type == OutputType.raster:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Raster grid data without grid_cell cannot be downloaded as tabular. "
+                    "Use the tile endpoint (/data/{z}/{x}/{y}.{format}) to retrieve raster data, "
+                    "or add grid_cell coordinates to extract point values."
+                ),
+            )
+
+        validate_format(format, dataset.output_type)
+        return PolarsStreamingResponse(dataset.source, format, compression)
 
 
 @app.get(
@@ -201,7 +220,7 @@ async def get_model_tile(
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query)
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
@@ -218,7 +237,7 @@ async def get_vector_tile(
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query)
     await dataset.apply_params()
     dataset.validate_vector_tile()
     return VectorTileResponse(dataset, x, y, z)
@@ -240,8 +259,7 @@ async def get_dataset_visualization(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
-    grid_values = query.filter_dimensions.grid
-    grid = grid_values[0] if grid_values else None
+    grid = str(query.grid) if query.grid else None
     query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
     visualization = VisualizationClass(
         variable=dataset_dimensions.variable,
