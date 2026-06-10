@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import polars as pl
-import polars.selectors as cs
 
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
@@ -95,43 +94,57 @@ def write_parquet(
     use_dictionary=False,
     **kwargs,
 ):
-    """Write data from a data frame to a Parquet file."""
+    """Write data from a data frame to a Parquet file.
 
-    df = data if isinstance(data, pl.DataFrame) else pl.DataFrame(data)
+    Accepts a Polars DataFrame, LazyFrame, or any object that can be passed to
+    pl.DataFrame().  When a LazyFrame is provided the write is fully streaming
+    (via sink_parquet) so the frame is never materialized into memory; a single
+    metadata row is collected upfront to drive grid/sort/partition decisions.
+    Validation is skipped for LazyFrame input because it requires touching every
+    row — pass validate=False explicitly when passing a LazyFrame.
+    """
 
-    # Add keyword arguments to the dataframe as columns.
-    df = df.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
+    is_lazy = isinstance(data, pl.LazyFrame)
+    lf = data if is_lazy else (data if isinstance(data, pl.DataFrame) else pl.DataFrame(data))
+
+    # Add keyword arguments as literal columns (works for both LazyFrame and DataFrame).
+    lf = lf.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
     # If this is wide-format data (grid_cell IDs as column names), unpivot to long.
-    numeric_cols = [col for col in df.columns if col[:1].isdigit()]
+    # lf.columns is derived from the schema and available without collecting.
+    numeric_cols = [col for col in lf.columns if col[:1].isdigit()]
     if numeric_cols:
-        alpha_cols = [col for col in df.columns if not col[:1].isdigit()]
-        df = df.unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value").with_columns(
+        alpha_cols = [col for col in lf.columns if not col[:1].isdigit()]
+        lf = lf.unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value").with_columns(
             pl.col("grid_cell").cast(pl.Int32)
         )
 
-    grid = validate_grid(df, **kwargs)
-    time_unit = df["time_unit"][0] if "time_unit" in df.columns else kwargs.get("time_unit")
+    # Collect one metadata row to drive decisions that need concrete values.
+    # For a LazyFrame this is cheap regardless of dataset size; for a DataFrame it is free.
+    meta = lf.head(1).collect() if is_lazy else lf
+
+    grid = validate_grid(meta, **kwargs)
+    time_unit = meta["time_unit"][0] if "time_unit" in meta.columns else kwargs.get("time_unit")
+    required_cols = required_columns(meta)
 
     # Validate and sort the data.
+    # Validation is skipped for LazyFrame because it requires full materialization.
     if validate or sort:
-        required_cols = required_columns(df)
-
-        if validate:
-            validate_data_frame(df, required_cols=required_cols)
+        if validate and not is_lazy:
+            validate_data_frame(lf, required_cols=required_cols)
 
             # Validate grid_cell ID range.
-            if grid.id_min is not None and df["grid_cell"].min() < grid.id_min:
-                msg = f"Geography ID below minimum for grid {grid.name}: {df['grid_cell'].min()}"
+            if grid.id_min is not None and lf["grid_cell"].min() < grid.id_min:
+                msg = f"Geography ID below minimum for grid {grid.name}: {lf['grid_cell'].min()}"
                 raise ValidationError(msg)
-            if grid.id_max is not None and df["grid_cell"].max() > grid.id_max:
-                msg = f"Geography ID above maximum for grid {grid.name}: {df['grid_cell'].max()}"
+            if grid.id_max is not None and lf["grid_cell"].max() > grid.id_max:
+                msg = f"Geography ID above maximum for grid {grid.name}: {lf['grid_cell'].max()}"
                 raise ValidationError(msg)
 
             # Validate value column dtype.
-            variable = VARIABLES[df["variable"][0]]
-            if df["value"].dtype != variable.dtype:
-                msg = f"Column 'value' has dtype {df['value'].dtype!s}, expected {variable.dtype!s}"
+            variable = VARIABLES[lf["variable"][0]]
+            if lf["value"].dtype != variable.dtype:
+                msg = f"Column 'value' has dtype {lf['value'].dtype!s}, expected {variable.dtype!s}"
                 raise ValidationError(msg)
 
         if sort:
@@ -141,24 +154,41 @@ def write_parquet(
             else:
                 sort_exprs = [pl.col("grid_cell"), pl.col("calendar_year")]
 
-            df = df.select(*required_cols, "grid_cell", "value").sort(*sort_exprs)
+            lf = lf.select(*required_cols, "grid_cell", "value").sort(*sort_exprs)
 
     # Compute row group size from grid and time_unit if not provided explicitly.
     if row_group_size is None:
         row_group_size = _row_group_size(grid, time_unit)
 
-    # Get partition columns.
-    partition_cols = partition_columns(df)
+    # Derive partition columns from the metadata row.
+    partition_cols = partition_columns(meta)
 
-    # Write the partitioned file.
-    df.write_parquet(
-        base_path,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_size=row_group_size,
-        use_pyarrow=True,
-        pyarrow_options=dict(use_dictionary=use_dictionary, partition_cols=partition_cols),
-    )
+    if is_lazy:
+        # Stream the write without materializing the full frame.
+        # pl.PartitionBy is marked unstable in Polars but produces the same
+        # Hive-style col=value/ directory structure as the PyArrow path below.
+        sink_kwargs = dict(
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+        )
+        if partition_cols:
+            lf.sink_parquet(
+                pl.PartitionBy(base_path, key=partition_cols, include_key=False),
+                **sink_kwargs,
+            )
+        else:
+            lf.sink_parquet(base_path, **sink_kwargs)
+    else:
+        # Write the partitioned file via PyArrow for stable partition support.
+        lf.write_parquet(
+            base_path,
+            compression=compression,
+            compression_level=compression_level,
+            row_group_size=row_group_size,
+            use_pyarrow=True,
+            pyarrow_options=dict(use_dictionary=use_dictionary, partition_cols=partition_cols),
+        )
 
 
 def compact_parquet(

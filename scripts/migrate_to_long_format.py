@@ -34,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.tabular import write_parquet
-from cpra.mp.data.utils import required_columns
 
 
 def _is_wide(path: Path) -> bool:
@@ -73,43 +72,37 @@ def migrate_file(parquet_path: Path, base_path: Path, dry_run: bool = False) -> 
 
     t0 = time.perf_counter()
 
-    # Read the wide-format file.  Hive partitioning is not used here because
-    # we are reading a single leaf file; dimension values from the path must
-    # be injected as literal columns since they are encoded in directory names,
-    # not stored inside the file.
-    df = pl.read_parquet(parquet_path)
-    hive_dims = _dimension_cols_from_hive(parquet_path)
-    if hive_dims:
-        df = df.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
+    schema = pl.read_parquet_schema(parquet_path)
+    geo_cols = [n for n in schema if n[:1].isdigit()]
 
-    # Identify wide grid_cell columns.
-    numeric_cols = [col for col in df.columns if col[:1].isdigit()]
-    alpha_cols = [col for col in df.columns if not col[:1].isdigit()]
+    # Rename the source to a temp name before scanning it.  The streaming
+    # write targets the same Hive partition directory, so leaving the source
+    # at its original path risks a filename collision with the output file.
+    # Renaming eliminates the conflict; on failure the original is restored.
+    tmp_path = parquet_path.with_suffix(".migrating")
+    parquet_path.rename(tmp_path)
 
-    if not numeric_cols:
-        return False
+    try:
+        lf = pl.scan_parquet(tmp_path)
 
-    # Unpivot to long format.
-    df = df.unpivot(
-        index=alpha_cols,
-        variable_name="grid_cell",
-        value_name="value",
-    ).with_columns(pl.col("grid_cell").cast(pl.Int32))
+        # Inject dimension values encoded in the Hive partition path as
+        # literal columns — they are not stored inside the leaf file.
+        hive_dims = _dimension_cols_from_hive(parquet_path)
+        if hive_dims:
+            lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
-    # Write back in long format using write_parquet so sort order and row
-    # group size are applied correctly.  validate=False because the data
-    # came from a previously validated file; the write call still sorts.
-    # base_path is always the root data directory so PyArrow reconstructs
-    # the full Hive partition path from the dimension columns in df.
-    write_parquet(df, base_path=base_path, validate=False, sort=True)
+        # write_parquet detects wide-format columns (numeric names), unpivots
+        # to long internally, sorts, and streams via sink_parquet so the full
+        # frame is never materialized.
+        write_parquet(lf, base_path=base_path, validate=False, sort=True)
+    except Exception:
+        tmp_path.rename(parquet_path)
+        raise
 
-    # Remove the original wide-format file now that the long-format version
-    # has been written successfully.
-    parquet_path.unlink()
+    tmp_path.unlink()
 
     elapsed = time.perf_counter() - t0
-    rows = len(df)
-    print(f"    {rows:,} rows written in {elapsed:.1f}s")
+    print(f"    {len(geo_cols)} grid_cell columns → long format in {elapsed:.1f}s")
     return True
 
 
