@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: quay.io/jupyter/scipy-notebook:python-3.12
+From: quay.io/jupyter/scipy-notebook@sha256:15b50ef89a316b483279aa5f689c5b26947e586ddb403c504e65a73b47ff8569
 
 %arguments
     JUPYTER_VERSION=3.2.3
