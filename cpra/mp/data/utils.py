@@ -14,17 +14,19 @@ from cpra.mp.data.variables import VARIABLES
 def partition_columns(df, include_dataset=True):
     """Get a list of partition columns based on the values in the data frame."""
 
-    return [
-        col.name
-        for col in df.select(
+    result = (
+        df.lazy()
+        .select(
             **{
                 dim.name: dim.partition & dim.required
                 for dim in DIMENSIONS.values()
                 if (include_dataset or dim.name not in DATASET_DIMENSIONS)
             }
         )
-        if col.any()
-    ]
+        .limit(1)
+        .collect()
+    )
+    return [col.name for col in result if col.any()]
 
 
 def required_columns(
@@ -36,10 +38,16 @@ def required_columns(
 ):
     """Get a list of required columns based on the values in the data frame."""
 
+    result = (
+        df.lazy()
+        .select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
+        .limit(1)
+        .collect()
+    )
     return (
         [
             col.name
-            for col in df.select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
+            for col in result
             if col.any()
             and (include_dataset or col.name not in DATASET_DIMENSIONS)
             and (include_metadata or col.name not in METADATA_DIMENSIONS)
@@ -60,12 +68,13 @@ def validate_data_frame(df, required_cols=None):
     if missing_cols:
         raise ValidationError(f"Required columns are missing: {', '.join(missing_cols)}")
 
+    schema = df.schema
     expressions = {}
 
     # Validate required columns, and add dimension validation expressions.
     for col in required_cols:
         dim = DIMENSIONS[col]
-        dim.validate_dtype(df[col])
+        dim.validate_dtype(pl.Series(name=col, values=[], dtype=schema[col]))
         expressions.update(dim.validation_expressions)
 
     # Add validation expressions for variable-geographic_unit and variable-time_unit.
@@ -79,7 +88,7 @@ def validate_data_frame(df, required_cols=None):
         *[((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units)) for n, v in VARIABLES.items()]
     )
 
-    results = df.select(**expressions).with_columns(valid=pl.all_horizontal(pl.col("*")))
+    results = df.lazy().select(**expressions).with_columns(valid=pl.all_horizontal(pl.col("*"))).collect()
 
     if not results["valid"].all():
         failed_row_count = results["valid"].len() - results["valid"].sum()

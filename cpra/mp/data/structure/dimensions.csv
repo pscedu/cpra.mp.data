@@ -1,6 +1,7 @@
 label,name,type,dtype,required,min_value,max_value,example_value
 Variable,variable,dataset,String,true,,,sal
 Time Unit,time_unit,dataset,String,true,,,daily
+Grid,grid,partition,String,true,,,hydro_compartment_v001
 Plan Implementation Scenario,model_group_id,partition,Int32,true,0,999,500
 Environmental Scenario,scenario_id,partition,Int32,true,0,100,7
 Aggregate Type,aggregate_type,partition,String,false,,,2_wk_max
@@ -20,11 +21,10 @@ Shared Socioeconomic Pathway,ssp,partition,Int8,false,,,4
 Species,species_code,partition,String,false,,,
 Vegetation: Coverage Type,vegetation_coverage_type,partition,String,false,,,
 Percentile,percentile,partition,Int8,false,0,100,50
-Vegetation: Species,veg_species_code,nonpartition,String,false,,,coes
-FFIBS: Coverage Type,ffibs_type,nonpartition,String,false,,,0.5
+Vegetation: Species,veg_species_code,partition,String,false,,,coes
+FFIBS: Coverage Type,ffibs_type,partition,String,false,,,0.5
 Year,calendar_year,nonpartition,Int32,false,2000,2100,2030
 Date,calendar_day,nonpartition,Date,false,,,2030-01-01
-Grid,grid,metadata,String,true,,,hydro_compartment_v001
 Model,model,metadata,String,true,,,icm_v2023.0.0
 Ecoregion,ecoregion,tag,String,false,,,UBA
 Region,region,tag,String,false,,,BA
