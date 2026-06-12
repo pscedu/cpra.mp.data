@@ -109,9 +109,10 @@ def write_parquet(
     lf = lf.with_columns(**{k: pl.lit(v) for k, v in kwargs.items()})
 
     # If this is wide-format data (grid_cell IDs as column names), unpivot to long.
-    numeric_cols = [col for col in lf.columns if col[:1].isdigit()]
+    _cols = lf.collect_schema().names()
+    numeric_cols = [col for col in _cols if col[:1].isdigit()]
     if numeric_cols:
-        alpha_cols = [col for col in lf.columns if not col[:1].isdigit()]
+        alpha_cols = [col for col in _cols if not col[:1].isdigit()]
         lf = lf.unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value").with_columns(
             pl.col("grid_cell").cast(pl.Int32)
         )
