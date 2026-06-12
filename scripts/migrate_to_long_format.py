@@ -1,10 +1,8 @@
 """Migrate tabular Parquet datasets from wide format to long format.
 
-Each existing wide-format file (one row per time step, grid_cell IDs as column
-names) is converted to long format (one row per time-step × grid_cell pair, with
-explicit `grid_cell` and `value` columns), then written to a separate output
-directory with the correct sort order and row group size.  The original
-wide-format files are left untouched.
+All wide-format files in the same partition directory are processed together
+and written as a single long-format Parquet file, so each output partition
+contains exactly one file.  The original wide-format files are left untouched.
 
 Usage
 -----
@@ -55,19 +53,21 @@ def _dimension_cols_from_hive(path: Path) -> dict:
     return parts
 
 
-def migrate_file(parquet_path: Path, base_path: Path, output_path: Path, dry_run: bool = False) -> bool:
-    """Convert one wide-format Parquet file to long format.
+def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: Path, dry_run: bool = False) -> bool:
+    """Convert all wide-format Parquet files in one partition to a single long-format file.
 
-    Reads from parquet_path (under base_path) and writes long-format output
-    under output_path, leaving the original file untouched.  Returns True if
-    the file was (or would be) migrated, False if it was already in long format.
+    All paths must share the same parent directory (partition).  Returns True if
+    the partition was (or would be) migrated, False if it was already in long format.
     """
-    if not _is_wide(parquet_path):
+    if not _is_wide(parquet_paths[0]):
         return False
 
-    print(f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {parquet_path.relative_to(base_path)}")
+    partition_dir = parquet_paths[0].parent
+    rel_dir = partition_dir.relative_to(base_path)
+    n = len(parquet_paths)
+    print(f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} ({n} file{'s' if n > 1 else ''})")
 
-    schema = pl.read_parquet_schema(parquet_path)
+    schema = pl.read_parquet_schema(parquet_paths[0])
     geo_cols = [n for n in schema if n[:1].isdigit()]
     print(f"    {len(geo_cols)} grid_cell columns → long format")
 
@@ -76,11 +76,11 @@ def migrate_file(parquet_path: Path, base_path: Path, output_path: Path, dry_run
 
     t0 = time.perf_counter()
 
-    lf = pl.scan_parquet(parquet_path)
+    lf = pl.scan_parquet(parquet_paths)
 
     # Inject dimension values encoded in the Hive partition path as literal
     # columns — they are not stored inside the leaf file itself.
-    hive_dims = _dimension_cols_from_hive(parquet_path)
+    hive_dims = _dimension_cols_from_hive(parquet_paths[0])
     if hive_dims:
         lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
@@ -94,17 +94,17 @@ def migrate_file(parquet_path: Path, base_path: Path, output_path: Path, dry_run
     return True
 
 
-def find_parquet_files(base_path: Path, variable=None, grid=None, time_unit=None) -> list[Path]:
-    """Find all wide-format Parquet files under base_path, optionally filtered."""
+def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
+    """Find all Parquet files under base_path grouped by partition directory."""
     pattern_parts = []
     for dim_name, value in [("variable", variable), ("grid", grid), ("time_unit", time_unit)]:
         pattern_parts.append(f"{dim_name}={value}" if value else f"{dim_name}=*")
 
-    # Walk and collect all .parquet files under the matching dataset directories.
-    paths = []
+    partitions: dict[Path, list[Path]] = {}
     for dataset_dir in base_path.glob("/".join(pattern_parts)):
-        paths.extend(dataset_dir.rglob("*.parquet"))
-    return sorted(paths)
+        for path in sorted(dataset_dir.rglob("*.parquet")):
+            partitions.setdefault(path.parent, []).append(path)
+    return dict(sorted(partitions.items()))
 
 
 def main():
@@ -119,27 +119,28 @@ def main():
 
     base_path = Path(args.data_path)
     output_path = Path(args.output_path)
-    paths = find_parquet_files(base_path, args.variable, args.grid, args.time_unit)
+    partitions = find_partitions(base_path, args.variable, args.grid, args.time_unit)
 
-    if not paths:
+    if not partitions:
         print("No Parquet files found matching the given filters.")
         return
 
-    print(f"Found {len(paths)} Parquet file(s) to inspect.")
+    total_files = sum(len(v) for v in partitions.values())
+    print(f"Found {total_files} Parquet file(s) across {len(partitions)} partition(s).")
     migrated = 0
     skipped = 0
 
-    for path in paths:
+    for paths in partitions.values():
         try:
-            if migrate_file(path, base_path=base_path, output_path=output_path, dry_run=args.dry_run):
+            if migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run):
                 migrated += 1
             else:
                 skipped += 1
         except Exception as exc:
-            print(f"  ERROR migrating {path}: {exc}", file=sys.stderr)
+            print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
 
     label = "Would migrate" if args.dry_run else "Migrated"
-    print(f"\n{label} {migrated} file(s), skipped {skipped} already-long file(s).")
+    print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
 
 
 if __name__ == "__main__":
