@@ -84,13 +84,18 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     if hive_dims:
         lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
+    # Row count: each wide-format row expands to one row per grid_cell column.
+    # Compute this from input metadata before writing to avoid scanning output.
+    wide_rows = lf.select(pl.len()).collect()[0, 0]
+    row_count = wide_rows * len(geo_cols)
+
     # write_parquet detects wide-format columns (numeric names), unpivots to
     # long internally, sorts, and streams via sink_parquet so the full frame
     # is never materialized.
     write_parquet(lf, base_path=output_path, validate=False, sort=True)
 
     elapsed = time.perf_counter() - t0
-    print(f"    done in {elapsed:.1f}s")
+    print(f"    {row_count:,} rows written in {elapsed:.1f}s")
     return True
 
 
