@@ -21,9 +21,9 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 """
 
 import argparse
+import multiprocessing
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import polars as pl
@@ -105,6 +105,20 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     return True
 
 
+def _run_partition(args):
+    """Worker target for multiprocessing.Pool.
+
+    Each call runs in a fresh subprocess (maxtasksperchild=1) so allocator
+    memory from Polars/Arrow is fully released when the process exits.
+    Returns (migrated: bool, error: str | None).
+    """
+    paths, base_path, output_path, dry_run = args
+    try:
+        return migrate_partition(paths, base_path, output_path, dry_run), None
+    except Exception as exc:
+        return False, f"{paths[0].parent}: {exc}"
+
+
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
     """Find all Parquet files under base_path grouped by partition directory."""
     pattern_parts = []
@@ -148,30 +162,21 @@ def main():
     migrated = 0
     skipped = 0
 
-    def _run(paths):
-        return migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run)
+    packed = [(paths, base_path, output_path, args.dry_run) for paths in partitions.values()]
 
-    if args.workers == 1:
-        for paths in partitions.values():
-            try:
-                if _run(paths):
-                    migrated += 1
-                else:
-                    skipped += 1
-            except Exception as exc:
-                print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
-    else:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run, paths): paths for paths in partitions.values()}
-            for future in as_completed(futures):
-                paths = futures[future]
-                try:
-                    if future.result():
-                        migrated += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:
-                    print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+    # spawn avoids fork-after-threads problems with Polars' internal thread pool.
+    # maxtasksperchild=1 replaces the worker process after each partition so the
+    # allocator (jemalloc/mimalloc) releases its pages back to the OS rather than
+    # letting RSS climb across the full run.
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=args.workers, maxtasksperchild=1) as pool:
+        for result, error in pool.map(_run_partition, packed):
+            if error:
+                print(f"  ERROR migrating {error}", file=sys.stderr)
+            elif result:
+                migrated += 1
+            else:
+                skipped += 1
 
     label = "Would migrate" if args.dry_run else "Migrated"
     print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
