@@ -22,6 +22,7 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 
 import argparse
 import multiprocessing
+import resource
 import signal
 import sys
 import time
@@ -114,15 +115,70 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
 
     t0 = time.perf_counter()
 
-    lf = pl.scan_parquet(parquet_paths)
+    time_unit = str(hive_dims.get("time_unit", ""))
+    if time_unit in ("daily", "monthly"):
+        # Multi-year data: target sort is year → gc → date, which the
+        # column-by-column approach cannot produce.  Fall back to the
+        # lazy unpivot + sort path.
+        lf = pl.scan_parquet(parquet_paths)
+        write_parquet(lf, base_path=output_path, validate=False, sort=True, **hive_dims)
+    else:
+        # Annual/decadal: target sort is [other_dims] → gc → year, where
+        # other_dims are the non-calendar, non-dataset dimensions (e.g.
+        # model_group_id, scenario_id, aggregate_type, model).
+        #
+        # Strategy: partition wide_df in one O(n) pass, sort the partitions to
+        # match write_parquet's sort_exprs, then unpivot + sort within each
+        # partition (cheap: only N_gc × N_years rows).  Each raw partition is
+        # freed as soon as its long form is produced, so peak memory ≈ long_df
+        # rather than wide_df + 2 × long_df for a full sort.
+        alpha_cols = [col for col in schema if not col[:1].isdigit()]
+        # Non-calendar alpha cols that aren't dataset-level kwargs — these are the
+        # outer sort keys, in DIMENSIONS order to match write_parquet's sort_exprs.
+        other_dim_cols = [
+            col for col in DIMENSIONS
+            if col in set(alpha_cols) and not col.startswith("calendar_")
+        ]
 
-    # write_parquet detects wide-format columns (numeric names), unpivots to
-    # long internally, sorts, and streams via sink_parquet so the full frame
-    # is never materialized.
-    write_parquet(lf, base_path=output_path, validate=False, sort=True, **hive_dims)
+        wide_df = pl.scan_parquet(parquet_paths).collect()
+
+        if other_dim_cols:
+            # One pass to split wide_df into per-combo partitions.
+            partitions = wide_df.partition_by(other_dim_cols, maintain_order=False, as_dict=False)
+            del wide_df
+            # Sort in [other_dim_cols] order (matches write_parquet's sort_exprs).
+            partitions.sort(key=lambda p: p.select(other_dim_cols).row(0))
+            combo_longs = []
+            for i, partition in enumerate(partitions):
+                combo_longs.append(
+                    partition.lazy()
+                    .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
+                    .with_columns(pl.col("grid_cell").cast(pl.Int32))
+                    .sort("grid_cell", "calendar_year")
+                    .collect()
+                )
+                partitions[i] = None  # free wide-format partition once its long form is done
+            long_df = pl.concat(combo_longs, rechunk=False)
+        else:
+            # No outer sort dims: gc → year order from column-by-column is correct.
+            geo_cols_sorted = sorted(geo_cols, key=int)
+            long_df = pl.concat(
+                [
+                    wide_df.select(
+                        *alpha_cols, pl.lit(int(gc)).alias("grid_cell"), pl.col(gc).alias("value")
+                    )
+                    for gc in geo_cols_sorted
+                ],
+                rechunk=False,
+            )
+
+        write_parquet(long_df, base_path=output_path, validate=False, sort=False, **hive_dims)
 
     elapsed = time.perf_counter() - t0
-    tqdm.write(f"    done in {elapsed:.1f}s")
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
+    tqdm.write(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
     return True
 
 
@@ -167,8 +223,13 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
     Sizes are derived from schema dtypes (num_rows × Σ dtype.itemsize), which reflects the
     actual decoded Arrow representation rather than the Parquet-encoded size.
 
-    Est. peak = wide_in_memory + long_in_memory × 2, where the ×2 accounts for sort
-    indices and a permutation buffer during the sort step in write_parquet.
+    Annual/decadal: est. peak = wide_in_memory + long_rows × 4 bytes.  The
+    migration builds the long format column-by-column so alpha and value columns
+    are Arrow zero-copy views of wide_df; the only meaningful new allocation is
+    the grid_cell Int32 literal series (4 bytes × long_rows).
+
+    Daily/monthly: est. peak = wide_in_memory + long_in_memory × 2, where the
+    ×2 accounts for sort indices and a permutation buffer during the sort step.
     """
     rows = []
     with tqdm(total=len(partitions), desc="Estimating", unit="partition", disable=not progress) as bar:
@@ -188,17 +249,20 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
             # Decoded in-memory size of the wide DataFrame.
             wide_in_memory = wide_rows * sum(_dtype_itemsize(schema[c]) for c in schema)
 
-            # Decoded in-memory size of the long DataFrame after unpivot + select:
-            # all alpha dimension columns (repeated long_rows times) + grid_cell (Int32) + value.
             long_bytes_per_row = (
                 sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
-                + _dtype_itemsize(pl.Int32)  # grid_cell cast from column name
-                + _dtype_itemsize(value_dtype)  # value column
+                + _dtype_itemsize(pl.Int32)  # grid_cell
+                + _dtype_itemsize(value_dtype)
             )
             long_in_memory = long_rows * long_bytes_per_row
-
-            # Sort overhead: ~1× long data for indices and permutation buffer.
-            est_peak = wide_in_memory + long_in_memory * 2
+            if "calendar_day" in schema:
+                # Daily/monthly: lazy unpivot + full sort.
+                est_peak = wide_in_memory + long_in_memory * 2
+            else:
+                # Annual/decadal: partition_by + per-combo unpivot/sort.
+                # Each partition's long form is materialized while the raw wide
+                # partition is freed; peak ≈ the accumulated long format.
+                est_peak = long_in_memory
 
             rows.append(
                 {
