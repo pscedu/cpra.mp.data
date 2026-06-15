@@ -23,9 +23,11 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 
 # Add the project root to sys.path so the package is importable when the
 # script is run from any working directory.
@@ -36,10 +38,13 @@ from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.tabular import write_parquet
 
 
-def _is_wide(path: Path) -> bool:
-    """Return True if the Parquet file at path is in wide format."""
+def _wide_schema(path: Path) -> dict | None:
+    """Return the schema if the file is wide-format, else None.
+
+    Reads the file footer once so callers don't need a second schema fetch.
+    """
     schema = pl.read_parquet_schema(path)
-    return any(name[:1].isdigit() for name in schema)
+    return schema if any(name[:1].isdigit() for name in schema) else None
 
 
 def _dimension_cols_from_hive(path: Path) -> dict:
@@ -59,17 +64,23 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     All paths must share the same parent directory (partition).  Returns True if
     the partition was (or would be) migrated, False if it was already in long format.
     """
-    if not _is_wide(parquet_paths[0]):
+    schema = _wide_schema(parquet_paths[0])
+    if schema is None:
         return False
 
     partition_dir = parquet_paths[0].parent
     rel_dir = partition_dir.relative_to(base_path)
     n = len(parquet_paths)
-    print(f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} ({n} file{'s' if n > 1 else ''})")
+    geo_cols = [col for col in schema if col[:1].isdigit()]
 
-    schema = pl.read_parquet_schema(parquet_paths[0])
-    geo_cols = [n for n in schema if n[:1].isdigit()]
-    print(f"    {len(geo_cols)} grid_cell columns → long format")
+    # Row counts come from Parquet footer metadata — no data scan needed.
+    wide_rows = sum(pq.read_metadata(p).num_rows for p in parquet_paths)
+    row_count = wide_rows * len(geo_cols)
+
+    print(
+        f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} "
+        f"({n} file{'s' if n > 1 else ''}, {len(geo_cols)} grid_cell cols, {row_count:,} long rows)"
+    )
 
     if dry_run:
         return True
@@ -84,18 +95,13 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     if hive_dims:
         lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
-    # Row count: each wide-format row expands to one row per grid_cell column.
-    # Compute this from input metadata before writing to avoid scanning output.
-    wide_rows = lf.select(pl.len()).collect()[0, 0]
-    row_count = wide_rows * len(geo_cols)
-
     # write_parquet detects wide-format columns (numeric names), unpivots to
     # long internally, sorts, and streams via sink_parquet so the full frame
     # is never materialized.
     write_parquet(lf, base_path=output_path, validate=False, sort=True)
 
     elapsed = time.perf_counter() - t0
-    print(f"    {row_count:,} rows written in {elapsed:.1f}s")
+    print(f"    done in {elapsed:.1f}s")
     return True
 
 
@@ -120,6 +126,13 @@ def main():
     parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without writing")
     parser.add_argument("--data-path", default=str(BASE_PATH), help=f"Base data path (default: {BASE_PATH})")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of partitions to process in parallel (default: 1). "
+             "Keep low (2–4) — Polars already saturates CPUs within each partition.",
+    )
     args = parser.parse_args()
 
     base_path = Path(args.data_path)
@@ -135,14 +148,30 @@ def main():
     migrated = 0
     skipped = 0
 
-    for paths in partitions.values():
-        try:
-            if migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run):
-                migrated += 1
-            else:
-                skipped += 1
-        except Exception as exc:
-            print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+    def _run(paths):
+        return migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run)
+
+    if args.workers == 1:
+        for paths in partitions.values():
+            try:
+                if _run(paths):
+                    migrated += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_run, paths): paths for paths in partitions.values()}
+            for future in as_completed(futures):
+                paths = futures[future]
+                try:
+                    if future.result():
+                        migrated += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
 
     label = "Would migrate" if args.dry_run else "Migrated"
     print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
