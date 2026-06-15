@@ -22,8 +22,10 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 
 import argparse
 import multiprocessing
+import os
 import resource
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -39,6 +41,82 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.tabular import read_parquet, write_parquet
+
+
+def _db_init(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS migrations (
+            partition TEXT PRIMARY KEY,
+            files INTEGER NOT NULL,
+            geo_cols INTEGER NOT NULL,
+            long_rows INTEGER NOT NULL,
+            elapsed_s REAL NOT NULL,
+            peak_bytes INTEGER NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS failures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partition TEXT NOT NULL,
+            error TEXT,
+            cpu_cores INTEGER,
+            mem_available_bytes INTEGER,
+            attempted_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.commit()
+    return conn
+
+
+def _db_completed(conn: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT partition FROM migrations")}
+
+
+def _available_memory_bytes() -> int | None:
+    """Return available system memory in bytes, or None if it cannot be determined."""
+    try:
+        if sys.platform == "linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        import psutil
+        return psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def _db_record_failure(
+    conn: sqlite3.Connection,
+    partition: str,
+    error: str | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO failures (partition, error, cpu_cores, mem_available_bytes, attempted_at)"
+        " VALUES (?, ?, ?, ?, datetime('now'))",
+        (partition, error, os.cpu_count(), _available_memory_bytes()),
+    )
+    conn.commit()
+
+
+def _db_record(
+    conn: sqlite3.Connection,
+    partition: str,
+    files: int,
+    geo_cols: int,
+    long_rows: int,
+    elapsed_s: float,
+    peak_bytes: int,
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO migrations"
+        " (partition, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+        (partition, files, geo_cols, long_rows, elapsed_s, peak_bytes),
+    )
+    conn.commit()
 
 
 def _wide_schema(path: Path) -> dict | None:
@@ -61,15 +139,18 @@ def _dimension_cols_from_hive(path: Path) -> dict:
     return parts
 
 
-def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: Path, dry_run: bool = False) -> bool:
+def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: Path, dry_run: bool = False) -> tuple[dict | None, list[str]]:
     """Convert all wide-format Parquet files in one partition to a single long-format file.
 
-    All paths must share the same parent directory (partition).  Returns True if
-    the partition was (or would be) migrated, False if it was already in long format.
+    All paths must share the same parent directory (partition).  Returns (result, messages)
+    where result is a stats dict if the partition was (or would be) migrated, or None if it
+    was already in long format.  messages contains lines to print via tqdm.write in the caller.
+    Stats keys: files, geo_cols, long_rows; plus elapsed_s and peak_bytes when not a dry run.
     """
+    messages: list[str] = []
     schema = _wide_schema(parquet_paths[0])
     if schema is None:
-        return False
+        return None, messages
 
     partition_dir = parquet_paths[0].parent
     rel_dir = partition_dir.relative_to(base_path)
@@ -98,20 +179,20 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     if existing_files:
         existing_rows = sum(pq.read_metadata(p).num_rows for p in existing_files)
         if existing_rows == row_count:
-            tqdm.write(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
-            return False
-        tqdm.write(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
+            messages.append(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
+            return {"skipped": True, "files": n, "geo_cols": len(geo_cols), "long_rows": row_count}, messages
+        messages.append(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
         if not dry_run:
             for p in existing_files:
                 Path(p).unlink()
 
-    tqdm.write(
+    messages.append(
         f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} "
         f"({n} file{'s' if n > 1 else ''}, {len(geo_cols)} grid_cell cols, {row_count:,} long rows)"
     )
 
     if dry_run:
-        return True
+        return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count}, messages
 
     t0 = time.perf_counter()
 
@@ -178,8 +259,8 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     # ru_maxrss is KiB on Linux, bytes on macOS.
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
-    tqdm.write(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
-    return True
+    messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
+    return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
 
 
 def _fmt_bytes(n: float) -> str:
@@ -321,13 +402,14 @@ def _run_partition(args):
 
     Each call runs in a fresh subprocess (maxtasksperchild=1) so allocator
     memory from Polars/Arrow is fully released when the process exits.
-    Returns (migrated: bool, error: str | None).
+    Returns (result: dict | None, messages: list[str], error: str | None).
     """
     paths, base_path, output_path, dry_run = args
     try:
-        return migrate_partition(paths, base_path, output_path, dry_run), None
+        result, messages = migrate_partition(paths, base_path, output_path, dry_run)
+        return result, messages, None
     except Exception as exc:
-        return False, f"{paths[0].parent}: {exc}"
+        return None, [], f"{paths[0].parent}: {exc}"
 
 
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
@@ -368,6 +450,12 @@ def main():
         help="Number of partitions to process in parallel (default: 1). "
         "Keep low (2–4) — Polars already saturates CPUs within each partition.",
     )
+    parser.add_argument(
+        "--progress-db",
+        metavar="PATH",
+        help="SQLite database for tracking migration progress. Completed partitions are "
+        "recorded and skipped on subsequent runs.",
+    )
     args = parser.parse_args()
 
     if not args.estimate and not args.output_path:
@@ -385,13 +473,29 @@ def main():
         return
 
     output_path = Path(args.output_path).resolve()
-    total_files = sum(len(v) for v in partitions.values())
-    total_partitions = len(partitions)
-    print(f"Found {total_files} Parquet file(s) across {total_partitions} partition(s).")
+
+    db_conn: sqlite3.Connection | None = None
+    partition_list = list(partitions.values())
+    db_skipped = 0
+    if args.progress_db:
+        db_conn = _db_init(Path(args.progress_db))
+        completed = _db_completed(db_conn)
+        if completed:
+            partition_list = [
+                paths for paths in partition_list
+                if str(paths[0].parent.relative_to(base_path)) not in completed
+            ]
+            db_skipped = len(partitions) - len(partition_list)
+
+    total_files = sum(len(p) for p in partition_list)
+    total_partitions = len(partition_list)
+    summary = f"Found {total_files} Parquet file(s) across {total_partitions} partition(s)."
+    if db_skipped:
+        summary += f" ({db_skipped} already in progress database, skipped.)"
+    print(summary)
     migrated = 0
     skipped = 0
     errors: list[str] = []
-    partition_list = list(partitions.values())
 
     desc = "[DRY RUN]" if args.dry_run else "Migrating"
     packed = [(paths, base_path, output_path, args.dry_run) for paths in partition_list]
@@ -409,7 +513,7 @@ def main():
                     try:
                         while True:
                             try:
-                                result, error = future.get(timeout=0.05)
+                                result, messages, error = future.get(timeout=0.05)
                                 break
                             except multiprocessing.TimeoutError:
                                 continue
@@ -422,19 +526,39 @@ def main():
                         msg = f"{rel}: worker killed (OOM?): {exc}"
                         errors.append(msg)
                         tqdm.write(f"  ERROR migrating {msg}", file=sys.stderr)
+                        if db_conn is not None:
+                            _db_record_failure(db_conn, str(rel), str(exc))
                     else:
+                        for msg in messages:
+                            tqdm.write(msg)
                         if error:
                             errors.append(error)
                             tqdm.write(f"  ERROR migrating {error}", file=sys.stderr)
-                        elif result:
+                            if db_conn is not None:
+                                rel = str(paths[0].parent.relative_to(base_path))
+                                _db_record_failure(db_conn, rel, error)
+                        elif result is None:
+                            skipped += 1  # not wide format
+                        elif result.get("skipped"):
+                            skipped += 1  # already in long format on disk
+                            if db_conn is not None:
+                                rel = str(paths[0].parent.relative_to(base_path))
+                                _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
+                        elif "elapsed_s" in result:
                             migrated += 1
+                            if db_conn is not None:
+                                rel = str(paths[0].parent.relative_to(base_path))
+                                _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
                         else:
-                            skipped += 1
+                            migrated += 1  # dry run
                     bar.update(1)
                     bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:
         tqdm.write("\nInterrupted by user.", file=sys.stderr)
         sys.exit(1)
+    finally:
+        if db_conn is not None:
+            db_conn.close()
 
     label = "Would migrate" if args.dry_run else "Migrated"
     print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")

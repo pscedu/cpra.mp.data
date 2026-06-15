@@ -11,6 +11,7 @@ token.txt
 
 *.~lock*
 /test_*.py
+*.db
 
 /cpra/mp/data/crosswalk/
 /cpra/mp/data/geojson/
