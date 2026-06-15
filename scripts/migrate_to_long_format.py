@@ -115,15 +115,10 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
 
     lf = pl.scan_parquet(parquet_paths)
 
-    # Inject dimension values encoded in the Hive partition path as literal
-    # columns — they are not stored inside the leaf file itself.
-    if hive_dims:
-        lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
-
     # write_parquet detects wide-format columns (numeric names), unpivots to
     # long internally, sorts, and streams via sink_parquet so the full frame
     # is never materialized.
-    write_parquet(lf, base_path=output_path, validate=False, sort=True)
+    write_parquet(lf, base_path=output_path, validate=False, sort=True, **hive_dims)
 
     elapsed = time.perf_counter() - t0
     tqdm.write(f"    done in {elapsed:.1f}s")
@@ -139,10 +134,18 @@ def _fmt_bytes(n: float) -> str:
 
 
 _DTYPE_SIZES = {
-    pl.Float32: 4, pl.Float64: 8,
-    pl.Int8: 1, pl.Int16: 2, pl.Int32: 4, pl.Int64: 8,
-    pl.UInt8: 1, pl.UInt16: 2, pl.UInt32: 4, pl.UInt64: 8,
-    pl.Date: 4, pl.Boolean: 1,
+    pl.Float32: 4,
+    pl.Float64: 8,
+    pl.Int8: 1,
+    pl.Int16: 2,
+    pl.Int32: 4,
+    pl.Int64: 8,
+    pl.UInt8: 1,
+    pl.UInt16: 2,
+    pl.UInt32: 4,
+    pl.UInt64: 8,
+    pl.Date: 4,
+    pl.Boolean: 1,
 }
 
 
@@ -188,7 +191,7 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
             # all alpha dimension columns (repeated long_rows times) + grid_cell (Int32) + value.
             long_bytes_per_row = (
                 sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
-                + _dtype_itemsize(pl.Int32)     # grid_cell cast from column name
+                + _dtype_itemsize(pl.Int32)  # grid_cell cast from column name
                 + _dtype_itemsize(value_dtype)  # value column
             )
             long_in_memory = long_rows * long_bytes_per_row
@@ -196,13 +199,15 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
             # Sort overhead: ~1× long data for indices and permutation buffer.
             est_peak = wide_in_memory + long_in_memory * 2
 
-            rows.append({
-                "partition": str(paths[0].parent.relative_to(base_path)),
-                "files": len(paths),
-                "long_rows": long_rows,
-                "wide_in_memory": wide_in_memory,
-                "est_peak": est_peak,
-            })
+            rows.append(
+                {
+                    "partition": str(paths[0].parent.relative_to(base_path)),
+                    "files": len(paths),
+                    "long_rows": long_rows,
+                    "wide_in_memory": wide_in_memory,
+                    "est_peak": est_peak,
+                }
+            )
 
     if not rows:
         print("No wide-format partitions found.")
@@ -220,21 +225,25 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
     sep = "-" * len(header)
     print(f"\n{header}\n{sep}")
     for r in rows:
-        print(_row(
-            r["partition"],
-            r["files"],
-            f"{r['long_rows']:,}",
-            _fmt_bytes(r["wide_in_memory"]),
-            _fmt_bytes(r["est_peak"]),
-        ))
+        print(
+            _row(
+                r["partition"],
+                r["files"],
+                f"{r['long_rows']:,}",
+                _fmt_bytes(r["wide_in_memory"]),
+                _fmt_bytes(r["est_peak"]),
+            )
+        )
     print(sep)
-    print(_row(
-        "TOTAL",
-        sum(r["files"] for r in rows),
-        f"{sum(r['long_rows'] for r in rows):,}",
-        _fmt_bytes(sum(r["wide_in_memory"] for r in rows)),
-        _fmt_bytes(sum(r["est_peak"] for r in rows)),
-    ))
+    print(
+        _row(
+            "TOTAL",
+            sum(r["files"] for r in rows),
+            f"{sum(r['long_rows'] for r in rows):,}",
+            _fmt_bytes(sum(r["wide_in_memory"] for r in rows)),
+            _fmt_bytes(sum(r["est_peak"] for r in rows)),
+        )
+    )
 
 
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
@@ -253,12 +262,19 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-path", help="Root directory for long-format output (required unless --estimate)")
-    parser.add_argument("--estimate", action="store_true", help="Print a memory-estimate table sorted by peak memory and exit")
+    parser.add_argument(
+        "--estimate", action="store_true", help="Print a memory-estimate table sorted by peak memory and exit"
+    )
     parser.add_argument("--variable", help="Migrate only this variable")
     parser.add_argument("--grid", help="Migrate only this grid")
     parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without writing")
-    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Show progress bar (use --no-progress for batch jobs)")
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show progress bar (use --no-progress for batch jobs)",
+    )
     parser.add_argument("--data-path", default=str(BASE_PATH), help=f"Base data path (default: {BASE_PATH})")
     parser.add_argument(
         "--workers",

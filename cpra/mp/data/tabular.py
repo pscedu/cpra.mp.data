@@ -151,7 +151,7 @@ def write_parquet(
                 raise ValidationError(msg)
 
         if sort:
-            sort_exprs = [pl.col(col) for col in required_cols if not col.startswith("calendar_")]
+            sort_exprs = [pl.col(col) for col in required_cols if not col.startswith("calendar_") and col not in kwargs]
             if time_unit in ("daily", "monthly"):
                 # Sort so each row group covers one calendar year: year → grid_cell → date.
                 sort_exprs.extend([pl.col("calendar_day").dt.year(), pl.col("grid_cell"), pl.col("calendar_day")])
