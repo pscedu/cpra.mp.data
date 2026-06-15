@@ -161,6 +161,7 @@ class VisualizationQuery(DataQuery):
 
     # Map-specific parameters
     show_projects: bool = True
+    projects_model_group_id: list[int] | None = None
     show_water: bool = False
     show_grid_labels: bool = False
     show_grid_lines: bool = True

@@ -343,16 +343,16 @@ class Map(DatasetVisualization):
 
         return ["case", ["has", "value"], fill_expr, "transparent"]
 
-    def projects_source(self, model_group_id: int) -> dict[str, Any]:
+    def projects_source(self, model_group_ids: list[int]) -> dict[str, Any]:
         """Generate a projects source definition.
 
         Args:
-            model_group_id: Model group ID for project filtering.
+            model_group_ids: Model group ID(s) for project filtering.
 
         Returns:
             A MapLibre vector source definition for projects.
         """
-        params = urlencode({"model_group_id": model_group_id})
+        params = urlencode({"model_group_id": model_group_ids}, doseq=True)
         return {
             "type": "vector",
             "url": f"{STATIC_TILES_BASE_URL}/f_generate_tile_element_project?{params}",
@@ -911,8 +911,9 @@ class Map(DatasetVisualization):
             style["layers"].insert(insert_idx + i, layer)
 
         # Add project overlay if requested (above data, below labels)
-        if show_projects and model_group_id and (calendar_year or calendar_day):
-            style["sources"]["projects"] = self.projects_source(model_group_id[0])
+        projects_model_group_id = self.params.get("projects_model_group_id") or model_group_id
+        if show_projects and projects_model_group_id and (calendar_year or calendar_day):
+            style["sources"]["projects"] = self.projects_source(projects_model_group_id)
             project_insert_idx = insert_idx + len(data_layers)
             project_year = calendar_year[0] if calendar_year else calendar_day[0].year
             for i, layer in enumerate(self.project_layers(project_year, is_overlay)):
