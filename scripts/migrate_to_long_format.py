@@ -130,6 +130,113 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     return True
 
 
+def _fmt_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+_DTYPE_SIZES = {
+    pl.Float32: 4, pl.Float64: 8,
+    pl.Int8: 1, pl.Int16: 2, pl.Int32: 4, pl.Int64: 8,
+    pl.UInt8: 1, pl.UInt16: 2, pl.UInt32: 4, pl.UInt64: 8,
+    pl.Date: 4, pl.Boolean: 1,
+}
+
+
+def _dtype_itemsize(dtype) -> int:
+    if dtype in _DTYPE_SIZES:
+        return _DTYPE_SIZES[dtype]
+    try:
+        if dtype.base_type() in (pl.Datetime, pl.Duration, pl.Time):
+            return 8
+    except AttributeError:
+        pass
+    return 50  # String, Categorical, List, Struct, etc.
+
+
+def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, progress: bool = True) -> None:
+    """Print a memory-estimate table for all wide-format partitions, sorted by estimated peak memory.
+
+    Sizes are derived from schema dtypes (num_rows × Σ dtype.itemsize), which reflects the
+    actual decoded Arrow representation rather than the Parquet-encoded size.
+
+    Est. peak = wide_in_memory + long_in_memory × 2, where the ×2 accounts for sort
+    indices and a permutation buffer during the sort step in write_parquet.
+    """
+    rows = []
+    with tqdm(total=len(partitions), desc="Estimating", unit="partition", disable=not progress) as bar:
+        for paths in partitions.values():
+            schema = _wide_schema(paths[0])
+            bar.update(1)
+            if schema is None:
+                continue
+
+            geo_cols = [col for col in schema if col[:1].isdigit()]
+            alpha_cols = [col for col in schema if not col[:1].isdigit()]
+            value_dtype = schema[geo_cols[0]]
+
+            wide_rows = sum(pq.read_metadata(p).num_rows for p in paths)
+            long_rows = wide_rows * len(geo_cols)
+
+            # Decoded in-memory size of the wide DataFrame.
+            wide_in_memory = wide_rows * sum(_dtype_itemsize(schema[c]) for c in schema)
+
+            # Decoded in-memory size of the long DataFrame after unpivot + select:
+            # all alpha dimension columns (repeated long_rows times) + grid_cell (Int32) + value.
+            long_bytes_per_row = (
+                sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
+                + _dtype_itemsize(pl.Int32)     # grid_cell cast from column name
+                + _dtype_itemsize(value_dtype)  # value column
+            )
+            long_in_memory = long_rows * long_bytes_per_row
+
+            # Sort overhead: ~1× long data for indices and permutation buffer.
+            est_peak = wide_in_memory + long_in_memory * 2
+
+            rows.append({
+                "partition": str(paths[0].parent.relative_to(base_path)),
+                "files": len(paths),
+                "long_rows": long_rows,
+                "wide_in_memory": wide_in_memory,
+                "est_peak": est_peak,
+            })
+
+    if not rows:
+        print("No wide-format partitions found.")
+        return
+
+    rows.sort(key=lambda r: r["est_peak"], reverse=True)
+
+    part_w = max(len(r["partition"]) for r in rows)
+    part_w = max(part_w, len("Partition"))
+
+    def _row(partition, files, long_rows, wide_data, est_peak):
+        return f"{partition:<{part_w}}  {files:>5}  {long_rows:>14}  {wide_data:>10}  {est_peak:>10}"
+
+    header = _row("Partition", "Files", "Long rows", "Wide data", "Est. peak")
+    sep = "-" * len(header)
+    print(f"\n{header}\n{sep}")
+    for r in rows:
+        print(_row(
+            r["partition"],
+            r["files"],
+            f"{r['long_rows']:,}",
+            _fmt_bytes(r["wide_in_memory"]),
+            _fmt_bytes(r["est_peak"]),
+        ))
+    print(sep)
+    print(_row(
+        "TOTAL",
+        sum(r["files"] for r in rows),
+        f"{sum(r['long_rows'] for r in rows):,}",
+        _fmt_bytes(sum(r["wide_in_memory"] for r in rows)),
+        _fmt_bytes(sum(r["est_peak"] for r in rows)),
+    ))
+
+
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
     """Find all Parquet files under base_path grouped by partition directory."""
     pattern_parts = []
@@ -145,7 +252,8 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output-path", required=True, help="Root directory for long-format output")
+    parser.add_argument("--output-path", help="Root directory for long-format output (required unless --estimate)")
+    parser.add_argument("--estimate", action="store_true", help="Print a memory-estimate table sorted by peak memory and exit")
     parser.add_argument("--variable", help="Migrate only this variable")
     parser.add_argument("--grid", help="Migrate only this grid")
     parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
@@ -161,14 +269,21 @@ def main():
     )
     args = parser.parse_args()
 
+    if not args.estimate and not args.output_path:
+        parser.error("--output-path is required unless --estimate is set")
+
     base_path = Path(args.data_path).resolve()
-    output_path = Path(args.output_path).resolve()
     partitions = find_partitions(base_path, args.variable, args.grid, args.time_unit)
 
     if not partitions:
         print("No Parquet files found matching the given filters.")
         return
 
+    if args.estimate:
+        estimate_partitions(partitions, base_path, progress=args.progress)
+        return
+
+    output_path = Path(args.output_path).resolve()
     total_files = sum(len(v) for v in partitions.values())
     total_partitions = len(partitions)
     print(f"Found {total_files} Parquet file(s) across {total_partitions} partition(s).")
