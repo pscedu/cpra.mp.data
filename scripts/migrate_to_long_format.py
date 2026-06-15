@@ -150,6 +150,7 @@ def main():
     parser.add_argument("--grid", help="Migrate only this grid")
     parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without writing")
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Show progress bar (use --no-progress for batch jobs)")
     parser.add_argument("--data-path", default=str(BASE_PATH), help=f"Base data path (default: {BASE_PATH})")
     parser.add_argument(
         "--workers",
@@ -178,7 +179,7 @@ def main():
         return migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run)
 
     desc = "[DRY RUN]" if args.dry_run else "Migrating"
-    with tqdm(total=total_partitions, desc=desc, unit="partition") as bar:
+    with tqdm(total=total_partitions, desc=desc, unit="partition", disable=not args.progress) as bar:
         if args.workers == 1:
             for paths in partitions.values():
                 try:
