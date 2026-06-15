@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.tabular import write_parquet
+from cpra.mp.data.tabular import read_parquet, write_parquet
 
 
 def _wide_schema(path: Path) -> dict | None:
@@ -77,6 +77,31 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     wide_rows = sum(pq.read_metadata(p).num_rows for p in parquet_paths)
     row_count = wide_rows * len(geo_cols)
 
+    hive_dims = _dimension_cols_from_hive(parquet_paths[0])
+
+    # Discover existing output files via read_parquet so the directory ordering
+    # of the output (which may differ from the input) is handled correctly.
+    try:
+        existing_files = (
+            read_parquet(base_path=output_path, include_file_paths="__path__", **hive_dims)
+            .select("__path__")
+            .collect()["__path__"]
+            .unique()
+            .to_list()
+        )
+    except Exception:
+        existing_files = []
+
+    if existing_files:
+        existing_rows = sum(pq.read_metadata(p).num_rows for p in existing_files)
+        if existing_rows == row_count:
+            print(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
+            return False
+        print(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
+        if not dry_run:
+            for p in existing_files:
+                Path(p).unlink()
+
     print(
         f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} "
         f"({n} file{'s' if n > 1 else ''}, {len(geo_cols)} grid_cell cols, {row_count:,} long rows)"
@@ -91,7 +116,6 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
 
     # Inject dimension values encoded in the Hive partition path as literal
     # columns — they are not stored inside the leaf file itself.
-    hive_dims = _dimension_cols_from_hive(parquet_paths[0])
     if hive_dims:
         lf = lf.with_columns(**{k: pl.lit(v) for k, v in hive_dims.items()})
 
@@ -131,12 +155,12 @@ def main():
         type=int,
         default=1,
         help="Number of partitions to process in parallel (default: 1). "
-             "Keep low (2–4) — Polars already saturates CPUs within each partition.",
+        "Keep low (2–4) — Polars already saturates CPUs within each partition.",
     )
     args = parser.parse_args()
 
-    base_path = Path(args.data_path)
-    output_path = Path(args.output_path)
+    base_path = Path(args.data_path).resolve()
+    output_path = Path(args.output_path).resolve()
     partitions = find_partitions(base_path, args.variable, args.grid, args.time_unit)
 
     if not partitions:
