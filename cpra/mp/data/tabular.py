@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 
 import polars as pl
@@ -166,7 +167,15 @@ def write_parquet(
     # Derive partition columns from the metadata row.
     partition_cols = partition_columns(meta)
 
-    sink_args = [pl.PartitionBy(base_path, key=partition_cols, include_key=False)] if partition_cols else []
+    def _uuid_path(args: pl.FileProviderArgs) -> str:
+        hive = "/".join(f"{col}={args.partition_keys[col][0]}" for col in args.partition_keys.columns)
+        return f"{hive}/{uuid.uuid4()}.parquet"
+
+    sink_args = (
+        [pl.PartitionBy(base_path, key=partition_cols, include_key=False, file_path_provider=_uuid_path, approximate_bytes_per_file=None)]
+        if partition_cols
+        else []
+    )
     sink_kwargs = dict(
         compression=compression,
         compression_level=compression_level,
