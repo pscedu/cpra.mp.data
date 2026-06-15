@@ -28,6 +28,7 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 # Add the project root to sys.path so the package is importable when the
 # script is run from any working directory.
@@ -95,14 +96,14 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     if existing_files:
         existing_rows = sum(pq.read_metadata(p).num_rows for p in existing_files)
         if existing_rows == row_count:
-            print(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
+            tqdm.write(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
             return False
-        print(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
+        tqdm.write(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
         if not dry_run:
             for p in existing_files:
                 Path(p).unlink()
 
-    print(
+    tqdm.write(
         f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} "
         f"({n} file{'s' if n > 1 else ''}, {len(geo_cols)} grid_cell cols, {row_count:,} long rows)"
     )
@@ -125,7 +126,7 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
     write_parquet(lf, base_path=output_path, validate=False, sort=True)
 
     elapsed = time.perf_counter() - t0
-    print(f"    done in {elapsed:.1f}s")
+    tqdm.write(f"    done in {elapsed:.1f}s")
     return True
 
 
@@ -168,34 +169,41 @@ def main():
         return
 
     total_files = sum(len(v) for v in partitions.values())
-    print(f"Found {total_files} Parquet file(s) across {len(partitions)} partition(s).")
+    total_partitions = len(partitions)
+    print(f"Found {total_files} Parquet file(s) across {total_partitions} partition(s).")
     migrated = 0
     skipped = 0
 
     def _run(paths):
         return migrate_partition(paths, base_path=base_path, output_path=output_path, dry_run=args.dry_run)
 
-    if args.workers == 1:
-        for paths in partitions.values():
-            try:
-                if _run(paths):
-                    migrated += 1
-                else:
-                    skipped += 1
-            except Exception as exc:
-                print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
-    else:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run, paths): paths for paths in partitions.values()}
-            for future in as_completed(futures):
-                paths = futures[future]
+    desc = "[DRY RUN]" if args.dry_run else "Migrating"
+    with tqdm(total=total_partitions, desc=desc, unit="partition") as bar:
+        if args.workers == 1:
+            for paths in partitions.values():
                 try:
-                    if future.result():
+                    if _run(paths):
                         migrated += 1
                     else:
                         skipped += 1
                 except Exception as exc:
-                    print(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+                    tqdm.write(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+                bar.update(1)
+                bar.set_postfix(migrated=migrated, skipped=skipped)
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = {pool.submit(_run, paths): paths for paths in partitions.values()}
+                for future in as_completed(futures):
+                    paths = futures[future]
+                    try:
+                        if future.result():
+                            migrated += 1
+                        else:
+                            skipped += 1
+                    except Exception as exc:
+                        tqdm.write(f"  ERROR migrating {paths[0].parent}: {exc}", file=sys.stderr)
+                    bar.update(1)
+                    bar.set_postfix(migrated=migrated, skipped=skipped)
 
     label = "Would migrate" if args.dry_run else "Migrated"
     print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
