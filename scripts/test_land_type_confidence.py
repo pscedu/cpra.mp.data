@@ -88,12 +88,15 @@ def main(output_dir):
         print(f"Processing historic year {year}...")
 
         with rasterio.open(row["path"]) as src:
-            hist = src.read(1)
-
-        out = apply_value_map(hist)
-
-        with rasterio.open(out_path, "w", **base_profile) as dst:
-            dst.write(out, 1)
+            with rasterio.open(out_path, "w", **base_profile) as dst:
+                for row_off in range(0, grid.height, TILE_SIZE):
+                    tile_h = min(TILE_SIZE, grid.height - row_off)
+                    for col_off in range(0, grid.width, TILE_SIZE):
+                        tile_w = min(TILE_SIZE, grid.width - col_off)
+                        window = Window(col_off, row_off, tile_w, tile_h)
+                        tile = src.read(1, window=window)
+                        out = apply_value_map(tile)
+                        dst.write(out, 1, window=window)
 
     # Current data — all model groups (excluding model_group_id=0), all scenarios.
     # Convert each raster to 0/1 and average across all members for each year.
