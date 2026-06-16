@@ -28,6 +28,7 @@ import resource
 import signal
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -140,13 +141,143 @@ def _dimension_cols_from_hive(path: Path) -> dict:
     return parts
 
 
-def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: Path, dry_run: bool = False) -> tuple[dict | None, list[str]]:
+def _convert_batched(
+    parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit, progress_cb=None
+) -> list[str]:
+    """Batched conversion via temp files, bounded to roughly one batch in memory.
+
+    Works for every time unit.  The wide frame has one column per grid cell, so
+    grid_cell is produced by unpivot rather than being a row attribute.  The
+    target sort therefore places grid_cell *between* row-derived keys:
+
+      annual/decadal: other_dims → grid_cell → year
+      daily/monthly:  other_dims → year → grid_cell → date
+
+    A "group" is the set of wide rows that share every sort key *outside*
+    grid_cell — other_dims for annual/decadal, (other_dims, year) for
+    daily/monthly.  Groups must never be split across batches, or a grid_cell
+    would appear in two batches and break the global order on concatenation.
+
+    The wide frame is sorted so groups are contiguous; consecutive groups are
+    packed into batches under a long-row budget; each batch is unpivoted, sorted
+    to the global order, and streamed to a temp file.  Batches are written in
+    order, so concatenating the temp files is globally sorted.  partition_by()
+    is deliberately avoided — it would materialize every group at once, each
+    retaining all (~100k) grid-cell columns.
+    """
+    messages: list[str] = []
+    alpha_cols = [col for col in schema if not col[:1].isdigit()]
+    other_dim_cols = [
+        col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
+    ]
+    daily_monthly = time_unit in ("daily", "monthly")
+
+    wide_df = pl.scan_parquet(parquet_paths).collect()
+
+    if daily_monthly:
+        year = pl.col("calendar_day").dt.year()
+        # Sort by (other_dims, date): within each other_dims combo dates ascend,
+        # so (other_dims, year) groups are contiguous and in ascending order.
+        wide_df = wide_df.sort(*other_dim_cols, "calendar_day")
+        group_lengths = (
+            wide_df.lazy()
+            .select(*other_dim_cols, year.alias("__year"))
+            .group_by(*other_dim_cols, "__year", maintain_order=True)
+            .len()
+            .select("len")
+            .collect()["len"]
+            .to_list()
+        )
+        batch_sort = [*[pl.col(c) for c in other_dim_cols], year, pl.col("grid_cell"), pl.col("calendar_day")]
+    else:
+        if other_dim_cols:
+            wide_df = wide_df.sort(other_dim_cols)
+            group_lengths = (
+                wide_df.lazy()
+                .select(other_dim_cols)
+                .group_by(other_dim_cols, maintain_order=True)
+                .len()
+                .select("len")
+                .collect()["len"]
+                .to_list()
+            )
+        else:
+            # No outer keys: the whole partition is one group (gc → year order).
+            group_lengths = [wide_df.height]
+        batch_sort = [*[pl.col(c) for c in other_dim_cols], pl.col("grid_cell"), pl.col("calendar_year")]
+
+    n_geo = len(geo_cols)
+    target_long_rows = _batch_target_rows(est, memory_limit)
+    if memory_limit is not None and est["wide_in_memory"] > memory_limit:
+        messages.append(
+            f"    WARNING: wide frame (~{_fmt_bytes(est['wide_in_memory'])}) exceeds the "
+            f"{_fmt_bytes(memory_limit)} limit; it must be loaded in full, so the limit "
+            f"cannot be honored for this partition."
+        )
+
+    # Pack consecutive groups into batches under the long-row budget (never
+    # splitting a group).
+    batches: list[tuple[int, int]] = []
+    start = 0
+    acc = 0
+    for length in group_lengths:
+        if acc > 0 and (acc + length) * n_geo > target_long_rows:
+            batches.append((start, acc))
+            start += acc
+            acc = 0
+        acc += length
+    if acc > 0:
+        batches.append((start, acc))
+
+    messages.append(
+        f"    batched conversion: {len(batches)} batch(es) via temp files "
+        f"(≈{est['long_bytes_per_row'] * target_long_rows / 1024**3:.1f} GB/batch)"
+    )
+    if progress_cb:
+        progress_cb(0, len(batches))
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        tmp_paths = []
+        for i, (b_offset, b_rows) in enumerate(batches):
+            tmp_path = Path(_tmpdir) / f"chunk_{i:06d}.parquet"
+            (
+                wide_df.slice(b_offset, b_rows)
+                .lazy()
+                .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
+                .with_columns(pl.col("grid_cell").cast(pl.Int32))
+                .sort(*batch_sort)
+                .sink_parquet(tmp_path)
+            )
+            tmp_paths.append(tmp_path)
+            if progress_cb:
+                progress_cb(i + 1, len(batches))
+        del wide_df  # free the wide frame before the final streaming write
+        write_parquet(
+            pl.scan_parquet(tmp_paths), base_path=output_path, validate=False, sort=False, **hive_dims
+        )
+    return messages
+
+
+def migrate_partition(
+    parquet_paths: list[Path],
+    base_path: Path,
+    output_path: Path,
+    dry_run: bool = False,
+    memory_limit: int | None = None,
+    progress_cb=None,
+) -> tuple[dict | None, list[str]]:
     """Convert all wide-format Parquet files in one partition to a single long-format file.
 
     All paths must share the same parent directory (partition).  Returns (result, messages)
     where result is a stats dict if the partition was (or would be) migrated, or None if it
     was already in long format.  messages contains lines to print via tqdm.write in the caller.
     Stats keys: files, geo_cols, long_rows; plus elapsed_s and peak_bytes when not a dry run.
+
+    Conversion always uses the batched temp-file path.  memory_limit (bytes),
+    when given, sizes each batch so the per-worker peak stays within it;
+    otherwise a default batch size is used.
+
+    progress_cb, when given, is called as progress_cb(done, total) to report
+    intra-partition progress (number of batches written).
     """
     messages: list[str] = []
     schema = _wide_schema(parquet_paths[0])
@@ -197,64 +328,16 @@ def migrate_partition(parquet_paths: list[Path], base_path: Path, output_path: P
 
     t0 = time.perf_counter()
 
+    est = _peak_estimates(schema, wide_rows)
     time_unit = str(hive_dims.get("time_unit", ""))
-    if time_unit in ("daily", "monthly"):
-        # Multi-year data: target sort is year → gc → date, which the
-        # column-by-column approach cannot produce.  Fall back to the
-        # lazy unpivot + sort path.
-        lf = pl.scan_parquet(parquet_paths)
-        write_parquet(lf, base_path=output_path, validate=False, sort=True, **hive_dims)
-    else:
-        # Annual/decadal: target sort is [other_dims] → gc → year, where
-        # other_dims are the non-calendar, non-dataset dimensions (e.g.
-        # model_group_id, scenario_id, aggregate_type, model).
-        #
-        # Strategy: partition wide_df in one O(n) pass, sort the partitions to
-        # match write_parquet's sort_exprs, then unpivot + sort within each
-        # partition (cheap: only N_gc × N_years rows).  Each raw partition is
-        # freed as soon as its long form is produced, so peak memory ≈ long_df
-        # rather than wide_df + 2 × long_df for a full sort.
-        alpha_cols = [col for col in schema if not col[:1].isdigit()]
-        # Non-calendar alpha cols that aren't dataset-level kwargs — these are the
-        # outer sort keys, in DIMENSIONS order to match write_parquet's sort_exprs.
-        other_dim_cols = [
-            col for col in DIMENSIONS
-            if col in set(alpha_cols) and not col.startswith("calendar_")
-        ]
 
-        wide_df = pl.scan_parquet(parquet_paths).collect()
-
-        if other_dim_cols:
-            # One pass to split wide_df into per-combo partitions.
-            partitions = wide_df.partition_by(other_dim_cols, maintain_order=False, as_dict=False)
-            del wide_df
-            # Sort in [other_dim_cols] order (matches write_parquet's sort_exprs).
-            partitions.sort(key=lambda p: p.select(other_dim_cols).row(0))
-            combo_longs = []
-            for i, partition in enumerate(partitions):
-                combo_longs.append(
-                    partition.lazy()
-                    .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
-                    .with_columns(pl.col("grid_cell").cast(pl.Int32))
-                    .sort("grid_cell", "calendar_year")
-                    .collect()
-                )
-                partitions[i] = None  # free wide-format partition once its long form is done
-            long_df = pl.concat(combo_longs, rechunk=False)
-        else:
-            # No outer sort dims: gc → year order from column-by-column is correct.
-            geo_cols_sorted = sorted(geo_cols, key=int)
-            long_df = pl.concat(
-                [
-                    wide_df.select(
-                        *alpha_cols, pl.lit(int(gc)).alias("grid_cell"), pl.col(gc).alias("value")
-                    )
-                    for gc in geo_cols_sorted
-                ],
-                rechunk=False,
-            )
-
-        write_parquet(long_df, base_path=output_path, validate=False, sort=False, **hive_dims)
+    # Always use the batched temp-file path.  Benchmarks across all time units
+    # showed it as fast or faster than a single in-memory sort while using far
+    # less memory on large partitions, with byte-identical output.  memory_limit
+    # tunes the per-batch budget.
+    messages += _convert_batched(
+        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit, progress_cb
+    )
 
     elapsed = time.perf_counter() - t0
     # ru_maxrss is KiB on Linux, bytes on macOS.
@@ -299,19 +382,96 @@ def _dtype_itemsize(dtype) -> int:
     return 50  # String, Categorical, List, Struct, etc.
 
 
-def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, progress: bool = True) -> None:
+def _parse_memory(value: str) -> int:
+    """Parse a human-readable memory size into bytes.
+
+    Accepts forms like '32GB', '32G', '500MB', '16gib', or a raw byte count.
+    Binary units (1 K = 1024) are used throughout.
+    """
+    s = value.strip().upper().replace("IB", "").rstrip("B")
+    mult = 1
+    for suffix, m in (("K", 1024), ("M", 1024**2), ("G", 1024**3), ("T", 1024**4)):
+        if s.endswith(suffix):
+            mult = m
+            s = s[:-1]
+            break
+    return int(float(s) * mult)
+
+
+# Tuning constants for the batched memory model.  BATCH_SORT_FACTOR is empirical:
+# a Polars unpivot→sort→sink pipeline transiently holds several copies of the
+# data (the unpivoted frame, the sort's gather/index buffers, and the parquet
+# encode buffer).  Measured batch-sort peaks were ~2.2× the batch's long form;
+# 2.5 adds a safety margin so the memory limit is not exceeded.
+DEFAULT_BATCH_LONG_ROWS = 50_000_000
+MIN_BATCH_LONG_ROWS = 5_000_000
+BATCH_SORT_FACTOR = 2.5
+
+
+def _peak_estimates(schema: dict, wide_rows: int) -> dict:
+    """Compute base memory figures for one wide-format partition.
+
+    Returns a dict with:
+      wide_in_memory      — decoded Arrow size of the wide DataFrame.
+      long_rows           — number of rows in the long form.
+      long_bytes_per_row  — bytes per row of the long form.
+      long_in_memory      — decoded Arrow size of the full long form.
+    """
+    geo_cols = [c for c in schema if c[:1].isdigit()]
+    alpha_cols = [c for c in schema if not c[:1].isdigit()]
+    value_dtype = schema[geo_cols[0]]
+    long_rows = wide_rows * len(geo_cols)
+    wide_in_memory = wide_rows * sum(_dtype_itemsize(schema[c]) for c in schema)
+    long_bytes_per_row = (
+        sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
+        + _dtype_itemsize(pl.Int32)  # grid_cell
+        + _dtype_itemsize(value_dtype)
+    )
+    long_in_memory = long_rows * long_bytes_per_row
+    return {
+        "wide_in_memory": wide_in_memory,
+        "long_rows": long_rows,
+        "long_bytes_per_row": long_bytes_per_row,
+        "long_in_memory": long_in_memory,
+    }
+
+
+def _batch_target_rows(est: dict, memory_limit: int | None) -> int:
+    """Long-row budget per batch for the batched temp-file path.
+
+    Without a limit, a fixed default is used.  With a limit, the budget is sized
+    so the resident wide frame plus one batch's sort stays within it:
+    wide + BATCH_SORT_FACTOR × batch_long_bytes ≤ limit.
+    """
+    if memory_limit is None:
+        return DEFAULT_BATCH_LONG_ROWS
+    budget = memory_limit - est["wide_in_memory"]
+    if budget <= 0:
+        return MIN_BATCH_LONG_ROWS
+    return max(MIN_BATCH_LONG_ROWS, int(budget / BATCH_SORT_FACTOR / est["long_bytes_per_row"]))
+
+
+def _batched_peak(est: dict, memory_limit: int | None) -> int:
+    """Conservative peak for the batched path, given its batch budget."""
+    # A batch never holds more than the whole partition's long form.
+    target = min(_batch_target_rows(est, memory_limit), est["long_rows"])
+    loop_peak = est["wide_in_memory"] + BATCH_SORT_FACTOR * target * est["long_bytes_per_row"]
+    # The one-time sort of the wide frame (≈ 2× wide) can also be the high-water mark.
+    return int(max(2 * est["wide_in_memory"], loop_peak))
+
+
+def estimate_partitions(
+    partitions: dict[Path, list[Path]], base_path: Path, progress: bool = True, memory_limit: int | None = None
+) -> None:
     """Print a memory-estimate table for all wide-format partitions, sorted by estimated peak memory.
 
     Sizes are derived from schema dtypes (num_rows × Σ dtype.itemsize), which reflects the
     actual decoded Arrow representation rather than the Parquet-encoded size.
 
-    Annual/decadal: est. peak = wide_in_memory + long_rows × 4 bytes.  The
-    migration builds the long format column-by-column so alpha and value columns
-    are Arrow zero-copy views of wide_df; the only meaningful new allocation is
-    the grid_cell Int32 literal series (4 bytes × long_rows).
-
-    Daily/monthly: est. peak = wide_in_memory + long_in_memory × 2, where the
-    ×2 accounts for sort indices and a permutation buffer during the sort step.
+    Every partition is converted via the batched temp-file path.  The estimated
+    peak is the larger of the one-time wide-frame sort (≈ 2× wide) and a single
+    batch's sort (≈ wide + BATCH_SORT_FACTOR × batch long form), where the batch
+    size follows from memory_limit (or the default when none is given).
     """
     rows = []
     with tqdm(total=len(partitions), desc="Estimating", unit="partition", disable=not progress) as bar:
@@ -321,38 +481,15 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
             if schema is None:
                 continue
 
-            geo_cols = [col for col in schema if col[:1].isdigit()]
-            alpha_cols = [col for col in schema if not col[:1].isdigit()]
-            value_dtype = schema[geo_cols[0]]
-
             wide_rows = sum(pq.read_metadata(p).num_rows for p in paths)
-            long_rows = wide_rows * len(geo_cols)
-
-            # Decoded in-memory size of the wide DataFrame.
-            wide_in_memory = wide_rows * sum(_dtype_itemsize(schema[c]) for c in schema)
-
-            long_bytes_per_row = (
-                sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
-                + _dtype_itemsize(pl.Int32)  # grid_cell
-                + _dtype_itemsize(value_dtype)
-            )
-            long_in_memory = long_rows * long_bytes_per_row
-            if "calendar_day" in schema:
-                # Daily/monthly: lazy unpivot + full sort.
-                est_peak = wide_in_memory + long_in_memory * 2
-            else:
-                # Annual/decadal: partition_by + per-combo unpivot/sort.
-                # Each partition's long form is materialized while the raw wide
-                # partition is freed; peak ≈ the accumulated long format.
-                est_peak = long_in_memory
-
+            est = _peak_estimates(schema, wide_rows)
             rows.append(
                 {
                     "partition": str(paths[0].parent.relative_to(base_path)),
                     "files": len(paths),
-                    "long_rows": long_rows,
-                    "wide_in_memory": wide_in_memory,
-                    "est_peak": est_peak,
+                    "long_rows": est["long_rows"],
+                    "wide_in_memory": est["wide_in_memory"],
+                    "est_peak": _batched_peak(est, memory_limit),
                 }
             )
 
@@ -397,20 +534,30 @@ def _run_partition(args, result_queue):
     """Target for worker processes spawned directly (not via Pool).
 
     Each partition runs in a fresh subprocess so allocator memory from
-    Polars/Arrow is fully released when the process exits.  On normal
-    completion (including caught exceptions) sends
-    (pid, rel, result, messages, error) to result_queue.  If the process is
-    killed by a signal the queue is never written; the main process detects
-    this via p.exitcode.
+    Polars/Arrow is fully released when the process exits.  Messages are tagged
+    tuples on result_queue:
+      ("progress", pid, rel, done, total)            — intra-partition progress
+      ("result",   pid, rel, result, messages, error) — terminal result
+    If the process is killed by a signal the queue is never written; the main
+    process detects this via p.exitcode.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    paths, base_path, output_path, dry_run = args
+    paths, base_path, output_path, dry_run, memory_limit, progress = args
     rel = str(paths[0].parent.relative_to(base_path))
+    pid = os.getpid()
+
+    def progress_cb(done, total):
+        result_queue.put(("progress", pid, rel, done, total))
+
     try:
-        result, messages = migrate_partition(paths, base_path, output_path, dry_run)
-        result_queue.put((os.getpid(), rel, result, messages, None))
+        result, messages = migrate_partition(
+            paths, base_path, output_path, dry_run,
+            memory_limit=memory_limit,
+            progress_cb=progress_cb if progress else None,
+        )
+        result_queue.put(("result", pid, rel, result, messages, None))
     except Exception as exc:
-        result_queue.put((os.getpid(), rel, None, [], str(exc)))
+        result_queue.put(("result", pid, rel, None, [], str(exc)))
 
 
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
@@ -457,10 +604,22 @@ def main():
         help="SQLite database for tracking migration progress. Completed partitions are "
         "recorded and skipped on subsequent runs.",
     )
+    parser.add_argument(
+        "--memory-limit",
+        metavar="SIZE",
+        help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
+        "worker's peak memory stays within the budget. Without this flag a default batch "
+        "size is used.",
+    )
     args = parser.parse_args()
 
     if not args.estimate and not args.output_path:
         parser.error("--output-path is required unless --estimate is set")
+
+    try:
+        memory_limit = _parse_memory(args.memory_limit) if args.memory_limit else None
+    except ValueError:
+        parser.error(f"invalid --memory-limit value: {args.memory_limit!r}")
 
     base_path = Path(args.data_path).resolve()
     partitions = find_partitions(base_path, args.variable, args.grid, args.time_unit)
@@ -470,7 +629,7 @@ def main():
         return
 
     if args.estimate:
-        estimate_partitions(partitions, base_path, progress=args.progress)
+        estimate_partitions(partitions, base_path, progress=args.progress, memory_limit=memory_limit)
         return
 
     output_path = Path(args.output_path).resolve()
@@ -499,7 +658,10 @@ def main():
     errors: list[str] = []
 
     desc = "[DRY RUN]" if args.dry_run else "Migrating"
-    packed = [(paths, base_path, output_path, args.dry_run) for paths in partition_list]
+    packed = [
+        (paths, base_path, output_path, args.dry_run, memory_limit, args.progress)
+        for paths in partition_list
+    ]
 
     # spawn avoids fork-after-threads problems with Polars' internal thread pool.
     # Each partition runs in a dedicated Process so the allocator (jemalloc/mimalloc)
@@ -521,16 +683,46 @@ def main():
         active[p.pid] = (p, str(paths[0].parent.relative_to(base_path)))
         return True
 
+    # Nested per-worker progress bars (one slot per active worker, below the
+    # partition bar at position 0).  Only created for multi-batch conversions.
+    inner_bars: dict[int, tqdm] = {}
+    used_positions: set[int] = set()
+
+    def _short(rel: str, width: int = 48) -> str:
+        return rel if len(rel) <= width else "…" + rel[-(width - 1):]
+
+    def _update_inner(pid: int, rel: str, done: int, total: int) -> None:
+        if not args.progress or total <= 1:
+            return
+        bar_inner = inner_bars.get(pid)
+        if bar_inner is None:
+            pos = 1
+            while pos in used_positions:
+                pos += 1
+            used_positions.add(pos)
+            bar_inner = tqdm(total=total, position=pos, leave=False, desc=_short(rel), unit="batch")
+            bar_inner._slot = pos
+            inner_bars[pid] = bar_inner
+        bar_inner.total = total
+        bar_inner.n = done
+        bar_inner.refresh()
+
+    def _close_inner(pid: int) -> None:
+        bar_inner = inner_bars.pop(pid, None)
+        if bar_inner is not None:
+            used_positions.discard(getattr(bar_inner, "_slot", None))
+            bar_inner.close()
+
     try:
         for _ in range(args.workers):
             if not _spawn_next():
                 break
 
-        with tqdm(total=total_partitions, desc=desc, unit="partition", disable=not args.progress) as bar:
+        with tqdm(total=total_partitions, desc=desc, unit="partition", position=0, disable=not args.progress) as bar:
             remaining = total_partitions
             while remaining > 0:
                 try:
-                    pid, rel, result, messages, error = result_queue.get(timeout=0.2)
+                    message = result_queue.get(timeout=0.2)
                 except queue.Empty:
                     # No result yet — check whether any worker was killed without
                     # writing to the queue (OOM kill, SIGKILL, etc.).
@@ -540,6 +732,7 @@ def main():
                             if p.exitcode != 0:
                                 del active[pid]
                                 remaining -= 1
+                                _close_inner(pid)
                                 msg = f"{rel}: worker killed (OOM?), exit code {p.exitcode}"
                                 errors.append(msg)
                                 tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
@@ -556,6 +749,13 @@ def main():
                         p.join()
                     raise
 
+                if message[0] == "progress":
+                    _, pid, rel, done, total = message
+                    _update_inner(pid, rel, done, total)
+                    continue
+
+                _, pid, rel, result, messages, error = message
+                _close_inner(pid)
                 if pid in active:
                     active.pop(pid)[0].join()
                 _spawn_next()
@@ -590,6 +790,8 @@ def main():
         tqdm.write("\nInterrupted by user.", file=sys.stderr)
         sys.exit(1)
     finally:
+        for pid in list(inner_bars):
+            _close_inner(pid)
         if db_conn is not None:
             db_conn.close()
 
