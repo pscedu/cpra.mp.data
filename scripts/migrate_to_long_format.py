@@ -142,7 +142,8 @@ def _dimension_cols_from_hive(path: Path) -> dict:
 
 
 def _convert_batched(
-    parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit, progress_cb=None
+    parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
+    progress_cb=None, temp_path=None,
 ) -> list[str]:
     """Batched conversion via temp files, bounded to roughly one batch in memory.
 
@@ -235,7 +236,7 @@ def _convert_batched(
     )
     if progress_cb:
         progress_cb(0, len(batches))
-    with tempfile.TemporaryDirectory() as _tmpdir:
+    with tempfile.TemporaryDirectory(dir=temp_path) as _tmpdir:
         tmp_paths = []
         for i, (b_offset, b_rows) in enumerate(batches):
             tmp_path = Path(_tmpdir) / f"chunk_{i:06d}.parquet"
@@ -264,6 +265,7 @@ def migrate_partition(
     dry_run: bool = False,
     memory_limit: int | None = None,
     progress_cb=None,
+    temp_path=None,
 ) -> tuple[dict | None, list[str]]:
     """Convert all wide-format Parquet files in one partition to a single long-format file.
 
@@ -275,6 +277,10 @@ def migrate_partition(
     Conversion always uses the batched temp-file path.  memory_limit (bytes),
     when given, sizes each batch so the per-worker peak stays within it;
     otherwise a default batch size is used.
+
+    temp_path, when given, is the directory under which the intermediate batch
+    files are written (e.g. a fast dedicated scratch filesystem); otherwise the
+    system default temp location is used.
 
     progress_cb, when given, is called as progress_cb(done, total) to report
     intra-partition progress (number of batches written).
@@ -336,7 +342,8 @@ def migrate_partition(
     # less memory on large partitions, with byte-identical output.  memory_limit
     # tunes the per-batch budget.
     messages += _convert_batched(
-        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit, progress_cb
+        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
+        progress_cb, temp_path,
     )
 
     elapsed = time.perf_counter() - t0
@@ -542,7 +549,7 @@ def _run_partition(args, result_queue):
     process detects this via p.exitcode.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    paths, base_path, output_path, dry_run, memory_limit, progress = args
+    paths, base_path, output_path, dry_run, memory_limit, progress, temp_path = args
     rel = str(paths[0].parent.relative_to(base_path))
     pid = os.getpid()
 
@@ -554,6 +561,7 @@ def _run_partition(args, result_queue):
             paths, base_path, output_path, dry_run,
             memory_limit=memory_limit,
             progress_cb=progress_cb if progress else None,
+            temp_path=temp_path,
         )
         result_queue.put(("result", pid, rel, result, messages, None))
     except Exception as exc:
@@ -611,10 +619,22 @@ def main():
         "worker's peak memory stays within the budget. Without this flag a default batch "
         "size is used.",
     )
+    parser.add_argument(
+        "--temp-path",
+        metavar="DIR",
+        help="Directory for intermediate batch files (e.g. a fast dedicated scratch "
+        "filesystem). Defaults to the system temp location.",
+    )
     args = parser.parse_args()
 
     if not args.estimate and not args.output_path:
         parser.error("--output-path is required unless --estimate is set")
+
+    temp_path = None
+    if args.temp_path:
+        temp_path = Path(args.temp_path).resolve()
+        if not temp_path.is_dir():
+            parser.error(f"--temp-path is not a directory: {temp_path}")
 
     try:
         memory_limit = _parse_memory(args.memory_limit) if args.memory_limit else None
@@ -659,7 +679,7 @@ def main():
 
     desc = "[DRY RUN]" if args.dry_run else "Migrating"
     packed = [
-        (paths, base_path, output_path, args.dry_run, memory_limit, args.progress)
+        (paths, base_path, output_path, args.dry_run, memory_limit, args.progress, temp_path)
         for paths in partition_list
     ]
 
