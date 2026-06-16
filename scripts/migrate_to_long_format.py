@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.tabular import read_parquet, write_parquet
+from cpra.mp.data.utils import long_sort_expressions
 
 
 def _db_init(db_path: Path) -> sqlite3.Connection:
@@ -192,7 +193,6 @@ def _convert_batched(
             .collect()["len"]
             .to_list()
         )
-        batch_sort = [*[pl.col(c) for c in other_dim_cols], year, pl.col("grid_cell"), pl.col("calendar_day")]
     else:
         if other_dim_cols:
             wide_df = wide_df.sort(other_dim_cols)
@@ -208,7 +208,9 @@ def _convert_batched(
         else:
             # No outer keys: the whole partition is one group (gc → year order).
             group_lengths = [wide_df.height]
-        batch_sort = [*[pl.col(c) for c in other_dim_cols], pl.col("grid_cell"), pl.col("calendar_year")]
+
+    # The global long-format order; shared with write_parquet so it cannot drift.
+    batch_sort = long_sort_expressions(other_dim_cols, time_unit)
 
     n_geo = len(geo_cols)
     target_long_rows = _batch_target_rows(est, memory_limit)

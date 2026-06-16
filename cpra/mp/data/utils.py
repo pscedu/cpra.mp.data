@@ -57,6 +57,30 @@ def required_columns(
     )
 
 
+def long_sort_expressions(outer_cols, time_unit):
+    """Return Polars sort expressions for the canonical long-format order.
+
+    ``outer_cols`` are the dimension column names that sort *outside* grid_cell
+    (every required column except calendar_* and grid_cell, in the desired
+    order).  The grid_cell/calendar tail is appended consistently:
+
+      daily/monthly:  outer_cols → calendar year → grid_cell → calendar_day
+      annual/decadal: outer_cols → grid_cell → calendar_year
+
+    Placing the calendar year ahead of grid_cell for daily/monthly data aligns
+    row-group boundaries to calendar years, so predicate pushdown can skip whole
+    row groups for year-filtered queries.  Both ``write_parquet`` and the
+    long-format migration build their sort key through this helper so the global
+    order cannot drift between them.
+    """
+    exprs = [pl.col(col) for col in outer_cols]
+    if time_unit in ("daily", "monthly"):
+        exprs.extend([pl.col("calendar_day").dt.year(), pl.col("grid_cell"), pl.col("calendar_day")])
+    else:
+        exprs.extend([pl.col("grid_cell"), pl.col("calendar_year")])
+    return exprs
+
+
 def validate_data_frame(df, required_cols=None):
     """Ensure that the provided data frame complies with the validation conditions."""
 

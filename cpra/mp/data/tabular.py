@@ -12,6 +12,7 @@ from cpra.mp.data.utils import (
     extract_dimension_value,
     get_filter_expressions,
     get_input_data_frame,
+    long_sort_expressions,
     partition_columns,
     required_columns,
     validate_data_frame,
@@ -151,13 +152,8 @@ def write_parquet(
                 raise ValidationError(msg)
 
         if sort:
-            sort_exprs = [pl.col(col) for col in required_cols if not col.startswith("calendar_") and col not in kwargs]
-            if time_unit in ("daily", "monthly"):
-                # Sort so each row group covers one calendar year: year → grid_cell → date.
-                sort_exprs.extend([pl.col("calendar_day").dt.year(), pl.col("grid_cell"), pl.col("calendar_day")])
-            else:
-                sort_exprs.extend([pl.col("grid_cell"), pl.col("calendar_year")])
-
+            outer_cols = [col for col in required_cols if not col.startswith("calendar_") and col not in kwargs]
+            sort_exprs = long_sort_expressions(outer_cols, time_unit)
             lf = lf.select(*required_cols, "grid_cell", "value").sort(*sort_exprs)
 
     # Compute row group size from grid and time_unit if not provided explicitly.
