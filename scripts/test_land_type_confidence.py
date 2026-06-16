@@ -3,9 +3,11 @@ from pathlib import Path
 
 import click
 import numpy as np
+import polars as pl
 import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
+from rasterio.windows import Window
 
 from cpra.mp.data import read_cog
 from cpra.mp.data.api.utils import parallel_read_rasters
@@ -14,7 +16,7 @@ from cpra.mp.data.grids import GRIDS
 # Maps lnd_type values to confidence output values.
 # 1/3/4 = land-like → 1 (confident land)
 # 2/5 = water-like → 0 (confident water)
-# anything else (including nodata) → -9999
+# anything else (including nodata) → NaN / -9999
 VALUE_MAP = {
     1: 1,
     2: 0,
@@ -24,12 +26,21 @@ VALUE_MAP = {
 }
 
 NODATA = -9999
+TILE_SIZE = 512
 
 
 def apply_value_map(arr):
     out = np.full(arr.shape, NODATA, dtype=np.float32)
     for in_val, out_val in VALUE_MAP.items():
         out[arr == in_val] = out_val
+    return out
+
+
+def to_binary_nan(arr):
+    """Map lnd_type to 0.0/1.0, using NaN for unmapped/nodata values."""
+    out = np.full(arr.shape, np.nan, dtype=np.float32)
+    for in_val, out_val in VALUE_MAP.items():
+        out[arr == in_val] = float(out_val)
     return out
 
 
@@ -55,7 +66,7 @@ def main(output_dir):
         "nodata": NODATA,
     }
 
-    # Historic data (model_group_id=0, scenario_id=0) — output as int32
+    # Historic data (model_group_id=0, scenario_id=0)
     hist_inputs = (
         read_cog(
             variable="lnd_type",
@@ -84,41 +95,53 @@ def main(output_dir):
         with rasterio.open(out_path, "w", **base_profile) as dst:
             dst.write(out, 1)
 
-    # Current data (model_group_id=500) — combine scenario 7 (60%) and 8 (40%), output as float32
-    def load_scenario(scenario_id):
-        return (
-            read_cog(
-                variable="lnd_type",
-                grid="morph_pixel_v001",
-                time_unit="annual",
-                model_group_id=500,
-                scenario_id=scenario_id,
-            )
-            .collect()
-            .select(["calendar_year", "path"])
+    # Current data — all model groups (excluding model_group_id=0), all scenarios.
+    # Convert each raster to 0/1 and average across all members for each year.
+    year_paths = (
+        read_cog(
+            variable="lnd_type",
+            grid="morph_pixel_v001",
+            time_unit="annual",
         )
+        .collect()
+        .filter(pl.col("model_group_id") != 0)
+        .group_by("calendar_year")
+        .agg(pl.col("path").sort())
+        .sort("calendar_year")
+    )
 
-    current_inputs = load_scenario(7).join(load_scenario(8), on="calendar_year", suffix="_s8").sort("calendar_year")
-
-    for row in current_inputs.iter_rows(named=True):
+    for row in year_paths.iter_rows(named=True):
         year = row["calendar_year"]
+        paths = row["path"]
         out_path = out_dir / f"test_land_type_confidence_{year}.tif"
         if out_path.exists():
             print(f"Skipping {out_path.name}, already exists.")
             continue
-        print(f"Processing current year {year}...")
+        print(f"Processing year {year} ({len(paths)} rasters)...")
 
-        with rasterio.open(row["path"]) as s7_src, rasterio.open(row["path_s8"]) as s8_src:
-            s7, s8 = [r[0] for r in asyncio.run(parallel_read_rasters([s7_src, s8_src]))]
+        srcs = [rasterio.open(p) for p in paths]
+        try:
+            with rasterio.open(out_path, "w", **base_profile) as dst:
+                for row_off in range(0, grid.height, TILE_SIZE):
+                    tile_h = min(TILE_SIZE, grid.height - row_off)
+                    for col_off in range(0, grid.width, TILE_SIZE):
+                        tile_w = min(TILE_SIZE, grid.width - col_off)
+                        window = Window(col_off, row_off, tile_w, tile_h)
 
-        mapped_s7 = apply_value_map(s7)
-        mapped_s8 = apply_value_map(s8)
+                        tiles = asyncio.run(parallel_read_rasters(srcs, window=window))
+                        mapped = np.stack([to_binary_nan(t[0]) for t in tiles], axis=0)
 
-        valid = (mapped_s7 != NODATA) & (mapped_s8 != NODATA)
-        out = np.where(valid, 0.6 * mapped_s7 + 0.4 * mapped_s8, NODATA).astype(np.float32)
+                        valid = ~np.isnan(mapped)
+                        count = valid.sum(axis=0)
+                        total = np.where(valid, mapped, 0.0).sum(axis=0)
+                        mean = np.zeros(count.shape, dtype=np.float32)
+                        np.divide(total, count, out=mean, where=count > 0)
+                        out = np.where(count > 0, mean, NODATA).astype(np.float32)
 
-        with rasterio.open(out_path, "w", **base_profile) as dst:
-            dst.write(out, 1)
+                        dst.write(out, 1, window=window)
+        finally:
+            for src in srcs:
+                src.close()
 
 
 if __name__ == "__main__":
