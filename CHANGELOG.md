@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.46.0](https://github.com/pscedu/cpra.mp.data/compare/v0.45.0...v0.46.0) (2026-06-16)
+
+
+### Features
+
+* **bridges2:** pin base image to a specific commit ([74b1d83](https://github.com/pscedu/cpra.mp.data/commit/74b1d836045a1633104fa1a0484022a414fd339d))
+* **map:** allow different/multiple project model groups ([0c1c262](https://github.com/pscedu/cpra.mp.data/commit/0c1c262ddee4d660d330adce637ee18c3f4d06e5))
+* **scripts:** add script to colorize land type confidence ([a50a5d7](https://github.com/pscedu/cpra.mp.data/commit/a50a5d7470cade339c73447459eefb7fa993158a))
+* **scripts:** add script to convert historic land change ([28e1d19](https://github.com/pscedu/cpra.mp.data/commit/28e1d19124b52e82aecd4a4efa0c1d532f7b4ea4))
+* **scripts:** add script to visualize historic land change ([c0c9ce9](https://github.com/pscedu/cpra.mp.data/commit/c0c9ce92e6f2a0ab4e10b0d08c703d83c6d1f889))
+* **scripts:** generate test land type confidence data ([03ea6e1](https://github.com/pscedu/cpra.mp.data/commit/03ea6e19b9bfdb6fad7b8bdc73b3f151af15d755))
+* **scripts:** use windowed read/write for historic land type ([f7973fc](https://github.com/pscedu/cpra.mp.data/commit/f7973fc27eb53c1a9a54f7b045f81d5e697cebc7))
+
+
+### Bug Fixes
+
+* **scripts:** use all model groups and scenarios for future data ([7a4c237](https://github.com/pscedu/cpra.mp.data/commit/7a4c23791b757df0a519b16e2424a5748a356464))
+* **structure:** allow calendar_year &gt;= 1900 for historical data ([84fc865](https://github.com/pscedu/cpra.mp.data/commit/84fc865fb82c38d811b12f206a3fd1b6e593f2ba))
+
 ## [0.45.0](https://github.com/pscedu/cpra.mp.data/compare/v0.44.2...v0.45.0) (2026-06-08)
 
 
