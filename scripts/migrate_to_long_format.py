@@ -4,23 +4,25 @@ All wide-format files in the same partition directory are processed together
 and written as a single long-format Parquet file, so each output partition
 contains exactly one file.  The original wide-format files are left untouched.
 
-Usage
------
+Usage:
+
+\b
     # Dry-run: show what would be migrated without writing anything
     python scripts/migrate_to_long_format.py --output-path /path/to/output --dry-run
 
+\b
     # Migrate a single dataset
     python scripts/migrate_to_long_format.py \\
         --output-path /path/to/output \\
         --variable sal --grid hydro_compartment_v001 --time-unit daily
 
+\b
     # Migrate all datasets
     python scripts/migrate_to_long_format.py --output-path /path/to/output
 
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
 
-import argparse
 import multiprocessing
 import queue
 import os
@@ -32,6 +34,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import click
 import polars as pl
 import pyarrow.parquet as pq
 from tqdm import tqdm
@@ -581,84 +584,82 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
     return dict(sorted(partitions.items()))
 
 
-def main():
+@click.command(
+    help=__doc__,
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
+)
+@click.option("--output-path", help="Root directory for long-format output (required unless --estimate).")
+@click.option("--estimate", is_flag=True, help="Print a memory-estimate table sorted by peak memory and exit.")
+@click.option("--variable", help="Migrate only this variable.")
+@click.option("--grid", help="Migrate only this grid.")
+@click.option("--time-unit", help="Migrate only this time unit.")
+@click.option("--dry-run", is_flag=True, help="Show what would be migrated without writing.")
+@click.option(
+    "--progress/--no-progress", default=True, help="Show progress bar (use --no-progress for batch jobs)."
+)
+@click.option("--data-path", default=str(BASE_PATH), show_default=True, help="Base data path.")
+@click.option(
+    "--workers",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of partitions to process in parallel. Keep low (2–4) — Polars already "
+    "saturates CPUs within each partition.",
+)
+@click.option(
+    "--progress-db",
+    metavar="PATH",
+    help="SQLite database for tracking migration progress. Completed partitions are "
+    "recorded and skipped on subsequent runs.",
+)
+@click.option(
+    "--memory-limit",
+    metavar="SIZE",
+    help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
+    "worker's peak memory stays within the budget. Without this flag a default batch size is used.",
+)
+@click.option(
+    "--temp-path",
+    metavar="DIR",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory for intermediate batch files (e.g. a fast dedicated scratch "
+    "filesystem). Defaults to the system temp location.",
+)
+def main(
+    output_path, estimate, variable, grid, time_unit, dry_run, progress,
+    data_path, workers, progress_db, memory_limit, temp_path,
+):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output-path", help="Root directory for long-format output (required unless --estimate)")
-    parser.add_argument(
-        "--estimate", action="store_true", help="Print a memory-estimate table sorted by peak memory and exit"
-    )
-    parser.add_argument("--variable", help="Migrate only this variable")
-    parser.add_argument("--grid", help="Migrate only this grid")
-    parser.add_argument("--time-unit", dest="time_unit", help="Migrate only this time unit")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without writing")
-    parser.add_argument(
-        "--progress",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show progress bar (use --no-progress for batch jobs)",
-    )
-    parser.add_argument("--data-path", default=str(BASE_PATH), help=f"Base data path (default: {BASE_PATH})")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of partitions to process in parallel (default: 1). "
-        "Keep low (2–4) — Polars already saturates CPUs within each partition.",
-    )
-    parser.add_argument(
-        "--progress-db",
-        metavar="PATH",
-        help="SQLite database for tracking migration progress. Completed partitions are "
-        "recorded and skipped on subsequent runs.",
-    )
-    parser.add_argument(
-        "--memory-limit",
-        metavar="SIZE",
-        help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
-        "worker's peak memory stays within the budget. Without this flag a default batch "
-        "size is used.",
-    )
-    parser.add_argument(
-        "--temp-path",
-        metavar="DIR",
-        help="Directory for intermediate batch files (e.g. a fast dedicated scratch "
-        "filesystem). Defaults to the system temp location.",
-    )
-    args = parser.parse_args()
 
-    if not args.estimate and not args.output_path:
-        parser.error("--output-path is required unless --estimate is set")
+    if not estimate and not output_path:
+        raise click.UsageError("--output-path is required unless --estimate is set")
 
-    temp_path = None
-    if args.temp_path:
-        temp_path = Path(args.temp_path).resolve()
-        if not temp_path.is_dir():
-            parser.error(f"--temp-path is not a directory: {temp_path}")
+    if temp_path is not None:
+        temp_path = temp_path.resolve()
 
     try:
-        memory_limit = _parse_memory(args.memory_limit) if args.memory_limit else None
+        memory_limit = _parse_memory(memory_limit) if memory_limit else None
     except ValueError:
-        parser.error(f"invalid --memory-limit value: {args.memory_limit!r}")
+        raise click.BadParameter(f"invalid value: {memory_limit!r}", param_hint="'--memory-limit'")
 
-    base_path = Path(args.data_path).resolve()
-    partitions = find_partitions(base_path, args.variable, args.grid, args.time_unit)
+    base_path = Path(data_path).resolve()
+    partitions = find_partitions(base_path, variable, grid, time_unit)
 
     if not partitions:
         print("No Parquet files found matching the given filters.")
         return
 
-    if args.estimate:
-        estimate_partitions(partitions, base_path, progress=args.progress, memory_limit=memory_limit)
+    if estimate:
+        estimate_partitions(partitions, base_path, progress=progress, memory_limit=memory_limit)
         return
 
-    output_path = Path(args.output_path).resolve()
+    output_path = Path(output_path).resolve()
 
     db_conn: sqlite3.Connection | None = None
     partition_list = list(partitions.values())
     db_skipped = 0
-    if args.progress_db:
-        db_conn = _db_init(Path(args.progress_db))
+    if progress_db:
+        db_conn = _db_init(Path(progress_db))
         completed = _db_completed(db_conn)
         if completed:
             partition_list = [
@@ -677,9 +678,9 @@ def main():
     skipped = 0
     errors: list[str] = []
 
-    desc = "[DRY RUN]" if args.dry_run else "Migrating"
+    desc = "[DRY RUN]" if dry_run else "Migrating"
     packed = [
-        (paths, base_path, output_path, args.dry_run, memory_limit, args.progress, temp_path)
+        (paths, base_path, output_path, dry_run, memory_limit, progress, temp_path)
         for paths in partition_list
     ]
 
@@ -712,7 +713,7 @@ def main():
         return rel if len(rel) <= width else "…" + rel[-(width - 1):]
 
     def _update_inner(pid: int, rel: str, done: int, total: int) -> None:
-        if not args.progress or total <= 1:
+        if not progress or total <= 1:
             return
         bar_inner = inner_bars.get(pid)
         if bar_inner is None:
@@ -734,11 +735,11 @@ def main():
             bar_inner.close()
 
     try:
-        for _ in range(args.workers):
+        for _ in range(workers):
             if not _spawn_next():
                 break
 
-        with tqdm(total=total_partitions, desc=desc, unit="partition", position=0, disable=not args.progress) as bar:
+        with tqdm(total=total_partitions, desc=desc, unit="partition", position=0, disable=not progress) as bar:
             remaining = total_partitions
             while remaining > 0:
                 try:
@@ -815,7 +816,7 @@ def main():
         if db_conn is not None:
             db_conn.close()
 
-    label = "Would migrate" if args.dry_run else "Migrated"
+    label = "Would migrate" if dry_run else "Migrated"
     print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
     if errors:
         print(f"\n{len(errors)} partition(s) failed:", file=sys.stderr)
