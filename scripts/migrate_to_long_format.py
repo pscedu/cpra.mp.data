@@ -402,14 +402,15 @@ def _run_partition(args):
 
     Each call runs in a fresh subprocess (maxtasksperchild=1) so allocator
     memory from Polars/Arrow is fully released when the process exits.
-    Returns (result: dict | None, messages: list[str], error: str | None).
+    Returns (rel: str, result: dict | None, messages: list[str], error: str | None).
     """
     paths, base_path, output_path, dry_run = args
+    rel = str(paths[0].parent.relative_to(base_path))
     try:
         result, messages = migrate_partition(paths, base_path, output_path, dry_run)
-        return result, messages, None
+        return rel, result, messages, None
     except Exception as exc:
-        return None, [], f"{paths[0].parent}: {exc}"
+        return rel, None, [], str(exc)
 
 
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
@@ -507,50 +508,43 @@ def main():
     ctx = multiprocessing.get_context("spawn")
     try:
         with ctx.Pool(processes=args.workers, maxtasksperchild=1, initializer=_worker_init) as pool:
-            futures = [pool.apply_async(_run_partition, (item,)) for item in packed]
+            imap = pool.imap_unordered(_run_partition, packed)
             with tqdm(total=total_partitions, desc=desc, unit="partition", disable=not args.progress) as bar:
-                for future, paths in zip(futures, partition_list):
+                while True:
                     try:
-                        while True:
-                            try:
-                                result, messages, error = future.get(timeout=0.05)
-                                break
-                            except multiprocessing.TimeoutError:
-                                continue
+                        rel, result, messages, error = next(imap)
+                    except StopIteration:
+                        break
                     except KeyboardInterrupt:
                         pool.terminate()
                         pool.join()
                         raise
                     except multiprocessing.ProcessError as exc:
-                        rel = paths[0].parent.relative_to(base_path)
-                        msg = f"{rel}: worker killed (OOM?): {exc}"
+                        msg = f"worker killed (OOM?): {exc}"
                         errors.append(msg)
-                        tqdm.write(f"  ERROR migrating {msg}", file=sys.stderr)
+                        tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
+                        bar.update(1)
+                        bar.set_postfix(migrated=migrated, skipped=skipped)
+                        continue
+                    for msg in messages:
+                        tqdm.write(msg)
+                    if error:
+                        errors.append(f"{rel}: {error}")
+                        tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
                         if db_conn is not None:
-                            _db_record_failure(db_conn, str(rel), str(exc))
+                            _db_record_failure(db_conn, rel, error)
+                    elif result is None:
+                        skipped += 1  # not wide format
+                    elif result.get("skipped"):
+                        skipped += 1  # already in long format on disk
+                        if db_conn is not None:
+                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
+                    elif "elapsed_s" in result:
+                        migrated += 1
+                        if db_conn is not None:
+                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
                     else:
-                        for msg in messages:
-                            tqdm.write(msg)
-                        if error:
-                            errors.append(error)
-                            tqdm.write(f"  ERROR migrating {error}", file=sys.stderr)
-                            if db_conn is not None:
-                                rel = str(paths[0].parent.relative_to(base_path))
-                                _db_record_failure(db_conn, rel, error)
-                        elif result is None:
-                            skipped += 1  # not wide format
-                        elif result.get("skipped"):
-                            skipped += 1  # already in long format on disk
-                            if db_conn is not None:
-                                rel = str(paths[0].parent.relative_to(base_path))
-                                _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
-                        elif "elapsed_s" in result:
-                            migrated += 1
-                            if db_conn is not None:
-                                rel = str(paths[0].parent.relative_to(base_path))
-                                _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
-                        else:
-                            migrated += 1  # dry run
+                        migrated += 1  # dry run
                     bar.update(1)
                     bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:
