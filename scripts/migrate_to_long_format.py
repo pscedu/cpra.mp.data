@@ -22,6 +22,7 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 
 import argparse
 import multiprocessing
+import queue
 import os
 import resource
 import signal
@@ -392,25 +393,24 @@ def estimate_partitions(partitions: dict[Path, list[Path]], base_path: Path, pro
     )
 
 
-def _worker_init():
-    """Ignore SIGINT in worker processes so Ctrl+C is handled solely by the main process."""
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+def _run_partition(args, result_queue):
+    """Target for worker processes spawned directly (not via Pool).
 
-
-def _run_partition(args):
-    """Worker target for multiprocessing.Pool.
-
-    Each call runs in a fresh subprocess (maxtasksperchild=1) so allocator
-    memory from Polars/Arrow is fully released when the process exits.
-    Returns (rel: str, result: dict | None, messages: list[str], error: str | None).
+    Each partition runs in a fresh subprocess so allocator memory from
+    Polars/Arrow is fully released when the process exits.  On normal
+    completion (including caught exceptions) sends
+    (pid, rel, result, messages, error) to result_queue.  If the process is
+    killed by a signal the queue is never written; the main process detects
+    this via p.exitcode.
     """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     paths, base_path, output_path, dry_run = args
     rel = str(paths[0].parent.relative_to(base_path))
     try:
         result, messages = migrate_partition(paths, base_path, output_path, dry_run)
-        return rel, result, messages, None
+        result_queue.put((os.getpid(), rel, result, messages, None))
     except Exception as exc:
-        return rel, None, [], str(exc)
+        result_queue.put((os.getpid(), rel, None, [], str(exc)))
 
 
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
@@ -502,52 +502,91 @@ def main():
     packed = [(paths, base_path, output_path, args.dry_run) for paths in partition_list]
 
     # spawn avoids fork-after-threads problems with Polars' internal thread pool.
-    # maxtasksperchild=1 replaces the worker process after each partition so the
-    # allocator (jemalloc/mimalloc) releases its pages back to the OS rather than
-    # letting RSS climb across the full run.
+    # Each partition runs in a dedicated Process so the allocator (jemalloc/mimalloc)
+    # releases its pages back to the OS when the process exits, and a SIGKILL'd
+    # worker is detectable via p.exitcode without relying on Pool's dead-worker logic.
     ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    active: dict[int, tuple[multiprocessing.Process, str]] = {}  # pid -> (proc, rel)
+    task_iter = iter(packed)
+
+    def _spawn_next() -> bool:
+        try:
+            item = next(task_iter)
+        except StopIteration:
+            return False
+        paths, *_ = item
+        p = ctx.Process(target=_run_partition, args=(item, result_queue), daemon=True)
+        p.start()
+        active[p.pid] = (p, str(paths[0].parent.relative_to(base_path)))
+        return True
+
     try:
-        with ctx.Pool(processes=args.workers, maxtasksperchild=1, initializer=_worker_init) as pool:
-            imap = pool.imap_unordered(_run_partition, packed)
-            with tqdm(total=total_partitions, desc=desc, unit="partition", disable=not args.progress) as bar:
-                while True:
-                    try:
-                        rel, result, messages, error = next(imap)
-                    except StopIteration:
-                        break
-                    except KeyboardInterrupt:
-                        pool.terminate()
-                        pool.join()
-                        raise
-                    except multiprocessing.ProcessError as exc:
-                        msg = f"worker killed (OOM?): {exc}"
-                        errors.append(msg)
-                        tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
-                        bar.update(1)
-                        bar.set_postfix(migrated=migrated, skipped=skipped)
-                        continue
-                    for msg in messages:
-                        tqdm.write(msg)
-                    if error:
-                        errors.append(f"{rel}: {error}")
-                        tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
-                        if db_conn is not None:
-                            _db_record_failure(db_conn, rel, error)
-                    elif result is None:
-                        skipped += 1  # not wide format
-                    elif result.get("skipped"):
-                        skipped += 1  # already in long format on disk
-                        if db_conn is not None:
-                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
-                    elif "elapsed_s" in result:
-                        migrated += 1
-                        if db_conn is not None:
-                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
-                    else:
-                        migrated += 1  # dry run
-                    bar.update(1)
-                    bar.set_postfix(migrated=migrated, skipped=skipped)
+        for _ in range(args.workers):
+            if not _spawn_next():
+                break
+
+        with tqdm(total=total_partitions, desc=desc, unit="partition", disable=not args.progress) as bar:
+            remaining = total_partitions
+            while remaining > 0:
+                try:
+                    pid, rel, result, messages, error = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    # No result yet — check whether any worker was killed without
+                    # writing to the queue (OOM kill, SIGKILL, etc.).
+                    for pid, (p, rel) in list(active.items()):
+                        if not p.is_alive():
+                            p.join()
+                            if p.exitcode != 0:
+                                del active[pid]
+                                remaining -= 1
+                                msg = f"{rel}: worker killed (OOM?), exit code {p.exitcode}"
+                                errors.append(msg)
+                                tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
+                                if db_conn is not None:
+                                    _db_record_failure(db_conn, rel, f"exit code {p.exitcode}")
+                                _spawn_next()
+                                bar.update(1)
+                                bar.set_postfix(migrated=migrated, skipped=skipped)
+                    continue
+                except KeyboardInterrupt:
+                    for p, _ in active.values():
+                        p.terminate()
+                    for p, _ in active.values():
+                        p.join()
+                    raise
+
+                if pid in active:
+                    active.pop(pid)[0].join()
+                _spawn_next()
+                remaining -= 1
+
+                for msg in messages:
+                    tqdm.write(msg)
+                if error:
+                    errors.append(f"{rel}: {error}")
+                    tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
+                    if db_conn is not None:
+                        _db_record_failure(db_conn, rel, error)
+                elif result is None:
+                    skipped += 1  # not wide format
+                elif result.get("skipped"):
+                    skipped += 1  # already in long format on disk
+                    if db_conn is not None:
+                        _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
+                elif "elapsed_s" in result:
+                    migrated += 1
+                    if db_conn is not None:
+                        _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
+                else:
+                    migrated += 1  # dry run
+                bar.update(1)
+                bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:
+        for p, _ in active.values():
+            p.terminate()
+        for p, _ in active.values():
+            p.join()
         tqdm.write("\nInterrupted by user.", file=sys.stderr)
         sys.exit(1)
     finally:
