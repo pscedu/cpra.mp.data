@@ -1,7 +1,13 @@
+import queue
+import tempfile
+import threading
 import uuid
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
@@ -20,23 +26,28 @@ from cpra.mp.data.utils import (
 )
 from cpra.mp.data.variables import VARIABLES
 
-# Days/months per year multiplied by a safety margin to ensure one row group
-# covers at most one calendar year for each time unit.
-_ROWS_PER_YEAR = {"daily": 400, "monthly": 15, "annual": 1, "decadal": 1}
-_MAX_ROW_GROUP_SIZE = 5_000_000
+_DEFAULT_ROW_GROUP_SIZE = 500_000
+
+# Sentinel distinguishing "temp_dir not passed" (stream via sink_batches) from
+# "temp_dir passed, possibly None" (use the bounded temp-file bridge).
+_TEMP_DIR_UNSET = object()
+
+# Columns sorted ahead of / alongside the calendar tail that are monotonic
+# within each group, so DELTA_BINARY_PACKED encodes them far more compactly than
+# the default dictionary/RLE.  grid_cell leads the sort; the calendar columns
+# are consecutive within each grid cell.
+_DELTA_COLUMNS = ("grid_cell", "calendar_day", "calendar_year")
 
 
 def _row_group_size(grid, time_unit):
-    """Return a row group size that aligns row group boundaries to calendar years.
+    """Return the default row group size.
 
-    For daily/monthly data the target is one row group per year, so each row
-    group's calendar_day min/max spans exactly one calendar year and Polars
-    predicate pushdown can skip entire row groups for year-filtered queries.
+    Data is sorted grid_cell-first, so each row group covers a contiguous range
+    of grid cells and predicate pushdown can skip row groups for
+    grid_cell-filtered queries.  A fixed, moderate size keeps that skipping
+    fine-grained without producing excessively many groups.
     """
-    if grid is None or grid.id_count is None:
-        return 500_000
-    rows_per_year = _ROWS_PER_YEAR.get(time_unit, 1)
-    return min(max(grid.id_count * rows_per_year, 500_000), _MAX_ROW_GROUP_SIZE)
+    return _DEFAULT_ROW_GROUP_SIZE
 
 
 def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
@@ -94,15 +105,31 @@ def write_parquet(
     compression="zstd",
     compression_level=6,
     row_group_size=None,
+    temp_dir=_TEMP_DIR_UNSET,
     **kwargs,
 ):
     """Write data from a data frame to a Parquet file.
 
     Accepts a Polars DataFrame, LazyFrame, or any object that can be passed to
-    pl.DataFrame().  All writes go through sink_parquet so the output always
-    uses the Polars engine; DataFrames are wrapped with .lazy() before writing.
-    A single metadata row is collected upfront to drive grid/sort/partition
+    pl.DataFrame().  DataFrames are wrapped with .lazy() before writing.  A
+    single metadata row is collected upfront to drive grid/sort/partition
     decisions.
+
+    The sorted data is streamed through PyArrow so the grid_cell and calendar
+    key columns can be DELTA_BINARY_PACKED encoded (Polars' ``sink_parquet``
+    cannot set per-column encodings).  The bridge between Polars and PyArrow
+    depends on ``temp_dir``:
+
+    * not passed (default): the data is streamed directly via
+      ``LazyFrame.sink_batches`` with no intermediate file.  This is faster but
+      peak memory grows with dataset size, so it suits the production system
+      (ample RAM, slow storage).
+    * passed (a directory path, or ``None`` for the system default): the data is
+      streamed to a temporary Parquet file with Polars and read back as an
+      ordered batch stream.  Peak memory is bounded and independent of dataset
+      size, at the cost of an extra write+read pass — used by the migration to
+      stay within a memory limit.  Pass a path on the same fast/large filesystem
+      as the output for very large datasets.
     """
 
     lf = data if isinstance(data, pl.LazyFrame) else pl.DataFrame(data).lazy()
@@ -163,21 +190,113 @@ def write_parquet(
     # Derive partition columns from the metadata row.
     partition_cols = partition_columns(meta)
 
-    def _uuid_path(args: pl.FileProviderArgs) -> str:
-        hive = "/".join(f"{col}={args.partition_keys[col][0]}" for col in args.partition_keys.columns)
-        return f"{hive}/{uuid.uuid4()}.parquet"
-
-    sink_args = (
-        [pl.PartitionBy(base_path, key=partition_cols, include_key=False, file_path_provider=_uuid_path, approximate_bytes_per_file=None)]
-        if partition_cols
-        else []
-    )
-    sink_kwargs = dict(
+    common = dict(
+        base_path=Path(base_path),
+        partition_cols=partition_cols,
         compression=compression,
         compression_level=compression_level,
         row_group_size=row_group_size,
     )
-    lf.sink_parquet(*sink_args, **sink_kwargs)
+    if temp_dir is _TEMP_DIR_UNSET:
+        _write_via_sink_batches(lf, **common)
+    else:
+        _write_via_temp_file(lf, temp_dir=temp_dir, **common)
+
+
+def _write_dataset(reader, schema, base_path, partition_cols, compression, compression_level, row_group_size):
+    """Write an ordered batch stream to a Hive-partitioned, delta-encoded dataset.
+
+    Applies DELTA_BINARY_PACKED to grid_cell and the calendar key columns (which
+    Polars cannot set), dictionary encoding to the small dimension columns, and
+    leaves the high-cardinality value column as PLAIN.  ``preserve_order`` keeps
+    the reader's global sort order in the on-disk layout.
+    """
+    file_cols = [name for name in schema.names if name not in partition_cols]
+    delta_cols = [col for col in _DELTA_COLUMNS if col in file_cols]
+    dict_cols = [col for col in file_cols if col not in delta_cols and col != "value"]
+
+    write_options = ds.ParquetFileFormat().make_write_options(
+        compression=compression,
+        compression_level=compression_level,
+        use_dictionary=dict_cols,
+        column_encoding={col: "DELTA_BINARY_PACKED" for col in delta_cols},
+    )
+    partitioning = (
+        ds.partitioning(pa.schema([schema.field(col) for col in partition_cols]), flavor="hive")
+        if partition_cols
+        else None
+    )
+    ds.write_dataset(
+        reader,
+        base_dir=base_path,
+        format="parquet",
+        partitioning=partitioning,
+        file_options=write_options,
+        basename_template=f"{uuid.uuid4()}-{{i}}.parquet",
+        existing_data_behavior="overwrite_or_ignore",
+        min_rows_per_group=row_group_size,
+        max_rows_per_group=row_group_size,
+        preserve_order=True,
+    )
+
+
+def _write_via_temp_file(lf, temp_dir, row_group_size, **kwargs):
+    """Bounded-memory bridge: stream the sorted data to a temp Parquet file, then
+    read it back as an ordered batch stream.  Peak memory is independent of size."""
+    with tempfile.TemporaryDirectory(dir=temp_dir) as tmpdir:
+        tmp_sorted = Path(tmpdir) / "sorted.parquet"
+        lf.sink_parquet(tmp_sorted, row_group_size=row_group_size)
+        parquet_file = pq.ParquetFile(tmp_sorted)
+        schema = parquet_file.schema_arrow
+        reader = pa.RecordBatchReader.from_batches(
+            schema, parquet_file.iter_batches(batch_size=row_group_size)
+        )
+        _write_dataset(reader, schema, row_group_size=row_group_size, **kwargs)
+
+
+def _write_via_sink_batches(lf, row_group_size, **kwargs):
+    """Direct bridge: stream batches straight from Polars to PyArrow via
+    sink_batches with no intermediate file.  Faster, but peak memory grows with
+    dataset size, so it is reserved for the memory-rich production system."""
+    batch_queue = queue.Queue(maxsize=4)
+    done = object()
+    stop = threading.Event()
+
+    def _produce():
+        def _emit(df):
+            if stop.is_set():  # consumer went away (e.g. write error); stop early
+                return True
+            batch_queue.put(df.to_arrow())
+            return None
+        try:
+            lf.sink_batches(_emit, chunk_size=row_group_size, maintain_order=True, engine="streaming")
+        finally:
+            batch_queue.put(done)
+
+    producer = threading.Thread(target=_produce, daemon=True)
+    producer.start()
+    try:
+        first = batch_queue.get()
+
+        def _batches(first_table):
+            table = first_table
+            while table is not done:
+                yield from table.to_batches()
+                table = batch_queue.get()
+
+        # Empty result: fall back to the declared schema so the reader is valid.
+        schema = lf.limit(0).collect().to_arrow().schema if first is done else first.schema
+        reader = pa.RecordBatchReader.from_batches(schema, _batches(first))
+        _write_dataset(reader, schema, row_group_size=row_group_size, **kwargs)
+    finally:
+        # Unblock the producer if it is waiting on a full queue, then wait for it.
+        stop.set()
+        while producer.is_alive():
+            try:
+                batch_queue.get(timeout=0.1)
+            except queue.Empty:
+                pass
+        producer.join()
 
 
 def compact_parquet(

@@ -153,15 +153,17 @@ def _convert_batched(
 
     Works for every time unit.  The wide frame has one column per grid cell, so
     grid_cell is produced by unpivot rather than being a row attribute.  The
-    target sort therefore places grid_cell *between* row-derived keys:
+    target sort places grid_cell ahead of the calendar tail for every time unit:
 
-      annual/decadal: other_dims → grid_cell → year
-      daily/monthly:  other_dims → year → grid_cell → date
+      other_dims → grid_cell → calendar_year (annual/decadal)
+      other_dims → grid_cell → calendar_day  (daily/monthly)
 
     A "group" is the set of wide rows that share every sort key *outside*
-    grid_cell — other_dims for annual/decadal, (other_dims, year) for
-    daily/monthly.  Groups must never be split across batches, or a grid_cell
-    would appear in two batches and break the global order on concatenation.
+    grid_cell — i.e. other_dims, for every time unit (the calendar column sorts
+    *inside* grid_cell, which is produced by unpivot, so all wide rows for one
+    other_dims combo must stay together).  Groups must never be split across
+    batches, or a grid_cell would appear in two batches and break the global
+    order on concatenation.
 
     The wide frame is sorted so groups are contiguous; consecutive groups are
     packed into batches under a long-row budget; each batch is unpivoted, sorted
@@ -175,39 +177,23 @@ def _convert_batched(
     other_dim_cols = [
         col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
     ]
-    daily_monthly = time_unit in ("daily", "monthly")
 
     wide_df = pl.scan_parquet(parquet_paths).collect()
 
-    if daily_monthly:
-        year = pl.col("calendar_day").dt.year()
-        # Sort by (other_dims, date): within each other_dims combo dates ascend,
-        # so (other_dims, year) groups are contiguous and in ascending order.
-        wide_df = wide_df.sort(*other_dim_cols, "calendar_day")
+    if other_dim_cols:
+        wide_df = wide_df.sort(other_dim_cols)
         group_lengths = (
             wide_df.lazy()
-            .select(*other_dim_cols, year.alias("__year"))
-            .group_by(*other_dim_cols, "__year", maintain_order=True)
+            .select(other_dim_cols)
+            .group_by(other_dim_cols, maintain_order=True)
             .len()
             .select("len")
             .collect()["len"]
             .to_list()
         )
     else:
-        if other_dim_cols:
-            wide_df = wide_df.sort(other_dim_cols)
-            group_lengths = (
-                wide_df.lazy()
-                .select(other_dim_cols)
-                .group_by(other_dim_cols, maintain_order=True)
-                .len()
-                .select("len")
-                .collect()["len"]
-                .to_list()
-            )
-        else:
-            # No outer keys: the whole partition is one group (gc → year order).
-            group_lengths = [wide_df.height]
+        # No outer keys: the whole partition is one group (grid_cell → calendar).
+        group_lengths = [wide_df.height]
 
     # The global long-format order; shared with write_parquet so it cannot drift.
     batch_sort = long_sort_expressions(other_dim_cols, time_unit)
@@ -258,7 +244,12 @@ def _convert_batched(
                 progress_cb(i + 1, len(batches))
         del wide_df  # free the wide frame before the final streaming write
         write_parquet(
-            pl.scan_parquet(tmp_paths), base_path=output_path, validate=False, sort=False, **hive_dims
+            pl.scan_parquet(tmp_paths),
+            base_path=output_path,
+            validate=False,
+            sort=False,
+            temp_dir=temp_path,
+            **hive_dims,
         )
     return messages
 

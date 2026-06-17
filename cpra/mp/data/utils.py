@@ -62,22 +62,23 @@ def long_sort_expressions(outer_cols, time_unit):
 
     ``outer_cols`` are the dimension column names that sort *outside* grid_cell
     (every required column except calendar_* and grid_cell, in the desired
-    order).  The grid_cell/calendar tail is appended consistently:
+    order).  The grid_cell/calendar tail is appended consistently for every
+    time unit:
 
-      daily/monthly:  outer_cols → calendar year → grid_cell → calendar_day
-      annual/decadal: outer_cols → grid_cell → calendar_year
+      outer_cols → grid_cell → calendar_day (daily/monthly)
+      outer_cols → grid_cell → calendar_year (annual/decadal)
 
-    Placing the calendar year ahead of grid_cell for daily/monthly data aligns
-    row-group boundaries to calendar years, so predicate pushdown can skip whole
-    row groups for year-filtered queries.  Both ``write_parquet`` and the
-    long-format migration build their sort key through this helper so the global
-    order cannot drift between them.
+    Sorting grid_cell ahead of the calendar column clusters each grid cell's
+    full time series contiguously, which both compresses the value column well
+    and lets predicate pushdown skip row groups for grid_cell-filtered queries.
+    The calendar column is delta-encoded on write, so its compactness no longer
+    depends on the sort order.  Both ``write_parquet`` and the long-format
+    migration build their sort key through this helper so the global order
+    cannot drift between them.
     """
     exprs = [pl.col(col) for col in outer_cols]
-    if time_unit in ("daily", "monthly"):
-        exprs.extend([pl.col("calendar_day").dt.year(), pl.col("grid_cell"), pl.col("calendar_day")])
-    else:
-        exprs.extend([pl.col("grid_cell"), pl.col("calendar_year")])
+    time_col = "calendar_day" if time_unit in ("daily", "monthly") else "calendar_year"
+    exprs.extend([pl.col("grid_cell"), pl.col(time_col)])
     return exprs
 
 
