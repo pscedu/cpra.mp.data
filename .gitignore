@@ -13,6 +13,7 @@ token.txt
 /test_*.py
 *.db
 
+/catalog
 /cpra/mp/data/crosswalk/
 /cpra/mp/data/geojson/
 /cpra/mp/data/geometry/
