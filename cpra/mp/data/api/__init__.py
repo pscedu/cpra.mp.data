@@ -25,7 +25,6 @@ from cpra.mp.data.api.models import (
     VisualizationQuery,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
-from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
@@ -34,6 +33,7 @@ from cpra.mp.data.api.utils import (
     validate_compression,
     validate_format,
 )
+from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -156,7 +156,7 @@ async def datasets(format: DataFormat, compression: Annotated[Compression, Query
 
 
 @app.get(
-    "/v1/datasets/{variable}/{time_unit}/catalog.json",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/catalog.json",
     tags=["Catalog"],
 )
 async def query_catalog(
@@ -168,7 +168,7 @@ async def query_catalog(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{time_unit}/data.{format}",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/data.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_data(
@@ -190,7 +190,7 @@ async def get_model_data(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{time_unit}/data/{z}/{x}/{y}.{format}",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/data/{z}/{x}/{y}.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_tile(
@@ -208,7 +208,7 @@ async def get_model_tile(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{time_unit}/tiles/{z}/{x}/{y}.pbf",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/tiles/{z}/{x}/{y}.pbf",
     tags=["Data and Analysis"],
 )
 async def get_vector_tile(
@@ -230,7 +230,7 @@ def visualizations() -> list[Visualization]:
 
 
 @app.get(
-    "/v1/datasets/{variable}/{time_unit}/visualization/{visualization_name}.json",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/visualization/{visualization_name}.json",
     tags=["Visualization"],
 )
 async def get_dataset_visualization(
@@ -240,12 +240,10 @@ async def get_dataset_visualization(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
-    grid_values = query.filter_dimensions.grid
-    grid = grid_values[0] if grid_values else None
     query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
     visualization = VisualizationClass(
         variable=dataset_dimensions.variable,
-        grid=grid,
+        grid=dataset_dimensions.grid,
         time_unit=dataset_dimensions.time_unit,
         request=request,
         **query_dict,

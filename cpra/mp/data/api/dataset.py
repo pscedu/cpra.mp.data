@@ -56,12 +56,7 @@ class Dataset(LazyFrameSource):
         self.raster_groups = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
-        grid_values = filter_dimensions.grid
-        if not grid_values:
-            self._error("grid query parameter is required")
-        self.grid = GRIDS.get(grid_values[0])
-        if self.grid is None:
-            self._error(f"unknown grid: {grid_values[0]}")
+        self.grid = GRIDS[self.dataset_dimensions.grid]
 
     def _error(self, msg, status_code=400):
         """Raise an exception."""
@@ -239,9 +234,8 @@ class Dataset(LazyFrameSource):
 
             # grid_cell must always be part of the group key in long format since each
             # row represents a single grid_cell.
-            self.lf = (
-                self.lf.group_by(*group_by_cols, "grid_cell")
-                .agg(getattr(pl.col("value"), self.options.group_aggregate)())
+            self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
+                getattr(pl.col("value"), self.options.group_aggregate)()
             )
 
             if null_cols:
@@ -298,8 +292,7 @@ class Dataset(LazyFrameSource):
         dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
         agg_fn = self.options.summarize_aggregate
         self.lf = (
-            self.lf
-            .join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
+            self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
             .with_columns(value=pl.col("value") * pl.col("scale_factor"))
             .group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
             .agg(getattr(pl.col("value"), agg_fn)())
@@ -412,14 +405,17 @@ class Dataset(LazyFrameSource):
 
         grid_name = self.options.summarize_by or self.grid.name
         if not (TILES_PATH / f"{grid_name}.pmtiles").exists():
-            raise HTTPException(
-                status_code=404, detail=f"no tile file for grid: {grid_name}"
-            )
+            raise HTTPException(status_code=404, detail=f"no tile file for grid: {grid_name}")
 
     @asynctiming
     async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
         """Get an MVT tile with dataset values injected into pre-generated geometry."""
-        from cpra.mp.data.api.vector import _data_to_id_value, inject_and_serialize, parse_tile, read_pmtile
+        from cpra.mp.data.api.vector import (
+            _data_to_id_value,
+            inject_and_serialize,
+            parse_tile,
+            read_pmtile,
+        )
 
         grid_name = self.options.summarize_by or self.grid.name
         tile = mercantile.Tile(x, y, z)
