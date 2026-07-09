@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.47.0](https://github.com/pscedu/cpra.mp.data/compare/v0.46.0...v0.47.0) (2026-07-09)
+
+
+### Features
+
+* **structure:** update coverage legend ([a841339](https://github.com/pscedu/cpra.mp.data/commit/a8413398e7db6d731c9b69fc8e5cbfdd792a7bab))
+
+
+### Bug Fixes
+
+* **visualizations:** update default date range in time series line ([4eab887](https://github.com/pscedu/cpra.mp.data/commit/4eab88765a7638f442fc3beeed274bd913d8dfc8))
+
 ## [0.46.0](https://github.com/pscedu/cpra.mp.data/compare/v0.45.0...v0.46.0) (2026-06-16)
 
 
