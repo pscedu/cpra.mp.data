@@ -25,8 +25,8 @@ class TimeSeriesLine(DatasetVisualization):
     def chart(self):
         """Build the visualization using Altair."""
 
-        start_date = self.params.get("start_date", None) or dt.date(2019, 1, 1)
-        end_date = self.params.get("end_date", None) or dt.date(2020, 1, 1)
+        start_date = self.params.get("start_date", None) or dt.date(2025, 1, 1)
+        end_date = self.params.get("end_date", None) or dt.date(2026, 1, 1)
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
@@ -96,17 +96,13 @@ class TimeSeriesLine(DatasetVisualization):
             from_=alt.LookupData(geography_df, "geography", ["geography_idx"]),
         )
         for dim_name, dim_values in compare_dimensions.items():
-            idx_expr = " : ".join([
-                f"datum.{dim_name} == {json.dumps(v)} ? {i}"
-                for i, v in enumerate(dim_values)
-            ]) + " : null"
+            idx_expr = (
+                " : ".join([f"datum.{dim_name} == {json.dumps(v)} ? {i}" for i, v in enumerate(dim_values)]) + " : null"
+            )
             rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
         pivot_key_parts = ["geography_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
         rules = (
-            rules
-            .transform_calculate(
-                tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts])
-            )
+            rules.transform_calculate(tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts]))
             .transform_pivot("tooltip", value="value", groupby=["date", self.time_column])
             .mark_rule(color="gray")
             .encode(
