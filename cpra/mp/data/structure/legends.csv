@@ -4,12 +4,15 @@ accr,2 to < 4,#fbb4b9,4.0
 accr,4 to < 6,#f768a1,6.0
 accr,6 to < 8,#c51b8a,8.0
 accr,8 to 10,#7a0177,
-coverage,No Data,#00000000,0.0
-coverage,0 to < 0.2,#fee5d9,0.2
-coverage,0.2 to < 0.4,#fcae91,0.4
-coverage,0.4 to < 0.6,#fb6a4a,0.6
-coverage,0.6 to < 0.8,#de2d26,0.8
-coverage,0.8 to 1.0,#a50f15,
+coverage,No Coverage Present,#00000000,1e-10
+coverage,> 0 to < 0.01,#fef2f2,0.01
+coverage,0.01 to < 0.05,#ffe2e2,0.05
+coverage,0.05 to < 0.1,#ffc9c9,0.1
+coverage,0.1 to < 0.2,#ffa2a2,0.2
+coverage,0.2 to < 0.4,#ff6467,0.4
+coverage,0.4 to < 0.6,#fb2c36,0.6
+coverage,0.6 to < 0.8,#c11007,0.8
+coverage,0.8 to 1.0,#82181a,
 damage,$0 to < $1K,#edf8fb,1000.0
 damage,$1K to < $10K,#b3cde3,10000.0
 damage,$10K to < $100K,#8c96c6,100000.0

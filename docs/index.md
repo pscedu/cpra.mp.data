@@ -33,7 +33,7 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Percentile | percentile | partition | Int8 | False | 0 | 100 | 50 |
 | Vegetation: Species | veg_species_code | nonpartition | String | False |  |  | coes |
 | FFIBS: Coverage Type | ffibs_type | nonpartition | String | False |  |  | 0.5 |
-| Year | calendar_year | nonpartition | Int32 | False | 2000 | 2100 | 2030 |
+| Year | calendar_year | nonpartition | Int32 | False | 1900 | 2100 | 2030 |
 | Date | calendar_day | nonpartition | Date | False |  |  | 2030-01-01 |
 | Model | model | metadata | String | True |  |  | icm_v2023.0.0 |
 | Ecoregion | ecoregion | tag | String | False |  |  | UBA |
@@ -47,15 +47,15 @@ Variables represent a type of model output. Each variable has a single data type
 <!--BEGIN SECTION variables-->
 | Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Number Format | Legend | Required Dimensions | Difference Legend Limit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
-| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
-| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
-| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
-| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
-| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | 1 |
-| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | 1 |
-| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | d | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | 1 |
-| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft | .1f | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | 1 |
+| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ | .3s | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -10000000 |
+| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ | .3s | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
+| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | .3s | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
+| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ | .3s | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
+| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
+| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
+| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents | .2f | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
+| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures | d | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | -10 |
+| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft | .1f | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | -15 |
 | Habitat Suitability Index | hsi | icm | hsi | Float32 | veg_grid_cell | annual |  | .2f | hsi | species_code | -1 |
 | Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  |  | aggregate_type | 1 |
 | Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt | .1f | sal | aggregate_type | -10 |
@@ -407,12 +407,15 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| No Data | #00000000 | 0.0 |
-| 0 to < 0.2 | #fee5d9 | 0.2 |
-| 0.2 to < 0.4 | #fcae91 | 0.4 |
-| 0.4 to < 0.6 | #fb6a4a | 0.6 |
-| 0.6 to < 0.8 | #de2d26 | 0.8 |
-| 0.8 to 1.0 | #a50f15 |  |
+| No Coverage Present | #00000000 | 1e-10 |
+| > 0 to < 0.01 | #fef2f2 | 0.01 |
+| 0.01 to < 0.05 | #ffe2e2 | 0.05 |
+| 0.05 to < 0.1 | #ffc9c9 | 0.1 |
+| 0.1 to < 0.2 | #ffa2a2 | 0.2 |
+| 0.2 to < 0.4 | #ff6467 | 0.4 |
+| 0.4 to < 0.6 | #fb2c36 | 0.6 |
+| 0.6 to < 0.8 | #c11007 | 0.8 |
+| 0.8 to 1.0 | #82181a |  |
 
 
 ### `damage` Legend
