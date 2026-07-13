@@ -69,8 +69,6 @@ def stack_annual_cogs(input_dir: Path, output_path: Path) -> None:
                 "OVERVIEW_RESAMPLING=NEAREST",
                 "-co",
                 "WARP_RESAMPLING=NEAREST",
-                # "-co",
-                # "NBITS=16",
                 "-co",
                 "NUM_THREADS=ALL_CPUS",
                 str(vrt_path),

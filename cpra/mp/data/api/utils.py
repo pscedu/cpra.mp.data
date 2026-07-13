@@ -62,29 +62,49 @@ def timing(func):
     return wrapped
 
 
-def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest):
-    """Read a window of data from a single raster."""
-    return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
+def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None):
+    """Read a window of data from a single raster (optionally a subset of bands)."""
+    return dataset.read(indexes=indexes, window=window, out_shape=out_shape, resampling=resampling)
 
 
-async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest):
-    """Read several rasters in multiple threads."""
+async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest, bands=None):
+    """Read several rasters in multiple threads.
+
+    ``bands`` optionally selects a single band per dataset (1-based).  Each selected band
+    is read as a ``(1, height, width)`` array so results can be vstacked, exactly as when
+    reading a single-band file.  When ``bands`` is None every band of each dataset is read.
+    """
     loop = asyncio.get_running_loop()
+    if bands is None:
+        bands = [None] * len(datasets)
     return await asyncio.gather(
-        *[loop.run_in_executor(None, _read_window, dataset, window, out_shape, resampling) for dataset in datasets]
+        *[
+            loop.run_in_executor(
+                None, _read_window, dataset, window, out_shape, resampling, None if band is None else [band]
+            )
+            for dataset, band in zip(datasets, bands)
+        ]
     )
 
 
-def _sample_raster(dataset, coordinates):
-    """Sample a single raster at the given coordinates."""
-    return list(dataset.sample(coordinates))
+def _sample_raster(dataset, coordinates, band=None):
+    """Sample a single raster at the given coordinates (optionally a single band)."""
+    return list(dataset.sample(coordinates, indexes=band))
 
 
-async def parallel_sample_rasters(datasets, coordinates):
-    """Sample several rasters at the given coordinates in multiple threads."""
+async def parallel_sample_rasters(datasets, coordinates, bands=None):
+    """Sample several rasters at the given coordinates in multiple threads.
+
+    ``bands`` optionally selects a single band per dataset (1-based); None samples every band.
+    """
     loop = asyncio.get_running_loop()
+    if bands is None:
+        bands = [None] * len(datasets)
     return await asyncio.gather(
-        *[loop.run_in_executor(None, _sample_raster, dataset, coordinates) for dataset in datasets]
+        *[
+            loop.run_in_executor(None, _sample_raster, dataset, coordinates, band)
+            for dataset, band in zip(datasets, bands)
+        ]
     )
 
 

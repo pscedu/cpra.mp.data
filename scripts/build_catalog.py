@@ -43,6 +43,7 @@ import click
 import polars as pl
 import pyarrow as pa
 import pyarrow.dataset as pads
+import rasterio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -123,8 +124,23 @@ def _unify(df):
     return df.with_columns(exprs)
 
 
+def _raster_rows(base, tif_paths):
+    """One dict per (COG, band): path dimensions plus the band's calendar value.
+
+    Every COG -- single-band or a multi-band contiguous-run merge from ``compact_cog`` --
+    stores each band's calendar value in its band description (e.g. ``"calendar_year=2032"``),
+    which is the sole source used here.
+    """
+    for path in tif_paths:
+        dims = _parse_path_dims(path.relative_to(base))
+        with rasterio.open(path) as ds:
+            for desc in ds.descriptions:
+                name, _, value = desc.partition("=")
+                yield {**dims, name: value}
+
+
 def _raster_catalog(base, tif_paths):
-    rows = [_parse_path_dims(p.relative_to(base)) for p in tif_paths]
+    rows = list(_raster_rows(base, tif_paths))
     cols = sorted({k for r in rows for k in r}, key=CATALOG_DIMS.index)
     df = pl.DataFrame({c: [_cast_str(c, r[c]) if c in r else None for r in rows] for c in cols})
     frames = []

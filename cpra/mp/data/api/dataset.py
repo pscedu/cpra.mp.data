@@ -159,12 +159,13 @@ class Dataset(LazyFrameSource):
             src_crs = CRS.from_epsg(4326)
             dst_crs = datasets[0].crs
             projected_pairs = list(zip(*transform(src_crs, dst_crs, lngs, lats)))
-            samples = await parallel_sample_rasters(datasets, projected_pairs)
+            bands = df["band"].to_list() if "band" in df.columns else None
+            samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
 
-        # Add the resulting values to the LazyFrame, and remove the path column.
+        # Add the resulting values to the LazyFrame, and remove the internal path/band columns.
         columns = [np.concatenate(col) for col in zip(*samples)]
         column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-        self.lf = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path")).lazy()
+        self.lf = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band")).lazy()
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
@@ -457,7 +458,9 @@ class Dataset(LazyFrameSource):
     async def get_raster_array(self, df, rasters, window, out_shape=None):
         """Read a raster array and apply the operations specified
         in the index DataFrame."""
-        data = np.vstack(await parallel_read_rasters(rasters, window, out_shape))
+        # Each index row selects one band of its (possibly multi-band) file.
+        bands = df["band"].to_list() if "band" in df.columns else None
+        data = np.vstack(await parallel_read_rasters(rasters, window, out_shape, bands=bands))
 
         # Apply multipliers from calculate parameters.
         if not (df["multiplier"] == 1).all():
@@ -547,9 +550,23 @@ class Dataset(LazyFrameSource):
 
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+
+            # Each selected (path, band) row — or each aggregated group — becomes one
+            # output band, so the source's own band count must be overridden.
+            if self.raster_groups is not None:
+                out_count = self.raster_groups.select(pl.len()).collect().item()
+            else:
+                out_count = len(df)
             profile = inputs[0].profile.copy()
-            profile.update(kwargs)
+            profile.update(count=out_count, **kwargs)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
+
+            # Label output bands with their calendar value when rows map 1:1 to bands.
+            if self.raster_groups is None:
+                calendar_col = next((c for c in ("calendar_year", "calendar_day") if c in df.columns), None)
+                if calendar_col is not None:
+                    for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
+                        output.set_band_description(band_idx, f"{calendar_col}={value}")
 
             # Group raster blocks by row, and read an entire row of blocks at once.
             groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])

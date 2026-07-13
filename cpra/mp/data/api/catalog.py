@@ -1,21 +1,19 @@
 import re
-from math import floor
 
 import polars as pl
 from fastapi import HTTPException
 
 from cpra.mp.data.config import BASE_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.utils import get_input_data_frame, required_columns
+from cpra.mp.data.utils import (
+    RANGE_FUNCTIONS,  # noqa: F401 (re-exported for scripts/build_catalog.py)
+    RANGE_KWARGS,  # noqa: F401 (re-exported for scripts/build_catalog.py)
+    calendar_run_offsets,
+    get_input_data_frame,
+    required_columns,
+)
 
 TIF_EXTENSION = re.compile(r"\.tif$")
-RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
-RANGE_KWARGS = {
-    "daily": {"interval": "1d"},
-    "monthly": {"interval": "1mo"},
-    "annual": {"step": 1},
-    "decadal": {"step": 10},
-}
 
 
 class CatalogQuery:
@@ -100,29 +98,10 @@ class CatalogQuery:
             if dimension_name in ("calendar_day", "calendar_year"):
                 if not isinstance(values, pl.Series):
                     values = pl.Series(values)
-                range_function = RANGE_FUNCTIONS[dimension_name]
-                range_kwargs = RANGE_KWARGS[self.dataset_dimensions.time_unit]
-                # Account for decadal data that don't start on an even decade.
-                # TODO: Handle monthly data that don't start on the first of the month.
-                range_start = (
-                    floor(values.min() / 10) * 10
-                    if self._choices.get("time_unit", None) == ["decadal"]
-                    else values.min()
-                )
-                range_end = values.max() if dimension_name == "calendar_day" else values.max() + 1
+                offsets = calendar_run_offsets(values, dimension_name, self.dataset_dimensions.time_unit)
                 groups = (
-                    pl.DataFrame(
-                        {
-                            "value": values,
-                            "seq": range_function(
-                                range_start,
-                                range_end,
-                                eager=True,
-                                **range_kwargs,
-                            )[: len(values)],
-                        }
-                    )
-                    .group_by(offset=(pl.col("value") - pl.col("seq")))
+                    pl.DataFrame({"value": values, "offset": offsets})
+                    .group_by("offset")
                     .agg(start=pl.col("value").min(), end=pl.col("value").max())
                     .sort(pl.col("start"))
                 )
