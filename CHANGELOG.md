@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.47.1](https://github.com/pscedu/cpra.mp.data/compare/v0.47.0...v0.47.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* **api:** fix pixel shift in raster tile ([3f193fb](https://github.com/pscedu/cpra.mp.data/commit/3f193fbbb46afb744276c376aa4482c8c494a451))
+
 ## [0.47.0](https://github.com/pscedu/cpra.mp.data/compare/v0.46.0...v0.47.0) (2026-07-09)
 
 
