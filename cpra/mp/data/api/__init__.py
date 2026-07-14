@@ -2,12 +2,11 @@ from collections import defaultdict
 from typing import Annotated
 
 import polars.selectors as cs
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
-from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     Compression,
@@ -34,6 +33,7 @@ from cpra.mp.data.api.utils import (
     validate_format,
 )
 from cpra.mp.data.api.vector import VectorTileResponse
+from cpra.mp.data.catalog import CatalogQuery
 from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -164,7 +164,11 @@ async def query_catalog(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     catalog_query = CatalogQuery(dataset_dimensions, filter_dimensions)
-    return JSONResponse(content=catalog_query.execute())
+    try:
+        result = catalog_query.execute()
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return JSONResponse(content=result)
 
 
 @app.get(

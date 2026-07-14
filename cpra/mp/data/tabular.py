@@ -9,7 +9,8 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.catalog import CAL_DIMS, EXCLUDE, Catalog, tabular_catalog_rows
+from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
@@ -100,6 +101,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
 def write_parquet(
     data,
     base_path=BASE_PATH,
+    catalog_path=CATALOG_PATH,
     validate=True,
     sort=True,
     compression="zstd",
@@ -202,6 +204,12 @@ def write_parquet(
     else:
         _write_via_temp_file(lf, temp_dir=temp_dir, **common)
 
+    # Keep the unified catalog side-table in sync with what was just written.
+    if catalog_path:
+        group_cols = [col for col in required_cols if col not in EXCLUDE and col not in CAL_DIMS]
+        rows = tabular_catalog_rows(lf, group_cols, time_unit)
+        Catalog(catalog_path).append(rows)
+
 
 def _write_dataset(reader, schema, base_path, partition_cols, compression, compression_level, row_group_size):
     """Write an ordered batch stream to a Hive-partitioned, delta-encoded dataset.
@@ -301,6 +309,7 @@ def _write_via_sink_batches(lf, row_group_size, **kwargs):
 
 def compact_parquet(
     base_path=BASE_PATH,
+    catalog_path=CATALOG_PATH,
     sort=True,
     compression="zstd",
     compression_level=6,
@@ -316,9 +325,17 @@ def compact_parquet(
     # Calculate the dataset directory path.
     dataset_dir = dataset_path(base_path, **kwargs)
 
-    # Construct the glob pattern.
-    required_cols = required_columns(input_df, include_dataset=False, include_metadata=False)
-    glob_pattern = build_glob_pattern(required_cols=required_cols, extension="parquet", **kwargs)
+    # Construct the glob pattern from the dims actually Hive-partitioned on disk
+    # (partition_columns(), not required_columns() -- partition-typed dims like
+    # model_group_id/scenario_id/aggregate_type are only real directories when
+    # time_unit == "daily", see Dimension.partition; files are UUID-named, never
+    # named after a dimension, so the match must be nested with a wildcard).
+    partition_cols = partition_columns(input_df, include_dataset=False)
+    glob_pattern = (
+        build_glob_pattern(required_cols=partition_cols, extension="parquet", nested=True, **kwargs)
+        if partition_cols
+        else "*.parquet"
+    )
     paths = list(dataset_dir.glob(glob_pattern))
 
     # Group by directory, and extract dimension values for directories with
@@ -328,7 +345,8 @@ def compact_parquet(
             {
                 "directory": [str(p.parent) for p in paths],
                 "file": [str(p.name) for p in paths],
-            }
+            },
+            schema={"directory": pl.String, "file": pl.String},
         )
         .group_by(pl.col("directory"))
         .agg(pl.col("file"))
@@ -337,7 +355,7 @@ def compact_parquet(
             [
                 pl.col("directory").str.extract(f"{dim.name}=([^/]+)(/|$)", 1).cast(dim.dtype).alias(dim.name)
                 for dim in DIMENSIONS.values()
-                if dim.name in partition_columns(input_df)
+                if dim.name in partition_cols
             ]
         )
     )
@@ -345,12 +363,15 @@ def compact_parquet(
     # Iterate over the directories, read the data, and rewrite it
     # as a single file.
     for partition in partitions_df.iter_rows(named=True):
-        read_kwargs = partition.copy()
-        del read_kwargs["directory"]
-        del read_kwargs["file"]
+        # variable/time_unit/grid never appear as partition_cols (they're baked into
+        # dataset_dir already, never re-extracted from the directory string), so start
+        # from kwargs for those and layer in whichever dims varied per directory.
+        read_kwargs = {**kwargs, **{k: v for k, v in partition.items() if k not in ("directory", "file")}}
 
         write_parquet(
-            read_parquet(**read_kwargs).collect(),
+            read_parquet(**read_kwargs, base_path=base_path).collect(),
+            base_path=base_path,
+            catalog_path=catalog_path,
             validate=False,
             sort=sort,
             compression=compression,
@@ -362,3 +383,9 @@ def compact_parquet(
         directory = Path(partition["directory"])
         for file in partition["file"]:
             (directory / file).unlink()
+
+    # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
+    # partition (the fresh rows from the write_parquet calls above, plus any older,
+    # more-fragmented rows from earlier writes) into minimal contiguous-run rows.
+    if catalog_path:
+        Catalog(catalog_path).compact_partition(kwargs["variable"], kwargs["time_unit"], kwargs["grid"])

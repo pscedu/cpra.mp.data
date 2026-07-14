@@ -64,6 +64,9 @@ jupyter = [
 ]
 scripts = ["fastexcel", "tippecanoe", "tqdm"]
 
+[dependency-groups]
+dev = ["pytest"]
+
 [tool.basedpyright]
 reportAny = false
 reportExplicitAny = false

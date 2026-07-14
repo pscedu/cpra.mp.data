@@ -27,7 +27,7 @@ def calendar_run_offsets(values, calendar_dim, time_unit):
 
     ``values`` must be a sorted (ascending), duplicate-free ``pl.Series`` of
     ``calendar_year`` (Int) or ``calendar_day`` (Date) values.  Used by both the API
-    catalog's range compression (``api/catalog.py:CatalogQuery._compress``) and
+    catalog's range compression (``catalog.py:CatalogQuery._compress``) and
     ``compact_cog``'s file-merge grouping (``raster.py``) -- keep the two in sync.
     """
     range_function = RANGE_FUNCTIONS[calendar_dim]

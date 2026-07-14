@@ -14,6 +14,7 @@ def get_config(name, default_value):
 
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
+CATALOG_PATH = Path(get_config("CATALOG_PATH", str(BASE_PATH.parent / "catalog")))
 GEOMETRY_PATH = Path(__file__).parent / "geometry"
 TILES_PATH = Path(get_config("TILES_PATH", "/ocean/projects/bcs200002p/shared/tiles"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES

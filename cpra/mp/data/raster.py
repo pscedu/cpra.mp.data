@@ -11,7 +11,8 @@ from rasterio.io import MemoryFile
 from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.catalog import Catalog, cast_str, parse_path_dims, raster_catalog_rows
+from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
@@ -103,7 +104,8 @@ def vrt(sources):
 
 
 def _read_cog_metadata(path):
-    """Open a COG and read its band descriptions and dtype, without reading pixel data.
+    """Open a COG and read its band descriptions, dtype, and dataset tags, without
+    reading pixel data.
 
     LEGACY COG SHIM (grep this tag to find every removable piece; delete once no on-disk
     COG is pre-migration -- see the project_multiband_cog memory): the old, single-band
@@ -114,22 +116,27 @@ def _read_cog_metadata(path):
     ``compact_cog``) treats the file exactly like a native one. The extra ``is_legacy``
     return value only matters to ``compact_cog``, which uses it to force a legacy file
     into the new format even when it has no neighbors to merge with.
+
+    ``tags`` (metadata-typed dims like ``model``, written by ``write_cog`` via
+    ``update_tags`` -- see ``write_cog``) is returned alongside so callers that need
+    metadata dims for the catalog (``compact_cog``) don't have to open the file again;
+    these dims are never COG path components, so tags are their only source.
     """
 
     with rio.open(path) as ds:
         descriptions = ds.descriptions
+        tags = ds.tags()
         is_legacy = False
         if not descriptions[0]:
-            tags = ds.tags()
             legacy_dim = next((dim for dim in _CALENDAR_DIMENSIONS if dim in tags), None)
             if legacy_dim is not None:
                 descriptions = (f"{legacy_dim}={tags[legacy_dim]}",)
                 is_legacy = True
-        return descriptions, ds.dtypes[0], is_legacy
+        return descriptions, ds.dtypes[0], is_legacy, tags
 
 
 def _parallel_read_cog_metadata(paths):
-    """Read ``(descriptions, dtype, is_legacy)`` for several COGs in parallel threads.
+    """Read ``(descriptions, dtype, is_legacy, tags)`` for several COGs in parallel threads.
 
     The calendar value a file/band covers can only be determined by opening it (the
     filename is an opaque UUID), so both ``read_cog`` and ``compact_cog`` must open every
@@ -191,7 +198,7 @@ def _band_calendar_frame(paths, path_column, calendar_col):
 
     dtype = DIMENSIONS[calendar_col].dtype
     rows = {path_column: [], "band": [], "_value": []}
-    for path, (descriptions, _dtype, _is_legacy) in zip(paths, _parallel_read_cog_metadata(paths)):
+    for path, (descriptions, _dtype, _is_legacy, _tags) in zip(paths, _parallel_read_cog_metadata(paths)):
         for band_idx, desc in enumerate(descriptions, start=1):
             _, _, value = desc.partition("=")
             rows[path_column].append(path)
@@ -280,6 +287,7 @@ def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6):
 def write_cog(
     data,
     base_path=BASE_PATH,
+    catalog_path=CATALOG_PATH,
     validate=True,
     compression="zstd",
     compression_level=6,
@@ -316,6 +324,18 @@ def write_cog(
         dst.set_band_description(1, description)
         dst.write(data.reshape((grid.height, grid.width)), 1)
 
+    # Keep the unified catalog side-table in sync with what was just written. Every
+    # non-calendar kwarg (including metadata-typed dims like model, which were just
+    # written as tags above) belongs on the catalog row -- see raster_catalog_rows.
+    if catalog_path:
+        dims = {
+            dim.name: kwargs[dim.name]
+            for dim in DIMENSIONS.values()
+            if dim.name in kwargs and dim.name not in _CALENDAR_DIMENSIONS
+        }
+        rows = raster_catalog_rows(dims, calendar_dim, [kwargs[calendar_dim]])
+        Catalog(catalog_path).append(rows)
+
 
 def _calendar_value(value, calendar_dim):
     """Parse a band description's value (the part after ``"="``) into a typed value."""
@@ -323,7 +343,7 @@ def _calendar_value(value, calendar_dim):
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
 
 
-def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **kwargs):
+def compact_cog(base_path=BASE_PATH, catalog_path=CATALOG_PATH, compression="zstd", compression_level=6, **kwargs):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
 
     Every matching COG within a partition directory -- single-band or already
@@ -389,10 +409,12 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
         triples = []
         dtype = None
         legacy_paths = set()  # LEGACY COG SHIM (see _read_cog_metadata); remove with it.
-        for tif, (descriptions, tif_dtype, is_legacy) in zip(tifs, _parallel_read_cog_metadata(tifs)):
+        tif_tags = {}
+        for tif, (descriptions, tif_dtype, is_legacy, tags) in zip(tifs, _parallel_read_cog_metadata(tifs)):
             dtype = tif_dtype
             if is_legacy:
                 legacy_paths.add(tif)
+            tif_tags[tif] = {k: v for k, v in tags.items() if k in METADATA_DIMENSIONS}
             for band_idx, desc in enumerate(descriptions, start=1):
                 _, _, value = desc.partition("=")
                 triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
@@ -406,6 +428,25 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
         for (value, tif, band_idx), offset in zip(triples, offsets):
             runs.setdefault(offset, []).append((tif, band_idx))
             run_values.setdefault(offset, []).append(value)
+
+        # Self-heal the catalog for this directory regardless of whether a physical
+        # merge happens below -- this recomputes every run's rows from what was just
+        # read, so directories containing legacy/pre-write_cog-hook files (which never
+        # got a catalog row of their own) are backfilled as a side effect of compacting.
+        if catalog_path:
+            path_dims = parse_path_dims(directory.relative_to(Path(base_path)))
+            directory_rows = pl.concat(
+                [
+                    raster_catalog_rows(
+                        {k: cast_str(k, v) for k, v in {**path_dims, **tif_tags[run[0][0]]}.items()},
+                        calendar_dim,
+                        run_values[offset],
+                    )
+                    for offset, run in runs.items()
+                ],
+                how="diagonal_relaxed",
+            )
+            Catalog(catalog_path).append(directory_rows)
 
         for offset, run in runs.items():
             unique_paths = {tif for tif, _band in run}
@@ -441,3 +482,9 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
 
             for path in unique_paths:
                 path.unlink()
+
+    # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
+    # partition (the self-healed rows appended above, plus any older, more-fragmented
+    # rows from earlier writes) into minimal contiguous-run rows.
+    if catalog_path:
+        Catalog(catalog_path).compact_partition(kwargs["variable"], kwargs["time_unit"], kwargs["grid"])
