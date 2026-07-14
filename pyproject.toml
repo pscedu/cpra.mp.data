@@ -62,7 +62,7 @@ jupyter = [
     "jupyterlab>=4.5.7",
     "maplibre[all]"
 ]
-scripts = ["fastexcel", "tippecanoe"]
+scripts = ["affine", "fastexcel", "playwright", "pyproj", "tippecanoe"]
 
 [tool.basedpyright]
 reportAny = false
