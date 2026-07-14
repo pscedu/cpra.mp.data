@@ -28,6 +28,26 @@ from cpra.mp.data.utils import (
 
 _CALENDAR_DIMENSIONS = ("calendar_year", "calendar_day")
 
+# LEGACY COG SHIM (grep this tag to find every removable piece; delete once no on-disk
+# COG directory uses this order -- see the project_multiband_cog memory's "migration
+# caveat"). Pre-migration COGs live under this older dataset-directory order instead of
+# the current dataset_path()'s (variable, time_unit, grid).
+_LEGACY_DATASET_DIMENSION_ORDER = ("variable", "grid", "time_unit")
+
+
+def _legacy_dataset_path(base_path, **kwargs):
+    """LEGACY COG SHIM (see ``_LEGACY_DATASET_DIMENSION_ORDER``; remove together with it).
+
+    Mirrors ``utils.dataset_path()`` but with the pre-migration dimension order, used only
+    to *find* legacy files -- every write still goes through the canonical
+    ``dataset_path()``.
+    """
+
+    path = Path(base_path)
+    for dim_name in _LEGACY_DATASET_DIMENSION_ORDER:
+        path = path / f"{dim_name}={kwargs[dim_name]!s}"
+    return path
+
 
 def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
     """Generate a COG dataset+partition directory path from a data frame.
@@ -83,14 +103,33 @@ def vrt(sources):
 
 
 def _read_cog_metadata(path):
-    """Open a COG and read its band descriptions and dtype, without reading pixel data."""
+    """Open a COG and read its band descriptions and dtype, without reading pixel data.
+
+    LEGACY COG SHIM (grep this tag to find every removable piece; delete once no on-disk
+    COG is pre-migration -- see the project_multiband_cog memory): the old, single-band
+    layout stored its calendar value as a *dataset tag* (set by the old ``write_cog`` via
+    a plain ``update_tags(**kwargs)``) instead of a band description. When band 1 has no
+    description at all but the dataset carries a calendar-dimension tag, synthesize the
+    ``"<dim>=<value>"`` description string so every downstream consumer (``read_cog``,
+    ``compact_cog``) treats the file exactly like a native one. The extra ``is_legacy``
+    return value only matters to ``compact_cog``, which uses it to force a legacy file
+    into the new format even when it has no neighbors to merge with.
+    """
 
     with rio.open(path) as ds:
-        return ds.descriptions, ds.dtypes[0]
+        descriptions = ds.descriptions
+        is_legacy = False
+        if not descriptions[0]:
+            tags = ds.tags()
+            legacy_dim = next((dim for dim in _CALENDAR_DIMENSIONS if dim in tags), None)
+            if legacy_dim is not None:
+                descriptions = (f"{legacy_dim}={tags[legacy_dim]}",)
+                is_legacy = True
+        return descriptions, ds.dtypes[0], is_legacy
 
 
 def _parallel_read_cog_metadata(paths):
-    """Read ``(descriptions, dtype)`` for several COGs in parallel threads.
+    """Read ``(descriptions, dtype, is_legacy)`` for several COGs in parallel threads.
 
     The calendar value a file/band covers can only be determined by opening it (the
     filename is an opaque UUID), so both ``read_cog`` and ``compact_cog`` must open every
@@ -99,6 +138,47 @@ def _parallel_read_cog_metadata(paths):
 
     with ThreadPoolExecutor() as pool:
         return list(pool.map(_read_cog_metadata, paths))
+
+
+def _patch_legacy_vrt(vrt_text, calendar_dim, values):
+    """LEGACY COG SHIM (see ``_read_cog_metadata``; remove together with it).
+
+    Two fixes applied purely to the in-memory VRT XML, never touching a source file
+    (editing an already-written COG in place is refused by GDAL -- "has Cloud Optimized
+    GeoTIFF layout... updating it will generally result in losing part of the
+    optimizations" -- so this has to happen before the ``copy()`` that produces the
+    output, not after):
+
+    1. ``vrt()``'s root ``<Metadata>`` block is copied from the run's first source; if
+       that source is legacy, its stale calendar-dimension tag would otherwise leak onto
+       the merged output's dataset tags even though the value now lives correctly in every
+       band's description -- violating the invariant that the calendar dimension is never
+       a metadata tag (see ``write_cog``). Drop it.
+    2. ``vrt()``'s per-band ``<Description>`` only reflects a *native* band description --
+       a legacy source never had one (its calendar value was synthesized in Python by
+       ``_read_cog_metadata`` and never written back to the file), so its VRTRasterBand
+       has no ``<Description>`` at all and the merged output would end up with unreadable
+       (empty) descriptions for those bands. Set every band's ``<Description>`` explicitly
+       from ``values`` (parallel to the run, same band order the VRT wrote them in) so the
+       result is correct regardless of which source bands were native vs. synthesized.
+    """
+
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+
+    metadata_el = root.find("Metadata")
+    if metadata_el is not None:
+        for mdi in metadata_el.findall("MDI"):
+            if mdi.get("key") == calendar_dim:
+                metadata_el.remove(mdi)
+
+    for band_el, value in zip(root.findall("VRTRasterBand"), values):
+        desc_el = band_el.find("Description")
+        if desc_el is None:
+            desc_el = xml.etree.ElementTree.Element("Description")
+            band_el.insert(0, desc_el)
+        desc_el.text = f"{calendar_dim}={value}"
+
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
 
 
 def _band_calendar_frame(paths, path_column, calendar_col):
@@ -111,7 +191,7 @@ def _band_calendar_frame(paths, path_column, calendar_col):
 
     dtype = DIMENSIONS[calendar_col].dtype
     rows = {path_column: [], "band": [], "_value": []}
-    for path, (descriptions, _dtype) in zip(paths, _parallel_read_cog_metadata(paths)):
+    for path, (descriptions, _dtype, _is_legacy) in zip(paths, _parallel_read_cog_metadata(paths)):
         for band_idx, desc in enumerate(descriptions, start=1):
             _, _, value = desc.partition("=")
             rows[path_column].append(path)
@@ -265,6 +345,11 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
     VRT and the copy.  GDAL never materializes the stack and, because the sources already
     carry overviews, reuses them instead of regenerating — markedly faster and lower peak
     memory than copying through a temporary GeoTIFF.
+
+    Also migrates pre-multi-band-migration COGs it encounters -- including ones still
+    sitting under the older dataset-directory order -- the first time it's swept up here,
+    merged with any contiguous neighbors in the same pass rather than as a separate
+    rewrite step (grep ``LEGACY COG SHIM`` for every removable piece).
     """
 
     input_df = cast_columns(pl.DataFrame(kwargs))
@@ -287,13 +372,27 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
     for path in dataset_dir.glob(glob_pattern):
         groups.setdefault(path.parent, []).append(path)
 
+    # LEGACY COG SHIM (see _LEGACY_DATASET_DIMENSION_ORDER): also search the
+    # pre-migration directory order and remap any matches to their canonical directory
+    # (Path.glob on a directory that doesn't exist just yields nothing, so this is a
+    # no-op once no legacy directory remains), so legacy files get pooled into the same
+    # run-detection/merge pass as everything already in the canonical location.
+    legacy_dataset_dir = _legacy_dataset_path(base_path, **kwargs)
+    if legacy_dataset_dir != dataset_dir:
+        for path in legacy_dataset_dir.glob(glob_pattern):
+            canonical_dir = dataset_dir / path.parent.relative_to(legacy_dataset_dir)
+            groups.setdefault(canonical_dir, []).append(path)
+
     for directory, tifs in groups.items():
         # Pool every band of every file (regardless of existing band count) into one
         # sorted sequence of (value, path, band) triples.
         triples = []
         dtype = None
-        for tif, (descriptions, tif_dtype) in zip(tifs, _parallel_read_cog_metadata(tifs)):
+        legacy_paths = set()  # LEGACY COG SHIM (see _read_cog_metadata); remove with it.
+        for tif, (descriptions, tif_dtype, is_legacy) in zip(tifs, _parallel_read_cog_metadata(tifs)):
             dtype = tif_dtype
+            if is_legacy:
+                legacy_paths.add(tif)
             for band_idx, desc in enumerate(descriptions, start=1):
                 _, _, value = desc.partition("=")
                 triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
@@ -303,16 +402,24 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
         offsets = calendar_run_offsets(values, calendar_dim, time_unit).to_list()
 
         runs = {}
-        for (_value, tif, band_idx), offset in zip(triples, offsets):
+        run_values = {}  # LEGACY COG SHIM (see below); remove alongside it.
+        for (value, tif, band_idx), offset in zip(triples, offsets):
             runs.setdefault(offset, []).append((tif, band_idx))
+            run_values.setdefault(offset, []).append(value)
 
-        for run in runs.values():
-            # A run already living entirely in one file (regardless of its band count)
-            # is already optimal; nothing to gain from rewriting it.
+        for offset, run in runs.items():
             unique_paths = {tif for tif, _band in run}
-            if len(unique_paths) < 2:
+            run_is_legacy = bool(unique_paths & legacy_paths)  # LEGACY COG SHIM
+            # A run already living entirely in one up-to-date file is already optimal;
+            # nothing to gain from rewriting it. A legacy run is rewritten regardless of
+            # file count -- that's its only path into the new format.
+            if len(unique_paths) < 2 and not run_is_legacy:
                 continue
 
+            # LEGACY COG SHIM: `directory` is always pre-existing once every source is
+            # already canonical, but a legacy-only group's canonical directory may not
+            # exist on disk yet.
+            directory.mkdir(parents=True, exist_ok=True)
             out_path = directory / f"{uuid.uuid4()}.tif"
 
             # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute
@@ -320,7 +427,10 @@ def compact_cog(base_path=BASE_PATH, compression="zstd", compression_level=6, **
             # directory entirely.
             with tempfile.TemporaryDirectory() as tmp_dir:
                 vrt_path = Path(tmp_dir) / f"{out_path.stem}.vrt"
-                vrt_path.write_text(vrt(run))
+                vrt_text = vrt(run)
+                if run_is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
+                    vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, run_values[offset])
+                vrt_path.write_text(vrt_text)
                 profile = _cog_profile(
                     grid, dtype, count=len(run), compression=compression, compression_level=compression_level
                 )
