@@ -54,8 +54,8 @@ TARGET_TRANSFORM = Affine(
 TARGET_WIDTH = 2520
 TARGET_HEIGHT = 1080
 
-UNDERLAY_LAST_LAYER = "initial-conditions-water"
-OVERLAY_FIRST_LAYER = "levee"
+UNDERLAY_LAST_LAYER = "water-not-in-icm"
+OVERLAY_FIRST_LAYER = "aeroway-taxiway"
 
 # Pin to the version this project was developed against (see package.json).
 MAPLIBRE_VERSION = "5.24.0"
