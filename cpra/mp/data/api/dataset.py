@@ -15,8 +15,9 @@ from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
+from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform
+from rasterio.warp import transform, transform_bounds
 
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -488,10 +489,25 @@ class Dataset(LazyFrameSource):
         df = self.materialize()
         with ExitStack() as stack:
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+
+            if not self.dataset_bounds:
+                self.dataset_bounds = BoundingBox(
+                    *transform_bounds(inputs[0].crs, "EPSG:3857", *inputs[0].bounds)
+                )
+                if disjoint_bounds(self.dataset_bounds, tile_bounds):
+                    return None
+
+            # Warp each source directly onto the tile's Web Mercator pixel grid so
+            # the output registers exactly with the tile, with no intermediate grid
+            # or window rounding to shift pixels off their true location.
+            tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
             vrts = [
                 WarpedVRT(
                     dataset,
                     crs="EPSG:3857",
+                    transform=tile_transform,
+                    width=tile_size,
+                    height=tile_size,
                     nodata=-9999,
                     add_alpha=False,
                     src_nodata=-9999,
@@ -501,39 +517,12 @@ class Dataset(LazyFrameSource):
                 for dataset in inputs
             ]
 
-            if not self.dataset_bounds:
-                self.dataset_bounds = vrts[0].bounds
-                if disjoint_bounds(self.dataset_bounds, tile_bounds):
-                    return None
-
-            read_bounds = BoundingBox(
-                max(tile_bounds.left, self.dataset_bounds.left),
-                max(tile_bounds.bottom, self.dataset_bounds.bottom),
-                min(tile_bounds.right, self.dataset_bounds.right),
-                min(tile_bounds.top, self.dataset_bounds.top),
-            )
-            scale = tile_size / abs(tile_bounds.right - tile_bounds.left)
-            out_shape = (
-                1,
-                round(scale * abs(read_bounds.top - read_bounds.bottom)),
-                round(scale * abs(read_bounds.right - read_bounds.left)),
-            )
-            window = vrts[0].window(*read_bounds)
-
-            data = await self.get_raster_array(df, vrts, window, out_shape)
+            data = await self.get_raster_array(df, vrts, None)
             color = self.legend.colorize_pixels(data)
             image = Image.fromarray(
                 color[:, :, :3] if format == "jpg" else color,
                 mode=("RGB" if format == "jpg" else "RGBA"),
             )
-
-            # If the image is smaller than the tile size, pad it with empty pixels.
-            if image.size != (tile_size, tile_size):
-                left_offset = round(abs(read_bounds.left - tile_bounds.left) * scale)
-                top_offset = round(abs(tile_bounds.top - read_bounds.top) * scale)
-                padded_image = Image.new(image.mode, (tile_size, tile_size))
-                padded_image.paste(image, (left_offset, top_offset), mask=image)
-                image = padded_image
 
             with BytesIO() as memfile:
                 image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))
