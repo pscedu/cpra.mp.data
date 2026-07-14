@@ -1,6 +1,6 @@
 """Tests for the incremental catalog-sync hooks in write_parquet/compact_parquet
 (tabular.py) and write_cog/compact_cog (raster.py), plus the underlying shared
-logic in cpra.mp.data.catalog that scripts/build_catalog.py also uses.
+logic in cpra.mp.data.catalog that the `cpra.mp.data.cli catalog` CLI also uses.
 
 All data is written under tmp_path-based base_path/catalog_path fixtures (see
 conftest.py) -- never the real data/ directory (see repo CLAUDE.md).
@@ -170,7 +170,7 @@ def test_raster_catalog_from_paths_includes_metadata_dim(base_path):
     tif_paths = list(base_path.rglob("*.tif"))
     assert len(tif_paths) == 1
 
-    # Exercises the same full-rescan path scripts/build_catalog.py's `build`
+    # Exercises the same full-rescan path the `cpra.mp.data.cli catalog build`
     # command uses, independent of the incremental write_cog hook above.
     catalog = unify_dtypes(raster_catalog_from_paths(base_path, tif_paths))
     assert catalog.height == 1

@@ -12,8 +12,9 @@ The catalog is itself a Hive dataset partitioned by the dataset dimensions
 
 This module holds the logic shared by:
 
-* ``scripts/build_catalog.py``, which does a one-time/backfill full rescan of a
-  data tree (``raster_catalog_from_paths``/``tabular_catalog_from_files``), and
+* ``cpra.mp.data.cli.catalog`` (``python -m cpra.mp.data.cli catalog ...``), which
+  does a one-time/backfill full rescan of a data tree
+  (``raster_catalog_from_paths``/``tabular_catalog_from_files``), and
 * the incremental hooks in ``tabular.write_parquet``/``compact_parquet`` and
   ``raster.write_cog``/``compact_cog``, which keep the catalog in sync on every
   write/compact without a full rescan (``tabular_catalog_rows``/
@@ -236,7 +237,7 @@ class Catalog:
     ``write_parquet``/``write_cog``'s catalog hooks call ``append`` with rows built by
     ``tabular_catalog_rows``/``raster_catalog_rows``; ``compact_parquet``/``compact_cog``
     call ``compact_partition`` afterward to coalesce whatever rows now exist for that
-    variable/time_unit/grid partition. ``scripts/build_catalog.py``'s ``build`` command
+    variable/time_unit/grid partition. ``cpra.mp.data.cli.catalog``'s ``build`` command
     uses ``append`` for its one-time/backfill full rescan of a data tree
     (``raster_catalog_from_paths``/``tabular_catalog_from_files``); its ``compact``
     command walks the whole catalog tree directly rather than through this class, since
@@ -277,7 +278,7 @@ class CatalogQuery:
     """Data catalog query: a live filesystem walk under ``BASE_PATH``, independent of
     the materialized ``Catalog`` side-table above (that table exists to make querying
     faster than this walk; this class is the production fallback/reference it's checked
-    against -- see ``scripts/build_catalog.py``'s ``TableCatalogQuery``/``--compare``).
+    against -- see ``cpra.mp.data.cli.catalog``'s ``TableCatalogQuery``/``--compare``).
 
     Raises ``ValueError`` (not an HTTP-framework exception, to keep this module free of
     a web-framework dependency) when a query has no valid values for some dimension;

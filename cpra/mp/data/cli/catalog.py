@@ -36,20 +36,17 @@ it's also used by the incremental catalog-sync hooks in
 Usage:
 
 \b
-    python scripts/build_catalog.py build   --base-path data-long --out catalog
-    python scripts/build_catalog.py compact --catalog catalog
-    python scripts/build_catalog.py query   --catalog catalog --variable damage --compare
+    python -m cpra.mp.data.cli catalog build   --base-path data-long --out catalog
+    python -m cpra.mp.data.cli catalog compact --catalog catalog
+    python -m cpra.mp.data.cli catalog query   --catalog catalog --variable damage --compare
 """
 
-import sys
 import time
 import uuid
 from pathlib import Path
 
 import click
 import polars as pl
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cpra.mp.data.catalog import (
     CAL_DIMS,
@@ -65,16 +62,17 @@ from cpra.mp.data.catalog import (
     tabular_catalog_from_files,
     unify_dtypes,
 )
+from cpra.mp.data.cli import cli
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 
 
-@click.group()
-def cli():
-    pass
+@cli.group()
+def catalog():
+    """Generate, compact, and query the unified catalog side-table."""
 
 
-@cli.command()
+@catalog.command()
 @click.option("--base-path", default="data-long")
 @click.option("--out", default="catalog")
 def build(base_path, out):
@@ -100,14 +98,14 @@ def build(base_path, out):
         click.echo(f"tabular: {rel}  ->  {cat.height:,} rows")
         frames.append(cat)
 
-    catalog = pl.concat(frames, how="diagonal_relaxed")
-    ordered = [c for c in CATALOG_DIMS if c in catalog.columns and c not in CAL_DIMS] + EXTENT_COLS + ["data_type"]
-    catalog = catalog.select([c for c in ordered if c in catalog.columns])
-    Catalog(out).append(catalog)
-    click.echo(f"\nDONE: {catalog.height:,} rows -> {out}/ in {time.time()-t0:.1f}s")
+    catalog_df = pl.concat(frames, how="diagonal_relaxed")
+    ordered = [c for c in CATALOG_DIMS if c in catalog_df.columns and c not in CAL_DIMS] + EXTENT_COLS + ["data_type"]
+    catalog_df = catalog_df.select([c for c in ordered if c in catalog_df.columns])
+    Catalog(out).append(catalog_df)
+    click.echo(f"\nDONE: {catalog_df.height:,} rows -> {out}/ in {time.time()-t0:.1f}s")
 
 
-@cli.command()
+@catalog.command()
 @click.option("--catalog", "catalog_dir", default="catalog")
 def compact(catalog_dir):
     base = Path(catalog_dir)
@@ -179,7 +177,7 @@ class TableCatalogQuery(CatalogQuery):
         return {"choices": self._choices, "results": self._results, "exact": self._exact}
 
 
-@cli.command()
+@catalog.command()
 @click.option("--catalog", "catalog_dir", default="catalog")
 @click.option("--base-path", default="data-long")
 @click.option("--variable", default=None)
@@ -189,13 +187,13 @@ class TableCatalogQuery(CatalogQuery):
 def query(catalog_dir, base_path, variable, time_unit, grid, compare):
     from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
 
-    catalog = _load_catalog(catalog_dir)
+    catalog_df = _load_catalog(catalog_dir)
     dd_kwargs = {k: v for k, v in dict(variable=variable, time_unit=time_unit, grid=grid).items() if v is not None}
     dd = DatasetDimensions(**dd_kwargs)
     fd = FilterDimensions()
 
     t = time.time()
-    out = TableCatalogQuery(catalog, dd, fd).execute()
+    out = TableCatalogQuery(catalog_df, dd, fd).execute()
     click.echo(f"[table] {(time.time()-t)*1000:.1f} ms")
     for k, v in out["choices"].items():
         click.echo(f"  {k}: choices={v}  result={out['results'][k]}")
@@ -214,7 +212,3 @@ def query(catalog_dir, base_path, variable, time_unit, grid, compare):
                     click.echo(f"  DIFF choices[{k}]: fs={ref['choices'].get(k)} table={out['choices'].get(k)}")
                 if ref["results"].get(k) != out["results"].get(k):
                     click.echo(f"  DIFF results[{k}]: fs={ref['results'].get(k)} table={out['results'].get(k)}")
-
-
-if __name__ == "__main__":
-    cli()
