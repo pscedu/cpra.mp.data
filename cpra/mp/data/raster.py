@@ -343,7 +343,14 @@ def _calendar_value(value, calendar_dim):
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
 
 
-def compact_cog(base_path=BASE_PATH, catalog_path=CATALOG_PATH, compression="zstd", compression_level=6, **kwargs):
+def compact_cog(
+    base_path=BASE_PATH,
+    catalog_path=CATALOG_PATH,
+    output_base_path=None,
+    compression="zstd",
+    compression_level=6,
+    **kwargs,
+):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
 
     Every matching COG within a partition directory -- single-band or already
@@ -370,11 +377,21 @@ def compact_cog(base_path=BASE_PATH, catalog_path=CATALOG_PATH, compression="zst
     sitting under the older dataset-directory order -- the first time it's swept up here,
     merged with any contiguous neighbors in the same pass rather than as a separate
     rewrite step (grep ``LEGACY COG SHIM`` for every removable piece).
+
+    ``output_base_path``, when given, writes the merged COGs into a *separate* tree
+    (canonical dataset-directory order) instead of alongside their sources, and leaves
+    the source files in place -- used by the migration to build a long-format tree
+    out-of-place without mutating the input ``base_path``. It defaults to ``base_path``
+    (the in-place behavior). Out-of-place mode assumes every source needs rewriting
+    (true for legacy COGs, which are always rewritten): a run already living optimally
+    in a single up-to-date file is skipped and would *not* be copied across.
     """
 
     input_df = cast_columns(pl.DataFrame(kwargs))
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
+    base_path = Path(base_path)
+    output_base_path = base_path if output_base_path is None else Path(output_base_path)
     dataset_dir = dataset_path(base_path, **kwargs)
     grid = GRIDS[kwargs["grid"]]
 
@@ -457,11 +474,14 @@ def compact_cog(base_path=BASE_PATH, catalog_path=CATALOG_PATH, compression="zst
             if len(unique_paths) < 2 and not run_is_legacy:
                 continue
 
-            # LEGACY COG SHIM: `directory` is always pre-existing once every source is
-            # already canonical, but a legacy-only group's canonical directory may not
-            # exist on disk yet.
-            directory.mkdir(parents=True, exist_ok=True)
-            out_path = directory / f"{uuid.uuid4()}.tif"
+            # The output directory mirrors `directory`'s canonical dimensions but roots
+            # at output_base_path (== base_path for in-place compaction).  LEGACY COG
+            # SHIM: `directory` is always pre-existing once every source is already
+            # canonical, but a legacy-only group's canonical directory may not exist on
+            # disk yet; an out-of-place output directory never exists up front.
+            out_directory = output_base_path / directory.relative_to(base_path)
+            out_directory.mkdir(parents=True, exist_ok=True)
+            out_path = out_directory / f"{uuid.uuid4()}.tif"
 
             # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute
             # paths, so its own location doesn't matter) -- keep it out of the data
@@ -480,8 +500,11 @@ def compact_cog(base_path=BASE_PATH, catalog_path=CATALOG_PATH, compression="zst
                 # file, so the copy can be written directly -- no temp-file/rename needed.
                 copy(str(vrt_path), str(out_path), **profile)
 
-            for path in unique_paths:
-                path.unlink()
+            # Out-of-place output leaves the source tree untouched; only an in-place
+            # merge consumes and removes its sources.
+            if output_base_path == base_path:
+                for path in unique_paths:
+                    path.unlink()
 
     # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
     # partition (the self-healed rows appended above, plus any older, more-fragmented

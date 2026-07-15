@@ -21,12 +21,8 @@ Commands:
            started keeping the catalog in sync incrementally on every write.
   compact  per partition, combine files AND coalesce adjacent/overlapping
            calendar runs into minimal contiguous rows (like compact_parquet)
-  query    run the simplified, table-backed catalog query (``--compare`` checks
-           it against the real filesystem CatalogQuery)
-
-``TableCatalogQuery`` subclasses the real ``CatalogQuery`` (``cpra.mp.data.catalog``)
-and reuses its ``_update``/``_compress`` verbatim, overriding only ``execute`` -- the
-simplification this prototype is for.
+  query    run the table-backed catalog query (``cpra.mp.data.catalog.CatalogQuery``,
+           the same class the ``/catalog.json`` API route uses)
 
 The shared row-building/compaction logic lives in ``cpra.mp.data.catalog`` --
 it's also used by the incremental catalog-sync hooks in
@@ -38,7 +34,7 @@ Usage:
 \b
     python -m cpra.mp.data.cli catalog build   --base-path data-long --out catalog
     python -m cpra.mp.data.cli catalog compact --catalog catalog
-    python -m cpra.mp.data.cli catalog query   --catalog catalog --variable damage --compare
+    python -m cpra.mp.data.cli catalog query   --catalog catalog --variable damage
 """
 
 import time
@@ -52,10 +48,8 @@ from cpra.mp.data.catalog import (
     CAL_DIMS,
     CATALOG_DIMS,
     EXTENT_COLS,
-    PART_COLS,
     Catalog,
     CatalogQuery,
-    expand_calendar_range,
     merge_partition,
     parse_path_dims,
     raster_catalog_from_paths,
@@ -63,8 +57,6 @@ from cpra.mp.data.catalog import (
     unify_dtypes,
 )
 from cpra.mp.data.cli import cli
-from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.utils import get_input_data_frame, required_columns
 
 
 @cli.group()
@@ -129,86 +121,20 @@ def compact(catalog_dir):
     click.echo(f"\nDONE: {n_parts} partitions, {n_before:,} -> {n_after:,} rows")
 
 
-def _load_catalog(catalog_dir):
-    return pl.read_parquet(Path(catalog_dir), hive_partitioning=True).with_columns(
-        pl.col(c).cast(pl.String) for c in PART_COLS
-    )
-
-
-class TableCatalogQuery(CatalogQuery):
-    """Catalog query backed by the unified table; reuses _update/_compress."""
-
-    def __init__(self, catalog, dataset_dimensions, filter_dimensions):
-        super().__init__(dataset_dimensions, filter_dimensions)
-        self.catalog = catalog
-
-    def execute(self):
-        input_df = get_input_data_frame(**dict(self.dataset_dimensions), **dict(self.filter_dimensions))
-        required_cols = required_columns(input_df)
-        non_cal = [c for c in CATALOG_DIMS if c in self.catalog.columns and c in required_cols and c not in CAL_DIMS]
-
-        lf = self.catalog.lazy()
-        for col in non_cal:
-            dim = DIMENSIONS[col]
-            raw = lf.select(col).drop_nulls().unique().sort(col).collect()[col].to_list()
-            if not raw:
-                continue
-            if dim.values is not None and str(dim.dtype).startswith("Float"):
-                cmap = dict(zip(dim.values["value"].cast(dim.dtype).to_list(), dim.values["value"].to_list()))
-                values = [cmap.get(v, v) for v in raw]
-            else:
-                values = raw
-            self._update(dimension_name=col, dimension_values=values)
-            sel = pl.Series(self._results[col], dtype=dim.dtype)
-            lf = lf.filter(pl.col(col).is_in(sel) | pl.col(col).is_null())
-
-        time_unit = (self._results.get("time_unit") or [None])[0]
-        for cal in CAL_DIMS:
-            if cal not in required_cols or f"{cal}_min" not in self.catalog.columns:
-                continue
-            ext = lf.select(f"{cal}_min", f"{cal}_max").drop_nulls().unique().collect()
-            values = set()
-            for mn, mx in ext.iter_rows():
-                values.update(expand_calendar_range(cal, time_unit, mn, mx).to_list())
-            if values:
-                self._update(dimension_name=cal, dimension_values=sorted(values))
-
-        self._compress()
-        return {"choices": self._choices, "results": self._results, "exact": self._exact}
-
-
 @catalog.command()
 @click.option("--catalog", "catalog_dir", default="catalog")
-@click.option("--base-path", default="data-long")
 @click.option("--variable", default=None)
 @click.option("--time-unit", default=None)
 @click.option("--grid", default=None)
-@click.option("--compare", is_flag=True)
-def query(catalog_dir, base_path, variable, time_unit, grid, compare):
+def query(catalog_dir, variable, time_unit, grid):
     from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
 
-    catalog_df = _load_catalog(catalog_dir)
     dd_kwargs = {k: v for k, v in dict(variable=variable, time_unit=time_unit, grid=grid).items() if v is not None}
     dd = DatasetDimensions(**dd_kwargs)
     fd = FilterDimensions()
 
     t = time.time()
-    out = TableCatalogQuery(catalog_df, dd, fd).execute()
+    out = CatalogQuery(dd, fd, catalog_path=catalog_dir).execute()
     click.echo(f"[table] {(time.time()-t)*1000:.1f} ms")
     for k, v in out["choices"].items():
         click.echo(f"  {k}: choices={v}  result={out['results'][k]}")
-
-    if compare:
-        import cpra.mp.data.catalog as catalog_module
-
-        catalog_module.BASE_PATH = Path(base_path)
-        t = time.time()
-        ref = CatalogQuery(dd, fd).execute()
-        same = ref["choices"] == out["choices"] and ref["results"] == out["results"]
-        click.echo(f"\n[filesystem] {time.time()-t:.2f} s   choices/results identical: {same}")
-        if not same:
-            for k in sorted(set(ref["choices"]) | set(out["choices"])):
-                if ref["choices"].get(k) != out["choices"].get(k):
-                    click.echo(f"  DIFF choices[{k}]: fs={ref['choices'].get(k)} table={out['choices'].get(k)}")
-                if ref["results"].get(k) != out["results"].get(k):
-                    click.echo(f"  DIFF results[{k}]: fs={ref['results'].get(k)} table={out['results'].get(k)}")

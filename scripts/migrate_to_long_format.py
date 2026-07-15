@@ -1,8 +1,18 @@
-"""Migrate tabular Parquet datasets from wide format to long format.
+"""Migrate model datasets into the long-format tree, out-of-place.
 
-All wide-format files in the same partition directory are processed together
-and written as a single long-format Parquet file, so each output partition
-contains exactly one file.  The original wide-format files are left untouched.
+Reads from ``--data-path`` and writes a complete long-format tree under
+``--output-path``, leaving the input untouched.  Two kinds of data are handled:
+
+* **Tabular (Parquet).**  All wide-format files in the same partition directory
+  are converted together and written as a single long-format Parquet file, so
+  each output partition contains exactly one file.
+* **Raster (COG).**  Single-band COGs (including legacy single-band files) are
+  compacted into multi-band COGs wherever a contiguous calendar run spans more
+  than one file, via ``raster.compact_cog`` writing into the output tree.
+
+Everything processed is recorded in the unified catalog side-table under
+``--catalog-path`` (per-write rows appended by the write/compact functions, then
+coalesced into minimal contiguous runs by a final compaction pass).
 
 Usage:
 
@@ -11,14 +21,15 @@ Usage:
     python scripts/migrate_to_long_format.py --output-path /path/to/output --dry-run
 
 \b
-    # Migrate a single dataset
+    # Migrate a single dataset (works for tabular or raster variables)
     python scripts/migrate_to_long_format.py \\
-        --output-path /path/to/output \\
+        --output-path /path/to/output --catalog-path /path/to/catalog \\
         --variable sal --grid hydro_compartment_v001 --time-unit daily
 
 \b
     # Migrate all datasets
-    python scripts/migrate_to_long_format.py --output-path /path/to/output
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog
 
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
@@ -43,8 +54,10 @@ from tqdm import tqdm
 # script is run from any working directory.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.catalog import Catalog, parse_path_dims
+from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.raster import compact_cog
 from cpra.mp.data.tabular import read_parquet, write_parquet
 from cpra.mp.data.utils import long_sort_expressions
 
@@ -54,6 +67,7 @@ def _db_init(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS migrations (
             partition TEXT PRIMARY KEY,
+            data_type TEXT NOT NULL DEFAULT 'tabular',
             files INTEGER NOT NULL,
             geo_cols INTEGER NOT NULL,
             long_rows INTEGER NOT NULL,
@@ -62,6 +76,9 @@ def _db_init(db_path: Path) -> sqlite3.Connection:
             completed_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
+    # Add data_type to progress DBs created before the raster/unified migration.
+    if "data_type" not in {row[1] for row in conn.execute("PRAGMA table_info(migrations)")}:
+        conn.execute("ALTER TABLE migrations ADD COLUMN data_type TEXT NOT NULL DEFAULT 'tabular'")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS failures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,12 +132,13 @@ def _db_record(
     long_rows: int,
     elapsed_s: float,
     peak_bytes: int,
+    data_type: str = "tabular",
 ) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO migrations"
-        " (partition, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-        (partition, files, geo_cols, long_rows, elapsed_s, peak_bytes),
+        " (partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+        (partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes),
     )
     conn.commit()
 
@@ -147,7 +165,7 @@ def _dimension_cols_from_hive(path: Path) -> dict:
 
 def _convert_batched(
     parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-    progress_cb=None, temp_path=None,
+    progress_cb=None, temp_path=None, catalog_path=None,
 ) -> list[str]:
     """Batched conversion via temp files, bounded to roughly one batch in memory.
 
@@ -246,6 +264,7 @@ def _convert_batched(
         write_parquet(
             pl.scan_parquet(tmp_paths),
             base_path=output_path,
+            catalog_path=catalog_path,
             validate=False,
             sort=False,
             temp_dir=temp_path,
@@ -258,6 +277,7 @@ def migrate_partition(
     parquet_paths: list[Path],
     base_path: Path,
     output_path: Path,
+    catalog_path: Path | None = None,
     dry_run: bool = False,
     memory_limit: int | None = None,
     progress_cb=None,
@@ -277,6 +297,9 @@ def migrate_partition(
     temp_path, when given, is the directory under which the intermediate batch
     files are written (e.g. a fast dedicated scratch filesystem); otherwise the
     system default temp location is used.
+
+    catalog_path, when given, is passed to ``write_parquet`` so its catalog hook
+    appends rows to the migration's catalog (None -- e.g. dry runs -- disables it).
 
     progress_cb, when given, is called as progress_cb(done, total) to report
     intra-partition progress (number of batches written).
@@ -339,7 +362,7 @@ def migrate_partition(
     # tunes the per-batch budget.
     messages += _convert_batched(
         parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-        progress_cb, temp_path,
+        progress_cb, temp_path, catalog_path,
     )
 
     elapsed = time.perf_counter() - t0
@@ -348,6 +371,75 @@ def migrate_partition(
     peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
     messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
     return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
+
+
+def _raster_source_tifs(base_path: Path, variable: str, time_unit: str, grid: str) -> list[Path]:
+    """All source COGs for one dataset, looked up under both directory orders.
+
+    ``compact_cog`` reads from the canonical (variable/time_unit/grid) order and
+    the legacy (variable/grid/time_unit) order; mirror both here so the reported
+    source count matches what it will actually consolidate.
+    """
+    dirs = [
+        base_path / f"variable={variable}" / f"time_unit={time_unit}" / f"grid={grid}",
+        base_path / f"variable={variable}" / f"grid={grid}" / f"time_unit={time_unit}",
+    ]
+    return [p for d in dirs if d.exists() for p in d.rglob("*.tif")]
+
+
+def migrate_raster_dataset(
+    dataset_kwargs: dict,
+    base_path: Path,
+    output_path: Path,
+    catalog_path: Path | None = None,
+    dry_run: bool = False,
+) -> tuple[dict, list[str]]:
+    """Compact one raster dataset's single-band COGs into multi-band COGs, written
+    into the output tree with the input left untouched.
+
+    ``dataset_kwargs`` holds variable/time_unit/grid.  Every matching COG under
+    ``base_path`` (canonical or legacy directory order) is pooled per partition and
+    consolidated by ``raster.compact_cog`` writing into ``output_path``; catalog
+    rows are appended and the partition coalesced by compact_cog itself when
+    ``catalog_path`` is given.  Returns (result, messages); result carries
+    ``data_type="raster"``, ``files`` (source COG count) and ``geo_cols`` (output
+    COG count), plus ``elapsed_s``/``peak_bytes`` when not a dry run.
+    """
+    messages: list[str] = []
+    variable, time_unit, grid = dataset_kwargs["variable"], dataset_kwargs["time_unit"], dataset_kwargs["grid"]
+    rel = f"variable={variable}/time_unit={time_unit}/grid={grid}"
+
+    n_src = len(_raster_source_tifs(base_path, variable, time_unit, grid))
+    messages.append(
+        f"  {'[DRY RUN] ' if dry_run else ''}Compacting rasters: {rel} ({n_src} source COG{'s' if n_src != 1 else ''})"
+    )
+    if dry_run:
+        return {"data_type": "raster", "files": n_src, "geo_cols": 0, "long_rows": 0}, messages
+
+    t0 = time.perf_counter()
+    compact_cog(
+        base_path=base_path,
+        output_base_path=output_path,
+        catalog_path=catalog_path,
+        **dataset_kwargs,
+    )
+    elapsed = time.perf_counter() - t0
+
+    out_dir = output_path / rel
+    n_out = len(list(out_dir.rglob("*.tif"))) if out_dir.exists() else 0
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
+    messages.append(
+        f"    done in {elapsed:.1f}s, {n_src} -> {n_out} COG(s), peak RSS {_fmt_bytes(peak_bytes)}"
+    )
+    return {
+        "data_type": "raster",
+        "files": n_src,
+        "geo_cols": n_out,
+        "long_rows": 0,
+        "elapsed_s": elapsed,
+        "peak_bytes": peak_bytes,
+    }, messages
 
 
 def _fmt_bytes(n: float) -> str:
@@ -536,29 +628,34 @@ def estimate_partitions(
 def _run_partition(args, result_queue):
     """Target for worker processes spawned directly (not via Pool).
 
-    Each partition runs in a fresh subprocess so allocator memory from
-    Polars/Arrow is fully released when the process exits.  Messages are tagged
-    tuples on result_queue:
+    Each task runs in a fresh subprocess so allocator memory from Polars/Arrow (or
+    GDAL) is fully released when the process exits.  A task is either a tabular
+    partition (``("tabular", rel, [parquet paths])``) or a raster dataset
+    (``("raster", rel, {dim kwargs})``); the kind selects the migration function.
+    Messages are tagged tuples on result_queue:
       ("progress", pid, rel, done, total)            — intra-partition progress
       ("result",   pid, rel, result, messages, error) — terminal result
     If the process is killed by a signal the queue is never written; the main
     process detects this via p.exitcode.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    paths, base_path, output_path, dry_run, memory_limit, progress, temp_path = args
-    rel = str(paths[0].parent.relative_to(base_path))
+    task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path = args
+    kind, rel, payload = task
     pid = os.getpid()
 
     def progress_cb(done, total):
         result_queue.put(("progress", pid, rel, done, total))
 
     try:
-        result, messages = migrate_partition(
-            paths, base_path, output_path, dry_run,
-            memory_limit=memory_limit,
-            progress_cb=progress_cb if progress else None,
-            temp_path=temp_path,
-        )
+        if kind == "raster":
+            result, messages = migrate_raster_dataset(payload, base_path, output_path, catalog_path, dry_run)
+        else:
+            result, messages = migrate_partition(
+                payload, base_path, output_path, catalog_path, dry_run,
+                memory_limit=memory_limit,
+                progress_cb=progress_cb if progress else None,
+                temp_path=temp_path,
+            )
         result_queue.put(("result", pid, rel, result, messages, None))
     except Exception as exc:
         result_queue.put(("result", pid, rel, None, [], str(exc)))
@@ -577,11 +674,44 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
     return dict(sorted(partitions.items()))
 
 
+def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=None) -> list[dict]:
+    """Find distinct raster (COG) datasets under base_path, keyed by variable/time_unit/grid.
+
+    COGs live under either the canonical (variable/time_unit/grid) or the legacy
+    (variable/grid/time_unit) directory order; both are globbed and collapsed to
+    one entry per (variable, time_unit, grid).  A dataset is included only if it
+    actually contains .tif files (so Parquet-only trees are skipped).  Returns a
+    sorted list of dimension-kwargs dicts suitable for ``compact_cog``.
+    """
+    v, g, t = variable or "*", grid or "*", time_unit or "*"
+    patterns = [
+        f"variable={v}/time_unit={t}/grid={g}",  # canonical
+        f"variable={v}/grid={g}/time_unit={t}",  # legacy
+    ]
+    datasets: dict[tuple, dict] = {}
+    for pattern in patterns:
+        for dataset_dir in base_path.glob(pattern):
+            if next(dataset_dir.rglob("*.tif"), None) is None:
+                continue
+            dims = parse_path_dims(dataset_dir.relative_to(base_path))
+            key = (dims["variable"], dims["time_unit"], dims["grid"])
+            datasets[key] = {"variable": dims["variable"], "time_unit": dims["time_unit"], "grid": dims["grid"]}
+    return [datasets[key] for key in sorted(datasets)]
+
+
 @click.command(
     help=__doc__,
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
 )
 @click.option("--output-path", help="Root directory for long-format output (required unless --estimate).")
+@click.option(
+    "--catalog-path",
+    metavar="DIR",
+    default=str(CATALOG_PATH),
+    show_default=True,
+    help="Root directory for the unified catalog side-table. Rows are appended as data is "
+    "written and coalesced into minimal contiguous runs at the end. Ignored for --dry-run.",
+)
 @click.option("--estimate", is_flag=True, help="Print a memory-estimate table sorted by peak memory and exit.")
 @click.option("--variable", help="Migrate only this variable.")
 @click.option("--grid", help="Migrate only this grid.")
@@ -619,7 +749,7 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
     "filesystem). Defaults to the system temp location.",
 )
 def main(
-    output_path, estimate, variable, grid, time_unit, dry_run, progress,
+    output_path, catalog_path, estimate, variable, grid, time_unit, dry_run, progress,
     data_path, workers, progress_db, memory_limit, temp_path,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
@@ -637,44 +767,65 @@ def main(
 
     base_path = Path(data_path).resolve()
     partitions = find_partitions(base_path, variable, grid, time_unit)
+    raster_datasets = find_raster_datasets(base_path, variable, grid, time_unit)
 
-    if not partitions:
-        print("No Parquet files found matching the given filters.")
+    if not partitions and not raster_datasets:
+        print("No datasets found matching the given filters.")
         return
 
     if estimate:
         estimate_partitions(partitions, base_path, progress=progress, memory_limit=memory_limit)
+        if raster_datasets:
+            n_tifs = sum(
+                len(_raster_source_tifs(base_path, d["variable"], d["time_unit"], d["grid"]))
+                for d in raster_datasets
+            )
+            print(
+                f"\nRaster: {len(raster_datasets)} dataset(s), {n_tifs} source COG(s) "
+                "(compacted via VRT — memory-light, not modeled above)."
+            )
         return
 
     output_path = Path(output_path).resolve()
+    # --dry-run writes nothing (no data, no catalog), so disable the catalog hooks
+    # by passing None through to the write/compact functions.
+    catalog_path = None if dry_run else Path(catalog_path).resolve()
+
+    # One unified task list: tabular partitions and raster datasets, each tagged
+    # with its kind and a stable progress key (rel).
+    tasks: list[tuple[str, str, object]] = []
+    for paths in partitions.values():
+        tasks.append(("tabular", str(paths[0].parent.relative_to(base_path)), paths))
+    for d in raster_datasets:
+        rel = f"variable={d['variable']}/time_unit={d['time_unit']}/grid={d['grid']}"
+        tasks.append(("raster", rel, d))
 
     db_conn: sqlite3.Connection | None = None
-    partition_list = list(partitions.values())
     db_skipped = 0
     if progress_db:
         db_conn = _db_init(Path(progress_db))
         completed = _db_completed(db_conn)
         if completed:
-            partition_list = [
-                paths for paths in partition_list
-                if str(paths[0].parent.relative_to(base_path)) not in completed
-            ]
-            db_skipped = len(partitions) - len(partition_list)
+            kept = [t for t in tasks if t[1] not in completed]
+            db_skipped = len(tasks) - len(kept)
+            tasks = kept
 
-    total_files = sum(len(p) for p in partition_list)
-    total_partitions = len(partition_list)
-    summary = f"Found {total_files} Parquet file(s) across {total_partitions} partition(s)."
+    n_tabular = sum(1 for t in tasks if t[0] == "tabular")
+    n_raster = sum(1 for t in tasks if t[0] == "raster")
+    total_partitions = len(tasks)
+    summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster dataset(s)."
     if db_skipped:
         summary += f" ({db_skipped} already in progress database, skipped.)"
     print(summary)
     migrated = 0
     skipped = 0
     errors: list[str] = []
+    touched_datasets: set[tuple] = set()  # (variable, time_unit, grid) to compact in the catalog
 
     desc = "[DRY RUN]" if dry_run else "Migrating"
     packed = [
-        (paths, base_path, output_path, dry_run, memory_limit, progress, temp_path)
-        for paths in partition_list
+        (task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path)
+        for task in tasks
     ]
 
     # spawn avoids fork-after-threads problems with Polars' internal thread pool.
@@ -691,10 +842,10 @@ def main(
             item = next(task_iter)
         except StopIteration:
             return False
-        paths, *_ = item
+        task = item[0]
         p = ctx.Process(target=_run_partition, args=(item, result_queue), daemon=True)
         p.start()
-        active[p.pid] = (p, str(paths[0].parent.relative_to(base_path)))
+        active[p.pid] = (p, task[1])
         return True
 
     # Nested per-worker progress bars (one slot per active worker, below the
@@ -784,16 +935,21 @@ def main(
                         _db_record_failure(db_conn, rel, error)
                 elif result is None:
                     skipped += 1  # not wide format
-                elif result.get("skipped"):
-                    skipped += 1  # already in long format on disk
-                    if db_conn is not None:
-                        _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0)
-                elif "elapsed_s" in result:
-                    migrated += 1
-                    if db_conn is not None:
-                        _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"])
                 else:
-                    migrated += 1  # dry run
+                    data_type = result.get("data_type", "tabular")
+                    dims = parse_path_dims(rel)
+                    if {"variable", "time_unit", "grid"} <= dims.keys():
+                        touched_datasets.add((dims["variable"], dims["time_unit"], dims["grid"]))
+                    if result.get("skipped"):
+                        skipped += 1  # already in long format on disk
+                        if db_conn is not None:
+                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0, data_type)
+                    elif "elapsed_s" in result:
+                        migrated += 1
+                        if db_conn is not None:
+                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"], data_type)
+                    else:
+                        migrated += 1  # dry run
                 bar.update(1)
                 bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:
@@ -809,10 +965,19 @@ def main(
         if db_conn is not None:
             db_conn.close()
 
+    # Coalesce the catalog for every dataset touched: write_parquet appended
+    # per-write rows and compact_cog appended raster rows, so a final
+    # compact_partition per variable/time_unit/grid collapses them into minimal
+    # contiguous runs.  Idempotent (a single-file catalog partition is a no-op).
+    if catalog_path is not None and touched_datasets:
+        catalog = Catalog(catalog_path)
+        for variable_, time_unit_, grid_ in sorted(touched_datasets):
+            catalog.compact_partition(variable_, time_unit_, grid_)
+
     label = "Would migrate" if dry_run else "Migrated"
-    print(f"\n{label} {migrated} partition(s), skipped {skipped} already-long partition(s).")
+    print(f"\n{label} {migrated} unit(s), skipped {skipped}.")
     if errors:
-        print(f"\n{len(errors)} partition(s) failed:", file=sys.stderr)
+        print(f"\n{len(errors)} unit(s) failed:", file=sys.stderr)
         for err in errors:
             print(f"  {err}", file=sys.stderr)
         sys.exit(1)

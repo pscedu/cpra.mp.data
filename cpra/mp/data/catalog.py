@@ -21,11 +21,13 @@ This module holds the logic shared by:
   ``raster_catalog_rows`` build the rows; the ``Catalog`` class -- initialized with
   a catalog path -- appends/coalesces them).
 
-Also holds ``CatalogQuery``, the production catalog-query implementation (a live
-filesystem walk, independent of the materialized side-table above) used by the
-``/catalog.json`` API route. It raises ``ValueError`` rather than an HTTP-framework
-exception so this module has no web-framework dependency; callers (e.g. the FastAPI
-route in ``api/__init__.py``) catch it and translate it into an ``HTTPException``.
+Also holds ``CatalogQuery``, the production catalog-query implementation, which
+resolves a request's dimension choices/results by scanning the materialized
+side-table above (loaded scoped to the requested variable/time_unit/grid) rather
+than walking the data tree -- used by the ``/catalog.json`` API route. It raises
+``ValueError`` rather than an HTTP-framework exception so this module has no
+web-framework dependency; callers (e.g. the FastAPI route in ``api/__init__.py``)
+catch it and translate it into an ``HTTPException``.
 
 Raster catalog rows include metadata-typed dimensions (e.g. ``model``) the same
 as tabular rows do. Metadata dimensions are never COG path components (see
@@ -34,7 +36,6 @@ dataset tags, not the path -- ``raster_rows``/``raster_catalog_rows`` source the
 from tags accordingly.
 """
 
-import re
 import uuid
 from pathlib import Path
 
@@ -43,7 +44,7 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import rasterio
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import CATALOG_PATH
 from cpra.mp.data.dimensions import DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.utils import (
     RANGE_FUNCTIONS,
@@ -58,7 +59,6 @@ CAL_DIMS = ("calendar_year", "calendar_day")
 PART_COLS = ["variable", "time_unit", "grid"]
 EXCLUDE = {"grid_cell", "value"}
 EXTENT_COLS = [f"{c}_{s}" for c in CAL_DIMS for s in ("min", "max", "count")]
-TIF_EXTENSION = re.compile(r"\.tif$")
 
 
 def cal_for(time_unit):
@@ -275,35 +275,58 @@ class Catalog:
 
 
 class CatalogQuery:
-    """Data catalog query: a live filesystem walk under ``BASE_PATH``, independent of
-    the materialized ``Catalog`` side-table above (that table exists to make querying
-    faster than this walk; this class is the production fallback/reference it's checked
-    against -- see ``cpra.mp.data.cli.catalog``'s ``TableCatalogQuery``/``--compare``).
+    """Data catalog query backed by the materialized ``Catalog`` side-table above.
+
+    Given a request's dataset dimensions (variable/time_unit/grid) and filter
+    dimensions, it resolves the available ``choices`` and selected ``results`` for
+    every dimension by scanning the side-table (one row per dimension combination x
+    contiguous calendar run) rather than walking the data tree -- so it works for
+    tabular (Parquet) and raster (multi-band COG) datasets alike.  Used by the
+    ``/catalog.json`` API route.
+
+    The catalog is loaded from ``catalog_path`` scoped to the requested
+    variable/time_unit/grid partition(s) unless a preloaded ``catalog`` frame is
+    supplied (used by the CLI/tests).
 
     Raises ``ValueError`` (not an HTTP-framework exception, to keep this module free of
-    a web-framework dependency) when a query has no valid values for some dimension;
-    callers translate that into the appropriate HTTP error.
+    a web-framework dependency) when a query has no catalog entries or no valid values
+    for some dimension; callers translate that into the appropriate HTTP error.
     """
 
-    def __init__(self, dataset_dimensions, filter_dimensions):
+    def __init__(self, dataset_dimensions, filter_dimensions, catalog=None, catalog_path=CATALOG_PATH):
         self.dataset_dimensions = dataset_dimensions
         self.filter_dimensions = filter_dimensions
+        self._catalog = catalog
+        self._catalog_path = Path(catalog_path)
         self._choices = {}
         self._results = {}
         self._exact = True
 
-    def _update(self, dimension_name=None, dimension_values=None, items=None):
-        # Ignore items that don't follow our naming scheme.
-        if items is not None:
-            items[:] = [item for item in items if "=" in item]
-            if dimension_name is None:
-                dimension_name = items[0].split("=")[0]
+    def _load_catalog(self):
+        """Load the side-table scoped to the requested dataset partition(s).
 
+        A preloaded frame (the ``catalog`` constructor arg) is returned as-is.  Otherwise
+        the Hive-partitioned catalog under ``catalog_path`` is read for the
+        variable/time_unit/grid selected by the dataset dimensions (a wildcard for any
+        left unset), so a single request never unions the heterogeneous per-variable
+        schemas of the whole tree.  ``PART_COLS`` are cast to String to match the values
+        the dataset dimensions carry.
+        """
+        if self._catalog is not None:
+            return self._catalog
+        parts = []
+        for name in PART_COLS:
+            value = getattr(self.dataset_dimensions, name, None)
+            parts.append(f"{name}={value}" if value else f"{name}=*")
+        files = [str(p) for p in self._catalog_path.glob("/".join(parts) + "/*.parquet")]
+        if not files:
+            msg = "No catalog entries for the requested dataset"
+            raise ValueError(msg)
+        frame = pl.read_parquet(files, hive_partitioning=True)
+        return frame.with_columns(pl.col(c).cast(pl.String) for c in PART_COLS)
+
+    def _update(self, dimension_name, dimension_values):
         dimension = DIMENSIONS.get(dimension_name)
-        dtype = dimension.dtype.to_python()
-
-        if items is not None:
-            dimension_values = sorted([dtype(d.split("=")[1]) for d in items])
 
         # Update choices with the dimension values.
         if dimension_name in self._choices:
@@ -354,10 +377,6 @@ class CatalogQuery:
 
         self._results[dimension_name] = selected_values
 
-        # Updates items to prevent walking unnecessary directories.
-        if items is not None:
-            items[:] = [f"{dimension_name}={val!s}" for val in selected_values]
-
     def _compress(self):
         """Compress date/time values into continuous [start, end] intervals."""
         for dimension_name, values in self._choices.items():
@@ -384,50 +403,39 @@ class CatalogQuery:
                 ]
 
     def execute(self):
-        """Execute a query for data."""
+        """Resolve dimension choices/results from the catalog side-table."""
+        catalog = self._load_catalog()
         input_df = get_input_data_frame(**dict(self.dataset_dimensions), **dict(self.filter_dimensions))
         required_cols = required_columns(input_df)
+        non_cal = [c for c in CATALOG_DIMS if c in catalog.columns and c in required_cols and c not in CAL_DIMS]
 
-        parquet_paths = []
-        for root, dirs, files in BASE_PATH.walk():
-            if dirs:
-                self._update(items=dirs)
-            elif files:
-                if files[0].endswith(".tif"):
-                    self._update(items=[TIF_EXTENSION.sub("", file) for file in files])
-                if files[0].endswith(".parquet"):
-                    parquet_paths.extend([root / file for file in files])
+        lf = catalog.lazy()
+        for col in non_cal:
+            dim = DIMENSIONS[col]
+            raw = lf.select(col).drop_nulls().unique().sort(col).collect()[col].to_list()
+            if not raw:
+                continue
+            # Map float32-repr values (e.g. 0.10000000149011612) back to their canonical
+            # display values (e.g. 0.1) using the dimension's known values list.
+            if dim.values is not None and str(dim.dtype).startswith("Float"):
+                cmap = dict(zip(dim.values["value"].cast(dim.dtype).to_list(), dim.values["value"].to_list()))
+                values = [cmap.get(v, v) for v in raw]
+            else:
+                values = raw
+            self._update(dimension_name=col, dimension_values=values)
+            sel = pl.Series(self._results[col], dtype=dim.dtype)
+            lf = lf.filter(pl.col(col).is_in(sel) | pl.col(col).is_null())
 
-        if parquet_paths:
-            filter_cols = [col for col in required_cols if col not in self._results]
-            # Scan one column at a time and add each selection as a predicate before
-            # reading the next column.  Polars pushes these predicates into parquet
-            # row-group and file statistics, so each subsequent pass reads
-            # progressively less data than a single all-columns unique() would.
-            lf = pl.scan_parquet(parquet_paths).select(filter_cols)
-            for col in filter_cols:
-                raw_values = lf.select(col).unique().sort(col).collect()[col].to_list()
-                # Map float32-repr values (e.g. 0.10000000149011612) back to their
-                # canonical display values (e.g. 0.1) using the dimension's known
-                # values list, so choices/results are consistent with dimensions.json.
-                dim = DIMENSIONS[col]
-                if dim.values is not None and str(dim.dtype).startswith("Float"):
-                    canonical_map = dict(zip(
-                        dim.values["value"].cast(dim.dtype).to_list(),
-                        dim.values["value"].to_list(),
-                    ))
-                    values = [canonical_map.get(v, v) for v in raw_values]
-                else:
-                    values = raw_values
-                self._update(dimension_name=col, dimension_values=values)
-                # Cast results through the storage dtype before is_in so the
-                # Float32 column comparison is exact (avoids deprecation warning).
-                cast_results = pl.Series(self._results[col], dtype=dim.dtype).to_list()
-                lf = lf.filter(pl.col(col).is_in(cast_results))
+        time_unit = (self._results.get("time_unit") or [None])[0]
+        for cal in CAL_DIMS:
+            if cal not in required_cols or f"{cal}_min" not in catalog.columns:
+                continue
+            ext = lf.select(f"{cal}_min", f"{cal}_max").drop_nulls().unique().collect()
+            values = set()
+            for mn, mx in ext.iter_rows():
+                values.update(expand_calendar_range(cal, time_unit, mn, mx).to_list())
+            if values:
+                self._update(dimension_name=cal, dimension_values=sorted(values))
 
         self._compress()
-        return {
-            "choices": self._choices,
-            "results": self._results,
-            "exact": self._exact,
-        }
+        return {"choices": self._choices, "results": self._results, "exact": self._exact}
