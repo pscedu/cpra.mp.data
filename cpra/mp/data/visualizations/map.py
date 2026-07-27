@@ -727,6 +727,32 @@ class Map(DatasetVisualization):
             },
             # Project labels
             {
+                "id": f"project-label-id{suffix}",
+                "type": "symbol",
+                "source": "projects",
+                "source-layer": "project_label",
+                "filter": [
+                    "all",
+                    ["!=", ["get", "project_type_code"], "OR"],
+                    year_filter,
+                ],
+                "maxzoom": 10,
+                "minzoom": 8,
+                "layout": {
+                    "text-anchor": "top",
+                    "text-field": ["get", "portal_id"],
+                    "text-offset": ["literal", [0, 0.75]],
+                    "text-size": 14,
+                    "text-font": ["literal", ["Franklin Gothic Demi Regular"]],
+                },
+                "paint": {
+                    "text-color": "#444444",
+                    "text-halo-blur": 1,
+                    "text-halo-color": "#ffffff",
+                    "text-halo-width": 2,
+                },
+            },
+            {
                 "id": f"project-label{suffix}",
                 "type": "symbol",
                 "source": "projects",
@@ -736,10 +762,10 @@ class Map(DatasetVisualization):
                     ["!=", ["get", "project_type_code"], "OR"],
                     year_filter,
                 ],
-                "minzoom": 9,
+                "minzoom": 10,
                 "layout": {
                     "text-anchor": "top",
-                    "text-field": ["get", "project_name"],
+                    "text-field": ["concat", ["get", "project_name"], " (", ["get", "portal_id"], ")"],
                     "text-offset": ["literal", [0, 0.75]],
                     "text-size": 14,
                     "text-font": ["literal", ["Franklin Gothic Demi Regular"]],
