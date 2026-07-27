@@ -72,6 +72,20 @@ def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
     )
 
 
+def _vrt_source_elements(source):
+    """Open one ``vrt`` source and return its ``(dataset_el, selected_band_el)`` VRT XML.
+
+    ``source`` is a bare path (band 1) or a ``(path, band)`` pair; ``band_el`` is that
+    source's chosen ``VRTRasterBand`` element (still parented to ``dataset_el``).
+    """
+
+    path, band = source if isinstance(source, tuple) else (source, 1)
+    with rio.open(path) as raster, MemoryFile() as memory:
+        copy(raster, memory.name, driver="VRT")
+        dataset_el = xml.etree.ElementTree.fromstring(memory.read().decode("utf-8"))
+    return dataset_el, dataset_el.find(f"VRTRasterBand[@band='{band}']")
+
+
 def vrt(sources):
     """Create a band-separate VRT dataset from the given sources.
 
@@ -79,26 +93,27 @@ def vrt(sources):
     selecting a specific 1-based band -- used by ``compact_cog`` to consolidate
     contiguous runs that span already multi-band COGs.  Output band order matches
     ``sources`` order; each output band inherits its source band's own description.
+
+    Each source's XML is extracted in parallel (opening/copying a COG to a VRT is
+    I/O-bound and releases the GIL, same as ``_parallel_read_cog_metadata``); the tree is
+    then assembled serially so the output is identical regardless of thread scheduling.
     """
 
     # Adapted from: https://gis.stackexchange.com/a/421687
-    out_el = None
-    for out_idx, source in enumerate(sources, start=1):
-        path, band = source if isinstance(source, tuple) else (source, 1)
-        with rio.open(path) as raster, MemoryFile() as memory:
-            copy(raster, memory.name, driver="VRT")
-            dataset_el = xml.etree.ElementTree.fromstring(memory.read().decode("utf-8"))
-            band_el = dataset_el.find(f"VRTRasterBand[@band='{band}']")
-            band_el.set("band", str(out_idx))
+    with ThreadPoolExecutor() as pool:
+        extracted = list(pool.map(_vrt_source_elements, sources))
 
-            if out_el is None:
-                out_el = dataset_el
-                # Keep only the selected band; drop any other bands this source has.
-                for extra in list(out_el.findall("VRTRasterBand")):
-                    if extra is not band_el:
-                        out_el.remove(extra)
-            else:
-                out_el.append(band_el)
+    out_el = None
+    for out_idx, (dataset_el, band_el) in enumerate(extracted, start=1):
+        band_el.set("band", str(out_idx))
+        if out_el is None:
+            out_el = dataset_el
+            # Keep only the selected band; drop any other bands this source has.
+            for extra in list(out_el.findall("VRTRasterBand")):
+                if extra is not band_el:
+                    out_el.remove(extra)
+        else:
+            out_el.append(band_el)
 
     return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
 
