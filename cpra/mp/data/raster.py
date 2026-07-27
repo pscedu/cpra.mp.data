@@ -11,7 +11,7 @@ from rasterio.io import MemoryFile
 from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
-from cpra.mp.data.catalog import Catalog, cast_str, parse_path_dims, raster_catalog_rows
+from cpra.mp.data.catalog import CAL_DIMS, Catalog, cal_for, cast_str, parse_path_dims, raster_catalog_rows
 from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -27,7 +27,7 @@ from cpra.mp.data.utils import (
     validate_data_frame,
 )
 
-_CALENDAR_DIMENSIONS = ("calendar_year", "calendar_day")
+_CALENDAR_DIMENSIONS = CAL_DIMS  # ("calendar_year", "calendar_day") -- shared with catalog.py
 
 # LEGACY COG SHIM (grep this tag to find every removable piece; delete once no on-disk
 # COG directory uses this order -- see the project_multiband_cog memory's "migration
@@ -147,6 +147,22 @@ def _parallel_read_cog_metadata(paths):
         return list(pool.map(_read_cog_metadata, paths))
 
 
+def _read_cog_band_rows(paths):
+    """Yield ``(path, band, name, value, dtype, is_legacy, tags)`` for every band of every COG.
+
+    Reads the given COGs in parallel (``_parallel_read_cog_metadata``) and expands each into
+    one record per band, splitting the band description ``"<name>=<value>"`` into its
+    calendar-dimension ``name`` and its raw (still-string) ``value``.  The sole place band
+    descriptions are parsed -- shared by ``read_cog`` (via ``_band_calendar_frame``),
+    ``compact_cog``, and ``catalog.raster_rows``.
+    """
+
+    for path, (descriptions, dtype, is_legacy, tags) in zip(paths, _parallel_read_cog_metadata(paths)):
+        for band_idx, desc in enumerate(descriptions, start=1):
+            name, _, value = desc.partition("=")
+            yield path, band_idx, name, value, dtype, is_legacy, tags
+
+
 def _patch_legacy_vrt(vrt_text, calendar_dim, values):
     """LEGACY COG SHIM (see ``_read_cog_metadata``; remove together with it).
 
@@ -198,12 +214,10 @@ def _band_calendar_frame(paths, path_column, calendar_col):
 
     dtype = DIMENSIONS[calendar_col].dtype
     rows = {path_column: [], "band": [], "_value": []}
-    for path, (descriptions, _dtype, _is_legacy, _tags) in zip(paths, _parallel_read_cog_metadata(paths)):
-        for band_idx, desc in enumerate(descriptions, start=1):
-            _, _, value = desc.partition("=")
-            rows[path_column].append(path)
-            rows["band"].append(band_idx)
-            rows["_value"].append(value)
+    for path, band_idx, _name, value, _dtype, _is_legacy, _tags in _read_cog_band_rows(paths):
+        rows[path_column].append(path)
+        rows["band"].append(band_idx)
+        rows["_value"].append(value)
 
     frame = pl.DataFrame(rows, schema={path_column: pl.String, "band": pl.Int64, "_value": pl.String})
     value = pl.col("_value").str.to_date() if dtype == pl.Date else pl.col("_value").cast(dtype)
@@ -246,8 +260,8 @@ def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
         band_frame = _band_calendar_frame(path_frame[path_column].to_list(), path_column, calendar_col)
         lf = path_frame.join(band_frame, on=path_column, how="inner").lazy()
 
-    # Metadata dimensions (e.g. grid) are in-file columns for tabular data but are not
-    # path components in COG files — exclude them from raster filters.
+    # Metadata dimensions (e.g. model) live in each COG's dataset tags, not the path or a
+    # band description, so they can't be used as path/band filters -- exclude them.
     raster_kwargs = {k: v for k, v in kwargs.items() if k not in METADATA_DIMENSIONS}
     filter_exps = get_filter_expressions(**raster_kwargs)
     if filter_exps:
@@ -310,7 +324,7 @@ def write_cog(
     cog_dir.mkdir(parents=True, exist_ok=True)
     cog_path = cog_dir / f"{uuid.uuid4()}.tif"
 
-    calendar_dim = next(dim for dim in _CALENDAR_DIMENSIONS if dim in kwargs)
+    calendar_dim = cal_for(kwargs["time_unit"])
     description = df.select(
         pl.concat_str([pl.lit(calendar_dim), pl.col(calendar_dim).cast(pl.String)], separator="=")
     ).item()
@@ -396,12 +410,10 @@ def compact_cog(
     grid = GRIDS[kwargs["grid"]]
 
     required_cols = required_columns(input_df, include_dataset=False, include_metadata=False)
-    calendar_dim = next((col for col in required_cols if col in _CALENDAR_DIMENSIONS), None)
-    if calendar_dim is None:
-        return
+    time_unit = kwargs["time_unit"]
+    calendar_dim = cal_for(time_unit)
     path_cols = [col for col in required_cols if col != calendar_dim]
     glob_pattern = build_glob_pattern(required_cols=path_cols, extension="tif", nested=True, **kwargs)
-    time_unit = kwargs["time_unit"]
 
     # Group matched files by directory (each directory holds every file for one
     # combination of non-calendar dimensions).
@@ -427,14 +439,12 @@ def compact_cog(
         dtype = None
         legacy_paths = set()  # LEGACY COG SHIM (see _read_cog_metadata); remove with it.
         tif_tags = {}
-        for tif, (descriptions, tif_dtype, is_legacy, tags) in zip(tifs, _parallel_read_cog_metadata(tifs)):
+        for tif, band_idx, _name, value, tif_dtype, is_legacy, tags in _read_cog_band_rows(tifs):
             dtype = tif_dtype
             if is_legacy:
                 legacy_paths.add(tif)
             tif_tags[tif] = {k: v for k, v in tags.items() if k in METADATA_DIMENSIONS}
-            for band_idx, desc in enumerate(descriptions, start=1):
-                _, _, value = desc.partition("=")
-                triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
+            triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
 
         triples.sort(key=lambda triple: triple[0])
         values = pl.Series([value for value, _tif, _band in triples])
