@@ -42,7 +42,6 @@ from pathlib import Path
 import polars as pl
 import pyarrow as pa
 import pyarrow.dataset as pads
-import rasterio
 
 from cpra.mp.data.config import CATALOG_PATH
 from cpra.mp.data.dimensions import DIMENSIONS, METADATA_DIMENSIONS
@@ -170,14 +169,17 @@ def raster_rows(base, tif_paths):
     Metadata-typed dimensions (e.g. ``model``) are never path components (see
     ``raster.cog_path_expression``), so they're read from the COG's dataset tags instead
     -- the sole other source ``write_cog`` persists them to.
+
+    Delegates the parallel open + band-description parse to ``raster._read_cog_band_rows``
+    (imported locally to avoid a raster<->catalog import cycle), which also synthesizes the
+    calendar description for pre-migration single-band COGs that stored it as a dataset tag.
     """
-    for path in tif_paths:
+    from cpra.mp.data.raster import _read_cog_band_rows
+
+    for path, _band, name, value, _dtype, _is_legacy, tags in _read_cog_band_rows(tif_paths):
         dims = parse_path_dims(path.relative_to(base))
-        with rasterio.open(path) as ds:
-            dims = {**dims, **{k: v for k, v in ds.tags().items() if k in METADATA_DIMENSIONS}}
-            for desc in ds.descriptions:
-                name, _, value = desc.partition("=")
-                yield {**dims, name: value}
+        dims.update({k: v for k, v in tags.items() if k in METADATA_DIMENSIONS})
+        yield {**dims, name: value}
 
 
 def raster_catalog_from_paths(base, tif_paths):
