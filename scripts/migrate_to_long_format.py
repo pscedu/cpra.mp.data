@@ -417,7 +417,7 @@ def migrate_raster_dataset(
         return {"data_type": "raster", "files": n_src, "geo_cols": 0, "long_rows": 0}, messages
 
     t0 = time.perf_counter()
-    compact_cog(
+    result = compact_cog(
         base_path=base_path,
         output_base_path=output_path,
         catalog_path=catalog_path,
@@ -425,8 +425,7 @@ def migrate_raster_dataset(
     )
     elapsed = time.perf_counter() - t0
 
-    out_dir = output_path / rel
-    n_out = len(list(out_dir.rglob("*.tif"))) if out_dir.exists() else 0
+    n_out = len(result["outputs"])
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
     messages.append(

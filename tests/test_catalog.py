@@ -109,12 +109,16 @@ def test_compact_cog_merges_files_and_coalesces_catalog(base_path, catalog_path)
     for year in (2020, 2021, 2022):
         write_cog(_raster_array(), base_path=base_path, catalog_path=catalog_path, calendar_year=year, **RASTER_KWARGS)
 
-    compact_cog(base_path=base_path, catalog_path=catalog_path, **RASTER_KWARGS)
+    result = compact_cog(base_path=base_path, catalog_path=catalog_path, **RASTER_KWARGS)
 
     tifs = list(base_path.rglob("*.tif"))
     assert len(tifs) == 1
     with rasterio.open(tifs[0]) as ds:
         assert ds.count == 3
+
+    # compact_cog reports what it wrote so callers needn't re-scan the output tree.
+    assert result["outputs"] == tifs
+    assert result["sources_merged"] == 3
 
     catalog = _read_catalog(catalog_path)
     assert catalog.height == 1

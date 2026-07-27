@@ -372,6 +372,33 @@ def _calendar_value(value, calendar_dim):
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
 
 
+def _write_run(run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level):
+    """Consolidate one contiguous run into the multi-band COG at ``out_path``.
+
+    A band-separate VRT is built over ``run``'s ``(path, band)`` sources (``vrt()``) and
+    streamed into ``out_path`` with ``CreateCopy``, reusing ``_cog_profile()`` for the
+    shared compression settings.  ``values`` (the run's per-band calendar values, in run
+    order) is only used to repair a legacy source's missing band descriptions.
+    """
+
+    # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute paths, so
+    # its own location doesn't matter) -- keep it out of the data directory entirely.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        vrt_path = Path(tmp_dir) / f"{out_path.stem}.vrt"
+        vrt_text = vrt(run)
+        if is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
+            vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, values)
+        vrt_path.write_text(vrt_text)
+        profile = _cog_profile(
+            grid, dtype, count=len(run), compression=compression, compression_level=compression_level
+        )
+        profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
+        # out_path is a fresh UUID that can't collide with any existing source file, so the
+        # copy can be written directly -- no temp-file/rename needed.  Each CreateCopy
+        # already runs with num_threads=ALL_CPUS, so parallelizing runs would only contend.
+        copy(str(vrt_path), str(out_path), **profile)
+
+
 def compact_cog(
     base_path=BASE_PATH,
     catalog_path=CATALOG_PATH,
@@ -414,6 +441,10 @@ def compact_cog(
     (the in-place behavior). Out-of-place mode assumes every source needs rewriting
     (true for legacy COGs, which are always rewritten): a run already living optimally
     in a single up-to-date file is skipped and would *not* be copied across.
+
+    Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
+    multi-band COGs and the number of source COGs they consumed (both empty/zero when
+    every run was already optimal), so callers don't have to re-scan the output tree.
     """
 
     input_df = cast_columns(pl.DataFrame(kwargs))
@@ -447,6 +478,8 @@ def compact_cog(
             canonical_dir = dataset_dir / path.parent.relative_to(legacy_dataset_dir)
             groups.setdefault(canonical_dir, []).append(path)
 
+    outputs = []  # newly written multi-band COGs, across every directory/run
+    sources_merged = 0  # source COGs consumed by those writes
     for directory, tifs in groups.items():
         # Pool every band of every file (regardless of existing band count) into one
         # sorted sequence of (value, path, band) triples.
@@ -508,22 +541,12 @@ def compact_cog(
             out_directory.mkdir(parents=True, exist_ok=True)
             out_path = out_directory / f"{uuid.uuid4()}.tif"
 
-            # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute
-            # paths, so its own location doesn't matter) -- keep it out of the data
-            # directory entirely.
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                vrt_path = Path(tmp_dir) / f"{out_path.stem}.vrt"
-                vrt_text = vrt(run)
-                if run_is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
-                    vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, run_values[offset])
-                vrt_path.write_text(vrt_text)
-                profile = _cog_profile(
-                    grid, dtype, count=len(run), compression=compression, compression_level=compression_level
-                )
-                profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
-                # out_path is a fresh UUID that can't collide with any existing source
-                # file, so the copy can be written directly -- no temp-file/rename needed.
-                copy(str(vrt_path), str(out_path), **profile)
+            _write_run(
+                run, out_path, grid, dtype, calendar_dim, run_values[offset],
+                run_is_legacy, compression, compression_level,
+            )
+            outputs.append(out_path)
+            sources_merged += len(unique_paths)
 
             # Out-of-place output leaves the source tree untouched; only an in-place
             # merge consumes and removes its sources.
@@ -536,3 +559,5 @@ def compact_cog(
     # rows from earlier writes) into minimal contiguous-run rows.
     if catalog_path:
         Catalog(catalog_path).compact_partition(kwargs["variable"], kwargs["time_unit"], kwargs["grid"])
+
+    return {"outputs": outputs, "sources_merged": sources_merged}
