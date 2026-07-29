@@ -25,6 +25,7 @@ dependencies = [
     "altair",
     "cachetools",
     "click",
+    "duckdb>=1.0",
     "mercantile",
     "numpy",
     "Pillow",

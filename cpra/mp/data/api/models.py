@@ -38,25 +38,47 @@ class DatasetDimensions(BaseDatasetDimensions):
 
 
 class FilterDimensions(BaseFilterDimensions):
+    """Structured filter parameters — used by tile endpoints and the catalog."""
+
     class Config:
         use_enum_values = True
 
 
 class Options(BaseModel):
+    """
+    Query options for the data download endpoint.
+
+    The `sql` parameter is a full SQL SELECT statement that operates on a
+    pre-registered view called `data`.  It replaces the structured filter and
+    transformation parameters from the previous API version.  Example::
+
+        SELECT grid_cell, AVG(value) AS value
+        FROM data
+        WHERE calendar_year IN (2025, 2035, 2045)
+          AND scenario_id = 1
+        GROUP BY grid_cell
+
+    When `summarize_by` is specified the server registers the relevant crosswalk
+    table as a view named ``xw`` (columns: src_id, dst_id, scale_factor) so
+    that users can also write the join themselves.
+
+    When `sql` is omitted the server executes ``SELECT * FROM data``.
+    """
+
+    # Coordinate-based point extraction (raster grids only).
+    # Comma-separated lng,lat pairs, e.g. "−90.5,29.3,−90.6,29.4".
     grid_cell: str | None = None
-    where: str | None = None
-    negate: str | None = None
-    multiply10: str | None = None
-    multiply100: str | None = None
-    group_by: str | None = None
-    group_aggregate: AggregateFunction | None = None
-    color_map: str | None = None
-    unpivot: bool = False
+
+    # Full SQL SELECT operating on the 'data' view (and optionally 'xw').
+    sql: str | None = None
+
+    # Geographic upsampling via pre-built crosswalk tables.
     summarize_by: VectorGrid | None = None
     summarize_aggregate: AggregateFunction | None = None
     summarize_grid_cell: str | None = None
-    sort: str | None = None
-    select: str | None = None
+
+    # Colour ramp for raster tile rendering.
+    color_map: str | None = None
 
     class Config:
         use_enum_values = True
@@ -67,26 +89,50 @@ class Compression(BaseModel):
     compression_level: int = 6
 
 
-class TileQuery(Options, FilterDimensions):
+class TileQuery(FilterDimensions):
+    """Query parameters for raster and vector tile endpoints."""
+
     class Config:
         use_enum_values = True
 
+    grid_cell: str | None = None
+    where: str | None = None
+    negate: str | None = None
+    multiply10: str | None = None
+    multiply100: str | None = None
+    group_by: str | None = None
+    group_aggregate: AggregateFunction | None = None
+    color_map: str | None = None
+    summarize_by: VectorGrid | None = None
+    summarize_aggregate: AggregateFunction | None = None
+    summarize_grid_cell: str | None = None
+    sort: str | None = None
+    select: str | None = None
+
     @property
     def filter_dimensions(self):
-        return FilterDimensions(**dict(self))
+        return FilterDimensions(**{
+            k: v for k, v in dict(self).items()
+            if k in FilterDimensions.model_fields
+        })
 
     @property
     def options(self):
-        return Options(**dict(self))
+        return self
 
 
-class DataQuery(TileQuery, Compression):
+class DataQuery(Options, Compression):
+    """Query parameters for the data download endpoint."""
+
     class Config:
         use_enum_values = True
 
     @property
     def compression(self):
-        return Compression(**dict(self))
+        return Compression(
+            compression_algorithm=self.compression_algorithm,
+            compression_level=self.compression_level,
+        )
 
 
 class DimensionValue(BaseModel):
@@ -168,8 +214,6 @@ class VisualizationQuery(DataQuery):
 
 
 class MPDDimensionValue(SQLModel, table=True):
-    """Model group from the MPD."""
-
     __tablename__ = "vw_a_portal_dimension_value"
     dimension: str = Field(primary_key=True)
     value_int: int | None = None
