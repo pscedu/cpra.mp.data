@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import rasterio as rio
 from rasterio.io import MemoryFile
@@ -372,13 +373,71 @@ def _calendar_value(value, calendar_dim):
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
 
 
-def _write_run(run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level):
+_ROUND_PIXEL_FUNCTION_NAME = "round_to_decimal_places"
+
+
+def _round_pixel_function_code(decimals: int) -> str:
+    """Python VRT pixel-function source that rounds every pixel to ``decimals`` places.
+
+    GDAL calls this per output block (see ``_apply_rounding_to_vrt``), so pixel data is
+    never materialized outside GDAL's normal streaming I/O -- unlike reading the whole
+    array with rasterio and calling ``np.round`` on it, this keeps memory/time close to an
+    unrounded ``CreateCopy``.
+    """
+    return (
+        "import numpy as np\n"
+        f"def {_ROUND_PIXEL_FUNCTION_NAME}(in_ar, out_ar, xoff, yoff, xsize, ysize, "
+        "raster_xsize, raster_ysize, buf_radius, gt, **kwargs):\n"
+        f"    out_ar[:] = np.round(in_ar[0], {decimals})\n"
+    )
+
+
+def _apply_rounding_to_vrt(vrt_text: str, decimals: int) -> str:
+    """Rewrite every band of ``vrt_text`` into a ``VRTDerivedRasterBand`` that rounds pixel
+    values to ``decimals`` places via a Python pixel function (``_round_pixel_function_code``),
+    wrapping each band's existing (single) source unchanged -- its dtype, description, and
+    the dataset-level tags/metadata inherited from the first source (see ``vrt()``) are
+    untouched, since none of those live on the ``SimpleSource`` element being wrapped.
+    """
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+    code = _round_pixel_function_code(decimals)
+    for band_el in root.findall("VRTRasterBand"):
+        band_el.set("subClass", "VRTDerivedRasterBand")
+        source_el = band_el.find("SimpleSource")
+        pf_type = xml.etree.ElementTree.Element("PixelFunctionType")
+        pf_type.text = _ROUND_PIXEL_FUNCTION_NAME
+        pf_lang = xml.etree.ElementTree.Element("PixelFunctionLanguage")
+        pf_lang.text = "Python"
+        pf_code = xml.etree.ElementTree.Element("PixelFunctionCode")
+        pf_code.text = code
+        idx = list(band_el).index(source_el)
+        band_el.insert(idx, pf_code)
+        band_el.insert(idx, pf_lang)
+        band_el.insert(idx, pf_type)
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
+
+
+def _write_run(
+    run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
+    round_to_decimal_places=None,
+):
     """Consolidate one contiguous run into the multi-band COG at ``out_path``.
 
     A band-separate VRT is built over ``run``'s ``(path, band)`` sources (``vrt()``) and
     streamed into ``out_path`` with ``CreateCopy``, reusing ``_cog_profile()`` for the
     shared compression settings.  ``values`` (the run's per-band calendar values, in run
     order) is only used to repair a legacy source's missing band descriptions.
+
+    round_to_decimal_places, when given and the band dtype is floating-point, rounds pixel
+    values before writing, via ``_apply_rounding_to_vrt`` -- each band becomes a
+    ``VRTDerivedRasterBand`` with a Python pixel function, so the rounding happens inside
+    GDAL's normal per-block ``CreateCopy`` streaming rather than a separate materialize/round
+    pass; memory and speed stay close to the unrounded path.  Inline VRT Python code is
+    refused by GDAL unless ``GDAL_VRT_ENABLE_PYTHON`` is set (an arbitrary-code-execution
+    guard) -- safe here because the code is generated in-process above, never read from an
+    external/untrusted VRT file.  The nodata sentinel (-9999, see ``_cog_profile``) is an
+    integer and is therefore unaffected by rounding to any decimal count, so no separate
+    masking is needed.
     """
 
     # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute paths, so
@@ -388,7 +447,12 @@ def _write_run(run, out_path, grid, dtype, calendar_dim, values, is_legacy, comp
         vrt_text = vrt(run)
         if is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
             vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, values)
+
+        round_dtype = round_to_decimal_places is not None and np.issubdtype(np.dtype(dtype), np.floating)
+        if round_dtype:
+            vrt_text = _apply_rounding_to_vrt(vrt_text, round_to_decimal_places)
         vrt_path.write_text(vrt_text)
+
         profile = _cog_profile(
             grid, dtype, count=len(run), compression=compression, compression_level=compression_level
         )
@@ -396,7 +460,11 @@ def _write_run(run, out_path, grid, dtype, calendar_dim, values, is_legacy, comp
         # out_path is a fresh UUID that can't collide with any existing source file, so the
         # copy can be written directly -- no temp-file/rename needed.  Each CreateCopy
         # already runs with num_threads=ALL_CPUS, so parallelizing runs would only contend.
-        copy(str(vrt_path), str(out_path), **profile)
+        if round_dtype:
+            with rio.Env(GDAL_VRT_ENABLE_PYTHON="YES"):
+                copy(str(vrt_path), str(out_path), **profile)
+        else:
+            copy(str(vrt_path), str(out_path), **profile)
 
 
 def compact_cog(
@@ -405,6 +473,7 @@ def compact_cog(
     output_base_path=None,
     compression="zstd",
     compression_level=6,
+    round_to_decimal_places=None,
     **kwargs,
 ):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
@@ -441,6 +510,10 @@ def compact_cog(
     (the in-place behavior). Out-of-place mode assumes every source needs rewriting
     (true for legacy COGs, which are always rewritten): a run already living optimally
     in a single up-to-date file is skipped and would *not* be copied across.
+
+    round_to_decimal_places, when given, is forwarded to ``_write_run`` to round
+    floating-point pixel values before writing each merged run (see there for the
+    performance trade-off it implies).
 
     Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
     multi-band COGs and the number of source COGs they consumed (both empty/zero when
@@ -543,7 +616,7 @@ def compact_cog(
 
             _write_run(
                 run, out_path, grid, dtype, calendar_dim, run_values[offset],
-                run_is_legacy, compression, compression_level,
+                run_is_legacy, compression, compression_level, round_to_decimal_places,
             )
             outputs.append(out_path)
             sources_merged += len(unique_paths)
