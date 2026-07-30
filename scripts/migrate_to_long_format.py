@@ -743,11 +743,15 @@ def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=No
     return [datasets[key] for key in sorted(datasets)]
 
 
-def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) -> None:
+def _print_progress_db(
+    db_path: Path, variable=None, grid=None, time_unit=None, show_failures: bool = False
+) -> None:
     """Print the contents of the progress database, optionally filtered by dimension.
 
     Filters match against the ``partition`` column, which encodes dimensions as
-    Hive-style ``name=value`` path segments (e.g. ``variable=sal/...``).
+    Hive-style ``name=value`` path segments (e.g. ``variable=sal/...``). With
+    ``show_failures``, prints the recorded failure attempts instead of the
+    completed migrations.
     """
     if not db_path.exists():
         print(f"No progress database found at {db_path}.")
@@ -762,14 +766,47 @@ def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) 
 
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(
-            "SELECT partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at "
-            f"FROM migrations{where} ORDER BY partition",
-            params,
-        ).fetchall()
-        n_failures = conn.execute(f"SELECT COUNT(*) FROM failures{where}", params).fetchone()[0]
+        if show_failures:
+            rows = conn.execute(
+                "SELECT partition, error, cpu_cores, mem_available_bytes, attempted_at "
+                f"FROM failures{where} ORDER BY attempted_at",
+                params,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at "
+                f"FROM migrations{where} ORDER BY partition",
+                params,
+            ).fetchall()
+            n_failures = conn.execute(f"SELECT COUNT(*) FROM failures{where}", params).fetchone()[0]
     finally:
         conn.close()
+
+    if show_failures:
+        if not rows:
+            print("No failures recorded matching the given filters.")
+            return
+        part_w = max(max(len(r[0]) for r in rows), len("Partition"))
+
+        def _frow(partition, cpu_cores, mem_available_bytes, attempted_at, error):
+            return f"{partition:<{part_w}}  {cpu_cores:>5}  {mem_available_bytes:>12}  {attempted_at}  {error}"
+
+        header = _frow("Partition", "CPUs", "Mem avail", "Attempted at", "Error")
+        sep = "-" * min(len(header), 200)
+        print(f"\n{header}\n{sep}")
+        for partition, error, cpu_cores, mem_available_bytes, attempted_at in rows:
+            print(
+                _frow(
+                    partition,
+                    cpu_cores if cpu_cores is not None else "n/a",
+                    _fmt_bytes(mem_available_bytes) if mem_available_bytes is not None else "n/a",
+                    attempted_at,
+                    error or "",
+                )
+            )
+        print(sep)
+        print(f"{len(rows)} recorded failure(s) matching the given filters.")
+        return
 
     if not rows:
         print("No completed migrations recorded matching the given filters.")
@@ -807,7 +844,10 @@ def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) 
         )
 
     if n_failures:
-        print(f"\n{n_failures} recorded failure(s) matching the given filters (see the 'failures' table).")
+        print(
+            f"\n{n_failures} recorded failure(s) matching the given filters "
+            "(pass --show-failures to see them)."
+        )
 
 
 @click.command(
@@ -853,6 +893,12 @@ def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) 
     "--time-unit) and exit without migrating anything.",
 )
 @click.option(
+    "--show-failures",
+    is_flag=True,
+    help="With --show-progress, print recorded failure attempts (partition, error, and "
+    "system state at the time) instead of completed migrations.",
+)
+@click.option(
     "--memory-limit",
     metavar="SIZE",
     help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
@@ -881,15 +927,18 @@ def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) 
 )
 def main(
     output_path, catalog_path, estimate, variable, grid, time_unit, dry_run, progress,
-    data_path, workers, progress_db, show_progress, memory_limit, temp_path, round_to_decimal_places,
-    unique_parquet_rows,
+    data_path, workers, progress_db, show_progress, show_failures, memory_limit, temp_path,
+    round_to_decimal_places, unique_parquet_rows,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
+
+    if show_failures and not show_progress:
+        raise click.UsageError("--show-failures requires --show-progress")
 
     if show_progress:
         if not progress_db:
             raise click.UsageError("--show-progress requires --progress-db")
-        _print_progress_db(Path(progress_db), variable, grid, time_unit)
+        _print_progress_db(Path(progress_db), variable, grid, time_unit, show_failures)
         return
 
     if not estimate and not output_path:
