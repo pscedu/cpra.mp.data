@@ -31,6 +31,12 @@ Usage:
     python scripts/migrate_to_long_format.py \\
         --output-path /path/to/output --catalog-path /path/to/catalog
 
+\b
+    # Inspect what a progress database has recorded so far, optionally scoped
+    # to a variable/grid/time-unit
+    python scripts/migrate_to_long_format.py --progress-db /path/to/progress.db \\
+        --show-progress --variable sal
+
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
 
@@ -737,6 +743,73 @@ def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=No
     return [datasets[key] for key in sorted(datasets)]
 
 
+def _print_progress_db(db_path: Path, variable=None, grid=None, time_unit=None) -> None:
+    """Print the contents of the progress database, optionally filtered by dimension.
+
+    Filters match against the ``partition`` column, which encodes dimensions as
+    Hive-style ``name=value`` path segments (e.g. ``variable=sal/...``).
+    """
+    if not db_path.exists():
+        print(f"No progress database found at {db_path}.")
+        return
+
+    clauses, params = [], []
+    for dim_name, value in [("variable", variable), ("grid", grid), ("time_unit", time_unit)]:
+        if value:
+            clauses.append("partition LIKE ?")
+            params.append(f"%{dim_name}={value}%")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at "
+            f"FROM migrations{where} ORDER BY partition",
+            params,
+        ).fetchall()
+        n_failures = conn.execute(f"SELECT COUNT(*) FROM failures{where}", params).fetchone()[0]
+    finally:
+        conn.close()
+
+    if not rows:
+        print("No completed migrations recorded matching the given filters.")
+    else:
+        part_w = max(max(len(r[0]) for r in rows), len("Partition"))
+
+        def _row(partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at):
+            return (
+                f"{partition:<{part_w}}  {data_type:<8}  {files:>5}  {geo_cols:>8}  "
+                f"{long_rows:>14}  {elapsed_s:>10}  {peak_bytes:>10}  {completed_at}"
+            )
+
+        header = _row("Partition", "Type", "Files", "Geo cols", "Long rows", "Elapsed", "Peak mem", "Completed at")
+        sep = "-" * len(header)
+        print(f"\n{header}\n{sep}")
+        for partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at in rows:
+            print(
+                _row(
+                    partition,
+                    data_type,
+                    files,
+                    geo_cols,
+                    f"{long_rows:,}",
+                    f"{elapsed_s:.1f}s",
+                    _fmt_bytes(peak_bytes),
+                    completed_at,
+                )
+            )
+        print(sep)
+        n_tabular = sum(1 for r in rows if r[1] == "tabular")
+        n_raster = sum(1 for r in rows if r[1] == "raster")
+        print(
+            f"{len(rows)} completed migration(s) ({n_tabular} tabular, {n_raster} raster), "
+            f"{sum(r[4] for r in rows):,} total long rows."
+        )
+
+    if n_failures:
+        print(f"\n{n_failures} recorded failure(s) matching the given filters (see the 'failures' table).")
+
+
 @click.command(
     help=__doc__,
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
@@ -774,6 +847,12 @@ def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=No
     "recorded and skipped on subsequent runs.",
 )
 @click.option(
+    "--show-progress",
+    is_flag=True,
+    help="Print the contents of --progress-db (optionally filtered by --variable/--grid/"
+    "--time-unit) and exit without migrating anything.",
+)
+@click.option(
     "--memory-limit",
     metavar="SIZE",
     help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
@@ -802,10 +881,16 @@ def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=No
 )
 def main(
     output_path, catalog_path, estimate, variable, grid, time_unit, dry_run, progress,
-    data_path, workers, progress_db, memory_limit, temp_path, round_to_decimal_places,
+    data_path, workers, progress_db, show_progress, memory_limit, temp_path, round_to_decimal_places,
     unique_parquet_rows,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
+
+    if show_progress:
+        if not progress_db:
+            raise click.UsageError("--show-progress requires --progress-db")
+        _print_progress_db(Path(progress_db), variable, grid, time_unit)
+        return
 
     if not estimate and not output_path:
         raise click.UsageError("--output-path is required unless --estimate is set")
