@@ -591,6 +591,22 @@ def _batched_peak(est: dict, memory_limit: int | None) -> int:
     return int(max(2 * est["wide_in_memory"], loop_peak))
 
 
+def _partition_estimates(paths: list[Path], memory_limit: int | None) -> dict | None:
+    """Peak-memory estimates for one tabular partition, or None if not wide-format.
+
+    Wraps ``_peak_estimates`` + ``_batched_peak`` (reading only Parquet footers,
+    no data scan) so callers share one code path for both ``--estimate`` and the
+    pre-flight memory-limit check in ``main``.
+    """
+    schema = _wide_schema(paths[0])
+    if schema is None:
+        return None
+    wide_rows = sum(pq.read_metadata(p).num_rows for p in paths)
+    est = _peak_estimates(schema, wide_rows)
+    est["est_peak"] = _batched_peak(est, memory_limit)
+    return est
+
+
 def estimate_partitions(
     partitions: dict[Path, list[Path]], base_path: Path, progress: bool = True, memory_limit: int | None = None
 ) -> None:
@@ -607,20 +623,18 @@ def estimate_partitions(
     rows = []
     with tqdm(total=len(partitions), desc="Estimating", unit="partition", disable=not progress) as bar:
         for paths in partitions.values():
-            schema = _wide_schema(paths[0])
+            est = _partition_estimates(paths, memory_limit)
             bar.update(1)
-            if schema is None:
+            if est is None:
                 continue
 
-            wide_rows = sum(pq.read_metadata(p).num_rows for p in paths)
-            est = _peak_estimates(schema, wide_rows)
             rows.append(
                 {
                     "partition": str(paths[0].parent.relative_to(base_path)),
                     "files": len(paths),
                     "long_rows": est["long_rows"],
                     "wide_in_memory": est["wide_in_memory"],
-                    "est_peak": _batched_peak(est, memory_limit),
+                    "est_peak": est["est_peak"],
                 }
             )
 
@@ -902,7 +916,9 @@ def _print_progress_db(
     "--memory-limit",
     metavar="SIZE",
     help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
-    "worker's peak memory stays within the budget. Without this flag a default batch size is used.",
+    "worker's peak memory stays within the budget. Without this flag a default batch size is used. "
+    "Partitions whose estimated peak exceeds the budget even at the minimum batch size (e.g. the "
+    "one-time wide-frame sort alone) are skipped up front rather than attempted and OOM-killed.",
 )
 @click.option(
     "--temp-path",
@@ -997,12 +1013,36 @@ def main(
             db_skipped = len(tasks) - len(kept)
             tasks = kept
 
+    # A partition whose estimated peak already exceeds --memory-limit will only
+    # get OOM-killed by a worker (the batch sizing in _batch_target_rows can
+    # shrink the per-batch cost, but not the one-time wide-frame sort, which
+    # alone can exceed the limit).  Skip those up front instead of burning a
+    # worker slot on a doomed attempt.
+    over_limit_skipped = 0
+    if memory_limit is not None:
+        kept = []
+        for t in tasks:
+            kind, rel, payload = t
+            if kind == "tabular":
+                est = _partition_estimates(payload, memory_limit)
+                if est is not None and est["est_peak"] > memory_limit:
+                    over_limit_skipped += 1
+                    print(
+                        f"  Skipping {rel} (est. peak {_fmt_bytes(est['est_peak'])} "
+                        f"exceeds --memory-limit {_fmt_bytes(memory_limit)})"
+                    )
+                    continue
+            kept.append(t)
+        tasks = kept
+
     n_tabular = sum(1 for t in tasks if t[0] == "tabular")
     n_raster = sum(1 for t in tasks if t[0] == "raster")
     total_partitions = len(tasks)
     summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster dataset(s)."
     if db_skipped:
         summary += f" ({db_skipped} already in progress database, skipped.)"
+    if over_limit_skipped:
+        summary += f" ({over_limit_skipped} skipped: estimated peak exceeds --memory-limit.)"
     print(summary)
     migrated = 0
     skipped = 0
