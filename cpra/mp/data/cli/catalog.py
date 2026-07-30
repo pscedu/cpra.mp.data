@@ -107,7 +107,10 @@ def compact(catalog_dir):
         if len(pqs) <= 1:
             continue  # build emits minimal runs; a single file needs no merge
         time_unit = parse_path_dims(root.relative_to(base))["time_unit"]
-        df = pl.read_parquet([str(root / f) for f in pqs])
+        # Concat files individually with diagonal_relaxed rather than pl.read_parquet(pqs) --
+        # older files may predate a fix to tabular_catalog_rows and lack the unused calendar
+        # dim's extent columns entirely, which pl.read_parquet rejects as a schema mismatch.
+        df = pl.concat([pl.read_parquet(root / f) for f in pqs], how="diagonal_relaxed")
         merged = merge_partition(df, time_unit)
         merged.write_parquet(root / f"{uuid.uuid4()}-0.parquet")
         for f in pqs:

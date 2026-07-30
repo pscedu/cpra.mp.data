@@ -212,8 +212,15 @@ def tabular_catalog_rows(lf, group_cols, time_unit):
     """Catalog rows for the data ``lf`` is about to write, computed in-memory
     (no re-scan from disk) -- used by ``tabular.write_parquet``'s catalog hook."""
     cal = cal_for(time_unit)
+    other = CAL_DIMS[1] if cal == CAL_DIMS[0] else CAL_DIMS[0]
     runs = contiguous_runs(lf, group_cols, cal, time_unit)
-    return unify_dtypes(runs.with_columns(data_type=pl.lit("tabular")))
+    runs = runs.with_columns(
+        pl.lit(None, dtype=DIMENSIONS[other].dtype).alias(f"{other}_min"),
+        pl.lit(None, dtype=DIMENSIONS[other].dtype).alias(f"{other}_max"),
+        pl.lit(None, dtype=pl.Int64).alias(f"{other}_count"),
+        data_type=pl.lit("tabular"),
+    )
+    return unify_dtypes(runs)
 
 
 def raster_catalog_rows(dims, calendar_dim, calendar_values):
@@ -269,7 +276,13 @@ class Catalog:
         files = list(directory.glob("*.parquet")) if directory.exists() else []
         if len(files) <= 1:
             return
-        merged = merge_partition(pl.read_parquet([str(f) for f in files]), time_unit)
+        # Read files individually and concat with diagonal_relaxed rather than
+        # pl.read_parquet(files) -- older files may predate a fix to tabular_catalog_rows
+        # and lack the unused calendar dim's extent columns entirely, which pl.read_parquet
+        # rejects as a schema mismatch across a file list.
+        merged = merge_partition(
+            pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed"), time_unit
+        )
         tmp = directory / f"{uuid.uuid4()}-0.parquet"
         merged.write_parquet(tmp)
         for f in files:
