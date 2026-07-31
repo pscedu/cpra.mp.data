@@ -403,18 +403,15 @@ def migrate_partition(
     return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
 
 
-def _raster_source_tifs(base_path: Path, variable: str, time_unit: str, grid: str) -> list[Path]:
-    """All source COGs for one dataset, looked up under both directory orders.
+def _raster_source_tifs(base_path: Path, dims: dict) -> list[Path]:
+    """All source COGs for one raster partition (all dims), looked up under both
+    directory orders.
 
     ``compact_cog`` reads from the canonical (variable/time_unit/grid) order and
     the legacy (variable/grid/time_unit) order; mirror both here so the reported
     source count matches what it will actually consolidate.
     """
-    dirs = [
-        base_path / f"variable={variable}" / f"time_unit={time_unit}" / f"grid={grid}",
-        base_path / f"variable={variable}" / f"grid={grid}" / f"time_unit={time_unit}",
-    ]
-    return [p for d in dirs if d.exists() for p in d.rglob("*.tif")]
+    return [p for d in _raster_leaf_dirs(base_path, dims) if d.exists() for p in d.glob("*.tif")]
 
 
 def migrate_raster_dataset(
@@ -425,13 +422,17 @@ def migrate_raster_dataset(
     dry_run: bool = False,
     round_to_decimal_places: int | None = None,
 ) -> tuple[dict, list[str]]:
-    """Compact one raster dataset's single-band COGs into multi-band COGs, written
-    into the output tree with the input left untouched.
+    """Compact one raster leaf partition's single-band COGs into multi-band COGs,
+    written into the output tree with the input left untouched.
 
-    ``dataset_kwargs`` holds variable/time_unit/grid.  Every matching COG under
-    ``base_path`` (canonical or legacy directory order) is pooled per partition and
-    consolidated by ``raster.compact_cog`` writing into ``output_path``; catalog
-    rows are appended and the partition coalesced by compact_cog itself when
+    ``dataset_kwargs`` holds every dimension encoded in the partition's directory path
+    (variable/time_unit/grid plus any further partition dims, e.g. model_group_id/
+    scenario_id) -- pinning all of them narrows ``compact_cog``'s internal glob to just
+    this one leaf directory, so each leaf partition is migrated (and its progress
+    recorded) independently, the same as a tabular partition. Every matching COG under
+    ``base_path`` (canonical or legacy directory order) for that leaf is pooled and
+    consolidated by ``raster.compact_cog`` writing into ``output_path``; catalog rows
+    are appended and the partition coalesced by compact_cog itself when
     ``catalog_path`` is given.  Returns (result, messages); result carries
     ``data_type="raster"``, ``files`` (source COG count) and ``geo_cols`` (output
     COG count), plus ``elapsed_s``/``peak_bytes`` when not a dry run.
@@ -442,10 +443,9 @@ def migrate_raster_dataset(
     same as compact_cog's usual skip behavior).
     """
     messages: list[str] = []
-    variable, time_unit, grid = dataset_kwargs["variable"], dataset_kwargs["time_unit"], dataset_kwargs["grid"]
-    rel = f"variable={variable}/time_unit={time_unit}/grid={grid}"
+    rel = _raster_rel(dataset_kwargs)
 
-    n_src = len(_raster_source_tifs(base_path, variable, time_unit, grid))
+    n_src = len(_raster_source_tifs(base_path, dataset_kwargs))
     messages.append(
         f"  {'[DRY RUN] ' if dry_run else ''}Compacting rasters: {rel} ({n_src} source COG{'s' if n_src != 1 else ''})"
     )
@@ -732,29 +732,54 @@ def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -
     return dict(sorted(partitions.items()))
 
 
+def _raster_rel(dims: dict) -> str:
+    """Canonical ``variable=.../time_unit=.../grid=.../...`` partition path for a set of
+    dimension values, in the same dimension order COGs are actually written under
+    (variable/time_unit/grid, then any further partition dims like model_group_id/
+    scenario_id in declaration order). Used as the progress-database key for a raster
+    partition, so it must be independent of which on-disk directory order (canonical or
+    legacy) the files were found under.
+    """
+    return "/".join(f"{name}={dims[name]}" for name in DIMENSIONS if name in dims)
+
+
+def _raster_leaf_dirs(base_path: Path, dims: dict) -> list[Path]:
+    """Canonical and legacy on-disk leaf directories for one raster partition (all dims)."""
+    tail = "/".join(
+        f"{name}={dims[name]}" for name in DIMENSIONS if name in dims and name not in ("variable", "time_unit", "grid")
+    )
+    canonical = base_path / f"variable={dims['variable']}" / f"time_unit={dims['time_unit']}" / f"grid={dims['grid']}"
+    legacy = base_path / f"variable={dims['variable']}" / f"grid={dims['grid']}" / f"time_unit={dims['time_unit']}"
+    return [d / tail if tail else d for d in (canonical, legacy)]
+
+
 def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=None) -> list[dict]:
-    """Find distinct raster (COG) datasets under base_path, keyed by variable/time_unit/grid.
+    """Find distinct raster (COG) partitions under base_path, one per leaf directory (a
+    directory that directly contains .tif files) -- keyed by every dimension encoded in
+    its path (variable/time_unit/grid plus any further partition dimensions, e.g.
+    model_group_id/scenario_id). This mirrors ``find_partitions``'s tabular-partition
+    granularity, so raster migration progress can be tracked and resumed per leaf
+    partition instead of being collapsed to one entry per (variable, time_unit, grid).
 
     COGs live under either the canonical (variable/time_unit/grid) or the legacy
-    (variable/grid/time_unit) directory order; both are globbed and collapsed to
-    one entry per (variable, time_unit, grid).  A dataset is included only if it
-    actually contains .tif files (so Parquet-only trees are skipped).  Returns a
-    sorted list of dimension-kwargs dicts suitable for ``compact_cog``.
+    (variable/grid/time_unit) directory order; both are globbed and collapsed to the
+    same canonical leaf key (``_raster_rel``), since ``compact_cog`` pools files from
+    both orders together into one partition. Returns a sorted list of dimension-kwargs
+    dicts suitable for ``compact_cog``.
     """
     v, g, t = variable or "*", grid or "*", time_unit or "*"
     patterns = [
         f"variable={v}/time_unit={t}/grid={g}",  # canonical
         f"variable={v}/grid={g}/time_unit={t}",  # legacy
     ]
-    datasets: dict[tuple, dict] = {}
+    datasets: dict[str, dict] = {}
     for pattern in patterns:
         for dataset_dir in base_path.glob(pattern):
-            if next(dataset_dir.rglob("*.tif"), None) is None:
-                continue
-            dims = parse_path_dims(dataset_dir.relative_to(base_path))
-            key = (dims["variable"], dims["time_unit"], dims["grid"])
-            datasets[key] = {"variable": dims["variable"], "time_unit": dims["time_unit"], "grid": dims["grid"]}
-    return [datasets[key] for key in sorted(datasets)]
+            top_dims = parse_path_dims(dataset_dir.relative_to(base_path))
+            for tif in dataset_dir.rglob("*.tif"):
+                dims = {**top_dims, **parse_path_dims(tif.parent.relative_to(dataset_dir))}
+                datasets[_raster_rel(dims)] = dims
+    return [datasets[rel] for rel in sorted(datasets)]
 
 
 def _print_progress_db(
@@ -979,12 +1004,9 @@ def main(
     if estimate:
         estimate_partitions(partitions, base_path, progress=progress, memory_limit=memory_limit)
         if raster_datasets:
-            n_tifs = sum(
-                len(_raster_source_tifs(base_path, d["variable"], d["time_unit"], d["grid"]))
-                for d in raster_datasets
-            )
+            n_tifs = sum(len(_raster_source_tifs(base_path, d)) for d in raster_datasets)
             print(
-                f"\nRaster: {len(raster_datasets)} dataset(s), {n_tifs} source COG(s) "
+                f"\nRaster: {len(raster_datasets)} partition(s), {n_tifs} source COG(s) "
                 "(compacted via VRT — memory-light, not modeled above)."
             )
         return
@@ -1000,8 +1022,7 @@ def main(
     for paths in partitions.values():
         tasks.append(("tabular", str(paths[0].parent.relative_to(base_path)), paths))
     for d in raster_datasets:
-        rel = f"variable={d['variable']}/time_unit={d['time_unit']}/grid={d['grid']}"
-        tasks.append(("raster", rel, d))
+        tasks.append(("raster", _raster_rel(d), d))
 
     db_conn: sqlite3.Connection | None = None
     db_skipped = 0
@@ -1038,7 +1059,7 @@ def main(
     n_tabular = sum(1 for t in tasks if t[0] == "tabular")
     n_raster = sum(1 for t in tasks if t[0] == "raster")
     total_partitions = len(tasks)
-    summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster dataset(s)."
+    summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster partition(s)."
     if db_skipped:
         summary += f" ({db_skipped} already in progress database, skipped.)"
     if over_limit_skipped:
