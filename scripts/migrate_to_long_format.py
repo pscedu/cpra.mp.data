@@ -32,23 +32,24 @@ Usage:
         --output-path /path/to/output --catalog-path /path/to/catalog
 
 \b
-    # Inspect what a progress database has recorded so far, optionally scoped
-    # to a variable/grid/time-unit
-    python scripts/migrate_to_long_format.py --progress-db /path/to/progress.db \\
-        --show-progress --variable sal
+    # Show how many partitions have already been converted, per variable/grid/
+    # time-unit, according to the catalog
+    python scripts/migrate_to_long_format.py \\
+        --catalog-path /path/to/catalog --show-progress --variable sal
 
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
 
+import csv
 import multiprocessing
 import queue
 import os
 import resource
 import signal
-import sqlite3
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -66,87 +67,6 @@ from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.raster import compact_cog
 from cpra.mp.data.tabular import read_parquet, write_parquet
 from cpra.mp.data.utils import long_sort_expressions
-
-
-def _db_init(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS migrations (
-            partition TEXT PRIMARY KEY,
-            data_type TEXT NOT NULL DEFAULT 'tabular',
-            files INTEGER NOT NULL,
-            geo_cols INTEGER NOT NULL,
-            long_rows INTEGER NOT NULL,
-            elapsed_s REAL NOT NULL,
-            peak_bytes INTEGER NOT NULL,
-            completed_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"""
-    )
-    # Add data_type to progress DBs created before the raster/unified migration.
-    if "data_type" not in {row[1] for row in conn.execute("PRAGMA table_info(migrations)")}:
-        conn.execute("ALTER TABLE migrations ADD COLUMN data_type TEXT NOT NULL DEFAULT 'tabular'")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS failures (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            partition TEXT NOT NULL,
-            error TEXT,
-            cpu_cores INTEGER,
-            mem_available_bytes INTEGER,
-            attempted_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"""
-    )
-    conn.commit()
-    return conn
-
-
-def _db_completed(conn: sqlite3.Connection) -> set[str]:
-    return {row[0] for row in conn.execute("SELECT partition FROM migrations")}
-
-
-def _available_memory_bytes() -> int | None:
-    """Return available system memory in bytes, or None if it cannot be determined."""
-    try:
-        if sys.platform == "linux":
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) * 1024
-        import psutil
-        return psutil.virtual_memory().available
-    except Exception:
-        return None
-
-
-def _db_record_failure(
-    conn: sqlite3.Connection,
-    partition: str,
-    error: str | None,
-) -> None:
-    conn.execute(
-        "INSERT INTO failures (partition, error, cpu_cores, mem_available_bytes, attempted_at)"
-        " VALUES (?, ?, ?, ?, datetime('now'))",
-        (partition, error, os.cpu_count(), _available_memory_bytes()),
-    )
-    conn.commit()
-
-
-def _db_record(
-    conn: sqlite3.Connection,
-    partition: str,
-    files: int,
-    geo_cols: int,
-    long_rows: int,
-    elapsed_s: float,
-    peak_bytes: int,
-    data_type: str = "tabular",
-) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO migrations"
-        " (partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        (partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes),
-    )
-    conn.commit()
 
 
 def _wide_schema(path: Path) -> dict | None:
@@ -782,111 +702,100 @@ def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=No
     return [datasets[rel] for rel in sorted(datasets)]
 
 
-def _print_progress_db(
-    db_path: Path, variable=None, grid=None, time_unit=None, show_failures: bool = False
-) -> None:
-    """Print the contents of the progress database, optionally filtered by dimension.
+def _catalog_completed(catalog_path: Path, tasks: list[tuple[str, str, object]]) -> set[str]:
+    """Return the ``rel`` keys of ``tasks`` already recorded in the catalog.
 
-    Filters match against the ``partition`` column, which encodes dimensions as
-    Hive-style ``name=value`` path segments (e.g. ``variable=sal/...``). With
-    ``show_failures``, prints the recorded failure attempts instead of the
-    completed migrations.
+    A tabular partition (keyed by its directory's path relative to the data root)
+    or raster leaf partition (keyed by ``_raster_rel``) counts as already converted
+    when the catalog has at least one row of the matching ``data_type`` whose
+    dimension columns agree with every dimension parsed from the partition's path.
+    The catalog is the durable record of what earlier runs finished, so this is
+    what lets a run pick up from wherever the catalog left off, without a
+    separately maintained progress log that could drift out of sync with it.
+
+    Catalog partitions (grouped by variable/time_unit/grid -- the catalog's own
+    Hive partitioning) are read at most once each, regardless of how many tasks
+    fall under them.
     """
-    if not db_path.exists():
-        print(f"No progress database found at {db_path}.")
+    by_dataset: dict[tuple, list[tuple[str, str, dict]]] = {}
+    for kind, rel, payload in tasks:
+        dims = dict(payload) if kind == "raster" else parse_path_dims(rel)
+        key = (dims.get("variable"), dims.get("time_unit"), dims.get("grid"))
+        by_dataset.setdefault(key, []).append((kind, rel, dims))
+
+    completed: set[str] = set()
+    for (variable, time_unit, grid), items in by_dataset.items():
+        directory = catalog_path / f"variable={variable}" / f"time_unit={time_unit}" / f"grid={grid}"
+        files = list(directory.glob("*.parquet")) if directory.exists() else []
+        if not files:
+            continue
+        frame = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+        frame = frame.select(pl.col(c).cast(pl.String) for c in frame.columns)
+        for kind, rel, dims in items:
+            data_type = "raster" if kind == "raster" else "tabular"
+            sub = frame.filter(pl.col("data_type") == data_type)
+            for name, value in dims.items():
+                if name in ("variable", "time_unit", "grid"):
+                    continue
+                if name in sub.columns:
+                    sub = sub.filter(pl.col(name) == value)
+            if sub.height > 0:
+                completed.add(rel)
+    return completed
+
+
+def _print_progress(
+    base_path: Path, catalog_path: Path, variable=None, grid=None, time_unit=None, progress: bool = True
+) -> None:
+    """Scan ``base_path`` for partitions (the same discovery ``--estimate`` uses),
+    then summarize -- per variable/time_unit/grid -- how many of them the catalog
+    already shows as converted."""
+    partitions = find_partitions(base_path, variable, grid, time_unit)
+    raster_datasets = find_raster_datasets(base_path, variable, grid, time_unit)
+
+    tasks: list[tuple[str, str, object]] = [
+        ("tabular", str(paths[0].parent.relative_to(base_path)), paths) for paths in partitions.values()
+    ]
+    tasks += [("raster", _raster_rel(d), d) for d in raster_datasets]
+
+    if not tasks:
+        print("No datasets found matching the given filters.")
         return
 
-    clauses, params = [], []
-    for dim_name, value in [("variable", variable), ("grid", grid), ("time_unit", time_unit)]:
-        if value:
-            clauses.append("partition LIKE ?")
-            params.append(f"%{dim_name}={value}%")
-    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    completed = _catalog_completed(catalog_path, tasks)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        if show_failures:
-            rows = conn.execute(
-                "SELECT partition, error, cpu_cores, mem_available_bytes, attempted_at "
-                f"FROM failures{where} ORDER BY attempted_at",
-                params,
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at "
-                f"FROM migrations{where} ORDER BY partition",
-                params,
-            ).fetchall()
-            n_failures = conn.execute(f"SELECT COUNT(*) FROM failures{where}", params).fetchone()[0]
-    finally:
-        conn.close()
+    summary: dict[tuple[str, str, str], dict[str, int]] = {}
+    for _kind, rel, _payload in tasks:
+        dims = parse_path_dims(rel)
+        key = (dims.get("variable", ""), dims.get("time_unit", ""), dims.get("grid", ""))
+        entry = summary.setdefault(key, {"converted": 0, "total": 0})
+        entry["total"] += 1
+        if rel in completed:
+            entry["converted"] += 1
 
-    if show_failures:
-        if not rows:
-            print("No failures recorded matching the given filters.")
-            return
-        part_w = max(max(len(r[0]) for r in rows), len("Partition"))
+    var_w = max([len(k[0]) for k in summary] + [len("Variable")])
+    tu_w = max([len(k[1]) for k in summary] + [len("Time unit")])
+    grid_w = max([len(k[2]) for k in summary] + [len("Grid")])
 
-        def _frow(partition, cpu_cores, mem_available_bytes, attempted_at, error):
-            return f"{partition:<{part_w}}  {cpu_cores:>5}  {mem_available_bytes:>12}  {attempted_at}  {error}"
-
-        header = _frow("Partition", "CPUs", "Mem avail", "Attempted at", "Error")
-        sep = "-" * min(len(header), 200)
-        print(f"\n{header}\n{sep}")
-        for partition, error, cpu_cores, mem_available_bytes, attempted_at in rows:
-            print(
-                _frow(
-                    partition,
-                    cpu_cores if cpu_cores is not None else "n/a",
-                    _fmt_bytes(mem_available_bytes) if mem_available_bytes is not None else "n/a",
-                    attempted_at,
-                    error or "",
-                )
-            )
-        print(sep)
-        print(f"{len(rows)} recorded failure(s) matching the given filters.")
-        return
-
-    if not rows:
-        print("No completed migrations recorded matching the given filters.")
-    else:
-        part_w = max(max(len(r[0]) for r in rows), len("Partition"))
-
-        def _row(partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at):
-            return (
-                f"{partition:<{part_w}}  {data_type:<8}  {files:>5}  {geo_cols:>8}  "
-                f"{long_rows:>14}  {elapsed_s:>10}  {peak_bytes:>10}  {completed_at}"
-            )
-
-        header = _row("Partition", "Type", "Files", "Geo cols", "Long rows", "Elapsed", "Peak mem", "Completed at")
-        sep = "-" * len(header)
-        print(f"\n{header}\n{sep}")
-        for partition, data_type, files, geo_cols, long_rows, elapsed_s, peak_bytes, completed_at in rows:
-            print(
-                _row(
-                    partition,
-                    data_type,
-                    files,
-                    geo_cols,
-                    f"{long_rows:,}",
-                    f"{elapsed_s:.1f}s",
-                    _fmt_bytes(peak_bytes),
-                    completed_at,
-                )
-            )
-        print(sep)
-        n_tabular = sum(1 for r in rows if r[1] == "tabular")
-        n_raster = sum(1 for r in rows if r[1] == "raster")
-        print(
-            f"{len(rows)} completed migration(s) ({n_tabular} tabular, {n_raster} raster), "
-            f"{sum(r[4] for r in rows):,} total long rows."
+    def _row(variable_, time_unit_, grid_, converted, total, pct):
+        return (
+            f"{variable_:<{var_w}}  {time_unit_:<{tu_w}}  {grid_:<{grid_w}}  "
+            f"{converted:>10}  {total:>10}  {pct:>5}"
         )
 
-    if n_failures:
-        print(
-            f"\n{n_failures} recorded failure(s) matching the given filters "
-            "(pass --show-failures to see them)."
-        )
+    header = _row("Variable", "Time unit", "Grid", "Converted", "Total", "Pct")
+    sep = "-" * len(header)
+    print(f"\n{header}\n{sep}")
+    total_converted = total_all = 0
+    for variable_, time_unit_, grid_ in sorted(summary):
+        entry = summary[(variable_, time_unit_, grid_)]
+        pct = f"{entry['converted'] / entry['total'] * 100:.0f}%" if entry["total"] else "-"
+        print(_row(variable_, time_unit_, grid_, entry["converted"], entry["total"], pct))
+        total_converted += entry["converted"]
+        total_all += entry["total"]
+    print(sep)
+    overall_pct = f"{total_converted / total_all * 100:.0f}%" if total_all else "-"
+    print(_row("TOTAL", "", "", total_converted, total_all, overall_pct))
 
 
 @click.command(
@@ -897,12 +806,19 @@ def _print_progress_db(
 @click.option(
     "--catalog-path",
     metavar="DIR",
-    default=str(CATALOG_PATH),
-    show_default=True,
-    help="Root directory for the unified catalog side-table. Rows are appended as data is "
-    "written and coalesced into minimal contiguous runs at the end. Ignored for --dry-run.",
+    default=None,
+    help="Root directory for the unified catalog side-table. This is the source of truth for "
+    "which partitions have already been converted -- already-converted partitions are skipped "
+    "before a migration starts. Rows are appended as data is written and coalesced into minimal "
+    "contiguous runs at the end. Also required for --show-progress. Defaults to CATALOG_PATH "
+    "(the CPRA_MP_DATA_CATALOG_PATH environment variable) if not given.",
 )
 @click.option("--estimate", is_flag=True, help="Print a memory-estimate table sorted by peak memory and exit.")
+@click.option(
+    "--unconverted-only",
+    is_flag=True,
+    help="With --estimate, only include partitions the catalog does not yet show as converted.",
+)
 @click.option("--variable", help="Migrate only this variable.")
 @click.option("--grid", help="Migrate only this grid.")
 @click.option("--time-unit", help="Migrate only this time unit.")
@@ -920,22 +836,18 @@ def _print_progress_db(
     "saturates CPUs within each partition.",
 )
 @click.option(
-    "--progress-db",
-    metavar="PATH",
-    help="SQLite database for tracking migration progress. Completed partitions are "
-    "recorded and skipped on subsequent runs.",
-)
-@click.option(
     "--show-progress",
     is_flag=True,
-    help="Print the contents of --progress-db (optionally filtered by --variable/--grid/"
-    "--time-unit) and exit without migrating anything.",
+    help="Scan --data-path (optionally filtered by --variable/--grid/--time-unit), then "
+    "summarize -- per variable/time_unit/grid -- how many partitions the catalog already "
+    "shows as converted, and exit without migrating anything.",
 )
 @click.option(
-    "--show-failures",
-    is_flag=True,
-    help="With --show-progress, print recorded failure attempts (partition, error, and "
-    "system state at the time) instead of completed migrations.",
+    "--log-path",
+    metavar="PATH",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Where to write the per-partition migration results as a CSV. Defaults to a "
+    "timestamped file in the current directory.",
 )
 @click.option(
     "--memory-limit",
@@ -967,19 +879,22 @@ def _print_progress_db(
     "Tabular data only; no equivalent is applied to raster (COG) output.",
 )
 def main(
-    output_path, catalog_path, estimate, variable, grid, time_unit, dry_run, progress,
-    data_path, workers, progress_db, show_progress, show_failures, memory_limit, temp_path,
+    output_path, catalog_path, estimate, unconverted_only, variable, grid, time_unit, dry_run, progress,
+    data_path, workers, show_progress, log_path, memory_limit, temp_path,
     round_to_decimal_places, unique_parquet_rows,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
 
-    if show_failures and not show_progress:
-        raise click.UsageError("--show-failures requires --show-progress")
+    if unconverted_only and not estimate:
+        raise click.UsageError("--unconverted-only requires --estimate")
+
+    catalog_path = Path(catalog_path) if catalog_path else CATALOG_PATH
+    if not catalog_path:
+        raise click.UsageError("--catalog-path is required (CATALOG_PATH is not set)")
+    catalog_path = catalog_path.resolve()
 
     if show_progress:
-        if not progress_db:
-            raise click.UsageError("--show-progress requires --progress-db")
-        _print_progress_db(Path(progress_db), variable, grid, time_unit, show_failures)
+        _print_progress(Path(data_path).resolve(), catalog_path, variable, grid, time_unit, progress)
         return
 
     if not estimate and not output_path:
@@ -997,6 +912,15 @@ def main(
     partitions = find_partitions(base_path, variable, grid, time_unit)
     raster_datasets = find_raster_datasets(base_path, variable, grid, time_unit)
 
+    if unconverted_only:
+        tasks = [("tabular", str(paths[0].parent.relative_to(base_path)), paths) for paths in partitions.values()]
+        tasks += [("raster", _raster_rel(d), d) for d in raster_datasets]
+        completed = _catalog_completed(catalog_path, tasks)
+        partitions = {
+            p: paths for p, paths in partitions.items() if str(p.relative_to(base_path)) not in completed
+        }
+        raster_datasets = [d for d in raster_datasets if _raster_rel(d) not in completed]
+
     if not partitions and not raster_datasets:
         print("No datasets found matching the given filters.")
         return
@@ -1012,9 +936,10 @@ def main(
         return
 
     output_path = Path(output_path).resolve()
-    # --dry-run writes nothing (no data, no catalog), so disable the catalog hooks
-    # by passing None through to the write/compact functions.
-    catalog_path = None if dry_run else Path(catalog_path).resolve()
+    # --dry-run writes nothing (no data, no catalog), so disable the catalog write
+    # hooks by passing None through to the write/compact functions. catalog_path
+    # itself stays set (it's still used below to skip already-converted partitions).
+    write_catalog_path = None if dry_run else catalog_path
 
     # One unified task list: tabular partitions and raster datasets, each tagged
     # with its kind and a stable progress key (rel).
@@ -1024,15 +949,12 @@ def main(
     for d in raster_datasets:
         tasks.append(("raster", _raster_rel(d), d))
 
-    db_conn: sqlite3.Connection | None = None
-    db_skipped = 0
-    if progress_db:
-        db_conn = _db_init(Path(progress_db))
-        completed = _db_completed(db_conn)
-        if completed:
-            kept = [t for t in tasks if t[1] not in completed]
-            db_skipped = len(tasks) - len(kept)
-            tasks = kept
+    catalog_skipped = 0
+    completed = _catalog_completed(catalog_path, tasks)
+    if completed:
+        kept = [t for t in tasks if t[1] not in completed]
+        catalog_skipped = len(tasks) - len(kept)
+        tasks = kept
 
     # A partition whose estimated peak already exceeds --memory-limit will only
     # get OOM-killed by a worker (the batch sizing in _batch_target_rows can
@@ -1060,8 +982,8 @@ def main(
     n_raster = sum(1 for t in tasks if t[0] == "raster")
     total_partitions = len(tasks)
     summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster partition(s)."
-    if db_skipped:
-        summary += f" ({db_skipped} already in progress database, skipped.)"
+    if catalog_skipped:
+        summary += f" ({catalog_skipped} already converted per the catalog, skipped.)"
     if over_limit_skipped:
         summary += f" ({over_limit_skipped} skipped: estimated peak exceeds --memory-limit.)"
     print(summary)
@@ -1069,11 +991,12 @@ def main(
     skipped = 0
     errors: list[str] = []
     touched_datasets: set[tuple] = set()  # (variable, time_unit, grid) to compact in the catalog
+    log_rows: list[dict] = []  # per-partition results, written out as a CSV at the end
 
     desc = "[DRY RUN]" if dry_run else "Migrating"
     packed = [
         (
-            task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path,
+            task, base_path, output_path, write_catalog_path, dry_run, memory_limit, progress, temp_path,
             round_to_decimal_places, unique_parquet_rows,
         )
         for task in tasks
@@ -1085,7 +1008,7 @@ def main(
     # worker is detectable via p.exitcode without relying on Pool's dead-worker logic.
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    active: dict[int, tuple[multiprocessing.Process, str]] = {}  # pid -> (proc, rel)
+    active: dict[int, tuple[multiprocessing.Process, str, str]] = {}  # pid -> (proc, rel, kind)
     task_iter = iter(packed)
 
     def _spawn_next() -> bool:
@@ -1096,7 +1019,7 @@ def main(
         task = item[0]
         p = ctx.Process(target=_run_partition, args=(item, result_queue), daemon=True)
         p.start()
-        active[p.pid] = (p, task[1])
+        active[p.pid] = (p, task[1], task[0])
         return True
 
     # Nested per-worker progress bars (one slot per active worker, below the
@@ -1142,7 +1065,7 @@ def main(
                 except queue.Empty:
                     # No result yet — check whether any worker was killed without
                     # writing to the queue (OOM kill, SIGKILL, etc.).
-                    for pid, (p, rel) in list(active.items()):
+                    for pid, (p, rel, kind) in list(active.items()):
                         if not p.is_alive():
                             p.join()
                             if p.exitcode != 0:
@@ -1152,16 +1075,23 @@ def main(
                                 msg = f"{rel}: worker killed (OOM?), exit code {p.exitcode}"
                                 errors.append(msg)
                                 tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
-                                if db_conn is not None:
-                                    _db_record_failure(db_conn, rel, f"exit code {p.exitcode}")
+                                log_rows.append({
+                                    "partition": rel,
+                                    "data_type": "raster" if kind == "raster" else "tabular",
+                                    "status": "failed",
+                                    "files": "", "geo_cols": "", "long_rows": "",
+                                    "elapsed_s": "", "peak_bytes": "",
+                                    "error": f"exit code {p.exitcode}",
+                                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                                })
                                 _spawn_next()
                                 bar.update(1)
                                 bar.set_postfix(migrated=migrated, skipped=skipped)
                     continue
                 except KeyboardInterrupt:
-                    for p, _ in active.values():
+                    for p, _, _ in active.values():
                         p.terminate()
-                    for p, _ in active.values():
+                    for p, _, _ in active.values():
                         p.join()
                     raise
 
@@ -1177,13 +1107,17 @@ def main(
                 _spawn_next()
                 remaining -= 1
 
+                completed_at = datetime.now().isoformat(timespec="seconds")
                 for msg in messages:
                     tqdm.write(msg)
                 if error:
                     errors.append(f"{rel}: {error}")
                     tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
-                    if db_conn is not None:
-                        _db_record_failure(db_conn, rel, error)
+                    log_rows.append({
+                        "partition": rel, "data_type": "", "status": "failed",
+                        "files": "", "geo_cols": "", "long_rows": "", "elapsed_s": "", "peak_bytes": "",
+                        "error": error, "completed_at": completed_at,
+                    })
                 elif result is None:
                     skipped += 1  # not wide format
                 else:
@@ -1193,37 +1127,57 @@ def main(
                         touched_datasets.add((dims["variable"], dims["time_unit"], dims["grid"]))
                     if result.get("skipped"):
                         skipped += 1  # already in long format on disk
-                        if db_conn is not None:
-                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], 0.0, 0, data_type)
+                        log_rows.append({
+                            "partition": rel, "data_type": data_type, "status": "skipped",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": 0.0, "peak_bytes": 0,
+                            "error": "", "completed_at": completed_at,
+                        })
                     elif "elapsed_s" in result:
                         migrated += 1
-                        if db_conn is not None:
-                            _db_record(db_conn, rel, result["files"], result["geo_cols"], result["long_rows"], result["elapsed_s"], result["peak_bytes"], data_type)
+                        log_rows.append({
+                            "partition": rel, "data_type": data_type, "status": "migrated",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": result["elapsed_s"],
+                            "peak_bytes": result["peak_bytes"], "error": "", "completed_at": completed_at,
+                        })
                     else:
                         migrated += 1  # dry run
+                        log_rows.append({
+                            "partition": rel, "data_type": data_type, "status": "would_migrate",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": "", "peak_bytes": "",
+                            "error": "", "completed_at": completed_at,
+                        })
                 bar.update(1)
                 bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:
-        for p, _ in active.values():
+        for p, _, _ in active.values():
             p.terminate()
-        for p, _ in active.values():
+        for p, _, _ in active.values():
             p.join()
         tqdm.write("\nInterrupted by user.", file=sys.stderr)
         sys.exit(1)
     finally:
         for pid in list(inner_bars):
             _close_inner(pid)
-        if db_conn is not None:
-            db_conn.close()
 
     # Coalesce the catalog for every dataset touched: write_parquet appended
     # per-write rows and compact_cog appended raster rows, so a final
     # compact_partition per variable/time_unit/grid collapses them into minimal
     # contiguous runs.  Idempotent (a single-file catalog partition is a no-op).
-    if catalog_path is not None and touched_datasets:
-        catalog = Catalog(catalog_path)
+    if write_catalog_path is not None and touched_datasets:
+        catalog = Catalog(write_catalog_path)
         for variable_, time_unit_, grid_ in sorted(touched_datasets):
             catalog.compact_partition(variable_, time_unit_, grid_)
+
+    if log_rows:
+        log_path = log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        with open(log_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(log_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(log_rows)
+        print(f"\nWrote {len(log_rows)} result(s) to {log_path}")
 
     label = "Would migrate" if dry_run else "Migrated"
     print(f"\n{label} {migrated} unit(s), skipped {skipped}.")
