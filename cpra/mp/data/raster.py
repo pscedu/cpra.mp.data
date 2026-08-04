@@ -460,10 +460,16 @@ def _write_run(
         # out_path is a fresh UUID that can't collide with any existing source file, so the
         # copy can be written directly -- no temp-file/rename needed.  Each CreateCopy
         # already runs with num_threads=ALL_CPUS, so parallelizing runs would only contend.
+        #
+        # GDAL_PAM_ENABLED=NO stops GDAL from writing a .aux.xml sidecar for the per-band
+        # Description/ColorInterp that CreateCopy carries over from the VRT -- the COG
+        # driver already embeds those natively in the output file's own GDAL_METADATA tag
+        # (same as write_cog's direct Create() path), so PAM's copy is pure redundant
+        # bookkeeping, never read back by anything in this codebase.
+        env_options = {"GDAL_PAM_ENABLED": "NO"}
         if round_dtype:
-            with rio.Env(GDAL_VRT_ENABLE_PYTHON="YES"):
-                copy(str(vrt_path), str(out_path), **profile)
-        else:
+            env_options["GDAL_VRT_ENABLE_PYTHON"] = "YES"
+        with rio.Env(**env_options):
             copy(str(vrt_path), str(out_path), **profile)
 
 
