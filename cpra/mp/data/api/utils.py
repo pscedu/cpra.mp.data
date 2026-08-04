@@ -62,6 +62,39 @@ def timing(func):
     return wrapped
 
 
+def group_rows_by_path(df):
+    """Group a materialized index DataFrame's rows by unique ``path``.
+
+    Multiband COGs mean several df rows (different bands, e.g. different
+    ``calendar_year`` values) can share the same file. Callers use this to open each
+    file once and request all of its needed bands in a single read/sample call, rather
+    than reopening the same file per row.
+
+    Returns ``(paths, row_indices, bands)`` where ``paths`` are the unique paths in
+    first-seen order, ``row_indices[i]`` are the df row positions backed by
+    ``paths[i]``, and ``bands[i]`` are the corresponding band numbers (1-based, in the
+    same order as ``row_indices[i]``), or None if df has no ``band`` column.
+    """
+    paths = df["path"].to_list()
+    has_bands = "band" in df.columns
+    row_bands = df["band"].to_list() if has_bands else [None] * len(paths)
+
+    order = []
+    row_indices_by_path = {}
+    bands_by_path = {}
+    for row_idx, (path, band) in enumerate(zip(paths, row_bands)):
+        if path not in row_indices_by_path:
+            order.append(path)
+            row_indices_by_path[path] = []
+            bands_by_path[path] = []
+        row_indices_by_path[path].append(row_idx)
+        bands_by_path[path].append(band)
+
+    row_indices = [row_indices_by_path[path] for path in order]
+    bands = [bands_by_path[path] if has_bands else None for path in order]
+    return order, row_indices, bands
+
+
 def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None):
     """Read a window of data from a single raster (optionally a subset of bands)."""
     return dataset.read(indexes=indexes, window=window, out_shape=out_shape, resampling=resampling)
@@ -70,32 +103,32 @@ def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest,
 async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest, bands=None):
     """Read several rasters in multiple threads.
 
-    ``bands`` optionally selects a single band per dataset (1-based).  Each selected band
-    is read as a ``(1, height, width)`` array so results can be vstacked, exactly as when
-    reading a single-band file.  When ``bands`` is None every band of each dataset is read.
+    ``bands`` optionally selects, per dataset, the list of band numbers (1-based) to
+    read; each dataset's selected bands are read together as one ``(n, height, width)``
+    array. When ``bands`` is None every band of each dataset is read.
     """
     loop = asyncio.get_running_loop()
     if bands is None:
         bands = [None] * len(datasets)
     return await asyncio.gather(
         *[
-            loop.run_in_executor(
-                None, _read_window, dataset, window, out_shape, resampling, None if band is None else [band]
-            )
+            loop.run_in_executor(None, _read_window, dataset, window, out_shape, resampling, band)
             for dataset, band in zip(datasets, bands)
         ]
     )
 
 
-def _sample_raster(dataset, coordinates, band=None):
-    """Sample a single raster at the given coordinates (optionally a single band)."""
-    return list(dataset.sample(coordinates, indexes=band))
+def _sample_raster(dataset, coordinates, bands=None):
+    """Sample a single raster at the given coordinates (optionally a subset of bands)."""
+    return list(dataset.sample(coordinates, indexes=bands))
 
 
 async def parallel_sample_rasters(datasets, coordinates, bands=None):
     """Sample several rasters at the given coordinates in multiple threads.
 
-    ``bands`` optionally selects a single band per dataset (1-based); None samples every band.
+    ``bands`` optionally selects, per dataset, the list of band numbers (1-based) to
+    sample; each dataset's selected bands are sampled together in one call. When
+    ``bands`` is None every band of each dataset is sampled.
     """
     loop = asyncio.get_running_loop()
     if bands is None:

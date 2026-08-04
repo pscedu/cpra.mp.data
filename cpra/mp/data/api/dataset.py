@@ -24,6 +24,7 @@ from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.api.utils import (
     asynctiming,
     get_lazy_frame,
+    group_rows_by_path,
     parallel_read_rasters,
     parallel_sample_rasters,
     unpack_values,
@@ -153,19 +154,32 @@ class Dataset(LazyFrameSource):
             lats.append(lat)
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
+        # Rows sharing the same path (bands of the same multiband COG) are grouped so each
+        # file is opened and sampled once, requesting all of its needed bands together.
         df = self.materialize()
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            datasets = [stack.enter_context(rio.open(path)) for path in unique_paths]
             src_crs = CRS.from_epsg(4326)
             dst_crs = datasets[0].crs
             projected_pairs = list(zip(*transform(src_crs, dst_crs, lngs, lats)))
-            bands = df["band"].to_list() if "band" in df.columns else None
-            samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
+            group_samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
+            dtype = datasets[0].dtypes[0]
 
-        # Add the resulting values to the LazyFrame, and remove the internal path/band columns.
-        columns = [np.concatenate(col) for col in zip(*samples)]
+        # Add the resulting values to the LazyFrame as one column per sampled coordinate,
+        # then unpivot into long format (grid_cell/value) to match the long-format contract
+        # used everywhere else in the API. Each grid_cell here is a "lng,lat" coordinate
+        # pair label rather than an integer grid ID, since these are arbitrary sample points.
+        columns = [np.empty(len(df), dtype=dtype) for _ in lngs]
+        for path_row_indices, path_samples in zip(row_indices, group_samples):
+            for column, values in zip(columns, path_samples):
+                column[path_row_indices] = values
         column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-        self.lf = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band")).lazy()
+        wide_df = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band"))
+        index_cols = [col for col in wide_df.columns if col not in column_labels]
+        self.lf = wide_df.unpivot(
+            index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
+        ).lazy()
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
@@ -456,12 +470,18 @@ class Dataset(LazyFrameSource):
 
         return inject_and_serialize(vt, id_values)
 
-    async def get_raster_array(self, df, rasters, window, out_shape=None):
-        """Read a raster array and apply the operations specified
-        in the index DataFrame."""
-        # Each index row selects one band of its (possibly multi-band) file.
-        bands = df["band"].to_list() if "band" in df.columns else None
-        data = np.vstack(await parallel_read_rasters(rasters, window, out_shape, bands=bands))
+    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None):
+        """Read a raster array and apply the operations specified in the index DataFrame.
+
+        ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
+        multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
+        with ``row_indices``/``bands`` mapping each raster back to the df rows and band
+        numbers it supplies.
+        """
+        band_reads = await parallel_read_rasters(rasters, window, out_shape, bands=bands)
+        data = np.empty((len(df), *band_reads[0].shape[1:]), dtype=band_reads[0].dtype)
+        for path_row_indices, read in zip(row_indices, band_reads):
+            data[path_row_indices] = read
 
         # Apply multipliers from calculate parameters.
         if not (df["multiplier"] == 1).all():
@@ -487,8 +507,9 @@ class Dataset(LazyFrameSource):
             return None
 
         df = self.materialize()
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
             vrts = [
                 WarpedVRT(
                     dataset,
@@ -515,13 +536,12 @@ class Dataset(LazyFrameSource):
             )
             scale = tile_size / abs(tile_bounds.right - tile_bounds.left)
             out_shape = (
-                1,
                 round(scale * abs(read_bounds.top - read_bounds.bottom)),
                 round(scale * abs(read_bounds.right - read_bounds.left)),
             )
             window = vrts[0].window(*read_bounds)
 
-            data = await self.get_raster_array(df, vrts, window, out_shape)
+            data = await self.get_raster_array(df, vrts, row_indices, bands, window, out_shape)
             color = self.legend.colorize_pixels(data)
             image = Image.fromarray(
                 color[:, :, :3] if format == "jpg" else color,
@@ -549,8 +569,9 @@ class Dataset(LazyFrameSource):
         if not len(df):
             return False
 
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
 
             # Each selected (path, band) row — or each aggregated group — becomes one
             # output band, so the source's own band count must be overridden.
@@ -573,7 +594,7 @@ class Dataset(LazyFrameSource):
             groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
-                data = await self.get_raster_array(df, inputs, window)
+                data = await self.get_raster_array(df, inputs, row_indices, bands, window)
                 output.write(data, window=window)
 
         return True
