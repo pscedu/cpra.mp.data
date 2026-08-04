@@ -67,13 +67,13 @@ class BaseVisualization:
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
-        required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit}))
+        required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit, "grid": grid}))
         select = [self.get_time_column(time_unit), "grid_cell", "value"]
 
         # Force unpivot to be true.
         kwargs["unpivot"] = True
 
-        params = [("grid", grid)] if grid else []
+        params = []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
                 if param_name == "grid_cell":
@@ -95,10 +95,11 @@ class BaseVisualization:
                 "get_model_data",
                 variable=variable,
                 time_unit=time_unit,
+                grid=grid,
                 format="csv",
             )
         else:
-            dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{time_unit}/data.csv"
+            dataset_url = f"https://api.mpdp.coastal.la.gov/v1/datasets/{variable}/{time_unit}/{grid}/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
 

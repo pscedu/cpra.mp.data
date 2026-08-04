@@ -361,6 +361,7 @@ class Dataset(LazyFrameSource):
         if self.grid_cell_ids is not None:
             columns = len(self.grid_cell_ids)
         else:
+            grid = GRIDS[self.dataset_dimensions.grid]
             columns = getattr(self.grid, "id_count", None)
 
             if columns is None:
