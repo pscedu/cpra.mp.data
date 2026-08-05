@@ -31,10 +31,10 @@ Without any query string parameters, each endpoint returns the full dataset by d
 | Order | Operation | Vector-Grid Status | Raster-Grid Status |
 |---|---|---|---|
 | 1 | [Filter](#filter) | ✅ Implemented | ✅ Implemented |
-| 2 | [Calculate](#calculate) | ✅ Implemented | ❌ Not Implemented |
-| 3 | [Group and Aggregate](#group-and-aggregate) | ✅ Implemented | ❌ Not Implemented |
-| 4 | [Transform and Extract](#transform-and-extract) | ✅ Implemented | ❌ Not Implemented |
-| 5 | [Sort](#sort) | ✅ Implemented | ❌ Not Implemented |
+| 2 | [Calculate](#calculate) | ✅ Implemented | ✅ Implemented |
+| 3 | [Group and Aggregate](#group-and-aggregate) | ✅ Implemented | ✅ Implemented |
+| 4 | [Transform and Extract](#transform-and-extract) | ✅ Implemented | ✅ Implemented |
+| 5 | [Sort](#sort) | ✅ Implemented | ✅ Implemented |
 
 ### Filter
 
@@ -77,7 +77,7 @@ Transform and extract parameters can be used to change the shape or format of th
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
 | `color_map` | Apply the given color map to raster data | ❌ | ✅ | `color_map=ffibs` |
-| `unpivot` | Change the data shape from wide to long, giving the resulting table a geography column and a value column instead of a separate column for each geography | ✅ | ❌ | `unpivot=true` |
+| `unpivot` | Change the data shape from wide to long, giving the resulting table a geography column and a value column instead of a separate column for each geography | ✅ | ✅ (once raster output is tabular, via `geography` or `summarize_by`) | `unpivot=true` |
 | `summarize_by` | Summarize by geographic unit | ✅ | ✅ | `summarize_by=hydro_compartment` |
 | `summarize_aggregate` | Aggregate function: one of `sum`, `difference`, `max`, `min`, or `mean` | ✅ | ✅ | `summarize_aggregate=max` |
 | `summarize_geography` | Limit the summary geographies to the provided IDs | ✅ | ✅ | `summarize_geography=659,680,700` |

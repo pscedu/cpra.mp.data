@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import re
 from contextlib import ExitStack
@@ -39,6 +40,32 @@ DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
 VALUE_COLUMNS = cs.matches(r"^[0-9\-]")
+
+# Zonal summarize aggregates, as (reducing ufunc, accumulator start value) pairs. Every
+# aggregate reduces the same way; mean additionally divides by the pixel counts that
+# `_get_zone_segments` returns.
+RASTER_AGGREGATES = {
+    "max": (np.maximum, -np.inf),
+    "mean": (np.add, 0.0),
+    "min": (np.minimum, np.inf),
+    "sum": (np.add, 0.0),
+}
+
+
+def _get_zone_segments(zones, zone_ids):
+    """Sort a block of crosswalk zone IDs into contiguous runs of same-zone pixels.
+
+    Returns the positions in `zone_ids` of the zones present in the block, the block's
+    flat pixel indices ordered by zone, the offset at which each zone's run of pixels
+    begins, and the number of pixels in each run. Pixels belonging to a zone that isn't
+    being summarized, including nodata pixels, are dropped.
+    """
+    flat_zones = zones.ravel()
+    positions = np.searchsorted(zone_ids, flat_zones).clip(max=zone_ids.size - 1)
+    pixels = np.flatnonzero(zone_ids[positions] == flat_zones)
+    pixels = pixels[np.argsort(positions[pixels], kind="stable")]
+    present, starts, counts = np.unique(positions[pixels], return_index=True, return_counts=True)
+    return present, pixels, starts, counts
 
 
 class Dataset(LazyFrameSource):
@@ -102,13 +129,23 @@ class Dataset(LazyFrameSource):
     @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.options.geography:
+        if self.grid.grid_type == "vector" or self.options.geography or self.options.summarize_by:
             return OutputType.vector
         return OutputType.raster
 
     @property
     def variable(self) -> Variable:
         return VARIABLES[self.dataset_dimensions.variable]
+
+    def _is_raster_metadata_table(self):
+        """Whether self.lf still holds the raster band-metadata table (dimension columns
+        and a path column), as opposed to a tabular result already derived from raster
+        pixels (via geography sampling or summarize_by). Unlike `output_type`, which
+        reflects the dataset's final response shape and is stable for the whole request,
+        this reflects self.lf's shape at the point it's called, since summarize_by's
+        raster-to-tabular conversion doesn't happen until the transform stage.
+        """
+        return self.grid.grid_type == "raster" and "path" in self.lf.collect_schema().names()
 
     async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame."""
@@ -170,7 +207,7 @@ class Dataset(LazyFrameSource):
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
 
-        if self.output_type == OutputType.raster:
+        if self._is_raster_metadata_table():
             self.lf = self.lf.with_columns(multiplier=pl.lit(1))
             value_cols = pl.col("multiplier")
         else:
@@ -228,7 +265,14 @@ class Dataset(LazyFrameSource):
             return
 
         group_by_cols = self._get_group_by_columns()
-        if self.output_type == OutputType.vector:
+        if self._is_raster_metadata_table():
+            # agg_groups() is deprecated and panics when grouping on a literal (the
+            # group_aggregate-without-group_by case, group_by_cols == [True]), so track
+            # row positions via with_row_index instead.
+            self.raster_groups = (
+                self.lf.with_row_index("row_idxs").group_by(*group_by_cols).agg(pl.col("row_idxs"))
+            )
+        else:
             # Set dimension columns to null if they are not part of the group by clause.
             required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
             null_cols = [col for col in required_cols if col not in group_by_cols]
@@ -241,22 +285,21 @@ class Dataset(LazyFrameSource):
             if null_cols:
                 self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
 
-        else:
-            self.raster_groups = self.lf.group_by(*group_by_cols).agg(row_idxs=pl.col("path").agg_groups())
-
-    def _apply_transform_params(self):
+    async def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
-        if self.output_type == OutputType.vector:
-            self._apply_transform_params_vector()
+        if self._is_raster_metadata_table():
+            await self._apply_transform_params_raster()
         else:
-            self._apply_transform_params_raster()
+            self._apply_transform_params_vector()
         self._apply_unpivot_param()
 
-    def _apply_transform_params_vector(self):
-        """Apply transform and extract parameters to the LazyFrame."""
+    def _validate_summarize_params(self):
+        """Validate summarize parameters and parse summary geography IDs, if present.
 
+        Returns True if summarize_by/summarize_aggregate were provided, False if neither was.
+        """
         if self.options.summarize_by is None and self.options.summarize_aggregate is None:
-            return
+            return False
 
         if self.options.summarize_by is None or self.options.summarize_aggregate is None:
             msg = "summarize_by and summarize_aggregate parameters must be used together"
@@ -270,6 +313,14 @@ class Dataset(LazyFrameSource):
                 int(geo_id) for geo_id in unpack_values(self.options.summarize_geography, "summarize_geography")
             ]
 
+        return True
+
+    def _apply_transform_params_vector(self):
+        """Apply transform and extract parameters to the LazyFrame."""
+
+        if not self._validate_summarize_params():
+            return
+
         # Generate column expressions.
         crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
         crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
@@ -277,7 +328,7 @@ class Dataset(LazyFrameSource):
         try:
             crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
         except FileNotFoundError:
-            msg = f"No crosswalk from {self.grid} to {self.options.summarize_by}"
+            msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)
 
         if self.geography_ids:
@@ -305,8 +356,103 @@ class Dataset(LazyFrameSource):
             },
         ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
 
-    def _apply_transform_params_raster(self):
-        """Apply transform and extract parameters to the image."""
+    def _get_raster_dimension_frame(self, df):
+        """Get a DataFrame with one row per output raster band, aligned by row order
+        with the pixel array `get_raster_array` returns for the same `df`."""
+        if self.raster_groups is None:
+            return df.select(pl.exclude("path", "multiplier"))
+
+        # Mirror the vector group-by branch: dimension columns that aren't part of the
+        # group by clause collapse into a single group, so they become null here too.
+        required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
+        group_df = self.raster_groups.collect().select(pl.exclude("row_idxs"))
+        null_cols = [col for col in required_cols if col not in group_df.columns]
+        if null_cols:
+            group_df = group_df.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
+        return group_df
+
+    async def _apply_transform_params_raster(self):
+        """Apply transform and extract parameters to the image.
+
+        Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
+        pre-generated zone-ID crosswalk raster (see scripts/generate_raster_crosswalks.py),
+        converting the result into a tabular LazyFrame in the same shape produced by
+        `_apply_transform_params_vector` (dimension columns, one column per destination
+        geography ID, and a `geographic_unit` column).
+        """
+        if not self._validate_summarize_params():
+            return
+
+        crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.tif"
+        crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
+        if not crosswalk_path.exists():
+            msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
+            raise HTTPException(status_code=400, detail=msg)
+
+        df = self.materialize()
+        if df.is_empty():
+            raise HTTPException(status_code=404, detail="Dataset does not exist")
+
+        dim_df = self._get_raster_dimension_frame(df)
+        n_bands = len(dim_df)
+        is_mean = self.options.summarize_aggregate == "mean"
+        aggregate_fn, start_value = RASTER_AGGREGATES[self.options.summarize_aggregate]
+
+        with ExitStack() as stack:
+            crosswalk = stack.enter_context(rio.open(crosswalk_path))
+            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            if self.summarize_geography_ids:
+                zone_ids = np.array(sorted(self.summarize_geography_ids), dtype="int64")
+            else:
+                dst_ids = crosswalk.tags()["dst_ids"].split(",")
+                zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
+
+            accumulator = np.full((n_bands, zone_ids.size), start_value)
+            counts = np.zeros(zone_ids.size) if is_mean else None
+            seen = np.zeros(zone_ids.size, dtype=bool)
+
+            groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
+            for _group_row, group in groups:
+                window = windows.union(*[w for ji, w in group])
+
+                # Neither read depends on the other, so overlap the crosswalk read with
+                # the (already parallel) reads of the data COGs.
+                data, zones = await asyncio.gather(
+                    self.get_raster_array(df, inputs, window),
+                    asyncio.to_thread(crosswalk.read, 1, window=window),
+                )
+
+                # Grouping the block's pixels by zone once lets each band be reduced over
+                # every zone in a single pass, and shares that grouping across the bands.
+                positions, pixels, starts, pixel_counts = _get_zone_segments(zones, zone_ids)
+                if positions.size == 0:
+                    continue
+
+                # Accumulate in float64, as the source pixels are often narrow integers.
+                block_stats = np.vstack(
+                    [
+                        aggregate_fn.reduceat(band.reshape(-1)[pixels].astype("float64", copy=False), starts)
+                        for band in data
+                    ]
+                )
+                accumulator[:, positions] = aggregate_fn(accumulator[:, positions], block_stats)
+                seen[positions] = True
+
+                if is_mean:
+                    counts[positions] += pixel_counts
+
+        result = (
+            np.divide(accumulator, counts, out=np.full_like(accumulator, np.nan), where=counts > 0)
+            if is_mean
+            else accumulator
+        )
+        result[:, ~seen] = np.nan
+
+        self.lf = (
+            dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
+            .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+            .lazy()
+        )
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""
@@ -319,7 +465,7 @@ class Dataset(LazyFrameSource):
         await self._apply_filter_params()
         self._apply_calculate_params()
         self._apply_group_params()
-        self._apply_transform_params()
+        await self._apply_transform_params()
         self._apply_sort_params()
 
     def estimate_data_size(self):
@@ -541,6 +687,10 @@ class Dataset(LazyFrameSource):
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
             profile = inputs[0].profile.copy()
             profile.update(kwargs)
+            # group_by/group_aggregate can collapse the matched bands into fewer output
+            # bands, so the output band count can't just be copied from the (single-band)
+            # source COGs' profile.
+            profile["count"] = self.raster_groups.collect().height if self.raster_groups is not None else len(df)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
 
             # Group raster blocks by row, and read an entire row of blocks at once.
