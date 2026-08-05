@@ -33,16 +33,16 @@ BaseFilterDimensions = create_model(
 
 
 class DatasetDimensions(BaseDatasetDimensions):
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class FilterDimensions(BaseFilterDimensions):
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class Options(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
     geography: str | None = None
     where: str | None = None
     negate: str | None = None
@@ -58,9 +58,6 @@ class Options(BaseModel):
     sort: str | None = None
     select: str | None = None
 
-    class Config:
-        use_enum_values = True
-
 
 class Compression(BaseModel):
     compression_algorithm: CompressionAlgorithm = CompressionAlgorithm.zstd
@@ -68,8 +65,7 @@ class Compression(BaseModel):
 
 
 class TileQuery(Options, FilterDimensions):
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
     @property
     def filter_dimensions(self):
@@ -81,8 +77,7 @@ class TileQuery(Options, FilterDimensions):
 
 
 class DataQuery(TileQuery, Compression):
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
     @property
     def compression(self):

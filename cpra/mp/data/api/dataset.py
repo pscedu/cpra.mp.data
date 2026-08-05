@@ -3,7 +3,6 @@ import itertools
 import re
 from contextlib import ExitStack
 from io import BytesIO
-from pathlib import Path
 
 import mercantile
 import numpy as np
@@ -20,6 +19,7 @@ from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform, transform_bounds
 
+from cpra.mp.data import config
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import OutputType
@@ -74,6 +74,7 @@ class Dataset(LazyFrameSource):
         dataset_dimensions: DatasetDimensions,
         filter_dimensions: FilterDimensions,
         options: Options,
+        base_path=None,
     ):
         self.dataset_dimensions = dataset_dimensions
         self.filter_dimensions = filter_dimensions
@@ -83,7 +84,7 @@ class Dataset(LazyFrameSource):
         self.summarize_geography_ids = None
         self.raster_groups = None
 
-        self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions)
+        self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
         self.grid = GRIDS[self.dataset_dimensions.grid]
 
     def _error(self, msg, status_code=400):
@@ -323,16 +324,22 @@ class Dataset(LazyFrameSource):
 
         # Generate column expressions.
         crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
-        crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
+        crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
 
-        try:
-            crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
-        except FileNotFoundError:
+        # scan_parquet is lazy and won't raise for a missing file until collection,
+        # so check up front to report the missing crosswalk as a 400.
+        if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)
 
+        crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
+
         if self.geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in(self.geography_ids))
+            # geography_ids stay strings because they double as column names; the
+            # crosswalk's src_id is an integer, so cast here as summarize_geography does.
+            crosswalk_lf = crosswalk_lf.filter(
+                pl.col("src_id").is_in([int(geo_id) for geo_id in self.geography_ids])
+            )
 
         if self.summarize_geography_ids:
             crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_geography_ids))
@@ -384,7 +391,7 @@ class Dataset(LazyFrameSource):
             return
 
         crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.tif"
-        crosswalk_path = Path(__file__).parent.parent / "crosswalk" / crosswalk_name
+        crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)
@@ -490,7 +497,9 @@ class Dataset(LazyFrameSource):
             values = getattr(self.filter_dimensions, col)
             if values is not None:
                 value_count = len(values)
-            elif dimension.values:
+            # Compare against None explicitly: dimension.values is a DataFrame, and
+            # Polars raises on bool() rather than reporting emptiness.
+            elif dimension.values is not None:
                 value_count = len(dimension.values)
             elif col == "calendar_year":
                 if self.dataset_dimensions.time_unit == "decadal":
@@ -552,13 +561,11 @@ class Dataset(LazyFrameSource):
 
     def validate_vector_tile(self):
         """Validate that the tile is a vector grid with an available PMTiles file."""
-        from cpra.mp.data.api.vector import TILES_PATH
-
         if self.output_type != OutputType.vector:
             raise HTTPException(status_code=400, detail="invalid output type for vector tile: raster")
 
         grid_name = self.options.summarize_by or self.grid.name
-        if not (TILES_PATH / f"{grid_name}.pmtiles").exists():
+        if not (config.TILES_PATH / f"{grid_name}.pmtiles").exists():
             raise HTTPException(
                 status_code=404, detail=f"no tile file for grid: {grid_name}"
             )
@@ -665,10 +672,9 @@ class Dataset(LazyFrameSource):
 
             data = await self.get_raster_array(df, vrts, None)
             color = self.legend.colorize_pixels(data)
-            image = Image.fromarray(
-                color[:, :, :3] if format == "jpg" else color,
-                mode=("RGB" if format == "jpg" else "RGBA"),
-            )
+            # JPEG has no alpha channel, so drop it. fromarray infers RGB vs RGBA from the
+            # array's shape, and passing mode= explicitly is deprecated as of Pillow 11.
+            image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
 
             with BytesIO() as memfile:
                 image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))

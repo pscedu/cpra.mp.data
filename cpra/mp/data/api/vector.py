@@ -9,12 +9,12 @@ from pmtiles.reader import MmapSource, Reader
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from cpra.mp.data.config import TILES_PATH
+from cpra.mp.data import config
 
 
 def read_pmtile(grid_name: str, tile: mercantile.Tile) -> bytes | None:
     """Return the raw (still gzip-compressed) MVT bytes for a tile, or None."""
-    path = TILES_PATH / f"{grid_name}.pmtiles"
+    path = config.TILES_PATH / f"{grid_name}.pmtiles"
     if not path.exists():
         return None
     with open(path, "rb") as f:

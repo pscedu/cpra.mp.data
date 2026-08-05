@@ -107,10 +107,11 @@ def _read_data_cached(*args, **kwargs):
     return read_data(*args, **kwargs)
 
 
-def get_lazy_frame(dataset_dimensions, filter_dimensions):
+def get_lazy_frame(dataset_dimensions, filter_dimensions, base_path=None):
     """Get a LazyFrame for the given dimensions with error handling."""
     try:
         return _read_data_cached(
+            **({"base_path": base_path} if base_path is not None else {}),
             **dict(dataset_dimensions),
             **{k: tuple(v) for (k, v) in dict(filter_dimensions).items() if isinstance(v, list)},
         )

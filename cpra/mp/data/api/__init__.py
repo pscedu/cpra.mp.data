@@ -1,4 +1,5 @@
 from collections import defaultdict
+from functools import lru_cache
 from typing import Annotated
 
 import polars.selectors as cs
@@ -42,11 +43,19 @@ from cpra.mp.data.utils import glob_lazy_frame
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
-MPD_ENGINE = create_engine(MPD_URI)
+@lru_cache(maxsize=1)
+def get_mpd_engine():
+    """Create the MPD database engine.
+
+    Built lazily so that importing the app doesn't require a database: MPD_URI
+    defaults to an empty string, which create_engine rejects, and only the
+    dimensions endpoint actually reads from the MPD.
+    """
+    return create_engine(MPD_URI)
 
 
 def get_mpd_session():
-    with Session(MPD_ENGINE) as session:
+    with Session(get_mpd_engine()) as session:
         yield session
 
 

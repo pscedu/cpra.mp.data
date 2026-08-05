@@ -7,7 +7,7 @@ from rasterio.io import MemoryFile
 from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import get_base_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
@@ -20,9 +20,10 @@ from cpra.mp.data.utils import (
 )
 
 
-def cog_path_expression(df, base_path=BASE_PATH, separator="/"):
+def cog_path_expression(df, base_path=None, separator="/"):
     """Generate a COG path from a data frame containing dimensions and values."""
 
+    base_path = get_base_path(base_path)
     return pl.concat_str(
         [
             pl.concat_str(
@@ -59,15 +60,19 @@ def vrt(paths):
                 # TODO: Verify that the dimensions etc. of this band match the output raster.
                 band_el = dataset_el.find("VRTRasterBand")
                 # TODO: Raise an error if there isn't a band?
-                if band_el:
+                # Compare against None explicitly: an Element with no children is
+                # falsy, which would silently drop bands that have no sub-elements.
+                if band_el is not None:
                     band_el.set("band", str(path_idx))
                     out_el.append(band_el)
 
     return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
 
 
-def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
+def read_cog(base_path=None, include_file_paths="path", **kwargs):
     """Locate matching COG paths."""
+
+    base_path = get_base_path(base_path)
 
     # Validate the input keyword arguments.
     input_df = get_input_data_frame(**kwargs)
@@ -75,7 +80,13 @@ def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
 
     # Construct the glob lazy frame.
     required_cols = required_columns(input_df, include_metadata=False)
-    lf = glob_lazy_frame(required_cols=required_cols, extension="tif", include_file_paths=include_file_paths, **kwargs)
+    lf = glob_lazy_frame(
+        required_cols=required_cols,
+        base_path=base_path,
+        extension="tif",
+        include_file_paths=include_file_paths,
+        **kwargs,
+    )
     filter_exps = get_filter_expressions(**kwargs)
     if filter_exps:
         lf = lf.filter(*filter_exps)
@@ -84,13 +95,14 @@ def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
 
 def write_cog(
     data,
-    base_path=BASE_PATH,
+    base_path=None,
     validate=True,
     compression="zstd",
     compression_level=6,
     **kwargs,
 ):
     """Write data from a NumPy array to a COG."""
+    base_path = get_base_path(base_path)
     df = cast_columns(pl.DataFrame(kwargs))
     if validate:
         validate_data_frame(df)

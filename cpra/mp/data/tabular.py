@@ -4,11 +4,10 @@ from pathlib import Path
 import polars as pl
 import polars.selectors as cs
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import get_base_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
-    build_glob_pattern,
     dataset_path,
     get_filter_expressions,
     get_input_data_frame,
@@ -23,8 +22,10 @@ ALPHA_COLUMN = re.compile(r"^[a-z]")
 NUMERIC_COLUMN = re.compile(r"^[0-9]")
 
 
-def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwargs):
+def read_parquet(base_path=None, cache=True, include_file_paths=None, **kwargs):
     """Read tabular data into a data frame from a Parquet file."""
+
+    base_path = get_base_path(base_path)
 
     # Validate the input keyword arguments.
     input_df = get_input_data_frame(**kwargs)
@@ -71,7 +72,7 @@ def read_parquet(base_path=BASE_PATH, cache=True, include_file_paths=None, **kwa
 
 def write_parquet(
     data,
-    base_path=BASE_PATH,
+    base_path=None,
     validate=True,
     sort=True,
     compression="zstd",
@@ -82,6 +83,7 @@ def write_parquet(
 ):
     """Write data from a data frame to a Parquet file."""
 
+    base_path = get_base_path(base_path)
     df = data if isinstance(data, pl.DataFrame) else pl.DataFrame(data)
 
     # Add keyword arguments to the dataframe as columns.
@@ -151,7 +153,7 @@ def write_parquet(
 
 
 def compact_parquet(
-    base_path=BASE_PATH,
+    base_path=None,
     sort=True,
     compression="zstd",
     compression_level=6,
@@ -159,7 +161,19 @@ def compact_parquet(
     use_dictionary=False,
     **kwargs,
 ):
-    """Rewrite Parquet datasets with one file per dataset."""
+    """Rewrite Parquet datasets with one file per partition directory.
+
+    Every partition directory holding more than one Parquet file is read back as a whole
+    and rewritten as a single file, and the originals are then removed. A directory that
+    already holds one file is left untouched.
+
+    Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
+    Parquet files and the number of source files they consumed (both empty/zero when
+    every partition was already a single file), so callers don't have to re-scan the
+    output tree. Mirrors ``raster.compact_cog``.
+    """
+
+    base_path = get_base_path(base_path)
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)
@@ -168,10 +182,28 @@ def compact_parquet(
     # Calculate the dataset directory path.
     dataset_dir = dataset_path(base_path, **kwargs)
 
-    # Construct the glob pattern.
-    required_cols = required_columns(input_df, include_dataset=False, include_metadata=False)
-    glob_pattern = build_glob_pattern(required_cols=required_cols, extension="parquet", **kwargs)
+    # Construct the glob pattern. Only partition columns become directories, and the
+    # files themselves are UUID-named, so the pattern is the partition directories
+    # below the dataset directory followed by any Parquet file. (This is why
+    # build_glob_pattern isn't reused here: it appends the extension to the last
+    # dimension, which suits COGs -- where the final dimension *is* the file name --
+    # but not Parquet.)
+    partition_cols = partition_columns(input_df, include_dataset=False)
+    single_values = {
+        k: v[0] if isinstance(v, (list, tuple)) else v
+        for k, v in kwargs.items()
+        if not isinstance(v, (list, tuple)) or len(v) == 1
+    }
+    glob_pattern = "/".join(
+        [f"{col}={single_values[col] if col in single_values else '*'}" for col in partition_cols]
+        + ["*.parquet"]
+    )
     paths = list(dataset_dir.glob(glob_pattern))
+
+    # Bail out before building the frame below: with no paths its columns would have a
+    # Null dtype, which str.extract rejects.
+    if not paths:
+        return {"outputs": [], "sources_merged": 0}
 
     # Group by directory, and extract dimension values for directories with
     # more than one file.
@@ -196,13 +228,21 @@ def compact_parquet(
 
     # Iterate over the directories, read the data, and rewrite it
     # as a single file.
+    outputs = []
+    sources_merged = 0
     for partition in partitions_df.iter_rows(named=True):
         read_kwargs = partition.copy()
         del read_kwargs["directory"]
         del read_kwargs["file"]
 
+        # write_parquet names its output with a UUID, so diff the directory to find out
+        # what it produced rather than trying to predict the name.
+        directory = Path(partition["directory"])
+        before = set(directory.iterdir())
+
         write_parquet(
-            read_parquet(**read_kwargs).collect(),
+            read_parquet(base_path=base_path, **read_kwargs).collect(),
+            base_path=base_path,
             validate=False,
             sort=sort,
             compression=compression,
@@ -211,7 +251,12 @@ def compact_parquet(
             use_dictionary=use_dictionary,
         )
 
-        # Delete the original files from the partition directory.
-        directory = Path(partition["directory"])
+        outputs.extend(sorted(set(directory.iterdir()) - before))
+
+        # Delete the original files from the partition directory. Deleting only after
+        # the write means a failure part-way through leaves the sources intact.
         for file in partition["file"]:
             (directory / file).unlink()
+            sources_merged += 1
+
+    return {"outputs": outputs, "sources_merged": sources_merged}

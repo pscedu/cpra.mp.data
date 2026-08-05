@@ -4,7 +4,7 @@ from math import floor
 import polars as pl
 from fastapi import HTTPException
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import get_base_path
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 
@@ -21,9 +21,10 @@ RANGE_KWARGS = {
 class CatalogQuery:
     """Data catalog query."""
 
-    def __init__(self, dataset_dimensions, filter_dimensions):
+    def __init__(self, dataset_dimensions, filter_dimensions, base_path=None):
         self.dataset_dimensions = dataset_dimensions
         self.filter_dimensions = filter_dimensions
+        self.base_path = base_path
         self._choices = {}
         self._results = {}
         self._exact = True
@@ -144,7 +145,7 @@ class CatalogQuery:
         required_cols = required_columns(input_df, include_metadata=False)
 
         parquet_paths = []
-        for root, dirs, files in BASE_PATH.walk():
+        for root, dirs, files in get_base_path(self.base_path).walk():
             if dirs:
                 self._update(items=dirs)
             elif files:

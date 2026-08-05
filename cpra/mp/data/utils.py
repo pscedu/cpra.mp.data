@@ -4,7 +4,7 @@ import polars as pl
 from polars.exceptions import ColumnNotFoundError
 from scipy.io import FortranFile
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import get_base_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
@@ -171,9 +171,10 @@ def build_glob_pattern(required_cols, extension=None, **kwargs):
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
 
 
-def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, include_file_paths="path", **kwargs):
+def glob_lazy_frame(required_cols, base_path=None, extension=None, include_file_paths="path", **kwargs):
     """Create a LazyFrame with information about matched paths."""
 
+    base_path = get_base_path(base_path)
     glob_pattern = build_glob_pattern(required_cols=required_cols, extension=extension, **kwargs)
     suffix = f"\\.{extension}" if extension else "$"
 
