@@ -64,6 +64,37 @@ jupyter = [
 ]
 scripts = ["affine", "fastexcel", "playwright", "pyproj", "tippecanoe"]
 
+[dependency-groups]
+dev = [
+    "fastapi[standard]>=0.115.0",
+    "mapbox-vector-tile>=2.2.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "sqlmodel",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95"
+# Fail on deprecations this package is responsible for, so they get fixed rather than
+# accumulating. Deliberately narrow: a blanket "error" would break the build on unrelated
+# deprecations from rasterio/GDAL, Polars, or Starlette on any dependency bump.
+filterwarnings = [
+    "error::DeprecationWarning:cpra.*",
+    "error::DeprecationWarning:tests.*",
+    "error::pydantic.PydanticDeprecatedSince20",
+]
+
+[tool.coverage.run]
+source = ["cpra/mp/data"]
+omit = [
+    "cpra/mp/data/visualizations/*",
+    "cpra/mp/data/api/__main__.py",
+    "cpra/mp/data/cli/__main__.py",
+]
+
 [tool.basedpyright]
 reportAny = false
 reportExplicitAny = false

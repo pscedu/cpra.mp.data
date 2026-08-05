@@ -13,6 +13,10 @@ token.txt
 *.~lock*
 /test_*.py
 
+.coverage
+coverage.xml
+.pytest_cache/
+
 *.db
 
 /catalog/

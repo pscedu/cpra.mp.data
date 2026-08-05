@@ -1,0 +1,297 @@
+"""End-to-end tests for the data and tile endpoints through the ASGI app.
+
+Unlike the Dataset unit tests, these go through real routing and query-string parsing, so
+they cover the parameter binding that FastAPI does before a Dataset is ever built.
+"""
+
+import io
+
+import mercantile
+import polars as pl
+import pytest
+import rasterio as rio
+
+from cpra.mp.data import config
+from cpra.mp.data.tabular import write_parquet
+
+from tests.factories import (
+    ANNUAL_KWARGS,
+    RASTER_KWARGS,
+    annual_frame,
+    write_pmtiles,
+    write_raster_dataset,
+)
+
+VECTOR_URL = "/v1/datasets/ssf/ecoregion_v001/annual"
+RASTER_URL = "/v1/datasets/vct/veg_grid_cell_v001/annual"
+
+
+@pytest.fixture
+def vector_data(base_path, monkeypatch):
+    write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return base_path
+
+
+@pytest.fixture
+def raster_data(base_path, monkeypatch):
+    write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return base_path
+
+
+class TestVectorData:
+    def test_csv(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv")
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["calendar_year"].to_list() == [2030, 2040]
+
+    def test_parquet(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.parquet")
+        assert response.status_code == 200
+        assert pl.read_parquet(io.BytesIO(response.content)).height == 2
+
+    def test_ndjson(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.ndjson")
+        assert response.status_code == 200
+        assert pl.read_ndjson(io.BytesIO(response.content)).height == 2
+
+    def test_dimension_filter_from_the_query_string(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?calendar_year=2030")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["calendar_year"].to_list() == [2030]
+
+    def test_repeated_filter_values(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?calendar_year=2030&calendar_year=2040")
+        assert pl.read_csv(io.BytesIO(response.content)).height == 2
+
+    def test_geography_selects_columns(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?geography=1,2")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert [c for c in df.columns if c[0].isdigit()] == ["1", "2"]
+
+    def test_unpivot(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&geography=1")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert {"geography", "value"} <= set(df.columns)
+
+    def test_select(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?select=calendar_year")
+        assert pl.read_csv(io.BytesIO(response.content)).columns == ["calendar_year"]
+
+    def test_sort_descending(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?sort=-calendar_year")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["calendar_year"].to_list() == [2040, 2030]
+
+    def test_where_clause(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?where=calendar_year%20%3E%202035")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["calendar_year"].to_list() == [2040]
+
+    def test_tif_is_rejected_for_a_vector_grid(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.tif")
+        assert response.status_code == 400
+        assert "must be one of" in response.json()["detail"]
+
+    def test_unknown_variable_is_rejected(self, client, vector_data):
+        assert client.get("/v1/datasets/nope/ecoregion_v001/annual/data.csv").status_code == 422
+
+    def test_unknown_grid_is_rejected(self, client, vector_data):
+        assert client.get("/v1/datasets/ssf/nope/annual/data.csv").status_code == 422
+
+    def test_missing_dataset_is_404(self, client, base_path, monkeypatch):
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        response = client.get(f"{VECTOR_URL}/data.csv")
+        assert response.status_code == 404
+
+    def test_invalid_sort_is_400(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?sort=nonsense")
+        assert response.status_code == 400
+
+    def test_group_by_without_aggregate_is_400(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?group_by=calendar_year")
+        assert response.status_code == 400
+
+
+class TestRasterData:
+    def test_tif(self, client, raster_data):
+        response = client.get(f"{RASTER_URL}/data.tif")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/tiff; application=geotiff"
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.read(1)[0, 0] == 30
+
+    def test_csv_is_rejected_for_a_raster_grid(self, client, raster_data):
+        response = client.get(f"{RASTER_URL}/data.csv")
+        assert response.status_code == 400
+        assert "must be tif" in response.json()["detail"]
+
+    def test_geography_makes_csv_valid(self, client, raster_data):
+        """Sampling at coordinates converts raster output to tabular."""
+        with rio.open(next(raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform
+
+            x, y = src.xy(src.height // 2, src.width // 2)
+            lng, lat = [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])]
+
+        response = client.get(f"{RASTER_URL}/data.csv?geography={lng},{lat}")
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df[f"{lng},{lat}"].to_list() == [30]
+
+    def test_tabular_compression_is_rejected_for_tif(self, client, raster_data):
+        response = client.get(f"{RASTER_URL}/data.tif?compression_algorithm=gzip")
+        assert response.status_code == 400
+
+    def test_missing_dataset_is_404(self, client, base_path, monkeypatch):
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        assert client.get(f"{RASTER_URL}/data.tif").status_code == 404
+
+
+class TestRasterTiles:
+    def _tile(self, raster_data, zoom=8):
+        with rio.open(next(raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform_bounds
+
+            west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+        return mercantile.tile((west + east) / 2, (south + north) / 2, zoom)
+
+    def test_png(self, client, raster_data):
+        tile = self._tile(raster_data)
+        response = client.get(f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.png")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_jpg(self, client, raster_data):
+        tile = self._tile(raster_data)
+        response = client.get(f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.jpg")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/jpeg"
+
+    def test_tile_outside_the_dataset_is_404(self, client, raster_data):
+        assert client.get(f"{RASTER_URL}/data/2/0/0.png").status_code == 404
+
+    def test_unknown_tile_format_is_422(self, client, raster_data):
+        tile = self._tile(raster_data)
+        response = client.get(f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.gif")
+        assert response.status_code == 422
+
+    def test_multiband_tile_is_400(self, client, base_path, monkeypatch):
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        response = client.get(f"{RASTER_URL}/data/8/0/0.png")
+        assert response.status_code == 400
+        assert "more than one band" in response.json()["detail"]
+
+    def test_color_map_is_accepted(self, client, raster_data):
+        tile = self._tile(raster_data)
+        response = client.get(
+            f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.png?color_map=lnd_type"
+        )
+        assert response.status_code == 200
+
+
+class TestVectorTiles:
+    def test_serves_a_tile(self, client, vector_data, tiles_path):
+        tile = mercantile.Tile(x=1, y=2, z=3)
+        write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
+
+        response = client.get(
+            f"{VECTOR_URL}/tiles/{tile.z}/{tile.x}/{tile.y}.pbf?calendar_year=2030"
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
+
+    def test_missing_pmtiles_file_is_404(self, client, vector_data, tiles_path):
+        response = client.get(f"{VECTOR_URL}/tiles/3/1/2.pbf")
+        assert response.status_code == 404
+        assert "no tile file for grid" in response.json()["detail"]
+
+    def test_raster_grid_is_400(self, client, raster_data, tiles_path):
+        response = client.get(f"{RASTER_URL}/tiles/3/1/2.pbf")
+        assert response.status_code == 400
+        assert "invalid output type for vector tile" in response.json()["detail"]
+
+
+class TestCatalogEndpoint:
+    def test_returns_choices_results_and_exact(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/catalog.json")
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"choices", "results", "exact"}
+
+    def test_reports_available_years(self, client, vector_data):
+        """2030 and 2040 are ten apart, so an annual series reports them separately."""
+        body = client.get(f"{VECTOR_URL}/catalog.json").json()
+        assert body["choices"]["calendar_year"] == [2030, 2040]
+
+    def test_contiguous_years_are_compressed_into_a_range(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030, 2031, 2032)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        body = client.get(f"{VECTOR_URL}/catalog.json").json()
+        assert body["choices"]["calendar_year"] == [[2030, 2032]]
+
+    def test_selection_is_reflected_in_results(self, client, vector_data):
+        body = client.get(f"{VECTOR_URL}/catalog.json?calendar_year=2040").json()
+        assert body["results"]["calendar_year"] == [2040]
+
+    def test_unavailable_selection_is_inexact(self, client, vector_data):
+        body = client.get(f"{VECTOR_URL}/catalog.json?calendar_year=1999").json()
+        assert body["exact"] is False
+
+
+class TestVisualizationEndpoints:
+    def test_dataset_visualization_returns_a_vega_spec(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/visualization/time-series-line.json?geography=1&calendar_year=2030"
+        )
+        assert response.status_code == 200
+        assert "$schema" in response.json()
+
+    def test_unknown_visualization_is_404(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/visualization/nope.json")
+        assert response.status_code == 404
+
+    def test_custom_visualization_rejected_on_the_dataset_route(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/visualization/sediment-dynamics.json?geography=1")
+        assert response.status_code == 400
+
+    def test_dataset_visualization_rejected_on_the_custom_route(self, client, vector_data):
+        response = client.get("/v1/visualizations/time-series-line.json?geography=1")
+        assert response.status_code == 400
+
+
+class TestCors:
+    """The portal is served from a different origin than the API, so CORS must permit it.
+
+    Whether the allow-origin header comes back as `*` or as the echoed origin is a
+    Starlette implementation detail that has changed across releases (the condition moved
+    from `allow_all_origins and has_cookie` to `allow_all_origins and allow_credentials`),
+    so these assert only that the requesting origin is permitted.
+    """
+
+    ORIGIN = "https://example.com"
+
+    def test_request_origin_is_permitted(self, client, vector_data):
+        response = client.get("/v1/variables.json", headers={"Origin": self.ORIGIN})
+        assert response.headers["access-control-allow-origin"] in ("*", self.ORIGIN)
+
+    def test_credentials_are_allowed(self, client, vector_data):
+        response = client.get("/v1/variables.json", headers={"Origin": self.ORIGIN})
+        assert response.headers["access-control-allow-credentials"] == "true"
+
+    def test_preflight_advertises_methods_and_headers(self, client, vector_data):
+        response = client.options(
+            f"{VECTOR_URL}/data.csv",
+            headers={
+                "Origin": self.ORIGIN,
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "X-Custom",
+            },
+        )
+        assert response.status_code == 200
+        assert "GET" in response.headers["access-control-allow-methods"]
+        assert "X-Custom" in response.headers["access-control-allow-headers"]
