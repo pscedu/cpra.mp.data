@@ -8,11 +8,11 @@ from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.types import CompressionAlgorithm
 
-COMPRESSION_LEVEL_ALGORITHMS = [
-    CompressionAlgorithm.deflate,
-    CompressionAlgorithm.lzma,
-    CompressionAlgorithm.zstd,
-]
+COMPRESSION_LEVEL_OPTIONS = {
+    CompressionAlgorithm.deflate: "zlevel",
+    CompressionAlgorithm.lzma: "lzma_preset",
+    CompressionAlgorithm.zstd: "zstd_level",
+}
 
 
 class RasterioStreamingResponse(FileResponse):
@@ -34,8 +34,9 @@ class RasterioStreamingResponse(FileResponse):
             profile_options = {
                 "compress": self.compression.compression_algorithm.value.upper()
             }
-            if self.compression.compression_algorithm in COMPRESSION_LEVEL_ALGORITHMS:
-                profile_options["level"] = self.compression.compression_level
+            level_option = COMPRESSION_LEVEL_OPTIONS.get(self.compression.compression_algorithm)
+            if level_option is not None:
+                profile_options[level_option] = self.compression.compression_level
 
             if await self.dataset.write_raster(fp.name, **profile_options):
                 self.path = fp.name
