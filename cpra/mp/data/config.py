@@ -36,6 +36,10 @@ RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
 # Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
 RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
 
+# Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is
+# the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
+RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))
+
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
 SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")

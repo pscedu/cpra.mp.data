@@ -35,7 +35,11 @@ from cpra.mp.data.api.utils import (
     raster_gdal_env,
     unpack_values,
 )
-from cpra.mp.data.config import RASTER_NUM_THREADS, RASTER_USE_VRT_COPY
+from cpra.mp.data.config import (
+    RASTER_NUM_THREADS,
+    RASTER_USE_VRT_COPY,
+    RASTER_WINDOW_BUFFER_LIMIT_MB,
+)
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS, Legend
@@ -572,20 +576,48 @@ class Dataset(LazyFrameSource):
     async def write_raster(self, out_path, **kwargs):
         """Write the selected bands to a raster file.
 
-        Selections that map 1:1 to output bands are streamed by GDAL from a band-separate
-        VRT (``_write_raster_vrt``), which is faster and uses several times less memory
-        than reading windows into NumPy.  Aggregated selections keep the windowed path:
-        their cross-band reduce has no bit-identical GDAL equivalent (the builtin ``mean``
-        pixel function rounds differently and drops band descriptions).
+        Wide selections are streamed by GDAL from a band-separate VRT
+        (``_write_raster_vrt``); narrow ones read windows into NumPy
+        (``_write_raster_windowed``).  The two are within noise of each other on time, so the
+        choice is made on memory -- see ``_windowed_read_is_lighter``.
+
+        Aggregated selections always take the windowed path. GDAL's builtin ``mean``/``sum``/
+        ``min``/``max`` pixel functions can express the reduction and are more accurate (they
+        accumulate in float64 and can propagate nodata, neither of which the NumPy reduce
+        does), but collapsing bands onto one ``VRTDerivedRasterBand`` makes GDAL re-read
+        every contributing band per output chunk -- for one PIXEL-interleaved multiband
+        source that decompresses each tile once per band. Measured reducing 52 elev bands:
+        983s vs 80s, at every swath size tried. The windowed path reads each tile once.
         """
 
         df = self.materialize()
         if not len(df):
             return False
 
-        if self.raster_groups is not None or not RASTER_USE_VRT_COPY:
+        if (
+            self.raster_groups is not None
+            or not RASTER_USE_VRT_COPY
+            or self._windowed_read_is_lighter(df)
+        ):
             return await self._write_raster_windowed(df, out_path, **kwargs)
         return await self._write_raster_vrt(df, out_path, **kwargs)
+
+    def _windowed_read_is_lighter(self, df):
+        """Whether the windowed path would use less memory than the VRT copy for ``df``.
+
+        The windowed path holds one ``(bands, block_height, width)`` buffer per window plus
+        the read that fills it, so its peak grows with the number of selected bands; the VRT
+        copy's peak is roughly flat, set by the swath and cache caps.  Measured on 52-band
+        float32 elev (peak RSS, windowed vs VRT): 1 band 1027 vs 1425 MB, 5 bands 1470 vs
+        1329 MB, 52 bands 7983 vs 2529 MB -- so the crossover is around 4-5 bands here, and
+        expressing it as a buffer size rather than a band count keeps it right for grids and
+        dtypes of other sizes.
+        """
+
+        with rio.open(df["path"][0]) as source:
+            block_height = source.block_shapes[0][0]
+            buffer_bytes = len(df) * block_height * source.width * np.dtype(source.dtypes[0]).itemsize
+        return buffer_bytes <= RASTER_WINDOW_BUFFER_LIMIT_MB * 1024 * 1024
 
     def _calendar_column(self, df):
         """The calendar dimension present in ``df``, if any."""
@@ -606,16 +638,19 @@ class Dataset(LazyFrameSource):
 
         # Label output bands with their calendar value, as the windowed path does. Set
         # explicitly rather than inherited so legacy sources (no on-disk description) are
-        # labeled too -- see set_vrt_band_descriptions.
+        # labeled too -- see set_vrt_band_descriptions. Skipped when aggregating, since an
+        # aggregated band spans several calendar values.
         calendar_col = self._calendar_column(df)
         if calendar_col is not None:
             descriptions = [f"{calendar_col}={value}" for value in df[calendar_col].to_list()]
             vrt_text = set_vrt_band_descriptions(vrt_text, descriptions)
 
-        # Apply multipliers from the calculate parameters.
+        # Apply multipliers from the calculate parameters. Applied to each source before
+        # any aggregation below, matching the windowed path's multiply-then-reduce order.
         factors = df["multiplier"].to_list()
         if not all(factor == 1 for factor in factors):
             vrt_text = scale_vrt_bands(vrt_text, factors)
+
 
         with rio.open(sources[0][0]) as source:
             profile = source.profile

@@ -76,11 +76,13 @@ def raster_gdal_env():
     band payload, so a 1-band read costs nearly as much as a 52-band one. Setting it
     measured 2.2-3.7x faster across band counts with byte-identical output.
 
-    Capping ``GDAL_CACHEMAX`` trades ~1% time for ~11% lower peak memory on the windowed
-    path (measured on a 52-band aggregate), much less dramatic than on the copy path but
-    worth having -- the windowed path's peak is dominated by its own NumPy buffers, not by
-    GDAL's cache. Being process-global, it also bounds cache growth across concurrent
-    requests rather than leaving it at GDAL's default 5% of RAM.
+    Capping ``GDAL_CACHEMAX`` is what keeps the windowed path's peak memory down, at no
+    measurable cost in time: reading one band of a 52-band float32 COG went from 4226 MB to
+    1027 MB peak RSS. Above a handful of bands the path's own NumPy buffers dominate instead
+    and the cap can't help (52 bands still peaks near 8 GB, which is why wide selections are
+    routed to the copy path -- see ``Dataset._windowed_read_is_lighter``). Being
+    process-global, the cap also bounds cache growth across concurrent requests rather than
+    leaving it at GDAL's default 5% of RAM.
 
     Deliberately not applied to tile requests -- those read a decimated 256x256 window
     through existing overviews and measured no benefit from threading.
