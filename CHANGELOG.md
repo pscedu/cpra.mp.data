@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.48.0](https://github.com/pscedu/cpra.mp.data/compare/v0.47.1...v0.48.0) (2026-08-05)
+
+
+### Features
+
+* **api:** implement transform params for raster grids ([9a99deb](https://github.com/pscedu/cpra.mp.data/commit/9a99debfd2264302a01049652b85159ac498387b))
+* **scripts:** add script for generating map video frames ([c5ba74d](https://github.com/pscedu/cpra.mp.data/commit/c5ba74d0acf55a9c761b423089e6b2d9eb777c91))
+* **scripts:** add script for generating raster to vector crosswalks ([2d4568a](https://github.com/pscedu/cpra.mp.data/commit/2d4568add9cb19fee9cf4567d2a62390c751a607))
+* **scripts:** add script to symbolize and tile land type with water ([a5b5d7f](https://github.com/pscedu/cpra.mp.data/commit/a5b5d7f133a9ad9c8ce1cfe28d1a60be26875056))
+* **scripts:** add scripts for test land change confidence ([60372d0](https://github.com/pscedu/cpra.mp.data/commit/60372d02aa377783538b39fc5ee7849251916d5e))
+* **visualization:** add stacked bar chart ([c2d2fea](https://github.com/pscedu/cpra.mp.data/commit/c2d2feaa9efc66eb2232e14b5e8a9397a9ef92f4))
+* **visualizations:** add portal ID to map project labels ([ed578e6](https://github.com/pscedu/cpra.mp.data/commit/ed578e6fc30f93c62f90d1ceab70484d262efd55))
+
+
+### Bug Fixes
+
+* **api:** respect compression level in raster streaming responses ([82b8913](https://github.com/pscedu/cpra.mp.data/commit/82b8913bf860ba0c20b60bbd006f1b79f08a9862))
+* correct path, compaction, and query defects surfaced by the new ([5c79856](https://github.com/pscedu/cpra.mp.data/commit/5c79856faf2f296955c584d4d53aae2cc805d1ba))
+* **scripts:** update overlay and underlay layer names ([1cd4444](https://github.com/pscedu/cpra.mp.data/commit/1cd44449b42a54ca4a42014e49a32c5a14262396))
+
 ## [0.47.1](https://github.com/pscedu/cpra.mp.data/compare/v0.47.0...v0.47.1) (2026-07-14)
 
 
