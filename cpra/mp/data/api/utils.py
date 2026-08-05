@@ -3,13 +3,19 @@ from enum import Enum
 from functools import wraps
 from time import time
 
+import rasterio as rio
 from cachetools import TTLCache, cached
 from fastapi import HTTPException
 from rasterio.enums import Resampling
 
 from cpra.mp.data import read_data
 from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
-from cpra.mp.data.config import DEBUG
+from cpra.mp.data.config import (
+    DEBUG,
+    RASTER_CACHE_MAX_MB,
+    RASTER_NUM_THREADS,
+    RASTER_SWATH_SIZE_MB,
+)
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
@@ -60,6 +66,53 @@ def timing(func):
         return result
 
     return wrapped
+
+
+def raster_gdal_env():
+    """GDAL configuration for reading and writing rasters.
+
+    ``GDAL_NUM_THREADS`` parallelizes tile decompression, which dominates every read of
+    a multiband COG: selecting a subset of bands still decompresses each tile's full
+    band payload, so a 1-band read costs nearly as much as a 52-band one. Setting it
+    measured 2.2-3.7x faster across band counts with byte-identical output.
+
+    Capping ``GDAL_CACHEMAX`` trades ~1% time for ~11% lower peak memory on the windowed
+    path (measured on a 52-band aggregate), much less dramatic than on the copy path but
+    worth having -- the windowed path's peak is dominated by its own NumPy buffers, not by
+    GDAL's cache. Being process-global, it also bounds cache growth across concurrent
+    requests rather than leaving it at GDAL's default 5% of RAM.
+
+    Deliberately not applied to tile requests -- those read a decimated 256x256 window
+    through existing overviews and measured no benefit from threading.
+    """
+
+    return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB)
+
+
+def raster_copy_gdal_env():
+    """GDAL configuration for the VRT + ``CreateCopy`` download path.
+
+    ``CreateCopy`` streams the output in ``GDAL_SWATH_SIZE`` chunks, only 10MB by default.
+    Each chunk re-enters GDAL's per-block path, which for a PIXEL-interleaved multiband
+    COG decompresses every band of every tile it touches -- the same cost that makes a
+    one-block-row-at-a-time loop slow. Raising the swath amortizes it: measured 91.8s ->
+    22.8s for one band of a 52-band float32 COG. GDAL clamps the swath to half of
+    ``GDAL_CACHEMAX``, so the cache has to be raised alongside it; capping the cache is
+    also what keeps peak memory down (3-4x lower than the windowed path).
+
+    ``GDAL_CACHEMAX`` must be an int -- a str raises ``TypeError`` from ``rio.Env``.
+
+    ``GDAL_PAM_ENABLED=NO`` stops GDAL writing a ``.aux.xml`` sidecar for the per-band
+    descriptions the copy carries over (the GTiff output embeds them natively). The
+    response streams only the TIFF, so a sidecar would just be orphaned in the temp dir.
+    """
+
+    return rio.Env(
+        GDAL_NUM_THREADS=RASTER_NUM_THREADS,
+        GDAL_SWATH_SIZE=str(RASTER_SWATH_SIZE_MB * 1024 * 1024),
+        GDAL_CACHEMAX=RASTER_CACHE_MAX_MB,
+        GDAL_PAM_ENABLED="NO",
+    )
 
 
 def group_rows_by_path(df):

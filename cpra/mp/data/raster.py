@@ -417,6 +417,53 @@ def _apply_rounding_to_vrt(vrt_text: str, decimals: int) -> str:
     return xml.etree.ElementTree.tostring(root).decode("UTF-8")
 
 
+def set_vrt_band_descriptions(vrt_text, descriptions):
+    """Set each band's ``<Description>`` in ``vrt_text`` from ``descriptions`` (band order).
+
+    ``vrt()`` only carries over a description that physically exists on the source band, so
+    this is set explicitly rather than inherited: a LEGACY COG SHIM file has none on disk
+    (``_read_cog_metadata`` synthesizes it in Python from a dataset tag and never writes it
+    back), and its bands would otherwise come out unlabeled.  Same repair as
+    ``_patch_legacy_vrt``'s second fix, but applied unconditionally by callers that already
+    know every band's label -- notably the API download path, which is handed a
+    ``(path, band, calendar value)`` frame.
+    """
+
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+    for band_el, description in zip(root.findall("VRTRasterBand"), descriptions):
+        desc_el = band_el.find("Description")
+        if desc_el is None:
+            desc_el = xml.etree.ElementTree.Element("Description")
+            band_el.insert(0, desc_el)
+        desc_el.text = description
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
+
+
+def scale_vrt_bands(vrt_text, factors):
+    """Multiply each band of ``vrt_text`` by its factor (band order) inside the VRT.
+
+    A ``SimpleSource`` copies pixels verbatim, so scaling requires promoting it to a
+    ``ComplexSource``, the only source type supporting ``<ScaleRatio>``.  GDAL then applies
+    the factor during its normal streaming copy, avoiding the full extra array the
+    equivalent NumPy multiply materializes.  Bands with a factor of 1 are left as plain
+    ``SimpleSource`` elements, since ``ComplexSource`` is a slower per-pixel path.
+
+    Matches the NumPy multiply it replaces exactly, including that the nodata sentinel is
+    scaled along with real values (-9999 * 10 stops matching the band's declared nodata) --
+    a pre-existing quirk preserved here deliberately so the two paths agree.
+    """
+
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+    for band_el, factor in zip(root.findall("VRTRasterBand"), factors):
+        if factor == 1:
+            continue
+        source_el = band_el.find("SimpleSource")
+        source_el.tag = "ComplexSource"
+        ratio_el = xml.etree.ElementTree.SubElement(source_el, "ScaleRatio")
+        ratio_el.text = str(factor)
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
+
+
 def _write_run(
     run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
     round_to_decimal_places=None,

@@ -1,6 +1,9 @@
+import asyncio
 import itertools
 import re
+import tempfile
 from contextlib import ExitStack
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
+from rasterio.shutil import copy as rio_copy
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform
 
@@ -27,11 +31,15 @@ from cpra.mp.data.api.utils import (
     group_rows_by_path,
     parallel_read_rasters,
     parallel_sample_rasters,
+    raster_copy_gdal_env,
+    raster_gdal_env,
     unpack_values,
 )
+from cpra.mp.data.config import RASTER_NUM_THREADS, RASTER_USE_VRT_COPY
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS, Legend
+from cpra.mp.data.raster import scale_vrt_bands, set_vrt_band_descriptions, vrt
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 from cpra.mp.data.variables import VARIABLES, Variable
 
@@ -562,15 +570,94 @@ class Dataset(LazyFrameSource):
 
     @asynctiming
     async def write_raster(self, out_path, **kwargs):
-        """Write a raster dataset to a file using windowed reading and writing
-        to conserve memory."""
+        """Write the selected bands to a raster file.
+
+        Selections that map 1:1 to output bands are streamed by GDAL from a band-separate
+        VRT (``_write_raster_vrt``), which is faster and uses several times less memory
+        than reading windows into NumPy.  Aggregated selections keep the windowed path:
+        their cross-band reduce has no bit-identical GDAL equivalent (the builtin ``mean``
+        pixel function rounds differently and drops band descriptions).
+        """
 
         df = self.materialize()
         if not len(df):
             return False
 
+        if self.raster_groups is not None or not RASTER_USE_VRT_COPY:
+            return await self._write_raster_windowed(df, out_path, **kwargs)
+        return await self._write_raster_vrt(df, out_path, **kwargs)
+
+    def _calendar_column(self, df):
+        """The calendar dimension present in ``df``, if any."""
+
+        return next((col for col in ("calendar_year", "calendar_day") if col in df.columns), None)
+
+    async def _write_raster_vrt(self, df, out_path, **kwargs):
+        """Stream the selected bands into ``out_path`` via a band-separate VRT.
+
+        The VRT names each selected ``(path, band)`` as one output band, so GDAL reads each
+        source once and never materializes the stack -- see ``raster_copy_gdal_env`` for the
+        swath/cache settings that make this pay off.  Band descriptions and the multiply
+        parameters are applied to the VRT XML rather than to pixels in Python.
+        """
+
+        sources = list(zip(df["path"].to_list(), df["band"].to_list()))
+        vrt_text = vrt(sources)
+
+        # Label output bands with their calendar value, as the windowed path does. Set
+        # explicitly rather than inherited so legacy sources (no on-disk description) are
+        # labeled too -- see set_vrt_band_descriptions.
+        calendar_col = self._calendar_column(df)
+        if calendar_col is not None:
+            descriptions = [f"{calendar_col}={value}" for value in df[calendar_col].to_list()]
+            vrt_text = set_vrt_band_descriptions(vrt_text, descriptions)
+
+        # Apply multipliers from the calculate parameters.
+        factors = df["multiplier"].to_list()
+        if not all(factor == 1 for factor in factors):
+            vrt_text = scale_vrt_bands(vrt_text, factors)
+
+        with rio.open(sources[0][0]) as source:
+            profile = source.profile
+        creation_options = {
+            "driver": "GTiff",
+            "tiled": profile.get("tiled", True),
+            "blockxsize": profile.get("blockxsize"),
+            "blockysize": profile.get("blockysize"),
+            "interleave": profile.get("interleave"),
+            "num_threads": RASTER_NUM_THREADS,
+            "bigtiff": "YES",
+            **kwargs,
+        }
+        creation_options = {k: v for k, v in creation_options.items() if v is not None}
+
+        # The VRT is a throwaway sidecar whose SimpleSource entries hold absolute paths, so
+        # its location doesn't matter -- keep it out of the output directory.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vrt_path = Path(tmp_dir) / "download.vrt"
+            vrt_path.write_text(vrt_text)
+
+            # CreateCopy is one long blocking call, unlike the windowed path's per-window
+            # awaits, so it runs in the default executor to keep the event loop free for
+            # other requests. GDAL config is process-global, so the env entered here
+            # applies inside the worker thread.
+            loop = asyncio.get_running_loop()
+            with raster_copy_gdal_env():
+                await loop.run_in_executor(
+                    None,
+                    partial(rio_copy, str(vrt_path), str(out_path), **creation_options),
+                )
+
+        return True
+
+    async def _write_raster_windowed(self, df, out_path, **kwargs):
+        """Write a raster dataset to a file using windowed reading and writing
+        to conserve memory."""
+
         unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
+            # Entered before the sources are opened so the thread setting applies to them.
+            stack.enter_context(raster_gdal_env())
             inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
 
             # Each selected (path, band) row — or each aggregated group — becomes one
@@ -585,7 +672,7 @@ class Dataset(LazyFrameSource):
 
             # Label output bands with their calendar value when rows map 1:1 to bands.
             if self.raster_groups is None:
-                calendar_col = next((c for c in ("calendar_year", "calendar_day") if c in df.columns), None)
+                calendar_col = self._calendar_column(df)
                 if calendar_col is not None:
                     for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
                         output.set_band_description(band_idx, f"{calendar_col}={value}")

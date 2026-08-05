@@ -1,4 +1,10 @@
+import os
+
 import pytest
+
+# cpra.mp.data.api builds a SQLAlchemy engine at import time, so importing anything from
+# it (e.g. Dataset) needs a parseable URL. Set before any cpra import binds config.MPD_URI.
+os.environ.setdefault("CPRA_MP_DATA_MPD_URI", "sqlite://")
 
 
 @pytest.fixture

@@ -21,6 +21,21 @@ DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
 MPD_URI = get_config("MPD_URI", "")
 STREAM_THRESHOLD = int(get_config("STREAM_THRESHOLD", "25"))
 
+# GDAL thread count for raster reads/writes (see api.utils.raster_gdal_env). Tunable
+# because the API runs as a single process and already spreads files across a thread
+# pool, so the two widths multiply under concurrent requests.
+RASTER_NUM_THREADS = get_config("RASTER_NUM_THREADS", "ALL_CPUS")
+
+# CreateCopy streaming chunk, and the block cache that bounds it -- GDAL clamps the swath
+# to half of GDAL_CACHEMAX, so the two must be raised together (see
+# api.utils.raster_copy_gdal_env). The cache is process-global, so this also bounds cache
+# growth across concurrent requests instead of leaving it at GDAL's default 5% of RAM.
+RASTER_SWATH_SIZE_MB = int(get_config("RASTER_SWATH_SIZE_MB", "512"))
+RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
+
+# Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
+RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
+
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
 SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")
