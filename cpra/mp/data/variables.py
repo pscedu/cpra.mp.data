@@ -19,6 +19,7 @@ class Variable:
         unit=None,
         number_format=None,
         difference_legend_limit=None,
+        max_z_error=None,
     ):
         self.name = name
         self.label = label
@@ -32,6 +33,9 @@ class Variable:
         self.unit = unit
         self.number_format = number_format
         self.difference_legend_limit = difference_legend_limit
+        # When set, raster writes for this variable default to LERC_ZSTD compression at this
+        # error tolerance instead of ZSTD+predictor -- see cpra.mp.data.raster._cog_profile.
+        self.max_z_error = max_z_error
 
 
 VARIABLES = {

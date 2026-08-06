@@ -18,10 +18,21 @@ import numpy as np
 import polars as pl
 import pytest
 import rasterio
+from rasterio.shutil import copy as rio_copy
 
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.raster import _cog_profile, compact_cog, scale_vrt_bands, vrt, write_cog
+from cpra.mp.data.raster import (
+    DECADE_GROUP_YEARS,
+    PENTAD_GROUP_YEARS,
+    _cog_profile,
+    _period_subgroups,
+    compact_cog,
+    scale_vrt_bands,
+    vrt,
+    write_cog,
+)
+from cpra.mp.data.variables import VARIABLES
 
 RASTER_KWARGS = dict(
     variable="hsi",
@@ -433,6 +444,52 @@ def test_wide_selection_is_dispatched_to_vrt_path(multiband_cog, tmp_path, monke
         assert src.count == 2
 
 
+@pytest.fixture
+def tile_interleaved_cog(base_path, multiband_cog):
+    """The multiband COG re-encoded INTERLEAVE=TILE, a COG-driver-only layout."""
+
+    out_path = base_path / "tile_interleaved.tif"
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"):
+        rio_copy(
+            str(multiband_cog), str(out_path), driver="COG", INTERLEAVE="TILE",
+            COMPRESS="ZSTD", LEVEL=6, BLOCKSIZE=256,
+        )
+    with rasterio.open(out_path) as src:
+        assert src.profile["interleave"] == "tile", "fixture should be tile interleaved"
+    return out_path
+
+
+@pytest.mark.parametrize("writer", ["vrt", "windowed"])
+def test_tile_interleaved_source_is_downloadable(tile_interleaved_cog, tmp_path, writer):
+    """A TILE-interleaved source must not break either write path.
+
+    INTERLEAVE=TILE is accepted by the COG driver but rejected by the GTiff driver used for
+    downloads, so inheriting the source's interleave made such a source fail outright with
+    "INTERLEAVE=tile unsupported". The output interleave is set explicitly instead.
+    """
+
+    df = _index_frame(tile_interleaved_cog, (1, 2))
+    out_path = tmp_path / "out.tif"
+    write = _write_vrt if writer == "vrt" else _write_windowed
+    assert write(_dataset(df), df, out_path)
+
+    with rasterio.open(out_path) as src:
+        assert src.count == 2
+        assert src.profile["interleave"] == "pixel"
+        np.testing.assert_array_equal(src.read(1), _band_data(YEARS[0]))
+
+
+def test_multiband_output_is_pixel_interleaved(multiband_cog, tmp_path):
+    """Pixel interleaving is what keeps a multiband response small, so it is not inherited."""
+
+    df = _index_frame(multiband_cog, (1, 2, 3))
+    for writer in (_write_vrt, _write_windowed):
+        out_path = tmp_path / f"{writer.__name__}.tif"
+        assert writer(_dataset(df), df, out_path)
+        with rasterio.open(out_path) as src:
+            assert src.profile["interleave"] == "pixel"
+
+
 def test_empty_selection_returns_false(tmp_path):
     """An empty selection is what drives the endpoint's 404, before either path runs."""
 
@@ -505,3 +562,172 @@ def test_paths_agree_across_multiple_source_files(base_path, tmp_path):
     assert _write_vrt(_dataset(df), df, tmp_path / "vrt.tif")
     assert _write_windowed(_dataset(df), df, tmp_path / "windowed.tif")
     _assert_same_raster(tmp_path / "vrt.tif", tmp_path / "windowed.tif")
+
+
+# --- compact_cog run-grouping (decade default / pentad / unbounded) -------------------
+
+# A 28-year span straddling three decades, so folding the short edge groups into their
+# neighbors (see _period_subgroups) leaves two full-size decade groups rather than one of
+# each size -- a case that actually exercises both edges of the fold, unlike a span short
+# enough to collapse into a single group.
+GROUPING_YEARS = list(range(2016, 2044))
+
+
+@pytest.mark.parametrize(
+    "values,period,expected",
+    [
+        ([2019, 2020, 2021, 2022], 10, [[0, 1, 2, 3]]),  # shorter than one period: one group
+        (list(range(2019, 2029)), 10, [list(range(10))]),  # exactly one period: one group
+        # A lone leading year folds forward into its decade rather than standing alone.
+        (list(range(2019, 2031)), 10, [list(range(12))]),
+        # A lone trailing year folds backward into its decade rather than standing alone.
+        (list(range(2020, 2032)), 10, [list(range(12))]),
+        # Full interior periods stay their own groups; only the run's own edges fold.
+        (
+            list(range(2016, 2044)),
+            10,
+            [list(range(14)), list(range(14, 28))],
+        ),
+    ],
+)
+def test_period_subgroups(values, period, expected):
+    """Pure boundary/folding cases for the grouping helper, without writing any COGs."""
+
+    assert _period_subgroups(values, period) == expected
+
+
+def test_compact_cog_defaults_to_decade_grouping(base_path):
+    """Without an explicit group_years, a multi-decade run splits into decade-sized COGs."""
+
+    for year in GROUPING_YEARS:
+        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
+    outputs = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)["outputs"]
+
+    band_counts = sorted(rasterio.open(p).count for p in outputs)
+    assert band_counts == [14, 14], "28 years over three decades should fold into two 14-year groups"
+
+    for path in outputs:
+        with rasterio.open(path) as src:
+            years = [int(desc.split("=")[1]) for desc in src.descriptions]
+            for band, year in enumerate(years, start=1):
+                np.testing.assert_array_equal(src.read(band), _band_data(year))
+
+
+def test_compact_cog_pentad_grouping(base_path):
+    """group_years=PENTAD_GROUP_YEARS produces finer, differently-folded groups."""
+
+    for year in GROUPING_YEARS:
+        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
+    outputs = compact_cog(
+        base_path=base_path, catalog_path=None, group_years=PENTAD_GROUP_YEARS, **RASTER_KWARGS
+    )["outputs"]
+
+    band_counts = sorted(rasterio.open(p).count for p in outputs)
+    assert band_counts == [5, 5, 9, 9], "pentad grouping should differ from the decade default"
+
+
+def test_compact_cog_regroup_at_a_different_period_does_not_lose_data(base_path):
+    """Regression: re-grouping already-grouped COGs at a different group_years must not
+    drop bands.
+
+    A source file's bands can straddle more than one new subgroup (e.g. a 14-band decade
+    file re-split into two pentads), so "does this subgroup already live in exactly one
+    file" is not enough to call it optimal -- that file may still owe bands to a
+    *different* subgroup. Checking only per-subgroup file count previously mis-classified
+    both halves of a split file as already optimal and skipped rewriting either one,
+    silently leaving the never-produced pentad file's years unrepresented anywhere.
+    """
+
+    for year in GROUPING_YEARS:
+        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
+    decade_outputs = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)["outputs"]
+    assert len(decade_outputs) == 2
+
+    pentad_outputs = compact_cog(
+        base_path=base_path, catalog_path=None, group_years=PENTAD_GROUP_YEARS, **RASTER_KWARGS
+    )["outputs"]
+
+    remaining = sorted(base_path.glob("**/*.tif"))
+    assert sorted(remaining) == sorted(pentad_outputs), "old decade files must not survive the re-group"
+
+    seen_years = {}
+    for path in remaining:
+        with rasterio.open(path) as src:
+            for band, desc in enumerate(src.descriptions, start=1):
+                year = int(desc.split("=")[1])
+                assert year not in seen_years, f"year {year} duplicated across output files"
+                seen_years[year] = src.read(band)
+    assert sorted(seen_years) == GROUPING_YEARS
+    for year, band in seen_years.items():
+        np.testing.assert_array_equal(band, _band_data(year))
+
+
+def test_compact_cog_group_years_none_restores_unbounded_run(base_path):
+    """group_years=None disables the split, matching the pre-grouping behavior."""
+
+    for year in GROUPING_YEARS:
+        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
+    outputs = compact_cog(base_path=base_path, catalog_path=None, group_years=None, **RASTER_KWARGS)["outputs"]
+
+    assert len(outputs) == 1
+    with rasterio.open(outputs[0]) as src:
+        assert src.count == len(GROUPING_YEARS)
+
+
+def test_decade_group_years_constant_is_ten():
+    """Pinned so a change to the default grouping period is a deliberate edit, not silent."""
+
+    assert DECADE_GROUP_YEARS == 10
+    assert PENTAD_GROUP_YEARS == 5
+
+
+# --- max_z_error-driven LERC_ZSTD compression ------------------------------------------
+
+
+def test_write_cog_uses_lerc_when_variable_has_max_z_error(base_path, monkeypatch):
+    """A variable's max_z_error switches write_cog's profile to LERC_ZSTD at that tolerance."""
+
+    monkeypatch.setattr(VARIABLES["hsi"], "max_z_error", 0.001)
+    data = _band_data(2019)
+    write_cog(data, base_path=base_path, catalog_path=None, calendar_year=2019, **RASTER_KWARGS)
+
+    (cog_path,) = base_path.glob("**/*.tif")
+    with rasterio.open(cog_path) as src:
+        assert src.profile["compress"] == "lerc_zstd"
+        np.testing.assert_allclose(src.read(1), data, atol=0.001)
+
+
+def test_write_cog_defaults_to_zstd_without_max_z_error(base_path):
+    """A variable with no max_z_error keeps the ordinary ZSTD profile, not LERC_ZSTD."""
+
+    assert VARIABLES["hsi"].max_z_error is None
+    write_cog(_band_data(2019), base_path=base_path, catalog_path=None, calendar_year=2019, **RASTER_KWARGS)
+
+    (cog_path,) = base_path.glob("**/*.tif")
+    with rasterio.open(cog_path) as src:
+        assert src.profile["compress"] == "zstd"
+
+
+def test_compact_cog_uses_lerc_when_variable_has_max_z_error(base_path, monkeypatch):
+    """compact_cog's merged output also switches codec when the variable requests it."""
+
+    monkeypatch.setattr(VARIABLES["hsi"], "max_z_error", 0.001)
+    for year in YEARS:
+        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
+    outputs = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)["outputs"]
+    assert len(outputs) == 1
+
+    with rasterio.open(outputs[0]) as src:
+        assert src.profile["compress"] == "lerc_zstd"
+        for band, year in enumerate(YEARS, start=1):
+            np.testing.assert_allclose(src.read(band), _band_data(year), atol=0.001)
+
+
+def test_cog_profile_omits_predictor_for_lerc():
+    """PREDICTOR is a ZSTD/DEFLATE concept; LERC_ZSTD's own quantization replaces it."""
+
+    grid = GRIDS[RASTER_KWARGS["grid"]]
+    profile = _cog_profile(grid, "float32", max_z_error=0.001)
+    assert profile["compress"] == "LERC_ZSTD"
+    assert profile["max_z_error"] == 0.001
+    assert "predictor" not in profile

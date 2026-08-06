@@ -52,6 +52,15 @@ SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHO
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")
 VALUE_COLUMNS = cs.by_name("value")
 
+# Interleaving for downloaded rasters, set rather than inherited from the source. A source
+# COG may be written INTERLEAVE=TILE, which is a COG-driver-only option that the GTiff driver
+# used here rejects outright ("INTERLEAVE=tile unsupported, value must be PIXEL or BAND"), so
+# inheriting it makes such a source undownloadable. PIXEL is also what keeps a multiband
+# response small: the same 52-band elev selection wrote 1.65 GB pixel-interleaved versus
+# 19.3 GB band-interleaved, since only pixel interleaving puts each pixel's bands adjacent
+# for the compression predictor.
+OUTPUT_INTERLEAVE = "PIXEL"
+
 
 class Dataset(LazyFrameSource):
     def __init__(
@@ -651,7 +660,6 @@ class Dataset(LazyFrameSource):
         if not all(factor == 1 for factor in factors):
             vrt_text = scale_vrt_bands(vrt_text, factors)
 
-
         with rio.open(sources[0][0]) as source:
             profile = source.profile
         creation_options = {
@@ -659,7 +667,7 @@ class Dataset(LazyFrameSource):
             "tiled": profile.get("tiled", True),
             "blockxsize": profile.get("blockxsize"),
             "blockysize": profile.get("blockysize"),
-            "interleave": profile.get("interleave"),
+            "interleave": OUTPUT_INTERLEAVE,
             "num_threads": RASTER_NUM_THREADS,
             "bigtiff": "YES",
             **kwargs,
@@ -702,7 +710,7 @@ class Dataset(LazyFrameSource):
             else:
                 out_count = len(df)
             profile = inputs[0].profile.copy()
-            profile.update(count=out_count, **kwargs)
+            profile.update(count=out_count, interleave=OUTPUT_INTERLEAVE, **kwargs)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
 
             # Label output bands with their calendar value when rows map 1:1 to bands.

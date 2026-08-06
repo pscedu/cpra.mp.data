@@ -91,8 +91,7 @@ def _dimension_cols_from_hive(path: Path) -> dict:
 
 def _convert_batched(
     parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-    progress_cb=None, temp_path=None, catalog_path=None, round_to_decimal_places=None,
-    unique_parquet_rows=False,
+    progress_cb=None, temp_path=None, catalog_path=None, unique_parquet_rows=False,
 ) -> list[str]:
     """Batched conversion via temp files, bounded to roughly one batch in memory.
 
@@ -117,10 +116,6 @@ def _convert_batched(
     is deliberately avoided — it would materialize every group at once, each
     retaining all (~100k) grid-cell columns.
 
-    round_to_decimal_places, when given, rounds the unpivoted "value" column to
-    that many decimal places before sorting/writing (only when the value dtype
-    is floating-point; ignored otherwise).
-
     unique_parquet_rows, when True, drops duplicate rows (all columns equal,
     including grid_cell and value) from each batch's unpivoted long frame before
     sorting/writing. Batches never split a group, and duplicate wide rows always
@@ -132,9 +127,6 @@ def _convert_batched(
     other_dim_cols = [
         col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
     ]
-    value_dtype = schema[geo_cols[0]]
-    round_value = round_to_decimal_places is not None and value_dtype in (pl.Float32, pl.Float64)
-
     wide_df = pl.scan_parquet(parquet_paths).collect()
 
     if other_dim_cols:
@@ -194,8 +186,6 @@ def _convert_batched(
                 .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
                 .with_columns(pl.col("grid_cell").cast(pl.Int32))
             )
-            if round_value:
-                batch_lazy = batch_lazy.with_columns(pl.col("value").round(round_to_decimal_places))
             if unique_parquet_rows:
                 batch_lazy = batch_lazy.unique()
             batch_lazy.sort(*batch_sort).sink_parquet(tmp_path)
@@ -224,7 +214,6 @@ def migrate_partition(
     memory_limit: int | None = None,
     progress_cb=None,
     temp_path=None,
-    round_to_decimal_places: int | None = None,
     unique_parquet_rows: bool = False,
 ) -> tuple[dict | None, list[str]]:
     """Convert all wide-format Parquet files in one partition to a single long-format file.
@@ -237,9 +226,6 @@ def migrate_partition(
     Conversion always uses the batched temp-file path.  memory_limit (bytes),
     when given, sizes each batch so the per-worker peak stays within it;
     otherwise a default batch size is used.
-
-    round_to_decimal_places, when given, is forwarded to ``_convert_batched`` to
-    round floating-point values before writing.
 
     unique_parquet_rows, when True, is forwarded to ``_convert_batched`` to drop
     duplicate rows from the long-format output.
@@ -312,7 +298,7 @@ def migrate_partition(
     # tunes the per-batch budget.
     messages += _convert_batched(
         parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-        progress_cb, temp_path, catalog_path, round_to_decimal_places, unique_parquet_rows,
+        progress_cb, temp_path, catalog_path, unique_parquet_rows,
     )
 
     elapsed = time.perf_counter() - t0
@@ -340,7 +326,6 @@ def migrate_raster_dataset(
     output_path: Path,
     catalog_path: Path | None = None,
     dry_run: bool = False,
-    round_to_decimal_places: int | None = None,
 ) -> tuple[dict, list[str]]:
     """Compact one raster leaf partition's single-band COGs into multi-band COGs,
     written into the output tree with the input left untouched.
@@ -356,11 +341,6 @@ def migrate_raster_dataset(
     ``catalog_path`` is given.  Returns (result, messages); result carries
     ``data_type="raster"``, ``files`` (source COG count) and ``geo_cols`` (output
     COG count), plus ``elapsed_s``/``peak_bytes`` when not a dry run.
-
-    round_to_decimal_places, when given, is forwarded to ``raster.compact_cog`` to
-    round floating-point pixel values of every band that gets consolidated into a
-    multi-band COG (bands whose run is already optimally stored are left untouched,
-    same as compact_cog's usual skip behavior).
     """
     messages: list[str] = []
     rel = _raster_rel(dataset_kwargs)
@@ -377,7 +357,6 @@ def migrate_raster_dataset(
         base_path=base_path,
         output_base_path=output_path,
         catalog_path=catalog_path,
-        round_to_decimal_places=round_to_decimal_places,
         **dataset_kwargs,
     )
     elapsed = time.perf_counter() - t0
@@ -611,7 +590,7 @@ def _run_partition(args, result_queue):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     (
         task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path,
-        round_to_decimal_places, unique_parquet_rows,
+        unique_parquet_rows,
     ) = args
     kind, rel, payload = task
     pid = os.getpid()
@@ -621,17 +600,13 @@ def _run_partition(args, result_queue):
 
     try:
         if kind == "raster":
-            result, messages = migrate_raster_dataset(
-                payload, base_path, output_path, catalog_path, dry_run,
-                round_to_decimal_places=round_to_decimal_places,
-            )
+            result, messages = migrate_raster_dataset(payload, base_path, output_path, catalog_path, dry_run)
         else:
             result, messages = migrate_partition(
                 payload, base_path, output_path, catalog_path, dry_run,
                 memory_limit=memory_limit,
                 progress_cb=progress_cb if progress else None,
                 temp_path=temp_path,
-                round_to_decimal_places=round_to_decimal_places,
                 unique_parquet_rows=unique_parquet_rows,
             )
         result_queue.put(("result", pid, rel, result, messages, None))
@@ -865,14 +840,6 @@ def _print_progress(
     "filesystem). Defaults to the system temp location.",
 )
 @click.option(
-    "--round-to-decimal-places",
-    type=int,
-    metavar="N",
-    help="Round floating-point values to N decimal places before writing the long-format "
-    "output. Applies to tabular (Parquet) value columns and to raster (COG) bands that get "
-    "consolidated into a multi-band COG; ignored where the value/band dtype isn't floating-point.",
-)
-@click.option(
     "--unique-parquet-rows",
     is_flag=True,
     help="Drop duplicate rows (all columns equal) from the long-format Parquet output. "
@@ -881,7 +848,7 @@ def _print_progress(
 def main(
     output_path, catalog_path, estimate, unconverted_only, variable, grid, time_unit, dry_run, progress,
     data_path, workers, show_progress, log_path, memory_limit, temp_path,
-    round_to_decimal_places, unique_parquet_rows,
+    unique_parquet_rows,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
 
@@ -997,7 +964,7 @@ def main(
     packed = [
         (
             task, base_path, output_path, write_catalog_path, dry_run, memory_limit, progress, temp_path,
-            round_to_decimal_places, unique_parquet_rows,
+            unique_parquet_rows,
         )
         for task in tasks
     ]

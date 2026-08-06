@@ -1,11 +1,11 @@
 import tempfile
 import uuid
 import xml.etree.ElementTree
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 import rasterio as rio
 from rasterio.io import MemoryFile
@@ -27,6 +27,14 @@ from cpra.mp.data.utils import (
     required_columns,
     validate_data_frame,
 )
+from cpra.mp.data.variables import VARIABLES
+
+# Default run-grouping period (in years) for compact_cog's annual COGs -- see its docstring
+# and _period_subgroups. A decade balances storage against single-band read/download cost
+# better than either the unbounded run (today's 52-band files) or a 5-year pentad; see the
+# project's raster-perf notes for the measurements behind this default.
+DECADE_GROUP_YEARS = 10
+PENTAD_GROUP_YEARS = 5
 
 _CALENDAR_DIMENSIONS = CAL_DIMS  # ("calendar_year", "calendar_day") -- shared with catalog.py
 
@@ -291,27 +299,34 @@ def read_cog(base_path=BASE_PATH, include_file_paths="path", **kwargs):
     return lf
 
 
-def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6):
+def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, max_z_error=None):
     """Build the rasterio COG write profile for a grid (used by ``write_cog``).
 
     ``compact_cog`` reuses this for the shared compression/predictor/nodata options on
     its ``CreateCopy`` call.
+
+    ``max_z_error``, when given (see ``Variable.max_z_error``), switches the codec to
+    LERC_ZSTD at that error tolerance instead of ``compression``/``predictor`` -- LERC's own
+    quantization does the work a predictor would, and combining the two is not meaningful.
+    ``compression_level`` still applies, as LERC_ZSTD's inner zstd stage.
     """
 
-    return {
-        "compress": compression.upper(),
-        "level": compression_level,
+    profile = {
         "count": count,
         "crs": grid.crs,
         "driver": "COG",
         "dtype": dtype,
         "height": grid.height,
         "nodata": -9999,
-        "predictor": "YES",
         "resampling": "NEAREST",
         "transform": from_bounds(*grid.bounds, width=grid.width, height=grid.height),
         "width": grid.width,
     }
+    if max_z_error is not None:
+        profile.update(compress="LERC_ZSTD", level=compression_level, max_z_error=max_z_error)
+    else:
+        profile.update(compress=compression.upper(), level=compression_level, predictor="YES")
+    return profile
 
 
 def write_cog(
@@ -346,7 +361,10 @@ def write_cog(
     ).item()
 
     grid = GRIDS[kwargs["grid"]]
-    profile = _cog_profile(grid, data.dtype, compression=compression, compression_level=compression_level)
+    max_z_error = VARIABLES[kwargs["variable"]].max_z_error
+    profile = _cog_profile(
+        grid, data.dtype, compression=compression, compression_level=compression_level, max_z_error=max_z_error
+    )
 
     with rio.open(cog_path, "w", **profile) as dst:
         # The calendar value lives only in the band description below, not as a tag.
@@ -371,50 +389,6 @@ def _calendar_value(value, calendar_dim):
     """Parse a band description's value (the part after ``"="``) into a typed value."""
 
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
-
-
-_ROUND_PIXEL_FUNCTION_NAME = "round_to_decimal_places"
-
-
-def _round_pixel_function_code(decimals: int) -> str:
-    """Python VRT pixel-function source that rounds every pixel to ``decimals`` places.
-
-    GDAL calls this per output block (see ``_apply_rounding_to_vrt``), so pixel data is
-    never materialized outside GDAL's normal streaming I/O -- unlike reading the whole
-    array with rasterio and calling ``np.round`` on it, this keeps memory/time close to an
-    unrounded ``CreateCopy``.
-    """
-    return (
-        "import numpy as np\n"
-        f"def {_ROUND_PIXEL_FUNCTION_NAME}(in_ar, out_ar, xoff, yoff, xsize, ysize, "
-        "raster_xsize, raster_ysize, buf_radius, gt, **kwargs):\n"
-        f"    out_ar[:] = np.round(in_ar[0], {decimals})\n"
-    )
-
-
-def _apply_rounding_to_vrt(vrt_text: str, decimals: int) -> str:
-    """Rewrite every band of ``vrt_text`` into a ``VRTDerivedRasterBand`` that rounds pixel
-    values to ``decimals`` places via a Python pixel function (``_round_pixel_function_code``),
-    wrapping each band's existing (single) source unchanged -- its dtype, description, and
-    the dataset-level tags/metadata inherited from the first source (see ``vrt()``) are
-    untouched, since none of those live on the ``SimpleSource`` element being wrapped.
-    """
-    root = xml.etree.ElementTree.fromstring(vrt_text)
-    code = _round_pixel_function_code(decimals)
-    for band_el in root.findall("VRTRasterBand"):
-        band_el.set("subClass", "VRTDerivedRasterBand")
-        source_el = band_el.find("SimpleSource")
-        pf_type = xml.etree.ElementTree.Element("PixelFunctionType")
-        pf_type.text = _ROUND_PIXEL_FUNCTION_NAME
-        pf_lang = xml.etree.ElementTree.Element("PixelFunctionLanguage")
-        pf_lang.text = "Python"
-        pf_code = xml.etree.ElementTree.Element("PixelFunctionCode")
-        pf_code.text = code
-        idx = list(band_el).index(source_el)
-        band_el.insert(idx, pf_code)
-        band_el.insert(idx, pf_lang)
-        band_el.insert(idx, pf_type)
-    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
 
 
 def set_vrt_band_descriptions(vrt_text, descriptions):
@@ -466,7 +440,7 @@ def scale_vrt_bands(vrt_text, factors):
 
 def _write_run(
     run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
-    round_to_decimal_places=None,
+    max_z_error=None,
 ):
     """Consolidate one contiguous run into the multi-band COG at ``out_path``.
 
@@ -474,17 +448,6 @@ def _write_run(
     streamed into ``out_path`` with ``CreateCopy``, reusing ``_cog_profile()`` for the
     shared compression settings.  ``values`` (the run's per-band calendar values, in run
     order) is only used to repair a legacy source's missing band descriptions.
-
-    round_to_decimal_places, when given and the band dtype is floating-point, rounds pixel
-    values before writing, via ``_apply_rounding_to_vrt`` -- each band becomes a
-    ``VRTDerivedRasterBand`` with a Python pixel function, so the rounding happens inside
-    GDAL's normal per-block ``CreateCopy`` streaming rather than a separate materialize/round
-    pass; memory and speed stay close to the unrounded path.  Inline VRT Python code is
-    refused by GDAL unless ``GDAL_VRT_ENABLE_PYTHON`` is set (an arbitrary-code-execution
-    guard) -- safe here because the code is generated in-process above, never read from an
-    external/untrusted VRT file.  The nodata sentinel (-9999, see ``_cog_profile``) is an
-    integer and is therefore unaffected by rounding to any decimal count, so no separate
-    masking is needed.
     """
 
     # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute paths, so
@@ -494,14 +457,11 @@ def _write_run(
         vrt_text = vrt(run)
         if is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
             vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, values)
-
-        round_dtype = round_to_decimal_places is not None and np.issubdtype(np.dtype(dtype), np.floating)
-        if round_dtype:
-            vrt_text = _apply_rounding_to_vrt(vrt_text, round_to_decimal_places)
         vrt_path.write_text(vrt_text)
 
         profile = _cog_profile(
-            grid, dtype, count=len(run), compression=compression, compression_level=compression_level
+            grid, dtype, count=len(run), compression=compression, compression_level=compression_level,
+            max_z_error=max_z_error,
         )
         profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
         # out_path is a fresh UUID that can't collide with any existing source file, so the
@@ -513,11 +473,35 @@ def _write_run(
         # driver already embeds those natively in the output file's own GDAL_METADATA tag
         # (same as write_cog's direct Create() path), so PAM's copy is pure redundant
         # bookkeeping, never read back by anything in this codebase.
-        env_options = {"GDAL_PAM_ENABLED": "NO"}
-        if round_dtype:
-            env_options["GDAL_VRT_ENABLE_PYTHON"] = "YES"
-        with rio.Env(**env_options):
+        with rio.Env(GDAL_PAM_ENABLED="NO"):
             copy(str(vrt_path), str(out_path), **profile)
+
+
+def _period_subgroups(values, period):
+    """Split a maximal contiguous run's sorted calendar years into ``period``-aligned
+    groups (e.g. decades for ``period=10``, pentads for ``period=5``).
+
+    A short leading or trailing group -- left over because the run doesn't start/end on a
+    period boundary -- is folded into its neighbour rather than written as its own
+    near-empty file (e.g. a run starting at 2019 would otherwise leave a lone 2019 in its
+    own decade file). Only the run's own two edges can be short; every interior group is
+    already a full period by construction.
+
+    Returns lists of *indices* into ``values``, not the values themselves, so the caller
+    can apply the same grouping to any parallel list (paths, bands, ...).
+    """
+
+    groups = {}
+    for i, year in enumerate(values):
+        groups.setdefault(year // period, []).append(i)
+    keys = sorted(groups)
+    if len(groups[keys[0]]) < period and len(keys) > 1:
+        groups[keys[1]] = groups.pop(keys[0]) + groups[keys[1]]
+        keys = sorted(groups)
+    if len(groups[keys[-1]]) < period and len(keys) > 1:
+        groups[keys[-2]] = groups[keys[-2]] + groups.pop(keys[-1])
+        keys = sorted(groups)
+    return [groups[k] for k in keys]
 
 
 def compact_cog(
@@ -526,7 +510,7 @@ def compact_cog(
     output_base_path=None,
     compression="zstd",
     compression_level=6,
-    round_to_decimal_places=None,
+    group_years=DECADE_GROUP_YEARS,
     **kwargs,
 ):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
@@ -537,14 +521,26 @@ def compact_cog(
     sorted sequence of calendar values.  Wherever that sequence forms a maximal
     contiguous run (consecutive years, decades, months, or days -- see
     ``utils.calendar_run_offsets``, shared with the API catalog's range compression)
-    spanning more than one source file, those files are consolidated into a single new
-    multi-band COG (named with a UUID, like the sources); a run already living entirely
-    in one file is left untouched.  A gap ends a run, so incomplete/sparse time series
-    stay physically distinct from complete ones and are safe to compact again later once
-    the gap is filled.
+    spanning more than one source file, those files are consolidated -- a run already
+    living entirely in one file is left untouched.  A gap ends a run, so incomplete/sparse
+    time series stay physically distinct from complete ones and are safe to compact again
+    later once the gap is filled.
 
-    A band-separate VRT is built over each run's ``(path, band)`` sources (``vrt()``) and
-    streamed into the output with ``CreateCopy`` (like ``gdalbuildvrt -separate`` +
+    For annual data, each maximal run is further split at ``group_years``-year calendar
+    boundaries (``_period_subgroups``) before writing, rather than merging the whole run
+    into one ever-growing file: reading or downloading any single year from an N-band
+    PIXEL-interleaved COG decompresses all N bands (see ``api/dataset.py``'s
+    ``OUTPUT_INTERLEAVE`` note), so an unbounded run makes that cost unbounded too.
+    ``group_years`` defaults to ``DECADE_GROUP_YEARS`` (10); pass
+    ``PENTAD_GROUP_YEARS`` (5) for finer-grained files at the cost of more total storage,
+    or ``None`` to restore the old unbounded-run behavior. Only applies when
+    ``time_unit == "annual"`` (decade/pentad boundaries aren't meaningful for daily,
+    monthly, or already-decadal data); non-annual runs are always written whole. Each
+    resulting group is written to its own new multi-band COG (named with a UUID, like the
+    sources).
+
+    A band-separate VRT is built over each group's ``(path, band)`` sources (``vrt()``)
+    and streamed into the output with ``CreateCopy`` (like ``gdalbuildvrt -separate`` +
     ``gdal_translate -of COG``), reusing ``_cog_profile()`` for the shared compression
     settings; band descriptions and dataset tags are inherited automatically through the
     VRT and the copy.  GDAL never materializes the stack and, because the sources already
@@ -561,16 +557,17 @@ def compact_cog(
     the source files in place -- used by the migration to build a long-format tree
     out-of-place without mutating the input ``base_path``. It defaults to ``base_path``
     (the in-place behavior). Out-of-place mode assumes every source needs rewriting
-    (true for legacy COGs, which are always rewritten): a run already living optimally
+    (true for legacy COGs, which are always rewritten): a group already living optimally
     in a single up-to-date file is skipped and would *not* be copied across.
 
-    round_to_decimal_places, when given, is forwarded to ``_write_run`` to round
-    floating-point pixel values before writing each merged run (see there for the
-    performance trade-off it implies).
+    The variable's ``max_z_error`` (see ``Variable``), when set, overrides the default
+    compression for every group to LERC_ZSTD at that tolerance, regardless of
+    ``compression``/``compression_level``'s algorithm choice (``compression_level`` still
+    governs LERC_ZSTD's inner zstd stage) -- see ``_cog_profile``.
 
     Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
     multi-band COGs and the number of source COGs they consumed (both empty/zero when
-    every run was already optimal), so callers don't have to re-scan the output tree.
+    every group was already optimal), so callers don't have to re-scan the output tree.
     """
 
     input_df = cast_columns(pl.DataFrame(kwargs))
@@ -580,6 +577,7 @@ def compact_cog(
     output_base_path = base_path if output_base_path is None else Path(output_base_path)
     dataset_dir = dataset_path(base_path, **kwargs)
     grid = GRIDS[kwargs["grid"]]
+    max_z_error = VARIABLES[kwargs["variable"]].max_z_error
 
     required_cols = required_columns(input_df, include_dataset=False, include_metadata=False)
     time_unit = kwargs["time_unit"]
@@ -650,34 +648,66 @@ def compact_cog(
             Catalog(catalog_path).append(directory_rows)
 
         for offset, run in runs.items():
-            unique_paths = {tif for tif, _band in run}
-            run_is_legacy = bool(unique_paths & legacy_paths)  # LEGACY COG SHIM
-            # A run already living entirely in one up-to-date file is already optimal;
-            # nothing to gain from rewriting it. A legacy run is rewritten regardless of
-            # file count -- that's its only path into the new format.
-            if len(unique_paths) < 2 and not run_is_legacy:
-                continue
+            values_in_run = run_values[offset]
+            # Period grouping only means anything for annual calendars -- a decade/pentad
+            # boundary isn't meaningful for daily, monthly, or already-decadal data, so
+            # those are always written as one group (the run as a whole).
+            if group_years and time_unit == "annual" and calendar_dim == "calendar_year":
+                subgroup_indices = _period_subgroups(values_in_run, group_years)
+            else:
+                subgroup_indices = [list(range(len(run)))]
 
-            # The output directory mirrors `directory`'s canonical dimensions but roots
-            # at output_base_path (== base_path for in-place compaction).  LEGACY COG
-            # SHIM: `directory` is always pre-existing once every source is already
-            # canonical, but a legacy-only group's canonical directory may not exist on
-            # disk yet; an out-of-place output directory never exists up front.
-            out_directory = output_base_path / directory.relative_to(base_path)
-            out_directory.mkdir(parents=True, exist_ok=True)
-            out_path = out_directory / f"{uuid.uuid4()}.tif"
+            # A single source file's bands can land in more than one subgroup (e.g.
+            # re-grouping an existing 52-band file at a different group_years), so a
+            # source can't be unlinked until every subgroup referencing it has been
+            # written -- collect the union across the whole run before unlinking below.
+            # path_band_counts tallies each source's total contribution to the *whole*
+            # run (every subgroup, not just one) -- a subgroup is only "already optimal"
+            # when its one file contributes *exactly* those bands and nothing else,
+            # otherwise that file also feeds a different subgroup and must be split.
+            path_band_counts = Counter(tif for tif, _band in run)
+            consumed_paths = set()
+            for indices in subgroup_indices:
+                sub_run = [run[i] for i in indices]
+                sub_values = [values_in_run[i] for i in indices]
+                unique_paths = {tif for tif, _band in sub_run}
+                run_is_legacy = bool(unique_paths & legacy_paths)  # LEGACY COG SHIM
+                # A group already living entirely in one up-to-date file, with none of
+                # that file's bands split off into a different group, is already
+                # optimal; nothing to gain from rewriting it. A legacy group is
+                # rewritten regardless of file count -- that's its only path into the
+                # new format.
+                already_optimal = (
+                    not run_is_legacy
+                    and len(unique_paths) == 1
+                    and path_band_counts[next(iter(unique_paths))] == len(sub_run)
+                )
+                if already_optimal:
+                    continue
 
-            _write_run(
-                run, out_path, grid, dtype, calendar_dim, run_values[offset],
-                run_is_legacy, compression, compression_level, round_to_decimal_places,
-            )
-            outputs.append(out_path)
-            sources_merged += len(unique_paths)
+                # The output directory mirrors `directory`'s canonical dimensions but
+                # roots at output_base_path (== base_path for in-place compaction).
+                # LEGACY COG SHIM: `directory` is always pre-existing once every source
+                # is already canonical, but a legacy-only group's canonical directory
+                # may not exist on disk yet; an out-of-place output directory never
+                # exists up front.
+                out_directory = output_base_path / directory.relative_to(base_path)
+                out_directory.mkdir(parents=True, exist_ok=True)
+                out_path = out_directory / f"{uuid.uuid4()}.tif"
+
+                _write_run(
+                    sub_run, out_path, grid, dtype, calendar_dim, sub_values,
+                    run_is_legacy, compression, compression_level, max_z_error,
+                )
+                outputs.append(out_path)
+                consumed_paths |= unique_paths
+
+            sources_merged += len(consumed_paths)
 
             # Out-of-place output leaves the source tree untouched; only an in-place
             # merge consumes and removes its sources.
             if output_base_path == base_path:
-                for path in unique_paths:
+                for path in consumed_paths:
                     path.unlink()
 
     # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
