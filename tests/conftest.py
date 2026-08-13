@@ -69,6 +69,21 @@ def crosswalk_path(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def geometry_path(tmp_path, monkeypatch):
+    """An isolated geometry directory, patched over the configured one.
+
+    GEOMETRY_PATH isn't env-configurable like the other data paths (see config.py), so
+    this patches the module attribute directly rather than an env var. The real geometry
+    directory is gitignored and not present in a fresh checkout or CI, so any test that
+    resolves coordinates to grid cell IDs must use this fixture.
+    """
+    path = tmp_path / "geometry"
+    path.mkdir()
+    monkeypatch.setattr(cpra_config, "GEOMETRY_PATH", path)
+    return path
+
+
+@pytest.fixture
 def tiles_path(tmp_path, monkeypatch):
     """An isolated PMTiles directory, patched over the configured one."""
     path = tmp_path / "tiles"

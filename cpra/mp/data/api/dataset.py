@@ -20,6 +20,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform, transform_bounds
 
 from cpra.mp.data import config
+from cpra.mp.data.api.geography import resolve_vector_geography
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import OutputType
@@ -52,6 +53,31 @@ RASTER_AGGREGATES = {
 }
 
 
+def _parse_coordinate_pairs(values):
+    """Parse a flat list of strings into (lngs, lats), validating that every value is
+    numeric, that there's an even count, and that each pair is a valid WGS84 coordinate.
+    """
+    try:
+        coords = [float(value) for value in values]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
+
+    if len(coords) % 2:
+        raise HTTPException(status_code=400, detail="geography contain an even number of coordinates")
+
+    lngs = []
+    lats = []
+    for start_idx in range(0, len(coords), 2):
+        lng, lat = coords[start_idx : start_idx + 2]
+        if abs(lng) > 180 or abs(lat) > 90:
+            msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
+            raise HTTPException(status_code=400, detail=msg)
+        lngs.append(lng)
+        lats.append(lat)
+
+    return lngs, lats
+
+
 def _get_zone_segments(zones, zone_ids):
     """Sort a block of crosswalk zone IDs into contiguous runs of same-zone pixels.
 
@@ -75,12 +101,15 @@ class Dataset(LazyFrameSource):
         filter_dimensions: FilterDimensions,
         options: Options,
         base_path=None,
+        relabel_geography=False,
     ):
         self.dataset_dimensions = dataset_dimensions
         self.filter_dimensions = filter_dimensions
         self.options = options
+        self.relabel_geography = relabel_geography
         self.dataset_bounds = None
         self.geography_ids = None
+        self.geography_labels = None
         self.summarize_geography_ids = None
         self.raster_groups = None
 
@@ -160,36 +189,64 @@ class Dataset(LazyFrameSource):
                 await self._apply_geography_raster()
 
     async def _apply_geography_vector(self):
-        """Apply the geography filter to a vector-grid dataset."""
-        # TODO: Validate that the given IDs fall within the grid min and max.
-        self.geography_ids = unpack_values(self.options.geography, "geography")
+        """Apply the geography filter to a vector-grid dataset.
+
+        Accepts either grid cell IDs or lat/lng coordinate pairs, matching the raster
+        convention. A geography value is treated as IDs only if every token is a plain
+        (unsigned, non-decimal) digit string; otherwise the whole list is parsed as
+        coordinate pairs and resolved to grid cell IDs via point-in-polygon lookup
+        against the grid's geometry. Coordinates that don't fall inside any polygon are
+        dropped rather than erroring.
+
+        Sets `geography_labels` to one `(label, grid cell ID)` pair per geography that
+        matched, in request order, and `geography_ids` to the distinct IDs among them.
+        The two differ when several coordinates land in the same cell: the cell can only
+        be selected once, since IDs double as column names, but each coordinate still
+        gets its own labeled copy in `_apply_geography_labels`.
+        """
+        values = unpack_values(self.options.geography, "geography")
+
+        if all(value.isdigit() for value in values):
+            # TODO: Validate that the given IDs fall within the grid min and max.
+            self.geography_labels = [(value, value) for value in values]
+        else:
+            lngs, lats = _parse_coordinate_pairs(values)
+            resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
+            self.geography_labels = [
+                (f"{lng!s},{lat!s}", str(geo_id))
+                for lng, lat, geo_id in zip(lngs, lats, resolved)
+                if geo_id is not None
+            ]
+
+        self.geography_ids = list(dict.fromkeys(geo_id for _, geo_id in self.geography_labels))
         self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
+
+    def _apply_geography_labels(self):
+        """Relabel geography-filtered columns from resolved grid cell IDs back to the
+        caller's original coordinate strings, for datasets queried by lat/lng.
+
+        Runs while the frame is still wide, so this only ever has to rename columns: the
+        unpivot that follows carries the labels into the `geography` column for free, and
+        two coordinates that resolved to the same cell each get their own copy of it.
+
+        Skipped when `summarize_by` has already collapsed the geography columns into
+        destination zone columns, and for the tile responses, which match `geography_ids`
+        against real pmtile feature IDs and so have to stay ID-keyed — hence the opt-in
+        `relabel_geography`.
+        """
+        if self.options.summarize_by is not None or not self.geography_labels:
+            return
+        if all(label == geo_id for label, geo_id in self.geography_labels):
+            return
+
+        self.lf = self.lf.select(
+            cs.exclude(*self.geography_ids),
+            *[pl.col(geo_id).alias(label) for label, geo_id in self.geography_labels],
+        )
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
-        # Check that coordinates are numeric and that there are an even number.
-        try:
-            coords = [float(coord) for coord in unpack_values(self.options.geography, "geography")]
-        except ValueError:
-            raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
-
-        coords_len = len(coords)
-        if coords_len % 2:
-            raise HTTPException(
-                status_code=400,
-                detail="geography contain an even number of coordinates",
-            )
-
-        # Extract lng,lat pairs.
-        lngs = []
-        lats = []
-        for start_idx in range(0, coords_len, 2):
-            lng, lat = coords[start_idx : (start_idx + 2)]
-            if abs(lng) > 180 or abs(lat) > 90:
-                msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
-                raise HTTPException(status_code=400, detail=msg)
-            lngs.append(lng)
-            lats.append(lat)
+        lngs, lats = _parse_coordinate_pairs(unpack_values(self.options.geography, "geography"))
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
         df = self.materialize()
@@ -292,6 +349,8 @@ class Dataset(LazyFrameSource):
             await self._apply_transform_params_raster()
         else:
             self._apply_transform_params_vector()
+        if self.relabel_geography:
+            self._apply_geography_labels()
         self._apply_unpivot_param()
 
     def _validate_summarize_params(self):
@@ -520,7 +579,9 @@ class Dataset(LazyFrameSource):
         # Estimate columns.
         columns = None
         if self.geography_ids is not None:
-            columns = len(self.geography_ids)
+            # Relabeling fans a shared grid cell back out to one column per coordinate, so
+            # the labels, not the distinct IDs, are what the response is that wide.
+            columns = len(self.geography_labels if self.relabel_geography else self.geography_ids)
         else:
             grid = GRIDS[self.dataset_dimensions.grid]
             columns = getattr(grid, "id_count", None)

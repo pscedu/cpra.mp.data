@@ -53,14 +53,22 @@ class TimeSeriesLine(DatasetVisualization):
         nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
 
+        # The data is keyed by whatever the API reports as `geography`, but the legend shows
+        # `geography_label` — a coordinate selection carries the resolved grid cell ID, which
+        # is what actually identifies the values being drawn. The row index doubles as the
+        # tooltip's column key below, so both label lists line up with it.
+        geography_df = pl.DataFrame(
+            dict(geography=self.geographies, geography_label=self.geography_labels)
+        ).with_row_index(name="geography_idx")
+
         main_line_encodings = [
             alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
             .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
-            alt.Color("geography:N")
+            alt.Color("geography_label:N")
             .title(self.grid.label)
-            .scale(domain=[geo for geo in self.geographies], range=MAP_SELECTION),
+            .scale(domain=self.geography_labels, range=MAP_SELECTION),
         ] + [
             compare_channels[i](f"{dimension}:N").title(DIMENSIONS[dimension].label)
             for i, dimension in enumerate(compare_dimensions.keys())
@@ -68,6 +76,10 @@ class TimeSeriesLine(DatasetVisualization):
 
         main_line = (
             self.get_base_chart(self.data_source, self.time_column)
+            .transform_lookup(
+                "geography",
+                from_=alt.LookupData(geography_df, "geography", ["geography_label"]),
+            )
             .mark_line()
             .encode(*main_line_encodings)
             .properties(title=self.title, width=chart_width)
@@ -75,15 +87,16 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
-        geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
                 type="quantitative",
-                title=f"{str(geo)}: {', '.join([str(c) for c in val_choices])}",
+                title=f"{label}: {', '.join([str(c) for c in val_choices])}",
                 format=self.variable.number_format or "",
             )
-            for (i, geo) in geography_df.iter_rows()
+            # Short labels here: a tooltip carries a row per geography, so a full label
+            # would push the numbers being read off to the right.
+            for i, label in enumerate(self.geography_short_labels)
             for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 

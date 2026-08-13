@@ -10,6 +10,27 @@ from cpra.mp.data.utils import required_columns
 from cpra.mp.data.variables import VARIABLES
 
 
+def geography_tokens(geography):
+    """Split a `geography` parameter into stripped string tokens.
+
+    Accepts either the comma-separated string the API binds from the query string or the
+    plain sequence a notebook is more likely to pass.
+    """
+    values = geography.split(",") if isinstance(geography, str) else geography
+    return [str(value).strip() for value in values]
+
+
+def is_geography_ids(geography):
+    """Are these geography values grid cell IDs rather than lat/lng coordinate pairs?
+
+    Mirrors the rule in `Dataset._apply_geography_vector`: values are IDs only when every
+    token is a plain unsigned digit string, so anything carrying a decimal point or a sign
+    is a coordinate. Only meaningful for a vector grid, since raster geography is always
+    coordinates. An absent geography selects the whole grid, which is keyed by ID.
+    """
+    return geography is None or all(token.isdigit() for token in geography_tokens(geography))
+
+
 class BaseVisualization:
     def __init__(self, request=None, height=400, width=600, **kwargs):
         self.request = request
@@ -114,7 +135,10 @@ class BaseVisualization:
 
         if parse is None:
             parse = {"value": "number"}
-            if GRIDS[grid].grid_type == "vector":
+            # A vector grid reports geography as numeric grid cell IDs, except when the
+            # caller selected cells by coordinate — then the API labels them with the
+            # original "lng,lat" strings, which have to stay strings here to match.
+            if GRIDS[grid].grid_type == "vector" and is_geography_ids(kwargs.get("geography")):
                 parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
             parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
@@ -161,16 +185,74 @@ class DatasetVisualization(BaseVisualization):
 
     @cached_property
     def geographies(self):
-        """Get the selected geographies."""
-        raster = self.grid.grid_type == "raster"
-        coord_type = float if raster else int
-        geos = self.params["geography"]
-        coords = list(map(coord_type, geos.split(",") if isinstance(geos, str) else geos))
+        """Get the selected geographies as the API keys them in its own output.
 
-        if not raster:
-            return coords
+        A vector grid takes either grid cell IDs or lat/lng coordinate pairs; a raster
+        grid only takes coordinates. These are what a `geography` value in the response
+        will actually equal, so they're what a scale domain or a lookup key has to match —
+        see `geography_labels` for what to show the reader instead.
+        """
+        return [geography for geography, _, _ in self._geographies]
 
-        return [",".join([str(coord) for coord in coords[i : i + 2]]) for i in range(0, len(coords), 2)]
+    @cached_property
+    def geography_labels(self):
+        """Get a display label per selected geography, in the same order as `geographies`.
+
+        Identifies a geography in full, for somewhere with room for it — a legend. A
+        coordinate is shown parenthesized, and on a vector grid it's prefixed with the ID of
+        the cell it landed in, since the cell — not the point — is what the values describe:
+        `24`, `24 (-90.49, 30.01)`, or `(-90.49, 30.01)` on a raster grid.
+        """
+        return [label for _, label, _ in self._geographies]
+
+    @cached_property
+    def geography_short_labels(self):
+        """Get a compact display label per selected geography, in the same order.
+
+        For somewhere a full label would crowd out the numbers being read, like a tooltip
+        with one row per geography. Where a grid cell ID is available it stands alone, since
+        it's what the values describe and the coordinate that selected it only repeats what
+        the legend already says. A raster pixel has no ID, so the coordinate is all there is
+        to show. Two coordinates inside one cell therefore share a short label; the legend is
+        what tells them apart.
+        """
+        return [short_label for _, _, short_label in self._geographies]
+
+    @cached_property
+    def _geographies(self):
+        """One `(API geography key, label, short label)` triple per selected geography.
+
+        The API reports a coordinate-selected geography under a `"lng,lat"` string built
+        from the parsed floats, so round-trip the tokens through `float` here to match it
+        (`-91` in the request becomes `-91.0` in the response). Labeling a vector-grid
+        coordinate means resolving it to a cell the same way the data endpoint does; a
+        coordinate outside the grid is dropped, as it is there, so no legend entry or
+        tooltip slot is left with nothing behind it.
+        """
+        geography = self.params["geography"]
+
+        if self.grid.grid_type == "vector" and is_geography_ids(geography):
+            ids = [int(token) for token in geography_tokens(geography)]
+            return [(geo_id, str(geo_id), str(geo_id)) for geo_id in ids]
+
+        coords = [float(token) for token in geography_tokens(geography)]
+        pairs = list(zip(coords[::2], coords[1::2]))
+        keys = [f"{lng!s},{lat!s}" for lng, lat in pairs]
+
+        if self.grid.grid_type != "vector":
+            return [(key, f"({lng}, {lat})", f"({lng}, {lat})") for key, (lng, lat) in zip(keys, pairs)]
+
+        # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
+        # a notebook that only builds specs shouldn't need either. Same reason map.py
+        # imports Dataset where it uses it.
+        from cpra.mp.data.api.geography import resolve_vector_geography_sync
+
+        ids = resolve_vector_geography_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
+        return [
+            (key, f"{geo_id} ({lng}, {lat})", str(geo_id))
+            for key, (lng, lat), geo_id in zip(keys, pairs, ids)
+            if geo_id is not None
+        ]
 
     @cached_property
     def time_column(self):
