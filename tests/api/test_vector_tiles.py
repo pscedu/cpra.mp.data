@@ -205,8 +205,7 @@ class TestGetVectorTile:
         self, dataset_factory, vector_data, ecoregion_tiles, geometry_path
     ):
         """A coordinate-selected geography is resolved to an ID before it reaches the tile,
-        because features are keyed by ID here — the coordinate relabeling that the tabular
-        response applies would leave nothing for a feature to match."""
+        which is what a pmtile feature is keyed by."""
         from shapely.geometry import box
 
         from tests.factories import ANNUAL_KWARGS, annual_frame, write_grid_geometry

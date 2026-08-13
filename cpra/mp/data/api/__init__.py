@@ -187,11 +187,7 @@ async def get_model_data(
 ):
     compression = query.compression
     validate_compression(compression, format)
-    # Unlike the tile routes, this one reports a coordinate-selected geography back under
-    # the caller's own coordinate rather than the grid cell ID it resolved to.
-    dataset = Dataset(
-        dataset_dimensions, query.filter_dimensions, query.options, relabel_geography=True
-    )
+    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     validate_format(format, dataset.output_type)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:

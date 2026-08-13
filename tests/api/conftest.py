@@ -73,13 +73,12 @@ def dataset_factory(base_path):
     """
     from cpra.mp.data.api.dataset import Dataset
 
-    def build(dimensions, filters=None, base=None, relabel_geography=False, **options):
+    def build(dimensions, filters=None, base=None, **options):
         return Dataset(
             DatasetDimensions(**dimensions),
             FilterDimensions(**(filters or {})),
             Options(**options),
             base_path=(base if base is not None else base_path),
-            relabel_geography=relabel_geography,
         )
 
     return build

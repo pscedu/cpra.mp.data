@@ -24,23 +24,29 @@ from tests.factories import write_grid_geometry
 ANNUAL_VECTOR = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual")
 ANNUAL_RASTER = dict(variable="vct", grid="veg_grid_cell_v001", time_unit="annual")
 
-# The cell every coordinate in these tests resolves to, and two coordinates inside it.
-CELL_ID = 7
+# Two coordinates inside cell 7, one inside cell 8, and one in neither.
 INSIDE = (-91.5, 29.5)
 ALSO_INSIDE = (-91.49, 29.49)
+IN_CELL_8 = (-91.3, 29.5)
 OUTSIDE = (-92.5, 30.5)
 
 
 @pytest.fixture
 def ecoregion_geometry(geometry_path):
-    """A 10km square around `INSIDE`, as ecoregion_v001 cell 7.
+    """10km squares around `INSIDE` and `IN_CELL_8`, as ecoregion_v001 cells 7 and 8.
 
-    Big enough to hold `ALSO_INSIDE` as well, so the shared-cell case is reachable, and far
-    enough from `OUTSIDE` that it isn't.
+    Each is big enough to hold its own coordinates — `ALSO_INSIDE` lands in cell 7 too, so
+    the shared-cell case is reachable — and far enough from `OUTSIDE` that it isn't.
     """
-    x, y = [c[0] for c in transform(CRS.from_epsg(4326), CRS.from_epsg(26915), *[[c] for c in INSIDE])]
+
+    def square(lng, lat):
+        x, y = [c[0] for c in transform(CRS.from_epsg(4326), CRS.from_epsg(26915), [lng], [lat])]
+        return box(x - 5000, y - 5000, x + 5000, y + 5000)
+
     return write_grid_geometry(
-        geometry_path, "ecoregion_v001", [(CELL_ID, box(x - 5000, y - 5000, x + 5000, y + 5000))]
+        geometry_path,
+        "ecoregion_v001",
+        [(7, square(*INSIDE)), (8, square(*IN_CELL_8))],
     )
 
 
@@ -87,29 +93,31 @@ class TestGeographies:
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
         assert viz.geographies == [1, 2]
 
-    def test_vector_coordinates_become_pair_labels(self, ecoregion_geometry):
-        """These must match the column labels Dataset._apply_geography_labels produces."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geographies == ["-91.5,29.5", "-91.49,29.49"]
-
-    def test_coordinates_are_normalized_through_float(self, ecoregion_geometry):
-        """The API labels with str(float(token)), so a trailing zero is dropped on the way
-        back (and a bare `-91` would come back as `-91.0`)."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="-91.500,29.500")
-        assert viz.geographies == ["-91.5,29.5"]
+    def test_vector_coordinates_resolve_to_cell_ids(self, ecoregion_geometry):
+        """The data endpoint reports a vector geography by ID however it was selected, so a
+        coordinate has to be resolved here to know what to match against."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, IN_CELL_8))
+        assert viz.geographies == [7, 8]
 
     def test_coordinates_outside_the_grid_are_dropped(self, ecoregion_geometry):
         """The API omits them from the data, so keeping them here would leave a legend entry
         and a tooltip slot with nothing behind them."""
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE))
-        assert viz.geographies == ["-91.5,29.5"]
+        assert viz.geographies == [7]
+
+    def test_coordinates_in_one_cell_collapse(self, ecoregion_geometry):
+        """The response carries one series for the cell, so a second entry would be a key
+        the data never matches."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
+        assert viz.geographies == [7]
 
     def test_raster_coordinates_become_pair_labels(self):
+        """A raster grid has no IDs, so its geography stays the coordinate it was given."""
         viz = DatasetVisualization(**ANNUAL_RASTER, geography="-91.5,29.5")
         assert viz.geographies == ["-91.5,29.5"]
 
-    def test_raster_digit_geography_is_still_coordinates(self):
-        """A raster grid has no IDs to confuse them with."""
+    def test_raster_coordinates_are_normalized_through_float(self):
+        """The API labels with str(float(token)), so `91` comes back as `91.0`."""
         viz = DatasetVisualization(**ANNUAL_RASTER, geography="91,29")
         assert viz.geographies == ["91.0,29.0"]
 
@@ -127,11 +135,11 @@ class TestGeographyLabels:
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE))
         assert viz.geography_labels == ["7 (-91.5, 29.5)"]
 
-    def test_coordinates_in_one_cell_share_its_id(self, ecoregion_geometry):
-        """Both are still listed — they're separate series in the data — but the shared ID
-        is what tells the reader why the two lines coincide."""
+    def test_a_shared_cell_is_labeled_with_the_first_coordinate(self, ecoregion_geometry):
+        """The two coordinates are one series in the data, so they're one legend entry, and
+        the first of them is what names it."""
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geography_labels == ["7 (-91.5, 29.5)", "7 (-91.49, 29.49)"]
+        assert viz.geography_labels == ["7 (-91.5, 29.5)"]
 
     def test_raster_coordinates_are_shown_parenthesized(self):
         """A raster pixel has no ID to report, so the coordinate stands alone."""
@@ -139,8 +147,11 @@ class TestGeographyLabels:
         assert viz.geography_labels == ["(-91.5, 29.5)"]
 
     def test_labels_stay_aligned_with_geographies(self, ecoregion_geometry):
-        """The chart zips them together by position."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE, ALSO_INSIDE))
+        """The chart zips them together by position, so dropping and collapsing have to
+        happen to all three lists at once."""
+        viz = DatasetVisualization(
+            **ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
+        )
         assert (
             len(viz.geography_labels) == len(viz.geography_short_labels) == len(viz.geographies) == 2
         )
@@ -159,11 +170,10 @@ class TestGeographyShortLabels:
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE))
         assert viz.geography_short_labels == ["7"]
 
-    def test_coordinates_in_one_cell_collapse_to_the_same_label(self, ecoregion_geometry):
-        """They report the same value, so the repetition is honest — and the legend is where
-        the two are told apart."""
+    def test_a_shared_cell_appears_once(self, ecoregion_geometry):
+        """One series in the data, so one tooltip row."""
         viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geography_short_labels == ["7", "7"]
+        assert viz.geography_short_labels == ["7"]
 
     def test_raster_coordinates_are_kept(self):
         """There's no ID to fall back on, so dropping the coordinate would leave nothing."""
@@ -172,7 +182,8 @@ class TestGeographyShortLabels:
 
 
 class TestDataSourceParse:
-    """Vega-Lite needs the CSV field types up front; a coordinate label is not a number."""
+    """Vega-Lite needs the CSV field types up front; a raster grid's coordinate label is not
+    a number, but a vector grid's cell ID always is."""
 
     @pytest.fixture
     def viz(self):
@@ -185,8 +196,9 @@ class TestDataSourceParse:
     def test_vector_ids_are_parsed_as_numbers(self, viz):
         assert self._parse(viz, geography="1,2")["geography"] == "number"
 
-    def test_vector_coordinates_are_left_as_strings(self, viz):
-        assert "geography" not in self._parse(viz, geography="-91.5,29.5")
+    def test_vector_coordinates_are_parsed_as_numbers_too(self, viz):
+        """They come back as the cell IDs they resolved to."""
+        assert self._parse(viz, geography="-91.5,29.5")["geography"] == "number"
 
     def test_an_unfiltered_vector_grid_is_parsed_as_numbers(self, viz):
         assert self._parse(viz)["geography"] == "number"

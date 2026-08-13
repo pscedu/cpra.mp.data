@@ -101,15 +101,12 @@ class Dataset(LazyFrameSource):
         filter_dimensions: FilterDimensions,
         options: Options,
         base_path=None,
-        relabel_geography=False,
     ):
         self.dataset_dimensions = dataset_dimensions
         self.filter_dimensions = filter_dimensions
         self.options = options
-        self.relabel_geography = relabel_geography
         self.dataset_bounds = None
         self.geography_ids = None
-        self.geography_labels = None
         self.summarize_geography_ids = None
         self.raster_groups = None
 
@@ -198,51 +195,22 @@ class Dataset(LazyFrameSource):
         against the grid's geometry. Coordinates that don't fall inside any polygon are
         dropped rather than erroring.
 
-        Sets `geography_labels` to one `(label, grid cell ID)` pair per geography that
-        matched, in request order, and `geography_ids` to the distinct IDs among them.
-        The two differ when several coordinates land in the same cell: the cell can only
-        be selected once, since IDs double as column names, but each coordinate still
-        gets its own labeled copy in `_apply_geography_labels`.
+        Either way the result is reported under grid cell IDs, never the coordinates that
+        selected them: a vector geography *is* its ID, and IDs double as column names here.
+        Several coordinates landing in one cell therefore select it once.
         """
         values = unpack_values(self.options.geography, "geography")
 
         if all(value.isdigit() for value in values):
             # TODO: Validate that the given IDs fall within the grid min and max.
-            self.geography_labels = [(value, value) for value in values]
+            geography_ids = values
         else:
             lngs, lats = _parse_coordinate_pairs(values)
             resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
-            self.geography_labels = [
-                (f"{lng!s},{lat!s}", str(geo_id))
-                for lng, lat, geo_id in zip(lngs, lats, resolved)
-                if geo_id is not None
-            ]
+            geography_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
 
-        self.geography_ids = list(dict.fromkeys(geo_id for _, geo_id in self.geography_labels))
+        self.geography_ids = list(dict.fromkeys(geography_ids))
         self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
-
-    def _apply_geography_labels(self):
-        """Relabel geography-filtered columns from resolved grid cell IDs back to the
-        caller's original coordinate strings, for datasets queried by lat/lng.
-
-        Runs while the frame is still wide, so this only ever has to rename columns: the
-        unpivot that follows carries the labels into the `geography` column for free, and
-        two coordinates that resolved to the same cell each get their own copy of it.
-
-        Skipped when `summarize_by` has already collapsed the geography columns into
-        destination zone columns, and for the tile responses, which match `geography_ids`
-        against real pmtile feature IDs and so have to stay ID-keyed — hence the opt-in
-        `relabel_geography`.
-        """
-        if self.options.summarize_by is not None or not self.geography_labels:
-            return
-        if all(label == geo_id for label, geo_id in self.geography_labels):
-            return
-
-        self.lf = self.lf.select(
-            cs.exclude(*self.geography_ids),
-            *[pl.col(geo_id).alias(label) for label, geo_id in self.geography_labels],
-        )
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
@@ -349,8 +317,6 @@ class Dataset(LazyFrameSource):
             await self._apply_transform_params_raster()
         else:
             self._apply_transform_params_vector()
-        if self.relabel_geography:
-            self._apply_geography_labels()
         self._apply_unpivot_param()
 
     def _validate_summarize_params(self):
@@ -579,9 +545,7 @@ class Dataset(LazyFrameSource):
         # Estimate columns.
         columns = None
         if self.geography_ids is not None:
-            # Relabeling fans a shared grid cell back out to one column per coordinate, so
-            # the labels, not the distinct IDs, are what the response is that wide.
-            columns = len(self.geography_labels if self.relabel_geography else self.geography_ids)
+            columns = len(self.geography_ids)
         else:
             grid = GRIDS[self.dataset_dimensions.grid]
             columns = getattr(grid, "id_count", None)

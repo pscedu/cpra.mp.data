@@ -92,37 +92,37 @@ class TestVectorData:
 
     def test_geography_accepts_a_coordinate_pair(self, client, vector_data, ecoregion_geometry):
         """geography= on a vector grid also accepts lat/lng, resolved via the grid's
-        FlatGeoBuf geometry and reported back under the caller's original coordinate."""
+        FlatGeoBuf geometry and reported back under the grid cell ID it resolved to."""
         label = _lng_lat(500500, 3300500)
 
         response = client.get(f"{VECTOR_URL}/data.csv?geography={label}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert label in df.columns
+        assert "1" in df.columns
+        assert label not in df.columns
 
     def test_unpivot(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&geography=1")
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"geography", "value"} <= set(df.columns)
 
-    def test_unpivot_reports_coordinates_in_the_geography_column(
+    def test_unpivot_reports_cell_ids_for_a_coordinate_selection(
         self, client, vector_data, ecoregion_geometry
     ):
-        """The shape every visualization requests: unpivoted, so the caller's coordinate
-        has to come back as a `geography` value rather than a column name."""
+        """The shape every visualization requests: unpivoted, and still keyed by ID, so the
+        caller can join it against anything else the vector grid keys that way."""
         label = _lng_lat(500500, 3300500)
 
         response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&geography={label}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["geography"].unique().to_list() == [label]
+        assert df["geography"].unique().to_list() == [1]
 
-    def test_coordinates_sharing_a_cell_are_reported_separately(
+    def test_coordinates_sharing_a_cell_report_it_once(
         self, client, vector_data, ecoregion_geometry
     ):
-        """Every requested coordinate gets a row, even when two of them resolve to the same
-        grid cell — the visualizations index their tooltips by request position, so a
-        missing row would render as NaN rather than the shared cell's value."""
+        """Two coordinates in one cell describe one series — there's a single value, so
+        reporting it twice under one ID would only be ambiguous."""
         first, second = _lng_lat(500400, 3300400), _lng_lat(500600, 3300600)
 
         response = client.get(
@@ -130,10 +130,7 @@ class TestVectorData:
         )
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert dict(zip(df["geography"], df["value"])) == {
-            first: pytest.approx(2030.01),
-            second: pytest.approx(2030.01),
-        }
+        assert dict(zip(df["geography"], df["value"])) == {1: pytest.approx(2030.01)}
 
     def test_select(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?select=calendar_year")
@@ -313,16 +310,21 @@ class TestVisualizationEndpoints:
     def test_dataset_visualization_accepts_coordinates_on_a_vector_grid(
         self, client, vector_data, ecoregion_geometry
     ):
-        """The spec has to describe the data.csv it points at: geography labeled with the
-        caller's coordinate, and left unparsed, since a "lng,lat" label is not a number."""
+        """The spec has to describe the data.csv it points at, which reports the resolved
+        cell ID however the caller selected it — a number, whatever the request looked
+        like. The coordinate survives only as a label."""
         label = _lng_lat(500500, 3300500)
         response = client.get(
             f"{VECTOR_URL}/visualization/time-series-line.json?geography={label}&calendar_year=2030"
         )
         assert response.status_code == 200
         spec = response.json()
-        assert label in json.dumps(spec)
-        assert spec["data"]["format"]["parse"] == {"value": "number", "calendar_year": "number"}
+        assert label.replace(",", ", ") in json.dumps(spec)
+        assert spec["data"]["format"]["parse"] == {
+            "value": "number",
+            "geography": "number",
+            "calendar_year": "number",
+        }
 
     def test_time_series_line_labels_a_coordinate_with_its_grid_cell(
         self, client, vector_data, ecoregion_geometry
@@ -345,7 +347,7 @@ class TestVisualizationEndpoints:
         lookup = line["transform"][-1]
         assert lookup["lookup"] == "geography"
         assert spec["datasets"][lookup["from"]["data"]["name"]] == [
-            {"geography_idx": 0, "geography": label, "geography_label": display}
+            {"geography_idx": 0, "geography": 1, "geography_label": display}
         ]
         tooltips = spec["layer"][2]["encoding"]["tooltip"]
         assert [t["title"] for t in tooltips[1:]] == ["1: "]

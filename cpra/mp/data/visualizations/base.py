@@ -135,10 +135,9 @@ class BaseVisualization:
 
         if parse is None:
             parse = {"value": "number"}
-            # A vector grid reports geography as numeric grid cell IDs, except when the
-            # caller selected cells by coordinate — then the API labels them with the
-            # original "lng,lat" strings, which have to stay strings here to match.
-            if GRIDS[grid].grid_type == "vector" and is_geography_ids(kwargs.get("geography")):
+            # A vector grid reports geography as numeric grid cell IDs however the caller
+            # asked for it; a raster grid reports the "lng,lat" string it was given.
+            if GRIDS[grid].grid_type == "vector":
                 parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
             parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
@@ -222,12 +221,13 @@ class DatasetVisualization(BaseVisualization):
     def _geographies(self):
         """One `(API geography key, label, short label)` triple per selected geography.
 
-        The API reports a coordinate-selected geography under a `"lng,lat"` string built
-        from the parsed floats, so round-trip the tokens through `float` here to match it
-        (`-91` in the request becomes `-91.0` in the response). Labeling a vector-grid
-        coordinate means resolving it to a cell the same way the data endpoint does; a
-        coordinate outside the grid is dropped, as it is there, so no legend entry or
-        tooltip slot is left with nothing behind it.
+        A raster grid is keyed by the coordinate itself, reported as a `"lng,lat"` string
+        built from the parsed floats — so round-trip the tokens through `float` to match
+        it (`-91` in the request becomes `-91.0` in the response). A vector grid is always
+        keyed by grid cell ID, whichever way the caller asked for it, so a coordinate has
+        to be resolved to a cell the same way the data endpoint does. That also means a
+        coordinate outside the grid drops out, as it does there, and coordinates sharing a
+        cell collapse into the one series the response actually carries.
         """
         geography = self.params["geography"]
 
@@ -237,10 +237,9 @@ class DatasetVisualization(BaseVisualization):
 
         coords = [float(token) for token in geography_tokens(geography)]
         pairs = list(zip(coords[::2], coords[1::2]))
-        keys = [f"{lng!s},{lat!s}" for lng, lat in pairs]
 
         if self.grid.grid_type != "vector":
-            return [(key, f"({lng}, {lat})", f"({lng}, {lat})") for key, (lng, lat) in zip(keys, pairs)]
+            return [(f"{lng!s},{lat!s}", f"({lng}, {lat})", f"({lng}, {lat})") for lng, lat in pairs]
 
         # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
         # a notebook that only builds specs shouldn't need either. Same reason map.py
@@ -248,11 +247,14 @@ class DatasetVisualization(BaseVisualization):
         from cpra.mp.data.api.geography import resolve_vector_geography_sync
 
         ids = resolve_vector_geography_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
-        return [
-            (key, f"{geo_id} ({lng}, {lat})", str(geo_id))
-            for key, (lng, lat), geo_id in zip(keys, pairs, ids)
-            if geo_id is not None
-        ]
+
+        geographies = {}
+        for (lng, lat), geo_id in zip(pairs, ids):
+            # First coordinate wins a shared cell: the response has one series for it, so a
+            # second entry would be a legend key the data never matches.
+            if geo_id is not None and geo_id not in geographies:
+                geographies[geo_id] = (geo_id, f"{geo_id} ({lng}, {lat})", str(geo_id))
+        return list(geographies.values())
 
     @cached_property
     def time_column(self):
