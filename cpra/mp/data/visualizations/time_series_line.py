@@ -47,8 +47,14 @@ class TimeSeriesLine(DatasetVisualization):
         compare_choices = list(itertools.product(*compare_dimensions.values()))
         compare_choice_indices = list(itertools.product(*[range(len(v)) for v in compare_dimensions.values()]))
 
-        chart_height = max(self.height - (222 if is_daily else 86), 50)
-        chart_width = max(self.width - 200, 50)
+        # `size_to_container` (see base.py) reinterprets width/height as the total
+        # container size and lets Vega-Lite's autosize give the leftover to the plot area
+        # after measuring real axis/title/legend chrome, so no chrome allowance is guessed
+        # here. The daily/vconcat branch is the exception: autosize only fits width for a
+        # vconcat spec, so the summary strip's 60px plus a fixed allowance still has to be
+        # subtracted from height by hand.
+        chart_width = self.width
+        chart_height = max(self.height - 222, 50) if is_daily else self.height
 
         nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
@@ -152,4 +158,4 @@ class TimeSeriesLine(DatasetVisualization):
             )
             viz = viz & summary_line
 
-        return viz
+        return self.size_to_container(viz, is_concat=is_daily)

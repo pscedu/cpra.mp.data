@@ -87,8 +87,13 @@ class SedimentDynamics(BaseVisualization):
 
     def chart(self):
         """Build the visualization using Altair."""
-        chart_height = max(self.height - 86, 50)
-        chart_width = max(self.width - 220, 50)
+        # `size_to_container` (see base.py) reinterprets width/height as the total
+        # container size and lets Vega-Lite's autosize give the leftover to the plot area
+        # after measuring real axis/title/legend chrome, so no chrome allowance is guessed
+        # here — this chart is a single layered view, so the full container size is passed
+        # straight through.
+        chart_width = self.width
+        chart_height = self.height
 
         lnd_type_chart = self._lnd_type_chart()
         meter_chart = self._line_chart(self.meter_variables, self.meter_colors)
@@ -126,7 +131,7 @@ class SedimentDynamics(BaseVisualization):
             .add_params(nearest)
         )
 
-        return (
+        chart = (
             alt.layer(
                 lnd_type_chart,
                 alt.layer(meter_chart, meter_points_chart, rule_chart),
@@ -135,3 +140,4 @@ class SedimentDynamics(BaseVisualization):
             .resolve_scale(y="independent", color="independent")
             .properties(title="Sediment Dynamics", width=chart_width, height=chart_height)
         )
+        return self.size_to_container(chart)

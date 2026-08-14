@@ -156,6 +156,43 @@ class BaseVisualization:
             title=DIMENSIONS[time_column].label,
         )
 
+    def size_to_container(self, chart, is_concat: bool = False):
+        """Size a finished chart to exactly fill `self.width` x `self.height` (the frontend's
+        container), whatever room the axes/title/legend end up taking.
+
+        In Vega-Lite, a mark's `width`/`height` describe the plotting area only — the
+        rendered SVG is that area plus the surrounding chrome, so a naive `.properties(width=,
+        height=)` on the container size leaves the chrome to overflow it. `autosize`'s `fit`
+        mode reinterprets `width`/`height` as the *total* size instead and shrinks the
+        plotting area to make room, which is exactly what's wanted here since it measures real
+        text metrics rather than guessing at legend width the way this code used to.
+
+        `fit` only works for single or layered views, though — Vega-Lite rejects it on a
+        vconcat spec (warns and silently falls back to `pad`, which overflows again exactly
+        like the bug this is fixing). `fit-x` is the documented workaround: it fits the width
+        only, which vconcat does support, and is enough on its own because concat's overflow
+        here only ever came from the legend pushing the width out — the height side of a
+        concat spec still has to be sized by hand (see the `- 222` arithmetic in
+        `TimeSeriesLine`/`StackedBar` for the daily/vconcat branch). Don't "simplify" this back
+        to `fit` for a concat chart; it will silently stop being honored.
+
+        A top-level vconcat spec has no `width`/`height` property at all in the Vega-Lite
+        schema — sizing there comes entirely from each concatenated child's own `width`/
+        `height` (set where the child is built, e.g. `chart_width`/`chart_height` in
+        `TimeSeriesLine`/`StackedBar`). So for a concat chart this method only sets
+        `autosize`; `fit-x` then stretches each child's plotting area so the child's own
+        declared width is honored as a total rather than a plot-area-only size, the same
+        way `fit` does for a single/layered chart's top-level width.
+
+        Apply this to the final, top-level chart object only (e.g. after a `&` concat) — a
+        nested/intermediate layer's `properties(width=, height=)` is what actually gets fit,
+        and putting autosize somewhere other than the top level has no effect.
+        """
+        autosize = alt.AutoSizeParams(type="fit-x" if is_concat else "fit", contains="padding")
+        if is_concat:
+            return chart.properties(autosize=autosize)
+        return chart.properties(width=self.width, height=self.height, autosize=autosize)
+
     @property
     def spec(self):
         """Get the Vega-Lite specification."""
