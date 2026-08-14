@@ -9,9 +9,11 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.api.catalog import CatalogQuery
+from cpra.mp.data.api.crosswalk import Crosswalk
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     Compression,
+    CrosswalkQuery,
     DataQuery,
     DatasetDimensions,
     Dimension,
@@ -30,6 +32,7 @@ from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
+from cpra.mp.data.api.types import Grid as GridName
 from cpra.mp.data.api.utils import (
     get_visualization_class,
     validate_compression,
@@ -143,6 +146,20 @@ def grids() -> list[Grid]:
         )
         for grid in GRIDS.values()
     ]
+
+
+@app.get("/v1/grids/{source_grid}/crosswalk.{format}", tags=["Catalog"])
+async def get_crosswalk(
+    source_grid: GridName,
+    format: DataFormat,
+    query: Annotated[CrosswalkQuery, Query()],
+):
+    compression = query.compression
+    validate_compression(compression, format)
+    validate_format(format, OutputType.vector)
+    crosswalk = Crosswalk(source_grid.value, query.geography, query.to_grid)
+    source = LazyFrameSource((await crosswalk.execute()).lazy())
+    return PolarsStreamingResponse(source, format, compression, collect_in_memory=True)
 
 
 @app.get("/v1/legends.json", tags=["Catalog"])

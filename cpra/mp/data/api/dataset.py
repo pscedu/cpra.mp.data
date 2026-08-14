@@ -13,14 +13,17 @@ from fastapi import HTTPException
 from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
-from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform, transform_bounds
+from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.api.geography import resolve_vector_geography
+from cpra.mp.data.api.geography import (
+    parse_coordinate_pairs,
+    project_coordinates,
+    resolve_vector_geography,
+)
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import OutputType
@@ -51,31 +54,6 @@ RASTER_AGGREGATES = {
     "min": (np.minimum, np.inf),
     "sum": (np.add, 0.0),
 }
-
-
-def _parse_coordinate_pairs(values):
-    """Parse a flat list of strings into (lngs, lats), validating that every value is
-    numeric, that there's an even count, and that each pair is a valid WGS84 coordinate.
-    """
-    try:
-        coords = [float(value) for value in values]
-    except ValueError:
-        raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
-
-    if len(coords) % 2:
-        raise HTTPException(status_code=400, detail="geography contain an even number of coordinates")
-
-    lngs = []
-    lats = []
-    for start_idx in range(0, len(coords), 2):
-        lng, lat = coords[start_idx : start_idx + 2]
-        if abs(lng) > 180 or abs(lat) > 90:
-            msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
-            raise HTTPException(status_code=400, detail=msg)
-        lngs.append(lng)
-        lats.append(lat)
-
-    return lngs, lats
 
 
 def _get_zone_segments(zones, zone_ids):
@@ -205,7 +183,7 @@ class Dataset(LazyFrameSource):
             # TODO: Validate that the given IDs fall within the grid min and max.
             geography_ids = values
         else:
-            lngs, lats = _parse_coordinate_pairs(values)
+            lngs, lats = parse_coordinate_pairs(values)
             resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
             geography_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
 
@@ -214,15 +192,13 @@ class Dataset(LazyFrameSource):
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
-        lngs, lats = _parse_coordinate_pairs(unpack_values(self.options.geography, "geography"))
+        lngs, lats = parse_coordinate_pairs(unpack_values(self.options.geography, "geography"))
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
         df = self.materialize()
         with ExitStack() as stack:
             datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
-            src_crs = CRS.from_epsg(4326)
-            dst_crs = datasets[0].crs
-            projected_pairs = list(zip(*transform(src_crs, dst_crs, lngs, lats)))
+            projected_pairs = list(zip(*project_coordinates(lngs, lats, datasets[0].crs)))
             samples = await parallel_sample_rasters(datasets, projected_pairs)
 
         # Add the resulting values to the LazyFrame, and remove the path column.

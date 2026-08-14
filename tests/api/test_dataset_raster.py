@@ -106,7 +106,9 @@ class TestGeographySampling:
         assert excinfo.value.status_code == 400
         assert "even number of coordinates" in excinfo.value.detail
 
-    @pytest.mark.parametrize("geography", ["181.0,29.5", "-91.0,91.0", "-200.0,-100.0"])
+    @pytest.mark.parametrize(
+        "geography", ["181.0,29.5", "-91.0,91.0", "-200.0,-100.0", "nan,nan"]
+    )
     async def test_out_of_range_coordinates_raise_400(
         self, dataset_factory, raster_data, geography
     ):
@@ -115,6 +117,14 @@ class TestGeographySampling:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "invalid coordinate pair" in excinfo.value.detail
+
+    async def test_unprojectable_coordinates_raise_400(self, dataset_factory, raster_data):
+        """A pair can be valid WGS84 and still have no place in the grid's UTM zone."""
+        dataset = dataset_factory(DIMENSIONS, geography="0,0")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "outside the grid's projection" in excinfo.value.detail
 
 
 class TestCalculateStage:
