@@ -20,7 +20,7 @@ from shapely.geometry import Point, Polygon, box
 
 from cpra.mp.data.api import crosswalk as crosswalk_module
 from cpra.mp.data.api.crosswalk import Crosswalk
-from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.grids import GRIDS, WGS84
 
 from tests.factories import write_grid_geometry, write_raster_crosswalk, write_vector_crosswalk
 
@@ -120,6 +120,17 @@ class TestDestinationGrids:
             "ecoregion_v001",
             "morph_pixel_v001",
             "morph_pixel_v002",
+            "veg_grid_cell_v002",
+        ]
+
+    def test_wgs84_reaches_the_grids_that_can_place_a_coordinate(self, vector_geometry):
+        """A vector grid whose polygons are on hand, and every raster grid, whose values
+        are at the coordinate itself. Neither is discovered from a crosswalk file."""
+        assert Crosswalk(WGS84.name).destination_grids == [
+            VECTOR_GRID,
+            "morph_pixel_v001",
+            "morph_pixel_v002",
+            "veg_grid_cell_v001",
             "veg_grid_cell_v002",
         ]
 
@@ -302,6 +313,82 @@ class TestRasterToRaster:
         assert df.select("dst_lng", "dst_lat").rows() == [(-80.0, 40.0)]
 
 
+class TestWGS84ToVector:
+    """Coordinates as source geographies, resolved from the destination grid's polygons.
+
+    The lookup is the data API's own, so a coordinate converts to the geography whose data
+    it selects — which is what a caller matching a chart to a map depends on, and what
+    sampling a zone raster only approximates.
+    """
+
+    def _crosswalk(self, *points, to_grid=None):
+        geography = _geography(*points, grid_name=VECTOR_GRID)
+        return Crosswalk(WGS84.name, geography=geography, to_grid=to_grid or [VECTOR_GRID])
+
+    async def test_a_coordinate_becomes_the_geography_containing_it(self, vector_geometry):
+        df = await self._crosswalk((500500, 3300500)).execute()
+        assert df["dst_id"].to_list() == [1]
+
+    async def test_the_coordinate_is_reported_as_the_source(self, vector_geometry):
+        """There is no source ID to report: the coordinate is the source geography."""
+        point = (500500, 3300500)
+        df = await self._crosswalk(point).execute()
+        lng, lat = _lng_lat(*point, grid_name=VECTOR_GRID)
+        assert df.select("src_id", "src_lng", "src_lat").rows() == [(None, lng, lat)]
+
+    async def test_every_coordinate_gets_its_own_row(self, vector_geometry):
+        """Two coordinates in one geography are two rows, so that every coordinate asked
+        about is answered for by name rather than by its place in the results."""
+        points = [(500400, 3300400), (500600, 3300600)]
+        df = await self._crosswalk(*points).execute()
+        assert df.select("src_lng", "src_lat", "dst_id").rows() == [
+            (*_lng_lat(*point, grid_name=VECTOR_GRID), 1) for point in points
+        ]
+
+    async def test_a_coordinate_outside_every_geography_is_left_out(self, vector_geometry):
+        """A point in the gap between compartment 2's arms: inside the bounding box the
+        geometry file is indexed by, outside the polygon itself."""
+        gap = (601500, 3302000)
+        assert not _u_shape(600000, 3300000).contains(Point(*gap))
+        assert (await self._crosswalk(gap).execute()).height == 0
+
+    async def test_a_repeated_coordinate_is_converted_once(self, vector_geometry):
+        point = (500500, 3300500)
+        assert (await self._crosswalk(point, point).execute()).height == 1
+
+    async def test_an_integer_is_a_coordinate_rather_than_an_id(self, vector_geometry):
+        """A vector source reads a whole number as a cell ID, but `wgs84` has no cells to
+        name — every value it takes is part of a location."""
+        crosswalk = Crosswalk(WGS84.name, geography="-91,30", to_grid=[VECTOR_GRID])
+        await crosswalk.execute()
+        assert crosswalk.source_ids is None
+        assert crosswalk.source_coordinates == [(-91.0, 30.0)]
+
+    async def test_geography_is_required(self, vector_geometry):
+        """There is nothing to convert without one: the coordinates are the geographies."""
+        crosswalk = Crosswalk(WGS84.name, to_grid=[VECTOR_GRID])
+        with pytest.raises(HTTPException) as excinfo:
+            await crosswalk.execute()
+        assert excinfo.value.status_code == 400
+        assert "geography is required for coordinate grid: wgs84" in excinfo.value.detail
+
+    async def test_a_missing_geometry_file_is_a_400(self, geometry_path):
+        crosswalk = self._crosswalk((500500, 3300500), to_grid=["parish_v2020"])
+        with pytest.raises(HTTPException) as excinfo:
+            await crosswalk.execute()
+        assert excinfo.value.status_code == 400
+        assert "No geometry file for grid: parish_v2020" in excinfo.value.detail
+
+    async def test_a_raster_destination_returns_the_coordinate_unchanged(self, geometry_path):
+        """The same conversion a raster source makes to a raster grid: the coordinate is
+        already the geography, and no geometry is read to say so."""
+        crosswalk = Crosswalk(WGS84.name, geography="-91.5,29.5", to_grid=[RASTER_GRID])
+        df = await crosswalk.execute()
+        assert df.select("src_lng", "src_lat", "dst_lng", "dst_lat").rows() == [
+            (-91.5, 29.5, -91.5, 29.5)
+        ]
+
+
 class TestOutputTable:
     """One table for several destinations, so every column has to hold every conversion."""
 
@@ -353,7 +440,14 @@ class TestOutputTable:
         raster_source = Crosswalk(
             RASTER_GRID, geography=_geography(NORTH), to_grid=["ecoregion_v001", "morph_pixel_v001"]
         )
-        assert (await vector_source.execute()).schema == (await raster_source.execute()).schema
+        wgs84_source = Crosswalk(
+            WGS84.name,
+            geography=_geography((500500, 3300500), grid_name=VECTOR_GRID),
+            to_grid=[VECTOR_GRID, "morph_pixel_v001"],
+        )
+        schema = (await vector_source.execute()).schema
+        assert (await raster_source.execute()).schema == schema
+        assert (await wgs84_source.execute()).schema == schema
 
 
 class TestParallelConversion:
@@ -455,6 +549,27 @@ class TestCrosswalkEndpoint:
         )
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["dst_id"].to_list() == [1]
+
+    def test_wgs84_is_a_source_grid(self, client, vector_geometry):
+        """The one source that isn't a grid of the model's, so the route has to accept a
+        name that the grid catalog doesn't list."""
+        response = self._get(
+            client,
+            WGS84.name,
+            format="ndjson",
+            geography=_geography((500500, 3300500), grid_name=VECTOR_GRID),
+            to_grid=VECTOR_GRID,
+        )
+        assert response.status_code == 200
+        df = pl.read_ndjson(io.BytesIO(response.content))
+        assert df.columns == COLUMNS
+        assert df["dst_id"].to_list() == [1]
+
+    def test_wgs84_is_not_a_destination_grid(self, client, vector_crosswalk):
+        """Nothing to convert to: a destination coordinate is what a raster grid already
+        reports."""
+        response = self._get(client, VECTOR_GRID, geography="1", to_grid=WGS84.name)
+        assert response.status_code == 422
 
     def test_an_unknown_grid_is_rejected(self, client, vector_crosswalk):
         assert self._get(client, "not_a_grid", geography="1").status_code == 422

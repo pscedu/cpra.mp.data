@@ -7,6 +7,12 @@ The two conversions those files don't cover are derived from the grids themselve
 vector to raster from the source polygon's point on surface, and raster to raster from the
 coordinate itself, which names a location rather than a cell and so needs no translation.
 
+The `wgs84` pseudo-grid adds a fifth conversion, and is the one source a caller can name that
+isn't a grid at all: its geographies are the request's own coordinates, converted to a vector
+grid's cells from that grid's polygons. It answers the same question a raster source does,
+but from the polygons rather than from a rasterization of them — so a coordinate crosswalks
+to the geography whose data the data API selects for it, both having resolved it the same way.
+
 The result keeps the crosswalk tables' own columns, plus a `dst_grid` column naming the
 grid each row converts to, since one response can carry several destinations. A geography
 is spelled by ID on a vector grid and by coordinate on a raster one, so each side gets a
@@ -28,11 +34,16 @@ from cpra.mp.data.api.geography import (
     resolve_vector_geography,
 )
 from cpra.mp.data.api.utils import unpack_values
-from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.grids import GRIDS, WGS84
 
 # Every conversion outside the vector-to-vector crosswalk tables maps a geography to
 # exactly one other geography, which is what the tables spell as a whole scale factor.
 WHOLE = 1
+
+# The grid types whose geographies are named by coordinate rather than by ID: a raster
+# grid, whose cells have no IDs to name them by, and the WGS84 pseudo-grid, whose
+# geographies are the coordinates.
+COORDINATE_GRID_TYPES = {"raster", WGS84.grid_type}
 
 # The columns naming the two geographies a row converts between, in output order. A
 # conversion populates only the ones its grids use and leaves the rest null.
@@ -55,13 +66,13 @@ class Crosswalk:
     """Convert one grid's geographies into one or more other grids' geographies."""
 
     def __init__(self, source_grid: str, geography: str | None = None, to_grid: list[str] | None = None):
-        self.grid = GRIDS[source_grid]
+        self.grid = WGS84 if source_grid == WGS84.name else GRIDS[source_grid]
         self.geography = geography
         self.destination_grids = self._get_destination_grids(to_grid)
 
         # Exactly one of these is filled in by `_resolve_source`, according to how the
-        # source grid identifies a geography: a vector grid by ID, a raster grid by
-        # coordinate. A vector grid may also leave `source_ids` None, meaning every
+        # source grid identifies a geography: a vector grid by ID, a raster or WGS84 grid
+        # by coordinate. A vector grid may also leave `source_ids` None, meaning every
         # geography in the grid.
         self.source_ids = None
         self.source_coordinates = None
@@ -86,6 +97,13 @@ class Crosswalk:
         if self.grid.grid_type == "raster":
             names |= {name for name, grid in GRIDS.items() if grid.grid_type == "raster"}
 
+        if self.grid is WGS84:
+            # A coordinate reaches every grid that can say where it falls: a vector grid
+            # whose polygons are on hand to contain it, and every raster grid, each of
+            # which holds a value at the coordinate itself.
+            names |= {path.stem for path in config.GEOMETRY_PATH.glob("*.fgb")}
+            names |= {name for name, grid in GRIDS.items() if grid.grid_type == "raster"}
+
         names &= set(GRIDS)
         names -= {self.grid.name}
         if not names:
@@ -107,12 +125,12 @@ class Crosswalk:
 
         A vector grid accepts either, on the same terms as the data API's geography
         filter: IDs only when every value is a plain unsigned integer, otherwise
-        coordinate pairs resolved to the geographies containing them. A raster grid
-        accepts only coordinate pairs, and requires them — there is no enumerable set of
-        pixels to convert in their absence.
+        coordinate pairs resolved to the geographies containing them. A raster or WGS84
+        grid accepts only coordinate pairs, and requires them — neither has an enumerable
+        set of geographies to convert in their absence.
         """
-        if self.grid.grid_type == "raster" and not self.geography:
-            msg = f"geography is required for raster grid: {self.grid.name}"
+        if self.grid.grid_type in COORDINATE_GRID_TYPES and not self.geography:
+            msg = f"geography is required for {self.grid.grid_type} grid: {self.grid.name}"
             raise HTTPException(status_code=400, detail=msg)
 
         if not self.geography:
@@ -125,7 +143,7 @@ class Crosswalk:
             return
 
         lngs, lats = parse_coordinate_pairs(values)
-        if self.grid.grid_type == "raster":
+        if self.grid.grid_type in COORDINATE_GRID_TYPES:
             self.source_coordinates = list(dict.fromkeys(zip(lngs, lats)))
             return
 
@@ -222,8 +240,31 @@ class Crosswalk:
         src_lngs, src_lats, dst_ids = _columns(matched, 3)
         return self._frame(src_lng=src_lngs, src_lat=src_lats, dst_id=dst_ids)
 
-    def _raster_to_raster(self):
-        """Convert coordinates between raster grids, which leaves them unchanged: a raster
+    async def _wgs84_to_vector(self, dst_grid_name):
+        """Convert coordinates to the geographies containing them, from the destination
+        grid's own polygons.
+
+        This is the same point-in-polygon lookup the data API's geography filter makes, so
+        a coordinate converts to the geography whose data it selects. Sampling a zone
+        raster the way a raster source does answers from a rasterization of those polygons
+        instead, which puts the boundaries within a pixel of where they are and leaves the
+        polygons it doesn't cover out altogether.
+
+        The points are resolved concurrently by `resolve_vector_geography`, so unlike the
+        conversions that read a whole file this one is awaited rather than run in a thread.
+        """
+        lngs, lats = zip(*self.source_coordinates)
+        resolved = await resolve_vector_geography(dst_grid_name, list(lngs), list(lats))
+        matched = [
+            (lng, lat, geography_id)
+            for (lng, lat), geography_id in zip(self.source_coordinates, resolved)
+            if geography_id is not None
+        ]
+        src_lngs, src_lats, dst_ids = _columns(matched, 3)
+        return self._frame(src_lng=src_lngs, src_lat=src_lats, dst_id=dst_ids)
+
+    def _coordinates_to_raster(self):
+        """Convert coordinates to a raster grid, which leaves them unchanged: a raster
         geography is the location itself, and every raster grid holds a value there."""
         lngs, lats = _columns(self.source_coordinates, 2)
         return self._frame(src_lng=lngs, src_lat=lats, dst_lng=lngs, dst_lat=lats)
@@ -233,12 +274,14 @@ class Crosswalk:
 
         The two conversions that read a crosswalk file do it in a thread, so that a request
         naming several destinations reads their files at once rather than one after the
-        other. The other two work from what is already in memory and would only pay the
-        thread's overhead.
+        other. The rest either work from what is already in memory, and would only pay the
+        thread's overhead, or spread their own reads across the executor.
         """
-        if self.grid.grid_type == "raster":
+        if self.grid.grid_type in COORDINATE_GRID_TYPES:
             if GRIDS[dst_grid_name].grid_type == "raster":
-                return self._raster_to_raster()
+                return self._coordinates_to_raster()
+            if self.grid is WGS84:
+                return await self._wgs84_to_vector(dst_grid_name)
             return await asyncio.to_thread(self._raster_to_vector, dst_grid_name)
 
         if GRIDS[dst_grid_name].grid_type == "raster":
@@ -252,7 +295,7 @@ class Crosswalk:
         the geometry file here means reading it once for the request rather than racing
         several conversions to read it apiece.
         """
-        if self.grid.grid_type == "raster":
+        if self.grid.grid_type in COORDINATE_GRID_TYPES:
             return
         if not any(GRIDS[name].grid_type == "raster" for name in self.destination_grids):
             return

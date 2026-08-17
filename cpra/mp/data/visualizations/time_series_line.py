@@ -9,7 +9,6 @@ import polars as pl
 
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.visualizations.base import DatasetVisualization
-from cpra.mp.data.visualizations.colors import MAP_SELECTION
 
 
 class TimeSeriesLine(DatasetVisualization):
@@ -72,9 +71,12 @@ class TimeSeriesLine(DatasetVisualization):
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
             .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
+            # Each series is colored as the map colors the geography it draws, rather than by
+            # its position in the legend — see `geography_colors`, which is why the palette
+            # isn't handed over whole.
             alt.Color("geography_label:N")
             .title(self.grid.label)
-            .scale(domain=self.geography_labels, range=MAP_SELECTION),
+            .scale(domain=self.geography_labels, range=self.geography_colors),
         ] + [
             compare_channels[i](f"{dimension}:N").title(DIMENSIONS[dimension].label)
             for i, dimension in enumerate(compare_dimensions.keys())

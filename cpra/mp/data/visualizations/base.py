@@ -8,6 +8,7 @@ from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns
 from cpra.mp.data.variables import VARIABLES
+from cpra.mp.data.visualizations.colors import selection_color
 
 
 def geography_tokens(geography):
@@ -228,7 +229,7 @@ class DatasetVisualization(BaseVisualization):
         will actually equal, so they're what a scale domain or a lookup key has to match —
         see `geography_labels` for what to show the reader instead.
         """
-        return [geography for geography, _, _ in self._geographies]
+        return [geography for geography, _, _, _ in self._geographies]
 
     @cached_property
     def geography_labels(self):
@@ -239,7 +240,7 @@ class DatasetVisualization(BaseVisualization):
         the cell it landed in, since the cell — not the point — is what the values describe:
         `24`, `24 (-90.49, 30.01)`, or `(-90.49, 30.01)` on a raster grid.
         """
-        return [label for _, label, _ in self._geographies]
+        return [label for _, label, _, _ in self._geographies]
 
     @cached_property
     def geography_short_labels(self):
@@ -252,11 +253,24 @@ class DatasetVisualization(BaseVisualization):
         to show. Two coordinates inside one cell therefore share a short label; the legend is
         what tells them apart.
         """
-        return [short_label for _, _, short_label in self._geographies]
+        return [short_label for _, _, short_label, _ in self._geographies]
+
+    @cached_property
+    def geography_colors(self):
+        """Get the color the map draws each selected geography with, in the same order.
+
+        A chart is read beside the map, so a geography has to carry the same color in both.
+        The map's color comes from the geography's place in the *selection*, which is not its
+        place in this list: a coordinate that fell outside the grid, or inside a cell an
+        earlier coordinate already took, is left out here and takes its color out with it.
+        Pairing the whole palette with this list positionally would instead shift every
+        series after such a coordinate onto the color of the pin before it.
+        """
+        return [color for _, _, _, color in self._geographies]
 
     @cached_property
     def _geographies(self):
-        """One `(API geography key, label, short label)` triple per selected geography.
+        """One `(API geography key, label, short label, color)` tuple per selected geography.
 
         A raster grid is keyed by the coordinate itself, reported as a `"lng,lat"` string
         built from the parsed floats — so round-trip the tokens through `float` to match
@@ -265,18 +279,24 @@ class DatasetVisualization(BaseVisualization):
         to be resolved to a cell the same way the data endpoint does. That also means a
         coordinate outside the grid drops out, as it does there, and coordinates sharing a
         cell collapse into the one series the response actually carries.
+
+        The color is the map's, and so is taken from the geography's place in the selection
+        rather than from its place in this list, which dropping and collapsing shorten.
         """
         geography = self.params["geography"]
 
         if self.grid.grid_type == "vector" and is_geography_ids(geography):
             ids = [int(token) for token in geography_tokens(geography)]
-            return [(geo_id, str(geo_id), str(geo_id)) for geo_id in ids]
+            return [(geo_id, str(geo_id), str(geo_id), selection_color(i)) for i, geo_id in enumerate(ids)]
 
         coords = [float(token) for token in geography_tokens(geography)]
         pairs = list(zip(coords[::2], coords[1::2]))
 
         if self.grid.grid_type != "vector":
-            return [(f"{lng!s},{lat!s}", f"({lng}, {lat})", f"({lng}, {lat})") for lng, lat in pairs]
+            return [
+                (f"{lng!s},{lat!s}", f"({lng}, {lat})", f"({lng}, {lat})", selection_color(i))
+                for i, (lng, lat) in enumerate(pairs)
+            ]
 
         # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
         # a notebook that only builds specs shouldn't need either. Same reason map.py
@@ -286,11 +306,12 @@ class DatasetVisualization(BaseVisualization):
         ids = resolve_vector_geography_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
 
         geographies = {}
-        for (lng, lat), geo_id in zip(pairs, ids):
+        for i, ((lng, lat), geo_id) in enumerate(zip(pairs, ids)):
             # First coordinate wins a shared cell: the response has one series for it, so a
-            # second entry would be a legend key the data never matches.
+            # second entry would be a legend key the data never matches. Its color is the
+            # first coordinate's too, which is how the map draws the cell's outline.
             if geo_id is not None and geo_id not in geographies:
-                geographies[geo_id] = (geo_id, f"{geo_id} ({lng}, {lat})", str(geo_id))
+                geographies[geo_id] = (geo_id, f"{geo_id} ({lng}, {lat})", str(geo_id), selection_color(i))
         return list(geographies.values())
 
     @cached_property

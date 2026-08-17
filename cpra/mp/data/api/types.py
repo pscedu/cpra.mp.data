@@ -2,7 +2,7 @@ from datetime import date
 from enum import Enum
 
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.grids import GRIDS
+from cpra.mp.data.grids import GRIDS, WGS84
 from cpra.mp.data.legends import LEGENDS
 
 
@@ -67,4 +67,11 @@ TimeUnit = dimension_type("time_unit")
 VectorGrid = Enum(
     "VectorGrid",
     {str(k): k for k, v in GRIDS.items() if v.grid_type == "vector"},
+)
+
+# The grids a crosswalk can convert from: every grid, plus the WGS84 pseudo-grid, which is
+# only ever a source — a coordinate is already what it converts to.
+CrosswalkGrid = Enum(
+    "CrosswalkGrid",
+    {WGS84.name: WGS84.name, **{str(k): k for k in GRIDS}},
 )

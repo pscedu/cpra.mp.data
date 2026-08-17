@@ -31,7 +31,7 @@ from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileRespo
 from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.types import DataFormat, OutputType, TileFormat
+from cpra.mp.data.api.types import CrosswalkGrid, DataFormat, OutputType, TileFormat
 from cpra.mp.data.api.types import Grid as GridName
 from cpra.mp.data.api.utils import (
     get_visualization_class,
@@ -150,7 +150,7 @@ def grids() -> list[Grid]:
 
 @app.get("/v1/grids/{source_grid}/crosswalk.{format}", tags=["Catalog"])
 async def get_crosswalk(
-    source_grid: GridName,
+    source_grid: CrosswalkGrid,
     format: DataFormat,
     query: Annotated[CrosswalkQuery, Query()],
 ):

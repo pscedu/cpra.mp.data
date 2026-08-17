@@ -5,7 +5,8 @@ has to describe that response correctly in advance: which `geography` values to 
 whether they arrive as numbers or strings. Both answers change when a vector grid is
 queried by coordinate rather than by grid cell ID, so they are pinned here. What the reader
 is *shown* is a third answer, since a coordinate names a point but the data describes the
-cell that contains it.
+cell that contains it — including which color shows it, which has to be the one the map
+drew the same geography with.
 """
 
 import pytest
@@ -18,6 +19,8 @@ from cpra.mp.data.visualizations.base import (
     geography_tokens,
     is_geography_ids,
 )
+from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
+from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 
 from tests.factories import write_grid_geometry
 
@@ -179,6 +182,76 @@ class TestGeographyShortLabels:
         """There's no ID to fall back on, so dropping the coordinate would leave nothing."""
         viz = DatasetVisualization(**ANNUAL_RASTER, geography="-91.5,29.5")
         assert viz.geography_short_labels == ["(-91.5, 29.5)"]
+
+
+class TestGeographyColors:
+    """The chart is read beside the map, so a geography has to be the same color in both.
+
+    The map colors a pin by its place in the selection and gives a cell the color of the
+    first pin inside it, while these lists hold only the geographies the data carries — so
+    a color has to follow the selection, not the list it ends up in.
+    """
+
+    def test_ids_take_the_palette_in_order(self):
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
+        assert viz.geography_colors == MAP_SELECTION[:2]
+
+    def test_raster_coordinates_take_the_palette_in_order(self):
+        viz = DatasetVisualization(**ANNUAL_RASTER, geography=_geography(INSIDE, IN_CELL_8))
+        assert viz.geography_colors == MAP_SELECTION[:2]
+
+    def test_a_shared_cell_keeps_the_first_coordinates_color(self, ecoregion_geometry):
+        """Both pins are drawn, but the cell's outline — and its one series — is the first
+        pin's color."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
+        assert viz.geography_colors == [MAP_SELECTION[0]]
+
+    def test_a_pin_sharing_a_cell_does_not_shift_the_next_cell(self, ecoregion_geometry):
+        """The bug this guards: cell 8 is the third pin, so it's the third color, even though
+        it's the second series. Pairing the palette with the series would make it cyan."""
+        viz = DatasetVisualization(
+            **ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE, IN_CELL_8)
+        )
+        assert viz.geographies == [7, 8]
+        assert viz.geography_colors == [MAP_SELECTION[0], MAP_SELECTION[2]]
+
+    def test_a_coordinate_outside_the_grid_does_not_shift_the_next_cell(self, ecoregion_geometry):
+        """It has no series and no cell outline, but it did take a pin color with it."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(OUTSIDE, IN_CELL_8))
+        assert viz.geographies == [8]
+        assert viz.geography_colors == [MAP_SELECTION[1]]
+
+    def test_colors_stay_aligned_with_geographies(self, ecoregion_geometry):
+        viz = DatasetVisualization(
+            **ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
+        )
+        assert len(viz.geography_colors) == len(viz.geographies) == 2
+
+    def test_a_selection_past_the_palette_is_drawn_black(self):
+        """As the UI draws it: the palette holds as many colors as a visualization allows
+        geographies, so past its end there is nothing left to tell them apart with."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=",".join(str(i) for i in range(12)))
+        assert viz.geography_colors[10:] == [MAP_SELECTION_OVERFLOW] * 2
+
+
+class TestTimeSeriesLineColorScale:
+    """The color scale pairs `domain` with `range` positionally, so the spec is where the
+    two lists being the same length stops being an implementation detail."""
+
+    def _color_scale(self, **kwargs):
+        spec = TimeSeriesLine(**ANNUAL_VECTOR, **kwargs).chart().to_dict()
+        return spec["layer"][0]["encoding"]["color"]["scale"]
+
+    def test_the_range_is_the_selections_colors(self, ecoregion_geometry):
+        scale = self._color_scale(geography=_geography(INSIDE, ALSO_INSIDE, IN_CELL_8))
+        assert scale["domain"] == ["7 (-91.5, 29.5)", "8 (-91.3, 29.5)"]
+        assert scale["range"] == [MAP_SELECTION[0], MAP_SELECTION[2]]
+
+    def test_the_whole_palette_is_not_handed_over(self):
+        """A range longer than the domain leaves Vega assigning colors to nothing, and hides
+        whether the two ever lined up."""
+        scale = self._color_scale(geography="1,2")
+        assert len(scale["range"]) == len(scale["domain"]) == 2
 
 
 class TestDataSourceParse:
