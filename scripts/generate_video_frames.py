@@ -1,20 +1,51 @@
 #!/usr/bin/env python3
 """
-Insert a georeferenced data raster (test_land_type_confidence_2019.tif) between the
-"initial-conditions-water" and "levee" layers of a MapLibre style, and flatten the
-whole stack (basemap-below, data, basemap-above) into a single georeferenced GeoTIFF
-on a fixed pixel grid.
+Export each layer of a video frame separately as an RGBA PNG with transparency, all on
+one fixed pixel grid. The layers are overlaid to build the composite frame downstream,
+outside this script.
 
-Pipeline:
-  1. Split the MapLibre style into an "underlay" style (background .. initial-conditions-water)
-     and an "overlay" style (levee .. label).
+Each group of layers is emitted only when the input it needs is given, so a run can
+export the basemap, the data layers, or both.
+
+Basemap layers (--basemap-style):
+  1. Split the MapLibre style into an "underlay" style (background .. water-not-in-icm)
+     and an "overlay" style (aeroway-taxiway .. label).
   2. Render each style with headless Chromium + maplibre-gl-js against the live
      basemap-vector/basemap-raster tile sources, and georeference the screenshots
      from the browser's own reported view bounds.
-  3. Reproject the underlay render, the data GeoTIFF, and the overlay render onto the
-     exact target grid (CRS/origin/pixel size/size given below) and alpha-composite
-     them in order: underlay -> data -> overlay.
-  4. Write the result as a 3-band (RGB) GeoTIFF.
+  3. Reproject both renders onto the exact target grid (CRS/origin/pixel size/size
+     given below), preserving alpha.
+  4. Write basemap_underlay.png and basemap_overlay.png.
+
+Data layers (--historic-data, the historic persistent-change raster):
+  1. Warp the categorical raster onto the same target grid, nearest neighbor by default
+     or a majority downsample with --majority.
+  2. Write historic_1932.png, the state at the start of the record: everything that later
+     changed is drawn in its pale "hasn't happened yet" color, land where the record shows
+     loss and water where it shows gain.
+  3. For each year group in HISTORIC_GROUPS, write historic_<group>.png coloring land
+     loss in that group and older groups by the group's own color, land gain in those
+     groups a single green, change newer than the group a pale gray, and everything
+     else transparent.
+  4. With --land-water-data and --baseline-land-water-data, extend the series one group
+     past the historic raster's 2015 end date: write historic_2015_2024.png, which is the
+     last historic group's image with the pixels that flipped land/water state by 2024
+     recolored. The 2015 state is the baseline raster with the historic change classes
+     burned in, so ground the historic raster never classified still gets compared. The
+     comparison runs at the historic raster's own 15 m resolution and only then gets
+     downsampled to the video grid, so the inputs are compared where they describe the
+     same ground.
+
+Confidence layers (--confidence-data, a directory of confidence rasters):
+  1. Warp each raster onto the target grid, averaging source pixels, since unlike the
+     categorical layers these hold a continuous confidence difference on [-1, 1].
+  2. Write confidence_<year>.png per raster, binning by magnitude per
+     data-input/confidence_groups.png: a transparent band around zero, then three
+     progressively darker bands, green where confidence in land is growing and blue where
+     confidence in water is.
+
+Stack the results in order — basemap_underlay, historic_<group> or confidence_<year>,
+basemap_overlay — to get one frame.
 
 Requires (installed in .venv): rasterio, numpy, Pillow, pyproj, playwright
 (+ `playwright install chromium` once). The render page (maplibre-gl loaded from
@@ -24,6 +55,7 @@ so no local maplibre-gl / node_modules install is needed.
 
 import http.server
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -56,6 +88,84 @@ TARGET_HEIGHT = 1080
 
 UNDERLAY_LAST_LAYER = "water-not-in-icm"
 OVERLAY_FIRST_LAYER = "aeroway-taxiway"
+
+# --- Historic land change classification -----------------------------------------
+# In sim_3381_persistent_change_spatial_data_092616.img (see historic_data_legend.png
+# and scripts/convert_historic_land_change.py) class values 1..19 are the "persistent
+# land loss" observation periods in chronological order, and 20..38 are the matching
+# "persistent land gain" periods. 0 is "no persistent change".
+# Loss period v spans HISTORIC_PERIOD_YEARS[v - 1] .. HISTORIC_PERIOD_YEARS[v]; the
+# corresponding gain period is class value GAIN_VALUE_OFFSET + v.
+HISTORIC_PERIOD_YEARS = [
+    1932, 1956, 1973, 1975, 1977, 1985, 1988, 1990, 1995, 1998,
+    1999, 2002, 2004, 2006, 2008, 2009, 2010, 2013, 2014, 2015,
+]  # fmt: skip
+N_HISTORIC_PERIODS = len(HISTORIC_PERIOD_YEARS) - 1  # 19
+GAIN_VALUE_OFFSET = N_HISTORIC_PERIODS
+
+# The year groups to emit one PNG per, with the loss color for each, from
+# historic_groups.png. The int is the index of the last loss period in the group, so
+# each group covers the periods after the previous group's through its own.
+HISTORIC_GROUPS = [
+    ("1932_1956", 1, "#DEF5F8"),
+    ("1956_1975", 3, "#ACE5ED"),
+    ("1975_1985", 5, "#71D6E6"),
+    ("1985_1995", 8, "#42C0D6"),
+    ("1995_2004", 12, "#4591AC"),
+    ("2004_2006", 13, "#1D6985"),
+    ("2006_2015", 19, "#004265"),
+]
+
+_group_ends = [last for _, last, _ in HISTORIC_GROUPS]
+assert _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS, (
+    f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
+)
+
+# Land gain up to and including the selected group is drawn in a single green rather
+# than per-group colors; change newer than the selected group is drawn in a pale
+# "hasn't happened yet" gray.
+PAST_GAIN_COLOR = "#265118"
+FUTURE_LOSS_COLOR = "#E4E4E4"
+FUTURE_GAIN_COLOR = "#F1F1F1"
+
+# The series opens on the state at the start of the record, before any group's change has
+# happened: every classified pixel is drawn in its "future" color.
+NO_GROUP_SELECTED = -1
+INITIAL_STATE_LABEL = str(HISTORIC_PERIOD_YEARS[0])
+
+# --- 2015-2024 land/water comparison ---------------------------------------------
+# The historic raster's period of observation ends in 2015, so the last group is
+# extended by comparing it against a 2024 land/water raster. That raster uses the
+# lnd_type classification from cpra/mp/data/structure/legends.csv: 1 Vegetated Wetland,
+# 2 Open Water, 3 Bare/Unvegetated Wetland, 4 Upland/Developed Areas, 5 Flotant Marsh.
+# Only class 2 is water; every other valid class is some form of land.
+LND_TYPE_OPEN_WATER = 2
+LAND_WATER_GROUP_LABEL = "2015_2024"
+NEW_LOSS_COLOR = "#00263B"  # land in 2015 -> water in 2024
+NEW_GAIN_COLOR = "#265118"  # water in 2015 -> land in 2024
+
+# Land/water state codes the lnd_type classes are reduced to before comparing.
+LW_UNKNOWN, LW_LAND, LW_WATER = 0, 1, 2
+
+# Synthetic class values appended to the historic classification to record the outcome of
+# the 2015-2024 comparison. Keeping the result a single categorical raster means it can be
+# downsampled to the video grid in one pass, the same way the historic classes are.
+LAND_TO_WATER_CLASS = 39
+WATER_TO_LAND_CLASS = 40
+
+# --- Land-change confidence layers -----------------------------------------------
+# Each confidence raster holds a projected year's land/water confidence minus the base
+# year's, on [-1, 1]: positive means growing confidence in land, negative in water.
+# data-input/confidence_groups.png bins these by magnitude, with a transparent band
+# straddling zero, and picks the palette by sign. Each band runs from its own break up to
+# the next, so the breaks below are lower bounds and the last band has no upper bound.
+CONFIDENCE_BREAKS = [0.1, 0.3, 0.7]
+CONFIDENCE_GAIN_COLORS = ["#ABCB9F", "#658859", "#1F4314"]
+CONFIDENCE_LOSS_COLORS = ["#A0C7D4", "#4999B6", "#256B84"]
+
+# Confidence outputs are labeled by the year their filename ends in, so a directory of
+# test_land_change_confidence_2025.tif ... _2070.tif becomes confidence_2025.png ... etc.
+CONFIDENCE_YEAR_PATTERN = re.compile(r"(\d{4})$")
 
 # Pin to the version this project was developed against (see package.json).
 MAPLIBRE_VERSION = "5.24.0"
@@ -230,7 +340,7 @@ def georeference_render(png_bytes, actual_bounds):
 
 def reproject_to_target(src_bands, src_crs, src_transform, resampling):
     n = src_bands.shape[0]
-    dst = np.zeros((n, TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint8)
+    dst = np.zeros((n, TARGET_HEIGHT, TARGET_WIDTH), dtype=src_bands.dtype)
     reproject(
         source=src_bands,
         destination=dst,
@@ -244,84 +354,360 @@ def reproject_to_target(src_bands, src_crs, src_transform, resampling):
     return dst
 
 
-def reproject_data_tif(data_path: Path, resampling):
+def reproject_rgba_to_target(src_bands, src_crs, src_transform, resampling):
+    """Reproject an RGBA render onto the target grid. Alpha is premultiplied first (and
+    divided back out afterwards) so that interpolating resamplers don't bleed the color
+    of fully transparent pixels into partially transparent edges as dark fringing.
+    Work is done in float32 to avoid quantizing twice."""
+    a = src_bands[3].astype(np.float32) / 255.0
+    premul = np.concatenate(
+        [src_bands[:3].astype(np.float32) * a, src_bands[3:].astype(np.float32)], axis=0
+    )
+
+    dst = reproject_to_target(premul, src_crs, src_transform, resampling)
+
+    dst_a = np.clip(dst[3], 0.0, 255.0)
+    unmul = np.where(dst_a > 0.0, 255.0 / np.maximum(dst_a, 1e-6), 0.0)
+    rgb = np.clip(dst[:3] * unmul, 0.0, 255.0)
+    return np.concatenate([rgb, dst_a[None]], axis=0).round().astype(np.uint8)
+
+
+def reproject_classes_to_target(data_path: Path, resampling):
+    """Warp a categorical single-band raster onto the target grid. Only class-preserving
+    resamplers are valid here — the values are class ids, so an averaging resampler
+    would invent classes that don't exist. The source is 15 m and the target is
+    ~277x289 m, so each target pixel covers ~340 source pixels: nearest takes whichever
+    class the single sampled point lands on (keeps thin, scattered change, at the cost
+    of speckle), while mode takes the class that dominates the footprint (coherent, but
+    drops change that covers less than half a target pixel, since class 0 "no persistent
+    change" wins the vote). Class 0 also doubles as the fill for target pixels the
+    source doesn't cover."""
     with rasterio.open(data_path) as ds:
-        n = ds.count
-        dst = np.zeros((n, TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint8)
-        for b in range(1, n + 1):
-            reproject(
-                source=rasterio.band(ds, b),
-                destination=dst[b - 1],
-                dst_transform=TARGET_TRANSFORM,
-                dst_crs=TARGET_CRS,
-                resampling=resampling,
-                num_threads=4,
-            )
-    if n == 3:
-        alpha = np.full((1, TARGET_HEIGHT, TARGET_WIDTH), 255, dtype=np.uint8)
-        dst = np.concatenate([dst, alpha], axis=0)
+        nodata = ds.nodatavals[0]
+        dst = np.full(
+            (TARGET_HEIGHT, TARGET_WIDTH), 0 if nodata is None else nodata, dtype=ds.dtypes[0]
+        )
+        reproject(
+            source=rasterio.band(ds, 1),
+            destination=dst,
+            dst_transform=TARGET_TRANSFORM,
+            dst_crs=TARGET_CRS,
+            src_nodata=nodata,
+            dst_nodata=nodata,
+            resampling=resampling,
+            num_threads=4,
+        )
     return dst
 
 
-def alpha_over(fg_rgba, bg_rgb):
-    """Composite fg (4,H,W uint8, RGBA) over bg (3,H,W uint8, RGB, assumed opaque)."""
-    fg_rgb = fg_rgba[:3].astype(np.float32)
-    fg_a = (fg_rgba[3].astype(np.float32) / 255.0)[None, :, :]
-    out = fg_rgb * fg_a + bg_rgb.astype(np.float32) * (1.0 - fg_a)
-    return np.clip(out, 0, 255).astype(np.uint8)
+def reproject_class_array_to_target(classes, src_crs, src_transform, resampling):
+    """Same as reproject_classes_to_target, for a categorical array already in memory."""
+    dst = np.zeros((TARGET_HEIGHT, TARGET_WIDTH), dtype=classes.dtype)
+    reproject(
+        source=classes,
+        destination=dst,
+        src_crs=src_crs,
+        src_transform=src_transform,
+        dst_transform=TARGET_TRANSFORM,
+        dst_crs=TARGET_CRS,
+        resampling=resampling,
+        num_threads=4,
+    )
+    return dst
 
 
-def write_geotiff(path: Path, rgb_bands: np.ndarray):
-    profile = {
-        "driver": "GTiff",
-        "dtype": "uint8",
-        "count": 3,
-        "width": TARGET_WIDTH,
-        "height": TARGET_HEIGHT,
-        "crs": TARGET_CRS,
-        "transform": TARGET_TRANSFORM,
-        "photometric": "RGB",
-        "interleave": "pixel",
-        "compress": "deflate",
-        "predictor": 2,
-        "zlevel": 9,
-    }
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(rgb_bands)
-        dst.colorinterp = [
-            rasterio.enums.ColorInterp.red,
-            rasterio.enums.ColorInterp.green,
-            rasterio.enums.ColorInterp.blue,
-        ]
+def reproject_values_to_target(data_path: Path):
+    """Warp a continuous single-band raster onto the target grid, averaging the source
+    pixels that fall in each target pixel.
+
+    The categorical layers can only be resampled by picking a winning class, but these
+    values are confidence fractions, so averaging them is meaningful — and at roughly 9x
+    downsampling it uses all of the source data instead of point-sampling 1 pixel in 85.
+    Nodata becomes NaN, which is excluded from the averages and symbolized transparent.
+    """
+    with rasterio.open(data_path) as ds:
+        values = ds.read(1).astype(np.float32)
+        nodata = ds.nodatavals[0]
+        if nodata is not None:
+            values[values == nodata] = np.nan
+        dst = np.full((TARGET_HEIGHT, TARGET_WIDTH), np.nan, dtype=np.float32)
+        reproject(
+            source=values,
+            destination=dst,
+            src_crs=ds.crs,
+            src_transform=ds.transform,
+            src_nodata=np.nan,
+            dst_transform=TARGET_TRANSFORM,
+            dst_crs=TARGET_CRS,
+            dst_nodata=np.nan,
+            resampling=Resampling.average,
+            num_threads=4,
+        )
+    return dst
 
 
-DATA_EXTENSIONS = {".tif", ".tiff"}
+def hex_to_rgba(color: str):
+    h = color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
 
 
-def resolve_data_output_pairs(data_arg: Path, output_arg: Path):
-    """If data_arg is a directory, convert every raster in it and mirror the
-    filenames into the output directory. Otherwise treat both as single files."""
-    if data_arg.is_dir():
-        output_arg.mkdir(parents=True, exist_ok=True)
-        data_paths = sorted(p for p in data_arg.iterdir() if p.is_file() and p.suffix.lower() in DATA_EXTENSIONS)
-        if not data_paths:
-            raise FileNotFoundError(f"no {sorted(DATA_EXTENSIONS)} files found in {data_arg}")
-        return [(p, output_arg / p.name) for p in data_paths]
-    return [(data_arg, output_arg)]
+def historic_group_lut(selected: int):
+    """Build a (256,4) uint8 RGBA lookup table mapping historic class values to colors
+    for the year group at index `selected`: loss in that group and older groups keeps
+    each group's own color, gain in those groups collapses to PAST_GAIN_COLOR, and
+    change in newer groups goes pale. Class values with no group (0, and 39..255)
+    are left fully transparent.
+
+    NO_GROUP_SELECTED puts every group in the future, which is the state at the start of
+    the record: nothing has changed yet, so every loss class is still land and every gain
+    class is still water."""
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    first = 1
+    for group_idx, (_, last, color) in enumerate(HISTORIC_GROUPS):
+        past = group_idx <= selected
+        loss_rgba = hex_to_rgba(color if past else FUTURE_LOSS_COLOR)
+        gain_rgba = hex_to_rgba(PAST_GAIN_COLOR if past else FUTURE_GAIN_COLOR)
+        for period in range(first, last + 1):
+            lut[period] = loss_rgba
+            lut[GAIN_VALUE_OFFSET + period] = gain_rgba
+        first = last + 1
+    return lut
+
+
+def write_historic_group_pngs(classes: np.ndarray, output_dir: Path):
+    write_historic_png(output_dir, INITIAL_STATE_LABEL, historic_group_lut(NO_GROUP_SELECTED)[classes])
+    for group_idx, (label, _, _) in enumerate(HISTORIC_GROUPS):
+        rgba = historic_group_lut(group_idx)[classes]  # H, W, 4
+        write_historic_png(output_dir, label, rgba)
+
+
+def read_land_water_state(land_water_path: Path):
+    """Read a lnd_type raster at its native resolution, reduced to LW_UNKNOWN / LW_LAND /
+    LW_WATER. Only class 2 is water; every other valid class is a form of land, and
+    anything below class 1 (the legend's "No Data", and the raster's nodata) is unknown."""
+    with rasterio.open(land_water_path) as ds:
+        values = ds.read(1)
+        state = np.where(values == LND_TYPE_OPEN_WATER, LW_WATER, LW_LAND).astype(np.uint8)
+        state[values < 1] = LW_UNKNOWN
+        return state, ds.crs, ds.transform
+
+
+def read_land_water_state_at_historic_grid(land_water_path: Path, historic_ds):
+    """read_land_water_state, upsampled onto the historic raster's grid. Nearest is the
+    right choice going from 30 m to 15 m: each historic pixel simply takes the state of
+    the land/water pixel containing it."""
+    state, state_crs, state_transform = read_land_water_state(land_water_path)
+    dst = np.zeros((historic_ds.height, historic_ds.width), dtype=np.uint8)
+    reproject(
+        source=state,
+        destination=dst,
+        src_crs=state_crs,
+        src_transform=state_transform,
+        src_nodata=LW_UNKNOWN,
+        dst_crs=historic_ds.crs,
+        dst_transform=historic_ds.transform,
+        dst_nodata=LW_UNKNOWN,
+        resampling=Resampling.nearest,
+        num_threads=4,
+    )
+    return dst
+
+
+def compare_land_water_at_historic_grid(historic_path: Path, baseline_path: Path, land_water_path: Path):
+    """Compare a 2024 land/water raster against the 2015 land/water state, on the historic
+    raster's own 15 m grid, and return its classes with the converted pixels replaced by
+    LAND_TO_WATER_CLASS / WATER_TO_LAND_CLASS.
+
+    The 2015 state is built from the baseline land/water raster (2018, the closest in time
+    available) with the historic raster's change classes burned in on top: each historic
+    class records the last transition that persisted through the end of observation in
+    2015, so a loss class is water in 2015 and a gain class is land, regardless of what the
+    2018 baseline says. Pixels the historic raster leaves unclassified had no persistent
+    change on record between 1932 and 2015, so they keep their 2018 state. Using a baseline
+    is what lets the comparison see change on ground the historic raster never classified —
+    which is where most new land loss actually happens.
+
+    The comparison has to happen at this resolution rather than at the video grid. Each
+    video pixel covers ~340 historic pixels and ~90 land/water pixels, so downsampling the
+    inputs first leaves point samples that describe different patches of ground, and they
+    disagree more often than the underlying data does.
+    """
+    with rasterio.open(historic_path) as ds:
+        classes = ds.read(1)
+        state_2015 = read_land_water_state_at_historic_grid(baseline_path, ds)
+        state_2024 = read_land_water_state_at_historic_grid(land_water_path, ds)
+
+    loss = (classes >= 1) & (classes <= N_HISTORIC_PERIODS)
+    gain = (classes > GAIN_VALUE_OFFSET) & (classes <= GAIN_VALUE_OFFSET + N_HISTORIC_PERIODS)
+    state_2015[loss] = LW_WATER
+    state_2015[gain] = LW_LAND
+
+    # A pixel unclassified on either side yields no comparison, so it keeps its class.
+    classes[(state_2015 == LW_LAND) & (state_2024 == LW_WATER)] = LAND_TO_WATER_CLASS
+    classes[(state_2015 == LW_WATER) & (state_2024 == LW_LAND)] = WATER_TO_LAND_CLASS
+    return classes
+
+
+def land_water_group_lut():
+    """The last historic group's colors, plus the two 2015-2024 transition classes."""
+    lut = historic_group_lut(len(HISTORIC_GROUPS) - 1)
+    lut[LAND_TO_WATER_CLASS] = hex_to_rgba(NEW_LOSS_COLOR)
+    lut[WATER_TO_LAND_CLASS] = hex_to_rgba(NEW_GAIN_COLOR)
+    return lut
+
+
+def write_land_water_group_png(
+    historic_path: Path, baseline_path: Path, land_water_path: Path, output_dir: Path, resampling
+):
+    """Extend the historic series past the end of its 2015 period of observation: compare
+    the 2024 land/water raster against the 2015 state at the historic raster's own
+    resolution, then downsample that result to the video grid."""
+    print(f"Comparing {land_water_path.name} against {baseline_path.name} + {historic_path.name} at 15 m...")
+    classes = compare_land_water_at_historic_grid(historic_path, baseline_path, land_water_path)
+
+    print(f"Downsampling the comparison to target grid ({resampling.name})...")
+    with rasterio.open(historic_path) as ds:
+        downsampled = reproject_class_array_to_target(classes, ds.crs, ds.transform, resampling)
+
+    write_historic_png(output_dir, LAND_WATER_GROUP_LABEL, land_water_group_lut()[downsampled])
+
+
+def confidence_rgba(values: np.ndarray):
+    """Symbolize a confidence difference array as RGBA per confidence_groups.png.
+
+    Bins on magnitude, so the bands are symmetric about zero, and picks the green ramp
+    where the value is positive and the blue ramp where it is negative. Each band includes
+    its lower break and excludes the next one. Anything below the first break — including
+    exactly zero — stays transparent, as does NaN, since every comparison against NaN is
+    False.
+    """
+    rgba = np.zeros(values.shape + (4,), dtype=np.uint8)
+    magnitude = np.abs(values)
+    uppers = CONFIDENCE_BREAKS[1:] + [np.inf]
+    for lower, upper, gain, loss in zip(CONFIDENCE_BREAKS, uppers, CONFIDENCE_GAIN_COLORS, CONFIDENCE_LOSS_COLORS):
+        band = (magnitude >= lower) & (magnitude < upper)
+        rgba[band & (values > 0)] = hex_to_rgba(gain)
+        rgba[band & (values < 0)] = hex_to_rgba(loss)
+    return rgba
+
+
+def confidence_label(path: Path):
+    """The output label for a confidence raster: the year its name ends in, or, failing
+    that, the whole file name."""
+    match = CONFIDENCE_YEAR_PATTERN.search(path.stem)
+    return match.group(1) if match else path.stem
+
+
+def write_confidence_pngs(confidence_dir: Path, output_dir: Path):
+    paths = sorted(confidence_dir.glob("*.tif"))
+    if not paths:
+        raise click.UsageError(f"no .tif files found in {confidence_dir}")
+    for path in paths:
+        label = confidence_label(path)
+        print(f"Reprojecting {path.name} to target grid (average)...")
+        output_path = output_dir / f"confidence_{label}.png"
+        write_png(output_path, np.moveaxis(confidence_rgba(reproject_values_to_target(path)), 2, 0))
+        print(f"Wrote {output_path}")
+
+
+def write_historic_png(output_dir: Path, label: str, rgba: np.ndarray):
+    output_path = output_dir / f"historic_{label}.png"
+    write_png(output_path, np.moveaxis(rgba, 2, 0))
+    print(f"Wrote {output_path}")
+
+
+def write_png(path: Path, rgba_bands: np.ndarray):
+    """Write a (4,H,W) uint8 RGBA array as a PNG with transparency."""
+    Image.fromarray(np.moveaxis(rgba_bands, 0, 2)).save(path, optimize=True)
 
 
 @click.command(help=__doc__)
-@click.option("--style", help="path to MapLibre style JSON", required=True)
-@click.option("--data", help="path to a single GeoTIFF, or a directory of GeoTIFFs to convert", required=True)
-@click.option("--output", help="output GeoTIFF path, or output directory when --data is a directory", required=True)
+@click.option(
+    "--basemap-style",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="path to MapLibre style JSON; emits basemap_underlay.png and basemap_overlay.png. "
+    "Omit to skip the basemap layers.",
+)
+@click.option(
+    "--historic-data",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="path to the historic persistent-change raster; emits one historic_<group>.png per year group. "
+    "Omit to skip the data layers.",
+)
+@click.option(
+    "--land-water-data",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=f"path to the 2024 lnd_type land/water raster; emits historic_{LAND_WATER_GROUP_LABEL}.png "
+    "by comparing it against the 2015 state. Requires --historic-data and --baseline-land-water-data.",
+)
+@click.option(
+    "--baseline-land-water-data",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="path to a lnd_type land/water raster from near 2015; the historic change classes are burned "
+    "into it to build the 2015 state that --land-water-data is compared against.",
+)
+@click.option(
+    "--confidence-data",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="path to a directory of land-change confidence rasters; emits one confidence_<year>.png per "
+    ".tif in it. Omit to skip the confidence layers.",
+)
+@click.option("--output", help="output directory for the layer PNGs", required=True)
+@click.option(
+    "--majority",
+    is_flag=True,
+    help="downsample the categorical data layers with a majority (mode) vote instead of nearest "
+    "neighbor: coherent rather than speckled, but drops change covering less than half a target "
+    "pixel. Does not affect the confidence layers, which are continuous and always averaged",
+)
 @click.option("--scale", type=float, default=2.0, show_default=True, help="device scale factor for supersampling")
 @click.option("--keep-intermediate", is_flag=True)
-def main(style, data, output, scale, keep_intermediate):
-    data_output_pairs = resolve_data_output_pairs(Path(data), Path(output))
+def main(
+    basemap_style,
+    historic_data,
+    land_water_data,
+    baseline_land_water_data,
+    confidence_data,
+    output,
+    majority,
+    scale,
+    keep_intermediate,
+):
+    if land_water_data is not None and (historic_data is None or baseline_land_water_data is None):
+        raise click.UsageError(
+            "--land-water-data needs both --historic-data and --baseline-land-water-data: the 2015 "
+            "land/water state it compares against is the baseline raster with the historic change "
+            "classes burned in"
+        )
+    if baseline_land_water_data is not None and land_water_data is None:
+        raise click.UsageError("--baseline-land-water-data does nothing without --land-water-data")
+    if basemap_style is None and historic_data is None and confidence_data is None:
+        raise click.UsageError(
+            "nothing to do: pass --basemap-style, --historic-data and/or --confidence-data"
+        )
+
+    output_dir = Path(output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resampling = Resampling.mode if majority else Resampling.nearest
+
+    if historic_data is not None:
+        print(f"Reprojecting {historic_data.name} to target grid ({resampling.name})...")
+        classes = reproject_classes_to_target(historic_data, resampling)
+        write_historic_group_pngs(classes, output_dir)
+        if land_water_data is not None:
+            write_land_water_group_png(
+                historic_data, baseline_land_water_data, land_water_data, output_dir, resampling
+            )
+
+    if confidence_data is not None:
+        write_confidence_pngs(confidence_data, output_dir)
+
+    if basemap_style is None:
+        return
 
     from playwright.sync_api import sync_playwright
 
-    style_path = Path(style)
+    style_path = basemap_style
     underlay_style, overlay_style = split_style(style_path)
     RENDER_DIR.mkdir(exist_ok=True)
     (RENDER_DIR / "underlay_style.json").write_text(json.dumps(underlay_style))
@@ -364,26 +750,14 @@ def main(style, data, output, scale, keep_intermediate):
         Image.fromarray(np.moveaxis(over_bands, 0, 2)).save(PROJECT_DIR / "_overlay_raw.png")
 
     print("Reprojecting underlay to target grid...")
-    underlay_t = reproject_to_target(under_bands, under_crs, under_tf, Resampling.bilinear)
+    underlay_t = reproject_rgba_to_target(under_bands, under_crs, under_tf, Resampling.bilinear)
     print("Reprojecting overlay to target grid...")
-    overlay_t = reproject_to_target(over_bands, over_crs, over_tf, Resampling.bilinear)
-    base_rgb = underlay_t[:3]
+    overlay_t = reproject_rgba_to_target(over_bands, over_crs, over_tf, Resampling.bilinear)
 
-    if keep_intermediate:
-        write_geotiff(PROJECT_DIR / "_underlay.tif", base_rgb)
-        write_geotiff(PROJECT_DIR / "_overlay.tif", overlay_t[:3])
-
-    for data_path, output_path in data_output_pairs:
-        print(f"Reprojecting data raster {data_path} to target grid...")
-        data_t = reproject_data_tif(data_path, Resampling.average)
-
-        with_data = alpha_over(data_t, base_rgb)
-        final_rgb = alpha_over(overlay_t, with_data)
-
-        if keep_intermediate:
-            write_geotiff(PROJECT_DIR / f"_data_{data_path.stem}.tif", data_t[:3])
-
-        write_geotiff(output_path, final_rgb)
+    # The data layer belongs between these two; it is composited downstream.
+    for name, bands in (("basemap_underlay.png", underlay_t), ("basemap_overlay.png", overlay_t)):
+        output_path = output_dir / name
+        write_png(output_path, bands)
         print(f"Wrote {output_path}")
 
 
