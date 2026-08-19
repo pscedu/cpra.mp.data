@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.49.0](https://github.com/pscedu/cpra.mp.data/compare/v0.48.0...v0.49.0) (2026-08-19)
+
+
+### Features
+
+* **api:** accept coordinate selections for vector grids ([cf9e08e](https://github.com/pscedu/cpra.mp.data/commit/cf9e08e3305879835d5000512406625ea51ac2bd))
+* **api:** add coordinate crosswalk to vector grids ([493da16](https://github.com/pscedu/cpra.mp.data/commit/493da160b98e4c44ec493b3523a2902b385cb1ea))
+* **api:** add crosswalk route ([0dd0860](https://github.com/pscedu/cpra.mp.data/commit/0dd08605e0f1e73c792091df365defe8c0d1c1de))
+* **scripts:** update colors for historical video frames ([7868f14](https://github.com/pscedu/cpra.mp.data/commit/7868f14b14e1ab6fadc6ca77e626861215155411))
+* **scripts:** update video frames to be transparent overlays ([588a8bf](https://github.com/pscedu/cpra.mp.data/commit/588a8bf70face8026da7df5515a0b8df3148b82e))
+* **visualizations:** improve chart sizing ([ec4a32c](https://github.com/pscedu/cpra.mp.data/commit/ec4a32c5bb8ec9e0c300ded23c581034a6c096a9))
+
+
+### Bug Fixes
+
+* **api:** report data for vector grids by cell ID ([e17e94e](https://github.com/pscedu/cpra.mp.data/commit/e17e94e20f387b3c037bc479ba6d8f51415c7a3a))
+
 ## [0.48.0](https://github.com/pscedu/cpra.mp.data/compare/v0.47.1...v0.48.0) (2026-08-05)
 
 
