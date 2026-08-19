@@ -10,6 +10,7 @@ from cpra.mp.data.api.types import (
     VectorGrid,
     dimension_type,
 )
+from cpra.mp.data.api.types import Grid as GridName
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 
 BaseDatasetDimensions = create_model(
@@ -78,6 +79,17 @@ class TileQuery(Options, FilterDimensions):
 
 class DataQuery(TileQuery, Compression):
     model_config = ConfigDict(use_enum_values=True)
+
+    @property
+    def compression(self):
+        return Compression(**dict(self))
+
+
+class CrosswalkQuery(Compression):
+    model_config = ConfigDict(use_enum_values=True)
+
+    geography: str | None = None
+    to_grid: list[GridName] | None = None
 
     @property
     def compression(self):

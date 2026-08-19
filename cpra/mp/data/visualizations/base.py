@@ -8,6 +8,28 @@ from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns
 from cpra.mp.data.variables import VARIABLES
+from cpra.mp.data.visualizations.colors import selection_color
+
+
+def geography_tokens(geography):
+    """Split a `geography` parameter into stripped string tokens.
+
+    Accepts either the comma-separated string the API binds from the query string or the
+    plain sequence a notebook is more likely to pass.
+    """
+    values = geography.split(",") if isinstance(geography, str) else geography
+    return [str(value).strip() for value in values]
+
+
+def is_geography_ids(geography):
+    """Are these geography values grid cell IDs rather than lat/lng coordinate pairs?
+
+    Mirrors the rule in `Dataset._apply_geography_vector`: values are IDs only when every
+    token is a plain unsigned digit string, so anything carrying a decimal point or a sign
+    is a coordinate. Only meaningful for a vector grid, since raster geography is always
+    coordinates. An absent geography selects the whole grid, which is keyed by ID.
+    """
+    return geography is None or all(token.isdigit() for token in geography_tokens(geography))
 
 
 class BaseVisualization:
@@ -114,6 +136,8 @@ class BaseVisualization:
 
         if parse is None:
             parse = {"value": "number"}
+            # A vector grid reports geography as numeric grid cell IDs however the caller
+            # asked for it; a raster grid reports the "lng,lat" string it was given.
             if GRIDS[grid].grid_type == "vector":
                 parse["geography"] = "number"
             time_column = self.get_time_column(time_unit)
@@ -132,6 +156,43 @@ class BaseVisualization:
             type="quantitative" if time_column == "calendar_year" else "temporal",
             title=DIMENSIONS[time_column].label,
         )
+
+    def size_to_container(self, chart, is_concat: bool = False):
+        """Size a finished chart to exactly fill `self.width` x `self.height` (the frontend's
+        container), whatever room the axes/title/legend end up taking.
+
+        In Vega-Lite, a mark's `width`/`height` describe the plotting area only — the
+        rendered SVG is that area plus the surrounding chrome, so a naive `.properties(width=,
+        height=)` on the container size leaves the chrome to overflow it. `autosize`'s `fit`
+        mode reinterprets `width`/`height` as the *total* size instead and shrinks the
+        plotting area to make room, which is exactly what's wanted here since it measures real
+        text metrics rather than guessing at legend width the way this code used to.
+
+        `fit` only works for single or layered views, though — Vega-Lite rejects it on a
+        vconcat spec (warns and silently falls back to `pad`, which overflows again exactly
+        like the bug this is fixing). `fit-x` is the documented workaround: it fits the width
+        only, which vconcat does support, and is enough on its own because concat's overflow
+        here only ever came from the legend pushing the width out — the height side of a
+        concat spec still has to be sized by hand (see the `- 222` arithmetic in
+        `TimeSeriesLine`/`StackedBar` for the daily/vconcat branch). Don't "simplify" this back
+        to `fit` for a concat chart; it will silently stop being honored.
+
+        A top-level vconcat spec has no `width`/`height` property at all in the Vega-Lite
+        schema — sizing there comes entirely from each concatenated child's own `width`/
+        `height` (set where the child is built, e.g. `chart_width`/`chart_height` in
+        `TimeSeriesLine`/`StackedBar`). So for a concat chart this method only sets
+        `autosize`; `fit-x` then stretches each child's plotting area so the child's own
+        declared width is honored as a total rather than a plot-area-only size, the same
+        way `fit` does for a single/layered chart's top-level width.
+
+        Apply this to the final, top-level chart object only (e.g. after a `&` concat) — a
+        nested/intermediate layer's `properties(width=, height=)` is what actually gets fit,
+        and putting autosize somewhere other than the top level has no effect.
+        """
+        autosize = alt.AutoSizeParams(type="fit-x" if is_concat else "fit", contains="padding")
+        if is_concat:
+            return chart.properties(autosize=autosize)
+        return chart.properties(width=self.width, height=self.height, autosize=autosize)
 
     @property
     def spec(self):
@@ -161,16 +222,97 @@ class DatasetVisualization(BaseVisualization):
 
     @cached_property
     def geographies(self):
-        """Get the selected geographies."""
-        raster = self.grid.grid_type == "raster"
-        coord_type = float if raster else int
-        geos = self.params["geography"]
-        coords = list(map(coord_type, geos.split(",") if isinstance(geos, str) else geos))
+        """Get the selected geographies as the API keys them in its own output.
 
-        if not raster:
-            return coords
+        A vector grid takes either grid cell IDs or lat/lng coordinate pairs; a raster
+        grid only takes coordinates. These are what a `geography` value in the response
+        will actually equal, so they're what a scale domain or a lookup key has to match —
+        see `geography_labels` for what to show the reader instead.
+        """
+        return [geography for geography, _, _, _ in self._geographies]
 
-        return [",".join([str(coord) for coord in coords[i : i + 2]]) for i in range(0, len(coords), 2)]
+    @cached_property
+    def geography_labels(self):
+        """Get a display label per selected geography, in the same order as `geographies`.
+
+        Identifies a geography in full, for somewhere with room for it — a legend. A
+        coordinate is shown parenthesized, and on a vector grid it's prefixed with the ID of
+        the cell it landed in, since the cell — not the point — is what the values describe:
+        `24`, `24 (-90.49, 30.01)`, or `(-90.49, 30.01)` on a raster grid.
+        """
+        return [label for _, label, _, _ in self._geographies]
+
+    @cached_property
+    def geography_short_labels(self):
+        """Get a compact display label per selected geography, in the same order.
+
+        For somewhere a full label would crowd out the numbers being read, like a tooltip
+        with one row per geography. Where a grid cell ID is available it stands alone, since
+        it's what the values describe and the coordinate that selected it only repeats what
+        the legend already says. A raster pixel has no ID, so the coordinate is all there is
+        to show. Two coordinates inside one cell therefore share a short label; the legend is
+        what tells them apart.
+        """
+        return [short_label for _, _, short_label, _ in self._geographies]
+
+    @cached_property
+    def geography_colors(self):
+        """Get the color the map draws each selected geography with, in the same order.
+
+        A chart is read beside the map, so a geography has to carry the same color in both.
+        The map's color comes from the geography's place in the *selection*, which is not its
+        place in this list: a coordinate that fell outside the grid, or inside a cell an
+        earlier coordinate already took, is left out here and takes its color out with it.
+        Pairing the whole palette with this list positionally would instead shift every
+        series after such a coordinate onto the color of the pin before it.
+        """
+        return [color for _, _, _, color in self._geographies]
+
+    @cached_property
+    def _geographies(self):
+        """One `(API geography key, label, short label, color)` tuple per selected geography.
+
+        A raster grid is keyed by the coordinate itself, reported as a `"lng,lat"` string
+        built from the parsed floats — so round-trip the tokens through `float` to match
+        it (`-91` in the request becomes `-91.0` in the response). A vector grid is always
+        keyed by grid cell ID, whichever way the caller asked for it, so a coordinate has
+        to be resolved to a cell the same way the data endpoint does. That also means a
+        coordinate outside the grid drops out, as it does there, and coordinates sharing a
+        cell collapse into the one series the response actually carries.
+
+        The color is the map's, and so is taken from the geography's place in the selection
+        rather than from its place in this list, which dropping and collapsing shorten.
+        """
+        geography = self.params["geography"]
+
+        if self.grid.grid_type == "vector" and is_geography_ids(geography):
+            ids = [int(token) for token in geography_tokens(geography)]
+            return [(geo_id, str(geo_id), str(geo_id), selection_color(i)) for i, geo_id in enumerate(ids)]
+
+        coords = [float(token) for token in geography_tokens(geography)]
+        pairs = list(zip(coords[::2], coords[1::2]))
+
+        if self.grid.grid_type != "vector":
+            return [
+                (f"{lng!s},{lat!s}", f"({lng}, {lat})", f"({lng}, {lat})", selection_color(i))
+                for i, (lng, lat) in enumerate(pairs)
+            ]
+
+        # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
+        # a notebook that only builds specs shouldn't need either. Same reason map.py
+        # imports Dataset where it uses it.
+        from cpra.mp.data.api.geography import resolve_vector_geography_sync
+
+        ids = resolve_vector_geography_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
+
+        geographies = {}
+        for i, ((lng, lat), geo_id) in enumerate(zip(pairs, ids)):
+            # First coordinate wins a shared cell: the response has one series for it, so a
+            # second entry would be a legend key the data never matches. Its color is the
+            # first coordinate's too, which is how the map draws the cell's outline.
+            if geo_id is not None and geo_id not in geographies:
+                geographies[geo_id] = (geo_id, f"{geo_id} ({lng}, {lat})", str(geo_id), selection_color(i))
+        return list(geographies.values())
 
     @cached_property
     def time_column(self):

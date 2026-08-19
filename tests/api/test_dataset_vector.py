@@ -7,13 +7,25 @@ filter -> calculate -> group and aggregate -> transform and extract -> sort.
 import polars as pl
 import pytest
 from fastapi import HTTPException
+from rasterio.crs import CRS
+from rasterio.warp import transform
+from shapely.geometry import box
 
 from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.tabular import write_parquet
 
-from tests.factories import ANNUAL_KWARGS, annual_frame, write_vector_crosswalk
+from tests.factories import ANNUAL_KWARGS, annual_frame, write_grid_geometry, write_vector_crosswalk
 
 DIMENSIONS = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
+# The dimension columns every wide annual frame carries, so tests can isolate the
+# geography columns beside them.
+DIMENSION_NAMES = set(annual_frame(years=(2030,)).select(pl.col("^[a-z].*$")).columns)
+
+
+def _lng_lat(x, y):
+    """Project an ecoregion_v001 (EPSG:26915) point to WGS84 for a geography= query."""
+    lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [x], [y])]
+    return f"{lng!s},{lat!s}"
 
 
 @pytest.fixture
@@ -125,6 +137,111 @@ class TestFilterStage:
         dataset = dataset_factory(DIMENSIONS, filters={"scenario_id": [8]})
         await dataset.apply_params()
         assert dataset.materialize()["scenario_id"].unique().to_list() == [8]
+
+
+class TestGeographyCoordinates:
+    """geography= on a vector grid may be grid cell IDs (as above) or lat/lng pairs,
+    resolved to grid cell IDs via point-in-polygon lookup against config.GEOMETRY_PATH."""
+
+    @pytest.fixture
+    def ecoregion_geometry(self, geometry_path):
+        """Two adjacent 1km squares in ecoregion_v001's CRS, at IDs 1 and 2."""
+        return write_grid_geometry(
+            geometry_path,
+            "ecoregion_v001",
+            [
+                (1, box(500000, 3300000, 501000, 3301000)),
+                (2, box(501000, 3300000, 502000, 3301000)),
+            ],
+        )
+
+    async def test_coordinate_resolves_to_grid_cell(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        label = _lng_lat(500500, 3300500)  # inside square 1
+        dataset = dataset_factory(DIMENSIONS, geography=label)
+        await dataset.apply_params()
+        assert dataset.geography_ids == ["1"]
+
+    async def test_multiple_coordinates_resolve_in_order(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        label1 = _lng_lat(500500, 3300500)  # square 1
+        label2 = _lng_lat(501500, 3300500)  # square 2
+        dataset = dataset_factory(DIMENSIONS, geography=f"{label1},{label2}")
+        await dataset.apply_params()
+        assert dataset.geography_ids == ["1", "2"]
+
+    async def test_unmatched_coordinate_is_ignored(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """A point outside every polygon is dropped rather than erroring."""
+        inside = _lng_lat(500500, 3300500)
+        outside = _lng_lat(0, 0)
+        dataset = dataset_factory(DIMENSIONS, geography=f"{inside},{outside}")
+        await dataset.apply_params()
+        assert dataset.geography_ids == ["1"]
+
+    async def test_grid_cell_ids_still_work(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """IDs (digit-only tokens) take the original, non-geometry path."""
+        dataset = dataset_factory(DIMENSIONS, geography="1,2")
+        await dataset.apply_params()
+        assert dataset.geography_ids == ["1", "2"]
+
+    async def test_coordinates_in_one_cell_select_it_once(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """A vector geography is its ID, and IDs double as column names, so the cell can
+        only appear once however many coordinates landed in it."""
+        first = _lng_lat(500400, 3300400)
+        second = _lng_lat(500600, 3300600)
+        dataset = dataset_factory(DIMENSIONS, geography=f"{first},{second}")
+        await dataset.apply_params()
+        assert dataset.geography_ids == ["1"]
+        df = dataset.materialize()
+        assert [c for c in df.columns if c not in DIMENSION_NAMES] == ["1"]
+
+    async def test_columns_are_named_for_the_resolved_cell(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """The response reports cell IDs whichever way the caller selected them — the
+        coordinate is how it was asked for, not what the values describe."""
+        label = _lng_lat(500500, 3300500)
+        dataset = dataset_factory(DIMENSIONS, geography=label)
+        await dataset.apply_params()
+        columns = dataset.materialize().columns
+        assert "1" in columns
+        assert label not in columns
+
+    async def test_unpivoting_reports_the_cell_id(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """The shape every visualization requests, so the ID has to reach the geography
+        column rather than the coordinate that selected it."""
+        label = _lng_lat(500500, 3300500)
+        dataset = dataset_factory(DIMENSIONS, geography=label, unpivot=True)
+        await dataset.apply_params()
+        assert dataset.materialize()["geography"].unique().to_list() == ["1"]
+
+    async def test_a_select_that_drops_the_geography_columns_still_works(
+        self, dataset_factory, annual_data, ecoregion_geometry
+    ):
+        """`select` can only name dimensions, so without unpivot it drops every geography
+        column."""
+        dataset = dataset_factory(
+            DIMENSIONS, geography=_lng_lat(500500, 3300500), select="calendar_year"
+        )
+        await dataset.apply_params()
+        assert dataset.materialize().columns == ["calendar_year"]
+
+    async def test_no_geometry_file_raises_400(self, dataset_factory, annual_data, geometry_path):
+        dataset = dataset_factory(DIMENSIONS, geography=_lng_lat(500500, 3300500))
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "No geometry file" in excinfo.value.detail
 
 
 class TestCalculateStage:

@@ -192,6 +192,23 @@ def write_raster_crosswalk(crosswalk_path, src_grid, dst_grid, zones):
     with rio.open(path, "w", **profile) as dst:
         dst.write(zones.astype("int32"), 1)
         dst.update_tags(dst_ids=",".join(str(i) for i in dst_ids))
+
+
+def write_grid_geometry(geometry_path, grid_name, features):
+    """Write a FlatGeoBuf geometry file for a vector grid.
+
+    ``features`` is an iterable of ``(id, geometry)`` pairs of shapely geometries.
+    Mirrors the real files in ``config.GEOMETRY_PATH``: an ``id`` field plus geometry, in
+    the grid's own CRS.
+    """
+    import geopandas as gpd
+
+    grid = GRIDS[grid_name]
+    path = geometry_path / f"{grid_name}.fgb"
+    ids, geometries = zip(*features)
+    gpd.GeoDataFrame({"id": list(ids)}, geometry=list(geometries), crs=grid.crs).to_file(
+        path, driver="FlatGeobuf"
+    )
     return path
 
 

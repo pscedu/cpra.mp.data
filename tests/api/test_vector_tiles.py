@@ -6,6 +6,8 @@ import mercantile
 import polars as pl
 import pytest
 from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
+from rasterio.crs import CRS
+from rasterio.warp import transform
 
 from cpra.mp.data.api.vector import (
     _data_to_id_value,
@@ -198,3 +200,30 @@ class TestGetVectorTile:
         result = VectorTile()
         result.ParseFromString(body)
         assert len(result.layers[0].values) == 1
+
+    async def test_coordinate_geography_still_matches_features_by_id(
+        self, dataset_factory, vector_data, ecoregion_tiles, geometry_path
+    ):
+        """A coordinate-selected geography is resolved to an ID before it reaches the tile,
+        which is what a pmtile feature is keyed by."""
+        from shapely.geometry import box
+
+        from tests.factories import ANNUAL_KWARGS, annual_frame, write_grid_geometry
+
+        write_grid_geometry(
+            geometry_path, "ecoregion_v001", [(1, box(500000, 3300000, 501000, 3301000))]
+        )
+        lng, lat = [
+            c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [500500], [3300500])
+        ]
+
+        dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
+        dataset = dataset_factory(dimensions, geography=f"{lng!s},{lat!s}")
+        await dataset.apply_params()
+
+        body = await dataset.get_vector_tile(TILE.x, TILE.y, TILE.z)
+        result = VectorTile()
+        result.ParseFromString(body)
+        expected = annual_frame(years=(2030,))["1"][0]
+        assert len(result.layers[0].values) == 1
+        assert result.layers[0].values[0].double_value == pytest.approx(expected, rel=1e-5)

@@ -43,6 +43,7 @@ api = [
     "geopandas>=0.14.4",
     "mapbox-vector-tile>=2.2.0",
     "psycopg2-binary",
+    "shapely",
     "sqlmodel",
 ]
 bridges2 = [

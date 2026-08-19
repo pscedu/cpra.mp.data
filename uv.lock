@@ -539,6 +539,7 @@ api = [
     { name = "geopandas" },
     { name = "mapbox-vector-tile" },
     { name = "psycopg2-binary" },
+    { name = "shapely" },
     { name = "sqlmodel" },
 ]
 bridges2 = [
@@ -608,6 +609,7 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "rasterio" },
     { name = "scipy" },
+    { name = "shapely", marker = "extra == 'api'" },
     { name = "sqlalchemy", marker = "extra == 'bridges2'" },
     { name = "sqlmodel", marker = "extra == 'api'" },
     { name = "sympy", marker = "extra == 'bridges2'" },

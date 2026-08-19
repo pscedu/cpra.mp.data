@@ -9,7 +9,6 @@ import polars as pl
 
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.visualizations.base import DatasetVisualization
-from cpra.mp.data.visualizations.colors import MAP_SELECTION
 
 
 class TimeSeriesLine(DatasetVisualization):
@@ -47,20 +46,37 @@ class TimeSeriesLine(DatasetVisualization):
         compare_choices = list(itertools.product(*compare_dimensions.values()))
         compare_choice_indices = list(itertools.product(*[range(len(v)) for v in compare_dimensions.values()]))
 
-        chart_height = max(self.height - (222 if is_daily else 86), 50)
-        chart_width = max(self.width - 200, 50)
+        # `size_to_container` (see base.py) reinterprets width/height as the total
+        # container size and lets Vega-Lite's autosize give the leftover to the plot area
+        # after measuring real axis/title/legend chrome, so no chrome allowance is guessed
+        # here. The daily/vconcat branch is the exception: autosize only fits width for a
+        # vconcat spec, so the summary strip's 60px plus a fixed allowance still has to be
+        # subtracted from height by hand.
+        chart_width = self.width
+        chart_height = max(self.height - 222, 50) if is_daily else self.height
 
         nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
+
+        # The data is keyed by whatever the API reports as `geography`, but the legend shows
+        # `geography_label` — a coordinate selection carries the resolved grid cell ID, which
+        # is what actually identifies the values being drawn. The row index doubles as the
+        # tooltip's column key below, so both label lists line up with it.
+        geography_df = pl.DataFrame(
+            dict(geography=self.geographies, geography_label=self.geography_labels)
+        ).with_row_index(name="geography_idx")
 
         main_line_encodings = [
             alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
             .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
-            alt.Color("geography:N")
+            # Each series is colored as the map colors the geography it draws, rather than by
+            # its position in the legend — see `geography_colors`, which is why the palette
+            # isn't handed over whole.
+            alt.Color("geography_label:N")
             .title(self.grid.label)
-            .scale(domain=[geo for geo in self.geographies], range=MAP_SELECTION),
+            .scale(domain=self.geography_labels, range=self.geography_colors),
         ] + [
             compare_channels[i](f"{dimension}:N").title(DIMENSIONS[dimension].label)
             for i, dimension in enumerate(compare_dimensions.keys())
@@ -68,6 +84,10 @@ class TimeSeriesLine(DatasetVisualization):
 
         main_line = (
             self.get_base_chart(self.data_source, self.time_column)
+            .transform_lookup(
+                "geography",
+                from_=alt.LookupData(geography_df, "geography", ["geography_label"]),
+            )
             .mark_line()
             .encode(*main_line_encodings)
             .properties(title=self.title, width=chart_width)
@@ -75,15 +95,16 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
-        geography_df = pl.DataFrame(dict(geography=self.geographies)).with_row_index(name="geography_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
                 type="quantitative",
-                title=f"{str(geo)}: {', '.join([str(c) for c in val_choices])}",
+                title=f"{label}: {', '.join([str(c) for c in val_choices])}",
                 format=self.variable.number_format or "",
             )
-            for (i, geo) in geography_df.iter_rows()
+            # Short labels here: a tooltip carries a row per geography, so a full label
+            # would push the numbers being read off to the right.
+            for i, label in enumerate(self.geography_short_labels)
             for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 
@@ -139,4 +160,4 @@ class TimeSeriesLine(DatasetVisualization):
             )
             viz = viz & summary_line
 
-        return viz
+        return self.size_to_container(viz, is_concat=is_daily)

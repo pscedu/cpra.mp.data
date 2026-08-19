@@ -42,12 +42,14 @@ Filter parameters are used to limit the rows, columns, or bands of the dataset t
 
 For vector-grid data, the `geography` parameter accepts a comma-separated list of source geography IDs. For raster-grid data, it accepts a comma-separated list of coordinate pairs (in the format `x,y`) at which values are extracted from the COGs. When specifying coordinate pairs for a raster-grid dataset, the result is a tabular dataset that can be transformed in the same way as Parquet data (e.g., using the `unpivot` parameter below).
 
+Vector-grid data also accepts coordinate pairs, so the same `geography` value can be used against any grid without knowing its type. The list is read as geography IDs only when every value is a plain unsigned integer; otherwise it is read as coordinate pairs, and each pair is resolved to the geography whose boundary contains it. Results are always reported under the geography ID, never the coordinate pair that selected it — as a column name, or as a `geography` value once unpivoted. A coordinate pair that falls outside every geography in the grid is omitted from the results, and several pairs that fall inside the same geography report it once.
+
 For raster-grid data, when the `geography` parameter is not provided, the full images are used. Each COG becomes a band in the resulting image. These bands can be aggregated using the `group_by` and `group_aggregate` parameters below. Due to memory constrains, a maximum of 10 bands can be loaded from COGs. Additional matches beyond the first 10 COGs are ignored.
 
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
 | Partition and Non-Partition Dimensions | Any dimension from the partition and non-partition tables above | ✅ | ✅ | `aep=0.2` |
-| `geography` | Geographies to include | ✅ | ✅ | `geography=24,81` |
+| `geography` | Geographies to include, as IDs (vector grids only) or as `x,y` coordinate pairs | ✅ | ✅ | `geography=24,81` or `geography=-90.49,30.01` |
 | `where` | Advanced filters in SQL where-clause format | ✅ | ✅ | `where=calendar_year%3E2040` |
 
 ### Calculate

@@ -13,13 +13,17 @@ from fastapi import HTTPException
 from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
-from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform, transform_bounds
+from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
+from cpra.mp.data.api.geography import (
+    parse_coordinate_pairs,
+    project_coordinates,
+    resolve_vector_geography,
+)
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import OutputType
@@ -160,44 +164,41 @@ class Dataset(LazyFrameSource):
                 await self._apply_geography_raster()
 
     async def _apply_geography_vector(self):
-        """Apply the geography filter to a vector-grid dataset."""
-        # TODO: Validate that the given IDs fall within the grid min and max.
-        self.geography_ids = unpack_values(self.options.geography, "geography")
+        """Apply the geography filter to a vector-grid dataset.
+
+        Accepts either grid cell IDs or lat/lng coordinate pairs, matching the raster
+        convention. A geography value is treated as IDs only if every token is a plain
+        (unsigned, non-decimal) digit string; otherwise the whole list is parsed as
+        coordinate pairs and resolved to grid cell IDs via point-in-polygon lookup
+        against the grid's geometry. Coordinates that don't fall inside any polygon are
+        dropped rather than erroring.
+
+        Either way the result is reported under grid cell IDs, never the coordinates that
+        selected them: a vector geography *is* its ID, and IDs double as column names here.
+        Several coordinates landing in one cell therefore select it once.
+        """
+        values = unpack_values(self.options.geography, "geography")
+
+        if all(value.isdigit() for value in values):
+            # TODO: Validate that the given IDs fall within the grid min and max.
+            geography_ids = values
+        else:
+            lngs, lats = parse_coordinate_pairs(values)
+            resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
+            geography_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
+
+        self.geography_ids = list(dict.fromkeys(geography_ids))
         self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
 
     async def _apply_geography_raster(self):
         """Apply the geography filter to a raster-grid dataset."""
-        # Check that coordinates are numeric and that there are an even number.
-        try:
-            coords = [float(coord) for coord in unpack_values(self.options.geography, "geography")]
-        except ValueError:
-            raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
-
-        coords_len = len(coords)
-        if coords_len % 2:
-            raise HTTPException(
-                status_code=400,
-                detail="geography contain an even number of coordinates",
-            )
-
-        # Extract lng,lat pairs.
-        lngs = []
-        lats = []
-        for start_idx in range(0, coords_len, 2):
-            lng, lat = coords[start_idx : (start_idx + 2)]
-            if abs(lng) > 180 or abs(lat) > 90:
-                msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
-                raise HTTPException(status_code=400, detail=msg)
-            lngs.append(lng)
-            lats.append(lat)
+        lngs, lats = parse_coordinate_pairs(unpack_values(self.options.geography, "geography"))
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
         df = self.materialize()
         with ExitStack() as stack:
             datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
-            src_crs = CRS.from_epsg(4326)
-            dst_crs = datasets[0].crs
-            projected_pairs = list(zip(*transform(src_crs, dst_crs, lngs, lats)))
+            projected_pairs = list(zip(*project_coordinates(lngs, lats, datasets[0].crs)))
             samples = await parallel_sample_rasters(datasets, projected_pairs)
 
         # Add the resulting values to the LazyFrame, and remove the path column.
