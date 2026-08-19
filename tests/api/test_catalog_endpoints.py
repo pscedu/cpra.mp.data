@@ -1,10 +1,13 @@
-"""Tests for the static catalog endpoints."""
+"""Tests for the static catalog endpoints, plus the /catalog.json dataset-catalog route."""
 
+import numpy as np
 import pytest
 
+from cpra.mp.data import config
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
+from cpra.mp.data.raster import write_cog
 from cpra.mp.data.variables import VARIABLES
 
 
@@ -148,3 +151,72 @@ class TestDatasetsIndex:
 
     def test_rejects_an_unknown_format(self, client):
         assert client.get("/v1/datasets.xlsx").status_code == 422
+
+
+class TestDatasetCatalogEndpoint:
+    """/v1/datasets/{variable}/{time_unit}/{grid}/catalog.json, backed by CatalogQuery
+    reading the materialized catalog side-table rather than walking the data tree.
+
+    See tests/api/test_catalog_query.py for CatalogQuery's own unit tests -- including why
+    there is no test here for the old "no common values" 404: that ValueError is
+    unreachable in the current CatalogQuery (see that file's TestChoiceIntersection).
+    """
+
+    URL = "/v1/datasets/vct/annual/veg_grid_cell_v001/catalog.json"
+
+    @pytest.fixture(autouse=True)
+    def _catalog_path(self, catalog_path, monkeypatch):
+        """The route builds CatalogQuery without a catalog_path argument, so it falls back
+        to config.CATALOG_PATH -- point that at the isolated fixture path."""
+        monkeypatch.setattr(config, "CATALOG_PATH", catalog_path)
+        return catalog_path
+
+    def _write(self, base_path, catalog_path, **overrides):
+        grid = GRIDS["veg_grid_cell_v001"]
+        kwargs = {
+            "variable": "vct",
+            "grid": "veg_grid_cell_v001",
+            "time_unit": "annual",
+            "model_group_id": 500,
+            "scenario_id": 7,
+            "model": "icm_v2023.0.0",
+            "calendar_year": 2030,
+            **overrides,
+        }
+        write_cog(
+            np.zeros((grid.height, grid.width), dtype="float32"),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            **kwargs,
+        )
+
+    def test_returns_choices_results_and_exact(self, client, base_path, _catalog_path):
+        self._write(base_path, _catalog_path)
+        response = client.get(self.URL)
+        assert response.status_code == 200
+        assert set(response.json()) == {"choices", "results", "exact"}
+
+    def test_reports_available_scenarios(self, client, base_path, _catalog_path):
+        self._write(base_path, _catalog_path, scenario_id=7)
+        self._write(base_path, _catalog_path, scenario_id=8)
+        body = client.get(self.URL).json()
+        assert body["choices"]["scenario_id"] == [7, 8]
+
+    def test_selection_is_reflected_in_results(self, client, base_path, _catalog_path):
+        self._write(base_path, _catalog_path, scenario_id=7)
+        self._write(base_path, _catalog_path, scenario_id=8)
+        body = client.get(f"{self.URL}?scenario_id=8").json()
+        assert body["results"]["scenario_id"] == [8]
+
+    def test_unavailable_selection_is_inexact(self, client, base_path, _catalog_path):
+        self._write(base_path, _catalog_path)
+        body = client.get(f"{self.URL}?scenario_id=99").json()
+        assert body["exact"] is False
+
+    def test_missing_catalog_entries_is_404(self, client, _catalog_path):
+        """No data has ever been written for this variable/time_unit/grid -- CatalogQuery's
+        _load_catalog finds no catalog files under catalog_path and raises ValueError,
+        which the route translates into a 404."""
+        response = client.get(self.URL)
+        assert response.status_code == 404
+        assert "No catalog entries" in response.json()["detail"]
