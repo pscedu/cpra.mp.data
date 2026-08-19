@@ -63,7 +63,7 @@ jupyter = [
     "jupyterlab>=4.5.7",
     "maplibre[all]"
 ]
-scripts = ["affine", "fastexcel", "playwright", "pyproj", "tippecanoe"]
+scripts = ["affine", "fastexcel", "playwright", "pyproj", "tippecanoe", "tqdm"]
 
 [dependency-groups]
 dev = [

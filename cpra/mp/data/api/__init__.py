@@ -3,12 +3,11 @@ from functools import lru_cache
 from typing import Annotated
 
 import polars.selectors as cs
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
-from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.crosswalk import Crosswalk
 from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
@@ -28,7 +27,6 @@ from cpra.mp.data.api.models import (
     VisualizationQuery,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
-from cpra.mp.data.api.vector import VectorTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.types import CrosswalkGrid, DataFormat, OutputType, TileFormat
@@ -38,6 +36,8 @@ from cpra.mp.data.api.utils import (
     validate_compression,
     validate_format,
 )
+from cpra.mp.data.api.vector import VectorTileResponse
+from cpra.mp.data.catalog import CatalogQuery
 from cpra.mp.data.config import MPD_URI, STREAM_THRESHOLD
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -45,6 +45,7 @@ from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.utils import glob_lazy_frame
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations import VISUALIZATIONS
+
 
 @lru_cache(maxsize=1)
 def get_mpd_engine():
@@ -182,7 +183,7 @@ async def datasets(format: DataFormat, compression: Annotated[Compression, Query
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/catalog.json",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/catalog.json",
     tags=["Catalog"],
 )
 async def query_catalog(
@@ -190,11 +191,15 @@ async def query_catalog(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     catalog_query = CatalogQuery(dataset_dimensions, filter_dimensions)
-    return JSONResponse(content=catalog_query.execute())
+    try:
+        result = catalog_query.execute()
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail=str(err)) from err
+    return JSONResponse(content=result)
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/data.{format}",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/data.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_data(
@@ -216,7 +221,7 @@ async def get_model_data(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/data/{z}/{x}/{y}.{format}",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/data/{z}/{x}/{y}.{format}",
     tags=["Data and Analysis"],
 )
 async def get_model_tile(
@@ -234,7 +239,7 @@ async def get_model_tile(
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/tiles/{z}/{x}/{y}.pbf",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/tiles/{z}/{x}/{y}.pbf",
     tags=["Data and Analysis"],
 )
 async def get_vector_tile(
@@ -256,7 +261,7 @@ def visualizations() -> list[Visualization]:
 
 
 @app.get(
-    "/v1/datasets/{variable}/{grid}/{time_unit}/visualization/{visualization_name}.json",
+    "/v1/datasets/{variable}/{time_unit}/{grid}/visualization/{visualization_name}.json",
     tags=["Visualization"],
 )
 async def get_dataset_visualization(
@@ -266,12 +271,13 @@ async def get_dataset_visualization(
     dataset_dimensions: DatasetDimensions = Depends(),
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
+    query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
     visualization = VisualizationClass(
         variable=dataset_dimensions.variable,
         grid=dataset_dimensions.grid,
         time_unit=dataset_dimensions.time_unit,
         request=request,
-        **dict(query),
+        **query_dict,
     )
     return JSONResponse(visualization.spec)
 

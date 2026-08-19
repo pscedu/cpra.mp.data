@@ -58,13 +58,13 @@ class TimeSeriesLine(DatasetVisualization):
         nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
 
-        # The data is keyed by whatever the API reports as `geography`, but the legend shows
-        # `geography_label` — a coordinate selection carries the resolved grid cell ID, which
+        # The data is keyed by whatever the API reports as `grid_cell`, but the legend shows
+        # `grid_cell_label` — a coordinate selection carries the resolved grid cell ID, which
         # is what actually identifies the values being drawn. The row index doubles as the
         # tooltip's column key below, so both label lists line up with it.
-        geography_df = pl.DataFrame(
-            dict(geography=self.geographies, geography_label=self.geography_labels)
-        ).with_row_index(name="geography_idx")
+        grid_cell_label_df = pl.DataFrame(
+            dict(grid_cell=self.geographies, grid_cell_label=self.geography_labels)
+        ).with_row_index(name="grid_cell_label_idx")
 
         main_line_encodings = [
             alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
@@ -74,7 +74,7 @@ class TimeSeriesLine(DatasetVisualization):
             # Each series is colored as the map colors the geography it draws, rather than by
             # its position in the legend — see `geography_colors`, which is why the palette
             # isn't handed over whole.
-            alt.Color("geography_label:N")
+            alt.Color("grid_cell_label:N")
             .title(self.grid.label)
             .scale(domain=self.geography_labels, range=self.geography_colors),
         ] + [
@@ -85,8 +85,8 @@ class TimeSeriesLine(DatasetVisualization):
         main_line = (
             self.get_base_chart(self.data_source, self.time_column)
             .transform_lookup(
-                "geography",
-                from_=alt.LookupData(geography_df, "geography", ["geography_label"]),
+                "grid_cell",
+                from_=alt.LookupData(grid_cell_label_df, "grid_cell", ["grid_cell_label"]),
             )
             .mark_line()
             .encode(*main_line_encodings)
@@ -95,6 +95,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
+        grid_cell_df = pl.DataFrame(dict(grid_cell=self.geographies)).with_row_index(name="grid_cell_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
@@ -113,15 +114,15 @@ class TimeSeriesLine(DatasetVisualization):
         # uses String() coercion on the key, so the number 0 (from JSON's 0.0) becomes
         # "0" and fails to match the CSV string "0.0". Loose == coerces correctly.
         rules = self.get_base_chart(self.data_source, self.time_column).transform_lookup(
-            "geography",
-            from_=alt.LookupData(geography_df, "geography", ["geography_idx"]),
+            "grid_cell",
+            from_=alt.LookupData(grid_cell_df, "grid_cell", ["grid_cell_idx"]),
         )
         for dim_name, dim_values in compare_dimensions.items():
             idx_expr = (
                 " : ".join([f"datum.{dim_name} == {json.dumps(v)} ? {i}" for i, v in enumerate(dim_values)]) + " : null"
             )
             rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
-        pivot_key_parts = ["geography_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
+        pivot_key_parts = ["grid_cell_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
         rules = (
             rules.transform_calculate(tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts]))
             .transform_pivot("tooltip", value="value", groupby=["date", self.time_column])

@@ -60,6 +60,12 @@ def base_path(tmp_path):
 
 
 @pytest.fixture
+def catalog_path(tmp_path):
+    """An isolated catalog directory."""
+    return tmp_path / "catalog"
+
+
+@pytest.fixture
 def crosswalk_path(tmp_path, monkeypatch):
     """An isolated crosswalk directory, patched over the configured one."""
     path = tmp_path / "crosswalk"

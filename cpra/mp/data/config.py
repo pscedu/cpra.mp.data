@@ -15,6 +15,7 @@ def get_config(name, default_value):
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
 CROSSWALK_PATH = Path(get_config("CROSSWALK_PATH", Path(__file__).parent / "crosswalk"))
+CATALOG_PATH = Path(get_config("CATALOG_PATH", str(BASE_PATH.parent / "catalog")))
 GEOMETRY_PATH = Path(__file__).parent / "geometry"
 TILES_PATH = Path(get_config("TILES_PATH", "/ocean/projects/bcs200002p/shared/tiles"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
@@ -30,6 +31,34 @@ def get_base_path(base_path=None):
     """
     return Path(base_path) if base_path is not None else BASE_PATH
 
+
+def get_catalog_path(catalog_path=None):
+    """Resolve a catalog path, falling back to the configured default.
+
+    Read at call time rather than bound as a default argument value so that
+    overriding CATALOG_PATH (in tests, or between calls) takes effect.
+    """
+    return Path(catalog_path) if catalog_path is not None else CATALOG_PATH
+
+
+# GDAL thread count for raster reads/writes (see api.utils.raster_gdal_env). Tunable
+# because the API runs as a single process and already spreads files across a thread
+# pool, so the two widths multiply under concurrent requests.
+RASTER_NUM_THREADS = get_config("RASTER_NUM_THREADS", "ALL_CPUS")
+
+# CreateCopy streaming chunk, and the block cache that bounds it -- GDAL clamps the swath
+# to half of GDAL_CACHEMAX, so the two must be raised together (see
+# api.utils.raster_copy_gdal_env). The cache is process-global, so this also bounds cache
+# growth across concurrent requests instead of leaving it at GDAL's default 5% of RAM.
+RASTER_SWATH_SIZE_MB = int(get_config("RASTER_SWATH_SIZE_MB", "512"))
+RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
+
+# Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
+RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
+
+# Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is
+# the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
+RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))
 
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")

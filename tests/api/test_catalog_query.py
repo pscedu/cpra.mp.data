@@ -10,8 +10,8 @@ import datetime
 import pytest
 from fastapi import HTTPException
 
-from cpra.mp.data.api.catalog import CatalogQuery
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
+from cpra.mp.data.catalog import CatalogQuery
 from cpra.mp.data.raster import write_cog
 from cpra.mp.data.tabular import write_parquet
 

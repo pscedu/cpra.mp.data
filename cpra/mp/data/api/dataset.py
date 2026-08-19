@@ -1,8 +1,11 @@
 import asyncio
 import itertools
 import re
+import tempfile
 from contextlib import ExitStack
+from functools import partial
 from io import BytesIO
+from pathlib import Path
 
 import mercantile
 import numpy as np
@@ -14,6 +17,7 @@ from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.enums import Resampling
+from rasterio.shutil import copy as rio_copy
 from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
@@ -30,20 +34,38 @@ from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.api.utils import (
     asynctiming,
     get_lazy_frame,
+    group_rows_by_path,
     parallel_read_rasters,
     parallel_sample_rasters,
+    raster_copy_gdal_env,
+    raster_gdal_env,
     unpack_values,
+)
+from cpra.mp.data.config import (
+    RASTER_NUM_THREADS,
+    RASTER_USE_VRT_COPY,
+    RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS, Legend
+from cpra.mp.data.raster import scale_vrt_bands, set_vrt_band_descriptions, vrt
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 from cpra.mp.data.variables import VARIABLES, Variable
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
-DIMENSION_COLUMNS = cs.matches(r"^[a-z]")
-VALUE_COLUMNS = cs.matches(r"^[0-9\-]")
+DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")
+VALUE_COLUMNS = cs.by_name("value")
+
+# Interleaving for downloaded rasters, set rather than inherited from the source. A source
+# COG may be written INTERLEAVE=TILE, which is a COG-driver-only option that the GTiff driver
+# used here rejects outright ("INTERLEAVE=tile unsupported, value must be PIXEL or BAND"), so
+# inheriting it makes such a source undownloadable. PIXEL is also what keeps a multiband
+# response small: the same 52-band elev selection wrote 1.65 GB pixel-interleaved versus
+# 19.3 GB band-interleaved, since only pixel interleaving puts each pixel's bands adjacent
+# for the compression predictor.
+OUTPUT_INTERLEAVE = "PIXEL"
 
 # Zonal summarize aggregates, as (reducing ufunc, accumulator start value) pairs. Every
 # aggregate reduces the same way; mean additionally divides by the pixel counts that
@@ -84,8 +106,8 @@ class Dataset(LazyFrameSource):
         self.filter_dimensions = filter_dimensions
         self.options = options
         self.dataset_bounds = None
-        self.geography_ids = None
-        self.summarize_geography_ids = None
+        self.grid_cell_ids = None
+        self.summarize_grid_cell_ids = None
         self.raster_groups = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
@@ -134,7 +156,7 @@ class Dataset(LazyFrameSource):
     @property
     def output_type(self) -> OutputType:
         """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.options.geography or self.options.summarize_by:
+        if self.grid.grid_type == "vector" or self.options.grid_cell or self.options.summarize_by:
             return OutputType.vector
         return OutputType.raster
 
@@ -157,54 +179,68 @@ class Dataset(LazyFrameSource):
         if self.options.where:
             self.lf = self.lf.sql(f"select * from self where {self.options.where}")
 
-        if self.options.geography:
+        if self.options.grid_cell:
             if self.grid.grid_type == "vector":
-                await self._apply_geography_vector()
+                await self._apply_grid_cell_vector()
             else:
-                await self._apply_geography_raster()
+                await self._apply_grid_cell_raster()
 
-    async def _apply_geography_vector(self):
-        """Apply the geography filter to a vector-grid dataset.
+    async def _apply_grid_cell_vector(self):
+        """Apply the grid_cell filter to a vector-grid dataset.
 
         Accepts either grid cell IDs or lat/lng coordinate pairs, matching the raster
-        convention. A geography value is treated as IDs only if every token is a plain
+        convention. A grid_cell value is treated as IDs only if every token is a plain
         (unsigned, non-decimal) digit string; otherwise the whole list is parsed as
         coordinate pairs and resolved to grid cell IDs via point-in-polygon lookup
         against the grid's geometry. Coordinates that don't fall inside any polygon are
         dropped rather than erroring.
 
         Either way the result is reported under grid cell IDs, never the coordinates that
-        selected them: a vector geography *is* its ID, and IDs double as column names here.
-        Several coordinates landing in one cell therefore select it once.
+        selected them: a vector grid_cell *is* its ID. Several coordinates landing in one
+        cell therefore select it once.
         """
-        values = unpack_values(self.options.geography, "geography")
+        values = unpack_values(self.options.grid_cell, "grid_cell")
 
         if all(value.isdigit() for value in values):
             # TODO: Validate that the given IDs fall within the grid min and max.
-            geography_ids = values
+            grid_cell_ids = values
         else:
             lngs, lats = parse_coordinate_pairs(values)
             resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
-            geography_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
+            grid_cell_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
 
-        self.geography_ids = list(dict.fromkeys(geography_ids))
-        self.lf = self.lf.select(cs.matches(r"^[a-z]"), *self.geography_ids)
+        self.grid_cell_ids = list(dict.fromkeys(grid_cell_ids))
+        self.lf = self.lf.filter(pl.col("grid_cell").is_in([int(g) for g in self.grid_cell_ids]))
 
-    async def _apply_geography_raster(self):
-        """Apply the geography filter to a raster-grid dataset."""
-        lngs, lats = parse_coordinate_pairs(unpack_values(self.options.geography, "geography"))
+    async def _apply_grid_cell_raster(self):
+        """Apply the grid_cell filter to a raster-grid dataset."""
+        lngs, lats = parse_coordinate_pairs(unpack_values(self.options.grid_cell, "grid_cell"))
 
         # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
+        # Rows sharing the same path (bands of the same multiband COG) are grouped so each
+        # file is opened and sampled once, requesting all of its needed bands together.
         df = self.materialize()
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            datasets = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            datasets = [stack.enter_context(rio.open(path)) for path in unique_paths]
             projected_pairs = list(zip(*project_coordinates(lngs, lats, datasets[0].crs)))
-            samples = await parallel_sample_rasters(datasets, projected_pairs)
+            group_samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
+            dtype = datasets[0].dtypes[0]
 
-        # Add the resulting values to the LazyFrame, and remove the path column.
-        columns = [np.concatenate(col) for col in zip(*samples)]
+        # Add the resulting values to the LazyFrame as one column per sampled coordinate,
+        # then unpivot into long format (grid_cell/value) to match the long-format contract
+        # used everywhere else in the API. Each grid_cell here is a "lng,lat" coordinate
+        # pair label rather than an integer grid ID, since these are arbitrary sample points.
+        columns = [np.empty(len(df), dtype=dtype) for _ in lngs]
+        for path_row_indices, path_samples in zip(row_indices, group_samples):
+            for column, values in zip(columns, path_samples):
+                column[path_row_indices] = values
         column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-        self.lf = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path")).lazy()
+        wide_df = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band"))
+        index_cols = [col for col in wide_df.columns if col not in column_labels]
+        self.lf = wide_df.unpivot(
+            index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
+        ).lazy()
 
     def _apply_calculate_params(self):
         """Apply calculate parameters to the LazyFrame."""
@@ -245,7 +281,7 @@ class Dataset(LazyFrameSource):
         if self.options.select is not None:
             required_cols = required_columns(
                 get_input_data_frame(**dict(self.dataset_dimensions)),
-                include_geography=True,
+                include_grid_cell=True,
                 include_value=True,
             )
             select_cols = unpack_values(self.options.select, "select", required_cols)
@@ -279,10 +315,11 @@ class Dataset(LazyFrameSource):
             required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
             null_cols = [col for col in required_cols if col not in group_by_cols]
 
-            self.lf = getattr(
-                self.lf.select(pl.exclude(null_cols)).group_by(*group_by_cols),
-                self.options.group_aggregate,
-            )()
+            # grid_cell must always be part of the group key in long format since each
+            # row represents a single grid_cell.
+            self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
+                getattr(pl.col("value"), self.options.group_aggregate)()
+            )
 
             if null_cols:
                 self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
@@ -307,12 +344,12 @@ class Dataset(LazyFrameSource):
             msg = "summarize_by and summarize_aggregate parameters must be used together"
             raise HTTPException(status_code=400, detail=msg)
 
-        # Extract and validate summary geography IDs, if present.
-        if self.options.summarize_geography:
+        # Extract and validate summary grid_cell IDs, if present.
+        if self.options.summarize_grid_cell:
             # summarize_grid = GRIDS[self.options.summarize_by]
             # TODO: Validate that the given IDs fall within the grid min and max.
-            self.summarize_geography_ids = [
-                int(geo_id) for geo_id in unpack_values(self.options.summarize_geography, "summarize_geography")
+            self.summarize_grid_cell_ids = [
+                int(geo_id) for geo_id in unpack_values(self.options.summarize_grid_cell, "summarize_grid_cell")
             ]
 
         return True
@@ -324,7 +361,7 @@ class Dataset(LazyFrameSource):
             return
 
         # Generate column expressions.
-        crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
+        crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.parquet"
         crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
 
         # scan_parquet is lazy and won't raise for a missing file until collection,
@@ -335,34 +372,24 @@ class Dataset(LazyFrameSource):
 
         crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
 
-        if self.geography_ids:
-            # geography_ids stay strings because they double as column names; the
-            # crosswalk's src_id is an integer, so cast here as summarize_geography does.
-            crosswalk_lf = crosswalk_lf.filter(
-                pl.col("src_id").is_in([int(geo_id) for geo_id in self.geography_ids])
-            )
+        if self.grid_cell_ids:
+            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in self.grid_cell_ids]))
 
-        if self.summarize_geography_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_geography_ids))
+        if self.summarize_grid_cell_ids:
+            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_grid_cell_ids))
 
-        crosswalk_df = (
-            crosswalk_lf.select("dst_id", summarize_columns=pl.struct("src_id", "scale_factor"))
-            .group_by(pl.col("dst_id"))
-            .agg("summarize_columns")
-            .sort("dst_id")
-            .collect()
+        # Join the data on grid_cell == src_id, scale the values, then aggregate
+        # per destination grid_cell. The join replaces the wide-format horizontal
+        # aggregation that was used when each source grid_cell was a column.
+        dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
+        agg_fn = self.options.summarize_aggregate
+        self.lf = (
+            self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
+            .with_columns(value=pl.col("value") * pl.col("scale_factor"))
+            .group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
+            .agg(getattr(pl.col("value"), agg_fn)())
+            .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
         )
-
-        agg_function = getattr(pl, f"{self.options.summarize_aggregate}_horizontal")
-        self.lf = self.lf.select(
-            DIMENSION_COLUMNS,
-            **{
-                str(row["dst_id"]): agg_function(
-                    *[pl.col(str(col["src_id"])) * col["scale_factor"] for col in row["summarize_columns"]]
-                )
-                for row in crosswalk_df.iter_rows(named=True)
-            },
-        ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
 
     def _get_raster_dimension_frame(self, df):
         """Get a DataFrame with one row per output raster band, aligned by row order
@@ -391,7 +418,7 @@ class Dataset(LazyFrameSource):
         if not self._validate_summarize_params():
             return
 
-        crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.tif"
+        crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.tif"
         crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
@@ -409,8 +436,8 @@ class Dataset(LazyFrameSource):
         with ExitStack() as stack:
             crosswalk = stack.enter_context(rio.open(crosswalk_path))
             inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
-            if self.summarize_geography_ids:
-                zone_ids = np.array(sorted(self.summarize_geography_ids), dtype="int64")
+            if self.summarize_grid_cell_ids:
+                zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
             else:
                 dst_ids = crosswalk.tags()["dst_ids"].split(",")
                 zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
@@ -456,17 +483,21 @@ class Dataset(LazyFrameSource):
         )
         result[:, ~seen] = np.nan
 
+        # Assemble in wide format (one column per zone) to line up with `result`'s shape,
+        # then unpivot to the long-format grid_cell/value contract used everywhere else --
+        # matching _apply_transform_params_vector's join-based output shape.
+        dim_cols = dim_df.columns
         self.lf = (
             dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
-            .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+            .unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
+            .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by))
             .lazy()
         )
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""
-
-        if self.options.unpivot:
-            self.lf = self.lf.unpivot(index=DIMENSION_COLUMNS, variable_name="geography")
+        # Data is already in long format on disk; nothing to do here. The parameter
+        # is kept for backward API compatibility.
 
     async def apply_params(self):
         """Apply the query parameters to the LazyFrame."""
@@ -520,11 +551,11 @@ class Dataset(LazyFrameSource):
 
         # Estimate columns.
         columns = None
-        if self.geography_ids is not None:
-            columns = len(self.geography_ids)
+        if self.grid_cell_ids is not None:
+            columns = len(self.grid_cell_ids)
         else:
             grid = GRIDS[self.dataset_dimensions.grid]
-            columns = getattr(grid, "id_count", None)
+            columns = getattr(self.grid, "id_count", None)
 
             if columns is None:
                 height = getattr(grid, "height", None)
@@ -567,14 +598,17 @@ class Dataset(LazyFrameSource):
 
         grid_name = self.options.summarize_by or self.grid.name
         if not (config.TILES_PATH / f"{grid_name}.pmtiles").exists():
-            raise HTTPException(
-                status_code=404, detail=f"no tile file for grid: {grid_name}"
-            )
+            raise HTTPException(status_code=404, detail=f"no tile file for grid: {grid_name}")
 
     @asynctiming
     async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
         """Get an MVT tile with dataset values injected into pre-generated geometry."""
-        from cpra.mp.data.api.vector import _data_to_id_value, inject_and_serialize, parse_tile, read_pmtile
+        from cpra.mp.data.api.vector import (
+            _data_to_id_value,
+            inject_and_serialize,
+            parse_tile,
+            read_pmtile,
+        )
 
         grid_name = self.options.summarize_by or self.grid.name
         tile = mercantile.Tile(x, y, z)
@@ -590,11 +624,11 @@ class Dataset(LazyFrameSource):
             return None
 
         tile_id_strs = [str(fid) for fid in raw_ids]
-        if self.summarize_geography_ids is not None:
-            valid = {str(gid) for gid in self.summarize_geography_ids}
+        if self.summarize_grid_cell_ids is not None:
+            valid = {str(gid) for gid in self.summarize_grid_cell_ids}
             val_cols = [c for c in tile_id_strs if c in valid]
-        elif self.geography_ids is not None:
-            valid = {str(gid) for gid in self.geography_ids}
+        elif self.grid_cell_ids is not None:
+            valid = {str(gid) for gid in self.grid_cell_ids}
             val_cols = [c for c in tile_id_strs if c in valid]
         else:
             val_cols = tile_id_strs
@@ -602,7 +636,8 @@ class Dataset(LazyFrameSource):
         if not val_cols:
             return None
 
-        df = self.lf.select(val_cols).collect()
+        tile_ints = [int(c) for c in val_cols]
+        df = self.lf.filter(pl.col("grid_cell").is_in(tile_ints)).collect()
         if df.is_empty():
             return None
 
@@ -612,10 +647,18 @@ class Dataset(LazyFrameSource):
 
         return inject_and_serialize(vt, id_values)
 
-    async def get_raster_array(self, df, rasters, window, out_shape=None):
-        """Read a raster array and apply the operations specified
-        in the index DataFrame."""
-        data = np.vstack(await parallel_read_rasters(rasters, window, out_shape))
+    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None):
+        """Read a raster array and apply the operations specified in the index DataFrame.
+
+        ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
+        multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
+        with ``row_indices``/``bands`` mapping each raster back to the df rows and band
+        numbers it supplies.
+        """
+        band_reads = await parallel_read_rasters(rasters, window, out_shape, bands=bands)
+        data = np.empty((len(df), *band_reads[0].shape[1:]), dtype=band_reads[0].dtype)
+        for path_row_indices, read in zip(row_indices, band_reads):
+            data[path_row_indices] = read
 
         # Apply multipliers from calculate parameters.
         if not (df["multiplier"] == 1).all():
@@ -641,8 +684,9 @@ class Dataset(LazyFrameSource):
             return None
 
         df = self.materialize()
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
 
             if not self.dataset_bounds:
                 self.dataset_bounds = BoundingBox(
@@ -671,7 +715,11 @@ class Dataset(LazyFrameSource):
                 for dataset in inputs
             ]
 
-            data = await self.get_raster_array(df, vrts, None)
+            # Each VRT above is already warped directly onto the tile's own pixel grid
+            # (tile_transform/tile_size), so no separate intersection window or output
+            # shape needs to be computed here -- reading the whole VRT reads exactly the
+            # tile, and GDAL fills anything outside the source's extent with nodata.
+            data = await self.get_raster_array(df, vrts, row_indices, bands, None)
             color = self.legend.colorize_pixels(data)
             # JPEG has no alpha channel, so drop it. fromarray infers RGB vs RGBA from the
             # array's shape, and passing mode= explicitly is deprecated as of Pillow 11.
@@ -683,28 +731,151 @@ class Dataset(LazyFrameSource):
 
     @asynctiming
     async def write_raster(self, out_path, **kwargs):
-        """Write a raster dataset to a file using windowed reading and writing
-        to conserve memory."""
+        """Write the selected bands to a raster file.
+
+        Wide selections are streamed by GDAL from a band-separate VRT
+        (``_write_raster_vrt``); narrow ones read windows into NumPy
+        (``_write_raster_windowed``).  The two are within noise of each other on time, so the
+        choice is made on memory -- see ``_windowed_read_is_lighter``.
+
+        Aggregated selections always take the windowed path. GDAL's builtin ``mean``/``sum``/
+        ``min``/``max`` pixel functions can express the reduction and are more accurate (they
+        accumulate in float64 and can propagate nodata, neither of which the NumPy reduce
+        does), but collapsing bands onto one ``VRTDerivedRasterBand`` makes GDAL re-read
+        every contributing band per output chunk -- for one PIXEL-interleaved multiband
+        source that decompresses each tile once per band. Measured reducing 52 elev bands:
+        983s vs 80s, at every swath size tried. The windowed path reads each tile once.
+        """
 
         df = self.materialize()
         if not len(df):
             return False
 
+        if (
+            self.raster_groups is not None
+            or not RASTER_USE_VRT_COPY
+            or self._windowed_read_is_lighter(df)
+        ):
+            return await self._write_raster_windowed(df, out_path, **kwargs)
+        return await self._write_raster_vrt(df, out_path, **kwargs)
+
+    def _windowed_read_is_lighter(self, df):
+        """Whether the windowed path would use less memory than the VRT copy for ``df``.
+
+        The windowed path holds one ``(bands, block_height, width)`` buffer per window plus
+        the read that fills it, so its peak grows with the number of selected bands; the VRT
+        copy's peak is roughly flat, set by the swath and cache caps.  Measured on 52-band
+        float32 elev (peak RSS, windowed vs VRT): 1 band 1027 vs 1425 MB, 5 bands 1470 vs
+        1329 MB, 52 bands 7983 vs 2529 MB -- so the crossover is around 4-5 bands here, and
+        expressing it as a buffer size rather than a band count keeps it right for grids and
+        dtypes of other sizes.
+        """
+
+        with rio.open(df["path"][0]) as source:
+            block_height = source.block_shapes[0][0]
+            buffer_bytes = len(df) * block_height * source.width * np.dtype(source.dtypes[0]).itemsize
+        return buffer_bytes <= RASTER_WINDOW_BUFFER_LIMIT_MB * 1024 * 1024
+
+    def _calendar_column(self, df):
+        """The calendar dimension present in ``df``, if any."""
+
+        return next((col for col in ("calendar_year", "calendar_day") if col in df.columns), None)
+
+    async def _write_raster_vrt(self, df, out_path, **kwargs):
+        """Stream the selected bands into ``out_path`` via a band-separate VRT.
+
+        The VRT names each selected ``(path, band)`` as one output band, so GDAL reads each
+        source once and never materializes the stack -- see ``raster_copy_gdal_env`` for the
+        swath/cache settings that make this pay off.  Band descriptions and the multiply
+        parameters are applied to the VRT XML rather than to pixels in Python.
+        """
+
+        sources = list(zip(df["path"].to_list(), df["band"].to_list()))
+        vrt_text = vrt(sources)
+
+        # Label output bands with their calendar value, as the windowed path does. Set
+        # explicitly rather than inherited so legacy sources (no on-disk description) are
+        # labeled too -- see set_vrt_band_descriptions. Skipped when aggregating, since an
+        # aggregated band spans several calendar values.
+        calendar_col = self._calendar_column(df)
+        if calendar_col is not None:
+            descriptions = [f"{calendar_col}={value}" for value in df[calendar_col].to_list()]
+            vrt_text = set_vrt_band_descriptions(vrt_text, descriptions)
+
+        # Apply multipliers from the calculate parameters. Applied to each source before
+        # any aggregation below, matching the windowed path's multiply-then-reduce order.
+        factors = df["multiplier"].to_list()
+        if not all(factor == 1 for factor in factors):
+            vrt_text = scale_vrt_bands(vrt_text, factors)
+
+        with rio.open(sources[0][0]) as source:
+            profile = source.profile
+        creation_options = {
+            "driver": "GTiff",
+            "tiled": profile.get("tiled", True),
+            "blockxsize": profile.get("blockxsize"),
+            "blockysize": profile.get("blockysize"),
+            "interleave": OUTPUT_INTERLEAVE,
+            "num_threads": RASTER_NUM_THREADS,
+            "bigtiff": "YES",
+            **kwargs,
+        }
+        creation_options = {k: v for k, v in creation_options.items() if v is not None}
+
+        # The VRT is a throwaway sidecar whose SimpleSource entries hold absolute paths, so
+        # its location doesn't matter -- keep it out of the output directory.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            vrt_path = Path(tmp_dir) / "download.vrt"
+            vrt_path.write_text(vrt_text)
+
+            # CreateCopy is one long blocking call, unlike the windowed path's per-window
+            # awaits, so it runs in the default executor to keep the event loop free for
+            # other requests. GDAL config is process-global, so the env entered here
+            # applies inside the worker thread.
+            loop = asyncio.get_running_loop()
+            with raster_copy_gdal_env():
+                await loop.run_in_executor(
+                    None,
+                    partial(rio_copy, str(vrt_path), str(out_path), **creation_options),
+                )
+
+        return True
+
+    async def _write_raster_windowed(self, df, out_path, **kwargs):
+        """Write a raster dataset to a file using windowed reading and writing
+        to conserve memory."""
+
+        unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            # Entered before the sources are opened so the thread setting applies to them.
+            stack.enter_context(raster_gdal_env())
+            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
+
+            # Each selected (path, band) row — or each aggregated group — becomes one
+            # output band, so the source's own band count must be overridden.
+            if self.raster_groups is not None:
+                out_count = self.raster_groups.select(pl.len()).collect().item()
+            else:
+                out_count = len(df)
             profile = inputs[0].profile.copy()
-            profile.update(kwargs)
             # group_by/group_aggregate can collapse the matched bands into fewer output
             # bands, so the output band count can't just be copied from the (single-band)
             # source COGs' profile.
-            profile["count"] = self.raster_groups.collect().height if self.raster_groups is not None else len(df)
+            profile.update(count=out_count, interleave=OUTPUT_INTERLEAVE, **kwargs)
             output = stack.enter_context(rio.open(out_path, "w", **profile))
+
+            # Label output bands with their calendar value when rows map 1:1 to bands.
+            if self.raster_groups is None:
+                calendar_col = self._calendar_column(df)
+                if calendar_col is not None:
+                    for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
+                        output.set_band_description(band_idx, f"{calendar_col}={value}")
 
             # Group raster blocks by row, and read an entire row of blocks at once.
             groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
-                data = await self.get_raster_array(df, inputs, window)
+                data = await self.get_raster_array(df, inputs, row_indices, bands, window)
                 output.write(data, window=window)
 
         return True

@@ -89,8 +89,8 @@ class BaseVisualization:
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
 
-        required_cols = required_columns(pl.DataFrame({"variable": variable, "grid": grid, "time_unit": time_unit}))
-        select = [self.get_time_column(time_unit), "geography", "value"]
+        required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit, "grid": grid}))
+        select = [self.get_time_column(time_unit), "grid_cell", "value"]
 
         # Force unpivot to be true.
         kwargs["unpivot"] = True
@@ -98,8 +98,8 @@ class BaseVisualization:
         params = []
         for param_name, param_values in kwargs.items():
             if isinstance(param_values, (list, tuple)):
-                if param_name == "geography":
-                    params.append(("geography", ",".join([str(geo) for geo in param_values])))
+                if param_name == "grid_cell":
+                    params.append(("grid_cell", ",".join([str(geo) for geo in param_values])))
                 else:
                     for value in param_values:
                         params.append((param_name, value))
@@ -116,12 +116,12 @@ class BaseVisualization:
             dataset_url = self.request.url_for(
                 "get_model_data",
                 variable=variable,
-                grid=grid,
                 time_unit=time_unit,
+                grid=grid,
                 format="csv",
             )
         else:
-            dataset_url = "https://api.mpdp.coastal.la.gov/v1/datasets" f"/{variable}/{grid}/{time_unit}/data.csv"
+            dataset_url = f"https://api.mpdp.coastal.la.gov/v1/datasets/{variable}/{time_unit}/{grid}/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
 
@@ -139,7 +139,7 @@ class BaseVisualization:
             # A vector grid reports geography as numeric grid cell IDs however the caller
             # asked for it; a raster grid reports the "lng,lat" string it was given.
             if GRIDS[grid].grid_type == "vector":
-                parse["geography"] = "number"
+                parse["grid_cell"] = "number"
             time_column = self.get_time_column(time_unit)
             parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
 
@@ -225,7 +225,7 @@ class DatasetVisualization(BaseVisualization):
         """Get the selected geographies as the API keys them in its own output.
 
         A vector grid takes either grid cell IDs or lat/lng coordinate pairs; a raster
-        grid only takes coordinates. These are what a `geography` value in the response
+        grid only takes coordinates. These are what a `grid_cell` value in the response
         will actually equal, so they're what a scale domain or a lookup key has to match —
         see `geography_labels` for what to show the reader instead.
         """
@@ -283,7 +283,7 @@ class DatasetVisualization(BaseVisualization):
         The color is the map's, and so is taken from the geography's place in the selection
         rather than from its place in this list, which dropping and collapsing shorten.
         """
-        geography = self.params["geography"]
+        geography = self.params["grid_cell"]
 
         if self.grid.grid_type == "vector" and is_geography_ids(geography):
             ids = [int(token) for token in geography_tokens(geography)]

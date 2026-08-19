@@ -3,13 +3,19 @@ from enum import Enum
 from functools import wraps
 from time import time
 
+import rasterio as rio
 from cachetools import TTLCache, cached
 from fastapi import HTTPException
 from rasterio.enums import Resampling
 
 from cpra.mp.data import read_data
 from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
-from cpra.mp.data.config import DEBUG
+from cpra.mp.data.config import (
+    DEBUG,
+    RASTER_CACHE_MAX_MB,
+    RASTER_NUM_THREADS,
+    RASTER_SWATH_SIZE_MB,
+)
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
@@ -62,29 +68,131 @@ def timing(func):
     return wrapped
 
 
-def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest):
-    """Read a window of data from a single raster."""
-    return dataset.read(window=window, out_shape=out_shape, resampling=resampling)
+def raster_gdal_env():
+    """GDAL configuration for reading and writing rasters.
+
+    ``GDAL_NUM_THREADS`` parallelizes tile decompression, which dominates every read of
+    a multiband COG: selecting a subset of bands still decompresses each tile's full
+    band payload, so a 1-band read costs nearly as much as a 52-band one. Setting it
+    measured 2.2-3.7x faster across band counts with byte-identical output.
+
+    Capping ``GDAL_CACHEMAX`` is what keeps the windowed path's peak memory down, at no
+    measurable cost in time: reading one band of a 52-band float32 COG went from 4226 MB to
+    1027 MB peak RSS. Above a handful of bands the path's own NumPy buffers dominate instead
+    and the cap can't help (52 bands still peaks near 8 GB, which is why wide selections are
+    routed to the copy path -- see ``Dataset._windowed_read_is_lighter``). Being
+    process-global, the cap also bounds cache growth across concurrent requests rather than
+    leaving it at GDAL's default 5% of RAM.
+
+    Deliberately not applied to tile requests -- those read a decimated 256x256 window
+    through existing overviews and measured no benefit from threading.
+    """
+
+    return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB)
 
 
-async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest):
-    """Read several rasters in multiple threads."""
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[loop.run_in_executor(None, _read_window, dataset, window, out_shape, resampling) for dataset in datasets]
+def raster_copy_gdal_env():
+    """GDAL configuration for the VRT + ``CreateCopy`` download path.
+
+    ``CreateCopy`` streams the output in ``GDAL_SWATH_SIZE`` chunks, only 10MB by default.
+    Each chunk re-enters GDAL's per-block path, which for a PIXEL-interleaved multiband
+    COG decompresses every band of every tile it touches -- the same cost that makes a
+    one-block-row-at-a-time loop slow. Raising the swath amortizes it: measured 91.8s ->
+    22.8s for one band of a 52-band float32 COG. GDAL clamps the swath to half of
+    ``GDAL_CACHEMAX``, so the cache has to be raised alongside it; capping the cache is
+    also what keeps peak memory down (3-4x lower than the windowed path).
+
+    ``GDAL_CACHEMAX`` must be an int -- a str raises ``TypeError`` from ``rio.Env``.
+
+    ``GDAL_PAM_ENABLED=NO`` stops GDAL writing a ``.aux.xml`` sidecar for the per-band
+    descriptions the copy carries over (the GTiff output embeds them natively). The
+    response streams only the TIFF, so a sidecar would just be orphaned in the temp dir.
+    """
+
+    return rio.Env(
+        GDAL_NUM_THREADS=RASTER_NUM_THREADS,
+        GDAL_SWATH_SIZE=str(RASTER_SWATH_SIZE_MB * 1024 * 1024),
+        GDAL_CACHEMAX=RASTER_CACHE_MAX_MB,
+        GDAL_PAM_ENABLED="NO",
     )
 
 
-def _sample_raster(dataset, coordinates):
-    """Sample a single raster at the given coordinates."""
-    return list(dataset.sample(coordinates))
+def group_rows_by_path(df):
+    """Group a materialized index DataFrame's rows by unique ``path``.
+
+    Multiband COGs mean several df rows (different bands, e.g. different
+    ``calendar_year`` values) can share the same file. Callers use this to open each
+    file once and request all of its needed bands in a single read/sample call, rather
+    than reopening the same file per row.
+
+    Returns ``(paths, row_indices, bands)`` where ``paths`` are the unique paths in
+    first-seen order, ``row_indices[i]`` are the df row positions backed by
+    ``paths[i]``, and ``bands[i]`` are the corresponding band numbers (1-based, in the
+    same order as ``row_indices[i]``), or None if df has no ``band`` column.
+    """
+    paths = df["path"].to_list()
+    has_bands = "band" in df.columns
+    row_bands = df["band"].to_list() if has_bands else [None] * len(paths)
+
+    order = []
+    row_indices_by_path = {}
+    bands_by_path = {}
+    for row_idx, (path, band) in enumerate(zip(paths, row_bands)):
+        if path not in row_indices_by_path:
+            order.append(path)
+            row_indices_by_path[path] = []
+            bands_by_path[path] = []
+        row_indices_by_path[path].append(row_idx)
+        bands_by_path[path].append(band)
+
+    row_indices = [row_indices_by_path[path] for path in order]
+    bands = [bands_by_path[path] if has_bands else None for path in order]
+    return order, row_indices, bands
 
 
-async def parallel_sample_rasters(datasets, coordinates):
-    """Sample several rasters at the given coordinates in multiple threads."""
+def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None):
+    """Read a window of data from a single raster (optionally a subset of bands)."""
+    return dataset.read(indexes=indexes, window=window, out_shape=out_shape, resampling=resampling)
+
+
+async def parallel_read_rasters(datasets, window=None, out_shape=None, resampling=Resampling.nearest, bands=None):
+    """Read several rasters in multiple threads.
+
+    ``bands`` optionally selects, per dataset, the list of band numbers (1-based) to
+    read; each dataset's selected bands are read together as one ``(n, height, width)``
+    array. When ``bands`` is None every band of each dataset is read.
+    """
     loop = asyncio.get_running_loop()
+    if bands is None:
+        bands = [None] * len(datasets)
     return await asyncio.gather(
-        *[loop.run_in_executor(None, _sample_raster, dataset, coordinates) for dataset in datasets]
+        *[
+            loop.run_in_executor(None, _read_window, dataset, window, out_shape, resampling, band)
+            for dataset, band in zip(datasets, bands)
+        ]
+    )
+
+
+def _sample_raster(dataset, coordinates, bands=None):
+    """Sample a single raster at the given coordinates (optionally a subset of bands)."""
+    return list(dataset.sample(coordinates, indexes=bands))
+
+
+async def parallel_sample_rasters(datasets, coordinates, bands=None):
+    """Sample several rasters at the given coordinates in multiple threads.
+
+    ``bands`` optionally selects, per dataset, the list of band numbers (1-based) to
+    sample; each dataset's selected bands are sampled together in one call. When
+    ``bands`` is None every band of each dataset is sampled.
+    """
+    loop = asyncio.get_running_loop()
+    if bands is None:
+        bands = [None] * len(datasets)
+    return await asyncio.gather(
+        *[
+            loop.run_in_executor(None, _sample_raster, dataset, coordinates, band)
+            for dataset, band in zip(datasets, bands)
+        ]
     )
 
 

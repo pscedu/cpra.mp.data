@@ -31,12 +31,26 @@ class RasterioStreamingResponse(FileResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         with tempfile.NamedTemporaryFile() as fp:
-            profile_options = {
-                "compress": self.compression.compression_algorithm.value.upper()
-            }
-            level_option = COMPRESSION_LEVEL_OPTIONS.get(self.compression.compression_algorithm)
-            if level_option is not None:
-                profile_options[level_option] = self.compression.compression_level
+            max_z_error = self.dataset.variable.max_z_error
+            if max_z_error is not None:
+                # The source is already LERC_ZSTD-quantized at this tolerance (see
+                # raster.py's Variable.max_z_error), so re-encoding the response as plain
+                # ZSTD would lose that structure and produce a *larger* file -- measured
+                # ~4x bigger for a single-band elev download. Matching the response codec
+                # to the source keeps it smaller than today's ZSTD response, not just no
+                # worse, so this overrides the client's requested compression algorithm.
+                profile_options = {
+                    "compress": "LERC_ZSTD",
+                    "max_z_error": max_z_error,
+                    "zstd_level": self.compression.compression_level,
+                }
+            else:
+                profile_options = {
+                    "compress": self.compression.compression_algorithm.value.upper()
+                }
+                level_option = COMPRESSION_LEVEL_OPTIONS.get(self.compression.compression_algorithm)
+                if level_option is not None:
+                    profile_options[level_option] = self.compression.compression_level
 
             if await self.dataset.write_raster(fp.name, **profile_options):
                 self.path = fp.name
