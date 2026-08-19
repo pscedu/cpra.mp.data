@@ -26,17 +26,17 @@ def parse_coordinate_pairs(values):
     try:
         coords = [float(value) for value in values]
     except ValueError:
-        raise HTTPException(status_code=400, detail="geography contains non-numeric coordinates")
+        raise HTTPException(status_code=400, detail="grid_cell contains non-numeric coordinates")
 
     if len(coords) % 2:
-        raise HTTPException(status_code=400, detail="geography contain an even number of coordinates")
+        raise HTTPException(status_code=400, detail="grid_cell contain an even number of coordinates")
 
     lngs = []
     lats = []
     for start_idx in range(0, len(coords), 2):
         lng, lat = coords[start_idx : start_idx + 2]
         if not -180 <= lng <= 180 or not -90 <= lat <= 90:
-            msg = f"geography contains invalid coordinate pair: {lng}, {lat}"
+            msg = f"grid_cell contains invalid coordinate pair: {lng}, {lat}"
             raise HTTPException(status_code=400, detail=msg)
         lngs.append(lng)
         lats.append(lat)
@@ -57,7 +57,7 @@ def project_coordinates(lngs: list[float], lats: list[float], dst_crs) -> tuple[
         xs, ys = transform(CRS.from_epsg(4326), dst_crs, lngs, lats)
     except CPLE_BaseError:
         pairs = [f"{lng}, {lat}" for lng, lat in zip(lngs, lats) if _is_unprojectable(lng, lat, dst_crs)]
-        msg = f"geography contains coordinate pairs outside the grid's projection: {'; '.join(pairs)}"
+        msg = f"grid_cell contains coordinate pairs outside the grid's projection: {'; '.join(pairs)}"
         raise HTTPException(status_code=400, detail=msg)
 
     return list(xs), list(ys)
@@ -105,7 +105,7 @@ def _projected_points(grid_name: str, lngs: list[float], lats: list[float]):
     return fgb_path, list(zip(xs, ys))
 
 
-async def resolve_vector_geography(grid_name: str, lngs: list[float], lats: list[float]) -> list[int | None]:
+async def resolve_vector_grid_cell(grid_name: str, lngs: list[float], lats: list[float]) -> list[int | None]:
     """Resolve WGS84 (lng, lat) pairs to grid cell IDs for a vector grid.
 
     Returns one ID per input pair, in order, with `None` for points that don't fall
@@ -119,23 +119,23 @@ async def resolve_vector_geography(grid_name: str, lngs: list[float], lats: list
     )
 
 
-def representative_points(grid_name: str, geography_ids: list[int] | None = None) -> dict[int, tuple]:
-    """Get a representative WGS84 (lng, lat) point for each geography in a vector grid.
+def representative_points(grid_name: str, grid_cell_ids: list[int] | None = None) -> dict[int, tuple]:
+    """Get a representative WGS84 (lng, lat) point for each grid cell in a vector grid.
 
     The point is PostGIS's `ST_PointOnSurface`, so it is guaranteed to lie inside the
-    polygon it names — unlike a centroid, which a concave or multi-part geography can
+    polygon it names — unlike a centroid, which a concave or multi-part grid cell can
     place outside itself, and which would then be a coordinate that doesn't select the
-    geography it came from.
+    grid cell it came from.
 
-    Geographies are read by attribute filter rather than by scanning the whole file, and
+    Grid cells are read by attribute filter rather than by scanning the whole file, and
     IDs with no polygon are simply absent from the result.
     """
     fgb_path = _geometry_path(grid_name)
     where = None
-    if geography_ids is not None:
-        if not geography_ids:
+    if grid_cell_ids is not None:
+        if not grid_cell_ids:
             return {}
-        where = f"id IN ({','.join(str(int(geo_id)) for geo_id in geography_ids)})"
+        where = f"id IN ({','.join(str(int(grid_cell_id)) for grid_cell_id in grid_cell_ids)})"
 
     gdf = pyogrio.read_dataframe(fgb_path, columns=["id"], where=where)
     if gdf.empty:
@@ -143,11 +143,11 @@ def representative_points(grid_name: str, geography_ids: list[int] | None = None
 
     points = gdf.geometry.representative_point()
     lngs, lats = transform(CRS.from_user_input(gdf.crs), CRS.from_epsg(4326), list(points.x), list(points.y))
-    return {int(geo_id): point for geo_id, point in zip(gdf["id"], zip(lngs, lats))}
+    return {int(grid_cell_id): point for grid_cell_id, point in zip(gdf["id"], zip(lngs, lats))}
 
 
-def resolve_vector_geography_sync(grid_name: str, lngs: list[float], lats: list[float]) -> list[int | None]:
-    """Blocking form of `resolve_vector_geography`, for callers outside the event loop.
+def resolve_vector_grid_cell_sync(grid_name: str, lngs: list[float], lats: list[float]) -> list[int | None]:
+    """Blocking form of `resolve_vector_grid_cell`, for callers outside the event loop.
 
     A visualization builds its spec from synchronous properties but still needs the cell
     IDs behind a coordinate selection to label itself — the same trade `map.py` makes when

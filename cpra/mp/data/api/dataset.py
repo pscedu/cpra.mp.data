@@ -26,7 +26,7 @@ from cpra.mp.data import config
 from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
     project_coordinates,
-    resolve_vector_geography,
+    resolve_vector_grid_cell,
 )
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -167,7 +167,7 @@ class Dataset(LazyFrameSource):
     def _is_raster_metadata_table(self):
         """Whether self.lf still holds the raster band-metadata table (dimension columns
         and a path column), as opposed to a tabular result already derived from raster
-        pixels (via geography sampling or summarize_by). Unlike `output_type`, which
+        pixels (via grid_cell sampling or summarize_by). Unlike `output_type`, which
         reflects the dataset's final response shape and is stable for the whole request,
         this reflects self.lf's shape at the point it's called, since summarize_by's
         raster-to-tabular conversion doesn't happen until the transform stage.
@@ -206,7 +206,7 @@ class Dataset(LazyFrameSource):
             grid_cell_ids = values
         else:
             lngs, lats = parse_coordinate_pairs(values)
-            resolved = await resolve_vector_geography(self.grid.name, lngs, lats)
+            resolved = await resolve_vector_grid_cell(self.grid.name, lngs, lats)
             grid_cell_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
 
         self.grid_cell_ids = list(dict.fromkeys(grid_cell_ids))
@@ -333,7 +333,7 @@ class Dataset(LazyFrameSource):
         self._apply_unpivot_param()
 
     def _validate_summarize_params(self):
-        """Validate summarize parameters and parse summary geography IDs, if present.
+        """Validate summarize parameters and parse summary grid_cell IDs, if present.
 
         Returns True if summarize_by/summarize_aggregate were provided, False if neither was.
         """
@@ -412,8 +412,8 @@ class Dataset(LazyFrameSource):
         Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
         pre-generated zone-ID crosswalk raster (see scripts/generate_raster_crosswalks.py),
         converting the result into a tabular LazyFrame in the same shape produced by
-        `_apply_transform_params_vector` (dimension columns, one column per destination
-        geography ID, and a `geographic_unit` column).
+        `_apply_transform_params_vector` (dimension columns, a `grid_cell` column holding
+        the destination grid_cell ID, a `value` column, and a `geographic_unit` column).
         """
         if not self._validate_summarize_params():
             return

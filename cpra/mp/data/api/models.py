@@ -88,7 +88,7 @@ class DataQuery(TileQuery, Compression):
 class CrosswalkQuery(Compression):
     model_config = ConfigDict(use_enum_values=True)
 
-    geography: str | None = None
+    grid_cell: str | None = None
     to_grid: list[GridName] | None = None
 
     @property
@@ -156,7 +156,7 @@ class Visualization(BaseModel):
     name: str
     label: str
     type: str
-    max_geographies: int
+    max_grid_cells: int
     variables: list[str] | None = None
 
 

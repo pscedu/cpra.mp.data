@@ -11,25 +11,25 @@ from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations.colors import selection_color
 
 
-def geography_tokens(geography):
-    """Split a `geography` parameter into stripped string tokens.
+def grid_cell_tokens(grid_cell):
+    """Split a `grid_cell` parameter into stripped string tokens.
 
     Accepts either the comma-separated string the API binds from the query string or the
     plain sequence a notebook is more likely to pass.
     """
-    values = geography.split(",") if isinstance(geography, str) else geography
+    values = grid_cell.split(",") if isinstance(grid_cell, str) else grid_cell
     return [str(value).strip() for value in values]
 
 
-def is_geography_ids(geography):
-    """Are these geography values grid cell IDs rather than lat/lng coordinate pairs?
+def is_grid_cell_ids(grid_cell):
+    """Are these grid_cell values grid cell IDs rather than lat/lng coordinate pairs?
 
-    Mirrors the rule in `Dataset._apply_geography_vector`: values are IDs only when every
+    Mirrors the rule in `Dataset._apply_grid_cell_vector`: values are IDs only when every
     token is a plain unsigned digit string, so anything carrying a decimal point or a sign
-    is a coordinate. Only meaningful for a vector grid, since raster geography is always
-    coordinates. An absent geography selects the whole grid, which is keyed by ID.
+    is a coordinate. Only meaningful for a vector grid, since a raster grid_cell is always
+    coordinates. An absent grid_cell selects the whole grid, which is keyed by ID.
     """
-    return geography is None or all(token.isdigit() for token in geography_tokens(geography))
+    return grid_cell is None or all(token.isdigit() for token in grid_cell_tokens(grid_cell))
 
 
 class BaseVisualization:
@@ -136,7 +136,7 @@ class BaseVisualization:
 
         if parse is None:
             parse = {"value": "number"}
-            # A vector grid reports geography as numeric grid cell IDs however the caller
+            # A vector grid reports grid_cell as numeric grid cell IDs however the caller
             # asked for it; a raster grid reports the "lng,lat" string it was given.
             if GRIDS[grid].grid_type == "vector":
                 parse["grid_cell"] = "number"
@@ -221,56 +221,56 @@ class DatasetVisualization(BaseVisualization):
         return "" if self.params.get("negate") is None else " Difference"
 
     @cached_property
-    def geographies(self):
-        """Get the selected geographies as the API keys them in its own output.
+    def grid_cells(self):
+        """Get the selected grid cells as the API keys them in its own output.
 
         A vector grid takes either grid cell IDs or lat/lng coordinate pairs; a raster
         grid only takes coordinates. These are what a `grid_cell` value in the response
         will actually equal, so they're what a scale domain or a lookup key has to match —
-        see `geography_labels` for what to show the reader instead.
+        see `grid_cell_labels` for what to show the reader instead.
         """
-        return [geography for geography, _, _, _ in self._geographies]
+        return [grid_cell for grid_cell, _, _, _ in self._grid_cells]
 
     @cached_property
-    def geography_labels(self):
-        """Get a display label per selected geography, in the same order as `geographies`.
+    def grid_cell_labels(self):
+        """Get a display label per selected grid cell, in the same order as `grid_cells`.
 
-        Identifies a geography in full, for somewhere with room for it — a legend. A
+        Identifies a grid cell in full, for somewhere with room for it — a legend. A
         coordinate is shown parenthesized, and on a vector grid it's prefixed with the ID of
         the cell it landed in, since the cell — not the point — is what the values describe:
         `24`, `24 (-90.49, 30.01)`, or `(-90.49, 30.01)` on a raster grid.
         """
-        return [label for _, label, _, _ in self._geographies]
+        return [label for _, label, _, _ in self._grid_cells]
 
     @cached_property
-    def geography_short_labels(self):
-        """Get a compact display label per selected geography, in the same order.
+    def grid_cell_short_labels(self):
+        """Get a compact display label per selected grid cell, in the same order.
 
         For somewhere a full label would crowd out the numbers being read, like a tooltip
-        with one row per geography. Where a grid cell ID is available it stands alone, since
+        with one row per grid cell. Where a grid cell ID is available it stands alone, since
         it's what the values describe and the coordinate that selected it only repeats what
         the legend already says. A raster pixel has no ID, so the coordinate is all there is
         to show. Two coordinates inside one cell therefore share a short label; the legend is
         what tells them apart.
         """
-        return [short_label for _, _, short_label, _ in self._geographies]
+        return [short_label for _, _, short_label, _ in self._grid_cells]
 
     @cached_property
-    def geography_colors(self):
-        """Get the color the map draws each selected geography with, in the same order.
+    def grid_cell_colors(self):
+        """Get the color the map draws each selected grid cell with, in the same order.
 
-        A chart is read beside the map, so a geography has to carry the same color in both.
-        The map's color comes from the geography's place in the *selection*, which is not its
+        A chart is read beside the map, so a grid cell has to carry the same color in both.
+        The map's color comes from the grid cell's place in the *selection*, which is not its
         place in this list: a coordinate that fell outside the grid, or inside a cell an
         earlier coordinate already took, is left out here and takes its color out with it.
         Pairing the whole palette with this list positionally would instead shift every
         series after such a coordinate onto the color of the pin before it.
         """
-        return [color for _, _, _, color in self._geographies]
+        return [color for _, _, _, color in self._grid_cells]
 
     @cached_property
-    def _geographies(self):
-        """One `(API geography key, label, short label, color)` tuple per selected geography.
+    def _grid_cells(self):
+        """One `(API grid_cell key, label, short label, color)` tuple per selected grid cell.
 
         A raster grid is keyed by the coordinate itself, reported as a `"lng,lat"` string
         built from the parsed floats — so round-trip the tokens through `float` to match
@@ -280,16 +280,19 @@ class DatasetVisualization(BaseVisualization):
         coordinate outside the grid drops out, as it does there, and coordinates sharing a
         cell collapse into the one series the response actually carries.
 
-        The color is the map's, and so is taken from the geography's place in the selection
+        The color is the map's, and so is taken from the grid cell's place in the selection
         rather than from its place in this list, which dropping and collapsing shorten.
         """
-        geography = self.params["grid_cell"]
+        grid_cell = self.params["grid_cell"]
 
-        if self.grid.grid_type == "vector" and is_geography_ids(geography):
-            ids = [int(token) for token in geography_tokens(geography)]
-            return [(geo_id, str(geo_id), str(geo_id), selection_color(i)) for i, geo_id in enumerate(ids)]
+        if self.grid.grid_type == "vector" and is_grid_cell_ids(grid_cell):
+            ids = [int(token) for token in grid_cell_tokens(grid_cell)]
+            return [
+                (grid_cell_id, str(grid_cell_id), str(grid_cell_id), selection_color(i))
+                for i, grid_cell_id in enumerate(ids)
+            ]
 
-        coords = [float(token) for token in geography_tokens(geography)]
+        coords = [float(token) for token in grid_cell_tokens(grid_cell)]
         pairs = list(zip(coords[::2], coords[1::2]))
 
         if self.grid.grid_type != "vector":
@@ -301,18 +304,23 @@ class DatasetVisualization(BaseVisualization):
         # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
         # a notebook that only builds specs shouldn't need either. Same reason map.py
         # imports Dataset where it uses it.
-        from cpra.mp.data.api.geography import resolve_vector_geography_sync
+        from cpra.mp.data.api.geography import resolve_vector_grid_cell_sync
 
-        ids = resolve_vector_geography_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
+        ids = resolve_vector_grid_cell_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
 
-        geographies = {}
-        for i, ((lng, lat), geo_id) in enumerate(zip(pairs, ids)):
+        grid_cells = {}
+        for i, ((lng, lat), grid_cell_id) in enumerate(zip(pairs, ids)):
             # First coordinate wins a shared cell: the response has one series for it, so a
             # second entry would be a legend key the data never matches. Its color is the
             # first coordinate's too, which is how the map draws the cell's outline.
-            if geo_id is not None and geo_id not in geographies:
-                geographies[geo_id] = (geo_id, f"{geo_id} ({lng}, {lat})", str(geo_id), selection_color(i))
-        return list(geographies.values())
+            if grid_cell_id is not None and grid_cell_id not in grid_cells:
+                grid_cells[grid_cell_id] = (
+                    grid_cell_id,
+                    f"{grid_cell_id} ({lng}, {lat})",
+                    str(grid_cell_id),
+                    selection_color(i),
+                )
+        return list(grid_cells.values())
 
     @cached_property
     def time_column(self):

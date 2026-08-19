@@ -131,7 +131,7 @@ def dimensions(session: MPDSession) -> list[Dimension]:
 
 @app.get("/v1/grids.json", tags=["Catalog"])
 def grids() -> list[Grid]:
-    # TODO: Compress geography IDs into ranges.
+    # TODO: Compress grid_cell IDs into ranges.
     return [
         Grid(
             name=grid.name,
@@ -158,7 +158,7 @@ async def get_crosswalk(
     compression = query.compression
     validate_compression(compression, format)
     validate_format(format, OutputType.vector)
-    crosswalk = Crosswalk(source_grid.value, query.geography, query.to_grid)
+    crosswalk = Crosswalk(source_grid.value, query.grid_cell, query.to_grid)
     source = LazyFrameSource((await crosswalk.execute()).lazy())
     return PolarsStreamingResponse(source, format, compression, collect_in_memory=True)
 

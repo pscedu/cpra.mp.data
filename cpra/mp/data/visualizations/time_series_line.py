@@ -19,7 +19,7 @@ class TimeSeriesLine(DatasetVisualization):
         name = "time-series-line"
         label = "Time Series Line"
         type = "dataset"
-        max_geographies = 10
+        max_grid_cells = 10
 
     def chart(self):
         """Build the visualization using Altair."""
@@ -63,7 +63,7 @@ class TimeSeriesLine(DatasetVisualization):
         # is what actually identifies the values being drawn. The row index doubles as the
         # tooltip's column key below, so both label lists line up with it.
         grid_cell_label_df = pl.DataFrame(
-            dict(grid_cell=self.geographies, grid_cell_label=self.geography_labels)
+            dict(grid_cell=self.grid_cells, grid_cell_label=self.grid_cell_labels)
         ).with_row_index(name="grid_cell_label_idx")
 
         main_line_encodings = [
@@ -71,12 +71,12 @@ class TimeSeriesLine(DatasetVisualization):
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
             .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
-            # Each series is colored as the map colors the geography it draws, rather than by
-            # its position in the legend — see `geography_colors`, which is why the palette
+            # Each series is colored as the map colors the grid cell it draws, rather than by
+            # its position in the legend — see `grid_cell_colors`, which is why the palette
             # isn't handed over whole.
             alt.Color("grid_cell_label:N")
             .title(self.grid.label)
-            .scale(domain=self.geography_labels, range=self.geography_colors),
+            .scale(domain=self.grid_cell_labels, range=self.grid_cell_colors),
         ] + [
             compare_channels[i](f"{dimension}:N").title(DIMENSIONS[dimension].label)
             for i, dimension in enumerate(compare_dimensions.keys())
@@ -95,7 +95,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
-        grid_cell_df = pl.DataFrame(dict(grid_cell=self.geographies)).with_row_index(name="grid_cell_idx")
+        grid_cell_df = pl.DataFrame(dict(grid_cell=self.grid_cells)).with_row_index(name="grid_cell_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
@@ -103,9 +103,9 @@ class TimeSeriesLine(DatasetVisualization):
                 title=f"{label}: {', '.join([str(c) for c in val_choices])}",
                 format=self.variable.number_format or "",
             )
-            # Short labels here: a tooltip carries a row per geography, so a full label
+            # Short labels here: a tooltip carries a row per grid cell, so a full label
             # would push the numbers being read off to the right.
-            for i, label in enumerate(self.geography_short_labels)
+            for i, label in enumerate(self.grid_cell_short_labels)
             for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 

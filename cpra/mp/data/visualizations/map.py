@@ -29,7 +29,7 @@ class Map(DatasetVisualization):
         name = "map"
         label = "Map Visualization"
         type = "dataset"
-        max_geographies = 10
+        max_grid_cells = 10
 
     @cached_property
     def feature_colors(self) -> dict[str, str]:
@@ -40,7 +40,7 @@ class Map(DatasetVisualization):
         rather than a full color expression evaluation per feature per frame.
 
         Returns:
-            A dictionary mapping string geography IDs to hex color strings.
+            A dictionary mapping string grid cell IDs to hex color strings.
         """
         if self.grid.grid_type != "vector":
             return {}
@@ -957,7 +957,7 @@ class Map(DatasetVisualization):
 
         # Set an empty object as the default value for selection colors.
         # TODO: Add support for setting initial selection colors based on the value
-        # of the geographies parameter.
+        # of the grid_cell parameter.
         style["state"]["selectionColors"] = {"default": {}}
 
         return style

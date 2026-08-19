@@ -18,7 +18,7 @@ class StackedBar(DatasetVisualization):
         name = "stacked-bar"
         label = "Stacked Bar"
         type = "dataset"
-        max_geographies = 1
+        max_grid_cells = 1
 
     def chart(self):
         """Build the visualization using Altair."""
