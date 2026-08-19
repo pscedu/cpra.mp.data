@@ -23,15 +23,17 @@ Data layers (--historic-data, the historic persistent-change raster):
   2. Write historic_1932.png, the state at the start of the record: everything that later
      changed is drawn in its pale "hasn't happened yet" color, land where the record shows
      loss and water where it shows gain.
-  3. For each year group in HISTORIC_GROUPS, write historic_<group>.png coloring land
-     loss in that group and older groups by the group's own color, land gain in those
-     groups a single green, change newer than the group a pale gray, and everything
-     else transparent.
+  3. For each year group in HISTORIC_GROUPS, write historic_<group>.png. Color follows a
+     period's role in the frame, not which period it is: that group is the current period
+     and takes the saturated loss/gain pair, the groups before it take the pale pair, the
+     groups after it stay the "hasn't happened yet" gray, and everything else is
+     transparent.
   4. With --land-water-data and --baseline-land-water-data, extend the series one group
-     past the historic raster's 2015 end date: write historic_2015_2024.png, which is the
-     last historic group's image with the pixels that flipped land/water state by 2024
-     recolored. The 2015 state is the baseline raster with the historic change classes
-     burned in, so ground the historic raster never classified still gets compared. The
+     past the historic raster's 2015 end date: write historic_2015_2024.png, where every
+     historic group is a previous period and the pixels that flipped land/water state by
+     2024 are the current one. The 2015 state is the baseline raster with the historic
+     change classes burned in, so ground the historic raster never classified still gets
+     compared. The
      comparison runs at the historic raster's own 15 m resolution and only then gets
      downsampled to the video grid, so the inputs are compared where they describe the
      same ground.
@@ -103,28 +105,31 @@ HISTORIC_PERIOD_YEARS = [
 N_HISTORIC_PERIODS = len(HISTORIC_PERIOD_YEARS) - 1  # 19
 GAIN_VALUE_OFFSET = N_HISTORIC_PERIODS
 
-# The year groups to emit one PNG per, with the loss color for each, from
-# historic_groups.png. The int is the index of the last loss period in the group, so
-# each group covers the periods after the previous group's through its own.
+# The year groups to emit one PNG per. The int is the index of the last loss period in
+# the group, so each group covers the periods after the previous group's through its own.
 HISTORIC_GROUPS = [
-    ("1932_1956", 1, "#DEF5F8"),
-    ("1956_1975", 3, "#ACE5ED"),
-    ("1975_1985", 5, "#71D6E6"),
-    ("1985_1995", 8, "#42C0D6"),
-    ("1995_2004", 12, "#4591AC"),
-    ("2004_2006", 13, "#1D6985"),
-    ("2006_2015", 19, "#004265"),
+    ("1932_1956", 1),
+    ("1956_1975", 3),
+    ("1975_1985", 5),
+    ("1985_1995", 8),
+    ("1995_2004", 12),
+    ("2004_2006", 13),
+    ("2006_2015", 19),
 ]
 
-_group_ends = [last for _, last, _ in HISTORIC_GROUPS]
+_group_ends = [last for _, last in HISTORIC_GROUPS]
 assert _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS, (
     f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
 )
 
-# Land gain up to and including the selected group is drawn in a single green rather
-# than per-group colors; change newer than the selected group is drawn in a pale
-# "hasn't happened yet" gray.
-PAST_GAIN_COLOR = "#265118"
+# Color depends on a period's role in the frame being drawn rather than on which period it
+# is (see historical_colors_revised.png): the group the frame is "on" is the current
+# period, the groups before it are previous, and the groups after it haven't happened yet
+# and are drawn in a pale gray.
+CURRENT_LOSS_COLOR = "#4591AC"
+CURRENT_GAIN_COLOR = "#265118"
+PREVIOUS_LOSS_COLOR = "#A0C7D4"
+PREVIOUS_GAIN_COLOR = "#ABCB9F"
 FUTURE_LOSS_COLOR = "#E4E4E4"
 FUTURE_GAIN_COLOR = "#F1F1F1"
 
@@ -141,8 +146,6 @@ INITIAL_STATE_LABEL = str(HISTORIC_PERIOD_YEARS[0])
 # Only class 2 is water; every other valid class is some form of land.
 LND_TYPE_OPEN_WATER = 2
 LAND_WATER_GROUP_LABEL = "2015_2024"
-NEW_LOSS_COLOR = "#00263B"  # land in 2015 -> water in 2024
-NEW_GAIN_COLOR = "#265118"  # water in 2015 -> land in 2024
 
 # Land/water state codes the lnd_type classes are reduced to before comparing.
 LW_UNKNOWN, LW_LAND, LW_WATER = 0, 1, 2
@@ -452,31 +455,36 @@ def hex_to_rgba(color: str):
 
 
 def historic_group_lut(selected: int):
-    """Build a (256,4) uint8 RGBA lookup table mapping historic class values to colors
-    for the year group at index `selected`: loss in that group and older groups keeps
-    each group's own color, gain in those groups collapses to PAST_GAIN_COLOR, and
-    change in newer groups goes pale. Class values with no group (0, and 39..255)
-    are left fully transparent.
+    """Build a (256,4) uint8 RGBA lookup table mapping historic class values to colors for
+    a frame drawn on the year group at index `selected`. That group is the current period
+    and gets the current loss/gain colors; groups before it are previous and groups after
+    it are future. Class values with no group (0, and 39..255) are left fully transparent.
 
-    NO_GROUP_SELECTED puts every group in the future, which is the state at the start of
-    the record: nothing has changed yet, so every loss class is still land and every gain
-    class is still water."""
+    Two indexes outside the range of groups are meaningful. NO_GROUP_SELECTED puts every
+    group in the future, which is the state at the start of the record: nothing has changed
+    yet, so every loss class is still land and every gain class is still water. An index
+    past the last group makes every group previous, for a frame whose current period comes
+    after the historic record ends.
+    """
     lut = np.zeros((256, 4), dtype=np.uint8)
     first = 1
-    for group_idx, (_, last, color) in enumerate(HISTORIC_GROUPS):
-        past = group_idx <= selected
-        loss_rgba = hex_to_rgba(color if past else FUTURE_LOSS_COLOR)
-        gain_rgba = hex_to_rgba(PAST_GAIN_COLOR if past else FUTURE_GAIN_COLOR)
+    for group_idx, (_, last) in enumerate(HISTORIC_GROUPS):
+        if group_idx == selected:
+            loss_color, gain_color = CURRENT_LOSS_COLOR, CURRENT_GAIN_COLOR
+        elif group_idx < selected:
+            loss_color, gain_color = PREVIOUS_LOSS_COLOR, PREVIOUS_GAIN_COLOR
+        else:
+            loss_color, gain_color = FUTURE_LOSS_COLOR, FUTURE_GAIN_COLOR
         for period in range(first, last + 1):
-            lut[period] = loss_rgba
-            lut[GAIN_VALUE_OFFSET + period] = gain_rgba
+            lut[period] = hex_to_rgba(loss_color)
+            lut[GAIN_VALUE_OFFSET + period] = hex_to_rgba(gain_color)
         first = last + 1
     return lut
 
 
 def write_historic_group_pngs(classes: np.ndarray, output_dir: Path):
     write_historic_png(output_dir, INITIAL_STATE_LABEL, historic_group_lut(NO_GROUP_SELECTED)[classes])
-    for group_idx, (label, _, _) in enumerate(HISTORIC_GROUPS):
+    for group_idx, (label, _) in enumerate(HISTORIC_GROUPS):
         rgba = historic_group_lut(group_idx)[classes]  # H, W, 4
         write_historic_png(output_dir, label, rgba)
 
@@ -549,10 +557,13 @@ def compare_land_water_at_historic_grid(historic_path: Path, baseline_path: Path
 
 
 def land_water_group_lut():
-    """The last historic group's colors, plus the two 2015-2024 transition classes."""
-    lut = historic_group_lut(len(HISTORIC_GROUPS) - 1)
-    lut[LAND_TO_WATER_CLASS] = hex_to_rgba(NEW_LOSS_COLOR)
-    lut[WATER_TO_LAND_CLASS] = hex_to_rgba(NEW_GAIN_COLOR)
+    """Every historic group as a previous period, plus the two 2015-2024 transition
+    classes. 2015-2024 is this frame's current period, so it takes the current loss/gain
+    colors and no group in the historic record is current — including the 2006-2015 one
+    that was current in the frame before this."""
+    lut = historic_group_lut(len(HISTORIC_GROUPS))
+    lut[LAND_TO_WATER_CLASS] = hex_to_rgba(CURRENT_LOSS_COLOR)
+    lut[WATER_TO_LAND_CLASS] = hex_to_rgba(CURRENT_GAIN_COLOR)
     return lut
 
 
