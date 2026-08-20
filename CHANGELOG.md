@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.50.0](https://github.com/pscedu/cpra.mp.data/compare/v0.49.1...v0.50.0) (2026-08-20)
+
+
+### Features
+
+* **cli:** generate area-weighted vector-to-vector crosswalks ([a86c1f7](https://github.com/pscedu/cpra.mp.data/commit/a86c1f79cf50bd3e408a3312c3d50dce66694c68))
+* **cli:** migrate crosswalk generation scripts to CLI ([55130af](https://github.com/pscedu/cpra.mp.data/commit/55130aff6642f99594d8c287d311c4f07500aeb1))
+
 ## [0.49.1](https://github.com/pscedu/cpra.mp.data/compare/v0.49.0...v0.49.1) (2026-08-20)
 
 
