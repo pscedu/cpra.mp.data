@@ -197,6 +197,15 @@ def write_parquet(
                 raise ValidationError(msg)
 
         if sort:
+            # The select below needs every required column, so check for them eagerly
+            # even when validate=False. Otherwise the failure surfaces as a Polars
+            # ColumnNotFoundError raised inside a sink producer thread, once the lazy
+            # plan is materialized and far from the caller that omitted the column.
+            missing_cols = [col for col in required_cols if col not in lf.collect_schema().names()]
+            if missing_cols:
+                msg = f"Required columns are missing: {', '.join(missing_cols)}"
+                raise ValidationError(msg)
+
             outer_cols = [col for col in required_cols if not col.startswith("calendar_") and col not in kwargs]
             sort_exprs = long_sort_expressions(outer_cols, time_unit)
             lf = lf.select(*required_cols, "grid_cell", "value").sort(*sort_exprs)

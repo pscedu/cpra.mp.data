@@ -117,14 +117,11 @@ class TestWriteParquetValidation:
 
     def test_sort_reports_a_column_required_by_the_data_itself(self, base_path):
         """With validation off, the sort branch still needs a column that the frame's
-        own dimension values imply: annual data must carry calendar_year. Unlike the
-        validate branch, this isn't caught up front with a friendly ValidationError --
-        Polars' own ColumnNotFoundError surfaces once the sort's `.select()` plan is
-        materialized. Kept as a regression test for *some* failure being raised (rather
-        than silently writing incomplete data); see this port's report for the
-        friendliness gap."""
+        own dimension values imply: annual data must carry calendar_year. It is checked
+        eagerly, so the caller gets this package's own error rather than a Polars
+        ColumnNotFoundError raised from inside a sink producer thread."""
         df = annual_frame().drop("calendar_year")
-        with pytest.raises(pl.exceptions.ColumnNotFoundError, match="calendar_year"):
+        with pytest.raises(ValidationError, match="calendar_year"):
             write_parquet(df, base_path=base_path, validate=False, sort=True)
 
     def test_unexpected_column_raises(self, base_path):
