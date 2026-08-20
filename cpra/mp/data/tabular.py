@@ -189,6 +189,21 @@ def write_parquet(
                     msg = f"Grid cell ID above maximum for grid {grid.name}: {gc_max}"
                     raise ValidationError(msg)
 
+            # Partial writes are not allowed: every grid cell ID must be present, and
+            # each must appear the same number of times (once per implied time step) --
+            # otherwise some grid cells would be missing time steps that others have.
+            if grid.id_count is not None:
+                counts = lf.group_by("grid_cell").agg(pl.len().alias("n")).collect()
+                if counts.height != grid.id_count:
+                    msg = (
+                        f"Grid cell IDs incomplete for grid {grid.name}: "
+                        f"expected {grid.id_count} unique IDs, found {counts.height}"
+                    )
+                    raise ValidationError(msg)
+                if counts["n"].n_unique() != 1:
+                    msg = f"Grid cell IDs have inconsistent row counts for grid {grid.name}"
+                    raise ValidationError(msg)
+
             # Validate value column dtype.
             variable = VARIABLES[meta["variable"][0]]
             value_dtype = lf.collect_schema()["value"]

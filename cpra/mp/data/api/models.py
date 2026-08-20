@@ -28,7 +28,7 @@ BaseFilterDimensions = create_model(
             None,
         )
         for dim in DIMENSIONS.values()
-        if dim.type not in ("dataset",)
+        if dim.type not in ("dataset", "metadata")
     },
 )
 

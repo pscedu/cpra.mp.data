@@ -90,6 +90,10 @@ def build(base_path, out):
         click.echo(f"tabular: {rel}  ->  {cat.height:,} rows")
         frames.append(cat)
 
+    if not frames:
+        click.echo(f"\nDONE: no valid datasets found under {base} in {time.time()-t0:.1f}s")
+        return
+
     catalog_df = pl.concat(frames, how="diagonal_relaxed")
     ordered = [c for c in CATALOG_DIMS if c in catalog_df.columns and c not in CAL_DIMS] + EXTENT_COLS + ["data_type"]
     catalog_df = catalog_df.select([c for c in ordered if c in catalog_df.columns])

@@ -86,12 +86,10 @@ class TestDatasetDimensions:
 
 
 class TestFilterDimensions:
-    def test_excludes_dataset_dimensions(self):
-        """Dataset dimensions (variable/grid/time_unit) are path segments, not filters.
-        Metadata dimensions like `model` are stored as file tags rather than partition
-        columns, but they are still real per-row values and remain filterable."""
+    def test_excludes_dataset_and_metadata_dimensions(self):
         fields = set(FilterDimensions.model_fields)
         assert not fields & set(DATASET_DIMENSIONS)
+        assert "model" not in fields
 
     def test_includes_partition_and_nonpartition_dimensions(self):
         fields = set(FilterDimensions.model_fields)
@@ -105,7 +103,7 @@ class TestFilterDimensions:
         assert FilterDimensions().model_group_id is None
 
     def test_every_filterable_dimension_is_present(self):
-        expected = {d.name for d in DIMENSIONS.values() if d.type != "dataset"}
+        expected = {d.name for d in DIMENSIONS.values() if d.type not in ("dataset", "metadata")}
         assert set(FilterDimensions.model_fields) == expected
 
 

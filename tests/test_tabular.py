@@ -152,6 +152,37 @@ class TestWriteParquetValidation:
         with pytest.raises(ValidationError, match="Grid cell ID below minimum"):
             write_parquet(df, base_path=base_path)
 
+    def test_grid_cell_id_count_incomplete_raises(self, base_path):
+        """Partial writes are not allowed: ecoregion_v001 has exactly 32 grid cells, so a
+        frame missing one -- even though every ID present is in range -- must be rejected
+        rather than silently written as an incomplete dataset."""
+        df = annual_frame(geo_ids=tuple(range(1, 32)))
+        with pytest.raises(ValidationError, match="Grid cell IDs incomplete"):
+            write_parquet(df, base_path=base_path)
+
+    def test_grid_cell_id_inconsistent_row_counts_raises(self, base_path):
+        """Every grid cell must appear the same number of times (once per implied time
+        step); a cell with extra or missing time steps relative to the others is also a
+        partial write, even though every ID from 1-32 is present."""
+        rows = [(gc, 2030) for gc in ECOREGION_IDS] + [(1, 2040)]
+        df = pl.DataFrame(
+            {
+                **{k: [v] * len(rows) for k, v in ANNUAL_KWARGS.items()},
+                "grid_cell": [r[0] for r in rows],
+                "calendar_year": [r[1] for r in rows],
+                "value": [1.0] * len(rows),
+            }
+        ).with_columns(
+            pl.col("model_group_id").cast(pl.Int32),
+            pl.col("scenario_id").cast(pl.Int32),
+            pl.col("percentile").cast(pl.Int8),
+            pl.col("calendar_year").cast(pl.Int32),
+            pl.col("grid_cell").cast(pl.Int32),
+            pl.col("value").cast(pl.Float32),
+        )
+        with pytest.raises(ValidationError, match="inconsistent row counts"):
+            write_parquet(df, base_path=base_path)
+
     def test_wrong_value_dtype_raises(self, base_path):
         """ssf values are Float32; Float64 columns must be rejected."""
         df = annual_frame().with_columns(pl.col("1").cast(pl.Float64))

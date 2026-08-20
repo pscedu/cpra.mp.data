@@ -151,6 +151,7 @@ def annual_tree(base_path, catalog_path):
         _annual_frame(years=(2030, 2031, 2032)),
         base_path=base_path,
         catalog_path=catalog_path,
+        validate=False,
         **ANNUAL_KWARGS,
     )
     return catalog_path
@@ -172,17 +173,17 @@ class TestCatalogChoices:
         assert all(isinstance(v, int) for v in result["choices"]["scenario_id"])
 
     def test_selecting_an_available_value_is_exact(self, raster_tree, raster_dimensions):
-        """`exact` requires every dimension the catalog tracks to be pinned -- including
-        metadata dimensions like `model`, which the old file-walking CatalogQuery could
-        never see (COG tags, not path components) and so never factored into `exact` at
-        all. See test_metadata_dimensions_are_tracked_as_choices below."""
+        """`exact` requires every *filterable* dimension to be pinned. Metadata
+        dimensions like `model` have no FilterDimensions field a caller could ever set --
+        they're file tags, not user-selectable filters (see
+        cpra/mp/data/api/models.py) -- so defaulting one doesn't count against `exact`.
+        See test_metadata_dimensions_are_tracked_as_choices below."""
         result = query(
             raster_tree,
             raster_dimensions,
             model_group_id=[500],
             scenario_id=[8],
             calendar_year=[2031],
-            model=["icm_v2023.0.0"],
         )
         assert result["results"]["scenario_id"] == [8]
         assert result["results"]["calendar_year"] == [2031]
@@ -191,9 +192,10 @@ class TestCatalogChoices:
     def test_metadata_dimensions_are_tracked_as_choices(self, raster_tree, raster_dimensions):
         """The materialized catalog carries metadata dimensions (e.g. `model`, sourced from
         COG/file tags) as ordinary columns, so CatalogQuery reports choices/results for them
-        the same as any path-derived dimension. main's directory walk had no way to do this
-        at all, since a metadata dimension is never a path component (see
-        cpra/mp/data/catalog.py's module docstring) -- new coverage, not a port."""
+        the same as any path-derived dimension, even though they aren't a filterable
+        FilterDimensions field. main's directory walk had no way to do this at all, since a
+        metadata dimension is never a path component (see cpra/mp/data/catalog.py's module
+        docstring) -- new coverage, not a port."""
         result = query(raster_tree, raster_dimensions)
         assert result["choices"]["model"] == ["icm_v2023.0.0"]
         assert result["results"]["model"] == ["icm_v2023.0.0"]
@@ -205,7 +207,6 @@ class TestCatalogChoices:
             raster_dimensions,
             scenario_id=[8],
             calendar_year=[2031],
-            model=["icm_v2023.0.0"],
         )
         assert result["results"]["scenario_id"] == [8]
         assert result["exact"] is False
@@ -348,12 +349,17 @@ class TestTabularCatalogChoices:
         """Each write_parquet call appends its own catalog file; the query unions every
         file under the requested variable/time_unit/grid partition."""
         write_parquet(
-            _annual_frame(years=(2030,)), base_path=base_path, catalog_path=catalog_path, **ANNUAL_KWARGS
+            _annual_frame(years=(2030,)),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **ANNUAL_KWARGS,
         )
         write_parquet(
             _annual_frame(years=(2040,)),
             base_path=base_path,
             catalog_path=catalog_path,
+            validate=False,
             **{**ANNUAL_KWARGS, "scenario_id": 8},
         )
         result = query(catalog_path, annual_dimensions)

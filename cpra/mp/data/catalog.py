@@ -362,6 +362,10 @@ class CatalogQuery:
         prop_value = getattr(
             self.dataset_dimensions if dimension.type == "dataset" else self.filter_dimensions,
             dimension_name,
+            # Metadata dimensions (e.g. `model`) are stored as file tags but are not
+            # filterable via FilterDimensions, so there's no attribute to read here --
+            # fall through to the default-value selection below.
+            None,
         )
         if prop_value:
             if not isinstance(prop_value, (list, tuple)):
@@ -388,7 +392,11 @@ class CatalogQuery:
             # TODO: Add more sophisticated logic for selecting a default value
             # from the available choices.
             selected_values = [self._choices[dimension_name][0]]
-            self._exact = False
+            # Metadata dimensions have no FilterDimensions field a caller could ever pin,
+            # so defaulting one doesn't make the result any less exact than the caller
+            # asked for.
+            if dimension.type != "metadata":
+                self._exact = False
 
         self._results[dimension_name] = selected_values
 

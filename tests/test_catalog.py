@@ -62,7 +62,9 @@ def _read_catalog(catalog_path):
 
 
 def test_write_parquet_appends_catalog_row(base_path, catalog_path):
-    write_parquet(_tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
+    write_parquet(
+        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
 
     catalog = _read_catalog(catalog_path)
     assert catalog.height == 1
@@ -72,8 +74,12 @@ def test_write_parquet_appends_catalog_row(base_path, catalog_path):
 
 
 def test_write_parquet_gap_then_compact_preserves_gap(base_path, catalog_path):
-    write_parquet(_tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
-    write_parquet(_tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
+    write_parquet(
+        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
+    write_parquet(
+        _tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
 
     assert _read_catalog(catalog_path).height == 2
 
@@ -86,9 +92,15 @@ def test_write_parquet_gap_then_compact_preserves_gap(base_path, catalog_path):
 
 
 def test_write_parquet_fill_gap_then_compact_merges(base_path, catalog_path):
-    write_parquet(_tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
-    write_parquet(_tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
-    write_parquet(_tabular_data([2023, 2024]), base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
+    write_parquet(
+        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
+    write_parquet(
+        _tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
+    write_parquet(
+        _tabular_data([2023, 2024]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+    )
 
     compact_parquet(base_path=base_path, catalog_path=catalog_path, **TABULAR_KWARGS)
 
@@ -165,7 +177,7 @@ def test_compact_cog_backfills_legacy_files_into_catalog(base_path, catalog_path
 
 
 def test_catalog_path_none_disables_catalog_writes(base_path, tmp_path):
-    write_parquet(_tabular_data([2020]), base_path=base_path, catalog_path=None, **TABULAR_KWARGS)
+    write_parquet(_tabular_data([2020]), base_path=base_path, catalog_path=None, validate=False, **TABULAR_KWARGS)
     write_cog(_raster_array(), base_path=base_path, catalog_path=None, calendar_year=2020, **RASTER_KWARGS)
     compact_parquet(base_path=base_path, catalog_path=None, **TABULAR_KWARGS)
     compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
@@ -284,6 +296,7 @@ class TestCatalogQueryRepeatedExecute:
             df,
             base_path=base_path,
             catalog_path=catalog_path,
+            validate=False,
             variable="sal",
             grid="hydro_compartment_v001",
             time_unit="annual",
