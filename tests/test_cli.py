@@ -1,9 +1,18 @@
 """Tests for the `cpra.mp.data.cli` Click group.
 
-The group currently carries no commands -- `convert` was removed once the MP2023 dump
-format went out of use -- but it remains the registration point that command modules
-attach to, so it is kept working.
+`cli` itself defines no commands directly -- `convert` was removed once the MP2023 dump
+format went out of use, and today `cli/catalog.py`'s `catalog` group is the only command
+module. `cli` remains the registration point command modules attach to: importing a
+command module (e.g. `cpra.mp.data.cli.catalog`, see tests/test_cli_catalog.py) mutates
+the shared `cli` object as a side effect of the `@cli.group()`/`@cli.command()`
+decoration at import time. That means `cli.commands` reflects whichever command modules
+the test session happened to import already, not just what this file imports -- see
+`test_cli_group_starts_with_no_commands_of_its_own` below for how that's tested without
+depending on import order.
 """
+
+import subprocess
+import sys
 
 from click.testing import CliRunner
 
@@ -16,8 +25,28 @@ def test_group_runs_and_reports_usage():
     assert "Usage:" in result.output
 
 
-def test_group_has_no_commands():
-    assert cli.commands == {}
+def test_cli_group_starts_with_no_commands_of_its_own():
+    """Execute the module source into a throwaway module object to get a `cli` Group
+    unaffected by whatever command modules other test files (e.g. test_cli_catalog.py)
+    have already imported in this session -- asserting `cli.commands == {}` on the
+    shared, possibly-already-mutated object would make the result depend on test
+    collection/import order.
+
+    Deliberately not `importlib.reload`: reload rebinds `cli` inside the cached
+    `cpra.mp.data.cli` module, so every later `from cpra.mp.data.cli import cli` in the
+    session would get a fresh, empty Group, while the already-imported command modules
+    stay attached to the old one -- and re-importing them can't re-register, since they
+    are themselves still cached. That trades this test's order-dependence for a
+    session-wide one.
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec("cpra.mp.data.cli")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.cli.commands == {}
+    assert sys.modules["cpra.mp.data.cli"] is not module
 
 
 def test_unknown_command_is_rejected():
@@ -44,4 +73,25 @@ def test_commands_can_be_registered_and_invoked():
     finally:
         del cli.commands["noop"]
 
-    assert cli.commands == {}
+    assert "noop" not in cli.commands
+
+
+def test_module_entry_point_registers_catalog_command():
+    """`python -m cpra.mp.data.cli` runs `cli/__main__.py`, which imports `cli.catalog`
+    for its side effect of registering the `catalog` subcommand before invoking `cli()`.
+
+    This regressed once: `__main__.py` imported a `convert` module that had already been
+    removed, so the entry point raised `ImportError` for anyone invoking it, and nothing
+    caught it -- `cli/__main__.py` calls `cli()` at import time and is in coverage's
+    `omit` list specifically so that importing it under pytest doesn't run the CLI, which
+    also means importing it directly can't be used to test it. Running it out-of-process
+    is the only way to exercise the real entry point.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "cpra.mp.data.cli", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0
+    assert "catalog" in result.stdout
