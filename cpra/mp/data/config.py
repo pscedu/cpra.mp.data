@@ -41,6 +41,27 @@ def get_catalog_path(catalog_path=None):
     return Path(catalog_path) if catalog_path is not None else CATALOG_PATH
 
 
+CATALOG_PATH_UNSET = object()
+
+
+def get_write_catalog_path(catalog_path=CATALOG_PATH_UNSET):
+    """Resolve a catalog path for writers, for which ``None`` means "don't write".
+
+    Writers (``write_parquet``, ``write_cog``, ``compact_parquet``, ``compact_cog``)
+    accept ``catalog_path=None`` to skip the catalog side-table entirely, so they can't
+    also use ``None`` to mean "use the default" the way readers do -- hence the separate
+    ``CATALOG_PATH_UNSET`` sentinel for "not passed".
+
+    Resolved at call time rather than bound as a default argument value: binding
+    ``CATALOG_PATH`` into a signature captures it at import, so a caller that redirects
+    only ``base_path`` (as every test is expected to -- see CLAUDE.md) would still write
+    catalog rows to the configured production path.
+    """
+    if catalog_path is CATALOG_PATH_UNSET:
+        return CATALOG_PATH
+    return Path(catalog_path) if catalog_path is not None else None
+
+
 # GDAL thread count for raster reads/writes (see api.utils.raster_gdal_env). Tunable
 # because the API runs as a single process and already spreads files across a thread
 # pool, so the two widths multiply under concurrent requests.

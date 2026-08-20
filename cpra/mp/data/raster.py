@@ -13,7 +13,7 @@ from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
 from cpra.mp.data.catalog import CAL_DIMS, Catalog, cal_for, cast_str, parse_path_dims, raster_catalog_rows
-from cpra.mp.data.config import BASE_PATH, CATALOG_PATH, get_base_path
+from cpra.mp.data.config import CATALOG_PATH_UNSET, get_base_path, get_write_catalog_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import (
@@ -335,7 +335,7 @@ def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, 
 def write_cog(
     data,
     base_path=None,
-    catalog_path=CATALOG_PATH,
+    catalog_path=CATALOG_PATH_UNSET,
     validate=True,
     compression="zstd",
     compression_level=6,
@@ -348,6 +348,7 @@ def write_cog(
     description, never as a metadata tag.
     """
     base_path = get_base_path(base_path)
+    catalog_path = get_write_catalog_path(catalog_path)
     df = cast_columns(pl.DataFrame(kwargs))
     if validate:
         validate_data_frame(df)
@@ -509,8 +510,8 @@ def _period_subgroups(values, period):
 
 
 def compact_cog(
-    base_path=BASE_PATH,
-    catalog_path=CATALOG_PATH,
+    base_path=None,
+    catalog_path=CATALOG_PATH_UNSET,
     output_base_path=None,
     compression="zstd",
     compression_level=6,
@@ -577,7 +578,8 @@ def compact_cog(
     input_df = cast_columns(pl.DataFrame(kwargs))
     validate_data_frame(input_df, required_cols=DATASET_DIMENSIONS.keys())
 
-    base_path = Path(base_path)
+    base_path = get_base_path(base_path)
+    catalog_path = get_write_catalog_path(catalog_path)
     output_base_path = base_path if output_base_path is None else Path(output_base_path)
     dataset_dir = dataset_path(base_path, **kwargs)
     grid = GRIDS[kwargs["grid"]]

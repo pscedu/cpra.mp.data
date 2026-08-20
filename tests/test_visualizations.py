@@ -16,8 +16,8 @@ from shapely.geometry import box
 
 from cpra.mp.data.visualizations.base import (
     DatasetVisualization,
-    geography_tokens,
-    is_geography_ids,
+    grid_cell_tokens,
+    is_grid_cell_ids,
 )
 from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
@@ -60,32 +60,32 @@ def _geography(*coords):
 
 class TestGeographyTokens:
     def test_splits_a_comma_separated_string(self):
-        assert geography_tokens("1,2,3") == ["1", "2", "3"]
+        assert grid_cell_tokens("1,2,3") == ["1", "2", "3"]
 
     def test_strips_surrounding_whitespace(self):
         """unpack_values strips too, so the API's own ID/coordinate check sees the same
         tokens this one does."""
-        assert geography_tokens(" 1 , 2 ") == ["1", "2"]
+        assert grid_cell_tokens(" 1 , 2 ") == ["1", "2"]
 
     def test_accepts_a_sequence(self):
         """Notebook callers pass a list rather than a query-string fragment."""
-        assert geography_tokens([1, 2]) == ["1", "2"]
+        assert grid_cell_tokens([1, 2]) == ["1", "2"]
 
 
 class TestIsGeographyIds:
     def test_digit_tokens_are_ids(self):
-        assert is_geography_ids("1,2") is True
+        assert is_grid_cell_ids("1,2") is True
 
     def test_a_decimal_point_makes_it_coordinates(self):
-        assert is_geography_ids("29.5,91.0") is False
+        assert is_grid_cell_ids("29.5,91.0") is False
 
     def test_a_sign_makes_it_coordinates(self):
         """A negative longitude has no decimal point but is still not an ID."""
-        assert is_geography_ids("-91,29") is False
+        assert is_grid_cell_ids("-91,29") is False
 
     def test_an_absent_geography_is_ids(self):
         """No filter means the whole grid, which is keyed by ID."""
-        assert is_geography_ids(None) is True
+        assert is_grid_cell_ids(None) is True
 
 
 class TestGeographies:

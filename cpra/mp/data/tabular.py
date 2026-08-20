@@ -10,7 +10,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from cpra.mp.data.catalog import CAL_DIMS, EXCLUDE, Catalog, tabular_catalog_rows
-from cpra.mp.data.config import CATALOG_PATH, get_base_path
+from cpra.mp.data.config import CATALOG_PATH_UNSET, get_base_path, get_write_catalog_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
@@ -103,7 +103,7 @@ def read_parquet(base_path=None, cache=True, include_file_paths=None, **kwargs):
 def write_parquet(
     data,
     base_path=None,
-    catalog_path=CATALOG_PATH,
+    catalog_path=CATALOG_PATH_UNSET,
     validate=True,
     sort=True,
     compression="zstd",
@@ -137,6 +137,7 @@ def write_parquet(
     """
 
     base_path = get_base_path(base_path)
+    catalog_path = get_write_catalog_path(catalog_path)
     lf = data if isinstance(data, pl.LazyFrame) else pl.DataFrame(data).lazy()
 
     # Add keyword arguments as literal columns.
@@ -312,7 +313,7 @@ def _write_via_sink_batches(lf, row_group_size, **kwargs):
 
 def compact_parquet(
     base_path=None,
-    catalog_path=CATALOG_PATH,
+    catalog_path=CATALOG_PATH_UNSET,
     sort=True,
     compression="zstd",
     compression_level=6,
@@ -332,6 +333,7 @@ def compact_parquet(
     """
 
     base_path = get_base_path(base_path)
+    catalog_path = get_write_catalog_path(catalog_path)
 
     # Validate the input keyword arguments.
     input_df = pl.DataFrame(kwargs)

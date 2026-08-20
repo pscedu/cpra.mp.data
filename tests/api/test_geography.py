@@ -10,8 +10,8 @@ from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
     project_coordinates,
     representative_points,
-    resolve_vector_geography,
-    resolve_vector_geography_sync,
+    resolve_vector_grid_cell,
+    resolve_vector_grid_cell_sync,
 )
 
 from tests.factories import write_grid_geometry
@@ -37,26 +37,26 @@ def ecoregion_geometry(geometry_path):
 
 async def test_resolves_a_point_inside_a_polygon(ecoregion_geometry):
     lng, lat = _lng_lat(500500, 3300500)
-    resolved = await resolve_vector_geography("ecoregion_v001", [lng], [lat])
+    resolved = await resolve_vector_grid_cell("ecoregion_v001", [lng], [lat])
     assert resolved == [1]
 
 
 async def test_resolves_multiple_points_independently(ecoregion_geometry):
     lng1, lat1 = _lng_lat(500500, 3300500)
     lng2, lat2 = _lng_lat(501500, 3300500)
-    resolved = await resolve_vector_geography("ecoregion_v001", [lng1, lng2], [lat1, lat2])
+    resolved = await resolve_vector_grid_cell("ecoregion_v001", [lng1, lng2], [lat1, lat2])
     assert resolved == [1, 2]
 
 
 async def test_point_outside_every_polygon_resolves_to_none(ecoregion_geometry):
     lng, lat = _lng_lat(0, 0)
-    resolved = await resolve_vector_geography("ecoregion_v001", [lng], [lat])
+    resolved = await resolve_vector_grid_cell("ecoregion_v001", [lng], [lat])
     assert resolved == [None]
 
 
 async def test_missing_geometry_file_raises_400(geometry_path):
     with pytest.raises(HTTPException) as excinfo:
-        await resolve_vector_geography("ecoregion_v001", [-91.0], [29.5])
+        await resolve_vector_grid_cell("ecoregion_v001", [-91.0], [29.5])
     assert excinfo.value.status_code == 400
     assert "No geometry file" in excinfo.value.detail
 
@@ -66,7 +66,7 @@ def test_representative_points_are_inside_their_polygons(ecoregion_geometry):
     assert set(points) == {1, 2}
     for geo_id, (lng, lat) in points.items():
         x, y = [c[0] for c in transform(CRS.from_epsg(4326), CRS.from_epsg(26915), [lng], [lat])]
-        assert resolve_vector_geography_sync("ecoregion_v001", [lng], [lat]) == [geo_id]
+        assert resolve_vector_grid_cell_sync("ecoregion_v001", [lng], [lat]) == [geo_id]
         assert 500000 <= x <= 502000 and 3300000 <= y <= 3301000
 
 
@@ -127,6 +127,6 @@ class TestParseCoordinatePairs:
 async def test_unprojectable_point_raises_400(ecoregion_geometry):
     """The vector lookup projects before it reads, so it fails the same way."""
     with pytest.raises(HTTPException) as excinfo:
-        await resolve_vector_geography("ecoregion_v001", [0.0], [0.0])
+        await resolve_vector_grid_cell("ecoregion_v001", [0.0], [0.0])
     assert excinfo.value.status_code == 400
     assert "outside the grid's projection" in excinfo.value.detail

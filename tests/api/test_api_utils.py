@@ -212,7 +212,15 @@ class TestParallelRasterHelpers:
     @pytest.fixture
     def rasters(self, base_path):
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
-        return sorted(base_path.rglob("*.tif"))
+
+        # COGs are named with a UUID, so filename order says nothing about which
+        # year a file holds -- order by the calendar value in the band description
+        # instead, which is where write_cog records it.
+        def calendar_year(path):
+            with rio.open(path) as dataset:
+                return int(dataset.descriptions[0].split("=")[1])
+
+        return sorted(base_path.rglob("*.tif"), key=calendar_year)
 
     async def test_parallel_read_returns_one_array_per_dataset(self, rasters):
         datasets = [rio.open(p) for p in rasters]
