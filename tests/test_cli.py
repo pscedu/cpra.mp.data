@@ -1,8 +1,9 @@
 """Tests for the `cpra.mp.data.cli` Click group.
 
-The group currently carries no commands -- `convert` was removed once the MP2023 dump
-format went out of use -- but it remains the registration point that command modules
-attach to, so it is kept working.
+`convert` was removed once the MP2023 dump format went out of use, but the group remains
+the registration point that command modules attach to. It currently carries the
+`crosswalk` group (vector/raster crosswalk generation), and is kept working for whatever
+attaches to it next.
 """
 
 from click.testing import CliRunner
@@ -16,12 +17,16 @@ def test_group_runs_and_reports_usage():
     assert "Usage:" in result.output
 
 
-def test_group_has_no_commands():
-    assert cli.commands == {}
+def test_crosswalk_group_is_registered():
+    assert "crosswalk" in cli.commands
+
+    result = CliRunner().invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "crosswalk" in result.output
 
 
 def test_unknown_command_is_rejected():
-    result = CliRunner().invoke(cli, ["convert", "some.parquet"])
+    result = CliRunner().invoke(cli, ["definitely-not-a-real-cpra-command"])
     assert result.exit_code != 0
 
 
@@ -44,4 +49,4 @@ def test_commands_can_be_registered_and_invoked():
     finally:
         del cli.commands["noop"]
 
-    assert cli.commands == {}
+    assert "noop" not in cli.commands

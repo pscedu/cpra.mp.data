@@ -168,8 +168,9 @@ def write_vector_crosswalk(crosswalk_path, src_grid, dst_grid, mapping):
 def write_raster_crosswalk(crosswalk_path, src_grid, dst_grid, zones):
     """Write a zone-ID crosswalk COG with a `dst_ids` tag.
 
-    Mirrors what ``scripts/generate_raster_crosswalks.py`` emits: a single-band raster of
-    destination zone IDs plus a comma-separated ``dst_ids`` tag listing the zones present.
+    Mirrors what ``python -m cpra.mp.data.cli crosswalk raster`` emits: a single-band
+    raster of destination zone IDs plus a comma-separated ``dst_ids`` tag listing the
+    zones present.
     """
     import rasterio as rio
     from rasterio.transform import from_bounds

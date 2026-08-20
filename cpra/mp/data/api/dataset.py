@@ -383,8 +383,9 @@ class Dataset(LazyFrameSource):
         """Apply transform and extract parameters to the image.
 
         Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
-        pre-generated zone-ID crosswalk raster (see scripts/generate_raster_crosswalks.py),
-        converting the result into a tabular LazyFrame in the same shape produced by
+        pre-generated zone-ID crosswalk raster (see
+        `python -m cpra.mp.data.cli crosswalk raster`), converting the result into a
+        tabular LazyFrame in the same shape produced by
         `_apply_transform_params_vector` (dimension columns, one column per destination
         geography ID, and a `geographic_unit` column).
         """
