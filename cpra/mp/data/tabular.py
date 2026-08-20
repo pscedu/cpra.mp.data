@@ -164,6 +164,17 @@ def write_parquet(
         if validate:
             validate_data_frame(lf, required_cols=required_cols)
 
+            # Reject columns that are neither a required dimension nor grid_cell/value.
+            # Without this an unrecognized column -- a typo, most likely -- is silently
+            # dropped by the sort's select() below when sort=True, and silently written
+            # into the output file when sort=False. Behaviour that depends on `sort` is
+            # not a useful contract, and the wide-format writer rejected these outright.
+            known_cols = {*required_cols, "grid_cell", "value"}
+            invalid_cols = [col for col in lf.collect_schema().names() if col not in known_cols]
+            if invalid_cols:
+                msg = f"Invalid columns: {', '.join(sorted(invalid_cols))}"
+                raise ValidationError(msg)
+
             # Validate grid_cell ID range.
             if grid.id_min is not None or grid.id_max is not None:
                 gc_stats = lf.select(
@@ -172,10 +183,10 @@ def write_parquet(
                 ).collect()
                 gc_min, gc_max = gc_stats["min"][0], gc_stats["max"][0]
                 if grid.id_min is not None and gc_min < grid.id_min:
-                    msg = f"Geography ID below minimum for grid {grid.name}: {gc_min}"
+                    msg = f"Grid cell ID below minimum for grid {grid.name}: {gc_min}"
                     raise ValidationError(msg)
                 if grid.id_max is not None and gc_max > grid.id_max:
-                    msg = f"Geography ID above maximum for grid {grid.name}: {gc_max}"
+                    msg = f"Grid cell ID above maximum for grid {grid.name}: {gc_max}"
                     raise ValidationError(msg)
 
             # Validate value column dtype.
