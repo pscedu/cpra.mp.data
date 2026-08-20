@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.49.1](https://github.com/pscedu/cpra.mp.data/compare/v0.49.0...v0.49.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **config:** use consistent crosswalk and grid paths ([182bca8](https://github.com/pscedu/cpra.mp.data/commit/182bca87fee98c7c4cdc963c200be416357ff978))
+
 ## [0.49.0](https://github.com/pscedu/cpra.mp.data/compare/v0.48.0...v0.49.0) (2026-08-19)
 
 
