@@ -180,8 +180,9 @@ def write_parquet(
 
             # Validate value column dtype.
             variable = VARIABLES[meta["variable"][0]]
-            if lf.schema["value"] != variable.dtype:
-                msg = f"Column 'value' has dtype {lf.schema['value']!s}, expected {variable.dtype!s}"
+            value_dtype = lf.collect_schema()["value"]
+            if value_dtype != variable.dtype:
+                msg = f"Column 'value' has dtype {value_dtype!s}, expected {variable.dtype!s}"
                 raise ValidationError(msg)
 
         if sort:

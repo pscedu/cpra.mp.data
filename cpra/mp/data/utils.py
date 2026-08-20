@@ -117,12 +117,16 @@ def validate_data_frame(df, required_cols=None):
     if required_cols is None:
         required_cols = required_columns(df)
 
+    # Resolve the schema once and take both the names and the dtypes from it: `df.columns`
+    # and `df.schema` each resolve a LazyFrame's schema separately, which Polars warns
+    # about as a potentially expensive operation.
+    schema = df.collect_schema()
+
     # Raise an exception if required columns are missing.
-    missing_cols = [col for col in required_cols if col not in df.columns]
+    missing_cols = [col for col in required_cols if col not in schema.names()]
     if missing_cols:
         raise ValidationError(f"Required columns are missing: {', '.join(missing_cols)}")
 
-    schema = df.schema
     expressions = {}
 
     # Validate required columns, and add dimension validation expressions.
