@@ -10,9 +10,9 @@ One command covers both source kinds: each `--from` grid dispatches on its `grid
 `structure/grids.csv`, so a mixed run needs no flag to tell the two apart, and the options
 that only apply to one kind (`--batch-size`, `--block-size`) are ignored for the other.
 
-Destinations are always vector grids. `write_vector_crosswalk` assigns source centroids to
-destination polygons and `write_raster_crosswalk` rasterizes those same polygons into zone
-IDs -- neither has anything to do with a destination that isn't polygons.
+Destinations are always vector grids. `write_vector_crosswalk` intersects source polygons
+with destination polygons and `write_raster_crosswalk` rasterizes those same polygons into
+zone IDs -- neither has anything to do with a destination that isn't polygons.
 
 Usage:
 
@@ -28,7 +28,7 @@ import click
 
 from cpra.mp.data import config
 from cpra.mp.data.cli import cli
-from cpra.mp.data.crosswalks import read_centroid_tree, write_raster_crosswalk, write_vector_crosswalk
+from cpra.mp.data.crosswalks import read_geometry_tree, write_raster_crosswalk, write_vector_crosswalk
 from cpra.mp.data.grids import GRIDS
 
 
@@ -182,7 +182,7 @@ def crosswalk(ctx, from_grids, to_grids, grids_path, crosswalks_path, batch_size
     for src_grid in sources:
         grid = GRIDS[src_grid]
 
-        # Resolve the whole source's work up front: a centroid index costs hundreds of MB on
+        # Resolve the whole source's work up front: a geometry index costs hundreds of MB on
         # the larger grids, so a source whose outputs all already exist must not pay for one.
         pending = []
         for dst_grid in destinations:
@@ -201,15 +201,15 @@ def crosswalk(ctx, from_grids, to_grids, grids_path, crosswalks_path, batch_size
         # than held alongside this one.
         tree = None
         if grid.grid_type == "vector":
-            click.echo(f"Indexing {src_grid} centroids...")
+            click.echo(f"Indexing {src_grid} geometry...")
             start = time.perf_counter()
             try:
-                tree = read_centroid_tree(grids_path / f"{src_grid}.fgb", batch_size=batch_size)
+                tree = read_geometry_tree(grids_path / f"{src_grid}.fgb", batch_size=batch_size)
             except Exception as exc:  # noqa: BLE001 - one unreadable source must not abort the rest
                 click.echo(f"FAIL: {src_grid}: {exc}", err=True)
                 failures.extend(f"{src_grid} -> {dst_grid}" for dst_grid in pending)
                 continue
-            click.echo(f"DONE: indexed {len(tree[1])} centroids in {time.perf_counter() - start:.1f}s")
+            click.echo(f"DONE: indexed {len(tree[1])} cells in {time.perf_counter() - start:.1f}s")
 
         for dst_grid in pending:
             start = time.perf_counter()

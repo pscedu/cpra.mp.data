@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import rasterio as rio
+import shapely
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 from shapely.geometry import box
@@ -32,9 +33,10 @@ from cpra.mp.data.crosswalks import (
     GDAL_CACHE_BYTES,
     MAX_SAFE_ZONE_ID,
     NODATA,
+    PAIR_CHUNK,
     ZONE_DTYPES,
     get_zone_dtype,
-    read_centroid_tree,
+    read_geometry_tree,
     write_raster_crosswalk,
     write_vector_crosswalk,
 )
@@ -188,32 +190,40 @@ class TestGetZoneDtype:
             get_zone_dtype([too_big_for_int64])
 
 
-class TestReadCentroidTree:
-    def test_ids_and_tree_align(self, geometry_path):
+class TestReadGeometryTree:
+    def test_ids_areas_and_tree_align(self, geometry_path):
         features = [
-            (1, box(0, 0, 2, 2)),  # centroid (1, 1)
-            (2, box(10, 10, 14, 14)),  # centroid (12, 12)
+            (1, box(0, 0, 2, 2)),  # area 4
+            (2, box(10, 10, 14, 14)),  # area 16
         ]
         path = write_grid_geometry(geometry_path, VECTOR_SRC_NAME, features)
 
-        tree, ids = read_centroid_tree(path)
+        tree, ids, areas = read_geometry_tree(path)
 
         assert sorted(ids.tolist()) == [1, 2]
-        # The tree holds centroids, not the original polygons: querying a point far from
-        # both centroids but still inside one polygon should not match via a centroid
-        # tree unless the point *is* (very near) that centroid.
-        idx = tree.query(box(11, 11, 13, 13).centroid, predicate="intersects")
-        assert list(idx) == [int(np.where(ids == 2)[0][0])]
+        assert dict(zip(ids.tolist(), areas.tolist())) == {1: 4.0, 2: 16.0}
+        # The tree holds the polygons themselves, not their centroids: a point well away
+        # from either centroid but inside one polygon still matches it. Area weighting
+        # needs the real geometry, so this is what distinguishes the tree from the centroid
+        # index this replaced.
+        corner = shapely.Point(10.5, 10.5)
+        assert list(tree.query(corner, predicate="intersects")) == [int(np.where(ids == 2)[0][0])]
+
+
+def _rows(out_path):
+    """`{(src_id, dst_id): scale_factor}` for a crosswalk table."""
+    return {(row["src_id"], row["dst_id"]): row["scale_factor"] for row in pq.read_table(out_path).to_pylist()}
 
 
 class TestWriteVectorCrosswalk:
-    def test_basic_join_and_absent_outside_geography(self, geometry_path, crosswalk_path):
-        """A source centroid outside every destination polygon is simply absent -- the
-        old SQL was an inner join, so it must not appear as a NODATA row or raise."""
+    def test_fully_contained_cells_and_absent_outside_geography(self, geometry_path, crosswalk_path):
+        """A source cell wholly inside one destination gets scale_factor 1.0, and one
+        overlapping nothing is simply absent -- this is an inner join, so it must not
+        appear as a NODATA row or raise."""
         src_features = [
-            (1, box(0, 0, 2, 2)),  # centroid (1, 1) -> inside dst 10
-            (2, box(10, 10, 12, 12)),  # centroid (11, 11) -> inside dst 20
-            (3, box(100, 100, 102, 102)),  # centroid (101, 101) -> outside everything
+            (1, box(0, 0, 2, 2)),  # wholly inside dst 10
+            (2, box(10, 10, 12, 12)),  # wholly inside dst 20
+            (3, box(100, 100, 102, 102)),  # overlaps nothing
         ]
         dst_features = [
             (10, box(0, 0, 5, 5)),
@@ -227,36 +237,132 @@ class TestWriteVectorCrosswalk:
         )
 
         assert row_count == 2
-        table = pq.read_table(out_path)
-        rows = {
-            (row["src_id"], row["dst_id"]): row["scale_factor"]
-            for row in table.to_pylist()
-        }
-        assert rows == {(1, 10): 1.0, (2, 20): 1.0}
-        assert 3 not in {row["src_id"] for row in table.to_pylist()}
+        assert _rows(out_path) == {(1, 10): 1.0, (2, 20): 1.0}
 
-    def test_centroid_on_shared_boundary_appears_under_both_destinations(
-        self, geometry_path, crosswalk_path
-    ):
-        """The module uses predicate="intersects" (not "within") to preserve the old
-        SQL's st_intersects semantics. A centroid that lands exactly on the shared edge
-        between two destination polygons must therefore join to both, not just one --
-        this is a deliberate semantic choice a future refactor could silently break by
-        switching to "within" or a strict point-in-polygon test."""
-        # box(0, 0, 10, 10) has centroid (5, 5), exactly on the shared edge x=5 below.
-        src_features = [(1, box(0, 0, 10, 10))]
+    def test_a_straddling_cell_is_split_by_area(self, geometry_path, crosswalk_path):
+        """The core of area weighting: a source cell overlapping two destinations produces
+        a row for each, weighted by how much of the source cell's area each one takes.
+
+        Under the centroid join this replaced, cell 1 went whole to whichever destination
+        held the point (5, 5) and cell 2 went whole to dst 1 -- the 25/75 split was lost
+        entirely.
+        """
+        src_features = [
+            (1, box(0, 0, 10, 10)),  # half in each destination
+            (2, box(0, 0, 4, 10)),  # 1 unit of 4 in dst 2, 3 in dst 1
+        ]
         dst_features = [
-            (1, box(0, 0, 5, 10)),
-            (2, box(5, 0, 10, 10)),
+            (1, box(0, 0, 3, 10)),
+            (2, box(3, 0, 10, 10)),
         ]
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        _out_path, row_count = write_vector_crosswalk(
+        out_path, row_count = write_vector_crosswalk(
             VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
         )
 
-        assert row_count == 2
+        assert row_count == 4
+        assert _rows(out_path) == pytest.approx({(1, 1): 0.3, (1, 2): 0.7, (2, 1): 0.75, (2, 2): 0.25})
+
+    def test_scale_factors_of_a_covered_cell_sum_to_one(self, geometry_path, crosswalk_path):
+        """The invariant `api/dataset.py` depends on: summarizing a source cell that the
+        destination grid covers completely must neither lose nor duplicate its value, which
+        holds exactly when its scale factors sum to 1."""
+        src_features = [(1, box(0, 0, 30, 30))]
+        dst_features = _tiles([0, 7, 19, 30], [0, 11, 30], start_id=1)
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
+
+        out_path, row_count = write_vector_crosswalk(
+            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
+        )
+
+        assert row_count == len(dst_features)
+        assert sum(_rows(out_path).values()) == pytest.approx(1.0)
+
+    def test_a_partly_covered_cell_sums_to_less_than_one(self, geometry_path, crosswalk_path):
+        """The complement of the invariant above: where the destination grid doesn't reach,
+        the scale factors deliberately don't add up, because the uncovered part of the
+        source cell belongs to no destination."""
+        src_features = [(1, box(0, 0, 10, 10))]  # only the left quarter is covered
+        dst_features = [(1, box(0, 0, 2.5, 10))]
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
+
+        out_path, _row_count = write_vector_crosswalk(
+            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
+        )
+
+        assert _rows(out_path) == pytest.approx({(1, 1): 0.25})
+
+    def test_boundary_only_contact_is_not_an_overlap(self, geometry_path, crosswalk_path):
+        """`intersects` is true for polygons sharing only an edge or a corner, so the
+        candidate query alone would emit those pairs with scale_factor 0. They contribute
+        nothing to a summary and are dropped instead."""
+        src_features = [(1, box(0, 0, 5, 5))]
+        dst_features = [
+            (1, box(0, 0, 5, 5)),  # identical -- the one real overlap
+            (2, box(5, 0, 10, 5)),  # shares the edge x=5
+            (3, box(5, 5, 10, 10)),  # shares only the corner (5, 5)
+        ]
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
+
+        out_path, row_count = write_vector_crosswalk(
+            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
+        )
+
+        assert row_count == 1
+        assert _rows(out_path) == {(1, 1): 1.0}
+
+    def test_a_zero_area_source_cell_is_dropped_not_infinite(self, geometry_path, crosswalk_path):
+        """A degenerate source cell has no area to apportion, so dividing by it would write
+        inf (or nan) into scale_factor and silently poison every summary using it."""
+        src_features = [
+            (1, box(0, 0, 0, 5)),  # collapsed to a line: area 0
+            (2, box(0, 0, 5, 5)),
+        ]
+        dst_features = [(10, box(0, 0, 5, 5))]
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
+
+        out_path, row_count = write_vector_crosswalk(
+            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
+        )
+
+        assert row_count == 1
+        assert _rows(out_path) == {(2, 10): 1.0}
+
+    def test_pair_chunking_does_not_change_the_result(self, geometry_path, crosswalk_path, tmp_path):
+        """`PAIR_CHUNK` bounds how many intersections are computed at once; slicing at a
+        size smaller than the pair count must produce the same table, just across more
+        record batches."""
+        src_features = _tiles(list(range(0, 11)), list(range(0, 11)), start_id=1)  # 100 cells
+        dst_features = [(1, box(0, 0, 5.5, 11)), (2, box(5.5, 0, 11, 11))]
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
+
+        whole_dir = tmp_path / "whole"
+        chunked_dir = tmp_path / "chunked"
+        whole_dir.mkdir()
+        chunked_dir.mkdir()
+
+        whole_path, whole_count = write_vector_crosswalk(
+            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, whole_dir
+        )
+        assert whole_count > 7, "test needs more pairs than the chunk size below"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(crosswalks, "PAIR_CHUNK", 7)
+            chunked_path, chunked_count = write_vector_crosswalk(
+                VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, chunked_dir
+            )
+
+        assert PAIR_CHUNK > whole_count, "the unchunked run must fit in one slice"
+        assert chunked_count == whole_count
+        assert _rows(chunked_path) == _rows(whole_path)
+        assert pq.ParquetFile(chunked_path).metadata.num_row_groups > pq.ParquetFile(whole_path).metadata.num_row_groups
 
     def test_schema_column_names_and_types_for_small_ids(self, geometry_path, crosswalk_path):
         """api/dataset.py and api/crosswalk.py both hard-depend on these exact column
@@ -343,7 +449,7 @@ class TestWriteVectorCrosswalk:
             VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, without_tree_dir
         )
 
-        prebuilt_tree = read_centroid_tree(geometry_path / f"{VECTOR_SRC_NAME}.fgb")
+        prebuilt_tree = read_geometry_tree(geometry_path / f"{VECTOR_SRC_NAME}.fgb")
         out_b, count_b = write_vector_crosswalk(
             VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, with_tree_dir, tree=prebuilt_tree
         )

@@ -46,7 +46,7 @@ def _src_features(extra_id=None):
 def _covering_polygon(dst_id):
     """One polygon covering the whole `veg_grid_cell_v001` footprint.
 
-    That footprint also contains every centroid `_src_features` produces, so the same
+    That footprint also contains every polygon `_src_features` produces, so the same
     destination geometry works for both a vector and a raster source -- which is the point
     of a single command handling both.
     """
@@ -279,7 +279,7 @@ class TestOverwrite:
         assert "SKIP" in second.output
         assert "SUMMARY: 0 written, 1 skipped, 0 failed" in second.output
 
-    def test_an_all_skipped_source_never_builds_a_centroid_index(self, vector_src, destinations, crosswalk_path):
+    def test_an_all_skipped_source_never_builds_a_geometry_index(self, vector_src, destinations, crosswalk_path):
         first = runner.invoke(cli, ["crosswalk", "--from", VECTOR_SRC, "--to", DST_A])
         assert first.exit_code == 0, first.output
         assert "Indexing" in first.output

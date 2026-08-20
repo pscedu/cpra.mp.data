@@ -1,28 +1,41 @@
 """Build vector-to-vector and raster-to-vector crosswalk files.
 
-Pure-Python replacements for `scripts/generate_crosswalks.py` (which shells out to
-`ogr2ogr -dialect sqlite` for `st_intersects(st_centroid(src.geometry), dst.geometry)`)
-and `scripts/generate_raster_crosswalks.py` (which loads a whole destination grid and a
-whole raster array into memory with geopandas). Both replacements exist because the old
-scripts' peak memory scales with the largest grid involved, which doesn't fit this
-environment's memory budget; everything below is written to scale with a batch or a
-window instead.
+Pure-Python replacements for `scripts/generate_crosswalks.py` (which shelled out to
+`ogr2ogr -dialect sqlite`) and `scripts/generate_raster_crosswalks.py` (which loaded a
+whole destination grid and a whole raster array into memory with geopandas). Both
+replacements exist because the old scripts' peak memory scales with the largest grid
+involved, which doesn't fit this environment's memory budget; everything below is written
+to scale with a batch or a window instead.
 
-**Vector crosswalks** (`write_vector_crosswalk`) index the SOURCE grid's point
-centroids in an `shapely.STRtree` and stream the DESTINATION grid's polygons through it
-in Arrow batches, discarding each batch once it's queried. This is the cheaper way
-around: a destination polygon only has to exist in memory for the batch it's read in,
-while the source structure has to live for the whole run, so the run-long structure
-should be the smaller one (points, not polygons). Measured (see task discussion): indexing
-destination polygons cost +275MB for `clara_grid_cell_v001` (112,318 features / 5.2M
-coords), while indexing source centroids and streaming all four destinations of
-`hydro_compartment_v001` cost +101MB total in 0.8s. `read_centroid_tree` is factored out
-so a caller converting one source to many destinations (as `cli` does) builds the tree
-once and reuses it.
+**Vector crosswalks** (`write_vector_crosswalk`) are area-weighted: every pair of
+overlapping cells is a row, and `scale_factor` is the fraction of the source cell's area
+that falls inside the destination cell. This is a deliberate change in semantics from the
+old SQL, which joined `st_intersects(st_centroid(src.geometry), dst.geometry)` and wrote a
+literal `1 as scale_factor` -- assigning each source cell whole to whichever destination
+happened to contain its centroid, and splitting nothing. `api/dataset.py` has always
+multiplied each source value by `scale_factor` when summarizing, so it was already built
+to consume real fractions and had only ever been handed 1.0.
 
-Row order changes from the SQL's `order by dst.id, src.id` to source-stream order. This
-is intentional and safe: `api/crosswalk.py` and `api/dataset.py` both re-sort explicitly
-after reading a crosswalk table, so neither depends on the file's own row order.
+The join indexes the SOURCE grid's polygons in a `shapely.STRtree` and streams the
+DESTINATION grid's polygons through it in Arrow batches, discarding each batch once it's
+been intersected. Both sides have to be real geometry now (area weighting has nothing to
+intersect otherwise), so the choice of which side to index is no longer about points
+versus polygons; the source is indexed because one source is typically crosswalked to
+several destinations, and `read_geometry_tree` is factored out so `cli` builds that index
+once and reuses it across all of them. What the source index costs is therefore the floor
+on a run: measured +285MB for `clara_grid_cell_v001` (112,318 features / 5.2M coords), the
+largest grid here, and the reason the destination side stays streamed. `PAIR_CHUNK` keeps
+the join itself from adding meaningfully to that floor.
+
+Area weighting is the more expensive semantics -- it has to keep source polygons for the
+whole run where a centroid index kept only points, and it intersects every candidate pair
+rather than testing point containment. Crosswalking `clara_grid_cell_v001` to all six of
+its destinations (729,734 rows) measured 538MB peak RSS in 142s.
+
+Row order changes from the SQL's `order by dst.id, src.id` to destination-stream order.
+This is intentional and safe: `api/crosswalk.py` and `api/dataset.py` both re-sort
+explicitly after reading a crosswalk table, so neither depends on the file's own row
+order.
 
 **Raster crosswalks** (`write_raster_crosswalk`) rasterize a destination grid's polygons
 onto a raster grid's pixel grid one window at a time, reading only the polygons that
@@ -77,6 +90,21 @@ MAX_SAFE_ZONE_ID = 2**53
 # 256MB int64 stand-in raster. This has to be a `rasterio.Env`, not a `GDAL_CACHEMAX`
 # creation option -- it's a global GDAL config setting, not a file's own metadata.
 GDAL_CACHE_BYTES = 64 * 1024 * 1024
+
+# Candidate (source, destination) pairs are intersected in slices of this many. The number
+# of pairs one destination batch produces isn't bounded by the batch size -- it scales with
+# how many source cells each destination polygon covers, which for a fine source grid
+# (`clara_grid_cell_v001`, 112,318 cells) under a coarse destination (`parish_v2020`, 64) is
+# thousands of pairs per destination feature. Slicing bounds the intersection geometries
+# alive at once by this number instead of by that product.
+#
+# Measured on `clara_grid_cell_v001` -> `block_group_v2020` (151,941 rows), peak RSS by
+# slice size: 65536 -> 648MB, 16384 -> 566MB, 4096 -> 515MB, 1024 -> 507MB, against a
+# 507MB floor set by the source index alone. 4096 is within 8MB of that floor, so the join
+# itself costs almost nothing on top of the index. Runtime across the same sweep varied
+# 12-16s with no trend -- repeat runs of one setting varied more than the settings did --
+# so this trades no measurable time for ~130MB.
+PAIR_CHUNK = 4096
 
 
 def get_zone_dtype(dst_ids):
@@ -147,26 +175,27 @@ def _iter_features(path, batch_size=65536, bbox=None):
             yield ids, wkb
 
 
-def read_centroid_tree(fgb_path, batch_size=65536):
-    """Build an `STRtree` of a vector grid's centroids plus the parallel array of IDs.
+def read_geometry_tree(fgb_path, batch_size=65536):
+    """Build an `STRtree` of a vector grid's polygons plus parallel arrays of IDs and areas.
 
-    Reads geometry only long enough to compute each batch's centroids, then discards the
-    polygons -- the tree and the ID array are all that live for the rest of the run. This
-    is the expensive step in a vector crosswalk (see module docstring), so callers
-    converting one source to several destinations should build it once with this
-    function and pass the result to `write_vector_crosswalk`'s `tree` argument.
+    Returns `(tree, ids, areas)`. `areas` is the denominator of every `scale_factor`
+    `write_vector_crosswalk` writes, so it's computed here once for the grid rather than
+    recomputed per destination.
+
+    This is the expensive step in a vector crosswalk (see module docstring), so callers
+    converting one source to several destinations should build it once with this function
+    and pass the result to `write_vector_crosswalk`'s `tree` argument.
     """
 
     id_parts = []
-    centroid_parts = []
+    geom_parts = []
     for ids, wkb in _iter_features(fgb_path, batch_size=batch_size):
-        geoms = shapely.from_wkb(wkb)
-        centroid_parts.append(shapely.centroid(geoms))
+        geom_parts.append(shapely.from_wkb(wkb))
         id_parts.append(ids)
 
     ids = np.concatenate(id_parts) if id_parts else np.array([], dtype=np.int32)
-    centroids = np.concatenate(centroid_parts) if centroid_parts else np.array([], dtype=object)
-    return shapely.STRtree(centroids), ids
+    geoms = np.concatenate(geom_parts) if geom_parts else np.array([], dtype=object)
+    return shapely.STRtree(geoms), ids, shapely.area(geoms)
 
 
 def write_vector_crosswalk(
@@ -178,12 +207,21 @@ def write_vector_crosswalk(
     compression="zstd",
     tree=None,
 ):
-    """Write a `src_grid_name` -> `dst_grid_name` crosswalk table, equivalent to the old
-    SQL's `st_intersects(st_centroid(src.geometry), dst.geometry)`.
+    """Write an area-weighted `src_grid_name` -> `dst_grid_name` crosswalk table.
 
-    `tree`, if given, must be a `(STRtree, ids)` pair as returned by `read_centroid_tree`
-    for `src_grid_name` -- passing one in lets several destinations of the same source
-    reuse it instead of rebuilding it each time. Written incrementally with
+    Every pair of overlapping cells becomes one row, with `scale_factor` set to the
+    fraction of the SOURCE cell's area lying inside the destination cell. A source cell
+    straddling several destination cells therefore contributes a row per destination, and
+    its scale factors sum to however much of it the destination grid covers at all -- 1.0
+    when the destination grid covers it completely, less when part of it falls outside.
+
+    Pairs that meet only along a shared boundary are dropped. `intersects` is true for
+    them, but the shared geometry has zero area, so they would only ever appear as
+    `scale_factor = 0` rows contributing nothing to a summary.
+
+    `tree`, if given, must be a `(STRtree, ids, areas)` triple as returned by
+    `read_geometry_tree` for `src_grid_name` -- passing one in lets several destinations of
+    the same source reuse it instead of rebuilding it each time. Written incrementally with
     `pyarrow.parquet.ParquetWriter` so the full join is never materialized at once.
 
     Returns `(output_path, row_count)`.
@@ -195,10 +233,11 @@ def write_vector_crosswalk(
 
     if tree is None:
         src_path = grids_path / f"{src_grid_name}.fgb"
-        tree, src_ids = read_centroid_tree(src_path, batch_size=batch_size)
+        tree, src_ids, src_areas = read_geometry_tree(src_path, batch_size=batch_size)
     else:
-        tree, src_ids = tree
+        tree, src_ids, src_areas = tree
 
+    src_geoms = tree.geometries
     src_id_type = _id_arrow_type(str(src_ids.dtype))
 
     crosswalks_path.mkdir(parents=True, exist_ok=True)
@@ -228,24 +267,37 @@ def write_vector_crosswalk(
                     continue
 
                 dst_geoms = shapely.from_wkb(wkb)
-                # `tree` holds SOURCE centroids and `dst_geoms` is the query side, so
+                # `tree` holds the SOURCE polygons and `dst_geoms` is the query side, so
                 # `query` returns (dst_index, src_index) -- backwards from how it reads at
-                # a glance. Verified empirically; see module docstring's memory rationale
-                # for why the tree is built on the source rather than the destination.
+                # a glance. Verified empirically; see the module docstring for why the tree
+                # is built on the source rather than the destination.
                 dst_idx, src_idx = tree.query(dst_geoms, predicate="intersects")
-                if len(dst_idx) == 0:
-                    continue
 
-                out_batch = pa.record_batch(
-                    [
-                        pa.array(src_ids[src_idx], type=src_id_type),
-                        pa.array(dst_ids[dst_idx], type=dst_id_type),
-                        pa.array(np.ones(len(dst_idx), dtype=np.float64)),
-                    ],
-                    schema=schema,
-                )
-                writer.write_batch(out_batch)
-                row_count += len(dst_idx)
+                # `intersects` only narrows down candidates; the actual overlap decides
+                # both whether a pair is a row at all and what its scale factor is.
+                for start in range(0, len(dst_idx), PAIR_CHUNK):
+                    src_sel = src_idx[start : start + PAIR_CHUNK]
+                    dst_sel = dst_idx[start : start + PAIR_CHUNK]
+                    overlap = shapely.area(shapely.intersection(src_geoms[src_sel], dst_geoms[dst_sel]))
+
+                    # Drop boundary-only touches (zero overlap), and guard the division:
+                    # a degenerate zero-area source cell can't be apportioned, and would
+                    # otherwise emit inf or nan scale factors.
+                    keep = (overlap > 0) & (src_areas[src_sel] > 0)
+                    if not keep.any():
+                        continue
+                    src_sel, dst_sel, overlap = src_sel[keep], dst_sel[keep], overlap[keep]
+
+                    out_batch = pa.record_batch(
+                        [
+                            pa.array(src_ids[src_sel], type=src_id_type),
+                            pa.array(dst_ids[dst_sel], type=dst_id_type),
+                            pa.array(overlap / src_areas[src_sel]),
+                        ],
+                        schema=schema,
+                    )
+                    writer.write_batch(out_batch)
+                    row_count += len(src_sel)
     finally:
         if writer is not None:
             writer.close()
