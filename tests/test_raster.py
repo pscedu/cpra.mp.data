@@ -18,10 +18,13 @@ DATASET_KWARGS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")
 
 
 class TestCogPathExpression:
-    def test_builds_a_dimension_path_with_a_tif_suffix(self, tmp_path):
+    def test_builds_a_dimension_directory_path(self, tmp_path):
+        """The calendar dimension is never part of the path -- its value lives only in
+        the band description (see write_cog) -- and neither is the file's .tif suffix,
+        since the file itself is named with a UUID rather than derived from this path."""
         df = pl.DataFrame({"variable": ["vct"], "grid": ["veg_grid_cell_v001"], "calendar_year": [2030]})
         path = df.select(p=cog_path_expression(df, tmp_path))["p"].item()
-        assert path == str(tmp_path / "variable=vct/grid=veg_grid_cell_v001/calendar_year=2030.tif")
+        assert path == str(tmp_path / "variable=vct/grid=veg_grid_cell_v001")
 
     def test_metadata_dimensions_are_excluded_from_the_path(self, tmp_path):
         df = pl.DataFrame({"variable": ["vct"], "model": ["icm_v2023.0.0"]})
@@ -42,13 +45,16 @@ class TestCogPathExpression:
 
 class TestWriteCog:
     def test_writes_to_the_dimension_path(self, base_path):
+        """Dataset dimensions (in variable/time_unit/grid order) and partition
+        dimensions form the directory; the calendar dimension isn't part of it, and the
+        file itself is named with a UUID, not a dimension value."""
         write_cog(raster_array(fill=1), base_path=base_path, calendar_year=2030, **RASTER_KWARGS)
-        expected = (
+        expected_dir = (
             base_path
-            / "variable=vct/grid=veg_grid_cell_v001/time_unit=annual"
-            / "model_group_id=500/scenario_id=7/calendar_year=2030.tif"
+            / "variable=vct/time_unit=annual/grid=veg_grid_cell_v001"
+            / "model_group_id=500/scenario_id=7"
         )
-        assert expected.exists()
+        assert list(expected_dir.glob("*.tif"))
 
     def test_creates_parent_directories(self, base_path):
         write_cog(raster_array(fill=1), base_path=base_path, calendar_year=2030, **RASTER_KWARGS)
@@ -80,13 +86,17 @@ class TestWriteCog:
             assert src.count == 1
 
     def test_kwargs_are_written_as_tags(self, base_path):
-        """Dimension values are the only record of what a COG contains."""
+        """Dimension values are the only record of what a COG contains, except the
+        calendar dimension, which is never a tag -- it lives solely in the band
+        description (see write_cog)."""
         write_cog(raster_array(fill=1), base_path=base_path, calendar_year=2030, **RASTER_KWARGS)
         with rio.open(next(base_path.rglob("*.tif"))) as src:
             tags = src.tags()
+            description = src.descriptions[0]
         assert tags["variable"] == "vct"
-        assert tags["calendar_year"] == "2030"
         assert tags["model"] == "icm_v2023.0.0"
+        assert "calendar_year" not in tags
+        assert description == "calendar_year=2030"
 
     def test_flat_arrays_are_reshaped_to_the_grid(self, base_path):
         grid = GRIDS[RASTER_KWARGS["grid"]]

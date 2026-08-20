@@ -86,10 +86,12 @@ class TestDatasetDimensions:
 
 
 class TestFilterDimensions:
-    def test_excludes_dataset_and_metadata_dimensions(self):
+    def test_excludes_dataset_dimensions(self):
+        """Dataset dimensions (variable/grid/time_unit) are path segments, not filters.
+        Metadata dimensions like `model` are stored as file tags rather than partition
+        columns, but they are still real per-row values and remain filterable."""
         fields = set(FilterDimensions.model_fields)
         assert not fields & set(DATASET_DIMENSIONS)
-        assert "model" not in fields
 
     def test_includes_partition_and_nonpartition_dimensions(self):
         fields = set(FilterDimensions.model_fields)
@@ -103,7 +105,7 @@ class TestFilterDimensions:
         assert FilterDimensions().model_group_id is None
 
     def test_every_filterable_dimension_is_present(self):
-        expected = {d.name for d in DIMENSIONS.values() if d.type not in ("dataset", "metadata")}
+        expected = {d.name for d in DIMENSIONS.values() if d.type != "dataset"}
         assert set(FilterDimensions.model_fields) == expected
 
 
@@ -111,7 +113,7 @@ class TestOptions:
     def test_defaults(self):
         options = Options()
         assert options.unpivot is False
-        assert options.geography is None
+        assert options.grid_cell is None
         assert options.group_aggregate is None
 
     def test_aggregate_enum_is_unwrapped(self):
