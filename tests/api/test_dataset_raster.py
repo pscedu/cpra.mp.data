@@ -6,12 +6,14 @@ the result to the same tabular shape the vector path produces.
 """
 
 import numpy as np
+import polars as pl
 import pytest
 import rasterio as rio
 from fastapi import HTTPException
 
 from cpra.mp.data.api.dataset import _get_zone_segments
 from cpra.mp.data.api.types import OutputType
+from cpra.mp.data.api.utils import group_rows_by_path
 from cpra.mp.data.grids import GRIDS
 
 from tests.factories import RASTER_KWARGS, write_raster_crosswalk, write_raster_dataset
@@ -48,8 +50,8 @@ class TestOutputType:
     def test_raster_grid_defaults_to_raster_output(self, dataset_factory, raster_data):
         assert dataset_factory(DIMENSIONS).output_type == OutputType.raster
 
-    def test_geography_switches_to_vector_output(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, geography="-91.0,29.5")
+    def test_grid_cell_switches_to_vector_output(self, dataset_factory, raster_data):
+        dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5")
         assert dataset.output_type == OutputType.vector
 
     def test_summarize_by_switches_to_vector_output(self, dataset_factory, raster_data):
@@ -71,7 +73,7 @@ class TestOutputType:
         assert dataset._is_raster_metadata_table() is False
 
 
-class TestGeographySampling:
+class TestGridCellSampling:
     async def test_samples_at_a_coordinate(self, dataset_factory, raster_data):
         """The grid covers coastal Louisiana; this point falls inside it."""
         left, bottom, right, top = GRID.bounds
@@ -81,38 +83,41 @@ class TestGeographySampling:
 
         lng, lat = [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])]
 
-        dataset = dataset_factory(DIMENSIONS, geography=f"{lng},{lat}")
+        dataset = dataset_factory(DIMENSIONS, grid_cell=f"{lng},{lat}")
         await dataset.apply_params()
-        df = dataset.materialize()
-        assert f"{lng},{lat}" in df.columns
-        assert df[f"{lng},{lat}"].to_list() == [30, 40]
+        df = dataset.materialize().sort("calendar_year")
+        # A sampled coordinate is reported as a "lng,lat" grid_cell label rather than an
+        # integer ID, in the long-format grid_cell/value shape used everywhere else.
+        label = f"{lng},{lat}"
+        assert df["grid_cell"].to_list() == [label, label]
+        assert df["value"].to_list() == [30, 40]
 
     async def test_path_column_is_dropped_after_sampling(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, geography="-91.0,29.5")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5")
         await dataset.apply_params()
         assert "path" not in dataset.materialize().columns
 
     async def test_non_numeric_coordinates_raise_400(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, geography="west,north")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="west,north")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "non-numeric coordinates" in excinfo.value.detail
 
     async def test_odd_coordinate_count_raises_400(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, geography="-91.0,29.5,-90.0")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5,-90.0")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "even number of coordinates" in excinfo.value.detail
 
     @pytest.mark.parametrize(
-        "geography", ["181.0,29.5", "-91.0,91.0", "-200.0,-100.0", "nan,nan"]
+        "grid_cell", ["181.0,29.5", "-91.0,91.0", "-200.0,-100.0", "nan,nan"]
     )
     async def test_out_of_range_coordinates_raise_400(
-        self, dataset_factory, raster_data, geography
+        self, dataset_factory, raster_data, grid_cell
     ):
-        dataset = dataset_factory(DIMENSIONS, geography=geography)
+        dataset = dataset_factory(DIMENSIONS, grid_cell=grid_cell)
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
@@ -120,7 +125,7 @@ class TestGeographySampling:
 
     async def test_unprojectable_coordinates_raise_400(self, dataset_factory, raster_data):
         """A pair can be valid WGS84 and still have no place in the grid's UTM zone."""
-        dataset = dataset_factory(DIMENSIONS, geography="0,0")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="0,0")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
@@ -148,8 +153,9 @@ class TestCalculateStage:
         dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
+        _paths, row_indices, bands = group_rows_by_path(df)
         with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], None)
+            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
         assert data[0][0, 0] == -30
         assert data[1][0, 0] == 40
 
@@ -172,8 +178,9 @@ class TestGroupStage:
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
         await dataset.apply_params()
         df = dataset.materialize()
+        _paths, row_indices, bands = group_rows_by_path(df)
         with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], None)
+            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
         assert data.shape[0] == 1
         assert data[0][0, 0] == 40
 
@@ -186,8 +193,9 @@ class TestGroupStage:
         dataset = dataset_factory(DIMENSIONS, group_aggregate=aggregate)
         await dataset.apply_params()
         df = dataset.materialize()
+        _paths, row_indices, bands = group_rows_by_path(df)
         with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], None)
+            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
         assert data[0][0, 0] == expected
 
 
@@ -239,20 +247,19 @@ class TestSummarizeStage:
         assert excinfo.value.status_code == 400
         assert "No crosswalk from veg_grid_cell_v001 to parish_v2020" in excinfo.value.detail
 
-    async def test_produces_one_column_per_zone(self, dataset_factory, raster_data, zone_crosswalk):
+    async def test_produces_one_row_per_zone_per_band(
+        self, dataset_factory, raster_data, zone_crosswalk
+    ):
+        """Summarizing no longer produces one column per zone; each zone is a row,
+        identified by an Int32 grid_cell value, in the long-format result."""
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert [c for c in df.columns if c[0].isdigit()] == ["1", "2"]
-
-    async def test_one_row_per_band(self, dataset_factory, raster_data, zone_crosswalk):
-        dataset = dataset_factory(
-            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
-        )
-        await dataset.apply_params()
-        assert dataset.materialize().height == 2
+        assert df["grid_cell"].dtype == pl.Int32
+        assert sorted(df["grid_cell"].unique().to_list()) == [1, 2]
+        assert df.height == 4  # 2 bands (years) x 2 zones
 
     @pytest.mark.parametrize("aggregate", ["min", "max", "mean", "sum"])
     async def test_uniform_rasters_summarize_to_the_fill_value(
@@ -263,11 +270,12 @@ class TestSummarizeStage:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate=aggregate
         )
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
+        df = dataset.materialize()
 
         zone_pixels = (GRID.height // 2) * GRID.width
         expected = {"min": 30, "max": 30, "mean": 30, "sum": 30 * zone_pixels}[aggregate]
-        assert df["1"][0] == pytest.approx(expected)
+        zone_1 = df.filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert zone_1["value"][0] == pytest.approx(expected)
 
     async def test_geographic_unit_column_is_added(
         self, dataset_factory, raster_data, zone_crosswalk
@@ -280,18 +288,18 @@ class TestSummarizeStage:
             "hydro_compartment_v001"
         ]
 
-    async def test_summarize_geography_restricts_zones(
+    async def test_summarize_grid_cell_restricts_zones(
         self, dataset_factory, raster_data, zone_crosswalk
     ):
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
-            summarize_geography="2",
+            summarize_grid_cell="2",
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert [c for c in df.columns if c[0].isdigit()] == ["2"]
+        assert sorted(df["grid_cell"].unique().to_list()) == [2]
 
     async def test_zone_with_no_pixels_is_nan(self, dataset_factory, raster_data, zone_crosswalk):
         """Zone 5 is not present in the crosswalk raster, so it has no contributing pixels."""
@@ -299,12 +307,14 @@ class TestSummarizeStage:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
-            summarize_geography="1,5",
+            summarize_grid_cell="1,5",
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert np.isnan(df["5"][0])
-        assert df["1"][0] == pytest.approx(30)
+        zone_5 = df.filter(pl.col("grid_cell") == 5)
+        zone_1 = df.filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert all(np.isnan(v) for v in zone_5["value"].to_list())
+        assert zone_1["value"][0] == pytest.approx(30)
 
     async def test_empty_dataset_raises_404(self, dataset_factory, base_path, zone_crosswalk):
         dataset = dataset_factory(
@@ -325,8 +335,9 @@ class TestSummarizeStage:
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert df.height == 1
-        assert df["1"][0] == pytest.approx(40)
+        assert df.height == 2  # one group (band) x 2 zones
+        zone_1 = df.filter(pl.col("grid_cell") == 1)
+        assert zone_1["value"][0] == pytest.approx(40)
 
     async def test_grouped_dimensions_become_null(
         self, dataset_factory, raster_data, zone_crosswalk
@@ -338,11 +349,14 @@ class TestSummarizeStage:
             summarize_aggregate="mean",
         )
         await dataset.apply_params()
-        assert dataset.materialize()["calendar_year"].null_count() == 1
+        df = dataset.materialize()
+        assert df["calendar_year"].null_count() == df.height
 
-    async def test_unpivot_applies_after_summarizing(
+    async def test_unpivot_is_a_no_op_after_summarizing(
         self, dataset_factory, raster_data, zone_crosswalk
     ):
+        """unpivot is retained only for API compatibility: the summarize result is
+        already long-format (grid_cell/value), so the parameter changes nothing."""
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
@@ -351,7 +365,7 @@ class TestSummarizeStage:
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert {"geography", "value"} <= set(df.columns)
+        assert {"grid_cell", "value"} <= set(df.columns)
         assert df.height == 4
 
 
@@ -377,7 +391,7 @@ class TestValidateTile:
         dataset.validate_tile()
 
     async def test_vector_output_raises_400(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, geography="-91.0,29.5")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5")
         with pytest.raises(HTTPException) as excinfo:
             dataset.validate_tile()
         assert "invalid output type for tile: vector" in excinfo.value.detail

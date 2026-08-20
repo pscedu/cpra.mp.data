@@ -433,9 +433,11 @@ class Dataset(LazyFrameSource):
         is_mean = self.options.summarize_aggregate == "mean"
         aggregate_fn, start_value = RASTER_AGGREGATES[self.options.summarize_aggregate]
 
+        unique_paths, row_indices, bands = group_rows_by_path(df)
+
         with ExitStack() as stack:
             crosswalk = stack.enter_context(rio.open(crosswalk_path))
-            inputs = [stack.enter_context(rio.open(path)) for path in df["path"]]
+            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
             if self.summarize_grid_cell_ids:
                 zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
             else:
@@ -453,7 +455,7 @@ class Dataset(LazyFrameSource):
                 # Neither read depends on the other, so overlap the crosswalk read with
                 # the (already parallel) reads of the data COGs.
                 data, zones = await asyncio.gather(
-                    self.get_raster_array(df, inputs, window),
+                    self.get_raster_array(df, inputs, row_indices, bands, window),
                     asyncio.to_thread(crosswalk.read, 1, window=window),
                 )
 
