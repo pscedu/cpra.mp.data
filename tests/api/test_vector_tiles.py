@@ -65,28 +65,30 @@ class TestParseTile:
 
 
 class TestDataToIdValue:
-    def test_extracts_numeric_columns_from_the_first_row(self):
-        df = pl.DataFrame({"calendar_year": [2030], "1": [1.5], "2": [2.5]})
+    """_data_to_id_value now reads a long-format frame (grid_cell/value columns, one row
+    per cell) rather than a wide frame's first row of numeric ID columns."""
+
+    def test_extracts_grid_cell_value_pairs(self):
+        df = pl.DataFrame({"calendar_year": [2030, 2030], "grid_cell": [1, 2], "value": [1.5, 2.5]})
         assert _data_to_id_value(df) == {1: 1.5, 2: 2.5}
 
     def test_skips_null_values(self):
-        df = pl.DataFrame({"1": [1.5], "2": [None]}, schema={"1": pl.Float64, "2": pl.Float64})
+        df = pl.DataFrame(
+            {"grid_cell": [1, 2], "value": [1.5, None]}, schema={"grid_cell": pl.Int32, "value": pl.Float64}
+        )
         assert _data_to_id_value(df) == {1: 1.5}
 
-    def test_only_the_first_row_is_used(self):
-        df = pl.DataFrame({"1": [1.5, 9.9]})
-        assert _data_to_id_value(df) == {1: 1.5}
-
-    def test_no_numeric_columns_yields_empty(self):
+    def test_no_grid_cell_column_yields_empty(self):
         assert _data_to_id_value(pl.DataFrame({"calendar_year": [2030]})) == {}
 
     def test_empty_frame_yields_empty(self):
-        df = pl.DataFrame({"1": []}, schema={"1": pl.Float64})
+        df = pl.DataFrame({"grid_cell": [], "value": []}, schema={"grid_cell": pl.Int32, "value": pl.Float64})
         assert _data_to_id_value(df) == {}
 
     def test_negative_ids_are_matched(self):
-        """The value-column pattern allows a leading minus sign."""
-        df = pl.DataFrame({"-1": [3.5]})
+        df = pl.DataFrame({"grid_cell": [-1]}, schema={"grid_cell": pl.Int32}).with_columns(
+            value=pl.Series([3.5], dtype=pl.Float64)
+        )
         assert _data_to_id_value(df) == {-1: 3.5}
 
 
@@ -187,13 +189,13 @@ class TestGetVectorTile:
         await dataset.apply_params()
         assert await dataset.get_vector_tile(TILE.x, TILE.y, TILE.z) is None
 
-    async def test_geography_filter_limits_injected_columns(
+    async def test_grid_cell_filter_limits_injected_columns(
         self, dataset_factory, vector_data, ecoregion_tiles
     ):
         from tests.factories import ANNUAL_KWARGS
 
         dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions, geography="1")
+        dataset = dataset_factory(dimensions, grid_cell="1")
         await dataset.apply_params()
 
         body = await dataset.get_vector_tile(TILE.x, TILE.y, TILE.z)
@@ -201,10 +203,10 @@ class TestGetVectorTile:
         result.ParseFromString(body)
         assert len(result.layers[0].values) == 1
 
-    async def test_coordinate_geography_still_matches_features_by_id(
+    async def test_coordinate_grid_cell_still_matches_features_by_id(
         self, dataset_factory, vector_data, ecoregion_tiles, geometry_path
     ):
-        """A coordinate-selected geography is resolved to an ID before it reaches the tile,
+        """A coordinate-selected grid_cell is resolved to an ID before it reaches the tile,
         which is what a pmtile feature is keyed by."""
         from shapely.geometry import box
 
@@ -218,7 +220,7 @@ class TestGetVectorTile:
         ]
 
         dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions, geography=f"{lng!s},{lat!s}")
+        dataset = dataset_factory(dimensions, grid_cell=f"{lng!s},{lat!s}")
         await dataset.apply_params()
 
         body = await dataset.get_vector_tile(TILE.x, TILE.y, TILE.z)

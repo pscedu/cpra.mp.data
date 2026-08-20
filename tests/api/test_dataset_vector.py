@@ -18,12 +18,12 @@ from tests.factories import ANNUAL_KWARGS, annual_frame, write_grid_geometry, wr
 
 DIMENSIONS = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 # The dimension columns every wide annual frame carries, so tests can isolate the
-# geography columns beside them.
+# per-cell columns (unpivoted into grid_cell/value on write) beside them.
 DIMENSION_NAMES = set(annual_frame(years=(2030,)).select(pl.col("^[a-z].*$")).columns)
 
 
 def _lng_lat(x, y):
-    """Project an ecoregion_v001 (EPSG:26915) point to WGS84 for a geography= query."""
+    """Project an ecoregion_v001 (EPSG:26915) point to WGS84 for a grid_cell= query."""
     lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [x], [y])]
     return f"{lng!s},{lat!s}"
 
@@ -108,30 +108,25 @@ class TestFilterStage:
     async def test_where_clause(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, where="calendar_year > 2035")
         await dataset.apply_params()
-        assert dataset.materialize()["calendar_year"].to_list() == [2040]
+        assert dataset.materialize()["calendar_year"].unique().to_list() == [2040]
 
-    async def test_geography_selects_columns(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, geography="1,2")
+    async def test_grid_cell_selects_rows(self, dataset_factory, annual_data):
+        """A grid_cell filter on a vector grid selects rows, not columns, now that each
+        cell is a row rather than a column."""
+        dataset = dataset_factory(DIMENSIONS, grid_cell="1,2")
         await dataset.apply_params()
-        columns = dataset.materialize().columns
-        assert [c for c in columns if c[0].isdigit()] == ["1", "2"]
+        df = dataset.materialize()
+        assert sorted(df["grid_cell"].unique().to_list()) == [1, 2]
 
-    async def test_geography_keeps_dimension_columns(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, geography="1")
+    async def test_grid_cell_keeps_dimension_columns(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, grid_cell="1")
         await dataset.apply_params()
         assert "calendar_year" in dataset.materialize().columns
 
-    async def test_geography_records_the_ids(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, geography="1,2")
+    async def test_grid_cell_records_the_ids(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, grid_cell="1,2")
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1", "2"]
-
-    async def test_unknown_geography_becomes_400(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, geography="9999")
-        await dataset.apply_params()
-        with pytest.raises(HTTPException) as excinfo:
-            dataset.materialize()
-        assert excinfo.value.status_code == 400
+        assert dataset.grid_cell_ids == ["1", "2"]
 
     async def test_dimension_filters_are_applied(self, dataset_factory, two_scenario_data):
         dataset = dataset_factory(DIMENSIONS, filters={"scenario_id": [8]})
@@ -139,8 +134,8 @@ class TestFilterStage:
         assert dataset.materialize()["scenario_id"].unique().to_list() == [8]
 
 
-class TestGeographyCoordinates:
-    """geography= on a vector grid may be grid cell IDs (as above) or lat/lng pairs,
+class TestGridCellCoordinates:
+    """grid_cell= on a vector grid may be grid cell IDs (as above) or lat/lng pairs,
     resolved to grid cell IDs via point-in-polygon lookup against config.GEOMETRY_PATH."""
 
     @pytest.fixture
@@ -159,18 +154,18 @@ class TestGeographyCoordinates:
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
         label = _lng_lat(500500, 3300500)  # inside square 1
-        dataset = dataset_factory(DIMENSIONS, geography=label)
+        dataset = dataset_factory(DIMENSIONS, grid_cell=label)
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1"]
+        assert dataset.grid_cell_ids == ["1"]
 
     async def test_multiple_coordinates_resolve_in_order(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
         label1 = _lng_lat(500500, 3300500)  # square 1
         label2 = _lng_lat(501500, 3300500)  # square 2
-        dataset = dataset_factory(DIMENSIONS, geography=f"{label1},{label2}")
+        dataset = dataset_factory(DIMENSIONS, grid_cell=f"{label1},{label2}")
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1", "2"]
+        assert dataset.grid_cell_ids == ["1", "2"]
 
     async def test_unmatched_coordinate_is_ignored(
         self, dataset_factory, annual_data, ecoregion_geometry
@@ -178,66 +173,63 @@ class TestGeographyCoordinates:
         """A point outside every polygon is dropped rather than erroring."""
         inside = _lng_lat(500500, 3300500)
         outside = _lng_lat(0, 0)
-        dataset = dataset_factory(DIMENSIONS, geography=f"{inside},{outside}")
+        dataset = dataset_factory(DIMENSIONS, grid_cell=f"{inside},{outside}")
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1"]
+        assert dataset.grid_cell_ids == ["1"]
 
     async def test_grid_cell_ids_still_work(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
         """IDs (digit-only tokens) take the original, non-geometry path."""
-        dataset = dataset_factory(DIMENSIONS, geography="1,2")
+        dataset = dataset_factory(DIMENSIONS, grid_cell="1,2")
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1", "2"]
+        assert dataset.grid_cell_ids == ["1", "2"]
 
     async def test_coordinates_in_one_cell_select_it_once(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
-        """A vector geography is its ID, and IDs double as column names, so the cell can
-        only appear once however many coordinates landed in it."""
+        """A vector grid_cell is its ID, and each ID is one row, so the cell can only
+        appear once however many coordinates landed in it."""
         first = _lng_lat(500400, 3300400)
         second = _lng_lat(500600, 3300600)
-        dataset = dataset_factory(DIMENSIONS, geography=f"{first},{second}")
+        dataset = dataset_factory(DIMENSIONS, grid_cell=f"{first},{second}")
         await dataset.apply_params()
-        assert dataset.geography_ids == ["1"]
+        assert dataset.grid_cell_ids == ["1"]
         df = dataset.materialize()
-        assert [c for c in df.columns if c not in DIMENSION_NAMES] == ["1"]
+        assert df["grid_cell"].unique().to_list() == [1]
 
-    async def test_columns_are_named_for_the_resolved_cell(
+    async def test_grid_cell_column_reports_the_resolved_cell(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
         """The response reports cell IDs whichever way the caller selected them — the
         coordinate is how it was asked for, not what the values describe."""
         label = _lng_lat(500500, 3300500)
-        dataset = dataset_factory(DIMENSIONS, geography=label)
+        dataset = dataset_factory(DIMENSIONS, grid_cell=label)
         await dataset.apply_params()
-        columns = dataset.materialize().columns
-        assert "1" in columns
-        assert label not in columns
+        assert dataset.materialize()["grid_cell"].unique().to_list() == [1]
 
     async def test_unpivoting_reports_the_cell_id(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
-        """The shape every visualization requests, so the ID has to reach the geography
-        column rather than the coordinate that selected it."""
+        """The shape every visualization requests, so the ID has to reach the grid_cell
+        column rather than the coordinate that selected it. Data is already long on disk,
+        so unpivot=True is a no-op here, but it's kept for backward API compatibility."""
         label = _lng_lat(500500, 3300500)
-        dataset = dataset_factory(DIMENSIONS, geography=label, unpivot=True)
+        dataset = dataset_factory(DIMENSIONS, grid_cell=label, unpivot=True)
         await dataset.apply_params()
-        assert dataset.materialize()["geography"].unique().to_list() == ["1"]
+        assert dataset.materialize()["grid_cell"].unique().to_list() == [1]
 
-    async def test_a_select_that_drops_the_geography_columns_still_works(
+    async def test_a_select_naming_only_dimensions_still_works(
         self, dataset_factory, annual_data, ecoregion_geometry
     ):
-        """`select` can only name dimensions, so without unpivot it drops every geography
-        column."""
         dataset = dataset_factory(
-            DIMENSIONS, geography=_lng_lat(500500, 3300500), select="calendar_year"
+            DIMENSIONS, grid_cell=_lng_lat(500500, 3300500), select="calendar_year"
         )
         await dataset.apply_params()
         assert dataset.materialize().columns == ["calendar_year"]
 
     async def test_no_geometry_file_raises_400(self, dataset_factory, annual_data, geometry_path):
-        dataset = dataset_factory(DIMENSIONS, geography=_lng_lat(500500, 3300500))
+        dataset = dataset_factory(DIMENSIONS, grid_cell=_lng_lat(500500, 3300500))
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
@@ -248,36 +240,37 @@ class TestCalculateStage:
     async def test_negate_flips_matching_rows(self, dataset_factory, two_scenario_data):
         dataset = dataset_factory(DIMENSIONS, negate="scenario_id = 8")
         await dataset.apply_params()
-        df = dataset.materialize().sort("scenario_id")
-        assert df["1"][0] > 0
-        assert df["1"][1] < 0
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("scenario_id")
+        assert df["value"][0] > 0
+        assert df["value"][1] < 0
 
     async def test_multiply10(self, dataset_factory, annual_data):
         base = annual_frame(years=(2030,))["1"][0]
         dataset = dataset_factory(DIMENSIONS, multiply10="calendar_year = 2030")
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["1"][0] == pytest.approx(base * 10, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(base * 10, rel=1e-5)
 
     async def test_multiply100(self, dataset_factory, annual_data):
         base = annual_frame(years=(2030,))["1"][0]
         dataset = dataset_factory(DIMENSIONS, multiply100="calendar_year = 2030")
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["1"][0] == pytest.approx(base * 100, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(base * 100, rel=1e-5)
 
     async def test_non_matching_rows_are_untouched(self, dataset_factory, annual_data):
         base = annual_frame(years=(2040,))["1"][0]
         dataset = dataset_factory(DIMENSIONS, multiply10="calendar_year = 2030")
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["1"][1] == pytest.approx(base, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][1] == pytest.approx(base, rel=1e-5)
 
     async def test_no_calculate_params_is_a_no_op(self, dataset_factory, annual_data):
         base = annual_frame(years=(2030,))["1"][0]
         dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
-        assert dataset.materialize().sort("calendar_year")["1"][0] == pytest.approx(base, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(base, rel=1e-5)
 
     async def test_first_matching_expression_wins(self, dataset_factory, annual_data):
         """The when/then chain is evaluated in negate, multiply10, multiply100 order."""
@@ -286,8 +279,8 @@ class TestCalculateStage:
             DIMENSIONS, negate="calendar_year = 2030", multiply10="calendar_year = 2030"
         )
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["1"][0] == pytest.approx(-base, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(-base, rel=1e-5)
 
 
 class TestGroupStage:
@@ -301,17 +294,25 @@ class TestGroupStage:
     async def test_aggregate_without_group_by_collapses_everything(
         self, dataset_factory, annual_data
     ):
+        """grid_cell always stays part of the group key in long format -- each row is one
+        grid cell -- so "everything" collapsing means every non-grid_cell dimension, not the
+        whole dataset into a single row: each of ecoregion_v001's 32 cells gets one row."""
         dataset = dataset_factory(DIMENSIONS, group_aggregate="sum")
         await dataset.apply_params()
         df = dataset.materialize()
-        assert df.height == 1
+        assert df.height == 32
         expected = sum(annual_frame(years=(2030, 2040))["1"].to_list())
-        assert df["1"][0] == pytest.approx(expected, rel=1e-5)
+        cell_1 = df.filter(pl.col("grid_cell") == 1)
+        assert cell_1["value"][0] == pytest.approx(expected, rel=1e-5)
 
     async def test_group_by_a_dimension(self, dataset_factory, two_scenario_data):
+        """One row per (scenario_id, grid_cell), since grid_cell always stays in the group
+        key in long format."""
         dataset = dataset_factory(DIMENSIONS, group_by="scenario_id", group_aggregate="max")
         await dataset.apply_params()
-        assert dataset.materialize().height == 2
+        df = dataset.materialize()
+        assert df.height == 2 * 32
+        assert sorted(df["scenario_id"].unique().to_list()) == [7, 8]
 
     async def test_ungrouped_dimensions_become_null(self, dataset_factory, two_scenario_data):
         dataset = dataset_factory(DIMENSIONS, group_by="scenario_id", group_aggregate="max")
@@ -330,7 +331,8 @@ class TestGroupStage:
             "sum": sum(values),
             "mean": sum(values) / len(values),
         }[aggregate]
-        assert dataset.materialize()["1"][0] == pytest.approx(expected, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1)
+        assert df["value"][0] == pytest.approx(expected, rel=1e-5)
 
     async def test_invalid_group_by_dimension_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, group_by="nope", group_aggregate="sum")
@@ -377,7 +379,7 @@ class TestSummarizeStage:
         assert excinfo.value.status_code == 400
         assert "No crosswalk from ecoregion_v001 to parish_v2020" in excinfo.value.detail
 
-    async def test_summarize_produces_destination_columns(
+    async def test_summarize_produces_destination_grid_cells(
         self, dataset_factory, annual_data, crosswalk
     ):
         dataset = dataset_factory(
@@ -385,7 +387,7 @@ class TestSummarizeStage:
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert [c for c in df.columns if c[0].isdigit()] == ["100", "200"]
+        assert sorted(df["grid_cell"].unique().to_list()) == [100, 200]
 
     async def test_scale_factors_are_applied(self, dataset_factory, annual_data, crosswalk):
         source = annual_frame(years=(2030, 2040))
@@ -393,9 +395,9 @@ class TestSummarizeStage:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="sum"
         )
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
+        df = dataset.materialize().filter(pl.col("grid_cell") == 100).sort("calendar_year")
         expected = (source["1"][0] + source["2"][0]) * 0.5
-        assert df["100"][0] == pytest.approx(expected, rel=1e-5)
+        assert df["value"][0] == pytest.approx(expected, rel=1e-5)
 
     async def test_geographic_unit_column_is_added(self, dataset_factory, annual_data, crosswalk):
         dataset = dataset_factory(
@@ -406,60 +408,60 @@ class TestSummarizeStage:
             "hydro_compartment_v001"
         ]
 
-    async def test_summarize_geography_narrows_destinations(
+    async def test_summarize_grid_cell_narrows_destinations(
         self, dataset_factory, annual_data, crosswalk
     ):
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
-            summarize_geography="200",
+            summarize_grid_cell="200",
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert [c for c in df.columns if c[0].isdigit()] == ["200"]
+        assert df["grid_cell"].unique().to_list() == [200]
 
-    async def test_geography_filter_narrows_sources(self, dataset_factory, annual_data, crosswalk):
-        """A source-side geography filter removes its contribution from the summary.
+    async def test_grid_cell_filter_narrows_sources(self, dataset_factory, annual_data, crosswalk):
+        """A source-side grid_cell filter removes its contribution from the summary.
 
-        Regression: `geography_ids` stay strings because they double as column names, and
-        were fed straight into `is_in` against the crosswalk's integer `src_id`.
+        Regression: `grid_cell_ids` stay strings because they were originally column
+        names, and were fed straight into `is_in` against the crosswalk's integer `src_id`.
         """
         source = annual_frame(years=(2030,))
         dataset = dataset_factory(
             DIMENSIONS,
-            geography="1,3",
+            grid_cell="1,3",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
         )
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["100"][0] == pytest.approx(source["1"][0] * 0.5, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 100).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(source["1"][0] * 0.5, rel=1e-5)
 
-    async def test_geography_filter_drops_excluded_sources_entirely(
+    async def test_grid_cell_filter_drops_excluded_sources_entirely(
         self, dataset_factory, annual_data, crosswalk
     ):
-        """Geographies 2 and 4 are excluded, so each destination has one contributor."""
+        """Source cells 2 and 4 are excluded, so each destination has one contributor."""
         source = annual_frame(years=(2030,))
         dataset = dataset_factory(
             DIMENSIONS,
-            geography="1,3",
+            grid_cell="1,3",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
         )
         await dataset.apply_params()
-        df = dataset.materialize().sort("calendar_year")
-        assert df["200"][0] == pytest.approx(source["3"][0] * 0.5, rel=1e-5)
+        df = dataset.materialize().filter(pl.col("grid_cell") == 200).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(source["3"][0] * 0.5, rel=1e-5)
 
-    async def test_summarize_geography_ids_are_cast_to_int(self, dataset_factory, annual_data):
+    async def test_summarize_grid_cell_ids_are_cast_to_int(self, dataset_factory, annual_data):
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
-            summarize_geography="100, 200",
+            summarize_grid_cell="100, 200",
         )
         dataset._validate_summarize_params()
-        assert dataset.summarize_geography_ids == [100, 200]
+        assert dataset.summarize_grid_cell_ids == [100, 200]
 
     async def test_summarize_switches_output_to_vector(self, dataset_factory, annual_data):
         dataset = dataset_factory(
@@ -472,12 +474,16 @@ class TestSortAndSelectStage:
     async def test_sort_ascending(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, sort="calendar_year")
         await dataset.apply_params()
-        assert dataset.materialize()["calendar_year"].to_list() == [2030, 2040]
+        # Long format repeats each year once per grid cell, so compare the order years
+        # first appear in rather than the raw (now 64-row) list.
+        years = dataset.materialize()["calendar_year"].unique(maintain_order=True).to_list()
+        assert years == [2030, 2040]
 
     async def test_sort_descending(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, sort="-calendar_year")
         await dataset.apply_params()
-        assert dataset.materialize()["calendar_year"].to_list() == [2040, 2030]
+        years = dataset.materialize()["calendar_year"].unique(maintain_order=True).to_list()
+        assert years == [2040, 2030]
 
     async def test_multiple_sort_keys(self, dataset_factory, two_scenario_data):
         dataset = dataset_factory(DIMENSIONS, sort="-scenario_id,calendar_year")
@@ -501,19 +507,20 @@ class TestSortAndSelectStage:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
-    async def test_select_allows_geography_and_value(self, dataset_factory, annual_data):
-        """These only exist after unpivot, but are valid select targets."""
-        dataset = dataset_factory(DIMENSIONS, unpivot=True, select="geography,value")
+    async def test_select_allows_grid_cell_and_value(self, dataset_factory, annual_data):
+        """grid_cell/value are always present in long format, but are still valid select
+        targets (unpivot=True is kept for backward API compatibility, and is a no-op)."""
+        dataset = dataset_factory(DIMENSIONS, unpivot=True, select="grid_cell,value")
         await dataset.apply_params()
-        assert dataset.materialize().columns == ["geography", "value"]
+        assert dataset.materialize().columns == ["grid_cell", "value"]
 
 
 class TestUnpivot:
-    async def test_produces_geography_and_value_columns(self, dataset_factory, annual_data):
+    async def test_produces_grid_cell_and_value_columns(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, unpivot=True)
         await dataset.apply_params()
         df = dataset.materialize()
-        assert "geography" in df.columns
+        assert "grid_cell" in df.columns
         assert "value" in df.columns
 
     async def test_row_count_is_years_times_geographies(self, dataset_factory, annual_data):
@@ -526,7 +533,7 @@ class TestUnpivot:
         dataset = dataset_factory(DIMENSIONS, unpivot=True)
         await dataset.apply_params()
         df = dataset.materialize().filter(
-            (pl.col("calendar_year") == 2030) & (pl.col("geography") == "1")
+            (pl.col("calendar_year") == 2030) & (pl.col("grid_cell") == 1)
         )
         assert df["value"][0] == pytest.approx(source["1"][0], rel=1e-5)
 
@@ -561,9 +568,9 @@ class TestEstimateDataSize:
         ).estimate_data_size()
         assert two == 2 * one
 
-    def test_geography_ids_override_the_grid_column_count(self, dataset_factory, annual_data):
+    def test_grid_cell_ids_override_the_grid_column_count(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, filters=self.ALL_FILTERED)
-        dataset.geography_ids = ["1", "2"]
+        dataset.grid_cell_ids = ["1", "2"]
         assert dataset.estimate_data_size() == pytest.approx(2 * 32 / 8)
 
     def test_group_by_shrinks_the_estimate(self, dataset_factory, annual_data):

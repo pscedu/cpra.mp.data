@@ -33,15 +33,15 @@ from tests.factories import annual_frame, daily_frame
 
 class TestPartitionColumns:
     def test_annual_partitions_on_dataset_dimensions_only(self):
-        """For non-daily data, only variable/grid/time_unit become directories."""
-        assert partition_columns(annual_frame()) == ["variable", "grid", "time_unit"]
+        """For non-daily data, only variable/time_unit/grid become directories."""
+        assert partition_columns(annual_frame()) == ["variable", "time_unit", "grid"]
 
     def test_daily_adds_partition_dimensions(self):
         """Daily data additionally partitions on the required partition dimensions."""
         assert partition_columns(daily_frame()) == [
             "variable",
-            "grid",
             "time_unit",
+            "grid",
             "model_group_id",
             "scenario_id",
             "aggregate_type",
@@ -62,8 +62,8 @@ class TestRequiredColumns:
     def test_annual_required_columns(self):
         assert required_columns(annual_frame()) == [
             "variable",
-            "grid",
             "time_unit",
+            "grid",
             "model_group_id",
             "scenario_id",
             "percentile",
@@ -89,8 +89,8 @@ class TestRequiredColumns:
         assert "model" not in required_columns(annual_frame(), include_metadata=False)
 
     def test_include_geography_and_value_append_in_order(self):
-        cols = required_columns(annual_frame(), include_geography=True, include_value=True)
-        assert cols[-2:] == ["geography", "value"]
+        cols = required_columns(annual_frame(), include_grid_cell=True, include_value=True)
+        assert cols[-2:] == ["grid_cell", "value"]
 
     def test_variable_specific_requirement(self):
         """percentile is required for ssf but not for sal."""
@@ -196,7 +196,7 @@ class TestExtractDimensionValue:
 class TestDatasetPath:
     def test_builds_dataset_dimension_prefix(self, tmp_path):
         path = dataset_path(tmp_path, variable="ssf", grid="ecoregion_v001", time_unit="annual")
-        assert path == tmp_path / "variable=ssf" / "grid=ecoregion_v001" / "time_unit=annual"
+        assert path == tmp_path / "variable=ssf" / "time_unit=annual" / "grid=ecoregion_v001"
 
     def test_ignores_extra_kwargs(self, tmp_path):
         path = dataset_path(

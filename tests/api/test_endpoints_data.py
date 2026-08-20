@@ -27,18 +27,22 @@ from tests.factories import (
     write_raster_dataset,
 )
 
-VECTOR_URL = "/v1/datasets/ssf/ecoregion_v001/annual"
-RASTER_URL = "/v1/datasets/vct/veg_grid_cell_v001/annual"
+VECTOR_URL = "/v1/datasets/ssf/annual/ecoregion_v001"
+RASTER_URL = "/v1/datasets/vct/annual/veg_grid_cell_v001"
 
 
 def _lng_lat(x, y):
-    """Project an ecoregion_v001 (EPSG:26915) point to WGS84, as a `geography=` value."""
+    """Project an ecoregion_v001 (EPSG:26915) point to WGS84, as a `grid_cell=` value."""
     lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [x], [y])]
     return f"{lng!s},{lat!s}"
 
 
 @pytest.fixture
 def vector_data(base_path, monkeypatch):
+    # The catalog side-table isolation (config.CATALOG_PATH) is handled centrally by the
+    # autouse `_isolated_catalog_path` fixture in tests/conftest.py -- otherwise catalog
+    # rows written by one test (e.g. the ssf/ecoregion_v001/annual years this fixture
+    # always uses) would leak into another test's /catalog.json assertions.
     write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
@@ -64,47 +68,51 @@ class TestVectorData:
         response = client.get(f"{VECTOR_URL}/data.csv")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["calendar_year"].to_list() == [2030, 2040]
+        assert df["calendar_year"].unique().sort().to_list() == [2030, 2040]
 
     def test_parquet(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.parquet")
         assert response.status_code == 200
-        assert pl.read_parquet(io.BytesIO(response.content)).height == 2
+        # Long format: one row per (grid cell x calendar year), so 32 cells x 2 years.
+        assert pl.read_parquet(io.BytesIO(response.content)).height == 64
 
     def test_ndjson(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.ndjson")
         assert response.status_code == 200
-        assert pl.read_ndjson(io.BytesIO(response.content)).height == 2
+        assert pl.read_ndjson(io.BytesIO(response.content)).height == 64
 
     def test_dimension_filter_from_the_query_string(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?calendar_year=2030")
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["calendar_year"].to_list() == [2030]
+        assert df["calendar_year"].unique().to_list() == [2030]
+        assert df.height == 32
 
     def test_repeated_filter_values(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?calendar_year=2030&calendar_year=2040")
-        assert pl.read_csv(io.BytesIO(response.content)).height == 2
-
-    def test_geography_selects_columns(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/data.csv?geography=1,2")
         df = pl.read_csv(io.BytesIO(response.content))
-        assert [c for c in df.columns if c[0].isdigit()] == ["1", "2"]
+        assert df.height == 64
+        assert set(df["calendar_year"]) == {2030, 2040}
 
-    def test_geography_accepts_a_coordinate_pair(self, client, vector_data, ecoregion_geometry):
-        """geography= on a vector grid also accepts lat/lng, resolved via the grid's
+    def test_grid_cell_selects_rows(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell=1,2")
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert sorted(df["grid_cell"].unique().to_list()) == [1, 2]
+
+    def test_grid_cell_accepts_a_coordinate_pair(self, client, vector_data, ecoregion_geometry):
+        """grid_cell= on a vector grid also accepts lat/lng, resolved via the grid's
         FlatGeoBuf geometry and reported back under the grid cell ID it resolved to."""
         label = _lng_lat(500500, 3300500)
 
-        response = client.get(f"{VECTOR_URL}/data.csv?geography={label}")
+        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell={label}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert "1" in df.columns
+        assert df["grid_cell"].unique().to_list() == [1]
         assert label not in df.columns
 
     def test_unpivot(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&geography=1")
+        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell=1")
         df = pl.read_csv(io.BytesIO(response.content))
-        assert {"geography", "value"} <= set(df.columns)
+        assert {"grid_cell", "value"} <= set(df.columns)
 
     def test_unpivot_reports_cell_ids_for_a_coordinate_selection(
         self, client, vector_data, ecoregion_geometry
@@ -113,10 +121,10 @@ class TestVectorData:
         caller can join it against anything else the vector grid keys that way."""
         label = _lng_lat(500500, 3300500)
 
-        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&geography={label}")
+        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell={label}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["geography"].unique().to_list() == [1]
+        assert df["grid_cell"].unique().to_list() == [1]
 
     def test_coordinates_sharing_a_cell_report_it_once(
         self, client, vector_data, ecoregion_geometry
@@ -126,11 +134,11 @@ class TestVectorData:
         first, second = _lng_lat(500400, 3300400), _lng_lat(500600, 3300600)
 
         response = client.get(
-            f"{VECTOR_URL}/data.csv?unpivot=true&geography={first},{second}&calendar_year=2030"
+            f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell={first},{second}&calendar_year=2030"
         )
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert dict(zip(df["geography"], df["value"])) == {1: pytest.approx(2030.01)}
+        assert dict(zip(df["grid_cell"], df["value"])) == {1: pytest.approx(2030.01)}
 
     def test_select(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?select=calendar_year")
@@ -139,12 +147,13 @@ class TestVectorData:
     def test_sort_descending(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?sort=-calendar_year")
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["calendar_year"].to_list() == [2040, 2030]
+        assert df["calendar_year"].unique(maintain_order=True).to_list() == [2040, 2030]
 
     def test_where_clause(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv?where=calendar_year%20%3E%202035")
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["calendar_year"].to_list() == [2040]
+        assert df["calendar_year"].unique().to_list() == [2040]
+        assert df.height == 32
 
     def test_tif_is_rejected_for_a_vector_grid(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.tif")
@@ -192,10 +201,12 @@ class TestRasterData:
             x, y = src.xy(src.height // 2, src.width // 2)
             lng, lat = [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])]
 
-        response = client.get(f"{RASTER_URL}/data.csv?geography={lng},{lat}")
+        response = client.get(f"{RASTER_URL}/data.csv?grid_cell={lng},{lat}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df[f"{lng},{lat}"].to_list() == [30]
+        # A raster grid_cell selection is keyed by the "lng,lat" label itself, not an ID.
+        assert df["grid_cell"].to_list() == [f"{lng},{lat}"]
+        assert df["value"].to_list() == [30]
 
     def test_tabular_compression_is_rejected_for_tif(self, client, raster_data):
         response = client.get(f"{RASTER_URL}/data.tif?compression_algorithm=gzip")
@@ -284,7 +295,9 @@ class TestCatalogEndpoint:
         body = client.get(f"{VECTOR_URL}/catalog.json").json()
         assert body["choices"]["calendar_year"] == [2030, 2040]
 
-    def test_contiguous_years_are_compressed_into_a_range(self, client, base_path, monkeypatch):
+    def test_contiguous_years_are_compressed_into_a_range(
+        self, client, base_path, monkeypatch
+    ):
         write_parquet(annual_frame(years=(2030, 2031, 2032)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         body = client.get(f"{VECTOR_URL}/catalog.json").json()
@@ -302,7 +315,7 @@ class TestCatalogEndpoint:
 class TestVisualizationEndpoints:
     def test_dataset_visualization_returns_a_vega_spec(self, client, vector_data):
         response = client.get(
-            f"{VECTOR_URL}/visualization/time-series-line.json?geography=1&calendar_year=2030"
+            f"{VECTOR_URL}/visualization/time-series-line.json?grid_cell=1&calendar_year=2030"
         )
         assert response.status_code == 200
         assert "$schema" in response.json()
@@ -315,14 +328,14 @@ class TestVisualizationEndpoints:
         like. The coordinate survives only as a label."""
         label = _lng_lat(500500, 3300500)
         response = client.get(
-            f"{VECTOR_URL}/visualization/time-series-line.json?geography={label}&calendar_year=2030"
+            f"{VECTOR_URL}/visualization/time-series-line.json?grid_cell={label}&calendar_year=2030"
         )
         assert response.status_code == 200
         spec = response.json()
         assert label.replace(",", ", ") in json.dumps(spec)
         assert spec["data"]["format"]["parse"] == {
             "value": "number",
-            "geography": "number",
+            "grid_cell": "number",
             "calendar_year": "number",
         }
 
@@ -334,20 +347,20 @@ class TestVisualizationEndpoints:
         the legend repeats the coordinate — a tooltip row has no width to spare."""
         label = _lng_lat(500500, 3300500)
         response = client.get(
-            f"{VECTOR_URL}/visualization/time-series-line.json?geography={label}&calendar_year=2030"
+            f"{VECTOR_URL}/visualization/time-series-line.json?grid_cell={label}&calendar_year=2030"
         )
         assert response.status_code == 200
         spec = response.json()
 
         display = f"1 ({label.replace(',', ', ')})"
         line = spec["layer"][0]
-        assert line["encoding"]["color"]["field"] == "geography_label"
+        assert line["encoding"]["color"]["field"] == "grid_cell_label"
         assert line["encoding"]["color"]["scale"]["domain"] == [display]
         # The lookup that puts that label on each row is keyed by the API's own value.
         lookup = line["transform"][-1]
-        assert lookup["lookup"] == "geography"
+        assert lookup["lookup"] == "grid_cell"
         assert spec["datasets"][lookup["from"]["data"]["name"]] == [
-            {"geography_idx": 0, "geography": 1, "geography_label": display}
+            {"grid_cell_label_idx": 0, "grid_cell": 1, "grid_cell_label": display}
         ]
         tooltips = spec["layer"][2]["encoding"]["tooltip"]
         assert [t["title"] for t in tooltips[1:]] == ["1: "]
@@ -358,24 +371,24 @@ class TestVisualizationEndpoints:
     ):
         label = _lng_lat(500500, 3300500)
         response = client.get(
-            f"{VECTOR_URL}/visualization/{name}.json?geography={label}&calendar_year=2030"
+            f"{VECTOR_URL}/visualization/{name}.json?grid_cell={label}&calendar_year=2030"
         )
         assert response.status_code == 200
 
     def test_dataset_visualization_parses_grid_cell_ids_as_numbers(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/visualization/time-series-line.json?geography=1")
-        assert response.json()["data"]["format"]["parse"]["geography"] == "number"
+        response = client.get(f"{VECTOR_URL}/visualization/time-series-line.json?grid_cell=1")
+        assert response.json()["data"]["format"]["parse"]["grid_cell"] == "number"
 
     def test_unknown_visualization_is_404(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/visualization/nope.json")
         assert response.status_code == 404
 
     def test_custom_visualization_rejected_on_the_dataset_route(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/visualization/sediment-dynamics.json?geography=1")
+        response = client.get(f"{VECTOR_URL}/visualization/sediment-dynamics.json?grid_cell=1")
         assert response.status_code == 400
 
     def test_dataset_visualization_rejected_on_the_custom_route(self, client, vector_data):
-        response = client.get("/v1/visualizations/time-series-line.json?geography=1")
+        response = client.get("/v1/visualizations/time-series-line.json?grid_cell=1")
         assert response.status_code == 400
 
 

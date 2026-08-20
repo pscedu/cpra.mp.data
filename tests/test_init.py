@@ -49,7 +49,9 @@ class TestReadData:
         write_data(annual_frame(), base_path=base_path, **ANNUAL_DATASET)
         lf = read_data(base_path=base_path, **ANNUAL_DATASET)
         assert isinstance(lf, pl.LazyFrame)
-        assert lf.collect()["calendar_year"].to_list() == [2030, 2040]
+        # Long format repeats each calendar_year once per grid_cell, so compare the
+        # distinct years present rather than the raw (repeated) column values.
+        assert sorted(lf.collect()["calendar_year"].unique().to_list()) == [2030, 2040]
 
     def test_raster_grid_returns_a_path_table(self, base_path):
         """For raster grids, read_data yields COG metadata rather than pixels."""
@@ -68,10 +70,16 @@ class TestReadData:
 
 
 class TestCompactData:
-    def test_raster_grid_is_a_no_op(self, base_path):
-        """compact_data only branches on vector grids; raster input returns None."""
+    def test_raster_grid_dispatches_to_compact_cog(self, base_path):
+        """compact_data's raster branch delegates to compact_cog's summary dict.
+
+        2030 and 2040 aren't a contiguous calendar run, so compact_cog has nothing to
+        merge here -- the point of this test is the dispatch (raster grids reach
+        compact_cog, not compact_parquet), not the merge logic itself.
+        """
         write_raster_dataset(base_path, years=(2030, 2040))
-        assert compact_data(base_path=base_path, **RASTER_DATASET) is None
+        result = compact_data(base_path=base_path, **RASTER_DATASET)
+        assert result == {"outputs": [], "sources_merged": 0}
         assert len(list(base_path.rglob("*.tif"))) == 2
 
     def test_unknown_grid_raises(self, base_path):
@@ -104,8 +112,13 @@ class TestRoundTrip:
         write_data(original, base_path=base_path, **ANNUAL_DATASET)
         result = read_data(base_path=base_path, **ANNUAL_DATASET).collect()
 
+        # Long format stores one grid_cell/value pair per row instead of one column per
+        # cell, so pull each cell's time series back out by filtering on grid_cell.
         for col in ("1", "16", "32"):
-            assert result[col].to_list() == pytest.approx(original[col].to_list())
+            values = (
+                result.filter(pl.col("grid_cell") == int(col)).sort("calendar_year")["value"].to_list()
+            )
+            assert values == pytest.approx(original[col].to_list())
 
     def test_raster_values_survive(self, base_path):
         import rasterio as rio

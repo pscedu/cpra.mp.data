@@ -134,8 +134,8 @@ class TestDatasetsIndex:
         response = client.get("/v1/datasets.csv")
         assert response.status_code == 200
         body = response.text
-        assert "variable,grid,time_unit" in body
-        assert "ssf,ecoregion_v001,annual" in body
+        assert "variable,time_unit,grid" in body
+        assert "ssf,annual,ecoregion_v001" in body
 
     def test_path_column_is_excluded(self, client):
         assert "path" not in client.get("/v1/datasets.csv").text
