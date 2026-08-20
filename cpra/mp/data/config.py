@@ -14,9 +14,9 @@ def get_config(name, default_value):
 
 
 BASE_PATH = Path(get_config("BASE_PATH", "/ocean/projects/bcs200002p/shared/data"))
-CROSSWALK_PATH = Path(get_config("CROSSWALK_PATH", Path(__file__).parent / "crosswalk"))
+CROSSWALKS_PATH = Path(get_config("CROSSWALKS_PATH", "/ocean/projects/bcs200002p/shared/crosswalks"))
 CATALOG_PATH = Path(get_config("CATALOG_PATH", str(BASE_PATH.parent / "catalog")))
-GEOMETRY_PATH = Path(__file__).parent / "geometry"
+GRIDS_PATH = Path(get_config("GRIDS_PATH", "/ocean/projects/bcs200002p/shared/grids"))
 TILES_PATH = Path(get_config("TILES_PATH", "/ocean/projects/bcs200002p/shared/tiles"))
 DEBUG = get_config("DEBUG", "False").lower() in TRUE_VALUES
 MPD_URI = get_config("MPD_URI", "")

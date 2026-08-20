@@ -91,7 +91,7 @@ def _resolve_point(fgb_path, x, y):
 
 def _geometry_path(grid_name: str):
     """Locate a vector grid's geometry file, reporting a missing one as a 400."""
-    fgb_path = config.GEOMETRY_PATH / f"{grid_name}.fgb"
+    fgb_path = config.GRIDS_PATH / f"{grid_name}.fgb"
     if not fgb_path.exists():
         raise HTTPException(status_code=400, detail=f"No geometry file for grid: {grid_name}")
     return fgb_path

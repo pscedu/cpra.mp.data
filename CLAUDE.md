@@ -92,11 +92,11 @@ reconstruct it if a bug in the code under test corrupts or deletes something.
 
 The test suite guards this two ways, and new tests should keep both intact:
 
-1. `tests/conftest.py` sets `CPRA_MP_DATA_BASE_PATH`, `CPRA_MP_DATA_TILES_PATH`, and
-   `CPRA_MP_DATA_CROSSWALK_PATH` into a throwaway sandbox **before the first `cpra`
-   import**. `cpra/mp/data/config.py` calls `load_dotenv()`, and `.env` is a symlink to
-   real secrets pointing at production data; `load_dotenv` does not override variables
-   already set in the environment, so assigning them first wins.
+1. `tests/conftest.py` sets `CPRA_MP_DATA_BASE_PATH`, `CPRA_MP_DATA_TILES_PATH`,
+   `CPRA_MP_DATA_CROSSWALKS_PATH`, and `CPRA_MP_DATA_GRIDS_PATH` into a throwaway sandbox
+   **before the first `cpra` import**. `cpra/mp/data/config.py` calls `load_dotenv()`, and
+   `.env` is a symlink to real secrets pointing at production data; `load_dotenv` does not
+   override variables already set in the environment, so assigning them first wins.
 2. Individual tests still pass `base_path=tmp_path` explicitly. The env sandbox is a
    backstop for code paths that don't accept an injected path, not the primary mechanism.
 

@@ -198,7 +198,7 @@ def write_grid_geometry(geometry_path, grid_name, features):
     """Write a FlatGeoBuf geometry file for a vector grid.
 
     ``features`` is an iterable of ``(id, geometry)`` pairs of shapely geometries.
-    Mirrors the real files in ``config.GEOMETRY_PATH``: an ``id`` field plus geometry, in
+    Mirrors the real files in ``config.GRIDS_PATH``: an ``id`` field plus geometry, in
     the grid's own CRS.
     """
     import geopandas as gpd

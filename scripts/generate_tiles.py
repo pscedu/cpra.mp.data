@@ -3,7 +3,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-GEOMETRY_PATH = Path("cpra/mp/data/geometry")
+from cpra.mp.data.config import GRIDS_PATH
+
 TILES_PATH = Path("tiles")
 TIPPECANOE_PATH = Path(sys.executable).parent / "tippecanoe"
 
@@ -12,7 +13,7 @@ def generate_tiles():
     TILES_PATH.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory() as temp_dir:
         dest_path = Path(temp_dir)
-        for fgb_path in GEOMETRY_PATH.glob("*.fgb"):
+        for fgb_path in GRIDS_PATH.glob("*.fgb"):
             boundary_path = dest_path / "boundary.fgb"
             label_path = dest_path / "label.fgb"
             tiles_path = TILES_PATH / f"{fgb_path.stem}.pmtiles"
