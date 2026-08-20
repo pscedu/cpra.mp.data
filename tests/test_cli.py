@@ -2,8 +2,8 @@
 
 `convert` was removed once the MP2023 dump format went out of use, but the group remains
 the registration point that command modules attach to. It currently carries the
-`crosswalk` group (vector/raster crosswalk generation), and is kept working for whatever
-attaches to it next.
+`crosswalk` command (vector and raster crosswalk generation), and is kept working for
+whatever attaches to it next.
 """
 
 from click.testing import CliRunner
@@ -17,7 +17,7 @@ def test_group_runs_and_reports_usage():
     assert "Usage:" in result.output
 
 
-def test_crosswalk_group_is_registered():
+def test_crosswalk_command_is_registered():
     assert "crosswalk" in cli.commands
 
     result = CliRunner().invoke(cli, ["--help"])

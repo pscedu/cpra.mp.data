@@ -384,7 +384,7 @@ class Dataset(LazyFrameSource):
 
         Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
         pre-generated zone-ID crosswalk raster (see
-        `python -m cpra.mp.data.cli crosswalk raster`), converting the result into a
+        `python -m cpra.mp.data.cli crosswalk`), converting the result into a
         tabular LazyFrame in the same shape produced by
         `_apply_transform_params_vector` (dimension columns, one column per destination
         geography ID, and a `geographic_unit` column).
