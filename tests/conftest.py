@@ -19,7 +19,8 @@ _SANDBOX = Path(tempfile.mkdtemp(prefix="cpra-test-sandbox-"))
 
 os.environ["CPRA_MP_DATA_BASE_PATH"] = str(_SANDBOX / "data")
 os.environ["CPRA_MP_DATA_TILES_PATH"] = str(_SANDBOX / "tiles")
-os.environ["CPRA_MP_DATA_CROSSWALK_PATH"] = str(_SANDBOX / "crosswalk")
+os.environ["CPRA_MP_DATA_CROSSWALKS_PATH"] = str(_SANDBOX / "crosswalk")
+os.environ["CPRA_MP_DATA_GRIDS_PATH"] = str(_SANDBOX / "geometry")
 os.environ["CPRA_MP_DATA_MPD_URI"] = "sqlite://"
 os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 
@@ -64,7 +65,7 @@ def crosswalk_path(tmp_path, monkeypatch):
     """An isolated crosswalk directory, patched over the configured one."""
     path = tmp_path / "crosswalk"
     path.mkdir()
-    monkeypatch.setattr(cpra_config, "CROSSWALK_PATH", path)
+    monkeypatch.setattr(cpra_config, "CROSSWALKS_PATH", path)
     return path
 
 
@@ -72,14 +73,12 @@ def crosswalk_path(tmp_path, monkeypatch):
 def geometry_path(tmp_path, monkeypatch):
     """An isolated geometry directory, patched over the configured one.
 
-    GEOMETRY_PATH isn't env-configurable like the other data paths (see config.py), so
-    this patches the module attribute directly rather than an env var. The real geometry
-    directory is gitignored and not present in a fresh checkout or CI, so any test that
-    resolves coordinates to grid cell IDs must use this fixture.
+    The real grids directory is gitignored and not present in a fresh checkout or CI, so
+    any test that resolves coordinates to grid cell IDs must use this fixture.
     """
     path = tmp_path / "geometry"
     path.mkdir()
-    monkeypatch.setattr(cpra_config, "GEOMETRY_PATH", path)
+    monkeypatch.setattr(cpra_config, "GRIDS_PATH", path)
     return path
 
 

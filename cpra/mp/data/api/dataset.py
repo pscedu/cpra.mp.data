@@ -325,7 +325,7 @@ class Dataset(LazyFrameSource):
 
         # Generate column expressions.
         crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.parquet"
-        crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
+        crosswalk_path = config.CROSSWALKS_PATH / crosswalk_name
 
         # scan_parquet is lazy and won't raise for a missing file until collection,
         # so check up front to report the missing crosswalk as a 400.
@@ -392,7 +392,7 @@ class Dataset(LazyFrameSource):
             return
 
         crosswalk_name = f"{self.dataset_dimensions.grid}__{self.options.summarize_by}.tif"
-        crosswalk_path = config.CROSSWALK_PATH / crosswalk_name
+        crosswalk_path = config.CROSSWALKS_PATH / crosswalk_name
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
             raise HTTPException(status_code=400, detail=msg)

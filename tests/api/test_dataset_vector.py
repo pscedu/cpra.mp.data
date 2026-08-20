@@ -141,7 +141,7 @@ class TestFilterStage:
 
 class TestGeographyCoordinates:
     """geography= on a vector grid may be grid cell IDs (as above) or lat/lng pairs,
-    resolved to grid cell IDs via point-in-polygon lookup against config.GEOMETRY_PATH."""
+    resolved to grid cell IDs via point-in-polygon lookup against config.GRIDS_PATH."""
 
     @pytest.fixture
     def ecoregion_geometry(self, geometry_path):

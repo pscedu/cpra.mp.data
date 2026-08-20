@@ -2,9 +2,8 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
-GEOMETRY_PATH = Path("cpra/mp/data/geometry")
+from cpra.mp.data.config import CROSSWALKS_PATH, GRIDS_PATH
 
 
 def crosswalk_sql(grid, crosswalk_grid):
@@ -25,10 +24,10 @@ def crosswalk_sql(grid, crosswalk_grid):
 
 def generate_crosswalks(grid):
     crosswalk_grids = []
-    vrt_path = GEOMETRY_PATH / "combined.vrt"
+    vrt_path = GRIDS_PATH / "combined.vrt"
     vrt_root = ET.Element("OGRVRTDataSource")
 
-    for fgb_path in GEOMETRY_PATH.glob("*.fgb"):
+    for fgb_path in GRIDS_PATH.glob("*.fgb"):
         fgb_grid = fgb_path.name.split(".")[0]
         vrt_layer = ET.SubElement(vrt_root, "OGRVRTLayer", name=fgb_grid)
         ET.SubElement(vrt_layer, "SrcDataSource").text = str(fgb_path.absolute())
@@ -42,7 +41,7 @@ def generate_crosswalks(grid):
         print(f"Generating crosswalk from {grid} to {crosswalk_grid}")
         sql = crosswalk_sql(grid, crosswalk_grid)
         parquet_name = f"{grid}__{crosswalk_grid}.parquet"
-        parquet_path = Path("cpra/mp/data/crosswalk") / parquet_name
+        parquet_path = CROSSWALKS_PATH / parquet_name
         cmd = [
             "ogr2ogr",
             "-dsco",

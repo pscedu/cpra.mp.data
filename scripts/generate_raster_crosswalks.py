@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
@@ -7,10 +6,9 @@ import rasterio as rio
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 
+from cpra.mp.data.config import CROSSWALKS_PATH, GRIDS_PATH
 from cpra.mp.data.grids import GRIDS
 
-GEOMETRY_PATH = Path("cpra/mp/data/geometry")
-CROSSWALK_PATH = Path("cpra/mp/data/crosswalk")
 NODATA = -1
 ZONE_DTYPES = ["int16", "int32", "int64"]
 
@@ -36,7 +34,7 @@ def generate_raster_crosswalk(raster_grid_name, dst_grid_name):
     producing a zone-ID crosswalk COG used by the data API's raster summarize_by."""
 
     raster_grid = GRIDS[raster_grid_name]
-    gdf = gpd.read_file(GEOMETRY_PATH / f"{dst_grid_name}.fgb")
+    gdf = gpd.read_file(GRIDS_PATH / f"{dst_grid_name}.fgb")
     if gdf.crs is not None and gdf.crs.to_string().lower() != raster_grid.crs.lower():
         gdf = gdf.to_crs(raster_grid.crs)
 
@@ -58,8 +56,8 @@ def generate_raster_crosswalk(raster_grid_name, dst_grid_name):
     if max_zone not in {NODATA, *dst_ids}:
         raise ValueError(f"Zone ID {max_zone} was clamped to the range of {dtype}")
 
-    CROSSWALK_PATH.mkdir(parents=True, exist_ok=True)
-    crosswalk_path = CROSSWALK_PATH / f"{raster_grid_name}__{dst_grid_name}.tif"
+    CROSSWALKS_PATH.mkdir(parents=True, exist_ok=True)
+    crosswalk_path = CROSSWALKS_PATH / f"{raster_grid_name}__{dst_grid_name}.tif"
 
     profile = {
         "compress": "ZSTD",
@@ -82,7 +80,7 @@ def generate_raster_crosswalk(raster_grid_name, dst_grid_name):
 
 
 def generate_raster_crosswalks(raster_grid_name):
-    for fgb_path in GEOMETRY_PATH.glob("*.fgb"):
+    for fgb_path in GRIDS_PATH.glob("*.fgb"):
         generate_raster_crosswalk(raster_grid_name, fgb_path.name.split(".")[0])
 
 

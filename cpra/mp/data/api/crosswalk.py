@@ -1,6 +1,6 @@
 """Convert geographies from one grid to another.
 
-The conversions come from the crosswalk files in `config.CROSSWALK_PATH`: a Parquet table
+The conversions come from the crosswalk files in `config.CROSSWALKS_PATH`: a Parquet table
 of `src_id`/`dst_id`/`scale_factor` rows for each vector-to-vector pair, and a zone-ID
 GeoTIFF for each raster-to-vector pair (the same files `Dataset`'s `summarize_by` uses).
 The two conversions those files don't cover are derived from the grids themselves —
@@ -91,7 +91,7 @@ class Crosswalk:
 
         names = set()
         for pattern in [f"{self.grid.name}__*.parquet", f"{self.grid.name}__*.tif"]:
-            for path in config.CROSSWALK_PATH.glob(pattern):
+            for path in config.CROSSWALKS_PATH.glob(pattern):
                 names.add(path.stem.split("__", 1)[1])
 
         if self.grid.grid_type == "raster":
@@ -101,7 +101,7 @@ class Crosswalk:
             # A coordinate reaches every grid that can say where it falls: a vector grid
             # whose polygons are on hand to contain it, and every raster grid, each of
             # which holds a value at the coordinate itself.
-            names |= {path.stem for path in config.GEOMETRY_PATH.glob("*.fgb")}
+            names |= {path.stem for path in config.GRIDS_PATH.glob("*.fgb")}
             names |= {name for name, grid in GRIDS.items() if grid.grid_type == "raster"}
 
         names &= set(GRIDS)
@@ -114,7 +114,7 @@ class Crosswalk:
     def _crosswalk_path(self, dst_grid_name, extension):
         """Locate the crosswalk file to a destination grid, reporting a missing one as a
         400 the way `summarize_by` does."""
-        crosswalk_path = config.CROSSWALK_PATH / f"{self.grid.name}__{dst_grid_name}.{extension}"
+        crosswalk_path = config.CROSSWALKS_PATH / f"{self.grid.name}__{dst_grid_name}.{extension}"
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {dst_grid_name}"
             raise HTTPException(status_code=400, detail=msg)
