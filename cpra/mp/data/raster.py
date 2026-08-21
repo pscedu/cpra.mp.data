@@ -445,7 +445,7 @@ def scale_vrt_bands(vrt_text, factors):
 
 def _write_run(
     run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
-    max_z_error=None,
+    max_z_error=None, vrt_transform=None,
 ):
     """Consolidate one contiguous run into the multi-band COG at ``out_path``.
 
@@ -453,6 +453,9 @@ def _write_run(
     streamed into ``out_path`` with ``CreateCopy``, reusing ``_cog_profile()`` for the
     shared compression settings.  ``values`` (the run's per-band calendar values, in run
     order) is only used to repair a legacy source's missing band descriptions.
+
+    ``vrt_transform``, when given, rewrites the finished VRT before the copy -- see
+    ``compact_cog``.
     """
 
     # The VRT is a throwaway XML sidecar (its SimpleSource entries hold absolute paths, so
@@ -462,6 +465,8 @@ def _write_run(
         vrt_text = vrt(run)
         if is_legacy:  # LEGACY COG SHIM (see _patch_legacy_vrt)
             vrt_text = _patch_legacy_vrt(vrt_text, calendar_dim, values)
+        if vrt_transform is not None:
+            vrt_text, dtype = vrt_transform(vrt_text, dtype)
         vrt_path.write_text(vrt_text)
 
         profile = _cog_profile(
@@ -516,6 +521,7 @@ def compact_cog(
     compression="zstd",
     compression_level=6,
     group_years=DECADE_GROUP_YEARS,
+    vrt_transform=None,
     **kwargs,
 ):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
@@ -569,6 +575,15 @@ def compact_cog(
     compression for every group to LERC_ZSTD at that tolerance, regardless of
     ``compression``/``compression_level``'s algorithm choice (``compression_level`` still
     governs LERC_ZSTD's inner zstd stage) -- see ``_cog_profile``.
+
+    ``vrt_transform``, when given, is called as ``(vrt_text, dtype) -> (vrt_text, dtype)``
+    on each group's finished VRT, just before it is copied to the output, and lets a caller
+    change the pixels or the output data type without giving up the streaming copy: GDAL
+    applies whatever the rewritten VRT declares while it reads. Note that ``CreateCopy``
+    takes the output data type from the VRT and ignores ``_cog_profile``'s, so a transform
+    that retypes a band must return the matching dtype for the profile to stay truthful.
+    Used by ``scripts/migrate_to_long_format.py`` to convert elev from Float32 meters to
+    Int32 millimeters as it compacts.
 
     Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
     multi-band COGs and the number of source COGs they consumed (both empty/zero when
@@ -704,6 +719,7 @@ def compact_cog(
                 _write_run(
                     sub_run, out_path, grid, dtype, calendar_dim, sub_values,
                     run_is_legacy, compression, compression_level, max_z_error,
+                    vrt_transform,
                 )
                 outputs.append(out_path)
                 consumed_paths |= unique_paths

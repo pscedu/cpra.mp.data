@@ -9,6 +9,7 @@ import polars as pl
 
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.visualizations.base import DatasetVisualization
+from cpra.mp.data.visualizations.display import display_number_format
 
 
 class TimeSeriesLine(DatasetVisualization):
@@ -101,7 +102,7 @@ class TimeSeriesLine(DatasetVisualization):
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
                 type="quantitative",
                 title=f"{label}: {', '.join([str(c) for c in val_choices])}",
-                format=self.variable.number_format or "",
+                format=display_number_format(self.variable),
             )
             # Short labels here: a tooltip carries a row per grid cell, so a full label
             # would push the numbers being read off to the right.

@@ -6,6 +6,7 @@ from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITES_BASE_URL, STATIC_TILES_
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
+from cpra.mp.data.visualizations.display import display_number_format, display_unit, to_display
 
 # Used when feature IDs are too sparse for array indexing.
 COLOR_OBJECT_EXPR = ["coalesce", ["get", ["to-string", ["id"]], ["global-state", "colors"]], "transparent"]
@@ -994,7 +995,10 @@ class Map(DatasetVisualization):
         var = self.variable
 
         if difference:
-            limit = var.difference_legend_limit or 1
+            # The client renders these as tick labels, so unlike `_difference_breaks` --
+            # which colorizes storage-unit pixels server-side and stays in storage units --
+            # the limit is converted for display here.
+            limit = to_display(var, var.difference_legend_limit or 1)
             steps = sorted(
                 [
                     {"color": "#d53e4f", "value": -1 * limit},
@@ -1005,9 +1009,9 @@ class Map(DatasetVisualization):
             )
             return {
                 "title": f"{var.label} Difference",
-                "subtitle": var.unit,
+                "subtitle": display_unit(var),
                 "type": "continuous",
-                "numberFormat": var.number_format,
+                "numberFormat": display_number_format(var),
                 "steps": steps,
             }
 
@@ -1021,12 +1025,14 @@ class Map(DatasetVisualization):
             if "label" in row and row["label"] is not None:
                 step["label"] = row["label"]
             if row["upper_bound"] is not None:
-                step["value"] = row["upper_bound"]
+                # Break points are stored in storage units (they colorize pixels); every
+                # value in this block is display units, matching `subtitle` below.
+                step["value"] = to_display(var, row["upper_bound"])
             steps.append(step)
 
         return {
             "title": "Land Change" if self._is_lnd_chng() else var.label,
-            "subtitle": var.unit,
+            "subtitle": display_unit(var),
             "type": legend.type,
             "steps": steps,
         }

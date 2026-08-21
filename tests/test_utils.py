@@ -405,10 +405,11 @@ class TestReadFortranArray:
         assert np.array_equal(result, array)
 
     def test_float_variable_dtype(self, tmp_path):
+        """inun is Float32, so the record is read as float32 without an explicit dtype."""
         path = tmp_path / "a.xyz.b"
         array = np.array([1.5, 2.5], dtype="float32")
         self._write(path, array)
-        assert read_fortran_array(path, variable="elev").dtype == np.float32
+        assert read_fortran_array(path, variable="inun").dtype == np.float32
 
     def test_missing_dtype_and_variable_raises(self, tmp_path):
         with pytest.raises(ValueError, match="Either variable or dtype must be provided"):

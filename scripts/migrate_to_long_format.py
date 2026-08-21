@@ -49,6 +49,7 @@ import signal
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree
 from datetime import datetime
 from pathlib import Path
 
@@ -309,6 +310,84 @@ def migrate_partition(
     return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
 
 
+# --- elev: Float32 meters -> Int32 millimeters -------------------------------------------
+#
+# elev is the one variable whose storage unit changed with the long-format move: it is now
+# stored as Int32 millimeters rather than Float32 meters, so ZSTD's predictor has integers
+# to delta-encode (the same profile every other raster variable uses -- it replaces the
+# LERC_ZSTD/max_z_error special case elev used to need). Its structure row carries
+# ``display_unit``/``display_scale_factor`` so charts and legends still read meters.
+#
+# Deliberately not generalized: nothing else needs a unit change, and a general
+# "convert units on migration" facility would be a much larger promise than one variable's
+# one-time move. This applies only to elev, and only to float sources.
+
+ELEV_SCALE_FACTOR = 1000  # millimeters per meter
+ELEV_NODATA = -9999  # matches raster._cog_profile's nodata for every COG this reads
+
+
+def _set_child(element, tag: str, value) -> None:
+    """Set ``element``'s ``tag`` child to ``value``, replacing rather than duplicating it."""
+
+    child = element.find(tag)
+    if child is None:
+        child = xml.etree.ElementTree.SubElement(element, tag)
+    child.text = str(value)
+
+
+def _elev_mm_vrt(vrt_text: str, dtype: str) -> tuple[str, str]:
+    """Rewrite a compaction VRT so it reads Float32 meters out as Int32 millimeters.
+
+    Passed to ``compact_cog`` as its ``vrt_transform``, so the conversion rides along with
+    the streaming CreateCopy that does the compaction rather than costing a second full
+    rewrite of 57 GB of elevation rasters.
+
+    Each band is retyped to Int32 and its ``SimpleSource`` promoted to a ``ComplexSource``
+    -- the only source type that supports ``<ScaleRatio>`` -- carrying two children:
+
+    * ``<ScaleRatio>1000</ScaleRatio>`` does the meters-to-millimeters multiply. GDAL
+      evaluates it in double precision even though the band it writes into is Int32, which
+      is what keeps the result off the float32 half-way ties that would otherwise round the
+      wrong way (2.0005 m is 2000.49996... mm in float64 and rounds to 2000, but is exactly
+      2000.5 in float32 and would round to 2001). Rounding is half-away-from-zero.
+    * ``<NODATA>`` excludes nodata pixels from the multiply, so the sentinel survives as
+      itself instead of becoming -9999000 and no longer matching the band's declared
+      nodata. (``raster.scale_vrt_bands``, the other scaling path, deliberately does *not*
+      do this -- it preserves an older quirk for the land-change multiply. Don't merge them.)
+
+    A non-float source is left alone and reported unchanged, so re-running or resuming a
+    migration over already-converted Int32 rasters can't scale them a second time.
+    """
+
+    if not dtype.startswith("float"):
+        return vrt_text, dtype
+
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+    for band_el in root.findall("VRTRasterBand"):
+        band_el.set("dataType", "Int32")
+        # The nodata the sources actually carry, rather than assuming the default: whatever
+        # GDAL was told to treat as nodata on the way in has to be what's excluded here.
+        nodata_el = band_el.find("NoDataValue")
+        nodata = nodata_el.text if nodata_el is not None else str(ELEV_NODATA)
+
+        # `gdalbuildvrt` normally emits a SimpleSource, but emits a ComplexSource itself
+        # for sources that need one, so take either and retag -- a ComplexSource already
+        # supports ScaleRatio and is left as it is.
+        source_el = band_el.find("SimpleSource")
+        if source_el is None:
+            source_el = band_el.find("ComplexSource")
+        source_el.tag = "ComplexSource"
+        _set_child(source_el, "ScaleRatio", ELEV_SCALE_FACTOR)
+        _set_child(source_el, "NODATA", nodata)
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8"), "int32"
+
+
+def _vrt_transform_for(variable: str):
+    """The VRT rewrite a variable's compaction needs, or ``None`` for the usual copy."""
+
+    return _elev_mm_vrt if variable == "elev" else None
+
+
 def _raster_source_tifs(base_path: Path, dims: dict) -> list[Path]:
     """All source COGs for one raster partition (all dims), looked up under both
     directory orders.
@@ -341,6 +420,8 @@ def migrate_raster_dataset(
     ``catalog_path`` is given.  Returns (result, messages); result carries
     ``data_type="raster"``, ``files`` (source COG count) and ``geo_cols`` (output
     COG count), plus ``elapsed_s``/``peak_bytes`` when not a dry run.
+
+    elev also changes units on the way through -- see ``_elev_mm_vrt``.
     """
     messages: list[str] = []
     rel = _raster_rel(dataset_kwargs)
@@ -357,6 +438,7 @@ def migrate_raster_dataset(
         base_path=base_path,
         output_base_path=output_path,
         catalog_path=catalog_path,
+        vrt_transform=_vrt_transform_for(dataset_kwargs["variable"]),
         **dataset_kwargs,
     )
     elapsed = time.perf_counter() - t0

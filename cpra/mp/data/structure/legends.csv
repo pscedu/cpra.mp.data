@@ -37,14 +37,14 @@ easd,0.001 to < 0.01,#feb24c,0.01
 easd,0.01 to < 0.1,#fd8d3c,0.1
 easd,0.1 to < 1,#f03b20,1.0
 easd,1 or more,#bd0026,
-elev,Less than -2.0,#d53e4f,-2.0
-elev,-2.0 to < -1.0,#f46d43,-1.0
-elev,-1.0 to < -0.5,#fdae61,-0.5
-elev,-0.5 to < 0.0,#fee08b,0.0
-elev,0.0 to < 0.5,#e6f598,0.5
-elev,0.5 to < 1.0,#abdda4,1.0
-elev,1.0 to < 2.0,#66c2a5,2.0
-elev,2.0 or greater,#3288bd,
+elev,Less than -2.0,#3288bd,-2000.0
+elev,-2.0 to < -1.0,#66c2a5,-1000.0
+elev,-1.0 to < -0.5,#abdda4,-500.0
+elev,-0.5 to < 0.0,#e6f598,0.0
+elev,0.0 to < 0.5,#fee08b,500.0
+elev,0.5 to < 1.0,#fdae61,1000.0
+elev,1.0 to < 2.0,#f46d43,2000.0
+elev,2.0 or greater,#d53e4f,
 exposure_count_asset,0 to 9,#d53e4f,10.0
 exposure_count_asset,10 to 49,#f46d43,50.0
 exposure_count_asset,50 to 99,#fdae61,100.0

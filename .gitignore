@@ -19,12 +19,14 @@ coverage.xml
 .pytest_cache/
 
 /catalog/
+/crosswalks/
 /cpra/mp/data/crosswalk/
 /cpra/mp/data/geojson/
 /cpra/mp/data/geometry/
 /data/
 /data-*/
 /data_*/
+/grids/
 /iceberg/
 /iceberg-*/
 /scratch/

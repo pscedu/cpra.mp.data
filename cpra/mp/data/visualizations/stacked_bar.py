@@ -8,6 +8,7 @@ import altair as alt
 
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.visualizations.base import DatasetVisualization
+from cpra.mp.data.visualizations.display import display_number_format
 
 
 class StackedBar(DatasetVisualization):
@@ -116,7 +117,7 @@ class StackedBar(DatasetVisualization):
                 "_".join(str(i) for i in idx_choice) if idx_choice else "value",
                 type="quantitative",
                 title=", ".join(str(v) for v in val_choice) if val_choice else self.variable_label,
-                format=self.variable.number_format or "",
+                format=display_number_format(self.variable),
             )
             for val_choice, idx_choice in zip(compare_choices, compare_choice_indices)
         ]
