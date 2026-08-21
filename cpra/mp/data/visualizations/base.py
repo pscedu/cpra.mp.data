@@ -9,6 +9,7 @@ from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations.colors import selection_color
+from cpra.mp.data.visualizations.display import display_unit, display_value_expr
 
 
 def geography_tokens(geography):
@@ -58,14 +59,22 @@ class BaseVisualization:
             data_sources = {"value": data_sources}
 
         for source_name, source in data_sources.items():
+            # The API serves storage units; every chart downstream reads display units, so
+            # the conversion happens here, once, on the way in -- see visualizations.display.
+            value_expr = display_value_expr(self.source_variable(source_name))
+
             # If this is the first data source, create the chart.
             if chart is None:
                 chart = alt.Chart(source)
 
                 # Collect and apply calculate expressions.
                 calculate_exprs = {}
+                # Both entries read `datum.value` directly rather than one reading the
+                # other, so they don't depend on which calculate transform Vega runs first.
+                if value_expr != "datum.value":
+                    calculate_exprs["value"] = value_expr
                 if source_name != "value":
-                    calculate_exprs[source_name] = "datum.value"
+                    calculate_exprs[source_name] = value_expr
 
                 if date_column:
                     if time_column == "calendar_year":
@@ -84,7 +93,25 @@ class BaseVisualization:
                     from_=alt.LookupData(source, col, ["value"]),
                 )
 
+                # The lookup pulls the joined source's raw `value` across, so this source's
+                # own scaling has to be applied to the field it landed in.
+                joined_field = f"datum['{source_name}']"
+                joined_expr = display_value_expr(self.source_variable(source_name), joined_field)
+                if joined_expr != joined_field:
+                    chart = chart.transform_calculate(**{source_name: joined_expr})
+
         return chart
+
+    def source_variable(self, source_name):
+        """The variable whose values the ``get_base_chart`` data source ``source_name`` carries.
+
+        ``get_data_source`` names each source after its variable, so the name is the lookup
+        key; a ``DatasetVisualization``'s single source is named ``"value"`` instead and
+        falls back to the visualization's own variable.  Returns ``None`` for a source named
+        after something that isn't a variable, which means "no scaling".
+        """
+
+        return VARIABLES.get(source_name) or getattr(self, "variable", None)
 
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
         """Get an API data URI."""
@@ -338,6 +365,7 @@ class DatasetVisualization(BaseVisualization):
     def variable_label(self):
         """Get the variable label and unit."""
         label = f"{self.variable.label}{self.difference_suffix}"
-        if self.variable.unit:
-            label += f" ({self.variable.unit})"
+        unit = display_unit(self.variable)
+        if unit:
+            label += f" ({unit})"
         return label

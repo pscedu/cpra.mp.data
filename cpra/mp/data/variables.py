@@ -17,7 +17,9 @@ class Variable:
         model=None,
         subroutine=None,
         unit=None,
-        number_format=None,
+        display_unit=None,
+        display_scale_factor=None,
+        display_number_format=None,
         difference_legend_limit=None,
     ):
         self.name = name
@@ -29,8 +31,16 @@ class Variable:
         self.required_dimensions = required_dimensions
         self.model = model
         self.subroutine = subroutine
+        # `unit` describes the values as *stored*; the display_* attributes describe how they
+        # are shown, which differs whenever a variable is stored in a finer unit than it is
+        # read in. No variable is stored that way on this branch -- `display_scale_factor` is
+        # unset throughout, so every conversion below is an identity -- but the presentation
+        # layer reads them through one place either way, so setting a scale factor in the
+        # structure spreadsheet is all it takes. See cpra.mp.data.visualizations.display.
         self.unit = unit
-        self.number_format = number_format
+        self.display_unit = display_unit
+        self.display_scale_factor = display_scale_factor
+        self.display_number_format = display_number_format
         self.difference_legend_limit = difference_legend_limit
 
 

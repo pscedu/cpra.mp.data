@@ -5,6 +5,7 @@ import polars as pl
 from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations.base import BaseVisualization
+from cpra.mp.data.visualizations.display import display_number_format, display_unit
 
 
 class SedimentDynamics(BaseVisualization):
@@ -78,7 +79,7 @@ class SedimentDynamics(BaseVisualization):
             .mark_line()
             .encode(
                 alt.X("date:T").title("Year"),
-                alt.Y("value:Q").title(", ".join([f"{v.label} ({v.unit})" for v in variables])),
+                alt.Y("value:Q").title(", ".join([f"{v.label} ({display_unit(v)})" for v in variables])),
                 alt.Color("variable_label:N")
                 .title("Variable" if show_label else None)
                 .scale(domain=[VARIABLES[v].label for v in variable_names], range=colors),
@@ -123,7 +124,7 @@ class SedimentDynamics(BaseVisualization):
                         VARIABLES[v].name,
                         type="quantitative",
                         title=VARIABLES[v].label,
-                        format=VARIABLES[v].number_format or "",
+                        format=display_number_format(VARIABLES[v]),
                     )
                     for v in self.variables
                 ],
