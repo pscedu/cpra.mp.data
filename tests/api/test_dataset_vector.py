@@ -11,12 +11,20 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.api.types import OutputType
+from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.tabular import write_parquet
 
-from tests.factories import ANNUAL_KWARGS, annual_frame, write_grid_geometry, write_vector_crosswalk
+from tests.factories import (
+    ANNUAL_KWARGS,
+    DAILY_KWARGS,
+    annual_frame,
+    write_grid_geometry,
+    write_vector_crosswalk,
+)
 
 DIMENSIONS = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
+# sal, the one variable whose structure row sets a `float_precision`.
+SAL_DIMENSIONS = {k: DAILY_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 # The dimension columns every wide annual frame carries, so tests can isolate the
 # geography columns beside them.
 DIMENSION_NAMES = set(annual_frame(years=(2030,)).select(pl.col("^[a-z].*$")).columns)
@@ -58,6 +66,30 @@ class TestOutputType:
     def test_unknown_color_map_falls_back_to_default(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, color_map="not_a_legend")
         assert dataset.legend.name == "ssf"
+
+
+class TestTabularKwargs:
+    """The writer arguments a Dataset contributes, on top of the request's own.
+
+    These read the variable's structure row rather than any data, so no dataset is written
+    for them -- the queries are never collected.
+    """
+
+    def test_a_variable_with_a_float_precision_rounds_its_csv(self, dataset_factory):
+        dataset = dataset_factory(SAL_DIMENSIONS)
+        assert dataset.variable.float_precision == 1
+        assert dataset.tabular_kwargs(DataFormat.csv) == {"float_precision": 1}
+
+    @pytest.mark.parametrize("format", [f for f in DataFormat if f != DataFormat.csv])
+    def test_only_csv_is_rounded(self, dataset_factory, format):
+        """The binary formats have no `float_precision` to give -- they carry the stored
+        value, and whatever reads them decides how to show it."""
+        assert dataset_factory(SAL_DIMENSIONS).tabular_kwargs(format) == {}
+
+    def test_a_variable_without_a_float_precision_adds_nothing(self, dataset_factory):
+        dataset = dataset_factory(DIMENSIONS)
+        assert dataset.variable.float_precision is None
+        assert dataset.tabular_kwargs(DataFormat.csv) == {}
 
 
 class TestCustomColorMap:

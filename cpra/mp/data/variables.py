@@ -20,6 +20,7 @@ class Variable:
         display_unit=None,
         display_scale_factor=None,
         display_number_format=None,
+        float_precision=None,
         difference_legend_limit=None,
     ):
         self.name = name
@@ -41,6 +42,12 @@ class Variable:
         self.display_unit = display_unit
         self.display_scale_factor = display_scale_factor
         self.display_number_format = display_number_format
+        # Decimal places to write when a dataset is served as CSV, for variables whose
+        # models report more precision than they actually resolve -- see
+        # cpra.mp.data.api.sources.LazyFrameSource.tabular_kwargs. Unlike the display_*
+        # attributes this is not a presentation hint the client may ignore: it changes the
+        # bytes in the download, so the values a user gets are the ones the model means.
+        self.float_precision = float_precision
         self.difference_legend_limit = difference_legend_limit
 
 

@@ -123,6 +123,7 @@ class Variable(BaseModel):
     display_unit: str | None
     display_scale_factor: float | None
     display_number_format: str | None
+    float_precision: int | None
     legend: str | None
     geographic_units: list[str] | None
     time_units: list[str] | None

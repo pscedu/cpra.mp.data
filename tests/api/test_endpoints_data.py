@@ -22,6 +22,7 @@ from tests.factories import (
     ANNUAL_KWARGS,
     RASTER_KWARGS,
     annual_frame,
+    daily_frame,
     write_grid_geometry,
     write_pmtiles,
     write_raster_dataset,
@@ -29,6 +30,9 @@ from tests.factories import (
 
 VECTOR_URL = "/v1/datasets/ssf/ecoregion_v001/annual"
 RASTER_URL = "/v1/datasets/vct/veg_grid_cell_v001/annual"
+SALINITY_URL = "/v1/datasets/sal/hydro_compartment_v001/daily"
+# Float32-representable, and far enough from a .x5 tie that the rounding is unambiguous.
+SALINITY_VALUES = [12.34375, 9.96875]
 
 
 def _lng_lat(x, y):
@@ -53,10 +57,60 @@ def ecoregion_geometry(geometry_path):
 
 
 @pytest.fixture
+def salinity_data(base_path, monkeypatch):
+    """Two days of sal on hydro_compartment_v001, with values that rounding changes.
+
+    ``validate=False`` because ``daily_frame`` carries three geography columns rather than
+    the grid's full 1,657.
+    """
+    df = daily_frame().with_columns(
+        pl.Series("1", SALINITY_VALUES, dtype=pl.Float32),
+        pl.Series("2", [-0.449, 1.24], dtype=pl.Float32),
+        pl.Series("3", [0.0, 0.04], dtype=pl.Float32),
+    )
+    write_parquet(df, base_path=base_path, validate=False, sort=False)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return base_path
+
+
+@pytest.fixture
 def raster_data(base_path, monkeypatch):
     write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
+
+
+class TestFloatPrecision:
+    """sal's structure row sets `float_precision`, so its CSV is rounded on the way out.
+
+    Checked as text rather than through `pl.read_csv`: the point is the bytes the client
+    receives, and a reader would parse "12.3" and "12.3456" into indistinguishable floats.
+    """
+
+    QUERY = "?unpivot=true&select=calendar_day,geography,value"
+
+    def test_csv_values_are_rounded_to_one_decimal(self, client, salinity_data):
+        response = client.get(f"{SALINITY_URL}/data.csv{self.QUERY}")
+        assert response.status_code == 200
+        rows = response.text.strip().splitlines()
+        assert rows[0] == "calendar_day,geography,value"
+        assert rows[1:4] == [
+            "2030-01-01,1,12.3",
+            "2030-01-01,2,-0.4",
+            "2030-01-01,3,0.0",
+        ]
+
+    def test_parquet_keeps_the_stored_value(self, client, salinity_data):
+        response = client.get(f"{SALINITY_URL}/data.parquet{self.QUERY}")
+        assert response.status_code == 200
+        df = pl.read_parquet(io.BytesIO(response.content))
+        assert df.filter(pl.col("geography") == "1")["value"].to_list() == SALINITY_VALUES
+
+    def test_an_unrounded_variable_is_unaffected(self, client, vector_data):
+        """ssf sets no precision, so its floats are written at full width."""
+        response = client.get(f"{VECTOR_URL}/data.csv?geography=1&unpivot=true&select=value")
+        assert response.status_code == 200
+        assert response.text.strip().splitlines()[1:] == ["2030.01", "2040.01"]
 
 
 class TestVectorData:

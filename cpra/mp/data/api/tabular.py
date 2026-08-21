@@ -19,6 +19,10 @@ def stream_or_write_to_file(source, out_path, format, compression, collect_in_me
             "compression_level": None if uncompressed else compression.compression_level,
         }
 
+    # Whatever the source itself needs for this format, on top of the request's own
+    # arguments -- a variable's `float_precision`, for one. See LazyFrameSource.
+    stream_kwargs |= source.tabular_kwargs(format)
+
     if collect_in_memory:
         source.write_tabular(out_path, format, **stream_kwargs)
     else:

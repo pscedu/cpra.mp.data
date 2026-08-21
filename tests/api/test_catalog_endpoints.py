@@ -27,6 +27,13 @@ class TestVariables:
         assert by_name["sal"]["time_units"] == ["daily", "monthly", "annual"]
         assert by_name["sal"]["geographic_units"] == ["hydro_compartment"]
 
+    def test_float_precision_is_reported(self, client):
+        """Reported rather than acted on: the API has already applied it to the CSV it
+        serves, so this only tells a client what it is about to receive."""
+        by_name = {v["name"]: v for v in client.get("/v1/variables.json").json()}
+        assert by_name["sal"]["float_precision"] == 1
+        assert by_name["ssf"]["float_precision"] is None
+
 
 class TestDimensions:
     def test_returns_every_dimension(self, client):

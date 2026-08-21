@@ -93,6 +93,7 @@ def variables() -> list[Variable]:
             display_unit=var.display_unit,
             display_scale_factor=var.display_scale_factor,
             display_number_format=var.display_number_format,
+            float_precision=var.float_precision,
             geographic_units=var.geographic_units,
             time_units=var.time_units,
             required_dimensions=var.required_dimensions,

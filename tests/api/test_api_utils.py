@@ -207,6 +207,12 @@ class TestLazyFrameSource:
         with pytest.raises(KeyError):
             source.write_tabular(tmp_path / "out.xyz", "xyz")
 
+    @pytest.mark.parametrize("format", list(DataFormat))
+    def test_tabular_kwargs_are_empty_for_every_format(self, format):
+        """A source with no variable behind it, like a crosswalk or the dataset list, adds
+        nothing to the writer arguments the request supplies."""
+        assert LazyFrameSource(pl.LazyFrame({"a": [1]})).tabular_kwargs(format) == {}
+
 
 class TestParallelRasterHelpers:
     @pytest.fixture

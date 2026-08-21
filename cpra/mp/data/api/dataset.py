@@ -26,7 +26,7 @@ from cpra.mp.data.api.geography import (
 )
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
-from cpra.mp.data.api.types import OutputType
+from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.api.utils import (
     asynctiming,
     get_lazy_frame,
@@ -141,6 +141,24 @@ class Dataset(LazyFrameSource):
     @property
     def variable(self) -> Variable:
         return VARIABLES[self.dataset_dimensions.variable]
+
+    def tabular_kwargs(self, format):
+        """Round CSV output to the variable's `float_precision`, when it sets one.
+
+        CSV only: it's the one writer polars gives a `float_precision`, and the only format
+        here that renders floats as text at all -- the binary formats hand over the stored
+        value and leave rounding to whatever reads them.
+
+        This deliberately applies to every float column in the response, not just `value`.
+        Nothing else in a tabular response is a float today (dimensions are integers,
+        strings, or dates), and a bare `.round()` on `value` would be wrong anyway: it
+        would change the number in the binary formats too, where the request asked for the
+        stored value.
+        """
+        precision = self.variable.float_precision
+        if format == DataFormat.csv and precision is not None:
+            return {"float_precision": precision}
+        return {}
 
     def _is_raster_metadata_table(self):
         """Whether self.lf still holds the raster band-metadata table (dimension columns

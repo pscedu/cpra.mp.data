@@ -69,6 +69,22 @@ class TestVariables:
         for var in VARIABLES.values():
             assert isinstance(var.dtype, pl.datatypes.classes.DataTypeClass), var.name
 
+    def test_float_precision_is_set_only_for_salinity(self):
+        """Salinity is reported to a tenth of a ppt; nothing else is rounded on the way out."""
+        assert {var.name: var.float_precision for var in VARIABLES.values() if var.float_precision is not None} == {
+            "sal": 1
+        }
+
+    def test_float_precision_is_only_set_for_float_variables(self):
+        """Rounding decimal places out of an integer variable would be meaningless -- polars
+        applies `float_precision` to float columns only, so it would also be a silent no-op."""
+        offenders = [
+            var.name
+            for var in VARIABLES.values()
+            if var.float_precision is not None and not str(var.dtype).startswith("Float")
+        ]
+        assert offenders == []
+
 
 class TestDimensionsCsv:
     def test_dtypes_are_polars_dtypes(self):
