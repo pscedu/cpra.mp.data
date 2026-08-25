@@ -1,12 +1,13 @@
 """Tests for the `cpra.mp.data.cli` Click group.
 
 `cli` itself defines no commands directly -- `convert` was removed once the MP2023 dump
-format went out of use, and today `cli/catalog.py`'s `catalog` group is the only command
-module. `cli` remains the registration point command modules attach to: importing a
-command module (e.g. `cpra.mp.data.cli.catalog`, see tests/test_cli_catalog.py) mutates
-the shared `cli` object as a side effect of the `@cli.group()`/`@cli.command()`
-decoration at import time. That means `cli.commands` reflects whichever command modules
-the test session happened to import already, not just what this file imports -- see
+format went out of use, and today the command modules are `cli/catalog.py`'s `catalog`
+group and `cli/crosswalk.py`'s `crosswalk` command (vector and raster crosswalk
+generation). `cli` remains the registration point they attach to: importing a command
+module (e.g. `cpra.mp.data.cli.catalog`, see tests/test_cli_catalog.py) mutates the
+shared `cli` object as a side effect of the `@cli.group()`/`@cli.command()` decoration at
+import time. That means `cli.commands` reflects whichever command modules the test
+session happened to import already, not just what this file imports -- see
 `test_cli_group_starts_with_no_commands_of_its_own` below for how that's tested without
 depending on import order.
 """
@@ -49,8 +50,20 @@ def test_cli_group_starts_with_no_commands_of_its_own():
     assert sys.modules["cpra.mp.data.cli"] is not module
 
 
+def test_crosswalk_command_is_registered():
+    # Imported for the side effect the test is about -- the docstring above explains why
+    # relying on another test module having already imported it would be order-dependent.
+    import cpra.mp.data.cli.crosswalk  # noqa: F401
+
+    assert "crosswalk" in cli.commands
+
+    result = CliRunner().invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    assert "crosswalk" in result.output
+
+
 def test_unknown_command_is_rejected():
-    result = CliRunner().invoke(cli, ["convert", "some.parquet"])
+    result = CliRunner().invoke(cli, ["definitely-not-a-real-cpra-command"])
     assert result.exit_code != 0
 
 
@@ -76,9 +89,10 @@ def test_commands_can_be_registered_and_invoked():
     assert "noop" not in cli.commands
 
 
-def test_module_entry_point_registers_catalog_command():
+def test_module_entry_point_registers_its_command_modules():
     """`python -m cpra.mp.data.cli` runs `cli/__main__.py`, which imports `cli.catalog`
-    for its side effect of registering the `catalog` subcommand before invoking `cli()`.
+    and `cli.crosswalk` for the side effect of registering their subcommands before
+    invoking `cli()`.
 
     This regressed once: `__main__.py` imported a `convert` module that had already been
     removed, so the entry point raised `ImportError` for anyone invoking it, and nothing
@@ -95,3 +109,4 @@ def test_module_entry_point_registers_catalog_command():
     )
     assert result.returncode == 0
     assert "catalog" in result.stdout
+    assert "crosswalk" in result.stdout

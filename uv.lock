@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "cpra-mp-data"
-version = "0.49.0"
+version = "0.50.0"
 source = { editable = "." }
 dependencies = [
     { name = "altair" },
@@ -528,9 +528,11 @@ dependencies = [
     { name = "polars" },
     { name = "pyarrow" },
     { name = "pyogrio" },
+    { name = "pyproj" },
     { name = "python-dotenv" },
     { name = "rasterio" },
     { name = "scipy" },
+    { name = "shapely" },
 ]
 
 [package.optional-dependencies]
@@ -539,7 +541,6 @@ api = [
     { name = "geopandas" },
     { name = "mapbox-vector-tile" },
     { name = "psycopg2-binary" },
-    { name = "shapely" },
     { name = "sqlmodel" },
 ]
 bridges2 = [
@@ -563,7 +564,6 @@ scripts = [
     { name = "affine" },
     { name = "fastexcel" },
     { name = "playwright" },
-    { name = "pyproj" },
     { name = "tippecanoe" },
     { name = "tqdm" },
 ]
@@ -606,11 +606,11 @@ requires-dist = [
     { name = "psycopg2-binary", marker = "extra == 'bridges2'" },
     { name = "pyarrow" },
     { name = "pyogrio", specifier = ">=0.12.1" },
-    { name = "pyproj", marker = "extra == 'scripts'" },
+    { name = "pyproj" },
     { name = "python-dotenv" },
     { name = "rasterio" },
     { name = "scipy" },
-    { name = "shapely", marker = "extra == 'api'" },
+    { name = "shapely" },
     { name = "sqlalchemy", marker = "extra == 'bridges2'" },
     { name = "sqlmodel", marker = "extra == 'api'" },
     { name = "sympy", marker = "extra == 'bridges2'" },

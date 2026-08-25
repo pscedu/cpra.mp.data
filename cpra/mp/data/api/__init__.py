@@ -94,6 +94,7 @@ def variables() -> list[Variable]:
             display_unit=var.display_unit,
             display_scale_factor=var.display_scale_factor,
             display_number_format=var.display_number_format,
+            float_precision=var.float_precision,
             geographic_units=var.geographic_units,
             time_units=var.time_units,
             required_dimensions=var.required_dimensions,
@@ -122,7 +123,7 @@ def dimensions(session: MPDSession) -> list[Dimension]:
             min_value=dim.min_value,
             max_value=dim.max_value,
             values=(
-                dim.values.select("value", "label").iter_rows(named=True)
+                dim.values.select("value", "label", "color").iter_rows(named=True)
                 if dim.values is not None
                 else mpd_dimension_values.get(dim.name, None)
             ),

@@ -8,6 +8,16 @@ class LazyFrameSource:
     def __init__(self, lf):
         self.lf = lf
 
+    def tabular_kwargs(self, format):
+        """Writer arguments this source needs for `format`, beyond the ones the request asks
+        for.
+
+        A plain source needs none; `Dataset` overrides this to round CSV output to its
+        variable's `float_precision`. Catalog sources (crosswalks, the dataset list) cover
+        many variables at once, so there is no single precision to apply to them.
+        """
+        return {}
+
     def materialize(self, method="collect", *args, **kwargs):
         """Materialize the LazyFrame with error handling."""
         try:

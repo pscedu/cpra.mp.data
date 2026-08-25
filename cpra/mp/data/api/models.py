@@ -99,6 +99,10 @@ class CrosswalkQuery(Compression):
 class DimensionValue(BaseModel):
     value: Any
     label: str | None
+    # Set only where a value has a color of its own wherever it is drawn, which is the
+    # vegetation species; null for every other dimension. Values are listed in display
+    # order, so a client colors and orders a series from this list alone.
+    color: str | None = None
 
 
 class Dimension(BaseModel):
@@ -123,6 +127,7 @@ class Variable(BaseModel):
     display_unit: str | None
     display_scale_factor: float | None
     display_number_format: str | None
+    float_precision: int | None
     legend: str | None
     geographic_units: list[str] | None
     time_units: list[str] | None

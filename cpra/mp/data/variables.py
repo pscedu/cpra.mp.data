@@ -42,7 +42,11 @@ class Variable:
         self.display_unit = display_unit
         self.display_scale_factor = display_scale_factor
         self.display_number_format = display_number_format
-        # Carried through from the structure spreadsheet; no consumer yet.
+        # Decimal places to write when a dataset is served as CSV, for variables whose
+        # models report more precision than they actually resolve -- see
+        # cpra.mp.data.api.sources.LazyFrameSource.tabular_kwargs. Unlike the display_*
+        # attributes this is not a presentation hint the client may ignore: it changes the
+        # bytes in the download, so the values a user gets are the ones the model means.
         self.float_precision = float_precision
         # In storage units, like a legend's break points -- see visualizations.map, which
         # colorizes raster pixels with it directly and only scales the legend it hands the

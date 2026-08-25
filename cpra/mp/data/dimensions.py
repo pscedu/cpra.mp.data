@@ -7,6 +7,21 @@ from cpra.mp.data.variables import VARIABLES
 
 
 class Dimension:
+    """One dimension of the data: what it's called, what type it is, what values it takes.
+
+    `values` is a DataFrame of `dimension`, `value`, `label` and `color`, or None for a
+    dimension whose values aren't enumerable up front. Two things about it are worth knowing
+    before changing one:
+
+    * `color` is null for most dimensions. It is set where a value carries a color of its own
+      everywhere it's drawn -- `veg_species_code`, whose colors are the vegetation model's
+      own map symbology, so a species reads the same in a chart as it does on the map.
+    * the row order is the order the structure CSV lists them in, and it is meaningful. It is
+      the order values are offered in, and for a colored dimension it is also the display
+      order: `SpeciesStackedBar` takes both its stacking order and its legend order from a
+      row's position here, so reordering the CSV reorders the chart.
+    """
+
     def __init__(
         self,
         name,
@@ -106,8 +121,11 @@ def values_df_from_dict(dimension, values_dict, attr="label"):
                 "label": [getattr(obj, attr) for obj in values_dict.values()],
             }
         )
-        .with_columns(pl.lit(dimension).alias("dimension"))
-        .select("dimension", "value", "label")
+        .with_columns(pl.lit(dimension).alias("dimension"), color=pl.lit(None, dtype=pl.String))
+        # `color` is null rather than absent so that every `Dimension.values` frame has the
+        # same columns whatever built it -- the CSV colors only some dimensions, and callers
+        # that read the column shouldn't have to know which ones came from where.
+        .select("dimension", "value", "label", "color")
     )
 
 

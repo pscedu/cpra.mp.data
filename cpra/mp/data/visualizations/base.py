@@ -99,6 +99,13 @@ class BaseVisualization:
                 if joined_expr != joined_field:
                     chart = chart.transform_calculate(**{source_name: joined_expr})
 
+                # The lookup pulls the joined source's raw `value` across, so this source's
+                # own scaling has to be applied to the field it landed in.
+                joined_field = f"datum['{source_name}']"
+                joined_expr = display_value_expr(self.source_variable(source_name), joined_field)
+                if joined_expr != joined_field:
+                    chart = chart.transform_calculate(**{source_name: joined_expr})
+
         return chart
 
     def source_variable(self, source_name):

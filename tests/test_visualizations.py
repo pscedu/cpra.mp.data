@@ -7,6 +7,8 @@ queried by coordinate rather than by grid cell ID, so they are pinned here. What
 is *shown* is a third answer, since a coordinate names a point but the data describes the
 cell that contains it — including which color shows it, which has to be the one the map
 drew the same grid cell with.
+
+The stacked bars have their own file, `test_stacked_bar.py`.
 """
 
 import pytest
