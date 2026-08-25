@@ -84,6 +84,16 @@ addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-f
 # accumulating. Deliberately narrow: a blanket "error" would break the build on unrelated
 # deprecations from rasterio/GDAL, Polars, or Starlette on any dependency bump.
 filterwarnings = [
+    # geopandas 0.14.4 imports the deprecated `shapely.geos` when it loads. Nothing in this
+    # package can fix that, and neither can a bump: `maplibre[all]` (the jupyter extra, a
+    # fork pinned by git) requires geopandas <0.15, while the import was dropped in
+    # geopandas 1.0. Revisit when that fork moves; `uv lock --upgrade-package geopandas`
+    # will keep resolving to 0.14.4 until it does.
+    #
+    # Listed first on purpose. pytest applies these in order and each one takes precedence
+    # over the ones before it, so the two rules below still turn this same warning into an
+    # error if it is ever *our* code importing `shapely.geos`.
+    "ignore:The 'shapely.geos' module is deprecated:DeprecationWarning",
     "error::DeprecationWarning:cpra.*",
     "error::DeprecationWarning:tests.*",
     "error::pydantic.PydanticDeprecatedSince20",
