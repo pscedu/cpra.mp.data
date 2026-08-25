@@ -174,10 +174,21 @@ class TestValuesDfFromDict:
                 self.label = label
 
         df = values_df_from_dict("thing", {"a": Obj("A"), "b": Obj("B")})
-        assert df.columns == ["dimension", "value", "label"]
+        assert df.columns == ["dimension", "value", "label", "color"]
         assert df["dimension"].to_list() == ["thing", "thing"]
         assert df["value"].to_list() == ["a", "b"]
         assert df["label"].to_list() == ["A", "B"]
+
+    def test_colors_are_null_but_present(self):
+        """Values built from a dict have no colors, but they have to carry the column: the
+        API selects it off every `Dimension.values` frame without asking which built it."""
+
+        class Obj:
+            label = "A"
+
+        df = values_df_from_dict("thing", {"a": Obj()})
+        assert df["color"].to_list() == [None]
+        assert df["color"].dtype == pl.String
 
     def test_respects_attr_argument(self):
         class Obj:

@@ -111,6 +111,54 @@ class TestDimensionsCsv:
         assert all(series.all() for series in results), f"{dim.name}={dim.example_value}"
 
 
+# The colors are the vegetation model's own map symbology, and `SpeciesStackedBar` reads
+# both them and their row order straight out of this CSV -- so an edit here is an edit to
+# that chart, and these are the invariants it relies on.
+COLORED_DIMENSIONS = sorted(
+    read_structure_csv("dimension_values").drop_nulls("color")["dimension"].unique()
+)
+
+
+class TestDimensionValueColors:
+    def test_only_the_species_are_colored(self):
+        """Not a rule, just the current fact -- kept here so that coloring a second
+        dimension is a deliberate act that comes past these tests."""
+        assert COLORED_DIMENSIONS == ["veg_species_code"]
+
+    @pytest.mark.parametrize("dim_name", COLORED_DIMENSIONS)
+    def test_every_value_is_colored_or_none_is(self, dim_name):
+        """A partly-colored dimension is the bad middle: `SpeciesStackedBar` looks a color up
+        per row, and a null one is a segment Vega draws in its own default rather than an
+        error anybody sees."""
+        assert DIMENSIONS[dim_name].values["color"].null_count() == 0
+
+    @pytest.mark.parametrize("dim_name", COLORED_DIMENSIONS)
+    def test_colors_are_hex(self, dim_name):
+        pattern = re.compile(r"^#[0-9a-f]{6}([0-9a-f]{2})?$")
+        for color in DIMENSIONS[dim_name].values["color"]:
+            assert pattern.match(color), f"{dim_name}: {color}"
+
+    @pytest.mark.parametrize("dim_name", COLORED_DIMENSIONS)
+    def test_colors_are_unique(self, dim_name):
+        """`SpeciesStackedBar` hands Vega the colors in the data and lets it pair them with a
+        domain it infers from the rows that survived filtering: two values sharing a color
+        collapse into one entry of that range and shift every color after it."""
+        colors = DIMENSIONS[dim_name].values["color"]
+        assert colors.n_unique() == len(colors)
+
+    @pytest.mark.parametrize("dim_name", COLORED_DIMENSIONS)
+    def test_values_are_unique(self, dim_name):
+        """The chart joins on the value, so a repeat leaves which color wins to the lookup."""
+        values = DIMENSIONS[dim_name].values["value"]
+        assert values.n_unique() == len(values)
+
+    @pytest.mark.parametrize("dim_name", COLORED_DIMENSIONS)
+    def test_every_value_has_a_label(self, dim_name):
+        """The label is the legend entry and the tooltip row, so a null one is a blank
+        line in both."""
+        assert DIMENSIONS[dim_name].values["label"].null_count() == 0
+
+
 class TestGridsCsv:
     def test_grid_types_are_known(self):
         assert {grid.grid_type for grid in GRIDS.values()} == {"vector", "raster"}

@@ -40,6 +40,12 @@ def table(df, column_aliases={}, format={}):
     )
 
 
+def drop_empty_columns(df):
+    """Drop columns that are null for every row."""
+
+    return df.select([col for col in df.columns if df[col].null_count() < len(df)])
+
+
 def replace_section(section_id, content, markdown):
     """Replace a dynamic section with a new version."""
     return re.sub(
@@ -87,7 +93,11 @@ def update_docs():
         if not len(values_df):
             continue
         dimensions_values_content += f"\n\n## {pluralize(dim['label'])}"
-        dimensions_values_content += f"\n\n{table(values_df.select('value', 'label'))}"
+        # Only some dimensions color their values, so drop the column for the ones that
+        # don't rather than printing a blank one under every table.
+        dimensions_values_content += (
+            f"\n\n{table(values_df.select('value', 'label', 'color').pipe(drop_empty_columns))}"
+        )
     markdown = replace_section(
         "dimension_values", dimensions_values_content, markdown
     )

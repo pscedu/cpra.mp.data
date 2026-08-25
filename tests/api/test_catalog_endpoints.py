@@ -69,6 +69,34 @@ class TestDimensions:
         assert by_name["calendar_year"]["min_value"] == 1900
         assert by_name["calendar_year"]["max_value"] == 2100
 
+    def test_colored_values_carry_their_color(self, client):
+        """The species colors are the vegetation model's own symbology, and a client needs
+        them to draw a species the same way the map does."""
+        by_name = {d["name"]: d for d in client.get("/v1/dimensions.json").json()}
+        colors = {v["value"]: v["color"] for v in by_name["veg_species_code"]["values"]}
+        assert colors["spal"] == "#ff0000"
+        assert None not in colors.values()
+
+    def test_colored_values_are_listed_in_display_order(self, client):
+        """The order is the payload here, not an accident of serialization: it is what a
+        client stacks and lists a legend by, so it has to survive the round trip."""
+        by_name = {d["name"]: d for d in client.get("/v1/dimensions.json").json()}
+        values = [v["value"] for v in by_name["veg_species_code"]["values"]]
+        assert values == DIMENSIONS["veg_species_code"].values["value"].to_list()
+        assert (values[0], values[-1]) == ("notmod", "unpa")
+
+    def test_uncolored_values_report_a_null_color(self, client):
+        """Every dimension carries the field now that one dimension needs it, so the others
+        answer it rather than omitting it."""
+        by_name = {d["name"]: d for d in client.get("/v1/dimensions.json").json()}
+        assert {v["color"] for v in by_name["time_unit"]["values"]} == {None}
+
+    def test_database_backed_values_report_a_null_color_too(self, client):
+        """These come from the MPD rather than the CSV, so they are built by a different path
+        and could plausibly have skipped the field."""
+        by_name = {d["name"]: d for d in client.get("/v1/dimensions.json").json()}
+        assert {v["color"] for v in by_name["model_group_id"]["values"]} == {None}
+
     def test_float_values_are_canonical(self, client):
         """aep values must serialise as 0.1, not the Float32 repr 0.10000000149011612."""
         by_name = {d["name"]: d for d in client.get("/v1/dimensions.json").json()}
@@ -116,7 +144,13 @@ class TestVisualizations:
         response = client.get("/v1/visualizations.json")
         assert response.status_code == 200
         names = {v["name"] for v in response.json()}
-        assert {"time-series-line", "stacked-bar", "map", "sediment-dynamics"} <= names
+        assert {
+            "time-series-line",
+            "stacked-bar",
+            "species-stacked-bar",
+            "map",
+            "sediment-dynamics",
+        } <= names
 
     def test_each_entry_declares_a_type(self, client):
         for viz in client.get("/v1/visualizations.json").json():

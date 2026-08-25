@@ -122,7 +122,7 @@ def dimensions(session: MPDSession) -> list[Dimension]:
             min_value=dim.min_value,
             max_value=dim.max_value,
             values=(
-                dim.values.select("value", "label").iter_rows(named=True)
+                dim.values.select("value", "label", "color").iter_rows(named=True)
                 if dim.values is not None
                 else mpd_dimension_values.get(dim.name, None)
             ),

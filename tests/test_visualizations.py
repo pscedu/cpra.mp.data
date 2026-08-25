@@ -1,12 +1,14 @@
-"""Tests for how visualizations label and parse the geography they were asked for.
+"""Tests for what a visualization has to get right without ever reading the data.
 
-A visualization never reads data itself — it emits a spec pointing at a `data.csv` URL and
-has to describe that response correctly in advance: which `geography` values to expect, and
-whether they arrive as numbers or strings. Both answers change when a vector grid is
-queried by coordinate rather than by grid cell ID, so they are pinned here. What the reader
-is *shown* is a third answer, since a coordinate names a point but the data describes the
-cell that contains it — including which color shows it, which has to be the one the map
-drew the same geography with.
+A visualization emits a spec pointing at a `data.csv` URL, so everything it says about that
+response it says in advance. Most of this file is about the geography: which `geography`
+values to expect, and whether they arrive as numbers or strings. Both answers change when a
+vector grid is queried by coordinate rather than by grid cell ID, so they are pinned here.
+What the reader is *shown* is a third answer, since a coordinate names a point but the data
+describes the cell that contains it — including which color shows it, which has to be the
+one the map drew the same geography with.
+
+The stacked bars have their own file, `test_stacked_bar.py`.
 """
 
 import pytest
