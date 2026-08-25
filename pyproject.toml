@@ -77,6 +77,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "sqlmodel",
+    # Also in the `scripts` extra, which is what actually needs it at runtime. It is here
+    # too because tests/test_migrate_to_long_format.py execs
+    # scripts/migrate_to_long_format.py, which imports it at module scope -- so without it
+    # the suite cannot even be collected under the `--extra api --group dev` set CI syncs.
+    "tqdm",
 ]
 
 [tool.pytest.ini_options]

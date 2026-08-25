@@ -576,6 +576,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "sqlmodel" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -629,6 +630,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "sqlmodel" },
+    { name = "tqdm" },
 ]
 
 [[package]]
