@@ -118,16 +118,16 @@ HISTORIC_GROUPS = [
 ]
 
 _group_ends = [last for _, last in HISTORIC_GROUPS]
-assert _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS, (
-    f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
-)
+assert (
+    _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS
+), f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
 
 # Color depends on a period's role in the frame being drawn rather than on which period it
 # is (see historical_colors_revised.png): the group the frame is "on" is the current
 # period, the groups before it are previous, and the groups after it haven't happened yet
 # and are drawn in a pale gray.
-CURRENT_LOSS_COLOR = "#4591AC"
-CURRENT_GAIN_COLOR = "#265118"
+CURRENT_LOSS_COLOR = "#256B84"
+CURRENT_GAIN_COLOR = "#4D7141"
 PREVIOUS_LOSS_COLOR = "#A0C7D4"
 PREVIOUS_GAIN_COLOR = "#ABCB9F"
 FUTURE_LOSS_COLOR = "#E4E4E4"
@@ -363,9 +363,7 @@ def reproject_rgba_to_target(src_bands, src_crs, src_transform, resampling):
     of fully transparent pixels into partially transparent edges as dark fringing.
     Work is done in float32 to avoid quantizing twice."""
     a = src_bands[3].astype(np.float32) / 255.0
-    premul = np.concatenate(
-        [src_bands[:3].astype(np.float32) * a, src_bands[3:].astype(np.float32)], axis=0
-    )
+    premul = np.concatenate([src_bands[:3].astype(np.float32) * a, src_bands[3:].astype(np.float32)], axis=0)
 
     dst = reproject_to_target(premul, src_crs, src_transform, resampling)
 
@@ -387,9 +385,7 @@ def reproject_classes_to_target(data_path: Path, resampling):
     source doesn't cover."""
     with rasterio.open(data_path) as ds:
         nodata = ds.nodatavals[0]
-        dst = np.full(
-            (TARGET_HEIGHT, TARGET_WIDTH), 0 if nodata is None else nodata, dtype=ds.dtypes[0]
-        )
+        dst = np.full((TARGET_HEIGHT, TARGET_WIDTH), 0 if nodata is None else nodata, dtype=ds.dtypes[0])
         reproject(
             source=rasterio.band(ds, 1),
             destination=dst,
@@ -693,9 +689,7 @@ def main(
     if baseline_land_water_data is not None and land_water_data is None:
         raise click.UsageError("--baseline-land-water-data does nothing without --land-water-data")
     if basemap_style is None and historic_data is None and confidence_data is None:
-        raise click.UsageError(
-            "nothing to do: pass --basemap-style, --historic-data and/or --confidence-data"
-        )
+        raise click.UsageError("nothing to do: pass --basemap-style, --historic-data and/or --confidence-data")
 
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -706,9 +700,7 @@ def main(
         classes = reproject_classes_to_target(historic_data, resampling)
         write_historic_group_pngs(classes, output_dir)
         if land_water_data is not None:
-            write_land_water_group_png(
-                historic_data, baseline_land_water_data, land_water_data, output_dir, resampling
-            )
+            write_land_water_group_png(historic_data, baseline_land_water_data, land_water_data, output_dir, resampling)
 
     if confidence_data is not None:
         write_confidence_pngs(confidence_data, output_dir)
