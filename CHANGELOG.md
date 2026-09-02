@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.51.0](https://github.com/pscedu/cpra.mp.data/compare/v0.50.0...v0.51.0) (2026-08-25)
+
+
+### Features
+
+* **structure:** add display format columns ([0ed2fe8](https://github.com/pscedu/cpra.mp.data/commit/0ed2fe858dc1c09127afb81a26c2806101cf12db))
+* **structure:** add variable float precision for CSVs ([b911837](https://github.com/pscedu/cpra.mp.data/commit/b9118373390b1b0a3df97bb38930e3f5e283d5c7))
+* **visualizations:** add species stacked bar chart ([d9f8bb0](https://github.com/pscedu/cpra.mp.data/commit/d9f8bb040c051247930aa558ecafb8a2aaf20b39))
+
 ## [0.50.0](https://github.com/pscedu/cpra.mp.data/compare/v0.49.1...v0.50.0) (2026-08-20)
 
 
