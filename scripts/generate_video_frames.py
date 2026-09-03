@@ -119,8 +119,7 @@ HISTORIC_GROUPS = [
     ("1975_1985", 5),
     ("1985_1995", 8),
     ("1995_2004", 12),
-    ("2004_2006", 13),
-    ("2006_2015", 19),
+    ("2004_2015", 19),
 ]
 
 _group_ends = [last for _, last in HISTORIC_GROUPS]
@@ -563,7 +562,7 @@ def compare_land_water_at_historic_grid(historic_path: Path, baseline_path: Path
 def land_water_group_lut():
     """Every historic group as a previous period, plus the two 2015-2024 transition
     classes. 2015-2024 is this frame's current period, so it takes the current loss/gain
-    colors and no group in the historic record is current — including the 2006-2015 one
+    colors and no group in the historic record is current — including the 2004-2015 one
     that was current in the frame before this."""
     lut = historic_group_lut(len(HISTORIC_GROUPS))
     lut[LAND_TO_WATER_CLASS] = hex_to_rgba(CURRENT_LOSS_COLOR)
