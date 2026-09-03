@@ -29,15 +29,16 @@ Data layers (--historic-data, the historic persistent-change raster):
      and takes the saturated loss/gain pair, the groups before it take the pale pair, the
      groups after it stay the "hasn't happened yet" gray, and everything else is
      transparent.
-  4. With --land-water-data and --baseline-land-water-data, extend the series one group
-     past the historic raster's 2015 end date: write historic_2015_2024.png, where every
-     historic group is a previous period and the pixels that flipped land/water state by
-     2024 are the current one. The 2015 state is the baseline raster with the historic
+  4. The last group ends in 2024, past the historic raster's 2015 end date, so with
+     --land-water-data and --baseline-land-water-data it is written from a comparison
+     against a 2024 land/water raster instead of from the historic raster alone: both the
+     group's own historic classes and the pixels that flipped land/water state by 2024 are
+     drawn as the current period. The 2015 state is the baseline raster with the historic
      change classes burned in, so ground the historic raster never classified still gets
-     compared. The
-     comparison runs at the historic raster's own 15 m resolution and only then gets
-     colored and resampled to the video grid, so the inputs are compared where they
-     describe the same ground.
+     compared. The comparison runs at the historic raster's own 15 m resolution and only
+     then gets colored and resampled to the video grid, so the inputs are compared where
+     they describe the same ground. Without that data step 3 writes the group from the
+     historic record alone, which stops in 2015.
 
 Confidence layers (--confidence-data, a directory of confidence rasters):
   1. Symbolize each raster at its own 30 m resolution, binning by magnitude per
@@ -113,13 +114,14 @@ GAIN_VALUE_OFFSET = N_HISTORIC_PERIODS
 
 # The year groups to emit one PNG per. The int is the index of the last loss period in
 # the group, so each group covers the periods after the previous group's through its own.
+# The last group runs past the end of the historic record: its label ends in 2024 but the
+# raster's periods stop at 2015, so the 2015-2024 part of it comes from the land/water
+# comparison below and the frame is only complete with --land-water-data.
 HISTORIC_GROUPS = [
     ("1932_1956", 1),
-    ("1956_1975", 3),
-    ("1975_1985", 5),
-    ("1985_1995", 8),
-    ("1995_2004", 12),
-    ("2004_2015", 19),
+    ("1956_1985", 5),
+    ("1985_2004", 12),
+    ("2004_2024", 19),
 ]
 
 _group_ends = [last for _, last in HISTORIC_GROUPS]
@@ -150,7 +152,11 @@ INITIAL_STATE_LABEL = str(HISTORIC_PERIOD_YEARS[0])
 # 2 Open Water, 3 Bare/Unvegetated Wetland, 4 Upland/Developed Areas, 5 Flotant Marsh.
 # Only class 2 is water; every other valid class is some form of land.
 LND_TYPE_OPEN_WATER = 2
-LAND_WATER_GROUP_LABEL = "2015_2024"
+
+# The comparison finishes the last group rather than adding one of its own, so it writes
+# that group's frame: the historic classes and the 2015-2024 transitions are the same
+# current period and belong in the same PNG.
+LAND_WATER_GROUP_LABEL = HISTORIC_GROUPS[-1][0]
 
 # Land/water state codes the lnd_type classes are reduced to before comparing.
 LW_UNKNOWN, LW_LAND, LW_WATER = 0, 1, 2
@@ -472,10 +478,18 @@ def historic_group_lut(selected: int):
     return lut
 
 
-def write_historic_group_pngs(classes: np.ndarray, src_crs, src_transform, output_dir: Path, save_full: bool):
-    """Color and resample one frame per year group, plus the frame the series opens on."""
+def write_historic_group_pngs(
+    classes: np.ndarray, src_crs, src_transform, output_dir: Path, save_full: bool, skip_last_group: bool
+):
+    """Color and resample one frame per year group, plus the frame the series opens on.
+
+    skip_last_group leaves the last group to write_land_water_group_png. That group ends
+    after the historic record does, so this raster holds only the first half of it; the
+    frame written here would be missing the 2015-2024 change and overwritten anyway.
+    """
+    groups = HISTORIC_GROUPS[:-1] if skip_last_group else HISTORIC_GROUPS
     selections = [(INITIAL_STATE_LABEL, NO_GROUP_SELECTED)]
-    selections += [(label, group_idx) for group_idx, (label, _) in enumerate(HISTORIC_GROUPS)]
+    selections += [(label, group_idx) for group_idx, (label, _) in enumerate(groups)]
     for label, selected in selections:
         lut = historic_group_lut(selected)
         write_historic_group_png(output_dir, label, lut, classes, src_crs, src_transform, save_full)
@@ -560,11 +574,12 @@ def compare_land_water_at_historic_grid(historic_path: Path, baseline_path: Path
 
 
 def land_water_group_lut():
-    """Every historic group as a previous period, plus the two 2015-2024 transition
-    classes. 2015-2024 is this frame's current period, so it takes the current loss/gain
-    colors and no group in the historic record is current — including the 2004-2015 one
-    that was current in the frame before this."""
-    lut = historic_group_lut(len(HISTORIC_GROUPS))
+    """The last historic group as the current period, the groups before it as previous,
+    plus the two 2015-2024 transition classes. This frame is the last group, which runs
+    from 2004 past the end of the historic record to 2024, so both halves of it are
+    current: the record's own 2004-2015 loss/gain classes and the transitions the
+    comparison found on top of them."""
+    lut = historic_group_lut(len(HISTORIC_GROUPS) - 1)
     lut[LAND_TO_WATER_CLASS] = hex_to_rgba(CURRENT_LOSS_COLOR)
     lut[WATER_TO_LAND_CLASS] = hex_to_rgba(CURRENT_GAIN_COLOR)
     return lut
@@ -686,8 +701,9 @@ def write_full_tif(path: Path, rgba_bands: np.ndarray, src_crs, src_transform):
 @click.option(
     "--land-water-data",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help=f"path to the 2024 lnd_type land/water raster; emits historic_{LAND_WATER_GROUP_LABEL}.png "
-    "by comparing it against the 2015 state. Requires --historic-data and --baseline-land-water-data.",
+    help=f"path to the 2024 lnd_type land/water raster; finishes the last year group by comparing it "
+    f"against the 2015 state, and writes historic_{LAND_WATER_GROUP_LABEL}.png in place of the "
+    "historic-only frame for that group. Requires --historic-data and --baseline-land-water-data.",
 )
 @click.option(
     "--baseline-land-water-data",
@@ -745,7 +761,9 @@ def main(
     if historic_data is not None:
         print(f"Reading {historic_data.name} at source resolution...")
         classes, src_crs, src_transform = read_classes(historic_data)
-        write_historic_group_pngs(classes, src_crs, src_transform, output_dir, save_full)
+        write_historic_group_pngs(
+            classes, src_crs, src_transform, output_dir, save_full, skip_last_group=land_water_data is not None
+        )
         if land_water_data is not None:
             write_land_water_group_png(
                 historic_data, baseline_land_water_data, land_water_data, output_dir, save_full
