@@ -77,6 +77,14 @@ RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
 # Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
 RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
 
+# Opt-in switch for the Polars IO-plugin summarize path (api.raster_source.scan_rasters),
+# falling back to the numpy block-window/reduceat loop. Off by default for one release
+# while the plugin path is verified in production -- see
+# Dataset._apply_transform_params_raster, which additionally never routes a request with
+# a group_aggregate or calculate (multiplier) parameter through the plugin regardless of
+# this flag, since the plugin has no equivalent of that pre-aggregation step.
+RASTER_USE_IO_PLUGIN = get_config("RASTER_USE_IO_PLUGIN", "False").lower() in TRUE_VALUES
+
 # Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is
 # the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
 RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))

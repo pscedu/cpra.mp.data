@@ -29,6 +29,7 @@ from cpra.mp.data.api.geography import (
     resolve_vector_grid_cell,
 )
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+from cpra.mp.data.api.raster_source import guarded_aggregate, scan_rasters
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.api.utils import (
@@ -45,6 +46,7 @@ from cpra.mp.data.api.utils import (
 )
 from cpra.mp.data.config import (
     RASTER_NUM_THREADS,
+    RASTER_USE_IO_PLUGIN,
     RASTER_USE_VRT_COPY,
     RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
@@ -488,6 +490,11 @@ class Dataset(LazyFrameSource):
         LazyFrame in the same shape produced by `_apply_transform_params_vector`
         (dimension columns, a `grid_cell` column holding the destination grid_cell ID, a
         `value` column, and a `geographic_unit` column).
+
+        The actual per-zone reduction is computed by one of two interchangeable
+        implementations -- see `_summarize_zone_stats_numpy` and
+        `_summarize_zone_stats_plugin` -- both returning a `(n_bands, zone_ids.size)`
+        array in the same shape, so the assembly below doesn't need to know which one ran.
         """
         if not self._validate_summarize_params():
             return
@@ -504,10 +511,55 @@ class Dataset(LazyFrameSource):
 
         dim_df = self._get_raster_dimension_frame(df)
         n_bands = len(dim_df)
+        unique_paths, row_indices, bands = group_rows_by_path(df)
+
+        with rio.open(crosswalk_path) as crosswalk:
+            if self.summarize_grid_cell_ids:
+                zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
+            else:
+                dst_ids = crosswalk.tags()["dst_ids"].split(",")
+                zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
+
+        # The plugin path (`scan_rasters`) reads every band directly from its own source
+        # pixels and has no notion of `get_raster_array`'s multiplier/group-aggregate
+        # step, so it is only equivalent to the numpy path -- and only used -- for the
+        # plain case neither feature touches. A request with a calculate (multiplier) or
+        # group_by/group_aggregate parameter always takes the numpy path, regardless of
+        # this flag.
+        plugin_eligible = (
+            RASTER_USE_IO_PLUGIN and self.raster_groups is None and bool((df["multiplier"] == 1).all())
+        )
+
+        if plugin_eligible:
+            result = await asyncio.to_thread(
+                self._summarize_zone_stats_plugin, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands
+            )
+        else:
+            result = await self._summarize_zone_stats_numpy(
+                df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands
+            )
+
+        # Assemble in wide format (one column per zone) to line up with `result`'s shape,
+        # then unpivot to the long-format grid_cell/value contract used everywhere else --
+        # matching _apply_transform_params_vector's join-based output shape.
+        dim_cols = dim_df.columns
+        self.lf = (
+            dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
+            .unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
+            .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by))
+            .lazy()
+        )
+
+    async def _summarize_zone_stats_numpy(self, df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
+        """Zonal aggregate via the batched block-window / masked-`reduceat` loop.
+
+        The default path, and the only one used whenever a group_aggregate or calculate
+        (multiplier) parameter is in play -- see the caller, `_apply_transform_params_raster`.
+        Returns a `(n_bands, zone_ids.size)` array, NaN where a (band, zone) had no
+        contributing (non-nodata) pixel.
+        """
         is_mean = self.options.summarize_aggregate == "mean"
         aggregate_fn, start_value = RASTER_AGGREGATES[self.options.summarize_aggregate]
-
-        unique_paths, row_indices, bands = group_rows_by_path(df)
 
         with ExitStack() as stack:
             # GDAL_NUM_THREADS only speeds up decompression for reads on a dataset that was
@@ -525,11 +577,6 @@ class Dataset(LazyFrameSource):
             with raster_gdal_env():
                 crosswalk = stack.enter_context(rio.open(crosswalk_path))
                 inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
-            if self.summarize_grid_cell_ids:
-                zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
-            else:
-                dst_ids = crosswalk.tags()["dst_ids"].split(",")
-                zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
 
             accumulator = np.full((n_bands, zone_ids.size), start_value)
             # Per-band, per-zone count of contributing (non-nodata) pixels -- mean's
@@ -579,17 +626,36 @@ class Dataset(LazyFrameSource):
         # A (band, zone) with no contributing pixel has no answer -- either the zone never
         # appeared in a scanned window, or every matched pixel there was nodata.
         result[valid == 0] = np.nan
+        return result
 
-        # Assemble in wide format (one column per zone) to line up with `result`'s shape,
-        # then unpivot to the long-format grid_cell/value contract used everywhere else --
-        # matching _apply_transform_params_vector's join-based output shape.
-        dim_cols = dim_df.columns
-        self.lf = (
-            dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
-            .unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
-            .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by))
-            .lazy()
+    def _summarize_zone_stats_plugin(self, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
+        """Zonal aggregate via the Polars IO plugin (`raster_source.scan_rasters`).
+
+        Equivalent to `_summarize_zone_stats_numpy` only for the plain per-band case the
+        caller restricts this path to (see `_apply_transform_params_raster`): no
+        group_aggregate pre-collapse, no calculate (multiplier) parameter. Nodata masking
+        and the all-nodata-is-NaN edge case both come from the source and `guarded_aggregate`
+        respectively -- no separate accumulation pass is needed here.
+
+        Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
+        long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
+        blocking the event loop for the whole summarize, matching how the numpy path's
+        blocking `rio_copy` call is offloaded elsewhere (`_write_raster_vrt`).
+        """
+        names = [f"b{i}" for i in range(n_bands)]
+        lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
+        grouped = (
+            lf.group_by("grid_cell")
+            .agg([guarded_aggregate(self.options.summarize_aggregate, name) for name in names])
+            .collect(engine="streaming")
         )
+
+        result = np.full((n_bands, zone_ids.size), np.nan)
+        if grouped.height:
+            positions = np.searchsorted(zone_ids, grouped["grid_cell"].to_numpy().astype("int64"))
+            for i, name in enumerate(names):
+                result[i, positions] = grouped[name].to_numpy()
+        return result
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""
