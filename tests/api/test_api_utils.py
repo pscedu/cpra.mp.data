@@ -15,11 +15,11 @@ from cpra.mp.data.api.utils import (
     get_visualization_class,
     parallel_read_rasters,
     parallel_sample_rasters,
+    raster_blocks_per_batch,
     unpack_values,
     validate_compression,
     validate_format,
 )
-
 from tests.factories import RASTER_KWARGS, write_raster_dataset
 
 
@@ -260,3 +260,85 @@ class TestParallelRasterHelpers:
                 dataset.close()
         assert len(results) == 2
         assert np.asarray(results[0]).ravel()[0] == 30
+
+    async def test_use_gdal_env_true_applies_config_on_the_worker_thread(self, rasters):
+        """Proves the env genuinely reaches the thread that performs the
+        read (not just that the call completes without error) by having a stand-in
+        dataset record the GDAL config actually in effect, and which thread it ran on,
+        at the moment `.read()` is called -- the same call `_read_window` makes."""
+        import threading
+
+        from rasterio._env import get_gdal_config
+
+        from cpra.mp.data.config import RASTER_NUM_THREADS
+
+        class RecordingDataset:
+            def __init__(self, dataset):
+                self._dataset = dataset
+                self.thread = None
+                self.num_threads = None
+
+            def read(self, indexes=None, window=None, out_shape=None, resampling=None):
+                self.thread = threading.current_thread()
+                self.num_threads = get_gdal_config("GDAL_NUM_THREADS")
+                return self._dataset.read(indexes=indexes, window=window, out_shape=out_shape, resampling=resampling)
+
+        dataset = rio.open(rasters[0])
+        try:
+            recorder = RecordingDataset(dataset)
+            results = await parallel_read_rasters([recorder], None, use_gdal_env=True)
+        finally:
+            dataset.close()
+
+        assert len(results) == 1
+        # run_in_executor's default pool never reuses the calling (main) thread.
+        assert recorder.thread is not threading.main_thread()
+        assert recorder.num_threads == RASTER_NUM_THREADS
+
+    async def test_use_gdal_env_false_does_not_set_the_config(self, rasters):
+        from rasterio._env import get_gdal_config
+
+        class RecordingDataset:
+            def __init__(self, dataset):
+                self._dataset = dataset
+                self.num_threads = "not observed"
+
+            def read(self, indexes=None, window=None, out_shape=None, resampling=None):
+                self.num_threads = get_gdal_config("GDAL_NUM_THREADS")
+                return self._dataset.read(indexes=indexes, window=window, out_shape=out_shape, resampling=resampling)
+
+        dataset = rio.open(rasters[0])
+        try:
+            recorder = RecordingDataset(dataset)
+            await parallel_read_rasters([recorder], None, use_gdal_env=False)
+        finally:
+            dataset.close()
+
+        assert recorder.num_threads is None
+
+
+class TestRasterBlocksPerBatch:
+    """The batch size is derived from the configured memory budget and the
+    request's own band count/block shape, not hardcoded."""
+
+    def test_more_bands_means_fewer_blocks_per_batch(self):
+        few_bands = raster_blocks_per_batch(1, 512, 512, 4)
+        many_bands = raster_blocks_per_batch(52, 512, 512, 4)
+        assert many_bands < few_bands
+
+    def test_never_returns_less_than_one(self):
+        assert raster_blocks_per_batch(10_000, 512, 512, 8) >= 1
+
+    def test_explicit_override_takes_precedence(self, monkeypatch):
+        import cpra.mp.data.api.utils as api_utils
+
+        monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 3)
+        assert raster_blocks_per_batch(52, 512, 512, 4) == 3
+
+    def test_derives_from_the_configured_buffer_budget(self, monkeypatch):
+        import cpra.mp.data.api.utils as api_utils
+
+        monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", None)
+        monkeypatch.setattr(api_utils, "RASTER_BATCH_BUFFER_MB", 8)
+        # 8 MB budget / (2 bands x 512 x 512 x 4 bytes = 2 MiB per block) -> 4 blocks.
+        assert raster_blocks_per_batch(2, 512, 512, 4) == 4

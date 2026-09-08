@@ -10,8 +10,9 @@ import polars as pl
 import pytest
 import rasterio as rio
 from fastapi import HTTPException
+from rasterio.windows import Window
 
-from cpra.mp.data.api.dataset import _get_zone_segments
+from cpra.mp.data.api.dataset import _batched_block_windows, _get_zone_segments
 from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.api.utils import group_rows_by_path
 from cpra.mp.data.grids import GRIDS
@@ -237,6 +238,45 @@ class TestZoneSegments:
         assert counts.sum() == pixels.size
 
 
+class TestBatchedBlockWindows:
+    """Batches are capped at `blocks_per_batch` blocks, independent of how
+    many blocks make up a full block row."""
+
+    @staticmethod
+    def _row_of_blocks(row, count, block_width=10, block_height=10):
+        return [
+            ((row, col), Window(col * block_width, row * block_height, block_width, block_height))
+            for col in range(count)
+        ]
+
+    def test_caps_batch_size_below_a_full_row(self):
+        block_windows = self._row_of_blocks(0, 10)
+        batches = list(_batched_block_windows(block_windows, blocks_per_batch=3))
+        assert len(batches) == 4  # ceil(10 / 3)
+        assert [b.width for b in batches] == [30, 30, 30, 10]
+
+    def test_never_spans_more_than_one_block_row(self):
+        block_windows = self._row_of_blocks(0, 5) + self._row_of_blocks(1, 5)
+        batches = list(_batched_block_windows(block_windows, blocks_per_batch=1000))
+        assert len(batches) == 2  # one batch per row, despite the huge cap
+        assert [b.row_off for b in batches] == [0, 10]
+
+    def test_batch_count_is_independent_of_row_width(self):
+        """The same blocks_per_batch yields the same number of batches per row whether
+        the row is 10 blocks wide or 100 -- the original defect was exactly the
+        batch size scaling with row width instead of staying capped."""
+        narrow = list(_batched_block_windows(self._row_of_blocks(0, 10), blocks_per_batch=3))
+        wide = list(_batched_block_windows(self._row_of_blocks(0, 100), blocks_per_batch=3))
+        assert len(narrow) == 4
+        assert len(wide) == 34  # ceil(100 / 3), not a single 100-block union
+
+    def test_covers_every_block_exactly_once(self):
+        block_windows = self._row_of_blocks(0, 7)
+        batches = list(_batched_block_windows(block_windows, blocks_per_batch=3))
+        total_width = sum(b.width for b in batches)
+        assert total_width == 7 * 10
+
+
 class TestSummarizeStage:
     async def test_missing_crosswalk_raises_400(self, dataset_factory, raster_data, crosswalk_path):
         dataset = dataset_factory(
@@ -246,6 +286,36 @@ class TestSummarizeStage:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "No crosswalk from veg_grid_cell_v001 to parish_v2020" in excinfo.value.detail
+
+    async def test_batch_size_does_not_change_the_result(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    ):
+        """A block row is chunked into batches of at most `RASTER_BLOCKS_PER_BATCH`
+        blocks purely to bound memory -- the summarized result must be identical
+        regardless of the chunk size. The test grid's single block row is split into 3
+        column blocks (512, 512, 28 px wide), so 1 vs. 1000 genuinely exercises chunked
+        vs. whole-row batching, not just a no-op override.
+        """
+        from cpra.mp.data.api import utils as api_utils
+
+        monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 1)
+        chunked_dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
+        )
+        await chunked_dataset.apply_params()
+        chunked = chunked_dataset.materialize().sort(["calendar_year", "grid_cell"])
+
+        monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 1000)
+        whole_row_dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
+        )
+        await whole_row_dataset.apply_params()
+        whole_row = whole_row_dataset.materialize().sort(["calendar_year", "grid_cell"])
+
+        assert chunked["grid_cell"].to_list() == whole_row["grid_cell"].to_list()
+        assert np.array_equal(
+            chunked["value"].to_numpy(), whole_row["value"].to_numpy(), equal_nan=True
+        )
 
     async def test_produces_one_row_per_zone_per_band(
         self, dataset_factory, raster_data, zone_crosswalk
@@ -367,6 +437,92 @@ class TestSummarizeStage:
         df = dataset.materialize()
         assert {"grid_cell", "value"} <= set(df.columns)
         assert df.height == 4
+
+
+@pytest.fixture
+def raster_data_with_nodata(base_path):
+    """Two COGs whose nodata pixels (-9999, `write_cog`'s fixed sentinel) probe the
+    nodata masking against `zone_crosswalk`'s top/bottom row split:
+
+    * 2030: zone 1 (top half) is real (10) except its first row, which is nodata; zone 2
+      (bottom half) is entirely nodata.
+    * 2040: the opposite -- zone 1 entirely nodata, zone 2 real (20) throughout.
+
+    The two bands disagree on which zone is all-nodata so a per-zone (rather than
+    per-band-per-zone) contributing-pixel count would wrongly mark the real band NaN too.
+    """
+    half = GRID.height // 2
+
+    def data_fn(year):
+        data = np.full((GRID.height, GRID.width), 10 if year == 2030 else 20, dtype="int32")
+        if year == 2030:
+            data[0, :] = -9999  # one nodata row inside real zone 1
+            data[half:, :] = -9999  # all of zone 2
+        else:
+            data[:half, :] = -9999  # all of zone 1
+        return data
+
+    return write_raster_dataset(base_path, years=(2030, 2040), data_fn=data_fn)
+
+
+class TestNodataMasking:
+    """Nodata pixels are excluded from every aggregate, and `mean` divides by
+    the count of contributing (non-nodata) pixels, not the zone's raw pixel count."""
+
+    async def test_nodata_excluded_from_min_max_sum(
+        self, dataset_factory, raster_data_with_nodata, zone_crosswalk
+    ):
+        zone_pixels = (GRID.height // 2) * GRID.width
+        contributing = zone_pixels - GRID.width  # one nodata row removed from zone 1
+
+        for aggregate, expected in (("min", 10), ("max", 10), ("sum", 10 * contributing)):
+            dataset = dataset_factory(
+                DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate=aggregate
+            )
+            await dataset.apply_params()
+            df = dataset.materialize()
+            zone_1_2030 = df.filter(
+                (pl.col("grid_cell") == 1) & (pl.col("calendar_year") == 2030)
+            )
+            assert zone_1_2030["value"][0] == pytest.approx(expected), aggregate
+
+    async def test_mean_denominator_is_contributing_pixels_not_zone_pixels(
+        self, dataset_factory, raster_data_with_nodata, zone_crosswalk
+    ):
+        """Every contributing pixel is 10; a raw-pixel-count denominator (the pre-fix
+        behaviour) would pull this below 10 because it would also divide by the nodata
+        row, and treating nodata as 0 as well as counting it would pull it lower still."""
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        zone_1_2030 = df.filter((pl.col("grid_cell") == 1) & (pl.col("calendar_year") == 2030))
+        assert zone_1_2030["value"][0] == pytest.approx(10)
+
+    async def test_all_nodata_band_zone_is_nan_per_band(
+        self, dataset_factory, raster_data_with_nodata, zone_crosswalk
+    ):
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        def value(grid_cell, year):
+            return df.filter(
+                (pl.col("grid_cell") == grid_cell) & (pl.col("calendar_year") == year)
+            )["value"][0]
+
+        # The all-nodata (band, zone) cells are NaN...
+        assert np.isnan(value(2, 2030))
+        assert np.isnan(value(1, 2040))
+        # ...but the real data in the *other* band for the very same zones is not --
+        # this is the per-(band, zone) granularity the fix requires: a per-zone-only
+        # contributing count would incorrectly mark these NaN too, since each zone has
+        # an all-nodata band somewhere.
+        assert value(1, 2030) == pytest.approx(10)
+        assert value(2, 2040) == pytest.approx(20)
 
 
 class TestValidateTile:

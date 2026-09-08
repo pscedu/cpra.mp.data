@@ -139,11 +139,19 @@ def raster_array(fill=None, grid_name=RASTER_KWARGS["grid"], dtype="int32"):
     return np.full((grid.height, grid.width), fill, dtype=dtype)
 
 
-def write_raster_dataset(base_path, years=(2030, 2040), fill_fn=None, **overrides):
-    """Write one COG per year and return the kwargs needed to read them back."""
+def write_raster_dataset(base_path, years=(2030, 2040), fill_fn=None, data_fn=None, **overrides):
+    """Write one COG per year and return the kwargs needed to read them back.
+
+    ``data_fn(year)``, when given, returns the full pixel array for that year directly
+    (e.g. to plant nodata pixels at specific locations), taking precedence over
+    ``fill_fn``'s uniform fill.
+    """
     kwargs = {**RASTER_KWARGS, **overrides}
     for year in years:
-        data = raster_array(fill=(fill_fn(year) if fill_fn else year))
+        if data_fn is not None:
+            data = data_fn(year)
+        else:
+            data = raster_array(fill=(fill_fn(year) if fill_fn else year))
         write_cog(data, base_path=base_path, calendar_year=year, **kwargs)
     return kwargs
 

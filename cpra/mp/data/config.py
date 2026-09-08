@@ -81,6 +81,22 @@ RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_
 # the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
 RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))
 
+# Target size, in MB, for one summarize-loop batch's read buffer (n_bands x block_height x
+# batch_width x itemsize -- see api.utils.raster_blocks_per_batch and
+# Dataset._apply_transform_params_raster). This is a separate budget from
+# RASTER_CACHE_MAX_MB (GDAL's own block cache): capping only GDAL's cache still leaves the
+# batch's own NumPy buffer free to grow with a block row's full width regardless of how many
+# bands or blocks are requested, which is exactly the defect this budget fixes. Defaulted from
+# RASTER_CACHE_MAX_MB (an eighth of it) so the two budgets stay in the same ballpark without
+# either one dominating; override directly for a different balance.
+RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", str(max(RASTER_CACHE_MAX_MB // 8, 1))))
+
+# Explicit override for the number of raster blocks unioned into one summarize-loop batch,
+# bypassing the RASTER_BATCH_BUFFER_MB / band-count derivation in
+# api.utils.raster_blocks_per_batch entirely. Unset (None) by default.
+_raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
+RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
+
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
 SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")

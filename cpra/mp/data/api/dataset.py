@@ -32,11 +32,13 @@ from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.api.utils import (
+    _read_window,
     asynctiming,
     get_lazy_frame,
     group_rows_by_path,
     parallel_read_rasters,
     parallel_sample_rasters,
+    raster_blocks_per_batch,
     raster_copy_gdal_env,
     raster_gdal_env,
     unpack_values,
@@ -67,9 +69,12 @@ VALUE_COLUMNS = cs.by_name("value")
 # for the compression predictor.
 OUTPUT_INTERLEAVE = "PIXEL"
 
-# Zonal summarize aggregates, as (reducing ufunc, accumulator start value) pairs. Every
-# aggregate reduces the same way; mean additionally divides by the pixel counts that
-# `_get_zone_segments` returns.
+# Zonal summarize aggregates, as (reducing ufunc, identity element) pairs. Every aggregate
+# reduces the same way; the identity element is what a nodata pixel is substituted with so
+# it drops out of the reduction (0 leaves sum/mean unchanged, +-inf leave min/max
+# unchanged). `mean` additionally divides by the per-band, per-zone count of pixels that
+# actually contributed -- see `_accumulate_zone_stats` -- not the raw pixel count that
+# `_get_zone_segments` returns, which counts nodata pixels too.
 RASTER_AGGREGATES = {
     "max": (np.maximum, -np.inf),
     "mean": (np.add, 0.0),
@@ -92,6 +97,56 @@ def _get_zone_segments(zones, zone_ids):
     pixels = pixels[np.argsort(positions[pixels], kind="stable")]
     present, starts, counts = np.unique(positions[pixels], return_index=True, return_counts=True)
     return present, pixels, starts, counts
+
+
+def _accumulate_zone_stats(data, zones, zone_ids, nodata, aggregate_fn, identity, accumulator, valid):
+    """Fold one window's pixels into `accumulator`/`valid` for one zonal aggregate.
+
+    Nodata pixels (`data == nodata`) are excluded from every aggregate: substituted with
+    the aggregate's identity element so the `reduceat` reduction is unaffected by their
+    presence, and left out of `valid`, the per-band, per-zone count of pixels that actually
+    contributed. That count is `mean`'s correct denominator (not the raw pixel count, which
+    is wrong the moment any pixel is excluded) and also marks an all-nodata (band, zone)
+    cell, which `_apply_transform_params_raster` turns into `NaN`.
+
+    `valid` is per-band, not per-zone, because one band can be entirely nodata in a zone
+    where another band has values -- a per-zone marker would wrongly blank out the other
+    band's real value.
+
+    `nodata=None` (no sentinel declared for this raster) treats every matched pixel as
+    contributing, i.e. no masking, matching the pre-fix behavior for such rasters.
+    """
+    positions, pixels, starts, _pixel_counts = _get_zone_segments(zones, zone_ids)
+    if positions.size == 0:
+        return
+
+    for band_idx, band in enumerate(data):
+        vals = band.reshape(-1)[pixels].astype("float64", copy=False)
+        ok = np.ones(vals.shape, dtype=bool) if nodata is None else (vals != nodata)
+        masked = np.where(ok, vals, identity)
+        accumulator[band_idx, positions] = aggregate_fn(
+            accumulator[band_idx, positions], aggregate_fn.reduceat(masked, starts)
+        )
+        valid[band_idx, positions] += np.add.reduceat(ok.astype("float64"), starts)
+
+
+def _batched_block_windows(block_windows, blocks_per_batch):
+    """Yield window unions over `block_windows`, chunked to at most `blocks_per_batch`
+    blocks each rather than a whole block row at a time.
+
+    `block_windows` (as returned by a rasterio dataset's own `block_windows(1)`) is grouped
+    into block rows first, then each row's blocks are split into batches of
+    `blocks_per_batch`. A block row can be tens of thousands of pixels wide regardless of
+    how much data a request actually needs, so unioning a whole row per iteration -- the
+    original behavior -- makes every iteration's read buffer scale with the raster's width
+    and the request's band count rather than with `blocks_per_batch`. See
+    `raster_blocks_per_batch` for how that batch size is chosen.
+    """
+    groups = itertools.groupby(block_windows, key=lambda bw: bw[0][0])
+    for _row, group in groups:
+        row_windows = [w for _ji, w in group]
+        for start in range(0, len(row_windows), blocks_per_batch):
+            yield windows.union(*row_windows[start : start + blocks_per_batch])
 
 
 class Dataset(LazyFrameSource):
@@ -455,8 +510,21 @@ class Dataset(LazyFrameSource):
         unique_paths, row_indices, bands = group_rows_by_path(df)
 
         with ExitStack() as stack:
-            crosswalk = stack.enter_context(rio.open(crosswalk_path))
-            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
+            # GDAL_NUM_THREADS only speeds up decompression for reads on a dataset that was
+            # *opened* with it in effect -- measured on real data: opening under the env then
+            # reading plainly took ~5s/10 bands vs ~15s with no env anywhere, while entering the
+            # env only around the later `.read()` calls (as this function used to assume) barely
+            # moved the needle (~12-14s). So the env must be live here, at open time, not just
+            # around the per-window reads below. Entered narrowly (only around the opens, not
+            # the whole loop) since it sets a process-global GDAL config while running on this
+            # coroutine's thread -- see raster_gdal_env's docstring -- so keeping it open for the
+            # whole (potentially 90s+) loop would leak GDAL_NUM_THREADS/GDAL_CACHEMAX into any
+            # unrelated concurrent request (e.g. a tile read) sharing the same worker thread pool
+            # for that entire window; confirmed empirically that a bare open() is fast enough
+            # that this leak window is negligible by comparison.
+            with raster_gdal_env():
+                crosswalk = stack.enter_context(rio.open(crosswalk_path))
+                inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
             if self.summarize_grid_cell_ids:
                 zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
             else:
@@ -464,45 +532,53 @@ class Dataset(LazyFrameSource):
                 zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
 
             accumulator = np.full((n_bands, zone_ids.size), start_value)
-            counts = np.zeros(zone_ids.size) if is_mean else None
-            seen = np.zeros(zone_ids.size, dtype=bool)
+            # Per-band, per-zone count of contributing (non-nodata) pixels -- mean's
+            # denominator and the all-nodata marker. Per band rather than per zone: see
+            # _accumulate_zone_stats.
+            valid = np.zeros((n_bands, zone_ids.size))
 
-            groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
-            for _group_row, group in groups:
-                window = windows.union(*[w for ji, w in group])
+            # All inputs backing one request share the same variable and are produced by
+            # the same conversion pipeline, so they share one nodata sentinel; read it from
+            # the file rather than hardcoding it. (The elevation sentinel is currently
+            # -9999, a known data-generation bug being fixed separately to -9999000 -- this
+            # needs no change either way, since it reads whatever the file declares.)
+            nodata = inputs[0].nodata
 
+            # Batch size is capped independently of the block row's width -- see
+            # raster_blocks_per_batch and _batched_block_windows -- so a wide raster or a
+            # large band selection doesn't force every iteration to materialize a whole
+            # block row's pixels regardless of how much data the request actually needs.
+            block_height, block_width = inputs[0].block_shapes[0]
+            itemsize = np.dtype(inputs[0].dtypes[0]).itemsize
+            blocks_per_batch = raster_blocks_per_batch(n_bands, block_height, block_width, itemsize)
+
+            for window in _batched_block_windows(inputs[0].block_windows(1), blocks_per_batch):
                 # Neither read depends on the other, so overlap the crosswalk read with
-                # the (already parallel) reads of the data COGs.
+                # the (already parallel) reads of the data COGs. use_gdal_env=True enters
+                # raster_gdal_env() around each read on the worker thread that performs it,
+                # which is what keeps GDAL_CACHEMAX's memory bound in effect for every read
+                # (measured: it must be live *at read time* to matter -- confirmed on real
+                # data that opening under a capped GDAL_CACHEMAX but reading without it made no
+                # difference to peak RSS, while capping it here did). This is a separate lever
+                # from the open-time env above, which is what GDAL_NUM_THREADS needs instead.
                 data, zones = await asyncio.gather(
-                    self.get_raster_array(df, inputs, row_indices, bands, window),
-                    asyncio.to_thread(crosswalk.read, 1, window=window),
+                    self.get_raster_array(df, inputs, row_indices, bands, window, use_gdal_env=True),
+                    asyncio.to_thread(_read_window, crosswalk, window, indexes=1, use_gdal_env=True),
                 )
 
                 # Grouping the block's pixels by zone once lets each band be reduced over
                 # every zone in a single pass, and shares that grouping across the bands.
-                positions, pixels, starts, pixel_counts = _get_zone_segments(zones, zone_ids)
-                if positions.size == 0:
-                    continue
-
-                # Accumulate in float64, as the source pixels are often narrow integers.
-                block_stats = np.vstack(
-                    [
-                        aggregate_fn.reduceat(band.reshape(-1)[pixels].astype("float64", copy=False), starts)
-                        for band in data
-                    ]
-                )
-                accumulator[:, positions] = aggregate_fn(accumulator[:, positions], block_stats)
-                seen[positions] = True
-
-                if is_mean:
-                    counts[positions] += pixel_counts
+                # Nodata pixels are excluded here -- see _accumulate_zone_stats.
+                _accumulate_zone_stats(data, zones, zone_ids, nodata, aggregate_fn, start_value, accumulator, valid)
 
         result = (
-            np.divide(accumulator, counts, out=np.full_like(accumulator, np.nan), where=counts > 0)
+            np.divide(accumulator, valid, out=np.full_like(accumulator, np.nan), where=valid > 0)
             if is_mean
-            else accumulator
+            else accumulator.copy()
         )
-        result[:, ~seen] = np.nan
+        # A (band, zone) with no contributing pixel has no answer -- either the zone never
+        # appeared in a scanned window, or every matched pixel there was nodata.
+        result[valid == 0] = np.nan
 
         # Assemble in wide format (one column per zone) to line up with `result`'s shape,
         # then unpivot to the long-format grid_cell/value contract used everywhere else --
@@ -668,15 +744,21 @@ class Dataset(LazyFrameSource):
 
         return inject_and_serialize(vt, id_values)
 
-    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None):
+    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
         """Read a raster array and apply the operations specified in the index DataFrame.
 
         ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
         multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
         with ``row_indices``/``bands`` mapping each raster back to the df rows and band
         numbers it supplies.
+
+        ``use_gdal_env`` is forwarded to ``parallel_read_rasters``/``_read_window``, which enter
+        ``raster_gdal_env()`` on the worker thread performing each read rather than here. Default
+        ``False`` so callers (e.g. ``get_tile``) that deliberately don't want it keep working
+        unchanged; ``_apply_transform_params_raster`` and ``_write_raster_windowed`` pass
+        ``True``.
         """
-        band_reads = await parallel_read_rasters(rasters, window, out_shape, bands=bands)
+        band_reads = await parallel_read_rasters(rasters, window, out_shape, bands=bands, use_gdal_env=use_gdal_env)
         data = np.empty((len(df), *band_reads[0].shape[1:]), dtype=band_reads[0].dtype)
         for path_row_indices, read in zip(row_indices, band_reads):
             data[path_row_indices] = read
@@ -868,22 +950,28 @@ class Dataset(LazyFrameSource):
 
         unique_paths, row_indices, bands = group_rows_by_path(df)
         with ExitStack() as stack:
-            # Entered before the sources are opened so the thread setting applies to them.
-            stack.enter_context(raster_gdal_env())
-            inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
+            # GDAL_NUM_THREADS' decompression speedup only takes effect for a dataset that
+            # was *opened* with it in effect (measured on real data -- see
+            # _apply_transform_params_raster); entering it here, before the sources (and the
+            # output, for the same reason on the write side) are opened, is what makes it
+            # apply to them. Scoped narrowly to just the opens, not the whole loop below, so
+            # this doesn't hold a process-global GDAL config open (and leaking into unrelated
+            # concurrent requests -- see raster_gdal_env's docstring) for the entire write.
+            with raster_gdal_env():
+                inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
 
-            # Each selected (path, band) row — or each aggregated group — becomes one
-            # output band, so the source's own band count must be overridden.
-            if self.raster_groups is not None:
-                out_count = self.raster_groups.select(pl.len()).collect().item()
-            else:
-                out_count = len(df)
-            profile = inputs[0].profile.copy()
-            # group_by/group_aggregate can collapse the matched bands into fewer output
-            # bands, so the output band count can't just be copied from the (single-band)
-            # source COGs' profile.
-            profile.update(count=out_count, interleave=OUTPUT_INTERLEAVE, **kwargs)
-            output = stack.enter_context(rio.open(out_path, "w", **profile))
+                # Each selected (path, band) row — or each aggregated group — becomes one
+                # output band, so the source's own band count must be overridden.
+                if self.raster_groups is not None:
+                    out_count = self.raster_groups.select(pl.len()).collect().item()
+                else:
+                    out_count = len(df)
+                profile = inputs[0].profile.copy()
+                # group_by/group_aggregate can collapse the matched bands into fewer output
+                # bands, so the output band count can't just be copied from the (single-band)
+                # source COGs' profile.
+                profile.update(count=out_count, interleave=OUTPUT_INTERLEAVE, **kwargs)
+                output = stack.enter_context(rio.open(out_path, "w", **profile))
 
             # Label output bands with their calendar value when rows map 1:1 to bands.
             if self.raster_groups is None:
@@ -896,7 +984,7 @@ class Dataset(LazyFrameSource):
             groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
             for _group_row, group in groups:
                 window = windows.union(*[w for ji, w in group])
-                data = await self.get_raster_array(df, inputs, row_indices, bands, window)
+                data = await self.get_raster_array(df, inputs, row_indices, bands, window, use_gdal_env=True)
                 output.write(data, window=window)
 
         return True
