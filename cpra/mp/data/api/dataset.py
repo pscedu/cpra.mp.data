@@ -29,7 +29,12 @@ from cpra.mp.data.api.geography import (
     resolve_vector_grid_cell,
 )
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
-from cpra.mp.data.api.raster_source import guarded_aggregate, scan_rasters
+from cpra.mp.data.api.raster_source import (
+    NUMPY_TO_POLARS,
+    guarded_aggregate,
+    horizontal_aggregate_expr,
+    scan_rasters,
+)
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.api.utils import (
@@ -149,6 +154,25 @@ def _batched_block_windows(block_windows, blocks_per_batch):
         row_windows = [w for _ji, w in group]
         for start in range(0, len(row_windows), blocks_per_batch):
             yield windows.union(*row_windows[start : start + blocks_per_batch])
+
+
+async def _read_window_columns(inputs, row_indices, bands, window, raw_names):
+    """Read one window's raw per-(path, band) arrays into named, raveled columns.
+
+    Column names follow the same `b<row position>` convention `raster_source.scan_rasters`
+    uses for its band columns, keyed to the caller's own df row positions (not file band
+    order) so the caller's expressions -- built once against `raw_names` -- line up with
+    whichever (path, band) pair actually backs each row. Returns the columns dict (ready
+    for `pl.DataFrame`) and the window's `(height, width)` shape, needed to reshape each
+    output column back into a 2-D band after the Polars round-trip.
+    """
+    band_reads = await parallel_read_rasters(inputs, window, bands=bands, use_gdal_env=True)
+    shape = band_reads[0].shape[1:]
+    cols = {}
+    for path_row_indices, read in zip(row_indices, band_reads):
+        for i, row_idx in enumerate(path_row_indices):
+            cols[raw_names[row_idx]] = read[i].ravel()
+    return cols, shape
 
 
 class Dataset(LazyFrameSource):
@@ -520,19 +544,23 @@ class Dataset(LazyFrameSource):
                 dst_ids = crosswalk.tags()["dst_ids"].split(",")
                 zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
 
-        # The plugin path (`scan_rasters`) reads every band directly from its own source
-        # pixels and has no notion of `get_raster_array`'s multiplier/group-aggregate
-        # step, so it is only equivalent to the numpy path -- and only used -- for the
-        # plain case neither feature touches. A request with a calculate (multiplier) or
-        # group_by/group_aggregate parameter always takes the numpy path, regardless of
-        # this flag.
-        plugin_eligible = (
-            RASTER_USE_IO_PLUGIN and self.raster_groups is None and bool((df["multiplier"] == 1).all())
-        )
+        # The plugin path (`scan_rasters`) now applies the same multiplier/group-aggregate
+        # pre-collapse as the numpy path's `get_raster_array`, via the shared
+        # `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary in
+        # raster_source.py -- see `_summarize_zone_stats_plugin` -- so eligibility depends
+        # only on the flag, not on which parameters are in play.
+        plugin_eligible = RASTER_USE_IO_PLUGIN
 
         if plugin_eligible:
             result = await asyncio.to_thread(
-                self._summarize_zone_stats_plugin, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands
+                self._summarize_zone_stats_plugin,
+                df,
+                unique_paths,
+                row_indices,
+                bands,
+                crosswalk_path,
+                zone_ids,
+                n_bands,
             )
         else:
             result = await self._summarize_zone_stats_numpy(
@@ -628,32 +656,57 @@ class Dataset(LazyFrameSource):
         result[valid == 0] = np.nan
         return result
 
-    def _summarize_zone_stats_plugin(self, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
+    def _summarize_zone_stats_plugin(self, df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
         """Zonal aggregate via the Polars IO plugin (`raster_source.scan_rasters`).
 
-        Equivalent to `_summarize_zone_stats_numpy` only for the plain per-band case the
-        caller restricts this path to (see `_apply_transform_params_raster`): no
-        group_aggregate pre-collapse, no calculate (multiplier) parameter. Nodata masking
-        and the all-nodata-is-NaN edge case both come from the source and `guarded_aggregate`
-        respectively -- no separate accumulation pass is needed here.
+        Equivalent to `_summarize_zone_stats_numpy` for every case that reaches this method
+        (see `_apply_transform_params_raster`): a calculate (multiplier) parameter and a
+        group_aggregate pre-collapse are applied here too, via the same
+        `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary
+        `Dataset.get_raster_array` uses, in the same order (multiply, then collapse).
+        `scan_rasters` masks nodata to null against each band's own raw pixel value before
+        either step sees it (`mask_nodata=True`), so a masked band's null survives the
+        multiply and drops out of the horizontal collapse and the final vertical
+        `guarded_aggregate` alike, with no separate accumulation pass needed here.
 
         Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
         long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
         blocking the event loop for the whole summarize, matching how the numpy path's
         blocking `rio_copy` call is offloaded elsewhere (`_write_raster_vrt`).
         """
-        names = [f"b{i}" for i in range(n_bands)]
+        raw_names = [f"b{i}" for i in range(len(df))]
         lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
+
+        multipliers = df["multiplier"].to_list()
+        if all(m == 1 for m in multipliers):
+            cols = [pl.col(name) for name in raw_names]
+        else:
+            cols = [pl.col(name) * float(m) for name, m in zip(raw_names, multipliers)]
+
+        if self.raster_groups is not None:
+            group_row_idxs = self.raster_groups.collect()["row_idxs"].to_list()
+            out_names = [f"g{k}" for k in range(len(group_row_idxs))]
+            group_exprs = [
+                horizontal_aggregate_expr(
+                    self.options.group_aggregate, [cols[i] for i in row_idxs], pl.lit(None)
+                ).alias(name)
+                for name, row_idxs in zip(out_names, group_row_idxs)
+            ]
+            lf = lf.with_columns(group_exprs)
+        else:
+            out_names = raw_names
+            lf = lf.with_columns([c.alias(name) for c, name in zip(cols, out_names)])
+
         grouped = (
             lf.group_by("grid_cell")
-            .agg([guarded_aggregate(self.options.summarize_aggregate, name) for name in names])
+            .agg([guarded_aggregate(self.options.summarize_aggregate, name) for name in out_names])
             .collect(engine="streaming")
         )
 
         result = np.full((n_bands, zone_ids.size), np.nan)
         if grouped.height:
             positions = np.searchsorted(zone_ids, grouped["grid_cell"].to_numpy().astype("int64"))
-            for i, name in enumerate(names):
+            for i, name in enumerate(out_names):
                 result[i, positions] = grouped[name].to_numpy()
         return result
 
@@ -1011,10 +1064,22 @@ class Dataset(LazyFrameSource):
         return True
 
     async def _write_raster_windowed(self, df, out_path, **kwargs):
-        """Write a raster dataset to a file using windowed reading and writing
-        to conserve memory."""
+        """Write a raster dataset to a file using windowed reading and writing to conserve
+        memory.
+
+        The multiplier/group_aggregate step is Polars expressions over a per-window
+        DataFrame rather than `get_raster_array`'s NumPy reduction, built once outside the
+        window loop below (`exprs`) -- see `raster_source.horizontal_aggregate_expr` and
+        `HORIZONTAL_RASTER_AGGREGATES` -- so it shares one operator vocabulary with the
+        summarize plugin path (`_summarize_zone_stats_plugin`) instead of maintaining a
+        second implementation of the same four aggregates. Reading and writing stay array
+        plumbing: one window's worth of raw bands in, one `output.write` per window out.
+        """
 
         unique_paths, row_indices, bands = group_rows_by_path(df)
+        raw_names = [f"b{i}" for i in range(len(df))]
+        multipliers = df["multiplier"].to_list()
+
         with ExitStack() as stack:
             # GDAL_NUM_THREADS' decompression speedup only takes effect for a dataset that
             # was *opened* with it in effect (measured on real data -- see
@@ -1029,8 +1094,10 @@ class Dataset(LazyFrameSource):
                 # Each selected (path, band) row — or each aggregated group — becomes one
                 # output band, so the source's own band count must be overridden.
                 if self.raster_groups is not None:
-                    out_count = self.raster_groups.select(pl.len()).collect().item()
+                    group_row_idxs = self.raster_groups.collect()["row_idxs"].to_list()
+                    out_count = len(group_row_idxs)
                 else:
+                    group_row_idxs = None
                     out_count = len(df)
                 profile = inputs[0].profile.copy()
                 # group_by/group_aggregate can collapse the matched bands into fewer output
@@ -1038,6 +1105,8 @@ class Dataset(LazyFrameSource):
                 # source COGs' profile.
                 profile.update(count=out_count, interleave=OUTPUT_INTERLEAVE, **kwargs)
                 output = stack.enter_context(rio.open(out_path, "w", **profile))
+                out_dtype = profile["dtype"]
+                nodata = inputs[0].nodata
 
             # Label output bands with their calendar value when rows map 1:1 to bands.
             if self.raster_groups is None:
@@ -1046,11 +1115,84 @@ class Dataset(LazyFrameSource):
                     for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
                         output.set_band_description(band_idx, f"{calendar_col}={value}")
 
-            # Group raster blocks by row, and read an entire row of blocks at once.
-            groups = itertools.groupby(inputs[0].block_windows(1), key=lambda bw: bw[0][0])
-            for _group_row, group in groups:
-                window = windows.union(*[w for ji, w in group])
-                data = await self.get_raster_array(df, inputs, row_indices, bands, window, use_gdal_env=True)
-                output.write(data, window=window)
+            # Everything below is built ONCE, outside the window loop -- the expression is
+            # identical for every window, so there is no reason to reconstruct it per
+            # iteration.
+            #
+            # Nodata is masked -- against each band's own raw pixel value, before the
+            # multiply, since scaling a nodata sentinel would stop it matching itself -- only
+            # for an aggregated (group_aggregate) selection. A plain, non-aggregated
+            # selection passes every pixel through untouched, matching get_raster_array's
+            # own (unmasked) behavior for that case and the pinned
+            # test_non_aggregated_output_preserves_nodata.
+            if group_row_idxs is not None and nodata is not None:
+                masked = [
+                    pl.when(pl.col(name) == nodata).then(None).otherwise(pl.col(name)) for name in raw_names
+                ]
+            else:
+                masked = [pl.col(name) for name in raw_names]
+
+            # Multiply-then-collapse, matching get_raster_array's order. Skipped entirely
+            # (rather than always multiplying by 1.0) when every multiplier is 1, so a plain
+            # selection keeps its source dtype instead of being silently promoted to float --
+            # matching get_raster_array's own `if not (df["multiplier"] == 1).all()` guard.
+            if all(m == 1 for m in multipliers):
+                scaled = masked
+            else:
+                scaled = [c * float(m) for c, m in zip(masked, multipliers)]
+
+            if group_row_idxs is not None:
+                # No band contributed anything to this pixel (every band in the group was
+                # nodata there): write the raster's own nodata sentinel, not NaN. Unlike the
+                # summarize path's Float64 result, an integer output band cannot hold NaN --
+                # this is a deliberate difference from that path's NaN marker, not an
+                # oversight. When the source declares no nodata at all, the masking above
+                # never produces a null, so this value can never actually be selected; 0 (in
+                # the output dtype) is used as a harmless placeholder for that case.
+                no_contributor = (
+                    pl.lit(nodata).cast(NUMPY_TO_POLARS[out_dtype])
+                    if nodata is not None
+                    else pl.lit(0, dtype=NUMPY_TO_POLARS[out_dtype])
+                )
+                agg = self.options.group_aggregate
+                out_names = [f"out{k}" for k in range(len(group_row_idxs))]
+                exprs = [
+                    horizontal_aggregate_expr(agg, [scaled[i] for i in row_idxs], no_contributor).alias(name)
+                    for name, row_idxs in zip(out_names, group_row_idxs)
+                ]
+            else:
+                out_names = [f"out{k}" for k in range(len(scaled))]
+                exprs = [c.alias(name) for c, name in zip(scaled, out_names)]
+
+            # Batch size is capped independently of the block row's width -- see
+            # raster_blocks_per_batch and _batched_block_windows -- so a wide raster or a
+            # large band selection doesn't force every iteration to materialize a whole
+            # block row's pixels regardless of how much data the request actually needs.
+            # Sized off the raw (pre-collapse) band count (`len(df)`), since that is what
+            # actually governs the read buffer materialized each iteration -- a
+            # group_aggregate can shrink the *output* band count without shrinking how many
+            # raw bands must be read to produce it.
+            block_height, block_width = inputs[0].block_shapes[0]
+            itemsize = np.dtype(inputs[0].dtypes[0]).itemsize
+            blocks_per_batch = raster_blocks_per_batch(len(df), block_height, block_width, itemsize)
+
+            for window in _batched_block_windows(inputs[0].block_windows(1), blocks_per_batch):
+                cols, shape = await _read_window_columns(inputs, row_indices, bands, window, raw_names)
+                result = pl.DataFrame(cols).select(exprs)
+                del cols
+
+                # Assemble every output band and write ONCE. Writing band-at-a-time into a
+                # PIXEL-interleaved tiled COG makes GDAL read-modify-write every tile once
+                # per band it touches -- measured on real data: 27.8s and a 301 MB output
+                # for a band-at-a-time write of one window versus 3.6s and 22.9 MB for a
+                # single write of the same window's full band stack. That cost is a property
+                # of the sink (GDAL's per-block path for a PIXEL-interleaved dataset), not of
+                # Polars, but it is the trap a per-band port of this loop would fall straight
+                # into.
+                block = np.stack(
+                    [result[name].to_numpy().astype(out_dtype, copy=False).reshape(shape) for name in out_names]
+                )
+                output.write(block, window=window)
+                del result, block
 
         return True

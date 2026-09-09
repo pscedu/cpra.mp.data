@@ -46,6 +46,48 @@ POLARS_RASTER_AGGREGATES = {
 }
 
 
+# Horizontal counterparts to `POLARS_RASTER_AGGREGATES` above. These reduce ACROSS a row's
+# selected band columns (dataset.py's per-band multiplier + group_aggregate collapse, the
+# same operation `np.<fn>(data, axis=0)` performs in `Dataset.get_raster_array`), not DOWN
+# a `group_by`'s rows the way the zonal summarize aggregates above do -- band-collapse and
+# zonal summarize are different axes of the same per-band pipeline and are kept in a
+# separate dict so the two are never reached for each other by mistake. Shared by
+# `Dataset._summarize_zone_stats_plugin` (pre-collapsing a group before the vertical zonal
+# `guarded_aggregate`) and `Dataset._write_raster_windowed` (collapsing a group into one
+# output band) -- the one shared expression vocabulary both paths use for group_aggregate.
+HORIZONTAL_RASTER_AGGREGATES = {
+    "max": pl.max_horizontal,
+    "mean": pl.mean_horizontal,
+    "min": pl.min_horizontal,
+    "sum": pl.sum_horizontal,
+}
+
+
+def horizontal_aggregate_expr(aggregate, exprs, no_contributor):
+    """One `group_aggregate` collapse across `exprs`, with the all-null-group edge case
+    resolved explicitly rather than left to each aggregate's own default.
+
+    `exprs` are the (already nodata-masked-to-null, already-multiplied) column expressions
+    for one output group's contributing bands -- masking must happen upstream of this call,
+    against each band's own raw pixel value, since multiplying first would make a scaled
+    nodata sentinel stop matching the sentinel it started as. Bare `*_horizontal` already
+    skips nulls on its own (that is what makes a masked-out band drop out of the reduction
+    for free), but the four aggregates disagree about what an all-null row should produce:
+    `min`/`max`/`mean` give null, `sum` gives 0 (its additive identity) -- neither is
+    necessarily the answer a caller wants for "no band contributed anything to this pixel
+    at all". `no_contributor` is that answer, supplied by the caller as a Polars expression
+    (typically `pl.lit(...)`) rather than a raw value, so the caller controls its dtype
+    explicitly: `pl.lit(None)` reproduces the summarize path's desired null-propagation (so
+    the downstream vertical `guarded_aggregate` sees an empty group rather than a
+    fabricated 0), while `pl.lit(nodata, dtype=...)` matched to the raster's own dtype is
+    what the output writer needs, since an integer output band cannot hold NaN the way the
+    summarize path's Float64 result can.
+    """
+    agg_fn = HORIZONTAL_RASTER_AGGREGATES[aggregate]
+    n_contributing = pl.sum_horizontal([e.is_not_null().cast(pl.UInt32) for e in exprs])
+    return pl.when(n_contributing == 0).then(no_contributor).otherwise(agg_fn(exprs))
+
+
 def guarded_aggregate(aggregate, name):
     """A `group_by().agg()` expression for one column, with the all-nodata edge case fixed.
 

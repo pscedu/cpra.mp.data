@@ -657,10 +657,10 @@ class TestGetTile:
 class TestPluginDifferential:
     """The Polars IO-plugin summarize path (config.RASTER_USE_IO_PLUGIN) must agree
     exactly with the numpy path it can replace -- see
-    Dataset._summarize_zone_stats_plugin vs _summarize_zone_stats_numpy. Only the "plain"
-    case (no group_aggregate, no calculate/multiplier) is ever routed through the plugin
-    -- see TestPluginEligibility below -- so that's all that needs differential coverage
-    here.
+    Dataset._summarize_zone_stats_plugin vs _summarize_zone_stats_numpy. Eligibility no
+    longer depends on which query parameters are in play (see TestPluginEligibility
+    below), so a group_aggregate collapse and a calculate (multiplier) parameter both need
+    differential coverage here too, not just the "plain" case.
     """
 
     async def _run(self, dataset_factory, monkeypatch, use_plugin, **options):
@@ -722,11 +722,79 @@ class TestPluginDifferential:
         assert all(np.isnan(v) for v in zone_5["value"].to_list())
         assert zone_1["value"][0] == pytest.approx(30)
 
+    @pytest.mark.parametrize("aggregate", ["min", "max", "sum", "mean"])
+    async def test_plugin_matches_numpy_with_group_aggregate(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch, aggregate
+    ):
+        """Closing the group_aggregate/multiplier bypass (see TestPluginEligibility) means
+        the plugin path must now agree with numpy for these cases too, not just the plain
+        one -- see Dataset._summarize_zone_stats_plugin.
+
+        Uses `raster_data` (no nodata) rather than `raster_data_with_nodata` deliberately:
+        the numpy path applies group_aggregate *before* nodata masking
+        (`get_raster_array` collapses first; `_accumulate_zone_stats` then masks the
+        already-collapsed value against the raw nodata sentinel, which will essentially
+        never match), so numpy's own group_aggregate+nodata combination has a pre-existing
+        asymmetry unrelated to closing this bypass. Exercising it here would pin that
+        numpy quirk into a test named for something else instead of documenting it as its
+        own, separate known behavior.
+        """
+        options = dict(
+            group_aggregate=aggregate,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+            summarize_grid_cell="1,5",  # zone 5 has no pixels -- exercises NaN placement too
+        )
+        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
+        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
+
+        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
+        assert np.array_equal(
+            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
+        ), aggregate
+
+    async def test_plugin_matches_numpy_with_multiplier(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    ):
+        """Same closed bypass, for the calculate (multiplier) parameter."""
+        options = dict(
+            negate="calendar_year = 2030",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
+        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
+
+        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
+        assert np.array_equal(
+            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
+        )
+
+    async def test_plugin_matches_numpy_with_group_aggregate_and_multiplier(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    ):
+        """Both parameters together -- the combination the bypass used to rule out
+        entirely, regardless of RASTER_USE_IO_PLUGIN."""
+        options = dict(
+            group_aggregate="sum",
+            negate="calendar_year = 2030",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
+        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
+
+        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
+        assert np.array_equal(
+            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
+        )
+
 
 class TestPluginEligibility:
-    """A request with a group_aggregate or calculate (multiplier) parameter always uses
-    the numpy path, regardless of RASTER_USE_IO_PLUGIN -- the plugin has no equivalent of
-    get_raster_array's pre-aggregation step (see _apply_transform_params_raster)."""
+    """The plugin path applies the same multiplier/group_aggregate pre-collapse as the
+    numpy path (see Dataset._summarize_zone_stats_plugin and
+    raster_source.horizontal_aggregate_expr), so whether it is used depends only on
+    RASTER_USE_IO_PLUGIN -- not on which query parameters are in play."""
 
     async def _plugin_was_called(self, dataset, monkeypatch):
         called = []
@@ -740,7 +808,7 @@ class TestPluginEligibility:
         await dataset.apply_params()
         return bool(called)
 
-    async def test_group_aggregate_bypasses_the_plugin(
+    async def test_group_aggregate_uses_the_plugin_when_flagged_on(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
         monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
@@ -750,15 +818,27 @@ class TestPluginEligibility:
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
-        assert await self._plugin_was_called(dataset, monkeypatch) is False
+        assert await self._plugin_was_called(dataset, monkeypatch) is True
 
-    async def test_multiplier_bypasses_the_plugin(
+    async def test_multiplier_uses_the_plugin_when_flagged_on(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
         monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
         dataset = dataset_factory(
             DIMENSIONS,
             negate="calendar_year = 2030",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        assert await self._plugin_was_called(dataset, monkeypatch) is True
+
+    async def test_group_aggregate_skips_the_plugin_when_flagged_off(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    ):
+        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
+        dataset = dataset_factory(
+            DIMENSIONS,
+            group_aggregate="max",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )

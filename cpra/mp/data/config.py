@@ -80,9 +80,10 @@ RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_
 # Opt-in switch for the Polars IO-plugin summarize path (api.raster_source.scan_rasters),
 # falling back to the numpy block-window/reduceat loop. Off by default for one release
 # while the plugin path is verified in production -- see
-# Dataset._apply_transform_params_raster, which additionally never routes a request with
-# a group_aggregate or calculate (multiplier) parameter through the plugin regardless of
-# this flag, since the plugin has no equivalent of that pre-aggregation step.
+# Dataset._apply_transform_params_raster. The plugin path applies the same
+# multiplier/group-aggregate pre-collapse as the numpy path (see
+# Dataset._summarize_zone_stats_plugin and raster_source.horizontal_aggregate_expr), so
+# eligibility depends only on this flag, not on which query parameters are in play.
 RASTER_USE_IO_PLUGIN = get_config("RASTER_USE_IO_PLUGIN", "False").lower() in TRUE_VALUES
 
 # Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is

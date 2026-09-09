@@ -316,14 +316,21 @@ def nodata_cog(base_path):
     return outputs[0]
 
 
-def test_aggregate_includes_nodata_in_the_reduction(nodata_cog, tmp_path):
-    """KNOWN QUIRK, pinned deliberately: the nodata sentinel takes part in aggregates.
+def test_aggregate_excludes_nodata_from_the_reduction(nodata_cog, tmp_path):
+    """Nodata pixels are excluded from a group_aggregate collapse, matching the summarize
+    path's exclusion semantics (see ``raster_source.horizontal_aggregate_expr``).
 
-    ``get_raster_array`` reduces with plain ``np.<fn>`` over the raw window, so -9999 is
-    treated as a value. A pixel that is nodata in only some bands therefore yields an
-    arbitrary number rather than nodata, and ``sum`` over a fully-nodata pixel yields
-    -9999 * n rather than nodata. Asserted so that fixing it (masking, or GDAL's
-    propagateNoData) is a deliberate change with a failing test to update, not a silent one.
+    This used to be pinned here as a KNOWN QUIRK the other direction: ``get_raster_array``
+    reduced with plain ``np.<fn>`` over the raw window, so -9999 was treated as an ordinary
+    value -- a pixel nodata in only some bands produced an arbitrary blend with the real
+    bands instead of their mean/sum, and ``sum`` over a fully-nodata pixel produced
+    ``-9999 * n`` rather than any kind of no-data marker. The windowed writer now masks
+    each band's own raw pixel value against the source's nodata sentinel before the
+    multiply/collapse step (mirroring ``_accumulate_zone_stats``'s exclusion for the
+    summarize path), and, when a pixel has no contributing band at all, writes the nodata
+    sentinel itself rather than NaN -- an integer output band cannot hold NaN the way the
+    summarize path's Float64 result can, so this is a deliberate difference from that
+    path's NaN marker, not an inconsistency.
     """
 
     df = _index_frame(nodata_cog, tuple(range(1, len(YEARS) + 1)))
@@ -334,20 +341,20 @@ def test_aggregate_includes_nodata_in_the_reduction(nodata_cog, tmp_path):
     with rasterio.open(mean_path) as src:
         band = src.read(1)
         assert src.nodata == -9999.0
-        # Nodata in every band: the mean of n copies of -9999 happens to land back on the
-        # sentinel, so this pixel looks correct by coincidence rather than by handling.
+        # Nodata in every band: no band contributes, so the sentinel is written directly.
         assert band[0, 0] == -9999.0
-        # Nodata in one band only: -9999 is averaged with the real values.
-        assert band[0, 1] == pytest.approx((-9999.0 + 5.0 * (n - 1)) / n)
+        # Nodata in one band only: excluded, so the mean is exactly the real bands' mean.
+        assert band[0, 1] == pytest.approx(5.0)
         assert band[1, 1] == pytest.approx(5.0)
 
     sum_path = tmp_path / "sum.tif"
     assert _write(_aggregated(df, "sum"), sum_path)
     with rasterio.open(sum_path) as src:
         band = src.read(1)
-        # Fully-nodata pixel under sum does not even coincide with the sentinel.
-        assert band[0, 0] == pytest.approx(-9999.0 * n)
-        assert band[0, 1] == pytest.approx(-9999.0 + 5.0 * (n - 1))
+        # Fully-nodata pixel: no contributor, so the sentinel is written directly.
+        assert band[0, 0] == pytest.approx(-9999.0)
+        # Nodata in one band only: excluded from the sum of the remaining n - 1 bands.
+        assert band[0, 1] == pytest.approx(5.0 * (n - 1))
 
 
 def test_non_aggregated_output_preserves_nodata(nodata_cog, tmp_path):
