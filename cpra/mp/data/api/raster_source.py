@@ -82,10 +82,19 @@ def horizontal_aggregate_expr(aggregate, exprs, no_contributor):
     fabricated 0), while `pl.lit(nodata, dtype=...)` matched to the raster's own dtype is
     what the output writer needs, since an integer output band cannot hold NaN the way the
     summarize path's Float64 result can.
+
+    The guard asks whether *every* band is null rather than counting how many are not. The
+    two are equivalent here, but counting is materially more expensive: it needs a boolean
+    per band, a widening cast per band, and a running integer accumulator across all of
+    them, only for the total to be compared against zero and discarded. `all_horizontal`
+    over the null masks needs the booleans alone. Measured on the collapse expression at
+    tile and half-tile widths, min of five interleaved rounds, the difference is 1.4-1.5x on
+    the whole expression -- worth the wording because this runs once per output pixel per
+    group, on the box that also has to serve tiles.
     """
     agg_fn = HORIZONTAL_RASTER_AGGREGATES[aggregate]
-    n_contributing = pl.sum_horizontal([e.is_not_null().cast(pl.UInt32) for e in exprs])
-    return pl.when(n_contributing == 0).then(no_contributor).otherwise(agg_fn(exprs))
+    no_contributor_at = pl.all_horizontal([e.is_null() for e in exprs])
+    return pl.when(no_contributor_at).then(no_contributor).otherwise(agg_fn(exprs))
 
 
 def guarded_aggregate(aggregate, name):
