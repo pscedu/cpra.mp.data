@@ -5,11 +5,14 @@ values, so each query stage has a separate raster implementation. `summarize_by`
 the result to the same tabular shape the vector path produces.
 """
 
+from io import BytesIO
+
 import numpy as np
 import polars as pl
 import pytest
 import rasterio as rio
 from fastapi import HTTPException
+from PIL import Image
 from rasterio.windows import Window
 
 from cpra.mp.data.api import dataset as dataset_module
@@ -18,7 +21,12 @@ from cpra.mp.data.api.types import OutputType
 from cpra.mp.data.api.utils import group_rows_by_path
 from cpra.mp.data.grids import GRIDS
 
-from tests.factories import RASTER_KWARGS, write_raster_crosswalk, write_raster_dataset
+from tests.factories import (
+    RASTER_KWARGS,
+    raster_array,
+    write_raster_crosswalk,
+    write_raster_dataset,
+)
 
 DIMENSIONS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 GRID = GRIDS[RASTER_KWARGS["grid"]]
@@ -34,6 +42,13 @@ def raster_data(base_path):
 @pytest.fixture
 def one_raster(base_path):
     write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
+    return base_path
+
+
+@pytest.fixture
+def nodata_raster(base_path):
+    """One COG that is entirely nodata, for rendering a tile with no real data in it."""
+    write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array(fill=-9999))
     return base_path
 
 
@@ -652,6 +667,101 @@ class TestGetTile:
         dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
         assert await dataset.get_tile(0, 0, 2, "png") is None
+
+    async def test_all_nodata_tile_renders_as_the_sentinel(self, dataset_factory, nodata_raster):
+        """A tile with nothing but nodata colors exactly as the sentinel value itself.
+
+        The end-to-end check that no null escapes `_collapse_tile_bands` into the legend:
+        a null would reach `colorize_pixels` as NaN, which `np.digitize` puts in the LAST
+        bin instead of the below-range first one, so an empty tile would come back painted
+        the top color.
+        """
+        import mercantile
+
+        with rio.open(next(nodata_raster.rglob("*.tif"))) as src:
+            from rasterio.warp import transform_bounds
+
+            west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+        tile = mercantile.tile((west + east) / 2, (south + north) / 2, 8)
+
+        dataset = dataset_factory(DIMENSIONS)
+        await dataset.apply_params()
+        body = await dataset.get_tile(tile.x, tile.y, tile.z, "png")
+
+        expected = dataset.legend.colorize_pixels(np.full((1, 1, 1), -9999, dtype="int32"))
+        with Image.open(BytesIO(body)) as image:
+            pixels = np.array(image)
+        assert (pixels == expected[0, 0]).all()
+
+
+class TestTileBandCollapse:
+    """`Dataset._collapse_tile_bands` -- the tile path's multiplier/group_aggregate step.
+
+    Exercised directly on a pixel array rather than through `get_tile`, so the assertions
+    are about values rather than colors: a legend maps whole ranges onto one color, which
+    would hide most of what these pin. `get_tile`'s own tests cover the wiring.
+
+    Nodata is handled here the way the write and summarize paths handle it (one shared
+    builder, `raster_source.band_collapse_exprs`). The NumPy reduce this replaced did not:
+    it scaled the sentinel by any calculate multiplier and averaged it in as a real value.
+    """
+
+    async def test_nodata_is_excluded_from_the_aggregate(self, dataset_factory, raster_data):
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        # Three pixels: nodata in one band, nodata in both, real data in both.
+        data = np.array([[[-9999, -9999, 30]], [[40, -9999, 40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out.shape == (1, 1, 3)
+        assert out[0, 0, 0] == 40, "the nodata band drops out instead of averaging in"
+        assert out[0, 0, 1] == -9999, "no band contributed, so the sentinel comes back"
+        assert out[0, 0, 2] == 35
+
+    async def test_all_nodata_group_is_the_sentinel_not_zero(self, dataset_factory, raster_data):
+        """`sum`'s additive identity is 0, which would render as a real value of zero."""
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="sum")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        data = np.array([[[-9999, 30]], [[-9999, 40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out[0, 0, 0] == -9999
+        assert out[0, 0, 1] == 70
+
+    async def test_multiplier_does_not_scale_the_sentinel(self, dataset_factory, raster_data):
+        """Masking happens before the multiply, so `negate` can't turn -9999 into 9999.
+
+        Unaggregated, so this is also the case where the tile path deliberately diverges
+        from the write path: a written file keeps the sentinel for its reader to interpret
+        (test_non_aggregated_output_preserves_nodata), but a rendered pixel has to commit to
+        a color, and 9999 is a legitimate value in some legends.
+        """
+        dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
+        await dataset.apply_params()
+        df = dataset.materialize().sort("calendar_year")
+        assert df["multiplier"].to_list() == [-1, 1]
+        data = np.array([[[-9999, 30]], [[40, 40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out.shape == (2, 1, 2), "no aggregate, so every selected band is an output band"
+        assert out[0].tolist() == [[-9999, -30]]
+        assert out[1].tolist() == [[40, 40]]
+
+    async def test_a_source_without_nodata_is_left_alone(self, dataset_factory, raster_data):
+        """`nodata=None` means every pixel is real, including one that looks like -9999."""
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        data = np.array([[[-9999]], [[40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, None)
+
+        assert out[0, 0, 0] == pytest.approx((-9999 + 40) / 2)
 
 
 class TestPluginDifferential:

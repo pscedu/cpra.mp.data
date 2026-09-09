@@ -30,7 +30,7 @@ from cpra.mp.data.api.geography import (
 )
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.raster_source import (
-    NUMPY_TO_POLARS,
+    band_collapse_exprs,
     guarded_aggregate,
     horizontal_aggregate_expr,
     scan_rasters,
@@ -863,13 +863,14 @@ class Dataset(LazyFrameSource):
 
         return inject_and_serialize(vt, id_values)
 
-    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
-        """Read a raster array and apply the operations specified in the index DataFrame.
+    async def _read_raster_bands(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
+        """Read one window's raw bands into a single ``(len(df), h, w)`` array in df row order.
 
         ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
         multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
         with ``row_indices``/``bands`` mapping each raster back to the df rows and band
-        numbers it supplies.
+        numbers it supplies. Row order is what lets the caller line the array up with ``df``
+        columns like ``multiplier`` and with ``raster_groups``' row positions.
 
         ``use_gdal_env`` is forwarded to ``parallel_read_rasters``/``_read_window``, which enter
         ``raster_gdal_env()`` on the worker thread performing each read rather than here. Default
@@ -881,6 +882,21 @@ class Dataset(LazyFrameSource):
         data = np.empty((len(df), *band_reads[0].shape[1:]), dtype=band_reads[0].dtype)
         for path_row_indices, read in zip(row_indices, band_reads):
             data[path_row_indices] = read
+        return data
+
+    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
+        """Read a raster array and apply the operations specified in the index DataFrame.
+
+        The NumPy formulation of the multiplier/group_aggregate step. Its only remaining
+        caller is ``_summarize_zone_stats_numpy``, which the Polars IO plugin path replaces
+        (see ``config.RASTER_USE_IO_PLUGIN``); the write and tile paths both express the same
+        step as Polars expressions instead, via ``raster_source.band_collapse_exprs``. Kept
+        as-is rather than routed through that shared builder because the two are not
+        bit-identical for a zonal accumulator -- ``np.sum`` over int32 bands accumulates in
+        int32 where `POLARS_RASTER_AGGREGATES` deliberately widens to Float64 -- and there is
+        no reason to perturb a path that goes away with the flag.
+        """
+        data = await self._read_raster_bands(df, rasters, row_indices, bands, window, out_shape, use_gdal_env)
 
         # Apply multipliers from calculate parameters.
         if not (df["multiplier"] == 1).all():
@@ -897,6 +913,37 @@ class Dataset(LazyFrameSource):
             )
 
         return data
+
+    def _collapse_tile_bands(self, df, data, nodata):
+        """Apply a tile's multiplier/group_aggregate step with Polars expressions.
+
+        Shares one operator vocabulary with the write and summarize paths
+        (``raster_source.band_collapse_exprs``) rather than reducing the array with NumPy,
+        which is what makes tiles treat nodata the way the rest of the API does: masked
+        against each band's own raw pixel value before the multiply, dropped from the
+        group_aggregate, and restored as the sentinel only where no band contributed
+        anything. The NumPy reduce it replaces did none of that -- a sentinel was scaled by
+        any calculate multiplier and averaged in as if it were a real value, so one nodata
+        band in a group pulled the whole rendered pixel toward -9999.
+
+        In and out stay array plumbing: ``data[i].ravel()`` is a view of the read buffer, and
+        each output column converts straight back into the ``(bands, h, w)`` shape
+        ``Legend.colorize_pixels`` expects.
+        """
+        raw_names = [f"b{i}" for i in range(len(df))]
+        group_row_idxs = (
+            self.raster_groups.collect()["row_idxs"].to_list() if self.raster_groups is not None else None
+        )
+        out_names, exprs = band_collapse_exprs(
+            raw_names,
+            df["multiplier"].to_list(),
+            group_row_idxs,
+            self.options.group_aggregate,
+            data.dtype.name,
+            nodata=nodata,
+        )
+        result = pl.DataFrame({name: data[i].ravel() for i, name in enumerate(raw_names)}).select(exprs)
+        return np.stack([result[name].to_numpy().reshape(data.shape[1:]) for name in out_names])
 
     @asynctiming
     async def get_tile(self, x, y, z, format, tile_size=256, **kwargs):
@@ -917,6 +964,18 @@ class Dataset(LazyFrameSource):
                 if disjoint_bounds(self.dataset_bounds, tile_bounds):
                     return None
 
+            # All inputs backing one request share the same variable and were produced by the
+            # same conversion pipeline, so they share one nodata sentinel; read it from the
+            # file rather than hardcoding it, matching the write and summarize paths. A
+            # source declaring none still needs *some* value here, because GDAL has to put
+            # something in the pixels of a tile that reach past the source's extent, and
+            # those pixels genuinely are absent data -- so -9999 stands in for that case and
+            # is masked below like any other sentinel. (Hardcoding -9999 on both sides, as
+            # this used to, silently mismatches a source that declares anything else: its
+            # real nodata would go unmasked while the fill value became a distinct second
+            # sentinel.)
+            nodata = inputs[0].nodata if inputs[0].nodata is not None else -9999
+
             # Warp each source directly onto the tile's Web Mercator pixel grid so
             # the output registers exactly with the tile, with no intermediate grid
             # or window rounding to shift pixels off their true location.
@@ -928,9 +987,9 @@ class Dataset(LazyFrameSource):
                     transform=tile_transform,
                     width=tile_size,
                     height=tile_size,
-                    nodata=-9999,
+                    nodata=nodata,
                     add_alpha=False,
-                    src_nodata=-9999,
+                    src_nodata=nodata,
                     dtype=dataset.dtypes[0],
                     resampling=Resampling.nearest,
                 )
@@ -941,8 +1000,8 @@ class Dataset(LazyFrameSource):
             # (tile_transform/tile_size), so no separate intersection window or output
             # shape needs to be computed here -- reading the whole VRT reads exactly the
             # tile, and GDAL fills anything outside the source's extent with nodata.
-            data = await self.get_raster_array(df, vrts, row_indices, bands, None)
-            color = self.legend.colorize_pixels(data)
+            data = await self._read_raster_bands(df, vrts, row_indices, bands, None)
+            color = self.legend.colorize_pixels(self._collapse_tile_bands(df, data, nodata))
             # JPEG has no alpha channel, so drop it. fromarray infers RGB vs RGBA from the
             # array's shape, and passing mode= explicitly is deprecated as of Pillow 11.
             image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
@@ -1069,11 +1128,10 @@ class Dataset(LazyFrameSource):
 
         The multiplier/group_aggregate step is Polars expressions over a per-window
         DataFrame rather than `get_raster_array`'s NumPy reduction, built once outside the
-        window loop below (`exprs`) -- see `raster_source.horizontal_aggregate_expr` and
-        `HORIZONTAL_RASTER_AGGREGATES` -- so it shares one operator vocabulary with the
-        summarize plugin path (`_summarize_zone_stats_plugin`) instead of maintaining a
-        second implementation of the same four aggregates. Reading and writing stay array
-        plumbing: one window's worth of raw bands in, one `output.write` per window out.
+        window loop below (`exprs`) by the shared `raster_source.band_collapse_exprs`, so it
+        uses the same operator vocabulary as the tile and summarize paths instead of a second
+        implementation of the same four aggregates. Reading and writing stay array plumbing:
+        one window's worth of raw bands in, one `output.write` per window out.
         """
 
         unique_paths, row_indices, bands = group_rows_by_path(df)
@@ -1115,54 +1173,25 @@ class Dataset(LazyFrameSource):
                     for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
                         output.set_band_description(band_idx, f"{calendar_col}={value}")
 
-            # Everything below is built ONCE, outside the window loop -- the expression is
-            # identical for every window, so there is no reason to reconstruct it per
-            # iteration.
+            # Built ONCE, outside the window loop -- the expression is identical for every
+            # window, so there is no reason to reconstruct it per iteration.
             #
-            # Nodata is masked -- against each band's own raw pixel value, before the
-            # multiply, since scaling a nodata sentinel would stop it matching itself -- only
-            # for an aggregated (group_aggregate) selection. A plain, non-aggregated
-            # selection passes every pixel through untouched, matching get_raster_array's
-            # own (unmasked) behavior for that case and the pinned
-            # test_non_aggregated_output_preserves_nodata.
-            if group_row_idxs is not None and nodata is not None:
-                masked = [
-                    pl.when(pl.col(name) == nodata).then(None).otherwise(pl.col(name)) for name in raw_names
-                ]
-            else:
-                masked = [pl.col(name) for name in raw_names]
-
-            # Multiply-then-collapse, matching get_raster_array's order. Skipped entirely
-            # (rather than always multiplying by 1.0) when every multiplier is 1, so a plain
-            # selection keeps its source dtype instead of being silently promoted to float --
-            # matching get_raster_array's own `if not (df["multiplier"] == 1).all()` guard.
-            if all(m == 1 for m in multipliers):
-                scaled = masked
-            else:
-                scaled = [c * float(m) for c, m in zip(masked, multipliers)]
-
-            if group_row_idxs is not None:
-                # No band contributed anything to this pixel (every band in the group was
-                # nodata there): write the raster's own nodata sentinel, not NaN. Unlike the
-                # summarize path's Float64 result, an integer output band cannot hold NaN --
-                # this is a deliberate difference from that path's NaN marker, not an
-                # oversight. When the source declares no nodata at all, the masking above
-                # never produces a null, so this value can never actually be selected; 0 (in
-                # the output dtype) is used as a harmless placeholder for that case.
-                no_contributor = (
-                    pl.lit(nodata).cast(NUMPY_TO_POLARS[out_dtype])
-                    if nodata is not None
-                    else pl.lit(0, dtype=NUMPY_TO_POLARS[out_dtype])
-                )
-                agg = self.options.group_aggregate
-                out_names = [f"out{k}" for k in range(len(group_row_idxs))]
-                exprs = [
-                    horizontal_aggregate_expr(agg, [scaled[i] for i in row_idxs], no_contributor).alias(name)
-                    for name, row_idxs in zip(out_names, group_row_idxs)
-                ]
-            else:
-                out_names = [f"out{k}" for k in range(len(scaled))]
-                exprs = [c.alias(name) for c, name in zip(scaled, out_names)]
+            # `nodata=` is passed only for an aggregated (group_aggregate) selection, so a
+            # nodata pixel drops out of the collapse instead of contributing a sentinel to
+            # it. A plain, non-aggregated selection passes every pixel through untouched,
+            # matching get_raster_array's own (unmasked) behavior for that case and the
+            # pinned test_non_aggregated_output_preserves_nodata. This is where the write
+            # path deliberately differs from get_tile, which masks either way: a written file
+            # can carry the sentinel forward for its reader to interpret, but a rendered
+            # pixel has to commit to a color.
+            out_names, exprs = band_collapse_exprs(
+                raw_names,
+                multipliers,
+                group_row_idxs,
+                self.options.group_aggregate,
+                out_dtype,
+                nodata=nodata if group_row_idxs is not None else None,
+            )
 
             # Batch size is capped independently of the block row's width -- see
             # raster_blocks_per_batch and _batched_block_windows -- so a wide raster or a

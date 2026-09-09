@@ -97,6 +97,72 @@ def horizontal_aggregate_expr(aggregate, exprs, no_contributor):
     return pl.when(no_contributor_at).then(no_contributor).otherwise(agg_fn(exprs))
 
 
+def band_collapse_exprs(raw_names, multipliers, group_row_idxs, aggregate, dtype, nodata=None):
+    """The whole calculate/group_aggregate step for a raster selection, as expressions.
+
+    Operates on a DataFrame whose columns are `raw_names` -- one raw band per selected
+    (path, band) row, in df row order. Returns `(out_names, exprs)`: one output column name
+    and expression per output band. `multipliers` (calculate parameters) and
+    `group_row_idxs` (the contributing row positions for each aggregated output band, or
+    None for a 1:1 selection) are indexed by df row position too, so all three line up.
+    `dtype` is the raw bands' numpy dtype name, which is also the output dtype before any
+    multiplier promotes it.
+
+    This is the single implementation of that step, shared by every caller that needs it
+    (`Dataset._write_raster_windowed`, `Dataset._collapse_tile_bands`, and -- expressed over
+    the plugin's own scan rather than a per-window frame -- `_summarize_zone_stats_plugin`),
+    so the four aggregates and the multiply-before-collapse order are defined once.
+
+    Passing `nodata` masks each band against its own raw pixel value BEFORE the multiply,
+    since scaling a sentinel would stop it matching the sentinel it started as. A masked
+    pixel then drops out of the collapse instead of contributing a sentinel to it, and the
+    sentinel comes back only where nothing contributed. Pass None to leave pixels untouched,
+    which is what a caller wants when its output has to preserve whatever was stored rather
+    than reinterpret it.
+
+    No null reaches the output columns: a masked-out band's null is filled back with the
+    sentinel, by `horizontal_aggregate_expr`'s `no_contributor` branch for an aggregated
+    selection and by an explicit `fill_null` for a 1:1 one. So a caller gets a column it can
+    hand straight to numpy in the dtype family it would have had unmasked -- which the tile
+    path depends on, since a null would arrive as NaN and land in whichever legend bin NaN
+    happens to digitize into (the last one).
+    """
+    if nodata is not None:
+        cols = [pl.when(pl.col(name) == nodata).then(None).otherwise(pl.col(name)) for name in raw_names]
+    else:
+        cols = [pl.col(name) for name in raw_names]
+
+    # Skipped entirely (rather than always multiplying by 1.0) when every multiplier is 1,
+    # so a plain selection keeps its source dtype instead of being silently promoted to
+    # float -- matching get_raster_array's own `if not (df["multiplier"] == 1).all()` guard.
+    if not all(m == 1 for m in multipliers):
+        cols = [c * float(m) for c, m in zip(cols, multipliers)]
+
+    if group_row_idxs is None:
+        out_names = [f"out{k}" for k in range(len(cols))]
+        if nodata is not None:
+            fill = pl.lit(nodata).cast(NUMPY_TO_POLARS[dtype])
+            cols = [c.fill_null(fill) for c in cols]
+        return out_names, [c.alias(name) for c, name in zip(cols, out_names)]
+
+    # No band contributed anything to this pixel (every band in the group was nodata
+    # there): the raster's own nodata sentinel, not NaN. Unlike the summarize path's Float64
+    # result, an integer output band cannot hold NaN -- this is a deliberate difference from
+    # that path's NaN marker, not an oversight. With no masking there is never a null to
+    # select it, so 0 (in the output dtype) is a harmless placeholder for that case.
+    no_contributor = (
+        pl.lit(nodata).cast(NUMPY_TO_POLARS[dtype])
+        if nodata is not None
+        else pl.lit(0, dtype=NUMPY_TO_POLARS[dtype])
+    )
+    out_names = [f"out{k}" for k in range(len(group_row_idxs))]
+    exprs = [
+        horizontal_aggregate_expr(aggregate, [cols[i] for i in row_idxs], no_contributor).alias(name)
+        for name, row_idxs in zip(out_names, group_row_idxs)
+    ]
+    return out_names, exprs
+
+
 def guarded_aggregate(aggregate, name):
     """A `group_by().agg()` expression for one column, with the all-nodata edge case fixed.
 
