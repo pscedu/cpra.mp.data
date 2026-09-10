@@ -77,14 +77,18 @@ RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
 # Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
 RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
 
-# Opt-in switch for the Polars IO-plugin summarize path (api.raster_source.scan_rasters),
-# falling back to the numpy block-window/reduceat loop. Off by default for one release
-# while the plugin path is verified in production -- see
-# Dataset._apply_transform_params_raster. The plugin path applies the same
-# multiplier/group-aggregate pre-collapse as the numpy path (see
-# Dataset._summarize_zone_stats_plugin and raster_source.horizontal_aggregate_expr), so
-# eligibility depends only on this flag, not on which query parameters are in play.
-RASTER_USE_IO_PLUGIN = get_config("RASTER_USE_IO_PLUGIN", "False").lower() in TRUE_VALUES
+# Switch for the Polars IO-plugin summarize path (api.raster_source.scan_rasters), with
+# the numpy block-window/reduceat loop as the fallback. ON by default: the plugin path is
+# cross-verified checksum-identical to numpy for min/max/sum/mean at full extent, and at
+# the default read-batch budget below it runs at or under the numpy path's peak RSS (worst
+# measured case `sum`, ~1.1 GB vs numpy's ~1.1 GB; min/max roughly half). Turning this off
+# is a kill switch only -- the numpy summarize path is scheduled for deletion, and the two
+# paths deliberately DISAGREE on requests combining group_aggregate with nodata (the numpy
+# path lets the sentinel contaminate the collapse; pinned in
+# tests/api/test_dataset_raster.py::TestNumpyGroupAggregateNodataQuirk). Requests using
+# value_where or summarize_aggregate=count route through the plugin regardless of this
+# flag -- see Dataset._apply_transform_params_raster.
+RASTER_USE_IO_PLUGIN = get_config("RASTER_USE_IO_PLUGIN", "True").lower() in TRUE_VALUES
 
 # Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is
 # the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
@@ -95,10 +99,18 @@ RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", 
 # Dataset._apply_transform_params_raster). This is a separate budget from
 # RASTER_CACHE_MAX_MB (GDAL's own block cache): capping only GDAL's cache still leaves the
 # batch's own NumPy buffer free to grow with a block row's full width regardless of how many
-# bands or blocks are requested, which is exactly the defect this budget fixes. Defaulted from
-# RASTER_CACHE_MAX_MB (an eighth of it) so the two budgets stay in the same ballpark without
-# either one dominating; override directly for a different balance.
-RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", str(max(RASTER_CACHE_MAX_MB // 8, 1))))
+# bands or blocks are requested, which is exactly the defect this budget fixes.
+#
+# 64 MB is a measured choice, not a ballpark: the streaming group_by's in-flight buffering
+# scales with (read batch size) x (batches spanned), so the read batch is the memory lever
+# for the whole summarize path. At the full 52-band selection, 64 MB derives one 512-block
+# per batch (52 x 512 x 512 x 4 B ~= 55 MB) -- the configuration measured at 1140 MB peak
+# for `sum` (vs ~3 GB at the previous 256 MB default) and 564 MB for `max`, at numpy-path
+# speed. Narrower selections still derive proportionally more blocks per batch, so every
+# batch stays ~64 MB rather than inheriting a size tuned for the full band count. The
+# earlier default coupled this to RASTER_CACHE_MAX_MB // 8; the two budgets have no real
+# relationship, and the coupling made this one drift with a GDAL-cache tuning decision.
+RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", "64"))
 
 # Explicit override for the number of raster blocks unioned into one summarize-loop batch,
 # bypassing the RASTER_BATCH_BUFFER_MB / band-count derivation in
