@@ -900,6 +900,108 @@ class TestPluginDifferential:
         )
 
 
+@pytest.fixture
+def group_aggregate_nodata_raster(base_path):
+    """Two COGs (2030, 2040) built so a `group_aggregate` collapse across them, combined
+    with nodata, has numerically distinct correct vs. quirky answers -- see
+    `TestNumpyGroupAggregateNodataQuirk` below.
+
+    Zone 1 (top half, via `zone_crosswalk`) is real in both bands: 10 in 2030, 20 in 2040.
+    Zone 2 (bottom half) is nodata (-9999, `write_cog`'s fixed sentinel) in 2030 and real
+    (30) in 2040 -- nodata in one of the two bands being collapsed, not all of them, so the
+    correct answer excludes it rather than landing on an all-nodata marker.
+    """
+    half = GRID.height // 2
+
+    def data_fn(year):
+        data = np.full((GRID.height, GRID.width), 10 if year == 2030 else 20, dtype="int32")
+        data[half:, :] = -9999 if year == 2030 else 30
+        return data
+
+    return write_raster_dataset(base_path, years=(2030, 2040), data_fn=data_fn)
+
+
+class TestNumpyGroupAggregateNodataQuirk:
+    """Pins a known-incorrect interaction between `group_aggregate` and nodata masking in
+    the numpy summarize path (`RASTER_USE_IO_PLUGIN=False`).
+
+    `_apply_transform_params_raster` -> `_summarize_zone_stats_numpy` reads pixels through
+    `Dataset.get_raster_array`, which collapses a `group_aggregate` with plain
+    `np.<fn>(data, axis=0)` over the *raw* stacked bands (`dataset.py`, `get_raster_array`)
+    -- with no nodata masking at all. Only afterwards does `_accumulate_zone_stats` mask
+    `vals == nodata` against that already-collapsed value, which essentially never equals
+    the raw sentinel again once it has been averaged/summed/etc. with a real value. The net
+    effect: a nodata pixel in one of the raw bands being collapsed contaminates the
+    group_aggregate for every band sharing that pixel, instead of being excluded from it.
+
+    This is a pin of CURRENT, known-incorrect behaviour, not an endorsement of it -- see
+    `test_numpy_group_aggregate_lets_nodata_contaminate_the_collapse` below for the exact
+    numbers. The Polars IO-plugin path (`_summarize_zone_stats_plugin`,
+    `raster_source.horizontal_aggregate_expr`, via `scan_rasters(mask_nodata=True)`) masks
+    nodata to null *before* the group_aggregate collapse, which is correct -- see
+    `test_plugin_group_aggregate_excludes_nodata_from_the_collapse`. Delete the numpy-path
+    test below once the numpy summarize path itself is removed (i.e. once
+    `RASTER_USE_IO_PLUGIN` is made permanently True and `_summarize_zone_stats_numpy` /
+    `get_raster_array`'s group_aggregate step are deleted with it).
+    """
+
+    async def _run(self, dataset_factory, monkeypatch, use_plugin, zone_crosswalk):
+        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", use_plugin)
+        dataset = dataset_factory(
+            DIMENSIONS,
+            group_aggregate="mean",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        await dataset.apply_params()
+        return dataset.materialize()
+
+    def _zone_value(self, df, grid_cell):
+        return df.filter(pl.col("grid_cell") == grid_cell)["value"][0]
+
+    async def test_numpy_group_aggregate_lets_nodata_contaminate_the_collapse(
+        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk, monkeypatch
+    ):
+        """KNOWN QUIRK, pinned deliberately (numpy summarize path only): the -9999 nodata
+        sentinel in zone 2's 2030 band is treated as an ordinary value by the
+        group_aggregate mean instead of being excluded.
+
+        Zone 1 has no nodata, so it collapses normally: mean(10, 2030; 20, 2040) = 15,
+        uniform across the zone, so the zonal mean is also 15 -- this is a sanity check
+        that both zones ran through the same collapse, not the quirk itself.
+
+        Zone 2's per-pixel group_aggregate mean is mean(-9999, 30) = -4984.5, computed
+        over the raw sentinel with no masking. That collapsed value, uniform across zone
+        2, is nowhere near -9999, so `_accumulate_zone_stats`'s `vals != nodata` check
+        treats every zone-2 pixel as contributing -- the zonal mean of -4984.5 comes
+        straight through unmasked, rather than the 30 a nodata-excluding collapse would
+        produce (see the plugin counterpart below).
+        """
+        df = await self._run(dataset_factory, monkeypatch, False, zone_crosswalk)
+        assert self._zone_value(df, 1) == pytest.approx(15.0)
+        assert self._zone_value(df, 2) == pytest.approx((-9999 + 30) / 2)
+        assert self._zone_value(df, 2) == pytest.approx(-4984.5)
+
+    async def test_plugin_group_aggregate_excludes_nodata_from_the_collapse(
+        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk, monkeypatch
+    ):
+        """The correct counterpart to the numpy quirk pinned above, through the Polars
+        IO-plugin summarize path (`RASTER_USE_IO_PLUGIN=True`).
+
+        `scan_rasters(mask_nodata=True)` nulls out zone 2's -9999 2030 pixel against its
+        own raw value before `horizontal_aggregate_expr` ever sees it, so the `mean`
+        collapse there is over the single surviving real value (30) rather than the raw
+        sentinel -- `mean_horizontal` skips nulls the same way Polars' own null-skipping
+        `mean()` does. That is not the all-nodata case (`horizontal_aggregate_expr`'s
+        `no_contributor` branch, which would apply only if *both* zone-2 bands were
+        nodata) -- one band still contributes, so the collapsed value is exactly that
+        band's value, 30, not NaN/null.
+        """
+        df = await self._run(dataset_factory, monkeypatch, True, zone_crosswalk)
+        assert self._zone_value(df, 1) == pytest.approx(15.0)
+        assert self._zone_value(df, 2) == pytest.approx(30.0)
+
+
 class TestPluginEligibility:
     """The plugin path applies the same multiplier/group_aggregate pre-collapse as the
     numpy path (see Dataset._summarize_zone_stats_plugin and
