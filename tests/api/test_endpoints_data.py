@@ -17,6 +17,7 @@ from rasterio.warp import transform
 from shapely.geometry import box
 
 from cpra.mp.data import config
+from cpra.mp.data.api import fold as fold_module
 from cpra.mp.data.tabular import write_parquet
 
 from tests.factories import (
@@ -309,6 +310,29 @@ class TestVectorData:
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.height == 32
         assert df["value"].to_list() == [1] * 32
+
+    def test_cliff_shaped_group_aggregate_goes_through_the_fold(self, client, base_path, monkeypatch):
+        """A request shaped exactly like the memory cliff this package's `api.fold`
+        module fixes -- no `group_by`, no selective filter, `group_aggregate` set, so
+        the group key is `grid_cell` alone -- routed end to end through the ASGI app,
+        not a directly constructed `Dataset`. `TABULAR_FOLD_STEP` is monkeypatched down
+        to 40 so this fixture-scale dataset (50 years x 32 cells = 1,600 rows) is still
+        forced through ~40 real fold chunks and merges, rather than degenerating to the
+        single-chunk case every other fixture-scale test in this suite exercises.
+        """
+        monkeypatch.setattr(fold_module, "TABULAR_FOLD_STEP", 40)
+        years = range(2000, 2050)
+        write_parquet(annual_frame(years=years), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"group_aggregate": "sum"})
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content)).sort("grid_cell")
+
+        assert df.height == 32
+        year_sum = sum(years)
+        expected = [year_sum + len(years) * geo_id / 100 for geo_id in range(1, 33)]
+        assert df["value"].to_list() == pytest.approx(expected, rel=1e-5)
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_vector_data):
         """"How many cells carry each distinct value per zone" -- one `summarize_by` +

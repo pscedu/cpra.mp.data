@@ -574,6 +574,119 @@ class TestSummarizeStage:
         assert dataset.output_type == OutputType.vector
 
 
+class TestFoldRouting:
+    """Dataset-level check that the two vector group_by sites actually call the fold
+    (api/fold.py) exactly when `api.fold.should_fold_group_by`'s rule says they should.
+    `test_fold.py::TestShouldFoldGroupBy` pins the rule itself as a pure function; this
+    pins that `_apply_group_params` and `_apply_transform_params_vector` feed it the
+    arguments the rule needs and honor its answer.
+    """
+
+    @pytest.fixture
+    def spy_fold(self, monkeypatch):
+        """Wraps the real `fold_group_by` (rather than replacing it with a mock) so
+        these tests also double as correctness checks on this package's fixture-scale
+        data, not just call-count checks."""
+        calls = []
+        real_fold_group_by = dataset_module.fold_group_by
+
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_fold_group_by(*args, **kwargs)
+
+        monkeypatch.setattr(dataset_module, "fold_group_by", spy)
+        return calls
+
+    @pytest.fixture
+    def crosswalk(self, crosswalk_path):
+        return write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 0.5), (2, 100, 0.5), (3, 200, 0.5), (4, 200, 0.5)],
+        )
+
+    async def test_unfiltered_group_aggregate_routes_through_the_fold(
+        self, dataset_factory, annual_data, spy_fold
+    ):
+        """Cliff-shaped: no group_by, no selective filter -- the group key is
+        `grid_cell` alone, exactly what `should_fold_group_by` folds."""
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="sum")
+        await dataset.apply_params()
+        dataset.materialize()
+        assert len(spy_fold) == 1
+
+    async def test_a_grid_cell_filter_skips_the_fold(self, dataset_factory, annual_data, spy_fold):
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="sum", grid_cell="1")
+        await dataset.apply_params()
+        dataset.materialize()
+        assert spy_fold == []
+
+    async def test_a_dimension_filter_skips_the_fold(self, dataset_factory, annual_data, spy_fold):
+        dataset = dataset_factory(
+            DIMENSIONS, group_aggregate="sum", filters={"calendar_year": [2030]}
+        )
+        await dataset.apply_params()
+        dataset.materialize()
+        assert spy_fold == []
+
+    async def test_a_where_clause_skips_the_fold(self, dataset_factory, annual_data, spy_fold):
+        dataset = dataset_factory(
+            DIMENSIONS, group_aggregate="sum", where="calendar_year > 2035"
+        )
+        await dataset.apply_params()
+        dataset.materialize()
+        assert spy_fold == []
+
+    async def test_crosswalk_reaggregation_routes_through_the_fold_when_unfiltered(
+        self, dataset_factory, annual_data, crosswalk, spy_fold
+    ):
+        """No `group_by`/`group_aggregate` here, so `_apply_group_params` returns before
+        ever considering a fold -- only `_apply_transform_params_vector`'s crosswalk
+        reaggregation site is reachable, and it fires because the request is unfiltered."""
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="sum"
+        )
+        await dataset.apply_params()
+        dataset.materialize()
+        assert len(spy_fold) == 1
+
+    async def test_summarize_grid_cell_skips_the_crosswalk_fold(
+        self, dataset_factory, annual_data, crosswalk, spy_fold
+    ):
+        """summarize_grid_cell narrows the crosswalk's destinations -- exactly the
+        selective-filter signal that should skip its fold."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="sum",
+            summarize_grid_cell="100",
+        )
+        await dataset.apply_params()
+        dataset.materialize()
+        assert spy_fold == []
+
+    async def test_group_aggregate_and_summarize_together_fold_both_sites(
+        self, dataset_factory, annual_data, crosswalk, spy_fold
+    ):
+        """With both `group_aggregate` and `summarize_by` set and nothing filtering the
+        request, both fold-eligible sites are reachable and both fire: the group_by
+        collapse in `_apply_group_params` (always keyed on grid_cell in long format,
+        which runs first) and the crosswalk reaggregation in
+        `_apply_transform_params_vector` (some crosswalks land on a finer destination
+        than the source grid; see that method's docstring), operating on the
+        already-collapsed result of the first."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            group_aggregate="sum",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="sum",
+        )
+        await dataset.apply_params()
+        dataset.materialize()
+        assert len(spy_fold) == 2
+
+
 class TestCountByValue:
     """count_by_value: one row per (dimension group, destination zone, distinct value),
     with the count of source grid cells sharing that value -- a categorical count, a

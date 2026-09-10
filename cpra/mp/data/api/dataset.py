@@ -24,6 +24,7 @@ from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
 from cpra.mp.data.api.expressions import ExpressionError, count_by_value_frame, parse_value_expr, value_predicate_mask
+from cpra.mp.data.api.fold import FoldError, fold_group_by, should_fold_group_by
 from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
     project_coordinates,
@@ -424,6 +425,30 @@ class Dataset(LazyFrameSource):
             return [True]
         return unpack_values(self.options.group_by, "group_by", DIMENSION_CHOICES)
 
+    def _has_selective_dimension_filter(self):
+        """Whether this request already carries something that shrinks the row count
+        reaching a vector group_by well below "the whole dataset" -- the signal
+        `api.fold.should_fold_group_by` uses to skip the fold on an already-cheap query.
+
+        `filter_dimensions` values are pushed down as Hive-partition filters inside
+        `get_lazy_frame`/`read_parquet`, before `self.lf` exists at all -- the measured
+        case where a `grid_cell` group-by drops from 9.8 GB to 285 MB. `options.grid_cell`
+        (a real `.filter()` on specific cell IDs) and `options.where` (an arbitrary SQL
+        `.filter()`) are the same kind of row-dropping filter, applied to `self.lf`
+        itself in `_apply_filter_params`, so they count too.
+
+        `options.value_where` and the `calculate` parameters (`negate`/`multiply10`/
+        `multiply100`) are deliberately NOT included: they are `with_columns` maps, not
+        filters -- they never change how many rows reach the group-by, so they don't
+        affect whether it's cliff-shaped, and (unlike a `.filter()`) they don't block the
+        fold's `.slice()` from reaching the scan either.
+        """
+        return (
+            self.options.grid_cell is not None
+            or self.options.where is not None
+            or any(v is not None for v in dict(self.filter_dimensions).values())
+        )
+
     def _apply_group_params(self):
         """Apply group and aggregate parameters to the LazyFrame or image."""
         if self.options.group_by is None and self.options.group_aggregate is None:
@@ -471,10 +496,28 @@ class Dataset(LazyFrameSource):
             null_cols = [col for col in required_cols if col not in group_by_cols]
 
             # grid_cell must always be part of the group key in long format since each
-            # row represents a single grid_cell.
-            self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
-                getattr(pl.col("value"), self.options.group_aggregate)()
-            )
+            # row represents a single grid_cell -- this is exactly the high-cardinality
+            # collapse the fold exists for (see api.fold's module docstring: 126,174
+            # distinct grid_cell values, ~9.8 GB unfolded). `should_fold_group_by` sees
+            # only the OUTPUT key names (plain strings; `group_by_cols` may also contain
+            # the literal `True` for the group_aggregate-without-group_by case, which
+            # never matches a high-cardinality column name and is harmless to include).
+            key_names = [col for col in group_by_cols if isinstance(col, str)] + ["grid_cell"]
+            if should_fold_group_by(
+                key_names, has_selective_filter=self._has_selective_dimension_filter()
+            ):
+                source_lf = self.lf
+                try:
+                    collapsed = fold_group_by(
+                        lambda: source_lf, [*group_by_cols, "grid_cell"], self.options.group_aggregate
+                    )
+                except FoldError as exc:
+                    self._error(str(exc))
+                self.lf = collapsed.lazy()
+            else:
+                self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
+                    getattr(pl.col("value"), self.options.group_aggregate)()
+                )
 
             if null_cols:
                 self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
@@ -575,13 +618,45 @@ class Dataset(LazyFrameSource):
         # per destination grid_cell. The join replaces the wide-format horizontal
         # aggregation that was used when each source grid_cell was a column.
         agg_fn = self.options.summarize_aggregate
-        self.lf = (
-            self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
-            .with_columns(value=pl.col("value") * pl.col("scale_factor"))
-            .group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
-            .agg(getattr(pl.col("value"), agg_fn)())
-            .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+
+        def _scale_and_join(chunk):
+            return chunk.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+                value=pl.col("value") * pl.col("scale_factor")
+            )
+
+        # The destination zone is aliased to `grid_cell` here too, so the same
+        # high-cardinality signal `_apply_group_params` uses applies -- and it has to:
+        # some crosswalks land on a FINER destination than the source grid (e.g.
+        # hydro_compartment_v001 -> clara_grid_cell_v001, 109,854 distinct destination
+        # cells), so this reaggregation is not uniformly safe just because most
+        # `summarize_by` targets (ecoregion, parish, hydro_compartment, ...) are small.
+        # `summarize_grid_cell` narrows destinations the same way `grid_cell` narrows
+        # sources, so it's added to the same selective-filter signal here.
+        key_names = [*dim_cols, "grid_cell"]
+        has_selective_filter = (
+            self._has_selective_dimension_filter() or self.options.summarize_grid_cell is not None
         )
+        if should_fold_group_by(key_names, has_selective_filter=has_selective_filter):
+            source_lf = self.lf
+            try:
+                collapsed = fold_group_by(
+                    lambda: source_lf,
+                    [*dim_cols, pl.col("dst_id").alias("grid_cell")],
+                    agg_fn,
+                    chunk_transform=_scale_and_join,
+                )
+            except FoldError as exc:
+                self._error(str(exc))
+            self.lf = collapsed.lazy().with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+        else:
+            joined = self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+                value=pl.col("value") * pl.col("scale_factor")
+            )
+            self.lf = (
+                joined.group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
+                .agg(getattr(pl.col("value"), agg_fn)())
+                .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+            )
 
     def _get_raster_dimension_frame(self, df):
         """Get a DataFrame with one row per output raster band, aligned by row order

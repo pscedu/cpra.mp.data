@@ -128,6 +128,27 @@ RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_ba
 # (the largest is a few dozen categories) while still catching a continuous column early.
 COUNT_BY_VALUE_MAX_DISTINCT = int(get_config("COUNT_BY_VALUE_MAX_DISTINCT", "1000"))
 
+# Row-offset chunk size for the tabular "fold" (api.fold.fold_group_by), which bounds a
+# high-cardinality `group_by` (e.g. `grid_cell`, 126,174 distinct values in
+# clara_grid_cell_v001) to at most this many input rows per `group_by`/`agg`/`collect`
+# call, instead of one `group_by` seeing an entire unfiltered dataset. Measured on the
+# real 1.04B-row damage file (`group_by("grid_cell").sum("value")`, streaming engine,
+# unfolded baseline ~9.7 GB / ~11.3s):
+#
+#   step        peak RSS   wall time
+#   25,000,000  ~1.0 GB    ~7.7-9.3s
+#   10,000,000  ~664 MB    ~12.7s
+#
+# 25M is the default: it is the largest step measured (least time overhead) while still
+# cutting peak memory ~9-10x, comfortably inside a 15 GB VM. A caller that wants a smaller
+# footprint at more time cost can lower this; tuning knobs on the underlying scan
+# (`low_memory`, `POLARS_STREAMING_CHUNK_SIZE`) do NOT reproduce this effect on their own
+# -- restructuring the query (this fold) is the only lever that measured a real change.
+# (Run-to-run variance on this machine is real -- peak RSS at 25M was seen anywhere from
+# ~988 MB to ~1.1 GB across repeated measurements; treat these as order-of-magnitude,
+# not exact, figures.)
+TABULAR_FOLD_STEP = int(get_config("TABULAR_FOLD_STEP", "25000000"))
+
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
 SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")
