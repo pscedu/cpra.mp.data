@@ -61,8 +61,12 @@ class TestEnums:
         # `count` is included as a valid `summarize_aggregate`/`group_by`-aggregate value
         # on both grid types (see the `AggregateFunction` docstring in types.py) even
         # though it is explicitly rejected as a raster `group_aggregate` -- that
-        # rejection is enforced by `Dataset`, not by the enum's membership.
-        assert {m.value for m in AggregateFunction} == {"count", "max", "mean", "min", "sum"}
+        # rejection is enforced by `Dataset`, not by the enum's membership. `count_by_value`
+        # is similarly a member here but rejected by `Dataset` as a `group_aggregate` on
+        # either grid type -- see the comment on it in types.py.
+        assert {m.value for m in AggregateFunction} == {
+            "count", "count_by_value", "max", "mean", "min", "sum"
+        }
 
     def test_output_types(self):
         assert {m.value for m in OutputType} == {"raster", "vector"}

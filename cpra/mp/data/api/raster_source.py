@@ -20,7 +20,7 @@ import rasterio as rio
 from polars.io.plugins import register_io_source
 from rasterio import windows
 
-from cpra.mp.data.api.expressions import rewrite_value_column, value_predicate_mask
+from cpra.mp.data.api.expressions import count_by_value_frame, rewrite_value_column, value_predicate_mask
 from cpra.mp.data.api.utils import raster_blocks_per_batch, raster_gdal_env
 
 NUMPY_TO_POLARS = {
@@ -230,6 +230,39 @@ def masked_value_predicate_exprs(raw_names, expr_str, extra_columns=()):
         mask = value_predicate_mask(rewrite_value_column(expr_str, name), allowed_columns=[name, *extra_columns])
         exprs.append(pl.when(mask).then(pl.col(name)).otherwise(None).alias(name))
     return exprs
+
+
+def count_by_value(paths, row_indices, bands, crosswalk_path, zone_ids, value_where=None, max_distinct=None):
+    """Per-zone categorical pixel count-by-value: one row per (zone, distinct pixel
+    value), via `scan_rasters` + `expressions.count_by_value_frame`.
+
+    Single-band only. `paths`/`row_indices`/`bands` must together describe exactly one
+    selected band -- `Dataset._apply_transform_params_raster` enforces this before ever
+    calling in (via its already-computed `n_bands`), since a multi-band request has no
+    single natural (zone, value) shape: counting each band's values into the same `value`
+    column would silently conflate unrelated variables/years, and counting them into
+    separate columns would need a different output shape per band count. Per the plan's
+    "silently wrong multi-band results are not acceptable" rule, this is refused rather
+    than guessed at -- re-asserted here defensively rather than only trusted from the
+    caller.
+
+    `value_where`, when given, is applied the same way `_summarize_zone_stats_plugin` (the
+    other summarize_aggregate path) applies it: masked to null against the (single) band's
+    own raw pixel value, before counting -- so a pixel the predicate rejects is excluded
+    from the category counts exactly like a masked nodata pixel already is (mask first,
+    then count distinct survivors).
+    """
+    raw_names = [f"b{i}" for indices in row_indices for i in indices]
+    if len(raw_names) != 1:
+        raise ValueError(f"count_by_value supports exactly one raster band, got {len(raw_names)}")
+    value_col = raw_names[0]
+
+    lf = scan_rasters(paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
+    if value_where is not None:
+        lf = lf.with_columns(masked_value_predicate_exprs(raw_names, value_where, extra_columns=("grid_cell",)))
+
+    counted = count_by_value_frame(lf, ["grid_cell"], value_col, max_distinct).collect(engine="streaming")
+    return counted.rename({value_col: "value"})
 
 
 def _raster_dtype(path):

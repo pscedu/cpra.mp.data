@@ -23,7 +23,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.api.expressions import ExpressionError, parse_value_expr, value_predicate_mask
+from cpra.mp.data.api.expressions import ExpressionError, count_by_value_frame, parse_value_expr, value_predicate_mask
 from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
     project_coordinates,
@@ -32,6 +32,7 @@ from cpra.mp.data.api.geography import (
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 from cpra.mp.data.api.raster_source import (
     band_collapse_exprs,
+    count_by_value as raster_count_by_value,
     guarded_aggregate,
     horizontal_aggregate_expr,
     masked_value_predicate_exprs,
@@ -52,6 +53,7 @@ from cpra.mp.data.api.utils import (
     unpack_values,
 )
 from cpra.mp.data.config import (
+    COUNT_BY_VALUE_MAX_DISTINCT,
     RASTER_NUM_THREADS,
     RASTER_USE_IO_PLUGIN,
     RASTER_USE_VRT_COPY,
@@ -427,6 +429,23 @@ class Dataset(LazyFrameSource):
         if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
+        if self.options.group_aggregate == "count_by_value":
+            # count_by_value changes the OUTPUT SHAPE (one row per group per distinct
+            # value) instead of collapsing a group to one row the way every other
+            # group_aggregate value does -- on both grid types, `group_by`/
+            # `group_aggregate` is a COLLAPSE step (raster band-collapse across selected
+            # bands per pixel, vector dimension-collapse across rows per grid_cell) that
+            # has no way to also multiply its own row count by the number of distinct
+            # values without breaking that collapse's "one row per group" contract.
+            # Rejected here, before any file is read, rather than left to fail deep in
+            # `HORIZONTAL_RASTER_AGGREGATES`/`getattr(pl.col("value"), ...)` -- the same
+            # pattern the raster-only `group_aggregate == "count"` rejection below uses.
+            # summarize_by/summarize_aggregate=count_by_value is the only way to reach it.
+            self._error(
+                "group_aggregate 'count_by_value' is not supported -- "
+                "use summarize_by and summarize_aggregate=count_by_value instead"
+            )
+
         group_by_cols = self._get_group_by_columns()
         if self._is_raster_metadata_table():
             if self.options.group_aggregate == "count":
@@ -490,6 +509,22 @@ class Dataset(LazyFrameSource):
 
         return True
 
+    def _reject_calculate_with_count_by_value(self):
+        """count_by_value counts DISTINCT values; a calculate parameter (negate,
+        multiply10, multiply100) rescales a value BEFORE it would be counted, which
+        changes which raw values collapse into "the same" category without changing what
+        the caller meant by "distinct" -- e.g. multiply10 turns land-type codes 1 and 2
+        into 10 and 20, not into two different categories, but does change what a
+        downstream consumer sees as the reported "value" for each count. Every other
+        aggregate folds a calculate parameter through unremarkably (a scaled number is
+        still a meaningful sum/mean/min/max), so this is a rejection specific to
+        count_by_value, not a general calculate/summarize incompatibility. Checked against
+        `self.options` directly (not `self.lf`) so it fires before the eventual `group_by`
+        even if `_apply_calculate_params` already ran earlier in the pipeline.
+        """
+        if self.options.negate is not None or self.options.multiply10 is not None or self.options.multiply100 is not None:
+            self._error("calculate parameters (negate/multiply10/multiply100) cannot be combined with count_by_value")
+
     def _apply_transform_params_vector(self):
         """Apply transform and extract parameters to the LazyFrame."""
 
@@ -514,10 +549,31 @@ class Dataset(LazyFrameSource):
         if self.summarize_grid_cell_ids:
             crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_grid_cell_ids))
 
+        dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
+
+        if self.options.summarize_aggregate == "count_by_value":
+            # No `scale_factor` multiply here (see _reject_calculate_with_count_by_value's
+            # docstring for the same reasoning applied to the crosswalk's own scale
+            # factor: rescaling a categorical code before counting it would change which
+            # raw values collapse into "the same" category). Group by the destination
+            # zone (aliased to `grid_cell`, matching every other summarize output) plus
+            # the value itself -- `count_by_value_frame` bounds this group key's
+            # cardinality; see its docstring for the math.
+            self._reject_calculate_with_count_by_value()
+            joined = self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+                pl.col("dst_id").alias("grid_cell")
+            )
+            try:
+                self.lf = count_by_value_frame(
+                    joined, [*dim_cols, "grid_cell"], "value", COUNT_BY_VALUE_MAX_DISTINCT
+                ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
+            except ExpressionError as exc:
+                self._error(str(exc))
+            return
+
         # Join the data on grid_cell == src_id, scale the values, then aggregate
         # per destination grid_cell. The join replaces the wide-format horizontal
         # aggregation that was used when each source grid_cell was a column.
-        dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
         agg_fn = self.options.summarize_aggregate
         self.lf = (
             self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
@@ -606,6 +662,46 @@ class Dataset(LazyFrameSource):
             else:
                 dst_ids = crosswalk.tags()["dst_ids"].split(",")
                 zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
+
+        if self.options.summarize_aggregate == "count_by_value":
+            # Single RAW band only: a request selecting more than one raw pixel band (e.g.
+            # every calendar_year in a range, or several bands pre-collapsed by
+            # group_by/group_aggregate into one group) has no single natural (zone, value)
+            # shape to count into -- see raster_source.count_by_value's docstring for why
+            # this is refused rather than guessed at. Checked against the raw band count
+            # from `row_indices` (not `n_bands`, which reflects the post-group_aggregate
+            # collapsed count and would wrongly admit a group_by that collapses several raw
+            # bands down to one group) -- `group_by`/`group_aggregate`'s own collapse logic
+            # is never applied by `raster_source.count_by_value`, so a caller combining it
+            # with count_by_value must be rejected outright rather than have it silently
+            # ignore every raw band but one. `row_indices` comes from `group_rows_by_path`
+            # on `self.materialize()`, which only reads the band-metadata table (path/band/
+            # dimensions), never pixel data -- so this check is still "before any file [of
+            # pixel data] is read", not merely before the summarize starts.
+            raw_band_count = sum(len(indices) for indices in row_indices)
+            if raw_band_count != 1:
+                self._error(
+                    f"count_by_value is only supported for a single raster band per request, got {raw_band_count} -- "
+                    "narrow the request (e.g. to one calendar_year) and don't combine it with group_by/group_aggregate"
+                )
+            self._reject_calculate_with_count_by_value()
+
+            try:
+                result_df = await asyncio.to_thread(
+                    self._summarize_count_by_value_plugin, unique_paths, row_indices, bands, crosswalk_path, zone_ids
+                )
+            except ExpressionError as exc:
+                self._error(str(exc))
+
+            dim_row = dim_df.row(0, named=True)
+            self.lf = (
+                result_df.lazy()
+                .with_columns(**{col: pl.lit(val) for col, val in dim_row.items()})
+                .with_columns(
+                    pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by)
+                )
+            )
+            return
 
         # The plugin path (`scan_rasters`) now applies the same multiplier/group-aggregate
         # pre-collapse as the numpy path's `get_raster_array`, via the shared
@@ -802,6 +898,23 @@ class Dataset(LazyFrameSource):
             for i, name in enumerate(out_names):
                 result[i, positions] = grouped[name].to_numpy()
         return result
+
+    def _summarize_count_by_value_plugin(self, unique_paths, row_indices, bands, crosswalk_path, zone_ids):
+        """count_by_value's raster-side worker: delegates to `raster_source.count_by_value`
+        (the single-band scan + per-zone categorical count), on a worker thread the same
+        way `_summarize_zone_stats_plugin` is -- see that method's docstring for why (the
+        streaming `collect()` underneath is long-running and CPU/IO-bound, so it must not
+        block the event loop for the whole summarize).
+        """
+        return raster_count_by_value(
+            unique_paths,
+            row_indices,
+            bands,
+            crosswalk_path,
+            zone_ids,
+            value_where=self.options.value_where,
+            max_distinct=COUNT_BY_VALUE_MAX_DISTINCT,
+        )
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""

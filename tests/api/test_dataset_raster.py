@@ -1149,3 +1149,165 @@ class TestValueWherePixelPredicate:
         assert excinfo.value.status_code == 400
         assert "min" in excinfo.value.detail
         assert not called
+
+
+class TestCountByValue:
+    """count_by_value: one row per (zone, distinct pixel value), with the count of
+    contributing pixels sharing that value -- a categorical count, a genuinely different
+    output SHAPE from every other summarize_aggregate (which collapse a zone to one row).
+    See `raster_source.count_by_value` and `expressions.count_by_value_frame` for the
+    single-raw-band scoping and the cardinality-ceiling design this class exercises.
+    """
+
+    N_CATEGORIES = 5
+
+    @pytest.fixture
+    def categorical_raster_data(self, base_path):
+        """One COG whose pixels cycle through a handful of small integer categories
+        (0..N_CATEGORIES-1) -- a bounded categorical column, e.g. land-type codes, not a
+        uniform fill or an unbounded gradient."""
+        write_raster_dataset(
+            base_path, years=(2030,), data_fn=lambda _year: raster_array() % self.N_CATEGORIES
+        )
+        return base_path
+
+    @pytest.fixture
+    def two_band_categorical_raster_data(self, base_path):
+        write_raster_dataset(
+            base_path, years=(2030, 2040), data_fn=lambda _year: raster_array() % self.N_CATEGORIES
+        )
+        return base_path
+
+    def _zone_category_counts(self):
+        """Expected {zone: {value: count}}, derived from the fixture's own data (the same
+        zone split `zone_crosswalk` writes: zone 1 on top, zone 2 below) rather than
+        hand-computed, so it can't drift from what the fixture actually contains."""
+        zones = np.zeros((GRID.height, GRID.width), dtype="int32")
+        zones[: GRID.height // 2, :] = 1
+        zones[GRID.height // 2 :, :] = 2
+        categories = raster_array() % self.N_CATEGORIES
+        counts = {}
+        for zone_id in (1, 2):
+            values, value_counts = np.unique(categories[zones == zone_id], return_counts=True)
+            counts[zone_id] = dict(zip(values.tolist(), value_counts.tolist()))
+        return counts
+
+    async def test_counts_pixels_per_zone_per_value(
+        self, dataset_factory, categorical_raster_data, zone_crosswalk
+    ):
+        expected = self._zone_category_counts()
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        assert set(df.columns) >= {"grid_cell", "value", "count", "geographic_unit"}
+        for zone_id, value_counts in expected.items():
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            assert actual == value_counts
+
+    async def test_composes_with_value_where_mask_then_count(
+        self, dataset_factory, categorical_raster_data, zone_crosswalk
+    ):
+        """value_where masks non-matching pixels to null BEFORE counting -- see
+        `raster_source.count_by_value`'s docstring -- so a masked-out pixel contributes
+        to no category at all, rather than being counted under some sentinel value."""
+        expected = self._zone_category_counts()
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count_by_value",
+            value_where="value != 2",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        for zone_id, value_counts in expected.items():
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            expected_masked = {v: c for v, c in value_counts.items() if v != 2}
+            assert actual == expected_masked
+
+    async def test_nodata_pixels_are_excluded_not_a_category(
+        self, dataset_factory, zone_crosswalk, base_path
+    ):
+        def data_fn(_year):
+            arr = raster_array() % self.N_CATEGORIES
+            arr.reshape(-1)[:10] = -9999
+            return arr
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=data_fn)
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        assert -9999 not in df["value"].to_list()
+        assert df["count"].sum() == GRID.height * GRID.width - 10
+
+    async def test_multi_band_request_is_rejected_before_any_pixel_data_is_read(
+        self, dataset_factory, two_band_categorical_raster_data, zone_crosswalk, monkeypatch
+    ):
+        called = []
+
+        def fail_if_called(*args, **kwargs):
+            called.append(True)
+            raise AssertionError(
+                "raster_count_by_value should not run: the multi-band request should have "
+                "been rejected first"
+            )
+
+        monkeypatch.setattr(dataset_module, "raster_count_by_value", fail_if_called)
+
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "single" in excinfo.value.detail
+        assert not called
+
+    async def test_cardinality_ceiling_is_enforced(
+        self, dataset_factory, base_path, zone_crosswalk, monkeypatch
+    ):
+        """An unbounded (per-pixel-distinct) column is exactly what the ceiling exists to
+        catch -- see config.COUNT_BY_VALUE_MAX_DISTINCT and
+        expressions.count_by_value_frame's docstring for the bound math. Unlike the
+        multi-band rejection above, this check necessarily reads pixel data (the
+        `approx_n_unique` probe) before it can fire -- an accepted cost, not a plan-time
+        rejection."""
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array())
+        monkeypatch.setattr(dataset_module, "COUNT_BY_VALUE_MAX_DISTINCT", 10)
+
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "distinct" in excinfo.value.detail
+
+    async def test_group_aggregate_count_by_value_is_rejected(self, dataset_factory, raster_data):
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="count_by_value")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "count_by_value" in excinfo.value.detail
+
+    async def test_calculate_params_are_rejected_with_count_by_value(
+        self, dataset_factory, categorical_raster_data, zone_crosswalk
+    ):
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count_by_value",
+            multiply10="1 = 1",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "count_by_value" in excinfo.value.detail

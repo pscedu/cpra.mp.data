@@ -106,6 +106,16 @@ RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", str(max(RASTER
 _raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
 RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
 
+# Ceiling on the number of distinct values `count_by_value` may enumerate (per grid, not
+# per zone -- see api.expressions.count_by_value_frame). count_by_value's output row count
+# is bounded by (number of summarize zones) x (number of distinct values in the scoped
+# selection); the zone count is already bounded by the crosswalk file, but the
+# distinct-value count is unbounded unless something stops a caller from pointing
+# count_by_value at a continuous column (e.g. elevation) and getting one row per raw
+# value. 1000 is comfortably above any real land-type/categorical legend in this dataset
+# (the largest is a few dozen categories) while still catching a continuous column early.
+COUNT_BY_VALUE_MAX_DISTINCT = int(get_config("COUNT_BY_VALUE_MAX_DISTINCT", "1000"))
+
 # Map tile and style URLs
 GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
 SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")

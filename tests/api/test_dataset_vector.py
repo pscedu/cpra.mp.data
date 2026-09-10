@@ -11,6 +11,7 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
+from cpra.mp.data.api import dataset as dataset_module
 from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.tabular import write_parquet
 
@@ -571,6 +572,127 @@ class TestSummarizeStage:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="max"
         )
         assert dataset.output_type == OutputType.vector
+
+
+class TestCountByValue:
+    """count_by_value: one row per (dimension group, destination zone, distinct value),
+    with the count of source grid cells sharing that value -- a categorical count, a
+    genuinely different output SHAPE from every other summarize_aggregate (which collapse
+    a zone to one row). See `expressions.count_by_value_frame` for the cardinality bound
+    and `Dataset._apply_transform_params_vector`'s count_by_value branch for the
+    vector-side wiring: no `scale_factor` multiply (unlike every other summarize_aggregate
+    here), since rescaling a categorical code before counting it would change which raw
+    values collapse into "the same" category.
+    """
+
+    @pytest.fixture
+    def crosswalk(self, crosswalk_path):
+        """Map ecoregions 1-4 onto two destination compartments -- the same split
+        `TestSummarizeStage.crosswalk` uses, redefined locally since this class's fixture
+        data (categorical, not `annual_frame`'s default continuous value_fn) differs."""
+        return write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 0.5), (2, 100, 0.5), (3, 200, 0.5), (4, 200, 0.5)],
+        )
+
+    @pytest.fixture
+    def categorical_annual_data(self, base_path):
+        """Each ecoregion's value is a small integer category (geo_id % 3), not
+        `annual_frame`'s default continuous `year + geo_id/100` -- a bounded categorical
+        column (e.g. a land-type code) is exactly what count_by_value is for."""
+        write_parquet(
+            annual_frame(years=(2030,), value_fn=lambda _year, geo_id: float(geo_id % 3)),
+            base_path=base_path,
+        )
+        return base_path
+
+    def _expected_counts(self):
+        """zone -> {value: count}, derived from the same (ecoregion -> compartment)
+        mapping `crosswalk` writes and the same value_fn `categorical_annual_data` uses,
+        rather than hand-computed, so it can't drift from what the fixtures actually
+        contain."""
+        mapping = {1: 100, 2: 100, 3: 200, 4: 200}
+        counts = {100: {}, 200: {}}
+        for geo_id, zone in mapping.items():
+            value = float(geo_id % 3)
+            counts[zone][value] = counts[zone].get(value, 0) + 1
+        return counts
+
+    async def test_counts_source_cells_per_zone_per_value(
+        self, dataset_factory, categorical_annual_data, crosswalk
+    ):
+        expected = self._expected_counts()
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        assert set(df.columns) >= {"grid_cell", "value", "count", "geographic_unit"}
+        for zone_id, value_counts in expected.items():
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            assert actual == value_counts
+
+    async def test_composes_with_value_where_mask_then_count(
+        self, dataset_factory, categorical_annual_data, crosswalk
+    ):
+        """value_where masks a non-matching source cell's value to null in
+        `_apply_filter_params` -- upstream of this stage -- so it is excluded here the
+        same way `count_by_value_frame` excludes any other null: not a category, and not
+        counted under any value."""
+        expected = self._expected_counts()
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count_by_value",
+            value_where="value != 1",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        for zone_id, value_counts in expected.items():
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            expected_masked = {v: c for v, c in value_counts.items() if v != 1}
+            assert actual == expected_masked
+
+    async def test_cardinality_ceiling_is_enforced(
+        self, dataset_factory, annual_data, crosswalk, monkeypatch
+    ):
+        """`annual_data`'s default value_fn (`year + geo_id/100`) makes every source cell
+        its own distinct value -- exactly what the ceiling exists to catch (see
+        config.COUNT_BY_VALUE_MAX_DISTINCT and count_by_value_frame's docstring)."""
+        monkeypatch.setattr(dataset_module, "COUNT_BY_VALUE_MAX_DISTINCT", 1)
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "distinct" in excinfo.value.detail
+
+    async def test_group_aggregate_count_by_value_is_rejected(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="count_by_value")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "count_by_value" in excinfo.value.detail
+
+    async def test_calculate_params_are_rejected_with_count_by_value(
+        self, dataset_factory, categorical_annual_data, crosswalk
+    ):
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count_by_value",
+            negate="1 = 1",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "count_by_value" in excinfo.value.detail
 
 
 class TestSortAndSelectStage:

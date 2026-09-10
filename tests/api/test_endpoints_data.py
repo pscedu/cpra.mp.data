@@ -29,6 +29,7 @@ from tests.factories import (
     write_pmtiles,
     write_raster_crosswalk,
     write_raster_dataset,
+    write_vector_crosswalk,
 )
 
 VECTOR_URL = "/v1/datasets/ssf/annual/ecoregion_v001"
@@ -85,6 +86,44 @@ def raster_data(base_path, monkeypatch):
     write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
+
+
+@pytest.fixture
+def categorical_vector_data(base_path, crosswalk_path, monkeypatch):
+    """ssf/ecoregion_v001 with a bounded categorical value (geo_id % 3) instead of
+    `annual_frame`'s default continuous `year + geo_id/100`, plus a crosswalk onto
+    hydro_compartment_v001 -- the shape count_by_value needs end to end (`summarize_by` +
+    `summarize_aggregate=count_by_value`), through routing and query-string parsing.
+    """
+    write_parquet(
+        annual_frame(years=(2030,), value_fn=lambda _year, geo_id: float(geo_id % 3)),
+        base_path=base_path,
+    )
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    write_vector_crosswalk(
+        crosswalk_path,
+        "ecoregion_v001",
+        "hydro_compartment_v001",
+        [(geo_id, 100 if geo_id <= 16 else 200, 1.0) for geo_id in range(1, 33)],
+    )
+    return base_path
+
+
+@pytest.fixture
+def categorical_raster_with_zones(base_path, crosswalk_path, monkeypatch):
+    """A raster whose pixels cycle through a handful of categories, split into two zones
+    -- the count_by_value counterpart to `gradient_raster_with_zones` below."""
+    from cpra.mp.data.grids import GRIDS
+
+    write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array() % 5)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+    grid = GRIDS[RASTER_KWARGS["grid"]]
+    zones = np.zeros((grid.height, grid.width), dtype="int32")
+    zones[: grid.height // 2, :] = 1
+    zones[grid.height // 2 :, :] = 2
+    write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+    return base_path, grid, zones
 
 
 @pytest.fixture
@@ -271,6 +310,31 @@ class TestVectorData:
         assert df.height == 32
         assert df["value"].to_list() == [1] * 32
 
+    def test_count_by_value_per_zone_is_one_request(self, client, categorical_vector_data):
+        """"How many cells carry each distinct value per zone" -- one `summarize_by` +
+        `summarize_aggregate=count_by_value` request, asserting the long output shape
+        (grid_cell/value/count/geographic_unit), end to end through routing and
+        query-string parsing rather than a directly constructed `Dataset`.
+        """
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={"summarize_by": "hydro_compartment_v001", "summarize_aggregate": "count_by_value"},
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
+
+        expected = {100: {}, 200: {}}
+        for geo_id in range(1, 33):
+            zone = 100 if geo_id <= 16 else 200
+            value = float(geo_id % 3)
+            expected[zone][value] = expected[zone].get(value, 0) + 1
+
+        for zone_id, value_counts in expected.items():
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            assert actual == value_counts
+
 
 class TestRasterData:
     def test_tif(self, client, raster_data):
@@ -331,6 +395,30 @@ class TestRasterData:
         for zone_id in (1, 2):
             expected = int((gradient[zones == zone_id] > threshold).sum())
             actual = df.filter(pl.col("grid_cell") == zone_id)["value"][0]
+            assert actual == expected
+
+    def test_count_by_value_per_zone_is_one_request(self, client, categorical_raster_with_zones):
+        """"How many pixels of each land-type value per hydro compartment" -- one
+        `summarize_by` + `summarize_aggregate=count_by_value` request, asserting the long
+        output shape (grid_cell/value/count/geographic_unit), end to end through routing
+        and query-string parsing rather than a directly constructed `Dataset`.
+        """
+        _base_path, _grid, zones = categorical_raster_with_zones
+        categories = raster_array() % 5
+
+        response = client.get(
+            f"{RASTER_URL}/data.csv",
+            params={"summarize_by": "hydro_compartment_v001", "summarize_aggregate": "count_by_value"},
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
+
+        for zone_id in (1, 2):
+            values, counts = np.unique(categories[zones == zone_id], return_counts=True)
+            expected = dict(zip(values.tolist(), counts.tolist()))
+            zone_df = df.filter(pl.col("grid_cell") == zone_id)
+            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
             assert actual == expected
 
 

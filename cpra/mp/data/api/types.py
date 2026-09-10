@@ -41,6 +41,17 @@ class AggregateFunction(str, Enum):
     min = "min"
     sum = "sum"
 
+    # A different OUTPUT SHAPE from every value above: one row per (group, distinct
+    # value) rather than one row per group. Meaningful only as a `summarize_aggregate`
+    # (zonal count-by-category, e.g. "how many pixels of each land-type value per hydro
+    # compartment") -- `Dataset._apply_group_params` rejects it as a `group_aggregate` on
+    # both grid types, since a `group_by`/`group_aggregate` collapse (raster band-collapse
+    # or vector dimension-collapse) has no way to also multiply its own row count by the
+    # number of distinct values without breaking that collapse's "one row per group"
+    # contract. See `expressions.count_by_value_frame` for the cardinality bound this
+    # requires.
+    count_by_value = "count_by_value"
+
 
 class CompressionAlgorithm(str, Enum):
     deflate = "deflate"
