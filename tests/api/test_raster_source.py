@@ -13,6 +13,7 @@ import pytest
 import rasterio as rio
 from polars.io.plugins import register_io_source
 
+from cpra.mp.data.api import raster_source
 from cpra.mp.data.api import utils as api_utils
 from cpra.mp.data.api.raster_source import _batched_windows, guarded_aggregate, scan_rasters
 from cpra.mp.data.api.utils import raster_blocks_per_batch
@@ -21,6 +22,61 @@ from cpra.mp.data.grids import GRIDS
 from tests.factories import RASTER_KWARGS, write_raster_crosswalk, write_raster_dataset
 
 GRID = GRIDS[RASTER_KWARGS["grid"]]
+
+
+def _gradient(offset=0):
+    """Every pixel a distinct, non-negative int32 value, offset per caller.
+
+    `raster_data` (fixed fill per file) can't exercise a pixel-level predicate at all --
+    every pixel in a file agrees, so a filter either keeps everything or nothing. This is
+    the fixture the predicate-pushdown tests need instead: a gradient, so a comparison
+    against a threshold actually discriminates between pixels, and an `offset` per file so
+    a two-band predicate (`b0` vs `b1`) discriminates differently per column too.
+    """
+    return (np.arange(GRID.height * GRID.width, dtype="int32") + offset).reshape(GRID.height, GRID.width)
+
+
+@pytest.fixture
+def varied_raster_data(base_path):
+    """Two COGs (2030, 2040), each a distinct gradient -- see `_gradient`."""
+    write_raster_dataset(
+        base_path, years=(2030, 2040), data_fn=lambda y: _gradient(offset=(0 if y == 2030 else 1_000_000))
+    )
+    return base_path
+
+
+@pytest.fixture
+def nodata_raster_data(base_path):
+    """One COG whose first 10 pixels are the nodata sentinel every `write_cog` profile
+    bakes in (-9999 -- see `raster.py:_cog_profile`), planted inside a gradient that
+    never legitimately goes negative, so any sentinel that leaks through a predicate is
+    unambiguous rather than indistinguishable from a real value (the same ambiguity the
+    plan's Phase 0.2 section flags for the real elevation sentinel).
+    """
+    def data_fn(year):
+        arr = _gradient()
+        arr.reshape(-1)[:10] = -9999
+        return arr
+
+    write_raster_dataset(base_path, years=(2030,), data_fn=data_fn)
+    return base_path
+
+
+def _spy_register_io_source(monkeypatch, captured):
+    """Wrap `raster_source.register_io_source` so every batch's `predicate` argument is
+    recorded, while still registering the real source underneath -- so a test can observe
+    what Polars decided to push down without changing what the query actually returns.
+    """
+    real_register = register_io_source
+
+    def spy(source, schema):
+        def wrapped(with_columns, predicate, n_rows, batch_size):
+            captured.append(predicate)
+            yield from source(with_columns, predicate, n_rows, batch_size)
+
+        return real_register(wrapped, schema=schema)
+
+    monkeypatch.setattr(raster_source, "register_io_source", spy)
 
 
 @pytest.fixture
@@ -186,3 +242,165 @@ class TestStreamingEngineHazard:
         lf = register_io_source(naive_source, schema=schema)
         with pytest.raises(pl.exceptions.ComputeError, match="GDAL environment"):
             lf.collect(engine="streaming")
+
+
+class TestPredicatePushdownReachesTheSource:
+    """`source`'s `predicate` parameter (raster_source.py, applied at lines ~353-355,
+    after nodata masking) had never been exercised by any query before this test existed
+    -- so it was unverified whether Polars ever pushes a filter down into this particular
+    IO plugin at all, as opposed to always collecting everything and filtering
+    afterwards. Both engines are checked because the plan flags exactly this kind of
+    divergence: the production summarize path (`_summarize_zone_stats_plugin`) collects
+    under ``engine="streaming"``, and pushdown behaviour is not guaranteed to be the same
+    between engines.
+    """
+
+    @pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+    def test_predicate_reaches_the_source(self, raster_data, monkeypatch, engine):
+        captured = []
+        _spy_register_io_source(monkeypatch, captured)
+        paths = _paths_by_year(raster_data)
+
+        lf = scan_rasters([paths[0]], [[0]], [None])
+        lf.filter(pl.col("b0") > 15).collect(engine=engine)
+
+        assert captured, "the source was never called at all"
+        assert any(p is not None for p in captured), (
+            f"predicate never reached the source under engine={engine!r} -- "
+            "every batch was collected and filtered post-hoc instead"
+        )
+
+
+class TestPredicateCorrectness:
+    """A pushed predicate is only a placement optimization: filtering inside the source
+    must return exactly the rows collecting everything and filtering afterwards would.
+    Run under both engines, since a bug that only manifests when the source resumes on a
+    different thread (the streaming hazard `TestStreamingEngineHazard` documents) would
+    otherwise only show up in production.
+    """
+
+    @pytest.mark.parametrize("engine", ["in-memory", "streaming"])
+    def test_simple_comparison(self, varied_raster_data, engine):
+        paths = _paths_by_year(varied_raster_data)
+        lf = scan_rasters([paths[0]], [[0]], [None])
+        predicate = pl.col("b0") > 200_000
+
+        pushed = lf.filter(predicate).collect(engine=engine).sort("b0")
+        posthoc = lf.collect(engine=engine).filter(predicate).sort("b0")
+
+        assert pushed.equals(posthoc)
+        assert 0 < pushed.height < GRID.height * GRID.width
+
+    def test_compound_and_of_two_band_comparisons(self, varied_raster_data):
+        """`b0` and `b1` come from different files (`varied_raster_data` offsets the
+        second file's gradient by 1,000,000), so this also exercises a predicate spanning
+        columns backed by different underlying rasters."""
+        paths = _paths_by_year(varied_raster_data)
+        lf = scan_rasters(paths, [[0], [1]], [None, None])
+        predicate = (pl.col("b0") > 100_000) & (pl.col("b1") < 1_300_000)
+
+        pushed = lf.filter(predicate).collect().sort(["b0", "b1"])
+        posthoc = lf.collect().filter(predicate).sort(["b0", "b1"])
+
+        assert pushed.equals(posthoc)
+        assert pushed.height > 0
+
+    def test_grid_cell_filter_combined_with_band_comparison(self, varied_raster_data, zone_crosswalk_path):
+        paths = _paths_by_year(varied_raster_data)
+        zone_ids = np.array([1, 2], dtype="int64")
+        lf = scan_rasters([paths[0]], [[0]], [None], zones_path=zone_crosswalk_path, zone_ids=zone_ids)
+        predicate = (pl.col("grid_cell") == 1) & (pl.col("b0") > 100_000)
+
+        pushed = lf.filter(predicate).collect().sort("b0")
+        posthoc = lf.collect().filter(predicate).sort("b0")
+
+        assert pushed.equals(posthoc)
+        assert pushed.height > 0
+        assert (pushed["grid_cell"] == 1).all()
+
+    def test_filter_combined_with_column_projection(self, varied_raster_data):
+        """A `select` of a subset of bands alongside a filter -- projection pushdown and
+        predicate pushdown exercised together, not just each in isolation."""
+        paths = _paths_by_year(varied_raster_data)
+        lf = scan_rasters(paths, [[0], [1]], [None, None])
+        predicate = pl.col("b0") > 200_000
+
+        pushed = lf.select("b0").filter(predicate).collect().sort("b0")
+        posthoc = lf.select("b0").collect().filter(predicate).sort("b0")
+
+        assert pushed.equals(posthoc)
+        assert pushed.columns == ["b0"]
+        assert pushed.height > 0
+
+
+class TestNodataPredicatePushdownInteraction:
+    """Masking (raster_source.py's `mask_nodata` block) runs BEFORE the predicate is
+    applied, so a masked pixel is null by the time any filter sees it; `null > x`
+    evaluates to null, and Polars' `filter` drops null results the same way it drops
+    `False` ones. If masking and pushdown were ever reordered, a nodata sentinel could
+    satisfy a predicate it has no business satisfying (e.g. `-9999 > -10000` is true on
+    the raw value) and silently reappear in a pushed-predicate result.
+    """
+
+    def test_nodata_pixels_never_satisfy_a_predicate_they_would_pass_unmasked(self, nodata_raster_data):
+        paths = _paths_by_year(nodata_raster_data)
+        lf = scan_rasters([paths[0]], [[0]], [None])
+        # True of the raw -9999 sentinel; must be false (i.e. absent, not merely False)
+        # once masking has turned those 10 pixels to null.
+        predicate = pl.col("b0") > -10_000
+
+        pushed = lf.filter(predicate).collect().sort("b0")
+        posthoc = lf.collect().filter(predicate).sort("b0")
+
+        assert pushed.equals(posthoc)
+        assert pushed.height == GRID.height * GRID.width - 10
+        assert pushed["b0"].min() >= 0
+
+
+class TestWhichPredicateFormsPushDown:
+    """Records, as an executable fact rather than a claim in a comment, which predicate
+    shapes this Polars version (1.41.2 as of writing) actually pushes into the source
+    versus keeps for a post-scan filter. Both are legitimate outcomes for correctness --
+    a predicate Polars keeps post-scan still produces the right rows, just without the
+    pushdown's memory/speed benefit (see raster_source.py and the plan's 94x-memory-cliff
+    measurement) -- so this class only pins down *which* forms currently push down, not
+    that they must.
+    """
+
+    @pytest.mark.parametrize(
+        "label, expr",
+        [
+            ("is_in", pl.col("b0").is_in([1, 2, 3])),
+            ("is_null", pl.col("b0").is_null()),
+            ("or_compound", (pl.col("b0") > 300_000) | (pl.col("b0") < 2)),
+        ],
+    )
+    def test_forms_that_push_down(self, raster_data, monkeypatch, label, expr):
+        """`is_in`, `is_null`, and an OR of two plain comparisons all arrive at the
+        source as a non-None predicate on this Polars version -- confirmed empirically,
+        not assumed."""
+        captured = []
+        _spy_register_io_source(monkeypatch, captured)
+        paths = _paths_by_year(raster_data)
+        lf = scan_rasters([paths[0]], [[0]], [None])
+
+        lf.filter(expr).collect()
+
+        assert any(p is not None for p in captured), f"{label} did not push down as expected"
+
+    def test_aggregate_inside_predicate_does_not_push_down(self, raster_data, monkeypatch):
+        """The one form that is NOT pushed: an aggregate inside the filter forces Polars
+        to see every row before it can evaluate the comparison, so nothing survives to
+        hand the source a row-level predicate -- the mechanism behind the plan's measured
+        94x memory cliff. Confirmed empirically here (`captured` holds only `None`s)
+        rather than assumed from the plan's prose.
+        """
+        captured = []
+        _spy_register_io_source(monkeypatch, captured)
+        paths = _paths_by_year(raster_data)
+        lf = scan_rasters([paths[0]], [[0]], [None])
+
+        lf.filter(pl.col("b0") == pl.col("b0").min()).collect()
+
+        assert captured, "the source was never called at all"
+        assert all(p is None for p in captured), "an aggregate-bearing predicate unexpectedly pushed down"

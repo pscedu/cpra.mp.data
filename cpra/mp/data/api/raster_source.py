@@ -20,6 +20,7 @@ import rasterio as rio
 from polars.io.plugins import register_io_source
 from rasterio import windows
 
+from cpra.mp.data.api.expressions import rewrite_value_column, value_predicate_mask
 from cpra.mp.data.api.utils import raster_blocks_per_batch, raster_gdal_env
 
 NUMPY_TO_POLARS = {
@@ -38,7 +39,17 @@ NUMPY_TO_POLARS = {
 # is deliberate: Polars would otherwise accumulate a Float32 column in Float32, which
 # diverged from the numpy path's explicit float64 accumulation by ~1.5 absolute over 10M
 # pixels in an earlier round. `min`/`max` need no cast -- they never accumulate.
+#
+# `count` has no numpy-path counterpart (`RASTER_AGGREGATES` in dataset.py is unaware of
+# it -- see `_summarize_zone_stats_numpy`'s docstring) because it exists only for the
+# plugin-routed conditional-count query ("how many pixels in this zone satisfy X"): a
+# value-where mask (see expressions.value_predicate_mask / masked_value_predicate_exprs
+# below) nulls out non-matching pixels, and `count()` is Polars' own null-skipping
+# row-count, so "count contributing pixels" and "count pixels the predicate kept" are the
+# same operation with no extra code. It is deliberately absent from
+# `HORIZONTAL_RASTER_AGGREGATES` below -- see that dict's docstring.
 POLARS_RASTER_AGGREGATES = {
+    "count": lambda c: c.count(),
     "sum": lambda c: c.cast(pl.Float64).sum(),
     "mean": lambda c: c.cast(pl.Float64).mean(),
     "min": lambda c: c.min(),
@@ -171,7 +182,16 @@ def guarded_aggregate(aggregate, name):
     zone) with no contributing pixel at all. `count()` skips nulls, so it is exactly the
     contributing-pixel count (the numpy path's `valid`), and the guard below is needed for
     all four aggregates, not just `sum`, to make the two paths agree exactly.
+
+    `count` itself is deliberately exempt from the guard: unlike a mean or a sum, "zero
+    contributing pixels" is `count`'s own correct answer, not an edge case standing in for
+    an undefined one -- a zone with no pixels satisfying a value-where predicate really did
+    have zero of them, and reporting that as `NaN` would turn a real, meaningful zero into
+    a missing-value marker.
     """
+    if aggregate == "count":
+        return pl.col(name).count().alias(name)
+
     agg_fn = POLARS_RASTER_AGGREGATES[aggregate]
     c = pl.col(name)
     return (
@@ -180,6 +200,36 @@ def guarded_aggregate(aggregate, name):
         .otherwise(agg_fn(c))
         .alias(name)
     )
+
+
+def masked_value_predicate_exprs(raw_names, expr_str, extra_columns=()):
+    """Per-band value-where masking: null out a band's own pixel wherever `expr_str`
+    (written once, against the placeholder column `value`) evaluates false for it.
+
+    Returns one expression per name in `raw_names`, each aliased back to that same name,
+    meant for a `with_columns` call on the plugin's output frame -- so the caller gets
+    back a frame with the identical shape and column names it started with, just with
+    some values replaced by null. That is deliberate: masking to null (rather than
+    filtering rows) is what lets a value-where predicate compose with the row-wide band
+    layout (one row is one pixel, N bands) without a match on one band's predicate
+    dropping its sibling bands' values too, and it is what lets a masked-out value fall
+    into the SAME null-skipping aggregate machinery a masked-out nodata pixel already
+    does (`guarded_aggregate`, `POLARS_RASTER_AGGREGATES`) -- no separate "predicate
+    failed" code path.
+
+    `expr_str` is rewritten per band via `rewrite_value_column` (the placeholder becomes
+    that band's own synthetic column name), then parsed and whitelisted independently by
+    `value_predicate_mask` -- each band's namespace is exactly `{that band, *extra_columns}`,
+    never every band at once, so a predicate cannot accidentally (or intentionally) compare
+    one band against another. `extra_columns` exists for `grid_cell`, when a caller also
+    wants a value-where predicate to be allowed to reference it (e.g. "value > x" scoped by
+    zone) -- empty by default, since most callers don't need it.
+    """
+    exprs = []
+    for name in raw_names:
+        mask = value_predicate_mask(rewrite_value_column(expr_str, name), allowed_columns=[name, *extra_columns])
+        exprs.append(pl.when(mask).then(pl.col(name)).otherwise(None).alias(name))
+    return exprs
 
 
 def _raster_dtype(path):

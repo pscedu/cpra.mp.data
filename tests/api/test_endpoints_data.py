@@ -8,6 +8,7 @@ import io
 import json
 
 import mercantile
+import numpy as np
 import polars as pl
 import pytest
 import rasterio as rio
@@ -23,8 +24,10 @@ from tests.factories import (
     RASTER_KWARGS,
     annual_frame,
     daily_frame,
+    raster_array,
     write_grid_geometry,
     write_pmtiles,
+    write_raster_crosswalk,
     write_raster_dataset,
 )
 
@@ -82,6 +85,26 @@ def raster_data(base_path, monkeypatch):
     write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
+
+
+@pytest.fixture
+def gradient_raster_with_zones(base_path, crosswalk_path, monkeypatch):
+    """A raster whose pixels are a gradient (see `raster_array`'s no-fill case), split
+    into two zones by row, for a `summarize_by`+`value_where` conditional-count request
+    -- the exit-criterion query, end to end through the ASGI app rather than a unit-level
+    `Dataset`.
+    """
+    from cpra.mp.data.grids import GRIDS
+
+    write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array())
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+    grid = GRIDS[RASTER_KWARGS["grid"]]
+    zones = np.zeros((grid.height, grid.width), dtype="int32")
+    zones[: grid.height // 2, :] = 1
+    zones[grid.height // 2 :, :] = 2
+    write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+    return base_path, grid, zones
 
 
 class TestFloatPrecision:
@@ -234,6 +257,20 @@ class TestVectorData:
         response = client.get(f"{VECTOR_URL}/data.csv?group_by=calendar_year")
         assert response.status_code == 400
 
+    def test_conditional_count_is_one_request(self, client, vector_data):
+        """"Count cells where value > x" -- one `value_where` + `group_aggregate=count`
+        request, no separate fetch-then-filter-then-count round trip on the client side.
+        Cell (year, geo) holds year + geo/100 (see `annual_frame`), so a threshold
+        between the two written years isolates exactly one year's worth of matches.
+        """
+        response = client.get(
+            f"{VECTOR_URL}/data.csv", params={"value_where": "value > 2035", "group_aggregate": "count"}
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.height == 32
+        assert df["value"].to_list() == [1] * 32
+
 
 class TestRasterData:
     def test_tif(self, client, raster_data):
@@ -270,6 +307,31 @@ class TestRasterData:
     def test_missing_dataset_is_404(self, client, base_path, monkeypatch):
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         assert client.get(f"{RASTER_URL}/data.tif").status_code == 404
+
+    def test_conditional_count_per_zone_is_one_request(self, client, gradient_raster_with_zones):
+        """The plan's target query -- "count pixels per compartment where value > X" --
+        expressed as one API request (`summarize_by` + `summarize_aggregate=count` +
+        `value_where`), end to end through routing and query-string parsing rather than
+        a directly constructed `Dataset`.
+        """
+        _base_path, _grid, zones = gradient_raster_with_zones
+        gradient = raster_array()
+        threshold = 100_000
+
+        response = client.get(
+            f"{RASTER_URL}/data.csv",
+            params={
+                "summarize_by": "hydro_compartment_v001",
+                "summarize_aggregate": "count",
+                "value_where": f"value > {threshold}",
+            },
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        for zone_id in (1, 2):
+            expected = int((gradient[zones == zone_id] > threshold).sum())
+            actual = df.filter(pl.col("grid_cell") == zone_id)["value"][0]
+            assert actual == expected
 
 
 class TestRasterTiles:

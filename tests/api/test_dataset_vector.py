@@ -166,6 +166,77 @@ class TestFilterStage:
         assert dataset.materialize()["scenario_id"].unique().to_list() == [8]
 
 
+class TestValueWhereStage:
+    """`value_where` (Options.value_where) is a predicate over VALUES, unlike `where`
+    (dimensions). Cell (year, geo) holds `year + geo/100` (see `annual_frame`), so a
+    threshold between the two years' ranges isolates exactly one year's rows.
+    """
+
+    async def test_non_matching_values_are_masked_to_null_not_dropped(
+        self, dataset_factory, annual_data
+    ):
+        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        # Masking, not filtering: every row from both years is still present.
+        assert df.height == 2 * 32
+        assert df.filter(pl.col("calendar_year") == 2030)["value"].null_count() == 32
+        assert df.filter(pl.col("calendar_year") == 2040)["value"].null_count() == 0
+
+    async def test_masked_values_are_excluded_from_a_group_by_count(
+        self, dataset_factory, annual_data
+    ):
+        """Null-skipping `count()` on a masked column is exactly "how many values
+        satisfied the predicate" -- the conditional-count capability."""
+        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035", group_aggregate="count")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        assert df.height == 32
+        assert df["value"].to_list() == [1] * 32
+
+    async def test_masked_values_are_excluded_from_a_group_by_sum(
+        self, dataset_factory, annual_data
+    ):
+        """A non-count aggregate over a masked column is a conditional aggregate for
+        free ("sum of values where value > x"), not just conditional counting."""
+        source = annual_frame(years=(2030, 2040))
+        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035", group_aggregate="sum")
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1)
+        assert df["value"][0] == pytest.approx(source["1"][1], rel=1e-5)
+
+    async def test_predicate_may_reference_a_dimension_column_too(
+        self, dataset_factory, annual_data
+    ):
+        """The vector value namespace is value + dimension columns + grid_cell -- unlike
+        the raster side, a vector row already carries its own dimension columns."""
+        dataset = dataset_factory(DIMENSIONS, value_where="calendar_year > 2035 and value > 0")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        assert df.filter(pl.col("calendar_year") == 2030)["value"].null_count() == 32
+        assert df.filter(pl.col("calendar_year") == 2040)["value"].null_count() == 0
+
+    async def test_unknown_column_is_rejected(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, value_where="not_a_column > 3")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "not_a_column" in excinfo.value.detail
+
+    async def test_aggregate_inside_the_predicate_is_rejected(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, value_where="value = min(value)")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "min" in excinfo.value.detail
+
+    async def test_disallowed_function_is_rejected(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, value_where="upper(value) = 'X'")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+
+
 class TestGridCellCoordinates:
     """grid_cell= on a vector grid may be grid cell IDs (as above) or lat/lng pairs,
     resolved to grid cell IDs via point-in-polygon lookup against config.GRIDS_PATH."""

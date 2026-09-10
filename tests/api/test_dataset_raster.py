@@ -971,3 +971,181 @@ class TestPluginEligibility:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
         assert await self._plugin_was_called(dataset, monkeypatch) is False
+
+
+class TestValueWherePixelPredicate:
+    """`value_where` -- a predicate over pixel VALUES, not dimensions -- is only
+    meaningful once pixels are actually being summarized (see
+    `_apply_transform_params_raster`'s docstring): it is masked in per band, before the
+    multiplier/group_aggregate collapse (`_summarize_zone_stats_plugin`), so
+    `summarize_aggregate=count` together with it is exactly "count pixels per zone where
+    value > X" -- and any other summarize_aggregate becomes its conditional counterpart
+    ("sum of pixels where...", etc.) for free via the same null-skipping mechanism nodata
+    already uses.
+    """
+
+    @pytest.fixture
+    def gradient_raster_data(self, base_path):
+        """One COG whose pixels are a distinct, strictly increasing gradient (row-major
+        0..N-1 -- see `raster_array`'s no-fill case) rather than a uniform fill, so a
+        value threshold selects a known, non-trivial subset of pixels per zone."""
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array())
+        return base_path
+
+    def _zone_values(self):
+        """The same zone split `zone_crosswalk` writes (zone 1 on top, zone 2 below),
+        applied directly to the gradient array, so expected counts/sums are derived from
+        the fixture's own data rather than hand-computed and liable to drift from it."""
+        zones = np.zeros((GRID.height, GRID.width), dtype="int32")
+        zones[: GRID.height // 2, :] = 1
+        zones[GRID.height // 2 :, :] = 2
+        gradient = raster_array()
+        return {zone_id: gradient[zones == zone_id] for zone_id in (1, 2)}
+
+    async def test_conditional_count_per_zone(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk
+    ):
+        threshold = 100_000
+        zone_values = self._zone_values()
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count",
+            value_where=f"value > {threshold}",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        for zone_id, values in zone_values.items():
+            actual = df.filter(pl.col("grid_cell") == zone_id)["value"][0]
+            assert actual == (values > threshold).sum()
+
+    async def test_conditional_sum_masks_non_matching_pixels(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk
+    ):
+        """A non-count aggregate with value_where is a conditional aggregate for free,
+        not a capability specific to count."""
+        threshold = 383_000
+        zone_values = self._zone_values()
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="sum",
+            value_where=f"value > {threshold}",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        for zone_id, values in zone_values.items():
+            matching = values[values > threshold].astype("float64")
+            actual = df.filter(pl.col("grid_cell") == zone_id)["value"][0]
+            if matching.size == 0:
+                # Every pixel in this zone was masked out -- the all-nodata-equivalent
+                # NaN, exactly as guarded_aggregate already gives an empty group.
+                assert np.isnan(actual)
+            else:
+                assert actual == pytest.approx(matching.sum())
+
+    async def test_value_where_without_summarize_is_rejected(self, dataset_factory, raster_data):
+        dataset = dataset_factory(DIMENSIONS, value_where="value > 3")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "value_where" in excinfo.value.detail
+
+    async def test_value_where_forces_the_plugin_regardless_of_the_flag(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
+    ):
+        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="sum",
+            value_where="value > 100000",
+        )
+        called = []
+        original = dataset._summarize_zone_stats_plugin
+
+        def spy(*args, **kwargs):
+            called.append(True)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dataset, "_summarize_zone_stats_plugin", spy)
+        await dataset.apply_params()
+        assert called
+
+    async def test_summarize_aggregate_count_forces_the_plugin_regardless_of_the_flag(
+        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    ):
+        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
+        dataset = dataset_factory(
+            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count"
+        )
+        called = []
+        original = dataset._summarize_zone_stats_plugin
+
+        def spy(*args, **kwargs):
+            called.append(True)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dataset, "_summarize_zone_stats_plugin", spy)
+        await dataset.apply_params()
+        assert called
+
+    async def test_group_aggregate_count_is_rejected(self, dataset_factory, raster_data):
+        """group_aggregate is the band-COLLAPSE step, not the zonal summarize aggregate
+        `summarize_aggregate` shares its enum values with -- "how many bands contributed
+        to this pixel" has no natural per-pixel meaning (see the AggregateFunction.count
+        comment in types.py)."""
+        dataset = dataset_factory(DIMENSIONS, group_aggregate="count")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "count" in excinfo.value.detail
+
+    async def test_unknown_column_is_rejected_before_any_pixel_data_is_read(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
+    ):
+        called = []
+
+        def fail_if_called(*args, **kwargs):
+            called.append(True)
+            raise AssertionError("scan_rasters should not run: the expression should have been rejected first")
+
+        monkeypatch.setattr(dataset_module, "scan_rasters", fail_if_called)
+
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count",
+            value_where="not_a_column > 3",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "not_a_column" in excinfo.value.detail
+        assert not called
+
+    async def test_aggregate_inside_the_predicate_is_rejected_before_any_pixel_data_is_read(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
+    ):
+        """The plan-time rule the 94x memory cliff (see api/expressions.py's module
+        docstring) requires: an aggregate inside a value predicate is refused before
+        `scan_rasters` -- and so before any COG or crosswalk file -- is ever touched."""
+        called = []
+
+        def fail_if_called(*args, **kwargs):
+            called.append(True)
+            raise AssertionError("scan_rasters should not run: the expression should have been rejected first")
+
+        monkeypatch.setattr(dataset_module, "scan_rasters", fail_if_called)
+
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count",
+            value_where="value = min(value)",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "min" in excinfo.value.detail
+        assert not called

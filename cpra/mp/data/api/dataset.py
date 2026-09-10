@@ -23,6 +23,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
+from cpra.mp.data.api.expressions import ExpressionError, parse_value_expr, value_predicate_mask
 from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
     project_coordinates,
@@ -33,6 +34,7 @@ from cpra.mp.data.api.raster_source import (
     band_collapse_exprs,
     guarded_aggregate,
     horizontal_aggregate_expr,
+    masked_value_predicate_exprs,
     scan_rasters,
 )
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -278,6 +280,30 @@ class Dataset(LazyFrameSource):
         if self.options.where:
             self.lf = self.lf.sql(f"select * from self where {self.options.where}")
 
+        # A vector frame already carries a real `value` column at this point, so
+        # `value_where` can be masked in directly here. A raster's `value` doesn't exist
+        # yet -- `self.lf` is still the band-metadata table (path/band/dimensions), one
+        # row per selected band, not one row per pixel -- so the raster half of this same
+        # option is applied later, per band, once pixels are actually read (see
+        # `_apply_transform_params_raster` / `_summarize_zone_stats_plugin`).
+        #
+        # Masking to null rather than filtering the row out is deliberate here too, for
+        # the same reason as the raster side: it lets a `value_where` predicate compose
+        # with whatever aggregate the request goes on to apply (`group_aggregate`,
+        # `summarize_aggregate`) via their EXISTING null-skipping behavior, rather than
+        # needing a second, predicate-aware code path. A plain `where=value > x` (SQL,
+        # unrestricted, run above) already happens to drop rows that fail such a
+        # predicate -- but that's a row filter, which is wrong once an aggregate is in
+        # play: it would also erase the group/zone's siblings that DO belong in the
+        # denominator for min/max/mean, and would make "count how many values passed"
+        # indistinguishable from "count how many rows exist".
+        if self.options.value_where is not None and self.grid.grid_type == "vector":
+            try:
+                mask = value_predicate_mask(self.options.value_where, self.lf.collect_schema().names())
+            except ExpressionError as exc:
+                self._error(str(exc))
+            self.lf = self.lf.with_columns(pl.when(mask).then(pl.col("value")).otherwise(None).alias("value"))
+
         if self.options.grid_cell:
             if self.grid.grid_type == "vector":
                 await self._apply_grid_cell_vector()
@@ -403,6 +429,17 @@ class Dataset(LazyFrameSource):
 
         group_by_cols = self._get_group_by_columns()
         if self._is_raster_metadata_table():
+            if self.options.group_aggregate == "count":
+                # group_aggregate is the raster band-COLLAPSE step
+                # (`raster_source.HORIZONTAL_RASTER_AGGREGATES`), reducing ACROSS one
+                # pixel's selected bands -- unlike the zonal summarize aggregate this
+                # option shares its name and values with, "how many of these bands
+                # contributed to this pixel" has no natural per-pixel scalar meaning the
+                # way max/mean/min/sum do (see the `AggregateFunction.count` comment in
+                # types.py). Rejected explicitly here rather than left to fail as a raw
+                # `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` deep in a later stage.
+                self._error("group_aggregate 'count' is not supported for raster grids")
+
             # agg_groups() is deprecated and panics when grouping on a literal (the
             # group_aggregate-without-group_by case, group_by_cols == [True]), so track
             # row positions via with_row_index instead.
@@ -519,8 +556,34 @@ class Dataset(LazyFrameSource):
         implementations -- see `_summarize_zone_stats_numpy` and
         `_summarize_zone_stats_plugin` -- both returning a `(n_bands, zone_ids.size)`
         array in the same shape, so the assembly below doesn't need to know which one ran.
+
+        `value_where` (a per-pixel value predicate -- see `Options.value_where`) is only
+        meaningful here, at the summarize stage: it is what `_summarize_zone_stats_plugin`
+        masks each band's raw pixel value against, before the multiplier/group_aggregate
+        collapse, so "count pixels above X" and "sum of pixels above X" both fall out of
+        the existing null-skipping zonal aggregates for free. A plain, non-summarized
+        raster selection has no zonal aggregate to feed a mask into and no per-pixel
+        frame the API exposes to a caller at all (`self.lf` is the band-metadata table
+        until this method builds one) -- so a `value_where` given without `summarize_by`/
+        `summarize_aggregate` is rejected outright below, rather than silently ignored.
         """
+        if self.options.value_where is not None:
+            # Parsed here, against the placeholder namespace every value_where caller
+            # writes against (`value`, `grid_cell`), before touching the crosswalk file,
+            # `self.materialize()`, or any pixel data -- an aggregate-inside-predicate or
+            # a whitelist violation is rejected before a single file is opened, not
+            # discovered partway through a streaming collect. `_summarize_zone_stats_plugin`
+            # re-parses the same string per selected band (each band's own namespace is
+            # exactly {that band, grid_cell} -- see `masked_value_predicate_exprs`), so this
+            # call is a validation pass, not the one whose result gets used.
+            try:
+                parse_value_expr(self.options.value_where, ["value", "grid_cell"])
+            except ExpressionError as exc:
+                self._error(str(exc))
+
         if not self._validate_summarize_params():
+            if self.options.value_where is not None:
+                self._error("value_where requires summarize_by and summarize_aggregate for raster grids")
             return
 
         crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.tif"
@@ -547,9 +610,24 @@ class Dataset(LazyFrameSource):
         # The plugin path (`scan_rasters`) now applies the same multiplier/group-aggregate
         # pre-collapse as the numpy path's `get_raster_array`, via the shared
         # `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary in
-        # raster_source.py -- see `_summarize_zone_stats_plugin` -- so eligibility depends
-        # only on the flag, not on which parameters are in play.
-        plugin_eligible = RASTER_USE_IO_PLUGIN
+        # raster_source.py -- see `_summarize_zone_stats_plugin` -- so eligibility would
+        # otherwise depend only on the flag, not on which parameters are in play.
+        #
+        # `summarize_aggregate == "count"` and `value_where` are the two exceptions: a
+        # per-pixel value predicate needs a per-pixel frame to mask, which only the
+        # plugin's row-per-pixel scan exposes (`_summarize_zone_stats_numpy` never
+        # materializes one -- its whole design point is the batched `reduceat` fold that
+        # avoids it), and `count` has no numpy-path implementation at all
+        # (`RASTER_AGGREGATES` above has no `count` entry -- see its docstring). Routing
+        # these two through the plugin regardless of the flag, rather than erroring when
+        # the flag is off, keeps exactly one execution path per request SHAPE: a
+        # conditional-count query always means one thing, instead of behaving differently
+        # depending on an operator-facing rollout flag the caller has no visibility into.
+        plugin_eligible = (
+            RASTER_USE_IO_PLUGIN
+            or self.options.summarize_aggregate == "count"
+            or self.options.value_where is not None
+        )
 
         if plugin_eligible:
             result = await asyncio.to_thread(
@@ -669,6 +747,16 @@ class Dataset(LazyFrameSource):
         multiply and drops out of the horizontal collapse and the final vertical
         `guarded_aggregate` alike, with no separate accumulation pass needed here.
 
+        `Options.value_where`, when set, is masked in the same way and at the same point
+        as nodata -- against each band's own raw pixel value, before the multiply -- via
+        `raster_source.masked_value_predicate_exprs`. That ordering matters for the same
+        reason the nodata mask has to run first: a value predicate is written against the
+        stored pixel value, not a scaled one, so masking after the multiply would test the
+        wrong number. A pixel the predicate rejects then behaves exactly like a nodata
+        pixel for everything downstream -- it drops out of the collapse, and out of
+        `guarded_aggregate`'s denominator -- which is what turns "count contributing
+        pixels" into "count pixels where value > x" with no separate code path.
+
         Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
         long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
         blocking the event loop for the whole summarize, matching how the numpy path's
@@ -676,6 +764,11 @@ class Dataset(LazyFrameSource):
         """
         raw_names = [f"b{i}" for i in range(len(df))]
         lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
+
+        if self.options.value_where is not None:
+            lf = lf.with_columns(
+                masked_value_predicate_exprs(raw_names, self.options.value_where, extra_columns=("grid_cell",))
+            )
 
         multipliers = df["multiplier"].to_list()
         if all(m == 1 for m in multipliers):

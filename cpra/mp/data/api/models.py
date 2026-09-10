@@ -46,6 +46,19 @@ class Options(BaseModel):
 
     grid_cell: str | None = None
     where: str | None = None
+    # A predicate over VALUES rather than dimensions, unlike `where` above -- e.g.
+    # "value > 3" to keep only cells/pixels above a threshold. Written once against the
+    # placeholder column `value`, for both grid types (`Dataset._apply_filter_params` for
+    # vector; `Dataset._summarize_zone_stats_plugin`, one raster band at a time, via
+    # `raster_source.masked_value_predicate_exprs`). Parsed through
+    # `api.expressions.parse_value_expr`'s restricted whitelist rather than handed to
+    # `lf.sql()` unrestricted the way `where` is, since it runs on the hot per-row path an
+    # aggregate or a sort inside it can force off of streaming pushdown entirely -- see
+    # `api/expressions.py`'s module docstring. A non-matching value is masked to null, not
+    # dropped as a row, so it composes with every aggregate's existing null-skipping
+    # behaviour (including `count`, which is what makes "count pixels where value > x"
+    # possible) instead of adding a second "predicate failed" code path.
+    value_where: str | None = None
     negate: str | None = None
     multiply10: str | None = None
     multiply100: str | None = None

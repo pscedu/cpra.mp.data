@@ -27,6 +27,15 @@ def dimension_type(dim_name):
 
 
 class AggregateFunction(str, Enum):
+    # `count` is valid as a `summarize_aggregate`/`group_by`-vertical-reduce value on
+    # both grid types (see raster_source.POLARS_RASTER_AGGREGATES and the vector
+    # `getattr(pl.col("value"), aggregate)()` call sites, both of which resolve it to
+    # Polars' own null-skipping `Expr.count`), but NOT as a `group_aggregate` (the raster
+    # band-COLLAPSE step, `raster_source.HORIZONTAL_RASTER_AGGREGATES`): "how many of
+    # these bands contributed to this pixel" has no natural per-pixel scalar meaning the
+    # way max/mean/min/sum do, and `Dataset` rejects it there with an explicit error
+    # rather than let it fail deeper as a raw `KeyError`/`AttributeError`.
+    count = "count"
     max = "max"
     mean = "mean"
     min = "min"
