@@ -65,6 +65,29 @@ def get_mpd_session():
 
 MPDSession = Annotated[Session, Depends(get_mpd_session)]
 
+# `value_where` was retired in favor of a single `where` parameter that accepts both
+# dimension and value conditions (see `Options.where`'s comment and
+# `api.expressions.classify_where`). It is no longer a field on `Options`/`DataQuery`/
+# `TileQuery`/`VisualizationQuery`, and FastAPI/pydantic silently ignore an unrecognized
+# query parameter by default (no `model_config = ConfigDict(extra=...)` is set anywhere
+# in models.py) -- confirmed empirically: a request with a bogus query param returns 200
+# with the rest of the query answered normally. Left alone, a caller still sending
+# `value_where` would have their filter silently vanish rather than fail loudly, so this
+# dependency checks the raw query string directly (the only place the retired name is
+# still visible at all) and rejects it explicitly.
+def reject_retired_value_where(request: Request) -> None:
+    if "value_where" in request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'value_where' has been retired -- use 'where' instead, which now accepts both "
+                "dimension and value conditions (e.g. 'calendar_year > 2040 AND value > 3')"
+            ),
+        )
+
+
+RejectRetiredValueWhere = Depends(reject_retired_value_where)
+
 app = FastAPI(
     title="CPRA Master Plan APIs",
     description="Access model data from [Louisiana's Coastal Master Plan](https://coastal.la.gov/our-plan/2023-coastal-master-plan/).",
@@ -209,6 +232,7 @@ async def get_model_data(
     format: DataFormat,
     query: Annotated[DataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    _reject_value_where: None = RejectRetiredValueWhere,
 ):
     compression = query.compression
     validate_compression(compression, format)
@@ -234,6 +258,7 @@ async def get_model_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    _reject_value_where: None = RejectRetiredValueWhere,
 ):
     dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
@@ -251,6 +276,7 @@ async def get_vector_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    _reject_value_where: None = RejectRetiredValueWhere,
 ):
     dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
@@ -272,6 +298,7 @@ async def get_dataset_visualization(
     visualization_name,
     query: Annotated[VisualizationQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    _reject_value_where: None = RejectRetiredValueWhere,
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
     query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
@@ -293,6 +320,7 @@ async def get_visualization(
     request: Request,
     visualization_name,
     query: Annotated[VisualizationQuery, Query()],
+    _reject_value_where: None = RejectRetiredValueWhere,
 ):
     VisualizationClass = get_visualization_class(visualization_name, "custom")
     visualization = VisualizationClass(

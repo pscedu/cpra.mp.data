@@ -16,7 +16,7 @@ from polars.io.plugins import register_io_source
 
 from cpra.mp.data.api import raster_source
 from cpra.mp.data.api import utils as api_utils
-from cpra.mp.data.api.raster_source import _batched_windows, guarded_aggregate, scan_rasters
+from cpra.mp.data.api.raster_source import _batched_windows, guarded_aggregate, scan_broadcast, scan_rasters
 from cpra.mp.data.api.utils import raster_blocks_per_batch
 from cpra.mp.data.grids import GRIDS
 
@@ -405,3 +405,114 @@ class TestWhichPredicateFormsPushDown:
 
         assert captured, "the source was never called at all"
         assert all(p is None for p in captured), "an aggregate-bearing predicate unexpectedly pushed down"
+
+
+class TestScanBroadcast:
+    """`scan_broadcast`: the cross-grid broadcast primitive that projects a small
+    coarse-grid selection onto a fine grid's pixels via two co-registered crosswalk
+    rasters (see its own docstring). It currently has no API caller -- these tests
+    exercise it directly (no `Dataset` involved) as the retained executor for a planned
+    pipeline grid-projection operation, pinning its masking mechanics: crosswalk nodata,
+    and coarse ids absent from the lookup.
+    """
+
+    @pytest.fixture
+    def broadcast_crosswalk_path(self, crosswalk_path):
+        """Three equal thirds by row: rows [0, H/3) -> zone 1, [H/3, 2H/3) -> nodata (0,
+        `write_raster_crosswalk`'s hardcoded background value), [2H/3, H) -> zone 2 --
+        the middle band exists specifically to pin crosswalk-nodata masking against a
+        region that is neither zone 1 nor zone 2, distinct from "a real zone id that
+        happens to be missing from the coarse frame" (`missing_id_broadcast_ids` below).
+        """
+        third = GRID.height // 3
+        zones = np.zeros((GRID.height, GRID.width), dtype="int32")
+        zones[:third, :] = 1
+        zones[2 * third :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        return crosswalk_path / f"{RASTER_KWARGS['grid']}__hydro_compartment_v001.tif"
+
+    def test_identity_case_matches_hand_computed_zone_means(self, broadcast_crosswalk_path):
+        """`output_zones_path == broadcast_crosswalk_path` -- summarizing broadcast
+        values back onto the same zones they came from, the identity check
+        `scan_broadcast`'s own docstring calls out. zone 1's pixels should broadcast
+        value 10.0; zone 2's, 20.0; the nodata middle band contributes to neither zone
+        (dropped, not merely nulled -- see the row-count assertion)."""
+        broadcast_ids = np.array([1, 2], dtype="int64")
+        broadcast_values = np.array([10.0, 20.0], dtype="float64")
+        output_zone_ids = np.array([1, 2], dtype="int64")
+
+        lf = scan_broadcast(
+            broadcast_crosswalk_path, broadcast_ids, broadcast_values, broadcast_crosswalk_path, output_zone_ids
+        )
+        out = lf.group_by("grid_cell").agg(guarded_aggregate("mean", "value")).sort("grid_cell").collect()
+
+        assert out["grid_cell"].to_list() == [1, 2]
+        assert out["value"].to_list() == pytest.approx([10.0, 20.0])
+
+        # Contributing rows = zone 1's band (`third` rows) + zone 2's band (`height -
+        # 2 * third` rows) -- the nodata middle band (`third` rows) is dropped entirely,
+        # so the total is `height - third`, not `2 * third` (those only coincide when
+        # `height` is an exact multiple of 3, which 365 is not).
+        third = GRID.height // 3
+        expected_rows = (GRID.height - third) * GRID.width
+        raw = lf.collect()
+        assert raw.height == expected_rows
+        assert 0 not in raw["grid_cell"].to_list()
+
+    def test_missing_id_pixels_are_dropped_not_defaulted(self, broadcast_crosswalk_path):
+        """The coarse frame supplies a value for zone 1 only -- zone 2 is a real,
+        present zone id in the crosswalk raster, but absent from `broadcast_ids`/
+        `broadcast_values` (e.g. the coarse dataset had no row for that zone). Every
+        zone-2 pixel must be dropped, matching the notebook's
+        `np.where(ids == nodata, nan, ...)` masking treating an out-of-frame id no
+        differently from nodata -- not defaulted to 0, NaN-as-a-value, or any other
+        placeholder that would still contribute a (masked) row.
+        """
+        broadcast_ids = np.array([1], dtype="int64")
+        broadcast_values = np.array([10.0], dtype="float64")
+        output_zone_ids = np.array([1, 2], dtype="int64")
+
+        lf = scan_broadcast(
+            broadcast_crosswalk_path, broadcast_ids, broadcast_values, broadcast_crosswalk_path, output_zone_ids
+        )
+        out = lf.collect()
+
+        assert out["grid_cell"].n_unique() == 1
+        assert out["grid_cell"].unique().to_list() == [1]
+        assert out["value"].to_list() == pytest.approx([10.0] * out.height)
+
+    def test_output_zone_set_can_differ_from_the_broadcast_zone_set(self, crosswalk_path, broadcast_crosswalk_path):
+        """Zonal stats of broadcast values over an entirely different zone set than the
+        one that supplied the coarse value: a SEPARATE output crosswalk groups the same
+        broadcast values by a different zone layout (halves, at H//2, rather than the
+        broadcast crosswalk's thirds), pinned here at the primitive level, independent
+        of `Dataset`.
+        """
+        half = GRID.height // 2
+        third = GRID.height // 3
+        output_zones = np.zeros((GRID.height, GRID.width), dtype="int32")
+        output_zones[:half, :] = 1
+        output_zones[half:, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "ecoregion_v001", output_zones)
+        output_crosswalk_path = crosswalk_path / f"{RASTER_KWARGS['grid']}__ecoregion_v001.tif"
+
+        broadcast_ids = np.array([1, 2], dtype="int64")
+        broadcast_values = np.array([10.0, 20.0], dtype="float64")
+        output_zone_ids = np.array([1, 2], dtype="int64")
+
+        lf = scan_broadcast(
+            broadcast_crosswalk_path, broadcast_ids, broadcast_values, output_crosswalk_path, output_zone_ids
+        )
+        out = lf.group_by("grid_cell").agg(guarded_aggregate("mean", "value")).sort("grid_cell").collect()
+
+        # Output zone 1 (rows [0, half)) straddles the broadcast raster's zone 1 band
+        # (rows [0, third)) and its nodata band (rows [third, half)) -- but the nodata
+        # pixels are DROPPED, not merely nulled, so they contribute nothing to the
+        # group's mean at all, leaving a pure 10.0 (every surviving pixel is a zone-1
+        # broadcast pixel).
+        assert out.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(10.0)
+        # Output zone 2 (rows [half, H)) straddles the tail of the broadcast raster's
+        # nodata band (rows [half, 2*third)) and its zone 2 band (rows [2*third, H)) --
+        # by the same reasoning, the surviving pixels are all zone-2 broadcast pixels,
+        # leaving a pure 20.0 mean.
+        assert out.filter(pl.col("grid_cell") == 2)["value"][0] == pytest.approx(20.0)

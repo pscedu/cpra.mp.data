@@ -11,9 +11,11 @@ import pytest
 
 from cpra.mp.data.api.expressions import (
     ExpressionError,
+    classify_where,
     count_by_value_frame,
     parse_value_expr,
     rewrite_value_column,
+    split_top_level_and,
     value_predicate_mask,
 )
 
@@ -122,6 +124,117 @@ class TestValuePredicateMask:
         mask = value_predicate_mask("value > 3", ["value"])
         df = pl.DataFrame({"value": [None, 1, 5]}, schema={"value": pl.Float64})
         assert df.select(mask.alias("m"))["m"].to_list() == [False, False, True]
+
+
+class TestSplitTopLevelAnd:
+    def test_single_conjunct_with_no_and(self):
+        assert split_top_level_and("calendar_year > 2040") == ["calendar_year > 2040"]
+
+    def test_splits_two_conjuncts(self):
+        assert split_top_level_and("calendar_year > 2040 and value > 3") == [
+            "calendar_year > 2040",
+            "value > 3",
+        ]
+
+    def test_splits_three_conjuncts(self):
+        assert split_top_level_and("a > 1 and b > 2 and c > 3") == ["a > 1", "b > 2", "c > 3"]
+
+    @pytest.mark.parametrize("connector", ["AND", "And", "aNd"])
+    def test_case_insensitive(self, connector):
+        assert split_top_level_and(f"a > 1 {connector} b > 2") == ["a > 1", "b > 2"]
+
+    def test_does_not_split_inside_parens(self):
+        """A nested AND inside a parenthesized group is not top-level -- it belongs to
+        whatever function call or grouped expression contains it, not to the outer
+        conjunct list."""
+        assert split_top_level_and("f(a, b) > 1 and g > 2") == ["f(a, b) > 1", "g > 2"]
+
+    def test_does_not_split_a_between_and(self):
+        """`BETWEEN x AND y` uses the word AND as part of its own syntax, not as a
+        top-level conjunct separator -- this splitter has no BETWEEN-awareness, so
+        callers relying on BETWEEN would see it split in two; documented here as the
+        behavior actually produced (not a bug the design asked to fix), matching the
+        design's "library-first, not a full SQL grammar" scope.
+        """
+        assert split_top_level_and("value between 1 and 10") == ["value between 1", "10"]
+
+    def test_does_not_split_inside_single_quoted_strings(self):
+        assert split_top_level_and("name = 'foo and bar' and value > 1") == [
+            "name = 'foo and bar'",
+            "value > 1",
+        ]
+
+    def test_does_not_split_word_containing_and_substring(self):
+        """`andes` and `sandy` both contain the letters "and" but not as a standalone
+        word -- the word-boundary check must not treat them as the AND connector."""
+        assert split_top_level_and("andes > 1 and sandy < 2") == ["andes > 1", "sandy < 2"]
+
+    def test_or_only_clause_is_a_single_conjunct(self):
+        assert split_top_level_and("a > 1 or b > 2") == ["a > 1 or b > 2"]
+
+    def test_not_clause_is_a_single_conjunct(self):
+        assert split_top_level_and("not (value > 1)") == ["not (value > 1)"]
+
+    def test_strips_surrounding_whitespace_from_each_conjunct(self):
+        assert split_top_level_and("  a > 1   and   b > 2  ") == ["a > 1", "b > 2"]
+
+
+class TestClassifyWhere:
+    def test_dimension_only_conjunct(self):
+        dimension, value = classify_where("calendar_year > 2040")
+        assert dimension == ["calendar_year > 2040"]
+        assert value == []
+
+    def test_value_only_conjunct(self):
+        dimension, value = classify_where("value > 3")
+        assert dimension == []
+        assert value == ["value > 3"]
+
+    def test_multiple_dimension_and_value_conjuncts_are_sorted_and_kept_separate(self):
+        dimension, value = classify_where("calendar_year > 2040 and value > 3 and aep = 0.2")
+        assert dimension == ["calendar_year > 2040", "aep = 0.2"]
+        assert value == ["value > 3"]
+
+    def test_mixed_conjunct_is_rejected(self):
+        """A single AND-term referencing both `value` and a dimension column has no
+        unambiguous classification -- see `classify_where`'s docstring -- and is
+        rejected outright rather than guessed at."""
+        with pytest.raises(ExpressionError, match="calendar_year"):
+            classify_where("value > calendar_year")
+
+    def test_unparseable_conjunct_is_rejected(self):
+        with pytest.raises(ExpressionError):
+            classify_where("value >>> 3")
+
+    def test_empty_conjunct_is_rejected(self):
+        with pytest.raises(ExpressionError, match="empty"):
+            classify_where("calendar_year > 2040 and")
+
+    def test_dimension_conjunct_with_aggregate_call_is_rejected(self):
+        with pytest.raises(ExpressionError, match="aggregate"):
+            classify_where("calendar_year = min(calendar_year)")
+
+    def test_dimension_conjunct_with_subquery_is_rejected(self):
+        with pytest.raises(ExpressionError, match="subquery"):
+            classify_where("calendar_year in (select 1)")
+
+    def test_dimension_conjunct_with_subquery_referencing_self_fails_to_parse(self):
+        """`select ... from self` has no registered `self` relation at this layer, so
+        `pl.sql_expr` itself raises before the explicit subquery check ever runs -- still
+        an `ExpressionError`, just via a different mechanism than the bare-`select` case
+        above."""
+        with pytest.raises(ExpressionError):
+            classify_where("calendar_year in (select max(calendar_year) from self)")
+
+    def test_value_conjunct_with_aggregate_call_is_not_rejected_at_classification(self):
+        """Aggregate rejection for VALUE conjuncts happens downstream, in
+        `parse_value_expr` (see `TestParseValueExpr.test_aggregate_functions_are_rejected_by_name`)
+        -- `classify_where` itself only sorts a conjunct by which namespace it
+        references, it does not run the value-expression whitelist.
+        """
+        dimension, value = classify_where("value = min(value)")
+        assert dimension == []
+        assert value == ["value = min(value)"]
 
 
 class TestCountByValueFrame:

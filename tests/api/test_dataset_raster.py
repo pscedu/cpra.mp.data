@@ -927,8 +927,9 @@ class TestSummarizeRoutesThroughThePlugin:
 
 
 class TestValueWherePixelPredicate:
-    """`value_where` -- a predicate over pixel VALUES, not dimensions -- is only
-    meaningful once pixels are actually being summarized (see
+    """A `where` VALUE conjunct -- a predicate over pixel VALUES, not dimensions,
+    written against the placeholder column `value` (see `expressions.classify_where`)
+    -- is only meaningful once pixels are actually being summarized (see
     `_apply_transform_params_raster`'s docstring): it is masked in per band, before the
     multiplier/group_aggregate collapse (`_summarize_zone_stats_plugin`), so
     `summarize_aggregate=count` together with it is exactly "count pixels per zone where
@@ -964,7 +965,7 @@ class TestValueWherePixelPredicate:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count",
-            value_where=f"value > {threshold}",
+            where=f"value > {threshold}",
         )
         await dataset.apply_params()
         df = dataset.materialize()
@@ -975,15 +976,15 @@ class TestValueWherePixelPredicate:
     async def test_conditional_sum_masks_non_matching_pixels(
         self, dataset_factory, gradient_raster_data, zone_crosswalk
     ):
-        """A non-count aggregate with value_where is a conditional aggregate for free,
-        not a capability specific to count."""
+        """A non-count aggregate with a `where` value conjunct is a conditional
+        aggregate for free, not a capability specific to count."""
         threshold = 383_000
         zone_values = self._zone_values()
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
-            value_where=f"value > {threshold}",
+            where=f"value > {threshold}",
         )
         await dataset.apply_params()
         df = dataset.materialize()
@@ -997,21 +998,25 @@ class TestValueWherePixelPredicate:
             else:
                 assert actual == pytest.approx(matching.sum())
 
-    async def test_value_where_without_summarize_is_rejected(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, value_where="value > 3")
+    async def test_where_value_conjunct_without_summarize_is_rejected(self, dataset_factory, raster_data):
+        """A raster grid has no per-pixel frame at all for a plain (non-summarized)
+        response -- see `_apply_transform_params_raster`'s docstring -- so a `where`
+        value conjunct given without summarize_by/summarize_aggregate is rejected
+        outright, with an error that says so."""
+        dataset = dataset_factory(DIMENSIONS, where="value > 3")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
-        assert "value_where" in excinfo.value.detail
+        assert "summarize" in excinfo.value.detail
 
-    async def test_value_where_uses_the_plugin(
+    async def test_where_value_conjunct_uses_the_plugin(
         self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
     ):
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
-            value_where="value > 100000",
+            where="value > 100000",
         )
         called = []
         original = dataset._summarize_zone_stats_plugin
@@ -1052,9 +1057,20 @@ class TestValueWherePixelPredicate:
         assert excinfo.value.status_code == 400
         assert "count" in excinfo.value.detail
 
-    async def test_unknown_column_is_rejected_before_any_pixel_data_is_read(
+    async def test_mixed_conjunct_is_rejected_before_any_pixel_data_is_read(
         self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
     ):
+        """A single AND-term referencing both `value` and some other column has no
+        ambiguity-free classification (`expressions.classify_where`) and is rejected at
+        `_apply_filter_params` time -- before `_apply_transform_params_raster` even
+        starts, so before `scan_rasters`, any COG, or the crosswalk file is touched.
+        Substituted here for the retired value_where's own "unknown column" rejection,
+        since a bare dimension-only conjunct (no `value` reference at all) is no longer
+        eagerly namespace-checked -- it goes to the same unrestricted `lf.sql()` path any
+        other `where` dimension conjunct does; this still pins the same observable
+        contract the old test did: a 400 naming the offending token, before any data is
+        read.
+        """
         called = []
 
         def fail_if_called(*args, **kwargs):
@@ -1067,7 +1083,7 @@ class TestValueWherePixelPredicate:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count",
-            value_where="not_a_column > 3",
+            where="value > not_a_column",
         )
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
@@ -1093,12 +1109,66 @@ class TestValueWherePixelPredicate:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count",
-            value_where="value = min(value)",
+            where="value = min(value)",
         )
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "min" in excinfo.value.detail
+        assert not called
+
+    async def test_dimension_subquery_is_rejected_before_any_pixel_data_is_read(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
+    ):
+        """The dimension-conjunct half of the closed 94x/26.9GB pushdown-defeating hole
+        (see api/expressions.py's module docstring and `classify_where`): a subquery
+        inside a DIMENSION conjunct is refused just as eagerly as one inside a value
+        conjunct is, before `scan_rasters` or any file is touched.
+        """
+        called = []
+
+        def fail_if_called(*args, **kwargs):
+            called.append(True)
+            raise AssertionError("scan_rasters should not run: the expression should have been rejected first")
+
+        monkeypatch.setattr(dataset_module, "scan_rasters", fail_if_called)
+
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count",
+            where="calendar_year in (select max(calendar_year) from self)",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert not called
+
+    async def test_value_subquery_is_rejected_before_any_pixel_data_is_read(
+        self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
+    ):
+        """The value-conjunct half of the same closed hole: `value in (select ... from
+        self)` fails to parse at `classify_where` time (no `self` relation is
+        registered there), the same as the dimension form above, before any file is
+        touched.
+        """
+        called = []
+
+        def fail_if_called(*args, **kwargs):
+            called.append(True)
+            raise AssertionError("scan_rasters should not run: the expression should have been rejected first")
+
+        monkeypatch.setattr(dataset_module, "scan_rasters", fail_if_called)
+
+        dataset = dataset_factory(
+            DIMENSIONS,
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="count",
+            where="value in (select max(value) from self)",
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
         assert not called
 
 
@@ -1159,18 +1229,19 @@ class TestCountByValue:
             actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
             assert actual == value_counts
 
-    async def test_composes_with_value_where_mask_then_count(
+    async def test_composes_with_where_value_conjunct_mask_then_count(
         self, dataset_factory, categorical_raster_data, zone_crosswalk
     ):
-        """value_where masks non-matching pixels to null BEFORE counting -- see
-        `raster_source.count_by_value`'s docstring -- so a masked-out pixel contributes
-        to no category at all, rather than being counted under some sentinel value."""
+        """A `where` value conjunct masks non-matching pixels to null BEFORE counting --
+        see `raster_source.count_by_value`'s docstring -- so a masked-out pixel
+        contributes to no category at all, rather than being counted under some sentinel
+        value."""
         expected = self._zone_category_counts()
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count_by_value",
-            value_where="value != 2",
+            where="value != 2",
         )
         await dataset.apply_params()
         df = dataset.materialize()

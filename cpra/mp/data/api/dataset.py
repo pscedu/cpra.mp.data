@@ -23,7 +23,13 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.api.expressions import ExpressionError, count_by_value_frame, parse_value_expr, value_predicate_mask
+from cpra.mp.data.api.expressions import (
+    ExpressionError,
+    classify_where,
+    count_by_value_frame,
+    parse_value_expr,
+    value_predicate_mask,
+)
 from cpra.mp.data.api.fold import FoldError, fold_group_by, should_fold_group_by
 from cpra.mp.data.api.geography import (
     parse_coordinate_pairs,
@@ -132,6 +138,19 @@ class Dataset(LazyFrameSource):
         self.grid_cell_ids = None
         self.summarize_grid_cell_ids = None
         self.raster_groups = None
+        # Set by `_apply_filter_params`, the first step `apply_params` runs, from
+        # `where`'s value conjuncts (see `expressions.classify_where`) -- the internal
+        # successor to the retired `Options.value_where` field. `None` means `where`
+        # contained no value conjunct; every other consumer of the old `value_where`
+        # field (`_apply_transform_params_raster`, `_summarize_zone_stats_plugin`,
+        # `_summarize_count_by_value_plugin`) reads this attribute instead now.
+        self._value_where = None
+        # Also set by `_apply_filter_params`: whether `where` produced at least one
+        # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
+        # the row count reaching a group_by -- see `_has_selective_dimension_filter`,
+        # which used to just check `options.where is not None` and is now wrong to,
+        # since `where` may hold only a value conjunct (a mask, not a row filter).
+        self._where_has_dimension_conjunct = False
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
         self.grid = GRIDS[self.dataset_dimensions.grid]
@@ -215,34 +234,76 @@ class Dataset(LazyFrameSource):
         """
         return self.grid.grid_type == "raster" and "path" in self.lf.collect_schema().names()
 
-    async def _apply_filter_params(self):
-        """Apply filter parameters to the LazyFrame."""
-        if self.options.where:
-            self.lf = self.lf.sql(f"select * from self where {self.options.where}")
+    def _is_aggregating(self):
+        """Whether this request collapses rows via an aggregate -- `group_aggregate`
+        (vector row-collapse) or `summarize_aggregate` (raster zonal / vector
+        cross-grid summarize) -- as opposed to a PLAIN, non-aggregating tabular/tile
+        response. Used by `_apply_filter_params` to decide whether a `where` value
+        conjunct masks a non-matching value to null (composing with an aggregate's own
+        null-skipping behavior) or drops the row outright (the only sensible behavior
+        once there is no aggregate downstream to skip a null for -- see that method).
+        """
+        return self.options.group_aggregate is not None or self.options.summarize_aggregate is not None
 
-        # A vector frame already carries a real `value` column at this point, so
-        # `value_where` can be masked in directly here. A raster's `value` doesn't exist
-        # yet -- `self.lf` is still the band-metadata table (path/band/dimensions), one
-        # row per selected band, not one row per pixel -- so the raster half of this same
-        # option is applied later, per band, once pixels are actually read (see
-        # `_apply_transform_params_raster` / `_summarize_zone_stats_plugin`).
-        #
-        # Masking to null rather than filtering the row out is deliberate here too, for
-        # the same reason as the raster side: it lets a `value_where` predicate compose
-        # with whatever aggregate the request goes on to apply (`group_aggregate`,
-        # `summarize_aggregate`) via their EXISTING null-skipping behavior, rather than
-        # needing a second, predicate-aware code path. A plain `where=value > x` (SQL,
-        # unrestricted, run above) already happens to drop rows that fail such a
-        # predicate -- but that's a row filter, which is wrong once an aggregate is in
-        # play: it would also erase the group/zone's siblings that DO belong in the
-        # denominator for min/max/mean, and would make "count how many values passed"
-        # indistinguishable from "count how many rows exist".
-        if self.options.value_where is not None and self.grid.grid_type == "vector":
+    async def _apply_filter_params(self):
+        """Apply filter parameters to the LazyFrame.
+
+        `where` accepts both DIMENSION conditions and VALUE conditions (against the
+        placeholder column `value`), AND-ed together in one string --
+        `expressions.classify_where` splits it on top-level `AND` and sorts each
+        conjunct by which kind it is (see that function's docstring for the full split/
+        classify/reject contract, including why a conjunct referencing both kinds is
+        rejected outright). Dimension conjuncts are recombined and handed to the same
+        unrestricted `lf.sql()` path `where` has always used; value conjuncts are
+        recombined into `self._value_where`, the internal successor to the retired
+        `Options.value_where` field, for this method (vector) and every raster-side
+        consumer (`_apply_transform_params_raster`, `_summarize_zone_stats_plugin`,
+        `_summarize_count_by_value_plugin`) to read instead.
+        """
+        if self.options.where:
             try:
-                mask = value_predicate_mask(self.options.value_where, self.lf.collect_schema().names())
+                dimension_conjuncts, value_conjuncts = classify_where(self.options.where)
             except ExpressionError as exc:
                 self._error(str(exc))
-            self.lf = self.lf.with_columns(pl.when(mask).then(pl.col("value")).otherwise(None).alias("value"))
+
+            self._where_has_dimension_conjunct = bool(dimension_conjuncts)
+            if dimension_conjuncts:
+                combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
+                self.lf = self.lf.sql(f"select * from self where {combined}")
+            if value_conjuncts:
+                self._value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
+
+        # A vector frame already carries a real `value` column at this point, so a
+        # `where` value conjunct can be applied directly here. A raster's `value`
+        # doesn't exist yet -- `self.lf` is still the band-metadata table (path/band/
+        # dimensions), one row per selected band, not one row per pixel -- so the
+        # raster half of this same option is applied later, per band, once pixels are
+        # actually read (see `_apply_transform_params_raster` / `_summarize_zone_stats_plugin`).
+        #
+        # AGGREGATING requests (group_aggregate/summarize_aggregate, including
+        # summarize_aggregate=count_by_value) mask a non-matching value to null rather
+        # than dropping its row: that's what lets the predicate compose with whatever
+        # aggregate the request goes on to apply via their EXISTING null-skipping
+        # behavior (`guarded_aggregate`'s count()-based denominator, count_by_value's
+        # own non-null filter, ...), rather than needing a second, predicate-aware code
+        # path. Dropping the row instead would also erase the group/zone's siblings
+        # that DO belong in the denominator for min/max/mean, and would make "count how
+        # many values passed" indistinguishable from "count how many rows exist".
+        #
+        # PLAIN (non-aggregating) requests have no aggregate downstream to skip a null
+        # for, so a masked-to-null value would just surface as a null in the response --
+        # observably different from "this row failed the filter" and indistinguishable
+        # from a genuine nodata value. There, the row is dropped outright instead (a
+        # deliberate behavior change from the old value_where, which always masked).
+        if self._value_where is not None and self.grid.grid_type == "vector":
+            try:
+                mask = value_predicate_mask(self._value_where, self.lf.collect_schema().names())
+            except ExpressionError as exc:
+                self._error(str(exc))
+            if self._is_aggregating():
+                self.lf = self.lf.with_columns(pl.when(mask).then(pl.col("value")).otherwise(None).alias("value"))
+            else:
+                self.lf = self.lf.filter(mask)
 
         if self.options.grid_cell:
             if self.grid.grid_type == "vector":
@@ -370,19 +431,27 @@ class Dataset(LazyFrameSource):
         `filter_dimensions` values are pushed down as Hive-partition filters inside
         `get_lazy_frame`/`read_parquet`, before `self.lf` exists at all -- the measured
         case where a `grid_cell` group-by drops from 9.8 GB to 285 MB. `options.grid_cell`
-        (a real `.filter()` on specific cell IDs) and `options.where` (an arbitrary SQL
-        `.filter()`) are the same kind of row-dropping filter, applied to `self.lf`
-        itself in `_apply_filter_params`, so they count too.
+        (a real `.filter()` on specific cell IDs) and a `where` DIMENSION conjunct (an
+        arbitrary SQL `.filter()`, applied to `self.lf` itself in `_apply_filter_params`)
+        are the same kind of row-dropping filter, so they count too --
+        `self._where_has_dimension_conjunct` (set by `_apply_filter_params`) is checked
+        here rather than `self.options.where is not None`, since `where` may now hold
+        only a VALUE conjunct, which never reaches this method as a row filter at all
+        (see the next paragraph).
 
-        `options.value_where` and the `calculate` parameters (`negate`/`multiply10`/
-        `multiply100`) are deliberately NOT included: they are `with_columns` maps, not
-        filters -- they never change how many rows reach the group-by, so they don't
-        affect whether it's cliff-shaped, and (unlike a `.filter()`) they don't block the
-        fold's `.slice()` from reaching the scan either.
+        A `where` VALUE conjunct and the `calculate` parameters (`negate`/`multiply10`/
+        `multiply100`) are deliberately NOT included: wherever this method's caller
+        (`_apply_group_params`, gating a vector `group_by`) applies, a value conjunct is
+        always a `with_columns` mask, never a row-dropping `.filter()` -- masking is
+        exactly what lets it compose with the group_by's own aggregate instead of
+        changing its denominator (see `_apply_filter_params`) -- so it never changes how
+        many rows reach the group-by, doesn't affect whether it's cliff-shaped, and
+        (unlike a `.filter()`) doesn't block the fold's `.slice()` from reaching the scan
+        either.
         """
         return (
             self.options.grid_cell is not None
-            or self.options.where is not None
+            or self._where_has_dimension_conjunct
             or any(v is not None for v in dict(self.filter_dimensions).values())
         )
 
@@ -624,18 +693,19 @@ class Dataset(LazyFrameSource):
         The actual per-zone reduction is computed by `_summarize_zone_stats_plugin`,
         returning a `(n_bands, zone_ids.size)` array.
 
-        `value_where` (a per-pixel value predicate -- see `Options.value_where`) is only
-        meaningful here, at the summarize stage: it is what `_summarize_zone_stats_plugin`
-        masks each band's raw pixel value against, before the multiplier/group_aggregate
-        collapse, so "count pixels above X" and "sum of pixels above X" both fall out of
-        the existing null-skipping zonal aggregates for free. A plain, non-summarized
-        raster selection has no zonal aggregate to feed a mask into and no per-pixel
-        frame the API exposes to a caller at all (`self.lf` is the band-metadata table
-        until this method builds one) -- so a `value_where` given without `summarize_by`/
+        A `where` VALUE conjunct (a per-pixel value predicate -- see
+        `_apply_filter_params`/`self._value_where`) is only meaningful here, at the
+        summarize stage: it is what `_summarize_zone_stats_plugin` masks each band's raw
+        pixel value against, before the multiplier/group_aggregate collapse, so "count
+        pixels above X" and "sum of pixels above X" both fall out of the existing
+        null-skipping zonal aggregates for free. A plain, non-summarized raster
+        selection has no zonal aggregate to feed a mask into and no per-pixel frame the
+        API exposes to a caller at all (`self.lf` is the band-metadata table until this
+        method builds one) -- so a `where` value conjunct given without `summarize_by`/
         `summarize_aggregate` is rejected outright below, rather than silently ignored.
         """
-        if self.options.value_where is not None:
-            # Parsed here, against the placeholder namespace every value_where caller
+        if self._value_where is not None:
+            # Parsed here, against the placeholder namespace every value conjunct
             # writes against (`value`, `grid_cell`), before touching the crosswalk file,
             # `self.materialize()`, or any pixel data -- an aggregate-inside-predicate or
             # a whitelist violation is rejected before a single file is opened, not
@@ -644,13 +714,13 @@ class Dataset(LazyFrameSource):
             # exactly {that band, grid_cell} -- see `masked_value_predicate_exprs`), so this
             # call is a validation pass, not the one whose result gets used.
             try:
-                parse_value_expr(self.options.value_where, ["value", "grid_cell"])
+                parse_value_expr(self._value_where, ["value", "grid_cell"])
             except ExpressionError as exc:
                 self._error(str(exc))
 
         if not self._validate_summarize_params():
-            if self.options.value_where is not None:
-                self._error("value_where requires summarize_by and summarize_aggregate for raster grids")
+            if self._value_where is not None:
+                self._error("where's value condition(s) require summarize_by and summarize_aggregate for raster grids")
             return
 
         crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.tif"
@@ -754,15 +824,16 @@ class Dataset(LazyFrameSource):
         and the final vertical `guarded_aggregate` alike, with no separate accumulation
         pass needed here.
 
-        `Options.value_where`, when set, is masked in the same way and at the same point
-        as nodata -- against each band's own raw pixel value, before the multiply -- via
-        `raster_source.masked_value_predicate_exprs`. That ordering matters for the same
-        reason the nodata mask has to run first: a value predicate is written against the
-        stored pixel value, not a scaled one, so masking after the multiply would test the
-        wrong number. A pixel the predicate rejects then behaves exactly like a nodata
-        pixel for everything downstream -- it drops out of the collapse, and out of
-        `guarded_aggregate`'s denominator -- which is what turns "count contributing
-        pixels" into "count pixels where value > x" with no separate code path.
+        `where`'s value conjunct (`self._value_where`), when set, is masked in the same
+        way and at the same point as nodata -- against each band's own raw pixel value,
+        before the multiply -- via `raster_source.masked_value_predicate_exprs`. That
+        ordering matters for the same reason the nodata mask has to run first: a value
+        predicate is written against the stored pixel value, not a scaled one, so
+        masking after the multiply would test the wrong number. A pixel the predicate
+        rejects then behaves exactly like a nodata pixel for everything downstream -- it
+        drops out of the collapse, and out of `guarded_aggregate`'s denominator -- which
+        is what turns "count contributing pixels" into "count pixels where value > x"
+        with no separate code path.
 
         Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
         long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
@@ -772,9 +843,9 @@ class Dataset(LazyFrameSource):
         raw_names = [f"b{i}" for i in range(len(df))]
         lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
 
-        if self.options.value_where is not None:
+        if self._value_where is not None:
             lf = lf.with_columns(
-                masked_value_predicate_exprs(raw_names, self.options.value_where, extra_columns=("grid_cell",))
+                masked_value_predicate_exprs(raw_names, self._value_where, extra_columns=("grid_cell",))
             )
 
         multipliers = df["multiplier"].to_list()
@@ -823,7 +894,7 @@ class Dataset(LazyFrameSource):
             bands,
             crosswalk_path,
             zone_ids,
-            value_where=self.options.value_where,
+            value_where=self._value_where,
             max_distinct=COUNT_BY_VALUE_MAX_DISTINCT,
         )
 

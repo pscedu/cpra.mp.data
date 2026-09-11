@@ -143,9 +143,10 @@ def should_fold_group_by(
     Given that asymmetry, this function is intentionally simple rather than clever: it
     does not attempt to estimate actual cardinality (which would need a scan of its own,
     defeating the point of a cheap plan-time check) or account for every way a filter
-    might shrink row count (e.g. `value_where`, which MASKS values to null rather than
-    dropping rows, is deliberately not treated as selective here -- it doesn't change how
-    many rows reach the group-by at all).
+    might shrink row count (e.g. `where`'s value conjunct, which MASKS values to null
+    rather than dropping rows when the request is aggregating -- see
+    `Dataset._apply_filter_params` -- is deliberately not treated as selective here -- it
+    doesn't change how many rows reach the group-by at all).
     """
     if has_selective_filter:
         return False

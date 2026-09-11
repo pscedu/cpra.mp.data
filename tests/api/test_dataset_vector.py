@@ -168,28 +168,34 @@ class TestFilterStage:
 
 
 class TestValueWhereStage:
-    """`value_where` (Options.value_where) is a predicate over VALUES, unlike `where`
-    (dimensions). Cell (year, geo) holds `year + geo/100` (see `annual_frame`), so a
-    threshold between the two years' ranges isolates exactly one year's rows.
+    """A `where` VALUE conjunct (a predicate over VALUES, using the placeholder column
+    `value`, unlike a `where` DIMENSION conjunct -- see `expressions.classify_where`).
+    Cell (year, geo) holds `year + geo/100` (see `annual_frame`), so a threshold between
+    the two years' ranges isolates exactly one year's rows.
     """
 
-    async def test_non_matching_values_are_masked_to_null_not_dropped(
+    async def test_non_matching_values_are_dropped_for_a_plain_request(
         self, dataset_factory, annual_data
     ):
-        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035")
+        """PLAIN (non-aggregating: no group_aggregate/summarize_aggregate) is the one
+        case where a `where` value conjunct behaves differently from the retired
+        `value_where`, which always masked -- see `Dataset._apply_filter_params`'s
+        docstring: there is no aggregate downstream here for a masked null to fall into
+        unnoticed, so a failing row is dropped outright instead."""
+        dataset = dataset_factory(DIMENSIONS, where="value > 2035")
         await dataset.apply_params()
         df = dataset.materialize()
-        # Masking, not filtering: every row from both years is still present.
-        assert df.height == 2 * 32
-        assert df.filter(pl.col("calendar_year") == 2030)["value"].null_count() == 32
-        assert df.filter(pl.col("calendar_year") == 2040)["value"].null_count() == 0
+        assert df.height == 32
+        assert df["calendar_year"].unique().to_list() == [2040]
+        assert df["value"].null_count() == 0
 
     async def test_masked_values_are_excluded_from_a_group_by_count(
         self, dataset_factory, annual_data
     ):
-        """Null-skipping `count()` on a masked column is exactly "how many values
-        satisfied the predicate" -- the conditional-count capability."""
-        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035", group_aggregate="count")
+        """AGGREGATING (group_aggregate set): null-skipping `count()` on a masked column
+        is exactly "how many values satisfied the predicate" -- the conditional-count
+        capability, unchanged from the retired `value_where`'s own behavior."""
+        dataset = dataset_factory(DIMENSIONS, where="value > 2035", group_aggregate="count")
         await dataset.apply_params()
         df = dataset.materialize()
         assert df.height == 32
@@ -201,38 +207,100 @@ class TestValueWhereStage:
         """A non-count aggregate over a masked column is a conditional aggregate for
         free ("sum of values where value > x"), not just conditional counting."""
         source = annual_frame(years=(2030, 2040))
-        dataset = dataset_factory(DIMENSIONS, value_where="value > 2035", group_aggregate="sum")
+        dataset = dataset_factory(DIMENSIONS, where="value > 2035", group_aggregate="sum")
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1)
         assert df["value"][0] == pytest.approx(source["1"][1], rel=1e-5)
 
-    async def test_predicate_may_reference_a_dimension_column_too(
+    async def test_mixed_dimension_and_value_conjuncts_aggregating(
         self, dataset_factory, annual_data
     ):
-        """The vector value namespace is value + dimension columns + grid_cell -- unlike
-        the raster side, a vector row already carries its own dimension columns."""
-        dataset = dataset_factory(DIMENSIONS, value_where="calendar_year > 2035 and value > 0")
+        """A dimension condition and a value condition inside one `where` are two
+        separate top-level AND-ed conjuncts, not one combined predicate the way the
+        retired `value_where` allowed (see `expressions.classify_where`'s "mixed
+        conjunct" rejection) -- each applies with ITS OWN semantics. The dimension
+        conjunct is a real row filter, dropping calendar_year=2030 BEFORE the group_by
+        even sees it (unlike the old value_where, which only masked); the value
+        conjunct still just masks a non-matching survivor, composing with
+        group_aggregate the same as a value-only `where` does.
+        """
+        dataset = dataset_factory(
+            DIMENSIONS, where="calendar_year > 2035 AND value > 0", group_aggregate="count"
+        )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert df.filter(pl.col("calendar_year") == 2030)["value"].null_count() == 32
-        assert df.filter(pl.col("calendar_year") == 2040)["value"].null_count() == 0
+        # Every remaining (2040-only) row already satisfies value > 0, so nothing is
+        # masked -- this pins the ROUTING (dimension filters, value masks), not masking
+        # itself, which the tests above already cover.
+        assert df.height == 32
+        assert df["value"].to_list() == [1] * 32
 
-    async def test_unknown_column_is_rejected(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, value_where="not_a_column > 3")
+    async def test_mixed_dimension_and_value_conjuncts_plain(self, dataset_factory, annual_data):
+        """The PLAIN counterpart of the aggregating case above: the dimension conjunct
+        still drops calendar_year=2030 as a real filter, and the value conjunct drops
+        (not masks) any surviving row that fails it, per the PLAIN/drop contract."""
+        dataset = dataset_factory(DIMENSIONS, where="calendar_year > 2035 AND value > 2040.16")
+        await dataset.apply_params()
+        df = dataset.materialize()
+        assert df["calendar_year"].unique().to_list() == [2040]
+        assert df["value"].null_count() == 0
+        assert (df["value"] > 2040.16).all()
+        assert df.height < 32  # some geo cells' 2040 value is <= 2040.16 and were dropped
+
+    async def test_mixed_conjunct_is_rejected(self, dataset_factory, annual_data):
+        """A single AND-term referencing both a dimension column and `value` (as
+        opposed to two separate AND-ed conjuncts, see the tests above) has no
+        ambiguity-free classification and is rejected outright -- substituted here for
+        the retired value_where's own "unknown column" rejection, since a bare
+        dimension-only conjunct is no longer eagerly namespace-checked at all (it goes
+        to the same unrestricted `lf.sql()` path any other `where` dimension conjunct
+        does); this still pins the same observable contract the old test did: a 400
+        naming the offending token, raised before any data is read.
+        """
+        dataset = dataset_factory(DIMENSIONS, where="value > not_a_column")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "not_a_column" in excinfo.value.detail
 
     async def test_aggregate_inside_the_predicate_is_rejected(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, value_where="value = min(value)")
+        dataset = dataset_factory(DIMENSIONS, where="value = min(value)")
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "min" in excinfo.value.detail
 
     async def test_disallowed_function_is_rejected(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, value_where="upper(value) = 'X'")
+        dataset = dataset_factory(DIMENSIONS, where="upper(value) = 'X'")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+
+    async def test_value_conjunct_subquery_is_rejected_at_plan_time(self, dataset_factory, annual_data):
+        """The value-conjunct half of the closed pushdown-defeating hole (see
+        api/expressions.py's module docstring and `classify_where`): `value in (select
+        ... from self)` fails to parse at `classify_where` time (no `self` relation is
+        registered there) before `apply_params` gets anywhere near `.collect()`/
+        `materialize()`. No spy is needed the way the raster equivalent uses one
+        (`scan_rasters` is a late-bound call the transform stage makes); here,
+        `get_lazy_frame` already runs unconditionally in `Dataset.__init__`, before any
+        `where` classification -- the guarantee this test actually pins is that
+        rejection happens with no `.collect()`/`materialize()` ever reached, which not
+        calling `dataset.materialize()` below already establishes.
+        """
+        dataset = dataset_factory(DIMENSIONS, where="value in (select max(value) from self)")
+        with pytest.raises(HTTPException) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+
+    async def test_dimension_conjunct_subquery_is_rejected_at_plan_time(self, dataset_factory, annual_data):
+        """The dimension-conjunct half of the same closed hole: a subquery inside a
+        DIMENSION conjunct is refused just as eagerly as one inside a value conjunct is
+        (see `test_value_conjunct_subquery_is_rejected_at_plan_time` for why no spy is
+        used here either)."""
+        dataset = dataset_factory(
+            DIMENSIONS, where="calendar_year in (select max(calendar_year) from self)"
+        )
         with pytest.raises(HTTPException) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
@@ -749,10 +817,10 @@ class TestCountByValue:
             actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
             assert actual == value_counts
 
-    async def test_composes_with_value_where_mask_then_count(
+    async def test_composes_with_where_value_conjunct_mask_then_count(
         self, dataset_factory, categorical_annual_data, crosswalk
     ):
-        """value_where masks a non-matching source cell's value to null in
+        """A `where` value conjunct masks a non-matching source cell's value to null in
         `_apply_filter_params` -- upstream of this stage -- so it is excluded here the
         same way `count_by_value_frame` excludes any other null: not a category, and not
         counted under any value."""
@@ -761,7 +829,7 @@ class TestCountByValue:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count_by_value",
-            value_where="value != 1",
+            where="value != 1",
         )
         await dataset.apply_params()
         df = dataset.materialize()

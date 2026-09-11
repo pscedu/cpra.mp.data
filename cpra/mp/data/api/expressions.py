@@ -1,19 +1,21 @@
 """A restricted expression surface for value-level predicates and conditional aggregates.
 
-Everything else the API accepts a SQL fragment for (`Options.where`, `Options.negate`,
-`Options.multiply10`, ...) is handed to `pl.sql_expr` -- or even a full `lf.sql(...)`
-call, for `where` -- unrestricted, because it only ever runs against DIMENSION columns:
-the raster metadata table (path/band/dimensions) or a vector frame before its values are
-touched. A value-level predicate is different in kind, not just in which columns it can
-name: it runs against actual pixel/cell VALUES, on the hot path Polars can stream, so an
-expression shaped wrong doesn't just give a bad answer -- it can force a full
-materialization the query would otherwise never need. The measured example (see
-raster_source.py's module docstring and the plan this module implements): two queries
-returning the identical 126,174-group result set differ 94x in memory (285 MB vs 26859
-MB) purely on whether one comparison in the predicate was `pl.col(x) == pl.col(x).min()`
-instead of a literal. An aggregate inside a filter forces Polars to see every row before
-it can evaluate what was supposed to be a per-row test, which blocks the pushdown this
-whole plugin exists to make work.
+`Options.where` accepts a single SQL-flavored boolean expression that may mix two kinds
+of AND-ed conditions: DIMENSION conditions (against the raster metadata table --
+path/band/dimensions -- or a vector frame's dimension columns) and VALUE conditions
+(against actual pixel/cell VALUES, via the placeholder column `value`). Dimension
+conjuncts are handed to `pl.sql_expr` -- or even a full `lf.sql(...)` call -- largely
+unrestricted, the same as always. A value conjunct is different in kind, not just in
+which columns it can name: it runs on the hot path Polars can stream, so an expression
+shaped wrong doesn't just give a bad answer -- it can force a full materialization the
+query would otherwise never need. The measured example (see raster_source.py's module
+docstring and the plan this module implements): two queries returning the identical
+126,174-group result set differ 94x in memory (285 MB vs 26859 MB) purely on whether one
+comparison in the predicate was `pl.col(x) == pl.col(x).min()` instead of a literal. An
+aggregate inside a filter forces Polars to see every row before it can evaluate what was
+supposed to be a per-row test, which blocks the pushdown this whole plugin exists to make
+work -- and that hole is closed for BOTH conjunct kinds now, not just value conjuncts (see
+`classify_where`).
 
 So this module's job is narrower and stricter than "parse a SQL string": reject, at parse
 time and before any file is opened, anything that is not an elementwise map, a filter
@@ -70,6 +72,14 @@ _NON_STREAMING_KEYWORDS = ("order by", "group by", " join ", " over ", "partitio
 
 _IDENTIFIER_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
+# A subquery keyword inside a DIMENSION conjunct (see `classify_where`/
+# `_check_no_dimension_subquery`). `pl.sql_expr` happens to reject a subquery that
+# names a FROM relation ("... in (select max(x) from self)": nothing is registered
+# under the name `self`), but NOT one that doesn't ("... in (select 1)" parses just
+# fine) -- so a plain parse failure can't be relied on to close this hole; the keyword
+# itself has to be checked for explicitly, the same way an aggregate call is.
+_SELECT_KEYWORD_RE = re.compile(r"\bselect\b", re.IGNORECASE)
+
 # The placeholder every value expression is written against, uniformly across both grid
 # types -- see `rewrite_value_column`. Matched on a word boundary so an identifier that
 # merely CONTAINS "value" (there are none in the current column namespaces, but nothing
@@ -89,13 +99,16 @@ def _check_streaming_closed(expr_str):
 def _check_no_aggregate_calls(expr_str):
     """The plan-time rule that must run before `pl.sql_expr` ever gets near the string:
     a match here means REJECT, unconditionally, before any file is opened -- there is no
-    "aggregate is fine here but not there" exception inside one predicate.
+    "aggregate is fine here but not there" exception inside one predicate. Shared between
+    `parse_value_expr` (a value expression) and `_check_no_dimension_subquery_or_aggregate`
+    (a dimension `where` conjunct) -- the error message below is deliberately worded for
+    either caller rather than naming just one.
     """
     for match in _IDENTIFIER_CALL_RE.finditer(expr_str):
         name = match.group(1).lower()
         if name in AGGREGATE_FUNCTION_NAMES:
             raise ExpressionError(
-                f"aggregate function '{name}' is not allowed inside a value expression -- "
+                f"aggregate function '{name}' is not allowed inside this expression -- "
                 "it forces a full pass before the predicate can be evaluated per row"
             )
 
@@ -107,6 +120,27 @@ def _check_allowed_calls(expr_str):
             continue  # reported by _check_no_aggregate_calls with a more specific message
         if name not in ALLOWED_FUNCTIONS:
             raise ExpressionError(f"function '{name}' is not in the allowed whitelist {sorted(ALLOWED_FUNCTIONS)}")
+
+
+def _check_no_dimension_subquery_or_aggregate(conjunct):
+    """The DIMENSION-conjunct counterpart of `_check_no_aggregate_calls` --  applied by
+    `classify_where`, not `parse_value_expr`, since a dimension conjunct never reaches
+    that function at all (it goes to `lf.sql()` unrestricted; see the module
+    docstring). Without this check, a dimension conjunct is otherwise unrestricted, so
+    nothing else stands between it and the same 94x/26.9GB pushdown-defeating
+    materialization the value-expression whitelist exists to prevent -- an aggregate
+    call (`calendar_year = max(calendar_year)`) or a subquery
+    (`calendar_year in (select ...)`) inside a per-row filter both force a full pass
+    before the comparison can be evaluated, exactly like the measured value-side
+    example in the module docstring.
+    """
+    _check_no_aggregate_calls(conjunct)
+    if _SELECT_KEYWORD_RE.search(conjunct):
+        raise ExpressionError(
+            f"subquery ('select') is not allowed in a where conjunct: {conjunct!r} -- it "
+            "forces a full pass before the filter can be evaluated per row, the same "
+            "pushdown-defeating shape an aggregate inside the filter would"
+        )
 
 
 def _check_column_namespace(expr, allowed_columns):
@@ -155,6 +189,129 @@ def parse_value_expr(expr_str, allowed_columns, *, reject_aggregates=True):
 
     _check_column_namespace(expr, allowed_columns)
     return expr
+
+
+def split_top_level_and(where_str):
+    """Split a `where` string into its top-level AND-ed conjuncts.
+
+    A plain character scanner over the raw string -- not a SQL parser, not Polars'
+    serialized expression tree, and not a naive `re.split(r"(?i)\\band\\b", ...)` (which
+    would also split inside a quoted string or a parenthesised subexpression). It walks
+    `where_str` once, tracking single-quote state and paren depth, and only treats a
+    case-insensitive, word-boundary "and" as a split point when both are at their
+    baseline (outside any quote, at paren depth 0). Anything nested inside `OR`, `NOT`,
+    parentheses, or a quoted literal stays part of the conjunct it's nested in and is
+    handed whole to `pl.sql_expr` by `classify_where` -- this function only ever finds
+    the TOP-level seam, which is the one `where`'s dimension/value split is defined
+    against (see `classify_where`).
+
+    Returns a list of conjunct strings (whitespace-stripped, not further validated --
+    an empty or unparseable conjunct is `classify_where`'s problem, not this function's,
+    since a would-be-reusable splitter shouldn't also own SQL semantics).
+    """
+    conjuncts = []
+    depth = 0
+    in_quote = False
+    start = 0
+    i = 0
+    n = len(where_str)
+    while i < n:
+        ch = where_str[i]
+        if in_quote:
+            if ch == "'":
+                in_quote = False
+            i += 1
+            continue
+        if ch == "'":
+            in_quote = True
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and where_str[i : i + 3].lower() == "and":
+            before = where_str[i - 1] if i > 0 else " "
+            after = where_str[i + 3] if i + 3 < n else " "
+            is_word_char = lambda c: c.isalnum() or c == "_"  # noqa: E731
+            if not is_word_char(before) and not is_word_char(after):
+                conjuncts.append(where_str[start:i])
+                i += 3
+                start = i
+                continue
+        i += 1
+    conjuncts.append(where_str[start:])
+    return [c.strip() for c in conjuncts]
+
+
+def classify_where(where_str):
+    """Split `where` into top-level AND conjuncts (`split_top_level_and`) and sort each
+    into a DIMENSION conjunct (references no `value` column) or a VALUE conjunct
+    (references `value`, and nothing outside `value` plus literals/whitelisted
+    functions) -- the seam this module's two existing surfaces are unified across: a
+    dimension conjunct is recombined by the caller (`Dataset._apply_filter_params`) into
+    the existing unrestricted `lf.sql()` path, and a value conjunct is recombined and
+    handed to `parse_value_expr`'s restricted whitelist, exactly the two mechanisms that
+    already existed for `where` and the former `value_where` respectively.
+
+    Classification is by NAME (`pl.sql_expr(conjunct).meta.root_names()`), not by
+    guessing from the string: a conjunct is parsed once, here, purely to answer "which
+    columns does this reference" -- the parsed `Expr` itself is discarded, since the
+    caller needs the original conjunct STRING back (to recombine dimension conjuncts
+    with `AND` for `lf.sql()`, or to hand a value conjunct to `parse_value_expr`, which
+    re-parses it under its own restricted whitelist rather than trusting this parse).
+
+    A conjunct referencing BOTH `value` and a dimension column is rejected outright --
+    e.g. `value > calendar_year` -- with an error naming the conjunct and explaining
+    the rule: dimension and value conditions must be separate AND-ed conjuncts (like
+    `calendar_year > 2040 AND value > 3`), never combined inside one comparison, since
+    there is no ambiguity-free way to classify a single conjunct that references both.
+
+    A conjunct `pl.sql_expr` cannot parse at all raises `ExpressionError` here -- the
+    same rejection an eventual `lf.sql()` or `parse_value_expr` failure would give for
+    the same malformed input, just surfaced at the earliest possible point (before any
+    file is opened) rather than once collection actually reaches that conjunct.
+
+    A dimension conjunct is additionally checked for an aggregate call or a subquery
+    (`_check_no_dimension_subquery_or_aggregate`) -- unlike `where` historically, a
+    dimension conjunct is no longer assumed safe by construction just because it
+    doesn't touch `value`; see that function and the module docstring for why.
+
+    Returns `(dimension_conjuncts, value_conjuncts)`, two lists of ORIGINAL conjunct
+    strings in the order they appeared in `where_str`.
+    """
+    dimension_conjuncts = []
+    value_conjuncts = []
+    for conjunct in split_top_level_and(where_str):
+        if not conjunct:
+            raise ExpressionError(f"empty conjunct in where={where_str!r}")
+        try:
+            expr = pl.sql_expr(conjunct)
+        except Exception as exc:  # pl.sql_expr's own exception types are not part of its stable API
+            raise ExpressionError(f"invalid where conjunct {conjunct!r}: {exc}") from exc
+
+        referenced = set(expr.meta.root_names())
+        references_value = "value" in referenced
+        references_dimension = bool(referenced - {"value"})
+        if references_value and references_dimension:
+            raise ExpressionError(
+                f"where conjunct {conjunct!r} references both a dimension column and "
+                "`value` -- a single AND-term can only be one kind; write dimension and "
+                "value conditions as separate AND-ed conjuncts (e.g. "
+                "`calendar_year > 2040 AND value > 3`), not combined in one comparison"
+            )
+
+        if references_value:
+            value_conjuncts.append(conjunct)
+        else:
+            _check_no_dimension_subquery_or_aggregate(conjunct)
+            dimension_conjuncts.append(conjunct)
+
+    return dimension_conjuncts, value_conjuncts
 
 
 def rewrite_value_column(expr_str, column_name):

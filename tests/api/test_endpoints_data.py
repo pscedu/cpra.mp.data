@@ -4,6 +4,7 @@ Unlike the Dataset unit tests, these go through real routing and query-string pa
 they cover the parameter binding that FastAPI does before a Dataset is ever built.
 """
 
+import datetime
 import io
 import json
 
@@ -130,9 +131,9 @@ def categorical_raster_with_zones(base_path, crosswalk_path, monkeypatch):
 @pytest.fixture
 def gradient_raster_with_zones(base_path, crosswalk_path, monkeypatch):
     """A raster whose pixels are a gradient (see `raster_array`'s no-fill case), split
-    into two zones by row, for a `summarize_by`+`value_where` conditional-count request
-    -- the exit-criterion query, end to end through the ASGI app rather than a unit-level
-    `Dataset`.
+    into two zones by row, for a `summarize_by`+`where`-value-conjunct conditional-count
+    request -- the exit-criterion query, end to end through the ASGI app rather than a
+    unit-level `Dataset`.
     """
     from cpra.mp.data.grids import GRIDS
 
@@ -298,14 +299,13 @@ class TestVectorData:
         assert response.status_code == 400
 
     def test_conditional_count_is_one_request(self, client, vector_data):
-        """"Count cells where value > x" -- one `value_where` + `group_aggregate=count`
-        request, no separate fetch-then-filter-then-count round trip on the client side.
-        Cell (year, geo) holds year + geo/100 (see `annual_frame`), so a threshold
-        between the two written years isolates exactly one year's worth of matches.
+        """"Count cells where value > x" -- one `where` value conjunct +
+        `group_aggregate=count` request, no separate fetch-then-filter-then-count round
+        trip on the client side. Cell (year, geo) holds year + geo/100 (see
+        `annual_frame`), so a threshold between the two written years isolates exactly
+        one year's worth of matches.
         """
-        response = client.get(
-            f"{VECTOR_URL}/data.csv", params={"value_where": "value > 2035", "group_aggregate": "count"}
-        )
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"where": "value > 2035", "group_aggregate": "count"})
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.height == 32
@@ -359,6 +359,49 @@ class TestVectorData:
             actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
             assert actual == value_counts
 
+    def test_mixed_dimension_and_value_where_aggregating(self, client, vector_data):
+        """A single `where` string with one dimension conjunct and one value conjunct,
+        AND-ed together (`calendar_year > 2035 AND value > 0`), end to end through
+        routing and query-string parsing. `calendar_year > 2035` (a dimension conjunct)
+        is a real row filter, isolating the 2040 rows; `value > 0` (a value conjunct) is
+        vacuously true for every remaining cell (see `annual_frame`'s
+        `year + geo_id / 100`), so `group_aggregate=count` should still see all 32 cells.
+        """
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={"where": "calendar_year > 2035 AND value > 0", "group_aggregate": "count"},
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.height == 32
+        assert df["value"].to_list() == [1] * 32
+
+    def test_mixed_dimension_and_value_where_plain(self, client, vector_data):
+        """The same mixed `where` as above, but with no aggregate: the dimension
+        conjunct still restricts to 2040's rows, and the value conjunct now drops (not
+        masks) any row that fails it, since a plain tabular request has no aggregate
+        downstream for a masked null to fall into unnoticed.
+        """
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={"where": "calendar_year > 2035 AND value > 2040.16"},
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["calendar_year"].unique().to_list() == [2040]
+        assert df["value"].null_count() == 0
+        assert (df["value"] > 2040.16).all()
+        assert df.height < 32
+
+    def test_retired_value_where_param_is_rejected(self, client, vector_data):
+        """`value_where` was retired in favor of `where` (see
+        `api.reject_retired_value_where`); a request that still sends it gets a loud 400
+        naming the replacement, rather than having the parameter silently ignored the way
+        FastAPI/pydantic treat any other unrecognized query parameter."""
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"value_where": "value > 2035"})
+        assert response.status_code == 400
+        assert "where" in response.json()["detail"]
+
 
 class TestRasterData:
     def test_tif(self, client, raster_data):
@@ -398,9 +441,9 @@ class TestRasterData:
 
     def test_conditional_count_per_zone_is_one_request(self, client, gradient_raster_with_zones):
         """The plan's target query -- "count pixels per compartment where value > X" --
-        expressed as one API request (`summarize_by` + `summarize_aggregate=count` +
-        `value_where`), end to end through routing and query-string parsing rather than
-        a directly constructed `Dataset`.
+        expressed as one API request (`summarize_by` + `summarize_aggregate=count` + a
+        `where` value conjunct), end to end through routing and query-string parsing
+        rather than a directly constructed `Dataset`.
         """
         _base_path, _grid, zones = gradient_raster_with_zones
         gradient = raster_array()
@@ -411,7 +454,7 @@ class TestRasterData:
             params={
                 "summarize_by": "hydro_compartment_v001",
                 "summarize_aggregate": "count",
-                "value_where": f"value > {threshold}",
+                "where": f"value > {threshold}",
             },
         )
         assert response.status_code == 200

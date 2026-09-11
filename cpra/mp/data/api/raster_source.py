@@ -440,3 +440,167 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
             yield df
 
     return register_io_source(source, schema=schema)
+
+
+# See `scan_broadcast`'s window-sizing comment: a measured stand-in for how many
+# same-length 8-byte temporary arrays are alive at once per window in that source's
+# `source()` closure, used only to size its read window -- never a real dtype.
+_BROADCAST_ITEMSIZE_INFLATION = 4
+
+
+def scan_broadcast(broadcast_crosswalk_path, broadcast_ids, broadcast_values, output_zones_path, output_zone_ids):
+    """Return a LazyFrame of (grid_cell, value) broadcasting a small coarse-grid
+    selection onto a fine grid's pixels via two co-registered crosswalk rasters.
+
+    This currently has no API caller. It is retained as the executor for a planned
+    pipeline grid-projection operation: projecting a coarse (zone-keyed) dataset's
+    per-zone values onto a fine raster grid's own pixels through a crosswalk raster, for
+    a caller that wants to zonal-summarize those projected values by a second, possibly
+    different zone set -- e.g. projecting a hydro-compartment salinity value onto
+    vegetation pixels, then zonal-summarizing by ecoregion. Measured at 752 MB peak at
+    full raster extent, and bit-identical to the reference formula
+    (``np.where(ids == nodata, nan, coarse_values[ids])``) it reproduces without holding
+    the fine grid's full pixel grid in the coarse dataset's own shape.
+
+    This is the cross-grid counterpart to `scan_rasters` above: where `scan_rasters`
+    reads actual band data from a variable's own files, this reads no variable data at
+    all -- the coarse dataset (a variable+selection on the coarse grid) is assumed
+    already collapsed, by the caller, to one row per coarse zone (`broadcast_ids`/
+    `broadcast_values`, aligned arrays), so every pixel's value is determined entirely by
+    which coarse zone it falls in. That is also why this can be a NumPy lookup array
+    rather than a Polars join: the lookup array's size is the coarse zone ID range, not
+    the (unbounded) pixel count, so the whole "join" is O(1) per pixel and never grows
+    with how much of the fine raster is read. A real Polars `.join()` against the small
+    coarse frame would reach the identical result -- the lookup is preferred here only
+    because the join key range is already known to be small and dense enough that
+    indexing beats hashing, not because a join wouldn't also fit in memory.
+
+    `output_zones_path`/`output_zone_ids` name a SECOND crosswalk (the destination zone a
+    caller wants results grouped by) -- independent of `broadcast_crosswalk_path`, which
+    supplies the coarse VALUE. The two may be the same file (a caller re-summarizing
+    broadcast values back onto their own coarse zones, a useful identity check) or
+    different (zonal stats of broadcast values over an entirely different zone set than
+    the one that supplied the coarse value). Both rasters are read per window; a pixel is
+    dropped -- not merely nulled -- when EITHER crosswalk's ID at that pixel is nodata or
+    absent from its own ID set (`broadcast_ids` / `output_zone_ids`). Dropping instead of
+    nulling reproduces the same result every supported aggregate would get from nulling,
+    since every aggregate a caller can apply downstream is null-skipping, so a row that
+    never existed and a row that existed with a null value are indistinguishable to
+    `count`, `sum`, `mean`, `min`, `max`. Either way the pixel never contributes a coarse
+    value to any output group, matching the ``np.where(ids == nodata, nan, ...)`` masking
+    this executor models.
+
+    `broadcast_ids` must be sorted; `broadcast_values` is any numeric NumPy dtype aligned
+    to it (typically Float64, so a null-shaped "no coarse row for this id" default of NaN
+    survives the lookup untouched -- see the guard in `source` below).
+    """
+    broadcast_crosswalk_path = str(broadcast_crosswalk_path)
+    output_zones_path = str(output_zones_path)
+    schema = pl.Schema({"grid_cell": pl.Int32, "value": pl.Float64})
+
+    # A dense lookup array indexed by raw coarse zone ID, built once here (not per
+    # window): NaN everywhere except the caller's own coarse rows, so a crosswalk ID that
+    # is in-range but was never one of `broadcast_ids` (the "absent from the coarse
+    # frame" case) resolves to NaN exactly like a lookup miss, with no separate branch.
+    # This array's size scales with the coarse ID range, not the (unbounded) pixel count
+    # -- a caller with a high-cardinality coarse selection should bound its row count
+    # before calling in, the same way `expressions.count_by_value_frame` bounds distinct
+    # values before its own array-shaped operation.
+    max_id = int(broadcast_ids.max()) if broadcast_ids.size else -1
+    lookup = np.full(max_id + 1, np.nan, dtype="float64")
+    lookup[broadcast_ids] = broadcast_values
+
+    def source(with_columns, predicate, n_rows, batch_size):
+        remaining = n_rows
+
+        with raster_gdal_env(), rio.open(broadcast_crosswalk_path) as first_src:
+            block_height, block_width = first_src.block_shapes[0]
+            # `raster_blocks_per_batch`'s budget is bytes-per-band-per-pixel
+            # (`itemsize`), sized for `scan_rasters`' one-array-per-band shape. This
+            # source's per-pixel footprint is different in kind: reading a window touches
+            # both zone rasters and carries several same-length Int64/Float64 intermediate
+            # arrays at once (search positions, keep masks, the looked-up values) that
+            # `scan_rasters` never allocates, since it has no lookup step. A single-band
+            # crosswalk's own itemsize (commonly Int16, 2 bytes) badly underestimates that
+            # footprint -- passed through unchanged, the derived window can span an entire
+            # block row (measured 1.7 GB peak on the real 1657-zone crosswalk at full
+            # 20674x8265 extent, on data with no per-pixel data file to read at all).
+            # `_BROADCAST_ITEMSIZE_INFLATION` is a measured stand-in for "how many
+            # same-length 8-byte temporaries are alive at once per window", not the raster's
+            # real dtype -- treating it as 4 such arrays brought the same measurement down
+            # to well under a quarter of that ceiling with no correctness change (it only
+            # feeds the batch-size heuristic, never the actual read or dtype).
+            itemsize = 8 * _BROADCAST_ITEMSIZE_INFLATION
+            blocks_per_batch = raster_blocks_per_batch(1, block_height, block_width, itemsize)
+            window_list = list(_batched_windows(first_src, blocks_per_batch))
+
+        for window in window_list:
+            if remaining is not None and remaining <= 0:
+                break
+
+            # See `scan_rasters`'s identical comment: nothing GDAL-related may cross the
+            # `yield` below, since the streaming engine can resume this generator on a
+            # different thread than the one that entered the env.
+            with raster_gdal_env():
+                with rio.open(broadcast_crosswalk_path) as bsrc:
+                    broadcast_zones = bsrc.read(1, window=window).ravel()
+                    broadcast_nodata = bsrc.nodata
+                if output_zones_path == broadcast_crosswalk_path:
+                    output_zones = broadcast_zones
+                    output_nodata = broadcast_nodata
+                else:
+                    with rio.open(output_zones_path) as osrc:
+                        output_zones = osrc.read(1, window=window).ravel()
+                        output_nodata = osrc.nodata
+
+                # Source-level spatial filter, mirroring `scan_rasters`: keep only pixels
+                # whose OUTPUT zone is one of the requested destinations.
+                out_positions = np.searchsorted(output_zone_ids, output_zones).clip(max=output_zone_ids.size - 1)
+                keep = np.flatnonzero(output_zone_ids[out_positions] == output_zones)
+                if output_nodata is not None:
+                    keep = keep[output_zones[keep] != output_nodata]
+                if keep.size == 0:
+                    continue
+
+                b_zones = broadcast_zones[keep]
+                out_zones = output_zones[keep]
+
+                # Second mask, same treatment: a broadcast-crosswalk nodata pixel, or one
+                # whose id is out of the lookup's range entirely (bigger than any coarse
+                # row's id), is dropped here rather than left to look up out of bounds.
+                valid = b_zones >= 0
+                if broadcast_nodata is not None:
+                    valid &= b_zones != broadcast_nodata
+                valid &= b_zones <= max_id
+                if not valid.all():
+                    b_zones = b_zones[valid]
+                    out_zones = out_zones[valid]
+                if b_zones.size == 0:
+                    continue
+
+                values = lookup[b_zones]
+                # A crosswalk ID inside the lookup's range but never one of the coarse
+                # frame's own rows resolves to NaN from the `np.full` default above --
+                # drop those pixels too, rather than emit a fabricated NaN "value" a
+                # caller's aggregate would otherwise have to special-case.
+                present = ~np.isnan(values)
+                if not present.all():
+                    values = values[present]
+                    out_zones = out_zones[present]
+
+            if out_zones.size == 0:
+                continue
+
+            df = pl.DataFrame({"grid_cell": out_zones.astype("int32"), "value": values})
+
+            if predicate is not None:
+                df = df.filter(predicate)
+
+            if remaining is not None and df.height > remaining:
+                df = df.head(remaining)
+            if remaining is not None:
+                remaining -= df.height
+
+            yield df
+
+    return register_io_source(source, schema=schema)
