@@ -320,17 +320,17 @@ def test_aggregate_excludes_nodata_from_the_reduction(nodata_cog, tmp_path):
     """Nodata pixels are excluded from a group_aggregate collapse, matching the summarize
     path's exclusion semantics (see ``raster_source.horizontal_aggregate_expr``).
 
-    This used to be pinned here as a KNOWN QUIRK the other direction: ``get_raster_array``
-    reduced with plain ``np.<fn>`` over the raw window, so -9999 was treated as an ordinary
-    value -- a pixel nodata in only some bands produced an arbitrary blend with the real
-    bands instead of their mean/sum, and ``sum`` over a fully-nodata pixel produced
-    ``-9999 * n`` rather than any kind of no-data marker. The windowed writer now masks
-    each band's own raw pixel value against the source's nodata sentinel before the
-    multiply/collapse step (mirroring ``_accumulate_zone_stats``'s exclusion for the
-    summarize path), and, when a pixel has no contributing band at all, writes the nodata
-    sentinel itself rather than NaN -- an integer output band cannot hold NaN the way the
-    summarize path's Float64 result can, so this is a deliberate difference from that
-    path's NaN marker, not an inconsistency.
+    This used to be pinned here as a KNOWN QUIRK the other direction: the windowed writer's
+    earlier NumPy reduce collapsed with plain ``np.<fn>`` over the raw window, so -9999 was
+    treated as an ordinary value -- a pixel nodata in only some bands produced an arbitrary
+    blend with the real bands instead of their mean/sum, and ``sum`` over a fully-nodata
+    pixel produced ``-9999 * n`` rather than any kind of no-data marker. The windowed
+    writer now masks each band's own raw pixel value against the source's nodata sentinel
+    before the multiply/collapse step (mirroring the summarize path's own nodata-to-null
+    exclusion, see ``raster_source.scan_rasters``'s ``mask_nodata``), and, when a pixel has
+    no contributing band at all, writes the nodata sentinel itself rather than NaN -- an
+    integer output band cannot hold NaN the way the summarize path's Float64 result can, so
+    this is a deliberate difference from that path's NaN marker, not an inconsistency.
     """
 
     df = _index_frame(nodata_cog, tuple(range(1, len(YEARS) + 1)))

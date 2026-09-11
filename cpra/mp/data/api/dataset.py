@@ -42,7 +42,6 @@ from cpra.mp.data.api.raster_source import (
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.types import DataFormat, OutputType
 from cpra.mp.data.api.utils import (
-    _read_window,
     asynctiming,
     get_lazy_frame,
     group_rows_by_path,
@@ -56,7 +55,6 @@ from cpra.mp.data.api.utils import (
 from cpra.mp.data.config import (
     COUNT_BY_VALUE_MAX_DISTINCT,
     RASTER_NUM_THREADS,
-    RASTER_USE_IO_PLUGIN,
     RASTER_USE_VRT_COPY,
     RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
@@ -80,67 +78,6 @@ VALUE_COLUMNS = cs.by_name("value")
 # 19.3 GB band-interleaved, since only pixel interleaving puts each pixel's bands adjacent
 # for the compression predictor.
 OUTPUT_INTERLEAVE = "PIXEL"
-
-# Zonal summarize aggregates, as (reducing ufunc, identity element) pairs. Every aggregate
-# reduces the same way; the identity element is what a nodata pixel is substituted with so
-# it drops out of the reduction (0 leaves sum/mean unchanged, +-inf leave min/max
-# unchanged). `mean` additionally divides by the per-band, per-zone count of pixels that
-# actually contributed -- see `_accumulate_zone_stats` -- not the raw pixel count that
-# `_get_zone_segments` returns, which counts nodata pixels too.
-RASTER_AGGREGATES = {
-    "max": (np.maximum, -np.inf),
-    "mean": (np.add, 0.0),
-    "min": (np.minimum, np.inf),
-    "sum": (np.add, 0.0),
-}
-
-
-def _get_zone_segments(zones, zone_ids):
-    """Sort a block of crosswalk zone IDs into contiguous runs of same-zone pixels.
-
-    Returns the positions in `zone_ids` of the zones present in the block, the block's
-    flat pixel indices ordered by zone, the offset at which each zone's run of pixels
-    begins, and the number of pixels in each run. Pixels belonging to a zone that isn't
-    being summarized, including nodata pixels, are dropped.
-    """
-    flat_zones = zones.ravel()
-    positions = np.searchsorted(zone_ids, flat_zones).clip(max=zone_ids.size - 1)
-    pixels = np.flatnonzero(zone_ids[positions] == flat_zones)
-    pixels = pixels[np.argsort(positions[pixels], kind="stable")]
-    present, starts, counts = np.unique(positions[pixels], return_index=True, return_counts=True)
-    return present, pixels, starts, counts
-
-
-def _accumulate_zone_stats(data, zones, zone_ids, nodata, aggregate_fn, identity, accumulator, valid):
-    """Fold one window's pixels into `accumulator`/`valid` for one zonal aggregate.
-
-    Nodata pixels (`data == nodata`) are excluded from every aggregate: substituted with
-    the aggregate's identity element so the `reduceat` reduction is unaffected by their
-    presence, and left out of `valid`, the per-band, per-zone count of pixels that actually
-    contributed. That count is `mean`'s correct denominator (not the raw pixel count, which
-    is wrong the moment any pixel is excluded) and also marks an all-nodata (band, zone)
-    cell, which `_apply_transform_params_raster` turns into `NaN`.
-
-    `valid` is per-band, not per-zone, because one band can be entirely nodata in a zone
-    where another band has values -- a per-zone marker would wrongly blank out the other
-    band's real value.
-
-    `nodata=None` (no sentinel declared for this raster) treats every matched pixel as
-    contributing, i.e. no masking, matching the pre-fix behavior for such rasters.
-    """
-    positions, pixels, starts, _pixel_counts = _get_zone_segments(zones, zone_ids)
-    if positions.size == 0:
-        return
-
-    for band_idx, band in enumerate(data):
-        vals = band.reshape(-1)[pixels].astype("float64", copy=False)
-        ok = np.ones(vals.shape, dtype=bool) if nodata is None else (vals != nodata)
-        masked = np.where(ok, vals, identity)
-        accumulator[band_idx, positions] = aggregate_fn(
-            accumulator[band_idx, positions], aggregate_fn.reduceat(masked, starts)
-        )
-        valid[band_idx, positions] += np.add.reduceat(ok.astype("float64"), starts)
-
 
 def _batched_block_windows(block_windows, blocks_per_batch):
     """Yield window unions over `block_windows`, chunked to at most `blocks_per_batch`
@@ -660,7 +597,8 @@ class Dataset(LazyFrameSource):
 
     def _get_raster_dimension_frame(self, df):
         """Get a DataFrame with one row per output raster band, aligned by row order
-        with the pixel array `get_raster_array` returns for the same `df`."""
+        with the `(n_bands, zone_ids.size)` array `_summarize_zone_stats_plugin` returns
+        for the same `df`."""
         if self.raster_groups is None:
             return df.select(pl.exclude("path", "multiplier"))
 
@@ -683,10 +621,8 @@ class Dataset(LazyFrameSource):
         (dimension columns, a `grid_cell` column holding the destination grid_cell ID, a
         `value` column, and a `geographic_unit` column).
 
-        The actual per-zone reduction is computed by one of two interchangeable
-        implementations -- see `_summarize_zone_stats_numpy` and
-        `_summarize_zone_stats_plugin` -- both returning a `(n_bands, zone_ids.size)`
-        array in the same shape, so the assembly below doesn't need to know which one ran.
+        The actual per-zone reduction is computed by `_summarize_zone_stats_plugin`,
+        returning a `(n_bands, zone_ids.size)` array.
 
         `value_where` (a per-pixel value predicate -- see `Options.value_where`) is only
         meaningful here, at the summarize stage: it is what `_summarize_zone_stats_plugin`
@@ -778,43 +714,21 @@ class Dataset(LazyFrameSource):
             )
             return
 
-        # The plugin path (`scan_rasters`) now applies the same multiplier/group-aggregate
-        # pre-collapse as the numpy path's `get_raster_array`, via the shared
-        # `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary in
-        # raster_source.py -- see `_summarize_zone_stats_plugin` -- so eligibility would
-        # otherwise depend only on the flag, not on which parameters are in play.
-        #
-        # `summarize_aggregate == "count"` and `value_where` are the two exceptions: a
-        # per-pixel value predicate needs a per-pixel frame to mask, which only the
-        # plugin's row-per-pixel scan exposes (`_summarize_zone_stats_numpy` never
-        # materializes one -- its whole design point is the batched `reduceat` fold that
-        # avoids it), and `count` has no numpy-path implementation at all
-        # (`RASTER_AGGREGATES` above has no `count` entry -- see its docstring). Routing
-        # these two through the plugin regardless of the flag, rather than erroring when
-        # the flag is off, keeps exactly one execution path per request SHAPE: a
-        # conditional-count query always means one thing, instead of behaving differently
-        # depending on an operator-facing rollout flag the caller has no visibility into.
-        plugin_eligible = (
-            RASTER_USE_IO_PLUGIN
-            or self.options.summarize_aggregate == "count"
-            or self.options.value_where is not None
+        # The plugin path (`scan_rasters`) applies the multiplier/group-aggregate
+        # pre-collapse via the shared `horizontal_aggregate_expr`/
+        # `HORIZONTAL_RASTER_AGGREGATES` vocabulary in raster_source.py -- see
+        # `_summarize_zone_stats_plugin` -- so every summarize request, regardless of
+        # which parameters are in play, reaches the same single implementation.
+        result = await asyncio.to_thread(
+            self._summarize_zone_stats_plugin,
+            df,
+            unique_paths,
+            row_indices,
+            bands,
+            crosswalk_path,
+            zone_ids,
+            n_bands,
         )
-
-        if plugin_eligible:
-            result = await asyncio.to_thread(
-                self._summarize_zone_stats_plugin,
-                df,
-                unique_paths,
-                row_indices,
-                bands,
-                crosswalk_path,
-                zone_ids,
-                n_bands,
-            )
-        else:
-            result = await self._summarize_zone_stats_numpy(
-                df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands
-            )
 
         # Assemble in wide format (one column per zone) to line up with `result`'s shape,
         # then unpivot to the long-format grid_cell/value contract used everywhere else --
@@ -827,96 +741,18 @@ class Dataset(LazyFrameSource):
             .lazy()
         )
 
-    async def _summarize_zone_stats_numpy(self, df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
-        """Zonal aggregate via the batched block-window / masked-`reduceat` loop.
-
-        The default path, and the only one used whenever a group_aggregate or calculate
-        (multiplier) parameter is in play -- see the caller, `_apply_transform_params_raster`.
-        Returns a `(n_bands, zone_ids.size)` array, NaN where a (band, zone) had no
-        contributing (non-nodata) pixel.
-        """
-        is_mean = self.options.summarize_aggregate == "mean"
-        aggregate_fn, start_value = RASTER_AGGREGATES[self.options.summarize_aggregate]
-
-        with ExitStack() as stack:
-            # GDAL_NUM_THREADS only speeds up decompression for reads on a dataset that was
-            # *opened* with it in effect -- measured on real data: opening under the env then
-            # reading plainly took ~5s/10 bands vs ~15s with no env anywhere, while entering the
-            # env only around the later `.read()` calls (as this function used to assume) barely
-            # moved the needle (~12-14s). So the env must be live here, at open time, not just
-            # around the per-window reads below. Entered narrowly (only around the opens, not
-            # the whole loop) since it sets a process-global GDAL config while running on this
-            # coroutine's thread -- see raster_gdal_env's docstring -- so keeping it open for the
-            # whole (potentially 90s+) loop would leak GDAL_NUM_THREADS/GDAL_CACHEMAX into any
-            # unrelated concurrent request (e.g. a tile read) sharing the same worker thread pool
-            # for that entire window; confirmed empirically that a bare open() is fast enough
-            # that this leak window is negligible by comparison.
-            with raster_gdal_env():
-                crosswalk = stack.enter_context(rio.open(crosswalk_path))
-                inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
-
-            accumulator = np.full((n_bands, zone_ids.size), start_value)
-            # Per-band, per-zone count of contributing (non-nodata) pixels -- mean's
-            # denominator and the all-nodata marker. Per band rather than per zone: see
-            # _accumulate_zone_stats.
-            valid = np.zeros((n_bands, zone_ids.size))
-
-            # All inputs backing one request share the same variable and are produced by
-            # the same conversion pipeline, so they share one nodata sentinel; read it from
-            # the file rather than hardcoding it. (The elevation sentinel is currently
-            # -9999, a known data-generation bug being fixed separately to -9999000 -- this
-            # needs no change either way, since it reads whatever the file declares.)
-            nodata = inputs[0].nodata
-
-            # Batch size is capped independently of the block row's width -- see
-            # raster_blocks_per_batch and _batched_block_windows -- so a wide raster or a
-            # large band selection doesn't force every iteration to materialize a whole
-            # block row's pixels regardless of how much data the request actually needs.
-            block_height, block_width = inputs[0].block_shapes[0]
-            itemsize = np.dtype(inputs[0].dtypes[0]).itemsize
-            blocks_per_batch = raster_blocks_per_batch(n_bands, block_height, block_width, itemsize)
-
-            for window in _batched_block_windows(inputs[0].block_windows(1), blocks_per_batch):
-                # Neither read depends on the other, so overlap the crosswalk read with
-                # the (already parallel) reads of the data COGs. use_gdal_env=True enters
-                # raster_gdal_env() around each read on the worker thread that performs it,
-                # which is what keeps GDAL_CACHEMAX's memory bound in effect for every read
-                # (measured: it must be live *at read time* to matter -- confirmed on real
-                # data that opening under a capped GDAL_CACHEMAX but reading without it made no
-                # difference to peak RSS, while capping it here did). This is a separate lever
-                # from the open-time env above, which is what GDAL_NUM_THREADS needs instead.
-                data, zones = await asyncio.gather(
-                    self.get_raster_array(df, inputs, row_indices, bands, window, use_gdal_env=True),
-                    asyncio.to_thread(_read_window, crosswalk, window, indexes=1, use_gdal_env=True),
-                )
-
-                # Grouping the block's pixels by zone once lets each band be reduced over
-                # every zone in a single pass, and shares that grouping across the bands.
-                # Nodata pixels are excluded here -- see _accumulate_zone_stats.
-                _accumulate_zone_stats(data, zones, zone_ids, nodata, aggregate_fn, start_value, accumulator, valid)
-
-        result = (
-            np.divide(accumulator, valid, out=np.full_like(accumulator, np.nan), where=valid > 0)
-            if is_mean
-            else accumulator.copy()
-        )
-        # A (band, zone) with no contributing pixel has no answer -- either the zone never
-        # appeared in a scanned window, or every matched pixel there was nodata.
-        result[valid == 0] = np.nan
-        return result
-
     def _summarize_zone_stats_plugin(self, df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
         """Zonal aggregate via the Polars IO plugin (`raster_source.scan_rasters`).
 
-        Equivalent to `_summarize_zone_stats_numpy` for every case that reaches this method
-        (see `_apply_transform_params_raster`): a calculate (multiplier) parameter and a
-        group_aggregate pre-collapse are applied here too, via the same
-        `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary
-        `Dataset.get_raster_array` uses, in the same order (multiply, then collapse).
-        `scan_rasters` masks nodata to null against each band's own raw pixel value before
-        either step sees it (`mask_nodata=True`), so a masked band's null survives the
-        multiply and drops out of the horizontal collapse and the final vertical
-        `guarded_aggregate` alike, with no separate accumulation pass needed here.
+        The single implementation of the zonal summarize step (see
+        `_apply_transform_params_raster`): a calculate (multiplier) parameter and a
+        group_aggregate pre-collapse are applied here via the
+        `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary, in that
+        order (multiply, then collapse). `scan_rasters` masks nodata to null against each
+        band's own raw pixel value before either step sees it (`mask_nodata=True`), so a
+        masked band's null survives the multiply and drops out of the horizontal collapse
+        and the final vertical `guarded_aggregate` alike, with no separate accumulation
+        pass needed here.
 
         `Options.value_where`, when set, is masked in the same way and at the same point
         as nodata -- against each band's own raw pixel value, before the multiply -- via
@@ -1165,36 +1001,6 @@ class Dataset(LazyFrameSource):
             data[path_row_indices] = read
         return data
 
-    async def get_raster_array(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
-        """Read a raster array and apply the operations specified in the index DataFrame.
-
-        The NumPy formulation of the multiplier/group_aggregate step. Its only remaining
-        caller is ``_summarize_zone_stats_numpy``, which the Polars IO plugin path replaces
-        (see ``config.RASTER_USE_IO_PLUGIN``); the write and tile paths both express the same
-        step as Polars expressions instead, via ``raster_source.band_collapse_exprs``. Kept
-        as-is rather than routed through that shared builder because the two are not
-        bit-identical for a zonal accumulator -- ``np.sum`` over int32 bands accumulates in
-        int32 where `POLARS_RASTER_AGGREGATES` deliberately widens to Float64 -- and there is
-        no reason to perturb a path that goes away with the flag.
-        """
-        data = await self._read_raster_bands(df, rasters, row_indices, bands, window, out_shape, use_gdal_env)
-
-        # Apply multipliers from calculate parameters.
-        if not (df["multiplier"] == 1).all():
-            data = data * df["multiplier"].to_numpy()[..., np.newaxis, np.newaxis]
-
-        # Apply group and aggregate parameters.
-        if self.raster_groups is not None:
-            aggregate_fn = getattr(np, self.options.group_aggregate)
-            data = np.vstack(
-                [
-                    aggregate_fn(data[row_idxs, :, :], axis=0, keepdims=True)
-                    for row_idxs in self.raster_groups.collect()["row_idxs"]
-                ]
-            )
-
-        return data
-
     def _collapse_tile_bands(self, df, data, nodata):
         """Apply a tile's multiplier/group_aggregate step with Polars expressions.
 
@@ -1408,11 +1214,11 @@ class Dataset(LazyFrameSource):
         memory.
 
         The multiplier/group_aggregate step is Polars expressions over a per-window
-        DataFrame rather than `get_raster_array`'s NumPy reduction, built once outside the
-        window loop below (`exprs`) by the shared `raster_source.band_collapse_exprs`, so it
-        uses the same operator vocabulary as the tile and summarize paths instead of a second
-        implementation of the same four aggregates. Reading and writing stay array plumbing:
-        one window's worth of raw bands in, one `output.write` per window out.
+        DataFrame, built once outside the window loop below (`exprs`) by the shared
+        `raster_source.band_collapse_exprs`, so it uses the same operator vocabulary as
+        the tile and summarize paths instead of a second implementation of the same four
+        aggregates. Reading and writing stay array plumbing: one window's worth of raw
+        bands in, one `output.write` per window out.
         """
 
         unique_paths, row_indices, bands = group_rows_by_path(df)
@@ -1459,12 +1265,11 @@ class Dataset(LazyFrameSource):
             #
             # `nodata=` is passed only for an aggregated (group_aggregate) selection, so a
             # nodata pixel drops out of the collapse instead of contributing a sentinel to
-            # it. A plain, non-aggregated selection passes every pixel through untouched,
-            # matching get_raster_array's own (unmasked) behavior for that case and the
-            # pinned test_non_aggregated_output_preserves_nodata. This is where the write
-            # path deliberately differs from get_tile, which masks either way: a written file
-            # can carry the sentinel forward for its reader to interpret, but a rendered
-            # pixel has to commit to a color.
+            # it. A plain, non-aggregated selection passes every pixel through untouched --
+            # see the pinned test_non_aggregated_output_preserves_nodata. This is where the
+            # write path deliberately differs from get_tile, which masks either way: a
+            # written file can carry the sentinel forward for its reader to interpret, but a
+            # rendered pixel has to commit to a color.
             out_names, exprs = band_collapse_exprs(
                 raw_names,
                 multipliers,

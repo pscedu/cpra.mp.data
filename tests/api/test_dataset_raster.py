@@ -16,9 +16,8 @@ from PIL import Image
 from rasterio.windows import Window
 
 from cpra.mp.data.api import dataset as dataset_module
-from cpra.mp.data.api.dataset import _batched_block_windows, _get_zone_segments
+from cpra.mp.data.api.dataset import _batched_block_windows
 from cpra.mp.data.api.types import OutputType
-from cpra.mp.data.api.utils import group_rows_by_path
 from cpra.mp.data.grids import GRIDS
 
 from tests.factories import (
@@ -167,14 +166,19 @@ class TestCalculateStage:
         assert dataset.materialize().sort("calendar_year")["multiplier"].to_list() == [1, 10]
 
     async def test_multiplier_reaches_the_pixels(self, dataset_factory, raster_data):
+        """The multiplier a calculate param records on `df` reaches the pixels through
+        `_collapse_tile_bands`, the shared Polars-expression multiplier/group_aggregate
+        step every read path (tile, write, summarize) now uses."""
         dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
-        _paths, row_indices, bands = group_rows_by_path(df)
-        with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
-        assert data[0][0, 0] == -30
-        assert data[1][0, 0] == 40
+        assert df["multiplier"].to_list() == [-1, 1]
+        data = np.array([[[30]], [[40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out[0, 0, 0] == -30
+        assert out[1, 0, 0] == 40
 
 
 class TestGroupStage:
@@ -195,11 +199,12 @@ class TestGroupStage:
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
         await dataset.apply_params()
         df = dataset.materialize()
-        _paths, row_indices, bands = group_rows_by_path(df)
-        with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
-        assert data.shape[0] == 1
-        assert data[0][0, 0] == 40
+        data = np.array([[[30]], [[40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out.shape == (1, 1, 1)
+        assert out[0, 0, 0] == 40
 
     @pytest.mark.parametrize(
         ("aggregate", "expected"), [("min", 30), ("max", 40), ("sum", 70), ("mean", 35)]
@@ -210,48 +215,11 @@ class TestGroupStage:
         dataset = dataset_factory(DIMENSIONS, group_aggregate=aggregate)
         await dataset.apply_params()
         df = dataset.materialize()
-        _paths, row_indices, bands = group_rows_by_path(df)
-        with rio.open(df["path"][0]) as first, rio.open(df["path"][1]) as second:
-            data = await dataset.get_raster_array(df, [first, second], row_indices, bands, None)
-        assert data[0][0, 0] == expected
+        data = np.array([[[30]], [[40]]], dtype="int32")
 
+        out = dataset._collapse_tile_bands(df, data, -9999)
 
-class TestZoneSegments:
-    def test_groups_pixels_by_zone(self):
-        zones = np.array([[1, 2, 1, 2]], dtype="int64")
-        zone_ids = np.array([1, 2], dtype="int64")
-        positions, pixels, starts, counts = _get_zone_segments(zones, zone_ids)
-        assert positions.tolist() == [0, 1]
-        assert counts.tolist() == [2, 2]
-        assert sorted(pixels[starts[0] : starts[0] + counts[0]].tolist()) == [0, 2]
-
-    def test_drops_zones_that_are_not_summarized(self):
-        zones = np.array([[1, 99, 1]], dtype="int64")
-        zone_ids = np.array([1], dtype="int64")
-        positions, pixels, _starts, counts = _get_zone_segments(zones, zone_ids)
-        assert positions.tolist() == [0]
-        assert counts.tolist() == [2]
-        assert sorted(pixels.tolist()) == [0, 2]
-
-    def test_drops_nodata_zeros(self):
-        zones = np.array([[0, 1, 0]], dtype="int64")
-        zone_ids = np.array([1, 2], dtype="int64")
-        positions, pixels, _starts, counts = _get_zone_segments(zones, zone_ids)
-        assert positions.tolist() == [0]
-        assert counts.tolist() == [1]
-
-    def test_no_matching_zones_returns_empty(self):
-        zones = np.array([[7, 8]], dtype="int64")
-        zone_ids = np.array([1, 2], dtype="int64")
-        positions, _pixels, _starts, _counts = _get_zone_segments(zones, zone_ids)
-        assert positions.size == 0
-
-    def test_counts_sum_to_the_matched_pixel_count(self):
-        rng = np.random.default_rng(0)
-        zones = rng.integers(0, 4, size=(8, 8)).astype("int64")
-        zone_ids = np.array([1, 2, 3], dtype="int64")
-        _positions, pixels, _starts, counts = _get_zone_segments(zones, zone_ids)
-        assert counts.sum() == pixels.size
+        assert out[0, 0, 0] == expected
 
 
 class TestBatchedBlockWindows:
@@ -348,10 +316,18 @@ class TestSummarizeStage:
         assert df.height == 4  # 2 bands (years) x 2 zones
 
     @pytest.mark.parametrize("aggregate", ["min", "max", "mean", "sum"])
+    @pytest.mark.parametrize("data_fixture", ["one_raster", "raster_data"])
     async def test_uniform_rasters_summarize_to_the_fill_value(
-        self, dataset_factory, raster_data, zone_crosswalk, aggregate
+        self, request, dataset_factory, zone_crosswalk, data_fixture, aggregate
     ):
-        """Each COG is uniform, so min/max/mean all equal the fill and sum scales by area."""
+        """Each COG is uniform, so min/max/mean all equal the fill and sum scales by area.
+
+        Parametrized over both a single-file (`one_raster`) and multi-file (`raster_data`)
+        dataset: rows sharing a multiband COG are grouped onto one raster/band-list by
+        `group_rows_by_path`, so this exercises both the single- and multi-source shapes
+        of that grouping through the same summarize call.
+        """
+        request.getfixturevalue(data_fixture)
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate=aggregate
         )
@@ -764,147 +740,87 @@ class TestTileBandCollapse:
         assert out[0, 0, 0] == pytest.approx((-9999 + 40) / 2)
 
 
-class TestPluginDifferential:
-    """The Polars IO-plugin summarize path (config.RASTER_USE_IO_PLUGIN) must agree
-    exactly with the numpy path it can replace -- see
-    Dataset._summarize_zone_stats_plugin vs _summarize_zone_stats_numpy. Eligibility no
-    longer depends on which query parameters are in play (see TestPluginEligibility
-    below), so a group_aggregate collapse and a calculate (multiplier) parameter both need
-    differential coverage here too, not just the "plain" case.
+class TestSummarizeCalculateAndGroupAggregate:
+    """The zonal summarize (`_summarize_zone_stats_plugin`) applies a calculate
+    (multiplier) parameter and a group_aggregate band collapse before the zonal reduce
+    itself, via the shared `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES`
+    vocabulary (see `_apply_transform_params_raster`'s docstring) -- these pin that
+    composition with hand-computed values, since `TestSummarizeStage`'s plain-selection
+    coverage doesn't exercise either parameter.
     """
 
-    async def _run(self, dataset_factory, monkeypatch, use_plugin, **options):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", use_plugin)
-        dataset = dataset_factory(DIMENSIONS, **options)
-        await dataset.apply_params()
-        return dataset.materialize().sort(["calendar_year", "grid_cell"])
-
-    @pytest.mark.parametrize("aggregate", ["min", "max", "sum", "mean"])
-    @pytest.mark.parametrize("data_fixture", ["one_raster", "raster_data"])
-    async def test_plugin_matches_numpy(
-        self, request, dataset_factory, zone_crosswalk, monkeypatch, data_fixture, aggregate
+    @pytest.mark.parametrize(
+        ("aggregate", "expected"), [("min", 30), ("max", 40), ("sum", 70), ("mean", 35)]
+    )
+    async def test_group_aggregate_precedes_the_zonal_summarize(
+        self, dataset_factory, raster_data, zone_crosswalk, aggregate, expected
     ):
-        """Single-file (`one_raster`) and multi-file (`raster_data`) cases, all four
-        aggregates -- the exit criterion this whole path is measured against."""
-        request.getfixturevalue(data_fixture)
-        options = dict(summarize_by="hydro_compartment_v001", summarize_aggregate=aggregate)
-
-        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
-        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
-
-        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
-        assert np.array_equal(
-            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
-        ), aggregate
-
-    @pytest.mark.parametrize("aggregate", ["min", "max", "sum", "mean"])
-    async def test_plugin_matches_numpy_with_nodata(
-        self, dataset_factory, raster_data_with_nodata, zone_crosswalk, monkeypatch, aggregate
-    ):
-        """Nodata handling differs in mechanism between the two paths (explicit masking
-        plus a hand-corrected mean denominator in numpy, vs null-propagation plus Polars'
-        own null-skipping count/mean in the plugin -- see scan_rasters) but must agree in
-        result, including the all-nodata (band, zone) NaN case."""
-        options = dict(summarize_by="hydro_compartment_v001", summarize_aggregate=aggregate)
-
-        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
-        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
-
-        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
-        assert np.array_equal(
-            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
-        ), aggregate
-
-    async def test_plugin_zone_with_no_pixels_is_nan(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
-    ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
+        """group_aggregate (band collapse) and summarize_aggregate (zonal reduce) are two
+        different axes of the same pipeline. Both source bands are uniform (30, 40), so
+        the collapsed per-pixel value is the same everywhere in the zone, and the zonal
+        `summarize_aggregate=mean` just confirms that collapsed value reaches every pixel
+        in the zone unchanged. Zone 5 has no pixels in the crosswalk, exercising NaN
+        placement here too.
+        """
         dataset = dataset_factory(
             DIMENSIONS,
+            group_aggregate=aggregate,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
             summarize_grid_cell="1,5",
         )
         await dataset.apply_params()
         df = dataset.materialize()
+
+        zone_1 = df.filter(pl.col("grid_cell") == 1)
         zone_5 = df.filter(pl.col("grid_cell") == 5)
-        zone_1 = df.filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert zone_1["value"][0] == pytest.approx(expected)
         assert all(np.isnan(v) for v in zone_5["value"].to_list())
-        assert zone_1["value"][0] == pytest.approx(30)
 
-    @pytest.mark.parametrize("aggregate", ["min", "max", "sum", "mean"])
-    async def test_plugin_matches_numpy_with_group_aggregate(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch, aggregate
+    async def test_multiplier_precedes_the_zonal_summarize(
+        self, dataset_factory, raster_data, zone_crosswalk
     ):
-        """Closing the group_aggregate/multiplier bypass (see TestPluginEligibility) means
-        the plugin path must now agree with numpy for these cases too, not just the plain
-        one -- see Dataset._summarize_zone_stats_plugin.
-
-        Uses `raster_data` (no nodata) rather than `raster_data_with_nodata` deliberately:
-        the numpy path applies group_aggregate *before* nodata masking
-        (`get_raster_array` collapses first; `_accumulate_zone_stats` then masks the
-        already-collapsed value against the raw nodata sentinel, which will essentially
-        never match), so numpy's own group_aggregate+nodata combination has a pre-existing
-        asymmetry unrelated to closing this bypass. Exercising it here would pin that
-        numpy quirk into a test named for something else instead of documenting it as its
-        own, separate known behavior.
-        """
-        options = dict(
-            group_aggregate=aggregate,
-            summarize_by="hydro_compartment_v001",
-            summarize_aggregate="mean",
-            summarize_grid_cell="1,5",  # zone 5 has no pixels -- exercises NaN placement too
-        )
-        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
-        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
-
-        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
-        assert np.array_equal(
-            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
-        ), aggregate
-
-    async def test_plugin_matches_numpy_with_multiplier(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
-    ):
-        """Same closed bypass, for the calculate (multiplier) parameter."""
-        options = dict(
+        """The calculate (multiplier) parameter applies before the zonal summarize
+        aggregate, band by band -- negating one band doesn't touch the other."""
+        dataset = dataset_factory(
+            DIMENSIONS,
             negate="calendar_year = 2030",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
-        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
-        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
+        await dataset.apply_params()
+        df = dataset.materialize()
 
-        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
-        assert np.array_equal(
-            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
-        )
+        zone_1 = df.filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert zone_1["value"].to_list() == pytest.approx([-30, 40])
 
-    async def test_plugin_matches_numpy_with_group_aggregate_and_multiplier(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
+    async def test_multiplier_and_group_aggregate_together(
+        self, dataset_factory, raster_data, zone_crosswalk
     ):
-        """Both parameters together -- the combination the bypass used to rule out
-        entirely, regardless of RASTER_USE_IO_PLUGIN."""
-        options = dict(
+        """Both parameters compose: multiply then collapse (see
+        `_summarize_zone_stats_plugin`'s docstring) -- sum(-30, 40) = 10, uniform across
+        the grid, so the zonal mean is also 10."""
+        dataset = dataset_factory(
+            DIMENSIONS,
             group_aggregate="sum",
             negate="calendar_year = 2030",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
-        numpy_df = await self._run(dataset_factory, monkeypatch, False, **options)
-        plugin_df = await self._run(dataset_factory, monkeypatch, True, **options)
+        await dataset.apply_params()
+        df = dataset.materialize()
 
-        assert plugin_df["grid_cell"].to_list() == numpy_df["grid_cell"].to_list()
-        assert np.array_equal(
-            plugin_df["value"].to_numpy(), numpy_df["value"].to_numpy(), equal_nan=True
-        )
+        zone_1 = df.filter(pl.col("grid_cell") == 1)
+        zone_2 = df.filter(pl.col("grid_cell") == 2)
+        assert zone_1["value"][0] == pytest.approx(10)
+        assert zone_2["value"][0] == pytest.approx(10)
 
 
 @pytest.fixture
 def group_aggregate_nodata_raster(base_path):
     """Two COGs (2030, 2040) built so a `group_aggregate` collapse across them, combined
-    with nodata, has numerically distinct correct vs. quirky answers -- see
-    `TestNumpyGroupAggregateNodataQuirk` below.
+    with nodata, has a numerically distinct answer depending on whether nodata is excluded
+    from the collapse -- see `TestGroupAggregateNodataExclusion` below.
 
     Zone 1 (top half, via `zone_crosswalk`) is real in both bands: 10 in 2030, 20 in 2040.
     Zone 2 (bottom half) is nodata (-9999, `write_cog`'s fixed sentinel) in 2030 and real
@@ -921,32 +837,31 @@ def group_aggregate_nodata_raster(base_path):
     return write_raster_dataset(base_path, years=(2030, 2040), data_fn=data_fn)
 
 
-class TestNumpyGroupAggregateNodataQuirk:
-    """Pins a known-incorrect interaction between `group_aggregate` and nodata masking in
-    the numpy summarize path (`RASTER_USE_IO_PLUGIN=False`).
+class TestGroupAggregateNodataExclusion:
+    """A nodata pixel in one of the raw bands being collapsed by `group_aggregate` is
+    excluded from that collapse rather than contaminating it.
 
-    `_apply_transform_params_raster` -> `_summarize_zone_stats_numpy` reads pixels through
-    `Dataset.get_raster_array`, which collapses a `group_aggregate` with plain
-    `np.<fn>(data, axis=0)` over the *raw* stacked bands (`dataset.py`, `get_raster_array`)
-    -- with no nodata masking at all. Only afterwards does `_accumulate_zone_stats` mask
-    `vals == nodata` against that already-collapsed value, which essentially never equals
-    the raw sentinel again once it has been averaged/summed/etc. with a real value. The net
-    effect: a nodata pixel in one of the raw bands being collapsed contaminates the
-    group_aggregate for every band sharing that pixel, instead of being excluded from it.
-
-    This is a pin of CURRENT, known-incorrect behaviour, not an endorsement of it -- see
-    `test_numpy_group_aggregate_lets_nodata_contaminate_the_collapse` below for the exact
-    numbers. The Polars IO-plugin path (`_summarize_zone_stats_plugin`,
-    `raster_source.horizontal_aggregate_expr`, via `scan_rasters(mask_nodata=True)`) masks
-    nodata to null *before* the group_aggregate collapse, which is correct -- see
-    `test_plugin_group_aggregate_excludes_nodata_from_the_collapse`. Delete the numpy-path
-    test below once the numpy summarize path itself is removed (i.e. once
-    `RASTER_USE_IO_PLUGIN` is made permanently True and `_summarize_zone_stats_numpy` /
-    `get_raster_array`'s group_aggregate step are deleted with it).
+    `scan_rasters(mask_nodata=True)` nulls out a nodata pixel against its own raw value
+    before `horizontal_aggregate_expr` (`raster_source.py`) ever sees it, so the collapse
+    runs over only the surviving real values -- `mean_horizontal` skips nulls the same way
+    Polars' own null-skipping `mean()` does. This is the single summarize implementation's
+    only behavior; there is no other order of operations to compare it against.
     """
 
-    async def _run(self, dataset_factory, monkeypatch, use_plugin, zone_crosswalk):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", use_plugin)
+    async def test_group_aggregate_excludes_nodata_from_the_collapse(
+        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk
+    ):
+        """Zone 1 has no nodata, so it collapses normally: mean(10, 2030; 20, 2040) = 15,
+        uniform across the zone, so the zonal mean is also 15 -- a sanity check that both
+        zones ran through the same collapse.
+
+        Zone 2's 2030 band is nodata (-9999) and its 2040 band is real (30). The
+        nodata-excluding collapse mean is over the single surviving value, so it is
+        exactly 30 -- not `mean(-9999, 30)`, which the masking exists to avoid. That is
+        not the all-nodata case (`horizontal_aggregate_expr`'s `no_contributor` branch,
+        which would apply only if *both* zone-2 bands were nodata) -- one band still
+        contributes, so the collapsed value is exactly that band's value, not NaN/null.
+        """
         dataset = dataset_factory(
             DIMENSIONS,
             group_aggregate="mean",
@@ -954,59 +869,19 @@ class TestNumpyGroupAggregateNodataQuirk:
             summarize_aggregate="mean",
         )
         await dataset.apply_params()
-        return dataset.materialize()
+        df = dataset.materialize()
 
-    def _zone_value(self, df, grid_cell):
-        return df.filter(pl.col("grid_cell") == grid_cell)["value"][0]
+        def zone_value(grid_cell):
+            return df.filter(pl.col("grid_cell") == grid_cell)["value"][0]
 
-    async def test_numpy_group_aggregate_lets_nodata_contaminate_the_collapse(
-        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk, monkeypatch
-    ):
-        """KNOWN QUIRK, pinned deliberately (numpy summarize path only): the -9999 nodata
-        sentinel in zone 2's 2030 band is treated as an ordinary value by the
-        group_aggregate mean instead of being excluded.
-
-        Zone 1 has no nodata, so it collapses normally: mean(10, 2030; 20, 2040) = 15,
-        uniform across the zone, so the zonal mean is also 15 -- this is a sanity check
-        that both zones ran through the same collapse, not the quirk itself.
-
-        Zone 2's per-pixel group_aggregate mean is mean(-9999, 30) = -4984.5, computed
-        over the raw sentinel with no masking. That collapsed value, uniform across zone
-        2, is nowhere near -9999, so `_accumulate_zone_stats`'s `vals != nodata` check
-        treats every zone-2 pixel as contributing -- the zonal mean of -4984.5 comes
-        straight through unmasked, rather than the 30 a nodata-excluding collapse would
-        produce (see the plugin counterpart below).
-        """
-        df = await self._run(dataset_factory, monkeypatch, False, zone_crosswalk)
-        assert self._zone_value(df, 1) == pytest.approx(15.0)
-        assert self._zone_value(df, 2) == pytest.approx((-9999 + 30) / 2)
-        assert self._zone_value(df, 2) == pytest.approx(-4984.5)
-
-    async def test_plugin_group_aggregate_excludes_nodata_from_the_collapse(
-        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk, monkeypatch
-    ):
-        """The correct counterpart to the numpy quirk pinned above, through the Polars
-        IO-plugin summarize path (`RASTER_USE_IO_PLUGIN=True`).
-
-        `scan_rasters(mask_nodata=True)` nulls out zone 2's -9999 2030 pixel against its
-        own raw value before `horizontal_aggregate_expr` ever sees it, so the `mean`
-        collapse there is over the single surviving real value (30) rather than the raw
-        sentinel -- `mean_horizontal` skips nulls the same way Polars' own null-skipping
-        `mean()` does. That is not the all-nodata case (`horizontal_aggregate_expr`'s
-        `no_contributor` branch, which would apply only if *both* zone-2 bands were
-        nodata) -- one band still contributes, so the collapsed value is exactly that
-        band's value, 30, not NaN/null.
-        """
-        df = await self._run(dataset_factory, monkeypatch, True, zone_crosswalk)
-        assert self._zone_value(df, 1) == pytest.approx(15.0)
-        assert self._zone_value(df, 2) == pytest.approx(30.0)
+        assert zone_value(1) == pytest.approx(15.0)
+        assert zone_value(2) == pytest.approx(30.0)
 
 
-class TestPluginEligibility:
-    """The plugin path applies the same multiplier/group_aggregate pre-collapse as the
-    numpy path (see Dataset._summarize_zone_stats_plugin and
-    raster_source.horizontal_aggregate_expr), so whether it is used depends only on
-    RASTER_USE_IO_PLUGIN -- not on which query parameters are in play."""
+class TestSummarizeRoutesThroughThePlugin:
+    """Every summarize request, regardless of which query parameters are in play, reaches
+    `_summarize_zone_stats_plugin` (see `_apply_transform_params_raster`'s docstring) --
+    there is only the one implementation to route to."""
 
     async def _plugin_was_called(self, dataset, monkeypatch):
         called = []
@@ -1020,10 +895,9 @@ class TestPluginEligibility:
         await dataset.apply_params()
         return bool(called)
 
-    async def test_group_aggregate_uses_the_plugin_when_flagged_on(
+    async def test_group_aggregate_uses_the_plugin(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
         dataset = dataset_factory(
             DIMENSIONS,
             group_aggregate="max",
@@ -1032,10 +906,9 @@ class TestPluginEligibility:
         )
         assert await self._plugin_was_called(dataset, monkeypatch) is True
 
-    async def test_multiplier_uses_the_plugin_when_flagged_on(
+    async def test_multiplier_uses_the_plugin(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
         dataset = dataset_factory(
             DIMENSIONS,
             negate="calendar_year = 2030",
@@ -1044,35 +917,13 @@ class TestPluginEligibility:
         )
         assert await self._plugin_was_called(dataset, monkeypatch) is True
 
-    async def test_group_aggregate_skips_the_plugin_when_flagged_off(
+    async def test_plain_request_uses_the_plugin(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
-        dataset = dataset_factory(
-            DIMENSIONS,
-            group_aggregate="max",
-            summarize_by="hydro_compartment_v001",
-            summarize_aggregate="mean",
-        )
-        assert await self._plugin_was_called(dataset, monkeypatch) is False
-
-    async def test_plain_request_uses_the_plugin_when_flagged_on(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
-    ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", True)
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
         assert await self._plugin_was_called(dataset, monkeypatch) is True
-
-    async def test_plain_request_skips_the_plugin_when_flagged_off(
-        self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
-    ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
-        dataset = dataset_factory(
-            DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
-        )
-        assert await self._plugin_was_called(dataset, monkeypatch) is False
 
 
 class TestValueWherePixelPredicate:
@@ -1153,10 +1004,9 @@ class TestValueWherePixelPredicate:
         assert excinfo.value.status_code == 400
         assert "value_where" in excinfo.value.detail
 
-    async def test_value_where_forces_the_plugin_regardless_of_the_flag(
+    async def test_value_where_uses_the_plugin(
         self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
     ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
@@ -1174,10 +1024,9 @@ class TestValueWherePixelPredicate:
         await dataset.apply_params()
         assert called
 
-    async def test_summarize_aggregate_count_forces_the_plugin_regardless_of_the_flag(
+    async def test_summarize_aggregate_count_uses_the_plugin(
         self, dataset_factory, raster_data, zone_crosswalk, monkeypatch
     ):
-        monkeypatch.setattr(dataset_module, "RASTER_USE_IO_PLUGIN", False)
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count"
         )

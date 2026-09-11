@@ -1,8 +1,9 @@
 """Tests for the Polars IO-plugin raster source (api.raster_source.scan_rasters).
 
 `scan_rasters` backs `Dataset._summarize_zone_stats_plugin` -- see
-`test_dataset_raster.py`'s `TestPluginDifferential` for the numpy-agreement tests -- but
-is exercised directly here for mechanics only a hand-built LazyFrame source has: dense
+`test_dataset_raster.py`'s `TestSummarizeCalculateAndGroupAggregate` and
+`TestGroupAggregateNodataExclusion` for value-level coverage of that path -- but is
+exercised directly here for mechanics only a hand-built LazyFrame source has: dense
 vs. zoned reads, projection pushdown, and running under Polars' streaming engine
 specifically.
 """

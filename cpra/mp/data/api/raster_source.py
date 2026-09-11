@@ -35,19 +35,17 @@ NUMPY_TO_POLARS = {
     "float64": pl.Float64,
 }
 
-# Polars equivalents of `RASTER_AGGREGATES` (dataset.py). The Float64 cast on `sum`/`mean`
-# is deliberate: Polars would otherwise accumulate a Float32 column in Float32, which
-# diverged from the numpy path's explicit float64 accumulation by ~1.5 absolute over 10M
-# pixels in an earlier round. `min`/`max` need no cast -- they never accumulate.
+# The zonal summarize aggregates. The Float64 cast on `sum`/`mean` is deliberate: Polars
+# would otherwise accumulate a Float32 column in Float32, which measured ~1.5 absolute off
+# from accumulating in float64 over 10M pixels in an earlier round. `min`/`max` need no
+# cast -- they never accumulate.
 #
-# `count` has no numpy-path counterpart (`RASTER_AGGREGATES` in dataset.py is unaware of
-# it -- see `_summarize_zone_stats_numpy`'s docstring) because it exists only for the
-# plugin-routed conditional-count query ("how many pixels in this zone satisfy X"): a
-# value-where mask (see expressions.value_predicate_mask / masked_value_predicate_exprs
-# below) nulls out non-matching pixels, and `count()` is Polars' own null-skipping
-# row-count, so "count contributing pixels" and "count pixels the predicate kept" are the
-# same operation with no extra code. It is deliberately absent from
-# `HORIZONTAL_RASTER_AGGREGATES` below -- see that dict's docstring.
+# `count` exists only for the plugin-routed conditional-count query ("how many pixels in
+# this zone satisfy X"): a value-where mask (see expressions.value_predicate_mask /
+# masked_value_predicate_exprs below) nulls out non-matching pixels, and `count()` is
+# Polars' own null-skipping row-count, so "count contributing pixels" and "count pixels
+# the predicate kept" are the same operation with no extra code. It is deliberately absent
+# from `HORIZONTAL_RASTER_AGGREGATES` below -- see that dict's docstring.
 POLARS_RASTER_AGGREGATES = {
     "count": lambda c: c.count(),
     "sum": lambda c: c.cast(pl.Float64).sum(),
@@ -58,9 +56,8 @@ POLARS_RASTER_AGGREGATES = {
 
 
 # Horizontal counterparts to `POLARS_RASTER_AGGREGATES` above. These reduce ACROSS a row's
-# selected band columns (dataset.py's per-band multiplier + group_aggregate collapse, the
-# same operation `np.<fn>(data, axis=0)` performs in `Dataset.get_raster_array`), not DOWN
-# a `group_by`'s rows the way the zonal summarize aggregates above do -- band-collapse and
+# selected band columns (dataset.py's per-band multiplier + group_aggregate collapse), not
+# DOWN a `group_by`'s rows the way the zonal summarize aggregates above do -- band-collapse and
 # zonal summarize are different axes of the same per-band pipeline and are kept in a
 # separate dict so the two are never reached for each other by mistake. Shared by
 # `Dataset._summarize_zone_stats_plugin` (pre-collapsing a group before the vertical zonal
@@ -145,7 +142,7 @@ def band_collapse_exprs(raw_names, multipliers, group_row_idxs, aggregate, dtype
 
     # Skipped entirely (rather than always multiplying by 1.0) when every multiplier is 1,
     # so a plain selection keeps its source dtype instead of being silently promoted to
-    # float -- matching get_raster_array's own `if not (df["multiplier"] == 1).all()` guard.
+    # float.
     if not all(m == 1 for m in multipliers):
         cols = [c * float(m) for c, m in zip(cols, multipliers)]
 
@@ -178,10 +175,11 @@ def guarded_aggregate(aggregate, name):
     """A `group_by().agg()` expression for one column, with the all-nodata edge case fixed.
 
     Bare Polars returns `null` for `min`/`max`/`mean` on an all-null group, and `0` (the
-    additive identity) for `sum` -- neither matches the numpy path's `NaN` for a (band,
-    zone) with no contributing pixel at all. `count()` skips nulls, so it is exactly the
-    contributing-pixel count (the numpy path's `valid`), and the guard below is needed for
-    all four aggregates, not just `sum`, to make the two paths agree exactly.
+    additive identity) for `sum` -- neither is a meaningful answer for a (band, zone) with
+    no contributing pixel at all, which `_apply_transform_params_raster` needs reported as
+    `NaN` instead. `count()` already skips nulls, so it is exactly the contributing-pixel
+    count on its own, but the guard below is still needed for all four aggregates, not
+    just `sum`, to turn "no contributing pixel" into `NaN` consistently.
 
     `count` itself is deliberately exempt from the guard: unlike a mean or a sum, "zero
     contributing pixels" is `count`'s own correct answer, not an edge case standing in for
@@ -307,18 +305,17 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
     ``zone_ids``, when given, is the sorted array of destination zone IDs to summarize
     (as resolved in `Dataset._apply_transform_params_raster`): a `grid_cell` column holds
     the destination zone ID from the crosswalk raster at `zones_path`, and pixels whose
-    zone is not in `zone_ids` (including crosswalk nodata) are dropped in the source,
-    mirroring `_get_zone_segments`. ``zone_ids=None`` is the dense, one-row-per-pixel
-    shape instead: every pixel, in raster order, no crosswalk read and no `grid_cell`
-    column -- not used by summarize, but the shape a future full-resolution consumer
-    (e.g. downloads) would need.
+    zone is not in `zone_ids` (including crosswalk nodata) are dropped in the source.
+    ``zone_ids=None`` is the dense, one-row-per-pixel shape instead: every pixel, in raster
+    order, no crosswalk read and no `grid_cell` column -- not used by summarize, but the
+    shape a future full-resolution consumer (e.g. downloads) would need.
 
     ``value_dtype=None`` infers the schema from `paths[0]` -- see `_raster_dtype`.
 
     ``mask_nodata=True`` maps each column's stored nodata sentinel (read per-file, so
     multiple sources may declare different values) to null before any aggregate sees it;
-    a file with no declared nodata (`src.nodata is None`) is left unmasked, matching the
-    numpy path's treatment of such rasters as never having nodata.
+    a file with no declared nodata (`src.nodata is None`) is left unmasked -- such a raster
+    is treated as never having nodata at all.
     """
     if not paths:
         raise ValueError("scan_rasters requires at least one source path")
@@ -357,8 +354,8 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
         # The window list -- and the batch size it's chunked to -- are derived once, from
         # the first source surviving projection pushdown, so a narrow band selection gets
         # a correspondingly larger batch rather than inheriting a size tuned for the full
-        # band count. Reuses the same budget/knob the numpy path uses
-        # (`raster_blocks_per_batch`) rather than a second, plugin-only setting.
+        # band count. Uses the shared `raster_blocks_per_batch` budget/knob (see
+        # config.RASTER_BATCH_BUFFER_MB) rather than a plugin-only setting.
         with raster_gdal_env(), rio.open(plan[0][0]) as first_src:
             block_height, block_width = first_src.block_shapes[0]
             itemsize = np.dtype(first_src.dtypes[0]).itemsize
@@ -421,9 +418,7 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
 
             # Nodata -> null, so every downstream aggregate skips it (including `mean`'s
             # denominator, via Polars' native null-skipping `count()`/`mean()`) with no
-            # per-aggregate special-casing -- unlike the numpy path, which has to mask
-            # explicitly and correct `mean`'s denominator by hand (see
-            # `_accumulate_zone_stats`).
+            # per-aggregate special-casing needed here.
             if mask_nodata:
                 df = df.with_columns(
                     [
