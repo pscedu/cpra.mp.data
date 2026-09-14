@@ -2,6 +2,8 @@
 
 The data and analysis API provides a RESTful interface for accessing and transforming model data stored in Parquet and COG files. Data from Parquet files can be returned in several tabular formats. Data from COGs can be returned as GeoTIFFs, raster map tiles, or — when summarized or extracted at points — in any of the tabular formats. Vector-grid data can also be rendered as vector map tiles.
 
+The same analysis engine is available as a Python library for code running with direct filesystem access to the data (notebooks, scripts): `analyze_data` accepts the same parameter names documented here — and the same pipeline documents described under [Analysis Pipelines](#analysis-pipelines) — with no HTTP involved. See the [README's Analyzing Data section](../README.md#analyzing-data) for usage.
+
 All of the data endpoints use the general format:
 
 ```
