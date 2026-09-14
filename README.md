@@ -155,6 +155,10 @@ df = await analyze_data(
     where="value > 5.5",
     group_aggregate="count",
 )
+# → one row per grid_cell. The grid cell is always part of the grouping key (this
+#   stage never merges across cells — that's summarize_by's job); group_by lists any
+#   ADDITIONAL dimensions to keep as columns, and everything unlisted is collapsed.
+#   Omitting group_by, as here, collapses across all days to one count per compartment.
 ```
 
 In a plain Python script, wrap the call once with `asyncio.run`:
