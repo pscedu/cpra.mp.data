@@ -39,7 +39,8 @@ migrate = _load_migrate_module()
 # raster's size.
 ELEV_KWARGS = {**RASTER_KWARGS, "variable": "elev", "grid": "morph_pixel_v001"}
 DATASET_KWARGS = {k: ELEV_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-NODATA = -9999
+NODATA = -9999  # what the Float32-meter sources declare
+NODATA_MM = -9999000  # what the migrated Int32-millimeter output must declare (Variable.nodata)
 
 # Consecutive years, so the two files form one contiguous run and are actually compacted --
 # a run already living in a single file is left untouched (see compact_cog).
@@ -117,6 +118,13 @@ class TestElevMmVrt:
         out, _ = migrate._elev_mm_vrt(_vrt_of(nodata=-5555), "float32")
         assert ET.fromstring(out).find("VRTRasterBand").find("ComplexSource").findtext("NODATA") == "-5555"
 
+    def test_scales_the_declared_nodata_with_the_data(self):
+        """The output band declares the sentinel in output units: GDAL fills the pixels
+        `<NODATA>` excludes with the band's declared nodata, and -9999 would be a
+        plausible millimeter elevation (-9.999 m) while -5555000/-9999000 is not."""
+        out, _ = migrate._elev_mm_vrt(_vrt_of(nodata=-5555), "float32")
+        assert ET.fromstring(out).find("VRTRasterBand").findtext("NoDataValue") == "-5555000"
+
     def test_preserves_band_descriptions(self):
         """Band descriptions carry the calendar year -- the only record of which year a
         band holds, so dropping them would make the compacted COG unreadable."""
@@ -192,14 +200,15 @@ class TestElevMigration:
         # exactly 2000.5 and round to 2001, so this pins the arithmetic's precision too.
         assert list(written) == [1500, -250, 2000, 0]
 
-    def test_preserves_the_nodata_sentinel(self, migrated):
-        """Without `<NODATA>` the sentinel is scaled along with real values, landing at
-        -9999000 and no longer matching the nodata the band declares -- so every nodata
-        pixel would read back as a real elevation 9.999 km below the datum."""
+    def test_scales_the_nodata_sentinel_into_millimeters(self, migrated):
+        """Nodata pixels and the band's declared nodata both land on -9999000, and the
+        two must agree -- a -9999 sentinel carried over unscaled would be a plausible
+        millimeter elevation (-9.999 m), silently colliding with real data. -9999000 is
+        also `Variable.nodata` for elev, so migrated rasters match fresh `write_cog` ones."""
         with rio.open(migrated) as src:
-            assert src.nodata == NODATA
+            assert src.nodata == NODATA_MM
             data = src.read(1).reshape(-1)
-        assert (data[len(VALUES) :] == NODATA).all()
+        assert (data[len(VALUES) :] == NODATA_MM).all()
 
     def test_leaves_the_source_rasters_untouched(self, migrated, base_path):
         """The migration writes into a separate tree; until its output is verified, the

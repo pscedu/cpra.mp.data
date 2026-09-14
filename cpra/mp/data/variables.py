@@ -23,6 +23,7 @@ class Variable:
         float_precision=None,
         difference_legend_limit=None,
         max_z_error=None,
+        nodata=None,
     ):
         self.name = name
         self.label = label
@@ -57,6 +58,11 @@ class Variable:
         # No variable sets it since elev moved to Int32 millimeters + ZSTD/predictor, so the
         # structure spreadsheet has no column for it; the write path still honors it.
         self.max_z_error = max_z_error
+        # The nodata sentinel raster writes declare for this variable, in storage units.
+        # The default (-9999) predates per-variable sentinels and is what every raster on
+        # disk already declares; a variable overrides it only when -9999 is a plausible
+        # stored value (elev: -9999 mm is -9.999 m, so it declares -9999000 instead).
+        self.nodata = -9999 if nodata is None else nodata
 
 
 VARIABLES = {

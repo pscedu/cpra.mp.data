@@ -313,7 +313,7 @@ def read_cog(base_path=None, include_file_paths="path", **kwargs):
     return lf
 
 
-def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, max_z_error=None):
+def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, max_z_error=None, nodata=-9999):
     """Build the rasterio COG write profile for a grid (used by ``write_cog``).
 
     ``compact_cog`` reuses this for the shared compression/predictor/nodata options on
@@ -323,6 +323,10 @@ def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, 
     LERC_ZSTD at that error tolerance instead of ``compression``/``predictor`` -- LERC's own
     quantization does the work a predictor would, and combining the two is not meaningful.
     ``compression_level`` still applies, as LERC_ZSTD's inner zstd stage.
+
+    ``nodata`` is the sentinel the band declares; variable-aware callers pass
+    ``Variable.nodata``, which overrides the shared -9999 default for a variable whose
+    stored values could plausibly reach -9999 (see ``Variable``).
     """
 
     profile = {
@@ -331,7 +335,7 @@ def _cog_profile(grid, dtype, count=1, compression="zstd", compression_level=6, 
         "driver": "COG",
         "dtype": dtype,
         "height": grid.height,
-        "nodata": -9999,
+        "nodata": nodata,
         "resampling": "NEAREST",
         "transform": from_bounds(*grid.bounds, width=grid.width, height=grid.height),
         "width": grid.width,
@@ -379,7 +383,8 @@ def write_cog(
     grid = GRIDS[kwargs["grid"]]
     max_z_error = VARIABLES[kwargs["variable"]].max_z_error
     profile = _cog_profile(
-        grid, data.dtype, compression=compression, compression_level=compression_level, max_z_error=max_z_error
+        grid, data.dtype, compression=compression, compression_level=compression_level,
+        max_z_error=max_z_error, nodata=VARIABLES[kwargs["variable"]].nodata,
     )
 
     with rio.open(cog_path, "w", **profile) as dst:
@@ -456,7 +461,7 @@ def scale_vrt_bands(vrt_text, factors):
 
 def _write_run(
     run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
-    max_z_error=None, vrt_transform=None,
+    max_z_error=None, vrt_transform=None, nodata=-9999,
 ):
     """Consolidate one contiguous run into the multi-band COG at ``out_path``.
 
@@ -482,7 +487,7 @@ def _write_run(
 
         profile = _cog_profile(
             grid, dtype, count=len(run), compression=compression, compression_level=compression_level,
-            max_z_error=max_z_error,
+            max_z_error=max_z_error, nodata=nodata,
         )
         profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
         # out_path is a fresh UUID that can't collide with any existing source file, so the
@@ -730,7 +735,7 @@ def compact_cog(
                 _write_run(
                     sub_run, out_path, grid, dtype, calendar_dim, sub_values,
                     run_is_legacy, compression, compression_level, max_z_error,
-                    vrt_transform,
+                    vrt_transform, nodata=VARIABLES[kwargs["variable"]].nodata,
                 )
                 outputs.append(out_path)
                 consumed_paths |= unique_paths

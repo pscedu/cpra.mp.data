@@ -323,7 +323,7 @@ def migrate_partition(
 # one-time move. This applies only to elev, and only to float sources.
 
 ELEV_SCALE_FACTOR = 1000  # millimeters per meter
-ELEV_NODATA = -9999  # matches raster._cog_profile's nodata for every COG this reads
+ELEV_NODATA = -9999  # the sentinel every pre-migration source COG declares (raster._cog_profile's default)
 
 
 def _set_child(element, tag: str, value) -> None:
@@ -350,10 +350,15 @@ def _elev_mm_vrt(vrt_text: str, dtype: str) -> tuple[str, str]:
       is what keeps the result off the float32 half-way ties that would otherwise round the
       wrong way (2.0005 m is 2000.49996... mm in float64 and rounds to 2000, but is exactly
       2000.5 in float32 and would round to 2001). Rounding is half-away-from-zero.
-    * ``<NODATA>`` excludes nodata pixels from the multiply, so the sentinel survives as
-      itself instead of becoming -9999000 and no longer matching the band's declared
-      nodata. (``raster.scale_vrt_bands``, the other scaling path, deliberately does *not*
-      do this -- it preserves an older quirk for the land-change multiply. Don't merge them.)
+    * ``<NODATA>`` excludes nodata pixels from the multiply, and the band's declared
+      ``<NoDataValue>`` is scaled to match (-9999 -> -9999000): GDAL initializes a VRT
+      band's read buffer to its declared nodata, so the excluded pixels come out as the
+      new sentinel. Scaling the sentinel is deliberate, not collateral -- -9999 is an
+      impossible elevation in meters but a plausible -9.999 m once values are stored as
+      millimeters, while -9999000 mm stays impossible. -9999000 is also what
+      ``Variable.nodata`` declares for elev, so migrated and freshly written rasters
+      agree. (``raster.scale_vrt_bands``, the other scaling path, deliberately excludes
+      nothing -- it preserves an older quirk for the land-change multiply. Don't merge them.)
 
     A non-float source is left alone and reported unchanged, so re-running or resuming a
     migration over already-converted Int32 rasters can't scale them a second time.
@@ -369,6 +374,9 @@ def _elev_mm_vrt(vrt_text: str, dtype: str) -> tuple[str, str]:
         # GDAL was told to treat as nodata on the way in has to be what's excluded here.
         nodata_el = band_el.find("NoDataValue")
         nodata = nodata_el.text if nodata_el is not None else str(ELEV_NODATA)
+        # The output band declares the *scaled* sentinel -- see the docstring. Set after
+        # `nodata` is read, so the source exclusion below still matches the input values.
+        _set_child(band_el, "NoDataValue", int(float(nodata) * ELEV_SCALE_FACTOR))
 
         # `gdalbuildvrt` normally emits a SimpleSource, but emits a ComplexSource itself
         # for sources that need one, so take either and retag -- a ComplexSource already

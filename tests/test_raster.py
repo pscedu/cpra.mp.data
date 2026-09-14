@@ -79,6 +79,20 @@ class TestWriteCog:
         with rio.open(next(base_path.rglob("*.tif"))) as src:
             assert src.nodata == -9999
 
+    def test_elev_declares_its_scaled_nodata(self, base_path, monkeypatch):
+        """elev stores Int32 millimeters, where -9999 is a plausible value (-9.999 m);
+        its writes must declare `Variable.nodata` (-9999000) instead of the shared
+        default. The grid is shrunk because morph_pixel is 170M pixels per band --
+        nothing about the declared nodata depends on the raster's size."""
+        grid = GRIDS["morph_pixel_v001"]
+        monkeypatch.setattr(grid, "height", 4)
+        monkeypatch.setattr(grid, "width", 8)
+        elev_kwargs = {**RASTER_KWARGS, "variable": "elev", "grid": "morph_pixel_v001"}
+        data = np.full((grid.height, grid.width), 1500, dtype="int32")
+        write_cog(data, base_path=base_path, calendar_year=2030, **elev_kwargs)
+        with rio.open(next(base_path.rglob("*.tif"))) as src:
+            assert src.nodata == -9999000
+
     def test_single_band(self, base_path):
         write_cog(raster_array(fill=1), base_path=base_path, calendar_year=2030, **RASTER_KWARGS)
         with rio.open(next(base_path.rglob("*.tif"))) as src:
