@@ -530,6 +530,162 @@ class TestRasterTiles:
         assert response.status_code == 200
 
 
+@pytest.fixture
+def two_year_raster_data(base_path, monkeypatch):
+    """Two COGs (2030 filled with 30, 2040 with 40), for band-weighting requests."""
+    write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return base_path
+
+
+class TestCalculateParams:
+    """The indexed `calculate.N.expression`/`calculate.N.where` query parameters, end to
+    end through routing: FastAPI's query models can't bind dotted names, so these go
+    through `api.parse_calculate_query`/`parameters.parse_indexed_calculate`, and any
+    malformed spelling must come back as a 400 naming the exact rule violated."""
+
+    def test_weighted_sum_on_a_vector_grid(self, client, vector_data):
+        """The confidence-weighting idiom on a vector grid: each selection scaled by its
+        own coefficient, collapsed with group_aggregate=sum."""
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={
+                "grid_cell": "1",
+                "calculate.1.expression": "value * 0.5",
+                "calculate.1.where": "calendar_year = 2030",
+                "calculate.2.expression": "value * 0.25",
+                "calculate.2.where": "calendar_year = 2040",
+                "group_aggregate": "sum",
+            },
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(
+            2030.01 * 0.5 + 2040.01 * 0.25, rel=1e-5
+        )
+
+    def test_non_matching_rows_pass_through(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={
+                "grid_cell": "1",
+                "calculate.1.expression": "value * 0",
+                "calculate.1.where": "calendar_year = 2030",
+                "sort": "calendar_year",
+            },
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["value"].to_list() == pytest.approx([0.0, 2040.01], rel=1e-5)
+
+    def test_weighted_band_sum_on_a_raster_grid(self, client, two_year_raster_data):
+        """Band selection via a dimension condition in calculate.N.where, through the
+        full GeoTIFF render path: 30*0.5 + 40*0.25 = 25 at every pixel."""
+        response = client.get(
+            f"{RASTER_URL}/data.tif",
+            params={
+                "calculate.1.expression": "value * 0.5",
+                "calculate.1.where": "calendar_year = 2030",
+                "calculate.2.expression": "value * 0.25",
+                "calculate.2.where": "calendar_year = 2040",
+                "group_aggregate": "sum",
+            },
+        )
+        assert response.status_code == 200
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 1
+            assert src.read(1)[0, 0] == 25
+
+    def test_weighted_band_sum_renders_as_a_tile(self, client, two_year_raster_data):
+        """The same weighting request on the tile route -- the confidence-weighted
+        surface use case, rendered."""
+        with rio.open(next(two_year_raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform_bounds
+
+            west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+        tile = mercantile.tile((west + east) / 2, (south + north) / 2, 8)
+
+        response = client.get(
+            f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.png",
+            params={
+                "calculate.1.expression": "value * 0.5",
+                "calculate.1.where": "calendar_year = 2030",
+                "calculate.2.expression": "value * 0.25",
+                "calculate.2.where": "calendar_year = 2040",
+                "group_aggregate": "sum",
+            },
+        )
+        assert response.status_code == 200
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_non_contiguous_indices_are_400(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv", params={"calculate.2.expression": "value * 2"}
+        )
+        assert response.status_code == 400
+        assert "contiguous" in response.json()["detail"]
+
+    def test_zero_index_is_400(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv", params={"calculate.0.expression": "value * 2"}
+        )
+        assert response.status_code == 400
+        assert "1-based" in response.json()["detail"]
+
+    def test_unknown_field_is_400(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"calculate.1.expr": "value * 2"})
+        assert response.status_code == 400
+        assert "expr" in response.json()["detail"]
+        assert "expression" in response.json()["detail"]
+
+    def test_bare_calculate_parameter_is_400(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"calculate": "value * 2"})
+        assert response.status_code == 400
+        assert "calculate.<N>.expression" in response.json()["detail"]
+
+    def test_where_without_expression_is_400(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv", params={"calculate.1.where": "calendar_year = 2030"}
+        )
+        assert response.status_code == 400
+        assert "expression" in response.json()["detail"]
+
+    def test_mixing_legacy_and_generic_is_400(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={"negate": "calendar_year = 2030", "calculate.1.expression": "value * 2"},
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "negate" in detail
+        assert "ambiguous" in detail
+
+    def test_legacy_negate_still_works_and_equals_its_sugar(self, client, vector_data):
+        legacy = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={"negate": "calendar_year = 2030", "sort": "calendar_year"},
+        )
+        generic = client.get(
+            f"{VECTOR_URL}/data.csv",
+            params={
+                "calculate.1.expression": "value * -1",
+                "calculate.1.where": "calendar_year = 2030",
+                "sort": "calendar_year",
+            },
+        )
+        assert legacy.status_code == generic.status_code == 200
+        legacy_df = pl.read_csv(io.BytesIO(legacy.content)).sort("grid_cell", "calendar_year")
+        generic_df = pl.read_csv(io.BytesIO(generic.content)).sort("grid_cell", "calendar_year")
+        assert legacy_df.equals(generic_df)
+
+    def test_invalid_expression_is_400_naming_the_entry(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/data.csv", params={"calculate.1.expression": "max(value)"}
+        )
+        assert response.status_code == 400
+        assert "calculate.1" in response.json()["detail"]
+
+
 class TestVectorTiles:
     def test_serves_a_tile(self, client, vector_data, tiles_path):
         tile = mercantile.Tile(x=1, y=2, z=3)

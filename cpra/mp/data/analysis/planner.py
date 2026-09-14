@@ -11,7 +11,10 @@ Two shapes compile today, tried in order by `compile_pipeline`:
 * **Shape 1: single-input chains** (`_compile_single_input_chain`) -- a pipeline with
   exactly one input and no `join` step anywhere, lowered onto the existing
   `BaseAnalysis`/`Options` machinery (`analysis.factory.create_analysis` builds the
-  `VectorGridAnalysis`/`RasterGridAnalysis` instance).
+  `VectorGridAnalysis`/`RasterGridAnalysis` instance). `calculate` steps compile onto
+  `Options.calculate`, the same generic entries the flat `calculate.N.*` parameters
+  populate; `calculate` in the paired shape is rejected (see
+  `_compile_paired_notebook_shape`).
 * **Shape 2: the paired (spatially-joined) shape** (`_compile_paired_notebook_shape`) -- a
   coarse input `project`-broadcast onto a finer raster grid, `join`-ed against the finer
   input, and collapsed by a trailing `group` -- compiled into a `PairedAnalysis`
@@ -28,6 +31,8 @@ from pydantic import ValidationError
 from cpra.mp.data import config
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
+    classify_where,
+    parse_calculate_expression,
     parse_value_expr,
     rewrite_named_columns,
     split_top_level_and,
@@ -44,6 +49,7 @@ from cpra.mp.data.analysis.parameters import (
 )
 from cpra.mp.data.analysis.pipeline import (
     _SINGLE_VALUE_COLUMN_FORMATS,
+    CalculateStep,
     FilterStep,
     GroupStep,
     JoinStep,
@@ -192,14 +198,14 @@ def _validate_join_alignment(step_no, names, selections):
                     )
 
 
-def _validate_filter_where(step_no, where, extra_allowed_columns):
+def _validate_filter_where(step_no, where, extra_allowed_columns, op="filter"):
     allowed = _FILTER_ALLOWED_DIMENSION_NAMES | set(extra_allowed_columns)
     for conjunct in split_top_level_and(where):
         try:
             parse_value_expr(conjunct, allowed_columns=allowed)
         except ExpressionError as exc:
             raise PipelineError(
-                f"step {step_no} (filter) where conjunct {conjunct!r} is invalid: {exc}"
+                f"step {step_no} ({op}) where conjunct {conjunct!r} is invalid: {exc}"
             ) from exc
 
 
@@ -314,6 +320,7 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
         option_kwargs["summarize_aggregate"] = first.aggregate
 
     filters = []
+    calculate_steps = []
     group_step = None
     for i, step in enumerate(steps[1:], start=2):
         if isinstance(step, FilterStep):
@@ -323,7 +330,17 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                     "after a group step in a single-input pipeline -- a filter cannot "
                     "run after the collapse a group performs"
                 )
-            filters.append((i, step.where))
+            filters.append((i, step.where, bool(calculate_steps)))
+            if step.as_ is not None:
+                value_names.add(step.as_)
+        elif isinstance(step, CalculateStep):
+            if group_step is not None:
+                raise PipelineError(
+                    f"not yet supported in analysis pipelines: step {i} (calculate) "
+                    "comes after a group step in a single-input pipeline -- a calculate "
+                    "cannot rewrite values after the collapse a group performs"
+                )
+            calculate_steps.append((i, step))
             if step.as_ is not None:
                 value_names.add(step.as_)
         elif isinstance(step, GroupStep):
@@ -346,17 +363,61 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             raise PipelineError(
                 f"not yet supported in analysis pipelines: step {i} ({step.op}) cannot "
                 "follow a single-input pipeline's leading `project` step (only "
-                "`filter`/`group` may)"
+                "`filter`/`calculate`/`group` may)"
             )
 
     rename_map = {name: "value" for name in value_names}
     rewritten_filters = []
-    for i, where in filters:
+    for i, where, after_calculate in filters:
         rewritten = rewrite_named_columns(where, rename_map)
         _validate_filter_where(i, rewritten, {"value"})
+        if after_calculate:
+            # The flat machinery this compiles onto runs its whole Filter stage before
+            # its Calculate stage, so a filter step ORDERED after a calculate step can
+            # only be honored when the two commute -- which a dimension condition does
+            # (calculate never touches dimensions) and a value condition does not (it
+            # would test the pre-calculate value while the pipeline's step order promises
+            # the post-calculate one). Rejected rather than silently misexecuted.
+            try:
+                _dimension_conjuncts, value_conjuncts = classify_where(rewritten)
+            except ExpressionError as exc:
+                raise PipelineError(
+                    f"step {i} (filter) where={where!r} is invalid: {exc}"
+                ) from exc
+            if value_conjuncts:
+                raise PipelineError(
+                    f"not yet supported in analysis pipelines: step {i} (filter) tests "
+                    "the running value after a `calculate` step -- the flat machinery a "
+                    "single-input pipeline compiles onto applies every filter before any "
+                    "calculate entry, so the condition would test the pre-calculate "
+                    "value; move the filter before the calculate step, or fold the "
+                    "condition into the calculate entry's own `where`"
+                )
         rewritten_filters.append(rewritten)
     if rewritten_filters:
         option_kwargs["where"] = " AND ".join(f"({w})" for w in rewritten_filters)
+
+    if calculate_steps:
+        # A calculate step compiles onto exactly the flat endpoints' generic calculate
+        # entries (`Options.calculate`), in step order -- the same code path
+        # `calculate.N.expression`/`calculate.N.where` take. Like `filter.where`, the
+        # running value may be referenced by its in-scope name (the input/step names in
+        # `rename_map`) or by the `value` placeholder; both rewrite to `value` here.
+        entries = []
+        for i, step in calculate_steps:
+            expression = rewrite_named_columns(step.expression, rename_map)
+            try:
+                parse_calculate_expression(expression)
+            except ExpressionError as exc:
+                raise PipelineError(
+                    f"step {i} (calculate) expression {step.expression!r} is invalid: {exc}"
+                ) from exc
+            where = None
+            if step.where is not None:
+                where = rewrite_named_columns(step.where, rename_map)
+                _validate_filter_where(i, where, {"value"}, op="calculate")
+            entries.append({"expression": expression, "where": where})
+        option_kwargs["calculate"] = entries
 
     if group_step is not None:
         # `by=[]` means "collapse to one row per grid_cell" (see `GroupStep`'s
@@ -473,6 +534,13 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
                     "after a group step"
                 )
             where_parts.append(step.where)
+        elif isinstance(step, CalculateStep):
+            raise PipelineError(
+                f"not yet supported in analysis pipelines: step {i} (calculate) in the "
+                "paired (spatially-joined) pipeline shape -- `calculate` compiles only "
+                "for single-input pipelines today; apply the rewrite on the flat data "
+                "endpoint (or a single-input pipeline) feeding this analysis instead"
+            )
         elif isinstance(step, GroupStep):
             if group_step is not None:
                 raise PipelineError(

@@ -148,36 +148,112 @@ class TestGridCellSampling:
 
 
 class TestCalculateStage:
-    async def test_multiplier_column_is_added(self, dataset_factory, raster_data):
-        """Raster calculate params become a per-band multiplier applied at read time."""
+    async def test_no_calculate_params_records_no_plans(self, dataset_factory, raster_data):
+        """A raster's calculate stage never touches the band-metadata table itself -- it
+        records validated plans for the pixel-read paths to apply per band."""
         dataset = dataset_factory(DIMENSIONS)
         dataset._apply_calculate_params()
-        assert dataset.materialize()["multiplier"].to_list() == [1, 1]
+        assert dataset._calculate_plans == []
+        assert "multiplier" not in dataset.materialize().columns
 
-    async def test_negate_sets_a_negative_multiplier(self, dataset_factory, raster_data):
+    async def test_legacy_negate_records_its_sugar_plan(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
         dataset._apply_calculate_params()
-        assert dataset.materialize().sort("calendar_year")["multiplier"].to_list() == [-1, 1]
+        (plan,) = dataset._calculate_plans
+        assert plan.label == "negate"
+        assert plan.expression == "value * -1"
+        assert plan.dimension_where == "(calendar_year = 2030)"
 
-    async def test_multiply10(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, multiply10="calendar_year = 2040")
+    async def test_dimension_where_selects_bands(self, dataset_factory, raster_data):
+        """The dimension half of a calculate where is evaluated against the metadata
+        rows, in df row order -- the band-selection half of the raster contract."""
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * 10", "where": "calendar_year = 2040"}]
+        )
         dataset._apply_calculate_params()
-        assert dataset.materialize().sort("calendar_year")["multiplier"].to_list() == [1, 10]
+        df = dataset.materialize().sort("calendar_year")
+        (plan,) = dataset._calculate_plans
+        assert dataset._band_applicability(df, plan) == [False, True]
 
-    async def test_multiplier_reaches_the_pixels(self, dataset_factory, raster_data):
-        """The multiplier a calculate param records on `df` reaches the pixels through
-        `_collapse_tile_bands`, the shared Polars-expression multiplier/group_aggregate
-        step every read path (tile, write, summarize) now uses."""
+    async def test_calculate_reaches_the_pixels(self, dataset_factory, raster_data):
+        """A calculate entry recorded at the calculate stage reaches the pixels through
+        `_collapse_tile_bands`, the shared Polars-expression calculate/group_aggregate
+        step every read path (tile, write, summarize) uses."""
         dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
-        assert df["multiplier"].to_list() == [-1, 1]
         data = np.array([[[30]], [[40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, -9999)
 
         assert out[0, 0, 0] == -30
         assert out[1, 0, 0] == 40
+
+    async def test_entries_compose_sequentially_per_band(self, dataset_factory, raster_data):
+        """Entry 2 sees entry 1's output on the band both select; the other band passes
+        through both entries unchanged."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[
+                {"expression": "value * 10", "where": "calendar_year = 2030"},
+                {"expression": "value * -1", "where": "calendar_year = 2030"},
+            ],
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().sort("calendar_year")
+        data = np.array([[[30]], [[40]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out[0, 0, 0] == -300
+        assert out[1, 0, 0] == 40
+
+    async def test_value_condition_masks_per_pixel(self, dataset_factory, raster_data):
+        """A `value` condition in a calculate where is a per-pixel elementwise mask on
+        the render path too: only pixels passing it are rewritten, the rest pass through."""
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * -1", "where": "value > 35"}]
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().sort("calendar_year")
+        data = np.array([[[30, 40]], [[40, 30]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out[0].tolist() == [[30, -40]]
+        assert out[1].tolist() == [[-40, 30]]
+
+    async def test_where_naming_a_dimension_this_dataset_lacks_is_400(
+        self, dataset_factory, raster_data
+    ):
+        """`aep` is a real dimension globally, but not one vct's band-metadata table
+        carries -- the plan records fine at the calculate stage (band applicability is a
+        pixel-read-time question) and 400s, naming the entry, once a read path tries to
+        resolve which bands it selects."""
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * 2", "where": "aep = 0.2"}]
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        data = np.array([[[30]], [[40]]], dtype="int32")
+
+        with pytest.raises(AnalysisError) as excinfo:
+            dataset._collapse_tile_bands(df, data, -9999)
+        assert excinfo.value.status_code == 400
+        assert "calculate.1" in excinfo.value.detail
+
+    async def test_calculate_does_not_rewrite_the_sentinel(self, dataset_factory, raster_data):
+        """NoData in, NoData out on the tile path: masking runs before every entry, so a
+        no-where entry cannot turn -9999 into anything else."""
+        dataset = dataset_factory(DIMENSIONS, calculate=[{"expression": "value + 1"}])
+        await dataset.apply_params()
+        df = dataset.materialize().sort("calendar_year")
+        data = np.array([[[-9999, 30]], [[40, -9999]]], dtype="int32")
+
+        out = dataset._collapse_tile_bands(df, data, -9999)
+
+        assert out[0].tolist() == [[-9999, 31]]
+        assert out[1].tolist() == [[41, -9999]]
 
 
 class TestGroupStage:
@@ -722,7 +798,6 @@ class TestTileBandCollapse:
         dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
-        assert df["multiplier"].to_list() == [-1, 1]
         data = np.array([[[-9999, 30]], [[40, 40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, -9999)
@@ -818,6 +893,27 @@ class TestSummarizeCalculateAndGroupAggregate:
         assert zone_1["value"][0] == pytest.approx(10)
         assert zone_2["value"][0] == pytest.approx(10)
 
+    async def test_generic_entries_weight_bands_before_the_zonal_summarize(
+        self, dataset_factory, raster_data, zone_crosswalk
+    ):
+        """The confidence-weighting idiom, on the summarize path: each band scaled by its
+        own coefficient (a dimension `where` selecting it), collapsed per pixel with
+        `group_aggregate=sum` -- 30*0.6 + 40*0.3 = 30, uniform, so the zonal mean is 30."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[
+                {"expression": "value * 0.6", "where": "calendar_year = 2030"},
+                {"expression": "value * 0.3", "where": "calendar_year = 2040"},
+            ],
+            group_aggregate="sum",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        zone_1 = df.filter(pl.col("grid_cell") == 1)
+        assert zone_1["value"][0] == pytest.approx(30 * 0.6 + 40 * 0.3)
+
 
 @pytest.fixture
 def group_aggregate_nodata_raster(base_path):
@@ -879,6 +975,29 @@ class TestGroupAggregateNodataExclusion:
 
         assert zone_value(1) == pytest.approx(15.0)
         assert zone_value(2) == pytest.approx(30.0)
+
+    async def test_calculate_never_rewrites_nodata_on_the_summarize_path(
+        self, dataset_factory, group_aggregate_nodata_raster, zone_crosswalk
+    ):
+        """A no-where calculate entry rewrites every REAL pixel, and a nodata pixel still
+        drops out of the collapse exactly as without calculate -- zone 2's 2030 band is
+        nodata, so its collapse mean is just its rewritten 2040 value (30*10), not a
+        blend with a rewritten sentinel."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[{"expression": "value * 10"}],
+            group_aggregate="mean",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="mean",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+
+        def zone_value(grid_cell):
+            return df.filter(pl.col("grid_cell") == grid_cell)["value"][0]
+
+        assert zone_value(1) == pytest.approx(150.0)
+        assert zone_value(2) == pytest.approx(300.0)
 
 
 class TestSummarizeRoutesThroughThePlugin:

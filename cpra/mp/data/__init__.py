@@ -71,6 +71,10 @@ async def analyze_data(pipeline=None, *, base_path=None, output_path=None, lazy=
       plus any dimension filter (`scenario_id=7`, or `scenario_id=[7, 8]` for a list) or
       `Options` field (`where=`, `group_by=`, `group_aggregate=`, `summarize_by=`,
       `summarize_aggregate=`, `grid_cell=`, `color_map=`, ...) as further keywords.
+      Generic calculate entries -- the HTTP endpoints' indexed `calculate.N.expression`/
+      `calculate.N.where` parameters -- are passed as one list here instead:
+      `calculate=[{"expression": "value * 0.6", "where": "model_group_id = 500"}, ...]`,
+      applied sequentially in list order.
       Forwarded to `analysis.create_analysis(**params, base_path=base_path)`; an
       unrecognized keyword raises `AnalysisError` naming it (and every valid name).
     * **Pipeline** -- `analyze_data(pipeline={"inputs": ..., "steps": ..., "output": ...})`,

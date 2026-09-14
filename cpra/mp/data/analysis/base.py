@@ -21,10 +21,12 @@ LazyFrame) through five ordered stages, run once by `apply_params`:
    `self._value_where` for later stages to apply (vector: immediately, as a mask or a
    filter; raster: per band, once pixels are read). `options.grid_cell`, if given, is
    applied here too, via the `_apply_grid_cell` hook.
-2. **calculate** (`_apply_calculate_params`) -- `negate`/`multiply10`/`multiply100`
-   conditionally scale `value` (vector) or a `multiplier` column added for later stages to
-   apply (raster, whose `self.lf` at this point is still the band-metadata table, not
-   pixels).
+2. **calculate** (`_apply_calculate_params`) -- the generic `calculate` entries
+   (expression/where pairs; the legacy `negate`/`multiply10`/`multiply100` parameters
+   are rewritten into them as sugar) conditionally rewrite `value` in place (vector), or
+   are validated and stashed on `self._calculate_plans` for the pixel-read paths to
+   apply per band (raster, whose `self.lf` at this point is still the band-metadata
+   table, not pixels -- see `RasterGridAnalysis._band_calculate_passes`).
 3. **group** (`_apply_group_params`) -- `group_by`/`group_aggregate` collapse rows via the
    `_collapse_group` hook (vector: dimension-collapse across rows per grid_cell, folding
    through `analysis.fold` when the collapse is cliff-shaped; raster: records which band
@@ -82,13 +84,14 @@ subclass `self` is.
 import re
 
 import polars as pl
-import polars.selectors as cs
 from polars.exceptions import ColumnNotFoundError
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
+    compile_calculate_entries,
+    parse_value_expr,
     value_predicate_mask,
 )
 from cpra.mp.data.analysis.types import DataFormat, OutputType
@@ -101,7 +104,6 @@ from cpra.mp.data.variables import VARIABLES, Variable
 
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
-VALUE_COLUMNS = cs.by_name("value")
 
 
 class AnalysisError(Exception):
@@ -138,6 +140,13 @@ class BaseAnalysis:
         # `_summarize_zone_stats_plugin`, `_summarize_count_by_value_plugin`) reads this
         # attribute instead now.
         self._value_where = None
+        # Set by `_apply_calculate_params`: the validated `CalculatePlan`s for this
+        # request (generic `calculate` entries, or the legacy negate/multiply10/
+        # multiply100 sugar), in application order. Empty when the request has no
+        # calculate parameters at all. A vector frame consumes them immediately inside
+        # `_apply_calculate_params`; the raster pixel-read paths (tile/write/summarize)
+        # read this attribute later, per band, via `_band_calculate_passes`.
+        self._calculate_plans = []
         # Also set by `_apply_filter_params`: whether `where` produced at least one
         # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
         # the row count reaching a group_by -- see `_has_selective_dimension_filter`,
@@ -375,33 +384,88 @@ class BaseAnalysis:
 
     # -- stage 2: calculate -----------------------------------------------------------------
 
+    def _resolve_calculate_entries(self):
+        """The effective calculate entries for this request, as `(label, expression,
+        where)` triples in application order: the generic `options.calculate` list when
+        given, otherwise the legacy `negate`/`multiply10`/`multiply100` parameters
+        rewritten as their documented sugar (`value * -1` / `value * 10` / `value * 100`
+        against each parameter's own condition, in that fixed order). Mixing the two
+        surfaces in one request is rejected outright -- there is no defined interleaving
+        between a legacy parameter and an indexed entry, and entries compose sequentially,
+        so their relative order matters.
+        """
+        legacy = [
+            ("negate", self.options.negate, -1),
+            ("multiply10", self.options.multiply10, 10),
+            ("multiply100", self.options.multiply100, 100),
+        ]
+        legacy_given = [(name, where, factor) for name, where, factor in legacy if where is not None]
+        generic = self.options.calculate or []
+
+        if generic and legacy_given:
+            names = ", ".join(name for name, _where, _factor in legacy_given)
+            self._error(
+                f"legacy calculate parameter(s) ({names}) cannot be mixed with generic "
+                "calculate entries in one request -- their relative application order "
+                "would be ambiguous, and calculate entries apply sequentially; rewrite "
+                "the legacy parameter(s) as entries instead (negate=X is "
+                "calculate.N.expression=value * -1 with calculate.N.where=X)"
+            )
+
+        if generic:
+            return [
+                (f"calculate.{i}", entry.expression, entry.where)
+                for i, entry in enumerate(generic, start=1)
+            ]
+        return [(name, f"value * {factor}", where) for name, where, factor in legacy_given]
+
     def _apply_calculate_params(self):
-        """Apply calculate parameters to the LazyFrame."""
+        """Apply the calculate stage: expression/where entries that rewrite `value` for
+        the rows/bands/pixels matching each entry's `where`, sequentially in entry order
+        (entry N+1 sees entry N's output). Rows NOT matching a `where` pass through
+        unchanged -- calculate never drops or masks data (that is Filter's job) -- and a
+        missing value stays missing (`is_not_null()` guards every rewrite, so NoData in
+        means NoData out regardless of what the expression could compute).
 
-        if self._is_raster_metadata_table():
-            self.lf = self.lf.with_columns(multiplier=pl.lit(1))
-            value_cols = pl.col("multiplier")
-        else:
-            value_cols = VALUE_COLUMNS
+        Everything is validated here (`expressions.compile_calculate_entries`), before
+        any pixel is read, for both grid types. A vector/tabular frame (including a
+        raster already narrowed to a table by `grid_cell` sampling) is rewritten in
+        place; for a raster whose `self.lf` is still the band-metadata table the
+        validated plans are only stashed on `self._calculate_plans` -- the entry's
+        dimension `where` selects BANDS (evaluated against the metadata rows by
+        `RasterGridAnalysis._band_applicability`) and its expression/value-`where` are
+        applied per band, against actual pixels, by every raster read path
+        (`_summarize_zone_stats_plugin`, `_collapse_tile_bands`,
+        `_write_raster_windowed`) via `_band_calculate_passes`.
+        """
+        entries = self._resolve_calculate_entries()
+        try:
+            self._calculate_plans = compile_calculate_entries(entries)
+        except ExpressionError as exc:
+            self._error(str(exc))
 
-        if self.options.negate is None and self.options.multiply10 is None and self.options.multiply100 is None:
+        if not self._calculate_plans or self._is_raster_metadata_table():
             return
 
-        sql_expressions = [
-            self.options.negate,
-            self.options.multiply10,
-            self.options.multiply100,
-        ]
-        factors = [-1, 10, 100]
-
-        when_expression = pl
-        for sql_expression, factor in zip(sql_expressions, factors):
-            if sql_expression is None:
-                continue
-            when_expression = when_expression.when(pl.sql_expr(sql_expression)).then(value_cols * factor)
-
-        when_expression = when_expression.otherwise(value_cols)
-        self.lf = self.lf.with_columns(when_expression)
+        schema_names = set(self.lf.collect_schema().names())
+        for plan in self._calculate_plans:
+            condition = pl.col("value").is_not_null()
+            if plan.dimension_where is not None:
+                dimension_expr = pl.sql_expr(plan.dimension_where)
+                missing = set(dimension_expr.meta.root_names()) - schema_names
+                if missing:
+                    self._error(
+                        f"{plan.label}: where references column(s) not present in this "
+                        f"dataset: {sorted(missing)} -- available columns: "
+                        f"{sorted(schema_names)}"
+                    )
+                condition = condition & dimension_expr.fill_null(False)
+            if plan.value_where is not None:
+                condition = condition & value_predicate_mask(plan.value_where, ["value"])
+            new_value = parse_value_expr(plan.expression, ["value"])
+            self.lf = self.lf.with_columns(
+                pl.when(condition).then(new_value).otherwise(pl.col("value")).alias("value")
+            )
 
     # -- stage 5: sort/select ---------------------------------------------------------------
 
@@ -550,20 +614,28 @@ class BaseAnalysis:
         return True
 
     def _reject_calculate_with_count_by_value(self):
-        """count_by_value counts DISTINCT values; a calculate parameter (negate,
-        multiply10, multiply100) rescales a value BEFORE it would be counted, which
-        changes which raw values collapse into "the same" category without changing what
-        the caller meant by "distinct" -- e.g. multiply10 turns land-type codes 1 and 2
-        into 10 and 20, not into two different categories, but does change what a
-        downstream consumer sees as the reported "value" for each count. Every other
-        aggregate folds a calculate parameter through unremarkably (a scaled number is
-        still a meaningful sum/mean/min/max), so this is a rejection specific to
+        """count_by_value counts DISTINCT values; a calculate entry (generic, or the
+        legacy negate/multiply10/multiply100 sugar) rewrites a value BEFORE it would be
+        counted, which changes which raw values collapse into "the same" category without
+        changing what the caller meant by "distinct" -- e.g. multiply10 turns land-type
+        codes 1 and 2 into 10 and 20, not into two different categories, but does change
+        what a downstream consumer sees as the reported "value" for each count. Every
+        other aggregate folds a calculate entry through unremarkably (a rewritten number
+        is still a meaningful sum/mean/min/max), so this is a rejection specific to
         count_by_value, not a general calculate/summarize incompatibility. Checked against
         `self.options` directly (not `self.lf`) so it fires before the eventual `group_by`
         even if `_apply_calculate_params` already ran earlier in the pipeline.
         """
-        if self.options.negate is not None or self.options.multiply10 is not None or self.options.multiply100 is not None:
-            self._error("calculate parameters (negate/multiply10/multiply100) cannot be combined with count_by_value")
+        if (
+            self.options.calculate
+            or self.options.negate is not None
+            or self.options.multiply10 is not None
+            or self.options.multiply100 is not None
+        ):
+            self._error(
+                "calculate parameters (calculate.N.*, or the legacy negate/multiply10/"
+                "multiply100) cannot be combined with count_by_value"
+            )
 
     def _apply_unpivot_param(self):
         """Apply the unpivot parameter."""

@@ -12,8 +12,9 @@ shape: every function here takes and returns plain values and raises `PipelineEr
 ordinary `ValueError` subclass) -- never `HTTPException`, never a FastAPI import -- so this
 module is usable outside the API later (`read_data()` in `cpra/mp/data/__init__.py`).
 
-**The five operations** (`project`, `join`, `filter`, `group` -- `inputs`/`output` are
-structural, not operations): see `ProjectStep`, `JoinStep`, `FilterStep`, `GroupStep` below.
+**The operations** (`project`, `join`, `filter`, `calculate`, `group` -- `inputs`/`output`
+are structural, not operations): see `ProjectStep`, `JoinStep`, `FilterStep`,
+`CalculateStep`, `GroupStep` below.
 
 **Two encodings, one model.** `Pipeline` is parsed directly from a JSON-shaped dict (the
 POST body) via `parse_pipeline`, or from a flat dotted query mapping (the GET/tile
@@ -43,7 +44,11 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from cpra.mp.data.analysis.expressions import ExpressionError, classify_where
+from cpra.mp.data.analysis.expressions import (
+    ExpressionError,
+    classify_where,
+    parse_calculate_expression,
+)
 from cpra.mp.data.analysis.fold import FoldError, validate_decomposable
 from cpra.mp.data.analysis.types import (
     AggregateFunction,
@@ -216,6 +221,28 @@ class FilterStep(BaseModel):
     as_: str | None = Field(default=None, alias="as")
 
 
+class CalculateStep(BaseModel):
+    """Conditionally rewrite the running value: one `expression`/`where` pair per step
+    (several pairs = repeated steps, applied sequentially -- step N+1 sees step N's
+    output). `expression` is arithmetic over the running value and numeric literals
+    (referenced either by its in-scope column name -- the input/step name, exactly the
+    way `filter.where` names columns -- or by the `value` placeholder); `where` uses the
+    same dimension-and/or-value-condition grammar as `filter.where`, and an omitted
+    `where` applies the expression to everything. Rows/bands NOT matching `where` pass
+    through unchanged -- `calculate` never drops data; use `filter` for that. Always
+    consumes the previous step's output (there is no `input` field), so like
+    `filter`/`group` it can never be a pipeline's first step. `as` follows `FilterStep`'s
+    reasoning: accepted, naming this step's output for a later step to reference.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    op: Literal["calculate"] = "calculate"
+    expression: str
+    where: str | None = None
+    as_: str | None = Field(default=None, alias="as")
+
+
 class GroupStep(BaseModel):
     """Collapse `by` (may be empty, meaning "collapse to one row per `grid_cell`") with
     `aggregate` (required; must be in `fold.DECOMPOSABLE_AGGREGATES`) applied to `of`
@@ -234,7 +261,7 @@ class GroupStep(BaseModel):
 
 
 Step = Annotated[
-    Union[ProjectStep, JoinStep, FilterStep, GroupStep],
+    Union[ProjectStep, JoinStep, FilterStep, CalculateStep, GroupStep],
     Field(discriminator="op"),
 ]
 
@@ -242,8 +269,8 @@ Step = Annotated[
 def _step_explicit_inputs(step: Any) -> list[str]:
     """The names a step references BY ITSELF, before any chaining default is applied --
     `[]` means "consumes the previous step's output" (only `project` can also mean this
-    via an omitted `input`; `filter`/`group` always mean this, having no field to be
-    explicit with).
+    via an omitted `input`; `filter`/`calculate`/`group` always mean this, having no
+    field to be explicit with).
     """
     if isinstance(step, ProjectStep):
         return [step.input] if step.input is not None else []
@@ -301,7 +328,7 @@ def validate_pipeline(pipeline: Pipeline) -> None:
 
     - every input name matches the identifier/reserved-name rule (`_validate_name`);
     - **chaining**: the first step must name its input(s) explicitly (`project.input` or
-      `join.inputs` -- `filter`/`group` never can, so neither may be the first step); a
+      `join.inputs` -- `filter`/`calculate`/`group` never can, so none may be the first step); a
       later step with no explicit reference consumes the immediately preceding step's
       output; every explicit reference (an input name, or a prior -- not later -- step's
       `as`) must already be known at that point;
@@ -387,19 +414,34 @@ def _validate_step_rules(i: int, step: Any) -> None:
             raise PipelineError(f"step {i} (join) inputs contains duplicate name(s): {step.inputs}")
     elif isinstance(step, FilterStep):
         _validate_where_structurally(i, step.where)
+    elif isinstance(step, CalculateStep):
+        # Structural validation only: the whitelist/no-aggregate/no-comparison rules run
+        # here (`allowed_columns=None` skips the namespace check, since which column name
+        # is in scope -- the input/step name, or the `value` placeholder -- is a
+        # compile-time question; the planner re-validates the rewritten expression against
+        # the real namespace). `where` gets the same structural treatment `filter.where`
+        # does.
+        try:
+            parse_calculate_expression(step.expression, allowed_columns=None)
+        except ExpressionError as exc:
+            raise PipelineError(
+                f"step {i} (calculate) expression {step.expression!r} is invalid: {exc}"
+            ) from exc
+        if step.where is not None:
+            _validate_where_structurally(i, step.where, op="calculate")
     elif isinstance(step, GroupStep):
         _require_decomposable(step.aggregate, f"step {i} (group) aggregate")
     else:  # pragma: no cover -- exhaustive over the Step union
         raise PipelineError(f"step {i} has unrecognized op {getattr(step, 'op', None)!r}")
 
 
-def _validate_where_structurally(i: int, where: str) -> None:
+def _validate_where_structurally(i: int, where: str, op: str = "filter") -> None:
     if not where or not where.strip():
-        raise PipelineError(f"step {i} (filter) where must be a non-empty string")
+        raise PipelineError(f"step {i} ({op}) where must be a non-empty string")
     try:
         classify_where(where)
     except ExpressionError as exc:
-        raise PipelineError(f"step {i} (filter) where={where!r} is invalid: {exc}") from exc
+        raise PipelineError(f"step {i} ({op}) where={where!r} is invalid: {exc}") from exc
 
 
 def _validate_output_rule(pipeline: Pipeline) -> None:
@@ -450,12 +492,16 @@ _STEP_FIELDS: dict[str, frozenset[str]] = {
     "project": frozenset({"op", "input", "to", "aggregate", "as"}),
     "join": frozenset({"op", "type", "inputs", "as"}),
     "filter": frozenset({"op", "where", "as"}),
+    "calculate": frozenset({"op", "expression", "where", "as"}),
     "group": frozenset({"op", "by", "aggregate", "of", "as"}),
 }
 _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
     "project": frozenset(),
     "join": frozenset({"inputs"}),
     "filter": frozenset(),
+    # `expression` and `where` are single opaque strings that may themselves contain
+    # commas verbatim -- never comma-split, same as `filter.where`.
+    "calculate": frozenset(),
     "group": frozenset({"by"}),
 }
 
@@ -682,6 +728,12 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
             params[f"{prefix}.as"] = step.as_
         elif isinstance(step, FilterStep):
             params[f"{prefix}.where"] = step.where
+            if step.as_ is not None:
+                params[f"{prefix}.as"] = step.as_
+        elif isinstance(step, CalculateStep):
+            params[f"{prefix}.expression"] = step.expression
+            if step.where is not None:
+                params[f"{prefix}.where"] = step.where
             if step.as_ is not None:
                 params[f"{prefix}.as"] = step.as_
         elif isinstance(step, GroupStep):

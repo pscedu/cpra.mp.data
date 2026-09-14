@@ -686,6 +686,80 @@ class TestCompileSingleInputChain:
         assert isinstance(compiled, BaseAnalysis)
 
 
+class TestCalculateStepCompile:
+    """`calculate` steps in a single-input chain compile onto `Options.calculate` -- the
+    same generic entries the flat `calculate.N.*` parameters populate -- in step order,
+    with the running value's in-scope name (the input/step name, or the `value`
+    placeholder) rewritten to `value` exactly like `filter.where`."""
+
+    def _pipeline(self, steps):
+        return parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}, *steps],
+                "output": {"format": "csv"},
+            }
+        )
+
+    def test_compiles_onto_generic_calculate_entries(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = self._pipeline(
+            [
+                {"op": "calculate", "expression": "eco * 0.6", "where": "calendar_year = 2030 AND eco > 1"},
+                {"op": "calculate", "expression": "value * 0.5"},
+            ]
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert [dict(e) for e in compiled.options.calculate] == [
+            {"expression": "value * 0.6", "where": "calendar_year = 2030 AND value > 1"},
+            {"expression": "value * 0.5", "where": None},
+        ]
+
+    def test_rejects_calculate_after_group(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = self._pipeline(
+            [
+                {"op": "group", "by": [], "aggregate": "max"},
+                {"op": "calculate", "expression": "eco * 0.6"},
+            ]
+        )
+        with pytest.raises(PipelineError, match="comes after a group step"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_rejects_value_filter_after_calculate(self, base_path):
+        """The flat machinery applies every filter before any calculate entry, so a
+        value condition ordered after a calculate step would test the pre-calculate
+        value -- rejected rather than silently misexecuted."""
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = self._pipeline(
+            [
+                {"op": "calculate", "expression": "eco * 0.6"},
+                {"op": "filter", "where": "eco > 100"},
+            ]
+        )
+        with pytest.raises(PipelineError, match="pre-calculate"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_allows_dimension_filter_after_calculate(self, base_path):
+        """A dimension condition commutes with calculate (calculate never touches
+        dimensions), so it stays legal in either order."""
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = self._pipeline(
+            [
+                {"op": "calculate", "expression": "eco * 0.6"},
+                {"op": "filter", "where": "calendar_year = 2030"},
+            ]
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+
+    def test_rejects_invalid_expression_naming_the_step(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = self._pipeline([{"op": "calculate", "expression": "scenario_id * 2"}])
+        with pytest.raises(PipelineError, match=r"step 2 \(calculate\)"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+
 # --------------------------------------------------------------------------------------
 # Shape 2: the paired (notebook) shape
 # --------------------------------------------------------------------------------------
@@ -994,6 +1068,106 @@ class TestSingleInputEndToEnd:
         post_df = pl.read_csv(io.BytesIO(post_response.content)).sort("grid_cell")
         get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
         assert get_df.equals(post_df)
+
+
+class TestCalculateStepEndToEnd:
+    """The `calculate` op through all three request encodings (POST JSON, dotted GET,
+    tile route), plus the paired-shape rejection and the flat-request equivalence."""
+
+    WEIGHTED_PIPELINE = {
+        "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+        "steps": [
+            {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+            {"op": "calculate", "expression": "eco * 0.5", "where": "calendar_year = 2030"},
+            {"op": "calculate", "expression": "eco * 0.25", "where": "calendar_year = 2040"},
+            {"op": "group", "by": [], "aggregate": "sum"},
+        ],
+        "output": {"format": "csv"},
+    }
+
+    def test_post_json(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        response = client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        for geo_id in (1, 32):
+            expected = (2030 + geo_id / 100) * 0.5 + (2040 + geo_id / 100) * 0.25
+            assert actual[geo_id] == pytest.approx(expected, rel=1e-4)
+
+    def test_get_dotted_query_matches_post(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.WEIGHTED_PIPELINE))
+        post_df = pl.read_csv(
+            io.BytesIO(client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE).content)
+        ).sort("grid_cell")
+        get_response = client.get("/v1/analysis.csv", params=query)
+        assert get_response.status_code == 200, get_response.text
+        get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
+        assert get_df.equals(post_df)
+
+    def test_tile_route(self, client, base_path, monkeypatch):
+        """A raster single-input chain with calculate steps, rendered on the analysis
+        tile route: bands weighted 0.5/0.25 and collapsed to the single band a tile
+        requires."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                {"op": "calculate", "expression": "vct * 0.5", "where": "calendar_year = 2030"},
+                {"op": "calculate", "expression": "vct * 0.25", "where": "calendar_year = 2040"},
+                {"op": "group", "by": [], "aggregate": "sum"},
+            ],
+            "output": {"format": "png"},
+        }
+        query = pipeline_to_query(parse_pipeline(pipeline))
+
+        with rio.open(next(base_path.rglob("*.tif"))) as src:
+            west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+        tile = mercantile.tile((west + east) / 2, (south + north) / 2, 8)
+
+        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        assert response.status_code == 200, response.text
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_matches_the_equivalent_flat_request(self, client, base_path, monkeypatch):
+        """A calculate step compiles onto the same machinery as the flat calculate.N.*
+        parameters, so the two spellings of one request return the same data."""
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline_df = pl.read_csv(
+            io.BytesIO(client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE).content)
+        ).sort("grid_cell")
+        flat_response = client.get(
+            "/v1/datasets/ssf/annual/ecoregion_v001/data.csv",
+            params={
+                "calculate.1.expression": "value * 0.5",
+                "calculate.1.where": "calendar_year = 2030",
+                "calculate.2.expression": "value * 0.25",
+                "calculate.2.where": "calendar_year = 2040",
+                "group_aggregate": "sum",
+            },
+        )
+        assert flat_response.status_code == 200
+        flat_df = pl.read_csv(io.BytesIO(flat_response.content)).sort("grid_cell")
+        assert flat_df.equals(pipeline_df)
+
+    def test_paired_shape_rejects_calculate(self, client, notebook_query_data):
+        pipeline = copy.deepcopy(NOTEBOOK_QUERY)
+        pipeline["steps"].insert(2, {"op": "calculate", "expression": "sal * 0.5"})
+        response = client.post("/v1/analysis.tif", json=pipeline)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "not yet supported" in detail
+        assert "paired" in detail
 
 
 class TestProjectOnlyReaggregationEndToEnd:

@@ -31,6 +31,7 @@ from cpra.mp.data.analysis.base import BaseAnalysis
 from cpra.mp.data.analysis.expressions import ExpressionError, parse_value_expr
 from cpra.mp.data.analysis.geography import parse_coordinate_pairs, project_coordinates
 from cpra.mp.data.analysis.sources import (
+    band_calculate_passes,
     band_collapse_exprs,
     guarded_aggregate,
     horizontal_aggregate_expr,
@@ -56,7 +57,7 @@ from cpra.mp.data.config import (
     RASTER_USE_VRT_COPY,
     RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
-from cpra.mp.data.raster import scale_vrt_bands, set_vrt_band_descriptions, vrt
+from cpra.mp.data.raster import set_vrt_band_descriptions, vrt
 
 # Interleaving for downloaded rasters, set rather than inherited from the source. A source
 # COG may be written INTERLEAVE=TILE, which is a COG-driver-only option that the GTiff driver
@@ -162,6 +163,43 @@ class RasterGridAnalysis(BaseAnalysis):
         # `True` group key.
         self.raster_groups = self.lf.with_row_index("row_idxs").group_by(*group_by_cols).agg(pl.col("row_idxs"))
 
+    def _band_applicability(self, df, plan):
+        """Which of `df`'s band-metadata rows a calculate plan's dimension `where`
+        selects, as a list of booleans in df row order.
+
+        The dimension half of a calculate `where` picks BANDS (e.g.
+        `model_group_id=500`), so it is evaluated here against the metadata rows'
+        dimension columns, never against pixels; the value half is per-pixel and is
+        folded in later by `band_calculate_passes`. No dimension `where` at all means
+        the entry applies to every band.
+        """
+        if plan.dimension_where is None:
+            return [True] * len(df)
+        try:
+            mask = (
+                df.lazy()
+                .select(pl.sql_expr(plan.dimension_where).fill_null(False))
+                .collect()
+                .to_series()
+            )
+        except Exception as exc:
+            self._error(
+                f"{plan.label}: where {plan.dimension_where!r} cannot be evaluated "
+                f"against this dataset's bands: {exc}"
+            )
+        return mask.to_list()
+
+    def _band_calculate_passes(self, df, raw_names):
+        """This request's calculate plans as per-band `with_columns` passes over
+        `raw_names` (see `raster_source.band_calculate_passes`), with each plan's
+        dimension `where` resolved against `df`'s own band rows first. Empty list when
+        the request has no calculate entries.
+        """
+        if not self._calculate_plans:
+            return []
+        applicability = [self._band_applicability(df, plan) for plan in self._calculate_plans]
+        return band_calculate_passes(raw_names, self._calculate_plans, applicability)
+
     def _get_raster_dimension_frame(self, df):
         """Get `(dim_df, n_bands)`: a DataFrame with one row per output raster band,
         aligned by row order with the `(n_bands, zone_ids.size)` array
@@ -182,7 +220,7 @@ class RasterGridAnalysis(BaseAnalysis):
         `row_idxs` is dropped down to (possibly) zero remaining columns.
         """
         if self.raster_groups is None:
-            dim_df = df.select(pl.exclude("path", "multiplier"))
+            dim_df = df.select(pl.exclude("path"))
             return dim_df, len(dim_df)
 
         group_df = self.raster_groups.collect()
@@ -295,9 +333,9 @@ class RasterGridAnalysis(BaseAnalysis):
             )
             return
 
-        # The plugin path (`scan_rasters`) applies the multiplier/group-aggregate
-        # pre-collapse via the shared `horizontal_aggregate_expr`/
-        # `HORIZONTAL_RASTER_AGGREGATES` vocabulary in raster_source.py -- see
+        # The plugin path (`scan_rasters`) applies the calculate/group-aggregate
+        # pre-collapse via the shared `band_calculate_passes`/
+        # `horizontal_aggregate_expr` vocabulary in raster_source.py -- see
         # `_summarize_zone_stats_plugin` -- so every summarize request, regardless of
         # which parameters are in play, reaches the same single implementation.
         result = await asyncio.to_thread(
@@ -332,25 +370,28 @@ class RasterGridAnalysis(BaseAnalysis):
         """Zonal aggregate via the Polars IO plugin (`raster_source.scan_rasters`).
 
         The single implementation of the zonal summarize step (see
-        `_apply_transform_params_impl`): a calculate (multiplier) parameter and a
-        group_aggregate pre-collapse are applied here via the
-        `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary, in that
-        order (multiply, then collapse). `scan_rasters` masks nodata to null against each
-        band's own raw pixel value before either step sees it (`mask_nodata=True`), so a
-        masked band's null survives the multiply and drops out of the horizontal collapse
-        and the final vertical `guarded_aggregate` alike, with no separate accumulation
-        pass needed here.
+        `_apply_transform_params_impl`): the calculate entries and a group_aggregate
+        pre-collapse are applied here via the shared `band_calculate_passes`/
+        `horizontal_aggregate_expr` vocabulary, in that order (calculate, then collapse).
+        `scan_rasters` masks nodata to null against each band's own raw pixel value
+        before either step sees it (`mask_nodata=True`), so a masked band's null survives
+        the calculate passes untouched (their `is_not_null()` guard -- NoData in, NoData
+        out) and drops out of the horizontal collapse and the final vertical
+        `guarded_aggregate` alike, with no separate accumulation pass needed here.
 
         `where`'s value conjunct (`self._value_where`), when set, is masked in the same
         way and at the same point as nodata -- against each band's own raw pixel value,
-        before the multiply -- via `raster_source.masked_value_predicate_exprs`. That
-        ordering matters for the same reason the nodata mask has to run first: a value
-        predicate is written against the stored pixel value, not a scaled one, so
-        masking after the multiply would test the wrong number. A pixel the predicate
-        rejects then behaves exactly like a nodata pixel for everything downstream -- it
-        drops out of the collapse, and out of `guarded_aggregate`'s denominator -- which
-        is what turns "count contributing pixels" into "count pixels where value > x"
-        with no separate code path.
+        before any calculate entry -- via `raster_source.masked_value_predicate_exprs`.
+        That ordering matters for the same reason the nodata mask has to run first: a
+        FILTER value predicate is written against the stored pixel value, not a rewritten
+        one (the staged flow runs filter before calculate), so masking after the
+        calculate passes would test the wrong number. A pixel the predicate rejects then
+        behaves exactly like a nodata pixel for everything downstream -- it drops out of
+        the collapse, and out of `guarded_aggregate`'s denominator -- which is what turns
+        "count contributing pixels" into "count pixels where value > x" with no separate
+        code path. (A CALCULATE entry's own value condition, by contrast, tests the
+        running value at that entry's position in the sequence, per the sequential
+        contract -- that's `band_calculate_passes`' job, not this mask's.)
 
         Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
         long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
@@ -365,25 +406,23 @@ class RasterGridAnalysis(BaseAnalysis):
                 masked_value_predicate_exprs(raw_names, self._value_where, extra_columns=("grid_cell",))
             )
 
-        multipliers = df["multiplier"].to_list()
-        if all(m == 1 for m in multipliers):
-            cols = [pl.col(name) for name in raw_names]
-        else:
-            cols = [pl.col(name) * float(m) for name, m in zip(raw_names, multipliers)]
+        for pass_exprs in self._band_calculate_passes(df, raw_names):
+            lf = lf.with_columns(pass_exprs)
 
         if self.raster_groups is not None:
             group_row_idxs = self.raster_groups.collect()["row_idxs"].to_list()
             out_names = [f"g{k}" for k in range(len(group_row_idxs))]
             group_exprs = [
                 horizontal_aggregate_expr(
-                    self.options.group_aggregate, [cols[i] for i in row_idxs], pl.lit(None)
+                    self.options.group_aggregate,
+                    [pl.col(raw_names[i]) for i in row_idxs],
+                    pl.lit(None),
                 ).alias(name)
                 for name, row_idxs in zip(out_names, group_row_idxs)
             ]
             lf = lf.with_columns(group_exprs)
         else:
             out_names = raw_names
-            lf = lf.with_columns([c.alias(name) for c, name in zip(cols, out_names)])
 
         grouped = (
             lf.group_by("grid_cell")
@@ -421,8 +460,9 @@ class RasterGridAnalysis(BaseAnalysis):
         ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
         multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
         with ``row_indices``/``bands`` mapping each raster back to the df rows and band
-        numbers it supplies. Row order is what lets the caller line the array up with ``df``
-        columns like ``multiplier`` and with ``raster_groups``' row positions.
+        numbers it supplies. Row order is what lets the caller line the array up with
+        ``df``'s own rows (e.g. each calculate plan's per-band applicability) and with
+        ``raster_groups``' row positions.
 
         ``use_gdal_env`` is forwarded to ``parallel_read_rasters``/``_read_window``, which enter
         ``raster_gdal_env()`` on the worker thread performing each read rather than here. Default
@@ -437,16 +477,17 @@ class RasterGridAnalysis(BaseAnalysis):
         return data
 
     def _collapse_tile_bands(self, df, data, nodata):
-        """Apply a tile's multiplier/group_aggregate step with Polars expressions.
+        """Apply a tile's calculate/group_aggregate step with Polars expressions.
 
         Shares one operator vocabulary with the write and summarize paths
-        (``raster_source.band_collapse_exprs``) rather than reducing the array with NumPy,
-        which is what makes tiles treat nodata the way the rest of the API does: masked
-        against each band's own raw pixel value before the multiply, dropped from the
-        group_aggregate, and restored as the sentinel only where no band contributed
-        anything. The NumPy reduce it replaces did none of that -- a sentinel was scaled by
-        any calculate multiplier and averaged in as if it were a real value, so one nodata
-        band in a group pulled the whole rendered pixel toward -9999.
+        (``raster_source.band_collapse_exprs``/``band_calculate_passes``) rather than
+        reducing the array with NumPy, which is what makes tiles treat nodata the way the
+        rest of the API does: masked against each band's own raw pixel value before any
+        calculate entry runs, dropped from the group_aggregate, and restored as the
+        sentinel only where no band contributed anything. The NumPy reduce it replaces did
+        none of that -- a sentinel was scaled by any calculate multiplier and averaged in
+        as if it were a real value, so one nodata band in a group pulled the whole
+        rendered pixel toward -9999.
 
         In and out stay array plumbing: ``data[i].ravel()`` is a view of the read buffer, and
         each output column converts straight back into the ``(bands, h, w)`` shape
@@ -456,15 +497,18 @@ class RasterGridAnalysis(BaseAnalysis):
         group_row_idxs = (
             self.raster_groups.collect()["row_idxs"].to_list() if self.raster_groups is not None else None
         )
-        out_names, exprs = band_collapse_exprs(
+        out_names, passes, exprs = band_collapse_exprs(
             raw_names,
-            df["multiplier"].to_list(),
+            self._band_calculate_passes(df, raw_names),
             group_row_idxs,
             self.options.group_aggregate,
             data.dtype.name,
             nodata=nodata,
         )
-        result = pl.DataFrame({name: data[i].ravel() for i, name in enumerate(raw_names)}).select(exprs)
+        frame = pl.DataFrame({name: data[i].ravel() for i, name in enumerate(raw_names)})
+        for pass_exprs in passes:
+            frame = frame.with_columns(pass_exprs)
+        result = frame.select(exprs)
         return np.stack([result[name].to_numpy().reshape(data.shape[1:]) for name in out_names])
 
     @asynctiming
@@ -548,6 +592,12 @@ class RasterGridAnalysis(BaseAnalysis):
         every contributing band per output chunk -- for one PIXEL-interleaved multiband
         source that decompresses each tile once per band. Measured reducing 52 elev bands:
         983s vs 80s, at every swath size tried. The windowed path reads each tile once.
+
+        Selections with calculate entries also always take the windowed path: a general
+        expression (or a per-pixel value condition) has no VRT spelling, and the windowed
+        path is also what enforces the calculate stage's NoData contract (mask the
+        sentinel before any entry runs, restore it after -- see ``band_collapse_exprs``),
+        which a VRT ScaleRatio could not.
         """
 
         df = self.materialize()
@@ -556,6 +606,7 @@ class RasterGridAnalysis(BaseAnalysis):
 
         if (
             self.raster_groups is not None
+            or self._calculate_plans
             or not RASTER_USE_VRT_COPY
             or self._windowed_read_is_lighter(df)
         ):
@@ -589,8 +640,11 @@ class RasterGridAnalysis(BaseAnalysis):
 
         The VRT names each selected ``(path, band)`` as one output band, so GDAL reads each
         source once and never materializes the stack -- see ``raster_copy_gdal_env`` for the
-        swath/cache settings that make this pay off.  Band descriptions and the multiply
-        parameters are applied to the VRT XML rather than to pixels in Python.
+        swath/cache settings that make this pay off.  Band descriptions are applied to the
+        VRT XML rather than to pixels in Python. Only plain selections reach this path --
+        ``write_raster`` routes any request with calculate entries (including the legacy
+        negate/multiply10/multiply100 sugar) to the windowed path, which can express a
+        general elementwise rewrite and its NoData contract; a VRT ScaleRatio cannot.
         """
 
         sources = list(zip(df["path"].to_list(), df["band"].to_list()))
@@ -604,12 +658,6 @@ class RasterGridAnalysis(BaseAnalysis):
         if calendar_col is not None:
             descriptions = [f"{calendar_col}={value}" for value in df[calendar_col].to_list()]
             vrt_text = set_vrt_band_descriptions(vrt_text, descriptions)
-
-        # Apply multipliers from the calculate parameters. Applied to each source before
-        # any aggregation below, matching the windowed path's multiply-then-reduce order.
-        factors = df["multiplier"].to_list()
-        if not all(factor == 1 for factor in factors):
-            vrt_text = scale_vrt_bands(vrt_text, factors)
 
         with rio.open(sources[0][0]) as source:
             profile = source.profile
@@ -648,17 +696,17 @@ class RasterGridAnalysis(BaseAnalysis):
         """Write a raster dataset to a file using windowed reading and writing to conserve
         memory.
 
-        The multiplier/group_aggregate step is Polars expressions over a per-window
-        DataFrame, built once outside the window loop below (`exprs`) by the shared
-        `raster_source.band_collapse_exprs`, so it uses the same operator vocabulary as
-        the tile and summarize paths instead of a second implementation of the same four
-        aggregates. Reading and writing stay array plumbing: one window's worth of raw
-        bands in, one `output.write` per window out.
+        The calculate/group_aggregate step is Polars expressions over a per-window
+        DataFrame, built once outside the window loop below (`passes`/`exprs`) by the
+        shared `raster_source.band_collapse_exprs`, so it uses the same operator
+        vocabulary as the tile and summarize paths instead of a second implementation of
+        the same four aggregates. Reading and writing stay array plumbing: one window's
+        worth of raw bands in, one `output.write` per window out.
         """
 
         unique_paths, row_indices, bands = group_rows_by_path(df)
         raw_names = [f"b{i}" for i in range(len(df))]
-        multipliers = df["multiplier"].to_list()
+        calculate_passes = self._band_calculate_passes(df, raw_names)
 
         with ExitStack() as stack:
             # GDAL_NUM_THREADS' decompression speedup only takes effect for a dataset that
@@ -695,23 +743,26 @@ class RasterGridAnalysis(BaseAnalysis):
                     for band_idx, value in enumerate(df[calendar_col].to_list(), start=1):
                         output.set_band_description(band_idx, f"{calendar_col}={value}")
 
-            # Built ONCE, outside the window loop -- the expression is identical for every
-            # window, so there is no reason to reconstruct it per iteration.
+            # Built ONCE, outside the window loop -- the expressions are identical for
+            # every window, so there is no reason to reconstruct them per iteration.
             #
-            # `nodata=` is passed only for an aggregated (group_aggregate) selection, so a
+            # `nodata=` is passed for an aggregated (group_aggregate) selection, so a
             # nodata pixel drops out of the collapse instead of contributing a sentinel to
-            # it. A plain, non-aggregated selection passes every pixel through untouched --
-            # see the pinned test_non_aggregated_output_preserves_nodata. This is where the
-            # write path deliberately differs from get_tile, which masks either way: a
-            # written file can carry the sentinel forward for its reader to interpret, but a
-            # rendered pixel has to commit to a color.
-            out_names, exprs = band_collapse_exprs(
+            # it, and for any selection with calculate entries, so an entry's rewrite
+            # never touches the sentinel (NoData in, NoData out -- the sentinel is masked
+            # to null before the entries run and restored afterwards). A plain,
+            # non-aggregated, non-calculated selection passes every pixel through
+            # untouched -- see the pinned test_non_aggregated_output_preserves_nodata.
+            # This is where the write path deliberately differs from get_tile, which masks
+            # either way: a written file can carry the sentinel forward for its reader to
+            # interpret, but a rendered pixel has to commit to a color.
+            out_names, passes, exprs = band_collapse_exprs(
                 raw_names,
-                multipliers,
+                calculate_passes,
                 group_row_idxs,
                 self.options.group_aggregate,
                 out_dtype,
-                nodata=nodata if group_row_idxs is not None else None,
+                nodata=nodata if (group_row_idxs is not None or calculate_passes) else None,
             )
 
             # Batch size is capped independently of the block row's width -- see
@@ -728,8 +779,12 @@ class RasterGridAnalysis(BaseAnalysis):
 
             for window in _batched_block_windows(inputs[0].block_windows(1), blocks_per_batch):
                 cols, shape = await _read_window_columns(inputs, row_indices, bands, window, raw_names)
-                result = pl.DataFrame(cols).select(exprs)
+                frame = pl.DataFrame(cols)
                 del cols
+                for pass_exprs in passes:
+                    frame = frame.with_columns(pass_exprs)
+                result = frame.select(exprs)
+                del frame
 
                 # Assemble every output band and write ONCE. Writing band-at-a-time into a
                 # PIXEL-interleaved tiled COG makes GDAL read-modify-write every tile once

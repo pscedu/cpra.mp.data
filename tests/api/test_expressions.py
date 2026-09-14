@@ -12,7 +12,9 @@ import pytest
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
+    compile_calculate_entries,
     count_by_value_frame,
+    parse_calculate_expression,
     parse_value_expr,
     rewrite_value_column,
     split_top_level_and,
@@ -89,6 +91,87 @@ class TestParseValueExpr:
     def test_invalid_syntax_is_reported_as_an_expression_error(self):
         with pytest.raises(ExpressionError):
             parse_value_expr("value >>> 3", ["value"])
+
+
+class TestParseCalculateExpression:
+    def test_arithmetic_over_value_parses_and_evaluates(self):
+        expr = parse_calculate_expression("(value + 1) * 0.5")
+        df = pl.DataFrame({"value": [1.0, 3.0]})
+        assert df.select(expr.alias("out"))["out"].to_list() == [1.0, 2.0]
+
+    def test_whitelisted_function_accepted(self):
+        expr = parse_calculate_expression("abs(value) * -1")
+        df = pl.DataFrame({"value": [-2.0, 2.0]})
+        assert df.select(expr.alias("out"))["out"].to_list() == [-2.0, -2.0]
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "value > 3",  # comparison: a condition, not an expression
+            "value = 3",
+            "value * 2 AND value",  # boolean keyword
+            "case when value > 1 then 2 else 3 end",  # conditional
+            "value % 3",  # operator outside the + - * / whitelist
+            "value * 'x'",  # string literal (quote character outside the whitelist)
+        ],
+    )
+    def test_condition_and_non_whitelisted_operators_rejected(self, bad):
+        with pytest.raises(ExpressionError):
+            parse_calculate_expression(bad)
+
+    def test_aggregate_call_rejected(self):
+        with pytest.raises(ExpressionError, match="aggregate"):
+            parse_calculate_expression("value - min(value)")
+
+    def test_non_whitelisted_function_rejected(self):
+        with pytest.raises(ExpressionError, match="whitelist"):
+            parse_calculate_expression("exp(value)")
+
+    def test_dimension_column_rejected(self):
+        with pytest.raises(ExpressionError, match="scenario_id"):
+            parse_calculate_expression("value * scenario_id")
+
+    def test_empty_expression_rejected(self):
+        with pytest.raises(ExpressionError, match="empty"):
+            parse_calculate_expression("   ")
+
+    def test_allowed_columns_none_skips_the_namespace_check(self):
+        """The pipeline layer validates structure before it can know the in-scope column
+        name -- the namespace check alone is deferred, everything else still runs."""
+        parse_calculate_expression("marsh * 0.6", allowed_columns=None)
+        with pytest.raises(ExpressionError):
+            parse_calculate_expression("max(marsh)", allowed_columns=None)
+
+
+class TestCompileCalculateEntries:
+    def test_splits_where_into_dimension_and_value_halves(self):
+        (plan,) = compile_calculate_entries(
+            [("calculate.1", "value * 0.6", "model_group_id = 500 AND value > 2")]
+        )
+        assert plan.label == "calculate.1"
+        assert plan.expression == "value * 0.6"
+        assert plan.dimension_where == "(model_group_id = 500)"
+        assert plan.value_where == "(value > 2)"
+
+    def test_no_where_leaves_both_halves_none(self):
+        (plan,) = compile_calculate_entries([("calculate.1", "value * 0.6", None)])
+        assert plan.dimension_where is None
+        assert plan.value_where is None
+
+    def test_rejections_name_the_entry_label(self):
+        with pytest.raises(ExpressionError, match="negate"):
+            compile_calculate_entries([("negate", "value >< 1", None)])
+        with pytest.raises(ExpressionError, match="calculate.2"):
+            compile_calculate_entries(
+                [
+                    ("calculate.1", "value * 2", None),
+                    ("calculate.2", "value * 2", "value > max(value)"),
+                ]
+            )
+
+    def test_mixed_conjunct_in_where_rejected(self):
+        with pytest.raises(ExpressionError, match="both a dimension column"):
+            compile_calculate_entries([("calculate.1", "value * 2", "value > calendar_year")])
 
 
 class TestRewriteValueColumn:

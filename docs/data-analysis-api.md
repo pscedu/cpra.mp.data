@@ -65,13 +65,39 @@ Every `AND`-joined term in `where` must be entirely one kind or the other — a 
 
 ### Calculate
 
-Calculate parameters change the values of individual table cells or raster pixels prior to aggregation. They are intended to support comparison operations, such as calculating the difference between two scenarios or concatenating digits to highlight changes. See the examples below for specific applications of these parameters.
+Calculate parameters change the values of individual table cells or raster pixels prior to aggregation — rescaling a selection by a coefficient (e.g. a confidence weight per model group), negating one side of a difference, or any other elementwise arithmetic. A calculate step is a list of indexed **expression/where pairs**:
+
+```
+calculate.1.expression=value * 0.6
+calculate.1.where=model_group_id=500
+calculate.2.expression=value * 0.3
+calculate.2.where=model_group_id=510
+```
 
 | Parameter | Description | Vector-Grid | Raster-Grid | Example |
 |---|---|---|---|---|
-| `negate` | SQL expression for rows/bands where the value should be multiplied by -1 | ✅ | ✅ | `negate=scenario_id%3D8` |
-| `multiply10` | SQL expression for rows/bands where the value should be multiplied by 10 | ✅ | ✅ | `multiply10=scenario_id%3D8%20AND%20calendar_year%3D2030` |
-| `multiply100` | SQL expression for rows/bands where the value should be multiplied by 100 | ✅ | ✅ | `multiply100=scenario_id%3D8%20AND%20calendar_year%3D2040` |
+| `calculate.N.expression` | Arithmetic rewriting the value of every row/band/pixel entry N's `where` matches (required per entry) | ✅ | ✅ | `calculate.1.expression=value%20*%200.6` |
+| `calculate.N.where` | Which rows/bands/pixels entry N applies to, in the same grammar as the Filter `where` (optional; omitted = everything) | ✅ | ✅ | `calculate.1.where=model_group_id%3D500` |
+
+**`expression`** is arithmetic over the placeholder column `value` and numeric literals, validated against a restricted whitelist: `+ - * /`, parentheses, and the same elementwise function set a Filter `where` value condition may call (`abs`, `round`, `floor`, `ceil`, `sqrt`, `coalesce`, `cast`). No aggregate functions, no subqueries, no dimension columns inside the expression — selecting *which* data an expression applies to is `where`'s job, and comparison/boolean operators are rejected from an expression for the same reason.
+
+**`where`** takes exactly the Filter `where` parameter's grammar: dimension conditions and/or `value` conditions joined with `AND`, a single comparison never mixing a dimension column and `value`, and no aggregate calls or subqueries. On a raster grid a dimension condition selects **bands** (e.g. `model_group_id=500`) and a `value` condition is a per-pixel elementwise mask; both work on every raster path, including tile and GeoTIFF rendering.
+
+**Pass-through semantics.** Rows and bands not matching `where` pass through unchanged; `calculate` never drops data — use `where`/filter for that. (This matches how `negate=scenario_id=8` leaves scenario 7 untouched.)
+
+**Ordering.** Entries apply sequentially in index order: entry N+1 sees entry N's output, so two entries matching the same row compose (×−1 then ×10 → ×−10). Indexes must be contiguous starting at 1; anything else — a gap, a 0 index, an unknown field, an entry missing its `expression` — is rejected with a 400 naming the exact rule violated.
+
+**Missing values.** NoData in, NoData out: an expression never rewrites or backfills a missing value, and a missing value matches no `where`. (Structurally guaranteed — even `coalesce(value, 0)` only ever runs on real values.)
+
+#### Deprecated: `negate`, `multiply10`, `multiply100`
+
+The legacy calculate parameters remain working but are **deprecated** — each is internal sugar for one generic entry (`negate=X` ≡ `calculate.N.expression=value * -1` with `calculate.N.where=X`; `multiply10`/`multiply100` likewise with factors 10/100, applied in `negate`, `multiply10`, `multiply100` order). A request mixing any legacy calculate parameter with any generic `calculate.*` parameter is rejected with a 400 (the relative ordering of the two would be ambiguous), rather than defining an interleaving.
+
+| Parameter | Description | Vector-Grid | Raster-Grid | Example |
+|---|---|---|---|---|
+| `negate` | Deprecated sugar: multiply matching rows/bands by -1 | ✅ | ✅ | `negate=scenario_id%3D8` |
+| `multiply10` | Deprecated sugar: multiply matching rows/bands by 10 | ✅ | ✅ | `multiply10=scenario_id%3D8%20AND%20calendar_year%3D2030` |
+| `multiply100` | Deprecated sugar: multiply matching rows/bands by 100 | ✅ | ✅ | `multiply100=scenario_id%3D8%20AND%20calendar_year%3D2040` |
 
 ### Group and Aggregate
 
@@ -169,6 +195,16 @@ This request returns the colorized elevation difference between two years (2050 
 GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7&calendar_year=2045,2050&negate=calendar_year%3D2045&group_by=true&group_aggregate=sum&color_map=elevation_difference
 ```
 
+#### Confidence-Weighted Surface Across Model Groups
+
+This request builds a confidence-weighted elevation surface as PNG map tiles: three model groups are each multiplied by their own confidence coefficient (0.6, 0.3, 0.1) via three calculate entries — a dimension condition in each `calculate.N.where` selecting that model group's bands — then collapsed to one band per pixel with `group_aggregate=sum`. Entries are independent (each matches a different model group), so this is a per-band weighting; a pixel that is NoData in one group's band simply contributes nothing from that group.
+
+```
+GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_id=500,510,520&scenario_id=7&calendar_year=2050&calculate.1.expression=value%20*%200.6&calculate.1.where=model_group_id%3D500&calculate.2.expression=value%20*%200.3&calculate.2.where=model_group_id%3D510&calculate.3.expression=value%20*%200.1&calculate.3.where=model_group_id%3D520&group_aggregate=sum&color_map=elevation
+```
+
+The same parameters work on the `data.tif` and (with `summarize_by`/`summarize_aggregate` or `grid_cell`) tabular endpoints.
+
 #### Time Series Query at Specific Points
 
 This request returns an elevation time series at three longitude-latitude pairs as an unpivoted (long format) CSV.
@@ -238,9 +274,12 @@ A pipeline has three parts:
 | `project` | `input` (optional, chains from the previous step if omitted), `to` (target grid), `aggregate` (required moving to a coarser grid, forbidden moving to a finer one), `as` | Move a named input onto a different grid via a crosswalk. |
 | `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine named inputs/step outputs on shared dimensions and `grid_cell`. |
 | `filter` | `where` | A SQL-style predicate over the in-scope named columns (e.g. `marsh > 0.5 AND sal > 5.5`), always over the previous step's output. |
+| `calculate` | `expression`, `where` (optional) | Conditionally rewrite the running value: one expression/where pair per step (several pairs = repeated steps, applied sequentially — step N+1 sees step N's output), always over the previous step's output. Same pass-through semantics as the flat `calculate.N.*` parameters: rows/bands not matching `where` flow through unchanged, and `calculate` never drops data. |
 | `group` | `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate`, `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held") | Collapse rows/bands, always over the previous step's output. |
 
-`filter` and `group` never take an explicit input -- they always consume whatever the immediately preceding step produced -- so the **first** step of every pipeline must be a `project` (naming its input explicitly) or a `join` (naming two or more inputs explicitly). A single-input pipeline that changes no grid at all still opens with an identity `project` (`to` equal to the input's own grid) purely to satisfy this rule.
+`filter`, `calculate`, and `group` never take an explicit input -- they always consume whatever the immediately preceding step produced -- so the **first** step of every pipeline must be a `project` (naming its input explicitly) or a `join` (naming two or more inputs explicitly). A single-input pipeline that changes no grid at all still opens with an identity `project` (`to` equal to the input's own grid) purely to satisfy this rule.
+
+A pipeline `calculate` expression references the running value **by its in-scope column name** — the input or step name, exactly the way `filter.where` resolves columns in that context (e.g. `{"op": "calculate", "expression": "sal * 0.6", "where": "model_group_id = 500"}` after an input named `sal`); the flat endpoints' `value` placeholder is also accepted, since both spellings resolve to the same running value in a single-input chain. Its `where` uses `filter.where`'s grammar, with dimension conditions untouched and value conditions written against either spelling.
 
 **`output`** gives the response `format` (any tabular/`tif` format, or a tile format for the tile route) and an optional `color_map` for rendered raster output.
 
@@ -248,9 +287,9 @@ A pipeline has three parts:
 
 Not every step sequence a pipeline could describe is executable yet. Three shapes are supported; anything else is rejected with a `PipelineError`-derived 400 naming the specific unsupported shape and why, rather than a generic failure. The response's `detail` text is intended to be actionable, e.g. it names the exact rule that failed (a cardinality direction, a row ceiling, a missing `group` step) rather than just "invalid pipeline."
 
-1. **Single-input chains equivalent to a flat dataset request**: one input, an opening `project` (identity, or many-to-one onto a coarser grid with `aggregate`), then optionally `filter` step(s) and at most one trailing `group`, to any tabular or `tif`/tile format. This compiles onto the same machinery the flat data endpoints use (`project`'s `to`/`aggregate` become `summarize_by`/`summarize_aggregate`; `filter.where` and `group` become `where`/`group_by`/`group_aggregate`) -- a single-input pipeline and the equivalent flat request return the same data.
+1. **Single-input chains equivalent to a flat dataset request**: one input, an opening `project` (identity, or many-to-one onto a coarser grid with `aggregate`), then optionally `filter` and/or `calculate` step(s) and at most one trailing `group`, to any tabular or `tif`/tile format. This compiles onto the same machinery the flat data endpoints use (`project`'s `to`/`aggregate` become `summarize_by`/`summarize_aggregate`; `filter.where` and `group` become `where`/`group_by`/`group_aggregate`; `calculate` steps become the flat `calculate.N.*` entries, in step order) -- a single-input pipeline and the equivalent flat request return the same data. One ordering caveat falls out of that lowering: the flat machinery runs its whole Filter stage before its Calculate stage, so a `filter` step ordered *after* a `calculate` step is accepted only when its `where` is dimension-only (the two commute); a value condition there would test the pre-calculate value, so it is rejected with a 400 suggesting the filter be moved before the calculate (or folded into the calculate entry's own `where`).
 2. **Project-only reaggregation**: the same shape as (1), specialized to a many-to-one `project` (e.g. raster pixels reaggregated onto a coarser vector zone) with a tabular output -- no `filter`/`group` needed.
-3. **The paired (spatially-joined) shape**: exactly two inputs -- a coarser one broadcast (one-to-many `project`, no `aggregate`) onto a finer *raster* grid, immediately `join`ed against that raster input, then any number of `filter` steps and exactly one trailing `group` with `by: []` (a per-pixel collapse across bands, e.g. across years -- not a zonal collapse) and a numeric `of` (`calendar_year`, or the running `value`) for every aggregate except `count`, which has none (see below). Because this shape's result is inherently one raster surface, only `tif`/`png`/`jpg` output is implemented for it; a tabular paired output is rejected outright (materializing every joined pixel row into a table is exactly the memory cost this shape's execution plan avoids -- see "Memory Behavior" below). This shape's `group.aggregate` supports `min`, `max`, `sum`, `mean`, and `count`: `count` reports, per pixel, how many bands (e.g. calendar steps) satisfy the preceding `filter` step(s)' `where` clause (or, with no `filter` at all, how many bands have real fine+paired data) -- it has no aggregand, so `of` must be left at its default (omitted) rather than naming a column. A pixel with zero satisfying bands reports a real `0`, not a missing value (consistent with `count` everywhere else in this API); nodata is reserved for a pixel entirely outside the pairing crosswalk's domain.
+3. **The paired (spatially-joined) shape** (`calculate` steps are not supported in this shape and are rejected with a `PipelineError`-derived 400 naming it — apply the rewrite on the flat endpoint or a single-input pipeline feeding the analysis instead): exactly two inputs -- a coarser one broadcast (one-to-many `project`, no `aggregate`) onto a finer *raster* grid, immediately `join`ed against that raster input, then any number of `filter` steps and exactly one trailing `group` with `by: []` (a per-pixel collapse across bands, e.g. across years -- not a zonal collapse) and a numeric `of` (`calendar_year`, or the running `value`) for every aggregate except `count`, which has none (see below). Because this shape's result is inherently one raster surface, only `tif`/`png`/`jpg` output is implemented for it; a tabular paired output is rejected outright (materializing every joined pixel row into a table is exactly the memory cost this shape's execution plan avoids -- see "Memory Behavior" below). This shape's `group.aggregate` supports `min`, `max`, `sum`, `mean`, and `count`: `count` reports, per pixel, how many bands (e.g. calendar steps) satisfy the preceding `filter` step(s)' `where` clause (or, with no `filter` at all, how many bands have real fine+paired data) -- it has no aggregand, so `of` must be left at its default (omitted) rather than naming a column. A pixel with zero satisfying bands reports a real `0`, not a missing value (consistent with `count` everywhere else in this API); nodata is reserved for a pixel entirely outside the pairing crosswalk's domain.
 
 A `join`'s two sides must agree on every dimension they share (present on all joined inputs and filtered to the same value(s)), and a dimension present on only one side must be pinned to a single value there, since there is no row on the other side to align it against. The coarse/zone side of a `project`/`join` is also capped at a configured row ceiling (`ANALYSIS_JOIN_MAX_ROWS`), checked before that side is materialized, so an unbounded selection is rejected rather than silently read in full.
 
@@ -319,6 +358,28 @@ POST /v1/analysis.csv
   "output": {"format": "csv"}
 }
 ```
+
+#### Single-Input Pipeline with Calculate Steps: a Confidence-Weighted Collapse
+
+Two model groups weighted 0.6/0.4 via two sequential `calculate` steps (each selecting its model group's rows with a dimension `where`), collapsed with `group`/`sum` -- the pipeline spelling of the flat `calculate.N.*` + `group_aggregate=sum` idiom, and it compiles onto exactly that machinery. The expression names the running value by the input's own name (`sal`), the same way `filter.where` would:
+
+```json
+POST /v1/analysis.csv
+{
+  "inputs": {
+    "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001", "model_group_id": [500, 510], "scenario_id": 7, "aggregate_type": "2_wk_max"}
+  },
+  "steps": [
+    {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
+    {"op": "calculate", "expression": "sal * 0.6", "where": "model_group_id = 500"},
+    {"op": "calculate", "expression": "sal * 0.4", "where": "model_group_id = 510"},
+    {"op": "group", "by": ["calendar_year"], "aggregate": "sum"}
+  ],
+  "output": {"format": "csv"}
+}
+```
+
+The same pipeline in the dotted `GET` encoding spells each step as `step.2.op=calculate&step.2.expression=sal%20*%200.6&step.2.where=model_group_id%20%3D%20500`, and works on the tile route the same way.
 
 #### Project-Only Reaggregation
 

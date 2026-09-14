@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.analysis import AnalysisError, create_analysis
+from cpra.mp.data.analysis.parameters import parse_indexed_calculate
 from cpra.mp.data.analysis.pipeline import (
     PipelineError,
     parse_pipeline,
@@ -97,6 +98,28 @@ def reject_retired_value_where(request: Request) -> None:
 
 
 RejectRetiredValueWhere = Depends(reject_retired_value_where)
+
+
+# The generic calculate entries arrive as indexed, dotted query parameters
+# (`calculate.1.expression=...&calculate.1.where=...`), which FastAPI's query models
+# cannot bind (a query model's fields are flat scalars -- see `api.models.TileQuery`'s
+# docstring), so this dependency reads them off the raw query string and validates them
+# via `analysis.parameters.parse_indexed_calculate` (contiguous 1-based indices,
+# expression required per entry, no unknown fields -- each rejection a 400 naming the
+# exact rule). Returns None when the request has no calculate.* parameters at all; the
+# route handlers set a non-None result onto the built `Options` before `create_analysis`.
+def parse_calculate_query(request: Request):
+    return parse_indexed_calculate(request.query_params)
+
+
+CalculateParams = Depends(parse_calculate_query)
+
+
+def _options_with_calculate(query, calculate):
+    options = query.options
+    if calculate is not None:
+        options.calculate = calculate
+    return options
 
 app = FastAPI(
     title="CPRA Master Plan APIs",
@@ -251,11 +274,12 @@ async def get_model_data(
     format: DataFormat,
     query: Annotated[DataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    calculate=CalculateParams,
     _reject_value_where: None = RejectRetiredValueWhere,
 ):
     compression = query.compression
     validate_compression(compression, format)
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
     validate_format(format, dataset.output_type)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
@@ -277,9 +301,10 @@ async def get_model_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    calculate=CalculateParams,
     _reject_value_where: None = RejectRetiredValueWhere,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
@@ -295,9 +320,10 @@ async def get_vector_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
+    calculate=CalculateParams,
     _reject_value_where: None = RejectRetiredValueWhere,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
     await dataset.apply_params()
     dataset.validate_vector_tile()
     return VectorTileResponse(dataset, x, y, z)

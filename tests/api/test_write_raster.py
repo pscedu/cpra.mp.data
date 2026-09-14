@@ -20,6 +20,7 @@ import pytest
 import rasterio
 from rasterio.shutil import copy as rio_copy
 
+from cpra.mp.data.analysis.expressions import compile_calculate_entries
 from cpra.mp.data.analysis.raster import RasterGridAnalysis
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import (
@@ -65,7 +66,7 @@ def multiband_cog(base_path):
     return outputs[0]
 
 
-def _index_frame(cog_path, bands, multiplier=1):
+def _index_frame(cog_path, bands):
     """The materialized frame write_raster consumes: one row per output band."""
 
     with rasterio.open(cog_path) as src:
@@ -75,23 +76,31 @@ def _index_frame(cog_path, bands, multiplier=1):
             "path": [str(cog_path)] * len(bands),
             "band": list(bands),
             "calendar_year": [years[band - 1] for band in bands],
-            "multiplier": pl.Series([multiplier] * len(bands), dtype=pl.Int32),
         }
     )
 
 
-def _dataset(df, raster_groups=None, group_aggregate=None):
+def _scale_plans(factor, where=None):
+    """Calculate plans multiplying every (or the `where`-selected) band by `factor` --
+    the validated form `BaseAnalysis._apply_calculate_params` would record for the
+    equivalent request."""
+
+    return compile_calculate_entries([("calculate.1", f"value * {factor}", where)])
+
+
+def _dataset(df, raster_groups=None, group_aggregate=None, calculate_plans=None):
     """A RasterGridAnalysis with only the state the write paths touch.
 
     ``RasterGridAnalysis.__init__`` builds a LazyFrame from on-disk data and a grid definition, none of
-    which these paths use -- they read ``materialize()``, ``raster_groups`` and
-    ``options.group_aggregate`` only.
+    which these paths use -- they read ``materialize()``, ``raster_groups``,
+    ``_calculate_plans`` and ``options.group_aggregate`` only.
     """
 
     dataset = object.__new__(RasterGridAnalysis)
     dataset.options = SimpleNamespace(group_aggregate=group_aggregate)
     dataset.materialize = lambda: df
     dataset.raster_groups = raster_groups
+    dataset._calculate_plans = calculate_plans or []
     return dataset
 
 
@@ -151,15 +160,38 @@ def test_vrt_matches_windowed_path(multiband_cog, tmp_path, bands):
     _assert_same_raster(tmp_path / "vrt.tif", tmp_path / "windowed.tif")
 
 
-def test_vrt_matches_windowed_path_with_multiplier(multiband_cog, tmp_path):
-    """A ScaleRatio in the VRT matches the NumPy multiply it replaces."""
+def test_calculate_entries_apply_on_the_windowed_path(multiband_cog, tmp_path):
+    """A calculate entry's rewrite reaches every written pixel (the successor to the old
+    per-band VRT ScaleRatio, which cannot express a general expression)."""
 
-    df = _index_frame(multiband_cog, (1, 2), multiplier=10)
-    assert _write_vrt(_dataset(df), df, tmp_path / "vrt.tif")
-    assert _write_windowed(_dataset(df), df, tmp_path / "windowed.tif")
-    _assert_same_raster(tmp_path / "vrt.tif", tmp_path / "windowed.tif")
+    df = _index_frame(multiband_cog, (1, 2))
+    out_path = tmp_path / "out.tif"
+    assert _write_windowed(_dataset(df, calculate_plans=_scale_plans(10)), df, out_path)
 
-    with rasterio.open(tmp_path / "vrt.tif") as src:
+    with rasterio.open(out_path) as src:
+        np.testing.assert_array_equal(src.read(1), _band_data(YEARS[0]) * 10)
+        np.testing.assert_array_equal(src.read(2), _band_data(YEARS[1]) * 10)
+
+
+def test_calculate_selection_is_dispatched_to_windowed_path(multiband_cog, tmp_path, monkeypatch):
+    """Any calculate entry forces the windowed path: a general expression (and the NoData
+    mask-then-restore contract) has no VRT spelling.
+
+    The buffer limit is raised first so the dispatcher would otherwise choose the VRT
+    path -- without that this would pass whether or not the calculate routing works.
+    """
+
+    monkeypatch.setattr("cpra.mp.data.analysis.raster.RASTER_WINDOW_BUFFER_LIMIT_MB", 0)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("a selection with calculate entries must not use the VRT path")
+
+    monkeypatch.setattr(RasterGridAnalysis, "_write_raster_vrt", fail)
+
+    df = _index_frame(multiband_cog, (1, 2))
+    out_path = tmp_path / "out.tif"
+    assert _write(_dataset(df, calculate_plans=_scale_plans(10)), out_path)
+    with rasterio.open(out_path) as src:
         np.testing.assert_array_equal(src.read(1), _band_data(YEARS[0]) * 10)
 
 
@@ -201,7 +233,6 @@ def test_vrt_labels_bands_from_legacy_source(base_path, tmp_path):
             "path": [str(legacy_path)],
             "band": [1],
             "calendar_year": [2019],
-            "multiplier": pl.Series([1], dtype=pl.Int32),
         }
     )
     out_path = tmp_path / "out.tif"
@@ -285,12 +316,14 @@ def test_aggregated_bands_are_unlabeled(multiband_cog, tmp_path):
         assert src.descriptions == (None,)
 
 
-def test_aggregate_applies_multiplier_before_reducing(multiband_cog, tmp_path):
-    """Multiply-then-reduce, not reduce-then-multiply."""
+def test_aggregate_applies_calculate_before_reducing(multiband_cog, tmp_path):
+    """Calculate-then-reduce, not reduce-then-calculate."""
 
-    df = _index_frame(multiband_cog, (1, 2), multiplier=10)
+    df = _index_frame(multiband_cog, (1, 2))
     out_path = tmp_path / "out.tif"
-    assert _write(_aggregated(df, "sum"), out_path)
+    dataset = _aggregated(df, "sum")
+    dataset._calculate_plans = _scale_plans(10)
+    assert _write(dataset, out_path)
 
     expected = np.sum([_band_data(year) * 10 for year in YEARS[:2]], axis=0).astype("float32")
     with rasterio.open(out_path) as src:
@@ -368,6 +401,22 @@ def test_non_aggregated_output_preserves_nodata(nodata_cog, tmp_path):
         assert src.read(1)[0, 0] == -9999.0
         assert src.read(1)[0, 1] == -9999.0, "nodata in band 1 only"
         assert src.read(2)[0, 1] == 5.0, "band 2 has real data at that pixel"
+
+
+def test_calculate_never_rewrites_nodata_on_the_windowed_path(nodata_cog, tmp_path):
+    """NoData in, NoData out: a non-aggregated write with calculate entries masks the
+    sentinel before the entries run and restores it afterwards, so `value * 10` cannot
+    turn -9999 into -99990 -- while every real pixel is rewritten."""
+
+    df = _index_frame(nodata_cog, (1, 2))
+    out_path = tmp_path / "out.tif"
+    assert _write_windowed(_dataset(df, calculate_plans=_scale_plans(10)), df, out_path)
+    with rasterio.open(out_path) as src:
+        assert src.nodata == -9999.0
+        assert src.read(1)[0, 0] == -9999.0, "nodata stays the sentinel, not sentinel * 10"
+        assert src.read(1)[0, 1] == -9999.0, "nodata in band 1 only"
+        assert src.read(1)[1, 1] == 50.0, "real pixels are rewritten"
+        assert src.read(2)[0, 1] == 50.0, "band 2 has real data at that pixel"
 
 
 def test_integer_aggregate_truncates_toward_zero(base_path, tmp_path):
@@ -500,9 +549,7 @@ def test_multiband_output_is_pixel_interleaved(multiband_cog, tmp_path):
 def test_empty_selection_returns_false(tmp_path):
     """An empty selection is what drives the endpoint's 404, before either path runs."""
 
-    df = pl.DataFrame(
-        schema={"path": pl.String, "band": pl.Int64, "calendar_year": pl.Int32, "multiplier": pl.Int32}
-    )
+    df = pl.DataFrame(schema={"path": pl.String, "band": pl.Int64, "calendar_year": pl.Int32})
     out_path = tmp_path / "out.tif"
     assert _write(_dataset(df), out_path) is False
     assert not out_path.exists()
@@ -562,7 +609,6 @@ def test_paths_agree_across_multiple_source_files(base_path, tmp_path):
             "path": [r[0] for r in rows],
             "band": [r[1] for r in rows],
             "calendar_year": [r[2] for r in rows],
-            "multiplier": pl.Series([1] * len(rows), dtype=pl.Int32),
         }
     )
 

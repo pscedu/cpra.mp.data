@@ -278,6 +278,101 @@ class TestFilterStep:
             parse_pipeline(data)
 
 
+class TestCalculateStep:
+    def test_ordinary_expression_accepted(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate", "expression": "marsh * 0.6"})
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[-1].expression == "marsh * 0.6"
+        assert pipeline.steps[-1].where is None
+
+    def test_expression_with_where_accepted(self):
+        data = simple_pipeline()
+        data["steps"].append(
+            {"op": "calculate", "expression": "marsh * 0.6", "where": "model_group_id = 500"}
+        )
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[-1].where == "model_group_id = 500"
+
+    def test_expression_is_required(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate"})
+        with pytest.raises(ValueError):
+            parse_pipeline(data)
+
+    def test_empty_expression_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate", "expression": "  "})
+        with pytest.raises(PipelineError, match="empty"):
+            parse_pipeline(data)
+
+    def test_comparison_operator_in_expression_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate", "expression": "marsh > 0.5"})
+        with pytest.raises(PipelineError, match="where"):
+            parse_pipeline(data)
+
+    def test_aggregate_call_in_expression_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate", "expression": "max(marsh)"})
+        with pytest.raises(PipelineError, match="aggregate"):
+            parse_pipeline(data)
+
+    def test_aggregate_call_in_where_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append(
+            {"op": "calculate", "expression": "marsh * 2", "where": "marsh > max(marsh)"}
+        )
+        with pytest.raises(PipelineError, match="aggregate"):
+            parse_pipeline(data)
+
+    def test_empty_where_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "calculate", "expression": "marsh * 2", "where": ""})
+        with pytest.raises(PipelineError, match="non-empty"):
+            parse_pipeline(data)
+
+    def test_calculate_cannot_be_first_step(self):
+        data = simple_pipeline()
+        data["steps"] = [{"op": "calculate", "expression": "marsh * 0.6"}]
+        with pytest.raises(PipelineError, match="no input"):
+            parse_pipeline(data)
+
+    def test_round_trips_through_query_encoding(self):
+        data = simple_pipeline()
+        data["steps"].append(
+            {"op": "calculate", "expression": "marsh * 0.6", "where": "model_group_id = 500"}
+        )
+        pipeline = parse_pipeline(data)
+        query = pipeline_to_query(pipeline)
+        assert query["step.2.op"] == "calculate"
+        assert query["step.2.expression"] == "marsh * 0.6"
+        assert query["step.2.where"] == "model_group_id = 500"
+        pipeline2 = pipeline_from_query(query)
+        assert pipeline_to_query(pipeline2) == query
+
+    def test_dotted_encoding_decodes_expression_and_where_verbatim(self):
+        """`expression`/`where` are opaque strings -- never comma-split, so a function
+        call with arguments survives the dotted GET encoding."""
+        query = pipeline_to_query(parse_pipeline(simple_pipeline()))
+        query.update(
+            {
+                "step.2.op": "calculate",
+                "step.2.expression": "round(marsh * 0.6, 2)",
+                "step.2.where": "model_group_id = 500 AND marsh > 0.5",
+            }
+        )
+        pipeline = pipeline_from_query(query)
+        assert pipeline.steps[1].expression == "round(marsh * 0.6, 2)"
+        assert pipeline.steps[1].where == "model_group_id = 500 AND marsh > 0.5"
+
+    def test_unknown_calculate_field_in_query_rejected(self):
+        query = pipeline_to_query(parse_pipeline(simple_pipeline()))
+        query.update({"step.2.op": "calculate", "step.2.expr": "marsh * 0.6"})
+        with pytest.raises(PipelineError, match="unknown field"):
+            pipeline_from_query(query)
+
+
 class TestGroupStep:
     def test_aggregate_is_required(self):
         data = simple_pipeline()

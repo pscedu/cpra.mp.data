@@ -32,6 +32,7 @@ outside the API later (the `read_data()` entry point in `cpra/mp/data/__init__.p
 """
 
 import re
+from typing import NamedTuple
 
 import polars as pl
 
@@ -312,6 +313,154 @@ def classify_where(where_str):
             dimension_conjuncts.append(conjunct)
 
     return dimension_conjuncts, value_conjuncts
+
+
+# Tokens that make a string a CONDITION rather than a value-producing expression: the SQL
+# comparison operators and boolean/conditional keywords. A calculate `expression` computes
+# the new value (arithmetic over `value`, numeric literals, and `ALLOWED_FUNCTIONS`);
+# selecting WHICH rows/bands/pixels it applies to is its sibling `where`'s job, so any of
+# these inside an `expression` is rejected by `parse_calculate_expression` with an error
+# pointing at `where`. (`cast(value as float)`'s `as` is deliberately not in this list --
+# `cast` is a whitelisted elementwise function, not a condition.)
+_CONDITION_TOKEN_RE = re.compile(
+    r"(<=|>=|!=|<>|<|>|=|!|\b(?:and|or|not|in|like|ilike|between|is|case|when|then|else|end)\b)",
+    re.IGNORECASE,
+)
+
+# Everything a calculate `expression` may be spelled with, at the character level:
+# identifiers (the `value` placeholder and whitelisted function names), numeric literals
+# (digits, `.`, and the `e`/`E` an exponent uses are all identifier/digit/dot characters),
+# the four arithmetic operators, parentheses, a comma (function arguments), and
+# whitespace. Anything else -- `%`, `|`, `&`, `^`, a quoted string literal, ... -- is not
+# in the documented grammar (`+ - * /`, parentheses, numeric literals, whitelisted
+# functions) and is rejected by character before the parser ever sees it, so the
+# whitelist stays honest about unlisted operators instead of admitting whatever
+# `pl.sql_expr` happens to parse.
+_CALCULATE_ALLOWED_CHARS_RE = re.compile(r"[^A-Za-z0-9_+\-*/(),.\s]")
+
+
+def parse_calculate_expression(expr_str, allowed_columns=("value",)):
+    """Parse a calculate `expression`: arithmetic (`+ - * /`, parentheses) over the
+    placeholder column `value` and numeric literals, plus the same elementwise function
+    whitelist (`ALLOWED_FUNCTIONS`) a `where` value condition may call -- built on
+    `parse_value_expr`'s own validation machinery (streaming-closed check, aggregate-call
+    rejection, function whitelist, parse, column-namespace check) rather than a second
+    parser, with two additional rejections of its own:
+
+    - a comparison/boolean token (`_CONDITION_TOKEN_RE`): an expression COMPUTES the new
+      value; row/band selection is the entry's `where`'s job, and silently letting a
+      boolean expression through would rewrite matched values to 0/1;
+    - a subquery keyword, closing the same hole `_check_no_dimension_subquery_or_aggregate`
+      closes for dimension conjuncts (`pl.sql_expr` does not reliably reject every
+      subquery spelling on its own -- see `_SELECT_KEYWORD_RE`).
+
+    `allowed_columns` defaults to the `value` placeholder alone -- no dimension columns
+    inside an expression, per the calculate stage's documented grammar. `None` skips the
+    namespace check entirely, for a caller (the pipeline layer's structural validation)
+    that cannot know the in-scope column name yet and re-validates at compile time.
+    """
+    if not expr_str or not expr_str.strip():
+        raise ExpressionError("empty calculate expression")
+
+    match = _CONDITION_TOKEN_RE.search(expr_str)
+    if match:
+        raise ExpressionError(
+            f"operator/keyword {match.group(0)!r} is not allowed in a calculate expression -- "
+            "an expression computes the new value (arithmetic over `value`, numeric "
+            f"literals, and the functions {sorted(ALLOWED_FUNCTIONS)}); selecting which "
+            "rows/bands it applies to belongs in the entry's `where`"
+        )
+    stray = _CALCULATE_ALLOWED_CHARS_RE.search(expr_str)
+    if stray:
+        raise ExpressionError(
+            f"character {stray.group(0)!r} is not allowed in a calculate expression -- "
+            "only arithmetic (`+ - * /`, parentheses), numeric literals, `value`, and "
+            f"the functions {sorted(ALLOWED_FUNCTIONS)} are"
+        )
+    if _SELECT_KEYWORD_RE.search(expr_str):
+        raise ExpressionError(
+            f"subquery ('select') is not allowed in a calculate expression: {expr_str!r}"
+        )
+
+    _check_streaming_closed(expr_str)
+    _check_no_aggregate_calls(expr_str)
+    _check_allowed_calls(expr_str)
+
+    try:
+        expr = pl.sql_expr(expr_str)
+    except Exception as exc:  # pl.sql_expr's own exception types are not part of its stable API
+        raise ExpressionError(f"invalid calculate expression {expr_str!r}: {exc}") from exc
+
+    if allowed_columns is not None:
+        try:
+            _check_column_namespace(expr, allowed_columns)
+        except ExpressionError as exc:
+            raise ExpressionError(
+                f"{exc} -- a calculate expression may only reference the value placeholder "
+                "and numeric literals; dimension selection belongs in the entry's `where`"
+            ) from exc
+    return expr
+
+
+class CalculatePlan(NamedTuple):
+    """One validated calculate entry, split the way the two grid types consume it.
+
+    `label` names the entry in errors (`calculate.1`, or a legacy parameter name like
+    `negate` once rewritten as sugar). `expression` is the validated arithmetic string,
+    still written against the `value` placeholder -- kept as a STRING (not the parsed
+    `Expr`) because the raster paths re-parse it once per band with `value` rewritten to
+    that band's own synthetic column (`rewrite_value_column`), exactly like a `where`
+    value condition. `dimension_where`/`value_where` are the entry's `where` split by
+    `classify_where` into its two conjunct kinds and recombined (`None` when that kind
+    was absent): the dimension half selects rows (vector) or bands (raster metadata); the
+    value half is a per-cell/per-pixel elementwise mask.
+    """
+
+    label: str
+    expression: str
+    dimension_where: str | None
+    value_where: str | None
+
+
+def compile_calculate_entries(entries):
+    """Validate calculate entries -- `(label, expression, where)` triples, in application
+    order -- into `CalculatePlan`s, before any file is opened.
+
+    `expression` goes through `parse_calculate_expression` against the `value`-only
+    namespace. `where` (optional) gets exactly the Filter stage's treatment: split and
+    classified by `classify_where` (so a conjunct mixing a dimension column and `value`,
+    an aggregate call, or a subquery is rejected with the same messages `where` gives),
+    dimension conjuncts recombined into `dimension_where` -- their column NAMES are
+    grid-dependent and are checked where the plan is applied -- and value conjuncts
+    recombined into `value_where` and validated here against the `value` placeholder.
+
+    Every rejection is an `ExpressionError` prefixed with the offending entry's label.
+    """
+    plans = []
+    for label, expression, where in entries:
+        try:
+            parse_calculate_expression(expression)
+        except ExpressionError as exc:
+            raise ExpressionError(f"{label}: {exc}") from exc
+
+        dimension_where = None
+        value_where = None
+        if where is not None:
+            try:
+                dimension_conjuncts, value_conjuncts = classify_where(where)
+            except ExpressionError as exc:
+                raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
+            if dimension_conjuncts:
+                dimension_where = " and ".join(f"({c})" for c in dimension_conjuncts)
+            if value_conjuncts:
+                value_where = " and ".join(f"({c})" for c in value_conjuncts)
+                try:
+                    parse_value_expr(value_where, ["value"])
+                except ExpressionError as exc:
+                    raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
+
+        plans.append(CalculatePlan(label, expression, dimension_where, value_where))
+    return plans
 
 
 def rewrite_value_column(expr_str, column_name):

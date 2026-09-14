@@ -443,15 +443,152 @@ class TestCalculateStage:
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
         assert df["value"][0] == pytest.approx(base, rel=1e-5)
 
-    async def test_first_matching_expression_wins(self, dataset_factory, annual_data):
-        """The when/then chain is evaluated in negate, multiply10, multiply100 order."""
+    async def test_legacy_parameters_compose_sequentially(self, dataset_factory, annual_data):
+        """Legacy parameters are sugar for calculate entries in negate, multiply10,
+        multiply100 order, and entries compose sequentially (entry N+1 sees entry N's
+        output) -- so a row matching both negate and multiply10 is multiplied by -10.
+
+        DELIBERATE behavior change from the pre-generic-calculate implementation, whose
+        single when/then chain was first-match-wins (the same request used to yield -base,
+        the negate alone): the legacy parameters are now defined as exactly their generic
+        sugar, and the generic entries' documented contract is sequential composition.
+        """
         base = annual_frame(years=(2030,))["1"][0]
         dataset = dataset_factory(
             DIMENSIONS, negate="calendar_year = 2030", multiply10="calendar_year = 2030"
         )
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
-        assert df["value"][0] == pytest.approx(-base, rel=1e-5)
+        assert df["value"][0] == pytest.approx(-10 * base, rel=1e-5)
+
+
+class TestGenericCalculate:
+    """The generic calculate entries (`Options.calculate`, the flat `calculate.N.*`
+    parameters' internal form) on a vector grid: expression/where pairs applied
+    sequentially, pass-through for non-matching rows, NoData preservation, and the
+    legacy-parameter sugar equivalence."""
+
+    @staticmethod
+    def _calc(expression, where=None):
+        return {"expression": expression, "where": where}
+
+    async def test_expression_rewrites_matching_rows_only(self, dataset_factory, annual_data):
+        base_2030 = annual_frame(years=(2030,))["1"][0]
+        base_2040 = annual_frame(years=(2040,))["1"][0]
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[self._calc("value * 0.5", "calendar_year = 2030")]
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(base_2030 * 0.5, rel=1e-5)
+        assert df["value"][1] == pytest.approx(base_2040, rel=1e-5), "non-matching rows pass through"
+
+    async def test_no_where_applies_everywhere(self, dataset_factory, annual_data):
+        dataset = dataset_factory(DIMENSIONS, calculate=[self._calc("value + 1")])
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"].to_list() == pytest.approx([2031.01, 2041.01], rel=1e-5)
+
+    async def test_entries_compose_sequentially(self, dataset_factory, annual_data):
+        """Entry 2 sees entry 1's output: (x * 10) then (running * -1) is -10x."""
+        base = annual_frame(years=(2030,))["1"][0]
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[
+                self._calc("value * 10", "calendar_year = 2030"),
+                self._calc("value * -1", "calendar_year = 2030"),
+            ],
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(-10 * base, rel=1e-5)
+
+    async def test_value_condition_in_where_tests_the_running_value(
+        self, dataset_factory, annual_data
+    ):
+        """A `value` condition in a calculate where is elementwise, and entry 2's tests
+        entry 1's output (2030 was doubled above the threshold before entry 2 ran)."""
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[
+                self._calc("value * 2", "value > 2035"),  # only 2040 rows exceed 2035
+                self._calc("value + 1", "value > 4000"),  # only the doubled 2040 rows
+            ],
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert df["value"][0] == pytest.approx(2030.01, rel=1e-5)
+        assert df["value"][1] == pytest.approx(2040.01 * 2 + 1, rel=1e-5)
+
+    async def test_dimension_and_value_conditions_combine_in_one_where(
+        self, dataset_factory, annual_data
+    ):
+        dataset = dataset_factory(
+            DIMENSIONS,
+            calculate=[self._calc("value * 0", "calendar_year = 2030 AND value > 2030.05")],
+        )
+        await dataset.apply_params()
+        df = dataset.materialize().filter(pl.col("calendar_year") == 2030).sort("grid_cell")
+        # geo 1 holds 2030.01 (below the threshold: untouched); geo 32 holds 2030.32.
+        assert df.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(2030.01, rel=1e-5)
+        assert df.filter(pl.col("grid_cell") == 32)["value"][0] == 0
+
+    async def test_missing_values_stay_missing(self, dataset_factory, base_path):
+        """NoData in, NoData out -- even for an expression (coalesce) that could backfill."""
+        write_parquet(
+            annual_frame(
+                years=(2030,), value_fn=lambda year, geo_id: None if geo_id == 1 else float(geo_id)
+            ),
+            base_path=base_path,
+        )
+        dataset = dataset_factory(DIMENSIONS, calculate=[self._calc("coalesce(value, 0) + 1")])
+        await dataset.apply_params()
+        df = dataset.materialize().sort("grid_cell")
+        assert df.filter(pl.col("grid_cell") == 1)["value"][0] is None
+        assert df.filter(pl.col("grid_cell") == 2)["value"][0] == pytest.approx(3.0)
+
+    async def test_legacy_negate_equals_its_generic_sugar(self, dataset_factory, annual_data):
+        legacy = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
+        await legacy.apply_params()
+        generic = dataset_factory(
+            DIMENSIONS, calculate=[self._calc("value * -1", "calendar_year = 2030")]
+        )
+        await generic.apply_params()
+        sort_cols = ["grid_cell", "calendar_year"]
+        assert legacy.materialize().sort(sort_cols)["value"].to_list() == pytest.approx(
+            generic.materialize().sort(sort_cols)["value"].to_list()
+        )
+
+    async def test_mixing_legacy_and_generic_is_rejected(self, dataset_factory, annual_data):
+        dataset = dataset_factory(
+            DIMENSIONS,
+            negate="calendar_year = 2030",
+            calculate=[self._calc("value * 2")],
+        )
+        with pytest.raises(AnalysisError) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "negate" in excinfo.value.detail
+        assert "ambiguous" in excinfo.value.detail
+
+    async def test_invalid_expression_is_a_400_naming_the_entry(
+        self, dataset_factory, annual_data
+    ):
+        dataset = dataset_factory(DIMENSIONS, calculate=[self._calc("value > 3")])
+        with pytest.raises(AnalysisError) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "calculate.1" in excinfo.value.detail
+        assert "where" in excinfo.value.detail
+
+    async def test_where_naming_a_missing_column_is_a_400(self, dataset_factory, annual_data):
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[self._calc("value * 2", "species_code = 'allig'")]
+        )
+        with pytest.raises(AnalysisError) as excinfo:
+            await dataset.apply_params()
+        assert excinfo.value.status_code == 400
+        assert "species_code" in excinfo.value.detail
 
 
 class TestGroupStage:

@@ -207,6 +207,72 @@ class TestFlatPipelineEquivalence:
         assert_frame_equal(flat_df.sort("grid_cell"), pipeline_df.sort("grid_cell"))
 
 
+class TestCalculate:
+    """The generic calculate entries on the library surface: the flat `calculate=` list
+    (the HTTP endpoints' `calculate.N.*` parameters) and the pipeline `calculate` op,
+    which compiles onto the same machinery."""
+
+    async def test_flat_calculate_list(self, two_scenario_annual_data):
+        """The confidence-weighting idiom: two selections each scaled by their own
+        coefficient, collapsed with group_aggregate=sum."""
+        df = await analyze_data(
+            variable=ANNUAL_KWARGS["variable"],
+            time_unit=ANNUAL_KWARGS["time_unit"],
+            grid=ANNUAL_KWARGS["grid"],
+            calculate=[
+                {"expression": "value * 0.5", "where": "scenario_id = 7"},
+                {"expression": "value * 0.25", "where": "scenario_id = 8"},
+            ],
+            group_by="calendar_year",
+            group_aggregate="sum",
+            base_path=two_scenario_annual_data,
+        )
+        cell_1 = df.filter((pl.col("grid_cell") == 1) & (pl.col("calendar_year") == 2030))
+        assert cell_1["value"][0] == pytest.approx(2030.01 * 0.75, rel=1e-5)
+
+    async def test_pipeline_calculate_op_matches_the_flat_spelling(self, two_scenario_annual_data):
+        flat_df = await analyze_data(
+            variable=ANNUAL_KWARGS["variable"],
+            time_unit=ANNUAL_KWARGS["time_unit"],
+            grid=ANNUAL_KWARGS["grid"],
+            scenario_id=7,
+            calculate=[{"expression": "value * 0.5", "where": "calendar_year = 2030"}],
+            group_aggregate="sum",
+            base_path=two_scenario_annual_data,
+        )
+        pipeline_df = await analyze_data(
+            pipeline={
+                "inputs": {
+                    "eco": {
+                        "variable": ANNUAL_KWARGS["variable"],
+                        "time_unit": ANNUAL_KWARGS["time_unit"],
+                        "grid": ANNUAL_KWARGS["grid"],
+                        "scenario_id": 7,
+                    }
+                },
+                "steps": [
+                    {"op": "project", "input": "eco", "to": ANNUAL_KWARGS["grid"]},
+                    {"op": "calculate", "expression": "eco * 0.5", "where": "calendar_year = 2030"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            },
+            base_path=two_scenario_annual_data,
+        )
+        assert_frame_equal(flat_df.sort("grid_cell"), pipeline_df.sort("grid_cell"))
+
+    async def test_mixing_legacy_and_generic_raises(self, two_scenario_annual_data):
+        with pytest.raises(AnalysisError, match="ambiguous"):
+            await analyze_data(
+                variable=ANNUAL_KWARGS["variable"],
+                time_unit=ANNUAL_KWARGS["time_unit"],
+                grid=ANNUAL_KWARGS["grid"],
+                negate="calendar_year = 2030",
+                calculate=[{"expression": "value * 2"}],
+                base_path=two_scenario_annual_data,
+            )
+
+
 class TestLazy:
     async def test_lazy_true_returns_a_lazyframe_matching_the_eager_result(self, two_scenario_annual_data):
         eager = await analyze_data(

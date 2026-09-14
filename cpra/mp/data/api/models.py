@@ -5,9 +5,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
 
 from cpra.mp.data.analysis.parameters import (  # noqa: F401
+    CalculateEntry,
     DatasetDimensions,
     FilterDimensions,
     Options,
+    ScalarOptions,
 )
 from cpra.mp.data.analysis.types import (
     CompressionAlgorithm,
@@ -20,7 +22,14 @@ class Compression(BaseModel):
     compression_level: int = 6
 
 
-class TileQuery(Options, FilterDimensions):
+class TileQuery(ScalarOptions, FilterDimensions):
+    """Inherits `ScalarOptions`, not `Options`: FastAPI binds every query-model field as
+    a flat scalar query parameter, and `Options.calculate` is a structured list with no
+    flat spelling -- it arrives as the dotted `calculate.N.*` parameters, parsed off the
+    raw query string by `api.__init__.parse_calculate_query` and set onto the `Options`
+    object this model's `options` property builds.
+    """
+
     model_config = ConfigDict(use_enum_values=True)
 
     @property
