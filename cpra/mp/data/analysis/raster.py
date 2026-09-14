@@ -57,7 +57,6 @@ from cpra.mp.data.config import (
     RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
 from cpra.mp.data.raster import scale_vrt_bands, set_vrt_band_descriptions, vrt
-from cpra.mp.data.utils import get_input_data_frame, required_columns
 
 # Interleaving for downloaded rasters, set rather than inherited from the source. A source
 # COG may be written INTERLEAVE=TILE, which is a COG-driver-only option that the GTiff driver
@@ -154,26 +153,41 @@ class RasterGridAnalysis(BaseAnalysis):
             # `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` deep in a later stage.
             self._error("group_aggregate 'count' is not supported for raster grids")
 
-        # agg_groups() is deprecated and panics when grouping on a literal (the
-        # group_aggregate-without-group_by case, group_by_cols == [True]), so track
-        # row positions via with_row_index instead.
+        # agg_groups() is deprecated and panics when grouping on a literal, so track
+        # row positions via with_row_index instead. `group_by_cols` is empty rather than
+        # the pre-cleanup `[True]` sentinel for the group_aggregate-without-group_by
+        # case (see `BaseAnalysis._get_group_by_columns`), and `group_by()` with no
+        # columns collapses everything into a single group -- exactly like
+        # `group_by(True)` did, minus the spurious "literal" column Polars names a bare
+        # `True` group key.
         self.raster_groups = self.lf.with_row_index("row_idxs").group_by(*group_by_cols).agg(pl.col("row_idxs"))
 
     def _get_raster_dimension_frame(self, df):
-        """Get a DataFrame with one row per output raster band, aligned by row order
-        with the `(n_bands, zone_ids.size)` array `_summarize_zone_stats_plugin` returns
-        for the same `df`."""
-        if self.raster_groups is None:
-            return df.select(pl.exclude("path", "multiplier"))
+        """Get `(dim_df, n_bands)`: a DataFrame with one row per output raster band,
+        aligned by row order with the `(n_bands, zone_ids.size)` array
+        `_summarize_zone_stats_plugin` returns for the same `df`, and that band count as
+        a separate value.
 
-        # Mirror the vector group-by branch: dimension columns that aren't part of the
-        # group by clause collapse into a single group, so they become null here too.
-        required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
-        group_df = self.raster_groups.collect().select(pl.exclude("row_idxs"))
-        null_cols = [col for col in required_cols if col not in group_df.columns]
-        if null_cols:
-            group_df = group_df.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
-        return group_df
+        A dimension column left out of the group by clause is simply absent from
+        `dim_df` -- mirroring `VectorGridAnalysis._collapse_group`'s drop (see its
+        comment for the full rationale: the old behavior null-filled every collapsed
+        dimension back in, which is the artifact this drops). `n_bands` is returned
+        alongside `dim_df` rather than left for a caller to compute as `len(dim_df)`
+        because Polars cannot represent "zero columns, N rows": a group_aggregate with
+        no group_by at all collapses to zero surviving dimension columns, and selecting
+        a DataFrame down to zero columns always reports height 0 regardless of the
+        source frame's real row count. `self.raster_groups` (which always carries
+        `row_idxs`, a real column, even when no dimension survives) is the one frame
+        whose height is reliable in that case, so it is read off `group_df` BEFORE
+        `row_idxs` is dropped down to (possibly) zero remaining columns.
+        """
+        if self.raster_groups is None:
+            dim_df = df.select(pl.exclude("path", "multiplier"))
+            return dim_df, len(dim_df)
+
+        group_df = self.raster_groups.collect()
+        n_bands = group_df.height
+        return group_df.select(pl.exclude("row_idxs")), n_bands
 
     async def _apply_transform_params_impl(self):
         """Apply transform and extract parameters to the image.
@@ -228,8 +242,7 @@ class RasterGridAnalysis(BaseAnalysis):
         if df.is_empty():
             self._error("Dataset does not exist", status_code=404)
 
-        dim_df = self._get_raster_dimension_frame(df)
-        n_bands = len(dim_df)
+        dim_df, n_bands = self._get_raster_dimension_frame(df)
         unique_paths, row_indices, bands = group_rows_by_path(df)
 
         with rio.open(crosswalk_path) as crosswalk:
@@ -269,7 +282,10 @@ class RasterGridAnalysis(BaseAnalysis):
             except ExpressionError as exc:
                 self._error(str(exc))
 
-            dim_row = dim_df.row(0, named=True)
+            # `dim_df` can legitimately have zero columns (every dimension collapsed
+            # away by group_aggregate with no group_by) -- `.row(0)` on a zero-width
+            # frame raises, so there is nothing to read off it in that case.
+            dim_row = dim_df.row(0, named=True) if dim_df.width else {}
             self.lf = (
                 result_df.lazy()
                 .with_columns(**{col: pl.lit(val) for col, val in dim_row.items()})
@@ -299,9 +315,15 @@ class RasterGridAnalysis(BaseAnalysis):
         # then unpivot to the long-format grid_cell/value contract used everywhere else --
         # matching VectorGridAnalysis's join-based output shape.
         dim_cols = dim_df.columns
+        result_frame = pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row")
+        # `dim_df` can legitimately have zero columns (every dimension collapsed away by
+        # group_aggregate with no group_by) -- `result_frame` already has the right
+        # height (`n_bands` rows) on its own in that case, so there is nothing to
+        # hstack onto it, and `hstack` would fail on the height mismatch a zero-column
+        # `dim_df` reports (see `_get_raster_dimension_frame`'s docstring).
+        wide = dim_df.hstack(result_frame) if dim_cols else result_frame
         self.lf = (
-            dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
-            .unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
+            wide.unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
             .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by))
             .lazy()
         )

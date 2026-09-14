@@ -27,7 +27,6 @@ from cpra.mp.data.analysis.geography import (
 )
 from cpra.mp.data.analysis.utils import asynctiming, unpack_values
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
-from cpra.mp.data.utils import get_input_data_frame, required_columns
 
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")
 
@@ -123,19 +122,34 @@ class VectorGridAnalysis(BaseAnalysis):
         """Collapse `self.lf` per `group_by_cols`, a real vector dimension-collapse
         across rows per grid_cell (via `group_by(...).agg(...)`, or
         `analysis.fold.fold_group_by` when cliff-shaped -- see `should_fold_group_by`).
-        """
-        # Set dimension columns to null if they are not part of the group by clause.
-        required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
-        null_cols = [col for col in required_cols if col not in group_by_cols]
 
+        A dimension column left out of `group_by_cols` is simply absent from the result
+        -- `group_by(...).agg(...)` (and `fold_group_by`, which delegates to the same
+        Polars primitive per chunk) already drops any column that is neither a group key
+        nor an aggregated expression, so no extra step is needed to make that happen.
+        This used to be undone right after: every such column was added straight back as
+        an all-null, Null-dtype placeholder, so a caller saw a schema-stable but
+        meaningless column for every dimension the request didn't group by (e.g.
+        `model_group_id`, `scenario_id`, `calendar_day` all appearing, entirely null, in
+        a plain `group_aggregate='count'` response). Dropping instead of null-filling is
+        the honest shape for "this dimension no longer has a value" and matches
+        `VectorGridAnalysis`'s own crosswalk-reaggregation branch below (`summarize_by`)
+        and `PairedAnalysis`/the pipeline shape, neither of which ever reintroduces a
+        collapsed dimension as null -- see the README's `analyze_data` example, whose
+        documented output columns (`grid_cell, calendar_year, value`) already assumed
+        the collapsed dimensions were simply gone. A `select` naming a since-collapsed
+        dimension now surfaces as a clean `ColumnNotFoundError` -> 400 out of
+        `materialize`, rather than silently returning an all-null column.
+        """
         # grid_cell must always be part of the group key in long format since each
         # row represents a single grid_cell -- this is exactly the high-cardinality
         # collapse the fold exists for (see analysis.fold's module docstring: 126,174
         # distinct grid_cell values, ~9.8 GB unfolded). `should_fold_group_by` sees
-        # only the OUTPUT key names (plain strings; `group_by_cols` may also contain
-        # the literal `True` for the group_aggregate-without-group_by case, which
-        # never matches a high-cardinality column name and is harmless to include).
-        key_names = [col for col in group_by_cols if isinstance(col, str)] + ["grid_cell"]
+        # only the OUTPUT key names, and `group_by_cols` here is always plain dimension
+        # name strings (never the `[True]` literal sentinel -- see
+        # `BaseAnalysis._get_group_by_columns`), so no filtering is needed before adding
+        # grid_cell to build the fold-routing key.
+        key_names = [*group_by_cols, "grid_cell"]
         if should_fold_group_by(
             key_names, has_selective_filter=self._has_selective_dimension_filter()
         ):
@@ -151,9 +165,6 @@ class VectorGridAnalysis(BaseAnalysis):
             self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
                 getattr(pl.col("value"), self.options.group_aggregate)()
             )
-
-        if null_cols:
-            self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
 
     async def _apply_transform_params_impl(self):
         """Apply transform and extract parameters to the LazyFrame.

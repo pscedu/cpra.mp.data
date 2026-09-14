@@ -361,9 +361,10 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     if group_step is not None:
         # `by=[]` means "collapse to one row per grid_cell" (see `GroupStep`'s
         # docstring) -- that is `Options`' OWN "group_aggregate with no group_by"
-        # shape (`BaseAnalysis._get_group_by_columns`'s `[True]` sentinel branch), not
-        # "group_by the empty string". Passing `group_by=""` through instead would
-        # hit `unpack_values("", ...)`, which 400s ("Invalid values for group_by: ")
+        # shape (`BaseAnalysis._get_group_by_columns`'s `group_by is None` branch,
+        # returning `[]`), not "group_by the empty string". Passing `group_by=""`
+        # through instead would hit `unpack_values("", ...)`, which 400s ("Invalid
+        # values for group_by: ")
         # since "" is never a member of `DIMENSION_CHOICES` -- so the empty-list
         # case must omit `group_by` entirely rather than joining it into "".
         if group_step.by:

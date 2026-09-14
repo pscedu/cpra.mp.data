@@ -400,9 +400,13 @@ class TestSummarizeStage:
         zone_1 = df.filter(pl.col("grid_cell") == 1)
         assert zone_1["value"][0] == pytest.approx(40)
 
-    async def test_grouped_dimensions_become_null(
+    async def test_grouped_dimensions_are_dropped(
         self, dataset_factory, raster_data, zone_crosswalk
     ):
+        """Mirrors vector's `test_ungrouped_dimensions_are_dropped`: calendar_year is
+        collapsed away here too (group_aggregate with no group_by), so it is absent from
+        the result entirely rather than an all-null placeholder column -- see
+        `RasterGridAnalysis._get_raster_dimension_frame`'s docstring."""
         dataset = dataset_factory(
             DIMENSIONS,
             group_aggregate="max",
@@ -411,7 +415,7 @@ class TestSummarizeStage:
         )
         await dataset.apply_params()
         df = dataset.materialize()
-        assert df["calendar_year"].null_count() == df.height
+        assert "calendar_year" not in df.columns
 
     async def test_unpivot_is_a_no_op_after_summarizing(
         self, dataset_factory, raster_data, zone_crosswalk

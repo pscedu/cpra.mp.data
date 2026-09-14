@@ -117,10 +117,14 @@ def should_fold_group_by(
     exactly what a caller can know at plan time, before any file is read:
 
     - `group_by_keys`: the columns the result will actually be grouped by, as plain
-      strings (a caller building an aliased or literal Polars expression -- e.g. `True`
-      for "no group_by, collapse into grid_cell alone", or `pl.col("dst_id").alias(
-      "grid_cell")` for a crosswalk reaggregation -- passes the OUTPUT name it resolves
-      to, "grid_cell" in both examples, not the expression object).
+      strings (a caller building an aliased Polars expression -- e.g.
+      `pl.col("dst_id").alias("grid_cell")` for a crosswalk reaggregation -- passes the
+      OUTPUT name it resolves to, "grid_cell" in that example, not the expression
+      object; a non-string entry, such as the literal `True` Polars accepts as a
+      "group everything into one group" key, is simply not a high-cardinality column
+      name and is harmless to include if a future caller ever passes one -- see
+      `fold_group_by`'s docstring for why one isn't produced by this package's own
+      callers today).
     - `has_selective_filter`: whether the request already carries something that shrinks
       the row count reaching this group_by well below "the whole dataset" -- a pushed-down
       dimension filter (Hive-partition-level: `calendar_year=[...]`, `scenario_id=[...]`,
@@ -192,12 +196,13 @@ def fold_group_by(
     operation is known to be cheap (see the two `Dataset` call sites).
 
     `keys` is passed to `group_by` as-is for the FIRST (partial) pass -- it may contain
-    plain column names, Polars expressions, or the literal `True` (the vector "no
-    group_by, collapse to grid_cell alone" case; see `Dataset._get_group_by_columns`).
-    The MERGE pass, on every chunk after the first, instead re-derives the group columns
-    from the collected partial's own schema (everything except the value/accumulator
-    columns) -- this sidesteps needing to know how a non-string key like `True` or an
-    aliased expression resolves to a concrete column name (Polars names a bare `True` key
+    plain column names or Polars expressions (e.g. an aliased crosswalk destination
+    column). The MERGE pass, on every chunk after the first, instead re-derives the
+    group columns from the collected partial's own schema (everything except the
+    value/accumulator columns) -- this sidesteps needing to know how a non-string key or
+    an aliased expression resolves to a concrete column name (a bare Polars literal key,
+    though this package's own callers no longer produce one -- see
+    `BaseAnalysis._get_group_by_columns` -- would resolve to a column literally named
     "literal"), since after one `.collect()` there is no more ambiguity to resolve.
 
     Decomposable aggregates only -- `validate_decomposable` raises `FoldError` (an

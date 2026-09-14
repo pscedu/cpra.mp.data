@@ -51,12 +51,14 @@ subclass produced it.
   each coordinate and rebuilds `self.lf` as a long-format (grid_cell/value) frame labeled
   by coordinate, since a raster has no cell IDs of its own.
 - `_collapse_group(self, group_by_cols)` -- apply `group_by`/`group_aggregate` (already
-  validated not to be `count_by_value`, and, on input, `group_by_cols` is either a list of
-  dimension names or the sentinel `[True]` meaning "aggregate with no grouping"). Vector:
-  a real `group_by(...).agg(...)` (or `analysis.fold.fold_group_by` when cliff-shaped),
-  nulling out dimension columns left out of the group. Raster: no pixels are read here --
-  this only records the row groups (`self.raster_groups`) that a later stage (transform,
-  tile, or write) collapses against actual band data.
+  validated not to be `count_by_value`, and, on input, `group_by_cols` is a list of
+  dimension names, empty meaning "aggregate with no grouping" -- see
+  `_get_group_by_columns`). Vector: a real `group_by(...).agg(...)` (or
+  `analysis.fold.fold_group_by` when cliff-shaped), DROPPING dimension columns left out
+  of the group (they no longer have a value, so they no longer have a column -- see the
+  method's own comment). Raster: no pixels are read here -- this only records the row
+  groups (`self.raster_groups`) that a later stage (transform, tile, or write) collapses
+  against actual band data.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
   converting to another grid's cells. Called only after `_validate_summarize_params`
   confirms both parameters (or neither) were given; a hook implementation returns
@@ -423,12 +425,23 @@ class BaseAnalysis:
     # -- stage 3: group ---------------------------------------------------------------------
 
     def _get_group_by_columns(self):
-        """Get a list of group_by column names."""
+        """Get a list of group_by column names.
+
+        Empty, not a `[True]` literal sentinel (its pre-cleanup shape): a caller
+        grouping by `True` gets a column literally named "literal" back from Polars
+        (`df.group_by(True)` -- see `fold.py`'s `fold_group_by` docstring for the same
+        naming quirk), which leaked into every collapse-to-cell/collapse-everything
+        response as a meaningless `literal` boolean column. An empty list needs no such
+        placeholder: `VectorGridAnalysis._collapse_group` always appends "grid_cell"
+        itself before grouping, so `[]` still collapses to one row per grid_cell, and
+        `RasterGridAnalysis._collapse_group`'s `group_by()` with no columns collapses
+        to a single overall group -- both without inventing a key column.
+        """
         if self.options.group_by is not None and self.options.group_aggregate is None:
             self._error("group_aggregate must be specified when group_by is used")
 
         if self.options.group_by is None:
-            return [True]
+            return []
         return unpack_values(self.options.group_by, "group_by", DIMENSION_CHOICES)
 
     def _has_selective_dimension_filter(self):

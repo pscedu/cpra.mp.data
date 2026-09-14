@@ -485,11 +485,16 @@ class TestGroupStage:
         assert df.height == 2 * 32
         assert sorted(df["scenario_id"].unique().to_list()) == [7, 8]
 
-    async def test_ungrouped_dimensions_become_null(self, dataset_factory, two_scenario_data):
+    async def test_ungrouped_dimensions_are_dropped(self, dataset_factory, two_scenario_data):
+        """A dimension collapsed away by group_by (calendar_year here, not part of the
+        `group_by="scenario_id"` key) is absent from the result entirely -- it used to
+        come back as an all-null, Null-dtype placeholder column, which was a meaningless
+        artifact every caller of `analyze_data`/the tabular API saw for every such
+        dimension (see `VectorGridAnalysis._collapse_group`'s comment)."""
         dataset = dataset_factory(DIMENSIONS, group_by="scenario_id", group_aggregate="max")
         await dataset.apply_params()
         df = dataset.materialize()
-        assert df["calendar_year"].null_count() == df.height
+        assert "calendar_year" not in df.columns
 
     @pytest.mark.parametrize("aggregate", ["min", "max", "sum", "mean"])
     async def test_each_aggregate_function(self, dataset_factory, annual_data, aggregate):
