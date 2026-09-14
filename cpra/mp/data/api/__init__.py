@@ -8,8 +8,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
+from cpra.mp.data.analysis import AnalysisError, create_analysis
+from cpra.mp.data.analysis.pipeline import (
+    PipelineError,
+    parse_pipeline,
+    pipeline_from_query,
+)
+from cpra.mp.data.analysis.planner import compile_pipeline
+from cpra.mp.data.analysis.types import (
+    CrosswalkGrid,
+    DataFormat,
+    OutputType,
+    TileFormat,
+)
 from cpra.mp.data.api.crosswalk import Crosswalk
-from cpra.mp.data.api.dataset import Dataset
 from cpra.mp.data.api.models import (
     Compression,
     CrosswalkQuery,
@@ -26,13 +38,9 @@ from cpra.mp.data.api.models import (
     Visualization,
     VisualizationQuery,
 )
-from cpra.mp.data.api.pipeline import PipelineError, parse_pipeline, pipeline_from_query
-from cpra.mp.data.api.pipeline_exec import compile_pipeline
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.types import CrosswalkGrid, DataFormat, OutputType, TileFormat
-from cpra.mp.data.api.types import Grid as GridName
 from cpra.mp.data.api.utils import (
     get_visualization_class,
     validate_compression,
@@ -103,6 +111,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# The one translation point between `analysis.AnalysisError` (the FastAPI-free stand-in
+# for `HTTPException` used throughout `cpra.mp.data.analysis` -- see that package's
+# docstring) and an actual HTTP response. Mirrors FastAPI's own default `HTTPException`
+# handler shape (`{"detail": ...}` at `exc.status_code`) so callers see no difference.
+@app.exception_handler(AnalysisError)
+async def analysis_error_handler(request: Request, exc: AnalysisError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.get("/v1/variables.json", tags=["Catalog"])
@@ -238,7 +255,7 @@ async def get_model_data(
 ):
     compression = query.compression
     validate_compression(compression, format)
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     validate_format(format, dataset.output_type)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
@@ -262,7 +279,7 @@ async def get_model_tile(
     dataset_dimensions: DatasetDimensions = Depends(),
     _reject_value_where: None = RejectRetiredValueWhere,
 ):
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
@@ -280,7 +297,7 @@ async def get_vector_tile(
     dataset_dimensions: DatasetDimensions = Depends(),
     _reject_value_where: None = RejectRetiredValueWhere,
 ):
-    dataset = Dataset(dataset_dimensions, query.filter_dimensions, query.options)
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     dataset.validate_vector_tile()
     return VectorTileResponse(dataset, x, y, z)

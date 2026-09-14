@@ -1,4 +1,9 @@
-"""Tests for cpra.mp.data.api.utils and the LazyFrameSource base class."""
+"""Tests for cpra.mp.data.api.utils / cpra.mp.data.analysis.utils and the LazyFrameSource
+base class. `get_lazy_frame`/`unpack_values` moved to `analysis.utils` (and raise
+`AnalysisError`, not `HTTPException`) since the `BaseAnalysis` hierarchy needs them and
+`analysis/` may not import FastAPI; `validate_compression`/`validate_format`/
+`get_visualization_class`/`LazyFrameSource` stayed in `api/` and still raise `HTTPException`.
+"""
 
 import numpy as np
 import polars as pl
@@ -6,17 +11,20 @@ import pytest
 import rasterio as rio
 from fastapi import HTTPException
 
-from cpra.mp.data.api.models import Compression, DatasetDimensions, FilterDimensions
-from cpra.mp.data.api.sources import LazyFrameSource
-from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat, OutputType
-from cpra.mp.data.api.utils import (
+from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
+from cpra.mp.data.analysis.utils import (
     enum_value,
     get_lazy_frame,
-    get_visualization_class,
     parallel_read_rasters,
     parallel_sample_rasters,
     raster_blocks_per_batch,
     unpack_values,
+)
+from cpra.mp.data.api.models import Compression, DatasetDimensions, FilterDimensions
+from cpra.mp.data.api.sources import LazyFrameSource
+from cpra.mp.data.api.utils import (
+    get_visualization_class,
     validate_compression,
     validate_format,
 )
@@ -48,13 +56,13 @@ class TestUnpackValues:
         assert unpack_values("a,b", "param", choices=["a", "b", "c"]) == ["a", "b"]
 
     def test_invalid_choice_raises_400(self):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             unpack_values("a,zzz", "sort", choices=["a", "b"])
         assert excinfo.value.status_code == 400
         assert "Invalid values for sort: zzz" in excinfo.value.detail
 
     def test_all_invalid_choices_are_listed(self):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             unpack_values("x,y", "sort", choices=["a"])
         assert "x, y" in excinfo.value.detail
 
@@ -150,7 +158,7 @@ class TestGetLazyFrame:
     def test_validation_errors_become_422(self, base_path):
         """An omitted grid leaves the field None, which read_data rejects."""
         dims = DatasetDimensions(variable="sal", time_unit="daily")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             get_lazy_frame(dims, FilterDimensions(), base_path=base_path)
         assert excinfo.value.status_code == 422
         assert "Grid is required" in excinfo.value.detail
@@ -330,13 +338,13 @@ class TestRasterBlocksPerBatch:
         assert raster_blocks_per_batch(10_000, 512, 512, 8) >= 1
 
     def test_explicit_override_takes_precedence(self, monkeypatch):
-        import cpra.mp.data.api.utils as api_utils
+        import cpra.mp.data.analysis.utils as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 3)
         assert raster_blocks_per_batch(52, 512, 512, 4) == 3
 
     def test_derives_from_the_configured_buffer_budget(self, monkeypatch):
-        import cpra.mp.data.api.utils as api_utils
+        import cpra.mp.data.analysis.utils as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", None)
         monkeypatch.setattr(api_utils, "RASTER_BATCH_BUFFER_MB", 8)

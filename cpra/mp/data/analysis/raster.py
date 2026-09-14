@@ -1,6 +1,11 @@
+"""`RasterGridAnalysis`: the raster half of the former `api/dataset.py`'s `Dataset` class.
+
+See `analysis/base.py`'s module docstring for the staged `apply_params` flow and the hook
+contract every method here fills in; see `analysis/vector.py` for the vector half.
+"""
+
 import asyncio
 import itertools
-import re
 import tempfile
 from contextlib import ExitStack
 from functools import partial
@@ -12,7 +17,6 @@ import numpy as np
 import polars as pl
 import polars.selectors as cs
 import rasterio as rio
-from fastapi import HTTPException
 from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
@@ -23,33 +27,21 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.api.expressions import (
-    ExpressionError,
-    classify_where,
-    count_by_value_frame,
-    parse_value_expr,
-    value_predicate_mask,
-)
-from cpra.mp.data.api.fold import FoldError, fold_group_by, should_fold_group_by
-from cpra.mp.data.api.geography import (
-    parse_coordinate_pairs,
-    project_coordinates,
-    resolve_vector_grid_cell,
-)
-from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
-from cpra.mp.data.api.raster_source import (
+from cpra.mp.data.analysis.base import BaseAnalysis
+from cpra.mp.data.analysis.expressions import ExpressionError, parse_value_expr
+from cpra.mp.data.analysis.geography import parse_coordinate_pairs, project_coordinates
+from cpra.mp.data.analysis.sources import (
     band_collapse_exprs,
-    count_by_value as raster_count_by_value,
     guarded_aggregate,
     horizontal_aggregate_expr,
     masked_value_predicate_exprs,
     scan_rasters,
 )
-from cpra.mp.data.api.sources import LazyFrameSource
-from cpra.mp.data.api.types import DataFormat, OutputType
-from cpra.mp.data.api.utils import (
+from cpra.mp.data.analysis.sources import (
+    count_by_value as raster_count_by_value,
+)
+from cpra.mp.data.analysis.utils import (
     asynctiming,
-    get_lazy_frame,
     group_rows_by_path,
     parallel_read_rasters,
     parallel_sample_rasters,
@@ -64,17 +56,8 @@ from cpra.mp.data.config import (
     RASTER_USE_VRT_COPY,
     RASTER_WINDOW_BUFFER_LIMIT_MB,
 )
-from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.raster import scale_vrt_bands, set_vrt_band_descriptions, vrt
 from cpra.mp.data.utils import get_input_data_frame, required_columns
-from cpra.mp.data.variables import VARIABLES, Variable
-
-DIMENSION_CHOICES = list(DIMENSIONS.keys())
-SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
-DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")
-VALUE_COLUMNS = cs.by_name("value")
 
 # Interleaving for downloaded rasters, set rather than inherited from the source. A source
 # COG may be written INTERLEAVE=TILE, which is a COG-driver-only option that the GTiff driver
@@ -84,6 +67,7 @@ VALUE_COLUMNS = cs.by_name("value")
 # 19.3 GB band-interleaved, since only pixel interleaving puts each pixel's bands adjacent
 # for the compression predictor.
 OUTPUT_INTERLEAVE = "PIXEL"
+
 
 def _batched_block_windows(block_windows, blocks_per_batch):
     """Yield window unions over `block_windows`, chunked to at most `blocks_per_batch`
@@ -123,222 +107,8 @@ async def _read_window_columns(inputs, row_indices, bands, window, raw_names):
     return cols, shape
 
 
-class Dataset(LazyFrameSource):
-    def __init__(
-        self,
-        dataset_dimensions: DatasetDimensions,
-        filter_dimensions: FilterDimensions,
-        options: Options,
-        base_path=None,
-    ):
-        self.dataset_dimensions = dataset_dimensions
-        self.filter_dimensions = filter_dimensions
-        self.options = options
-        self.dataset_bounds = None
-        self.grid_cell_ids = None
-        self.summarize_grid_cell_ids = None
-        self.raster_groups = None
-        # Set by `_apply_filter_params`, the first step `apply_params` runs, from
-        # `where`'s value conjuncts (see `expressions.classify_where`) -- the internal
-        # successor to the retired `Options.value_where` field. `None` means `where`
-        # contained no value conjunct; every other consumer of the old `value_where`
-        # field (`_apply_transform_params_raster`, `_summarize_zone_stats_plugin`,
-        # `_summarize_count_by_value_plugin`) reads this attribute instead now.
-        self._value_where = None
-        # Also set by `_apply_filter_params`: whether `where` produced at least one
-        # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
-        # the row count reaching a group_by -- see `_has_selective_dimension_filter`,
-        # which used to just check `options.where is not None` and is now wrong to,
-        # since `where` may hold only a value conjunct (a mask, not a row filter).
-        self._where_has_dimension_conjunct = False
-
-        self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
-        self.grid = GRIDS[self.dataset_dimensions.grid]
-
-    def _error(self, msg, status_code=400):
-        """Raise an exception."""
-        raise HTTPException(status_code=status_code, detail=msg)
-
-    @property
-    def legend(self) -> Legend:
-        color_map = self.options.color_map or ""
-
-        if ":" in color_map:
-            map_type, color_str = color_map.split(":", 1)
-
-            if map_type not in ["continuous", "discrete"]:
-                self._error(f"invalid color map type: {map_type}")
-
-            color_strs = color_str.split(",")
-            if map_type == "continuous":
-                colors = color_strs[1::2]
-                value_strs = color_strs[::2]
-            else:
-                colors = color_strs[::2]
-                value_strs = color_strs[1::2]
-
-            # TODO: Check that the color strings are valid.
-
-            try:
-                values = [float(val) for val in value_strs]
-            except ValueError:
-                self._error("invalid color map values")
-
-            # Add a null upper bound value to discrete color maps.
-            if map_type == "discrete":
-                values += [None]
-
-            if len(values) != len(colors):
-                self._error("mismatched colors and values in color map")
-
-            return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
-
-        return LEGENDS.get(self.options.color_map) or self.variable.legend or LEGENDS["default"]
-
-    @property
-    def output_type(self) -> OutputType:
-        """Get the output type for this dataset based on its parameters."""
-        if self.grid.grid_type == "vector" or self.options.grid_cell or self.options.summarize_by:
-            return OutputType.vector
-        return OutputType.raster
-
-    @property
-    def variable(self) -> Variable:
-        return VARIABLES[self.dataset_dimensions.variable]
-
-    def tabular_kwargs(self, format):
-        """Round CSV output to the variable's `float_precision`, when it sets one.
-
-        CSV only: it's the one writer polars gives a `float_precision`, and the only format
-        here that renders floats as text at all -- the binary formats hand over the stored
-        value and leave rounding to whatever reads them.
-
-        This deliberately applies to every float column in the response, not just `value`.
-        Nothing else in a tabular response is a float today (dimensions are integers,
-        strings, or dates), and a bare `.round()` on `value` would be wrong anyway: it
-        would change the number in the binary formats too, where the request asked for the
-        stored value.
-        """
-        precision = self.variable.float_precision
-        if format == DataFormat.csv and precision is not None:
-            return {"float_precision": precision}
-        return {}
-
-    def _is_raster_metadata_table(self):
-        """Whether self.lf still holds the raster band-metadata table (dimension columns
-        and a path column), as opposed to a tabular result already derived from raster
-        pixels (via grid_cell sampling or summarize_by). Unlike `output_type`, which
-        reflects the dataset's final response shape and is stable for the whole request,
-        this reflects self.lf's shape at the point it's called, since summarize_by's
-        raster-to-tabular conversion doesn't happen until the transform stage.
-        """
-        return self.grid.grid_type == "raster" and "path" in self.lf.collect_schema().names()
-
-    def _is_aggregating(self):
-        """Whether this request collapses rows via an aggregate -- `group_aggregate`
-        (vector row-collapse) or `summarize_aggregate` (raster zonal / vector
-        cross-grid summarize) -- as opposed to a PLAIN, non-aggregating tabular/tile
-        response. Used by `_apply_filter_params` to decide whether a `where` value
-        conjunct masks a non-matching value to null (composing with an aggregate's own
-        null-skipping behavior) or drops the row outright (the only sensible behavior
-        once there is no aggregate downstream to skip a null for -- see that method).
-        """
-        return self.options.group_aggregate is not None or self.options.summarize_aggregate is not None
-
-    async def _apply_filter_params(self):
-        """Apply filter parameters to the LazyFrame.
-
-        `where` accepts both DIMENSION conditions and VALUE conditions (against the
-        placeholder column `value`), AND-ed together in one string --
-        `expressions.classify_where` splits it on top-level `AND` and sorts each
-        conjunct by which kind it is (see that function's docstring for the full split/
-        classify/reject contract, including why a conjunct referencing both kinds is
-        rejected outright). Dimension conjuncts are recombined and handed to the same
-        unrestricted `lf.sql()` path `where` has always used; value conjuncts are
-        recombined into `self._value_where`, the internal successor to the retired
-        `Options.value_where` field, for this method (vector) and every raster-side
-        consumer (`_apply_transform_params_raster`, `_summarize_zone_stats_plugin`,
-        `_summarize_count_by_value_plugin`) to read instead.
-        """
-        if self.options.where:
-            try:
-                dimension_conjuncts, value_conjuncts = classify_where(self.options.where)
-            except ExpressionError as exc:
-                self._error(str(exc))
-
-            self._where_has_dimension_conjunct = bool(dimension_conjuncts)
-            if dimension_conjuncts:
-                combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
-                self.lf = self.lf.sql(f"select * from self where {combined}")
-            if value_conjuncts:
-                self._value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
-
-        # A vector frame already carries a real `value` column at this point, so a
-        # `where` value conjunct can be applied directly here. A raster's `value`
-        # doesn't exist yet -- `self.lf` is still the band-metadata table (path/band/
-        # dimensions), one row per selected band, not one row per pixel -- so the
-        # raster half of this same option is applied later, per band, once pixels are
-        # actually read (see `_apply_transform_params_raster` / `_summarize_zone_stats_plugin`).
-        #
-        # AGGREGATING requests (group_aggregate/summarize_aggregate, including
-        # summarize_aggregate=count_by_value) mask a non-matching value to null rather
-        # than dropping its row: that's what lets the predicate compose with whatever
-        # aggregate the request goes on to apply via their EXISTING null-skipping
-        # behavior (`guarded_aggregate`'s count()-based denominator, count_by_value's
-        # own non-null filter, ...), rather than needing a second, predicate-aware code
-        # path. Dropping the row instead would also erase the group/zone's siblings
-        # that DO belong in the denominator for min/max/mean, and would make "count how
-        # many values passed" indistinguishable from "count how many rows exist".
-        #
-        # PLAIN (non-aggregating) requests have no aggregate downstream to skip a null
-        # for, so a masked-to-null value would just surface as a null in the response --
-        # observably different from "this row failed the filter" and indistinguishable
-        # from a genuine nodata value. There, the row is dropped outright instead (a
-        # deliberate behavior change from the old value_where, which always masked).
-        if self._value_where is not None and self.grid.grid_type == "vector":
-            try:
-                mask = value_predicate_mask(self._value_where, self.lf.collect_schema().names())
-            except ExpressionError as exc:
-                self._error(str(exc))
-            if self._is_aggregating():
-                self.lf = self.lf.with_columns(pl.when(mask).then(pl.col("value")).otherwise(None).alias("value"))
-            else:
-                self.lf = self.lf.filter(mask)
-
-        if self.options.grid_cell:
-            if self.grid.grid_type == "vector":
-                await self._apply_grid_cell_vector()
-            else:
-                await self._apply_grid_cell_raster()
-
-    async def _apply_grid_cell_vector(self):
-        """Apply the grid_cell filter to a vector-grid dataset.
-
-        Accepts either grid cell IDs or lat/lng coordinate pairs, matching the raster
-        convention. A grid_cell value is treated as IDs only if every token is a plain
-        (unsigned, non-decimal) digit string; otherwise the whole list is parsed as
-        coordinate pairs and resolved to grid cell IDs via point-in-polygon lookup
-        against the grid's geometry. Coordinates that don't fall inside any polygon are
-        dropped rather than erroring.
-
-        Either way the result is reported under grid cell IDs, never the coordinates that
-        selected them: a vector grid_cell *is* its ID. Several coordinates landing in one
-        cell therefore select it once.
-        """
-        values = unpack_values(self.options.grid_cell, "grid_cell")
-
-        if all(value.isdigit() for value in values):
-            # TODO: Validate that the given IDs fall within the grid min and max.
-            grid_cell_ids = values
-        else:
-            lngs, lats = parse_coordinate_pairs(values)
-            resolved = await resolve_vector_grid_cell(self.grid.name, lngs, lats)
-            grid_cell_ids = [str(geo_id) for geo_id in resolved if geo_id is not None]
-
-        self.grid_cell_ids = list(dict.fromkeys(grid_cell_ids))
-        self.lf = self.lf.filter(pl.col("grid_cell").is_in([int(g) for g in self.grid_cell_ids]))
-
-    async def _apply_grid_cell_raster(self):
+class RasterGridAnalysis(BaseAnalysis):
+    async def _apply_grid_cell(self):
         """Apply the grid_cell filter to a raster-grid dataset."""
         lngs, lats = parse_coordinate_pairs(unpack_values(self.options.grid_cell, "grid_cell"))
 
@@ -368,301 +138,26 @@ class Dataset(LazyFrameSource):
             index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
         ).lazy()
 
-    def _apply_calculate_params(self):
-        """Apply calculate parameters to the LazyFrame."""
-
-        if self._is_raster_metadata_table():
-            self.lf = self.lf.with_columns(multiplier=pl.lit(1))
-            value_cols = pl.col("multiplier")
-        else:
-            value_cols = VALUE_COLUMNS
-
-        if self.options.negate is None and self.options.multiply10 is None and self.options.multiply100 is None:
-            return
-
-        sql_expressions = [
-            self.options.negate,
-            self.options.multiply10,
-            self.options.multiply100,
-        ]
-        factors = [-1, 10, 100]
-
-        when_expression = pl
-        for sql_expression, factor in zip(sql_expressions, factors):
-            if sql_expression is None:
-                continue
-            when_expression = when_expression.when(pl.sql_expr(sql_expression)).then(value_cols * factor)
-
-        when_expression = when_expression.otherwise(value_cols)
-        self.lf = self.lf.with_columns(when_expression)
-
-    def _apply_sort_params(self):
-        """Apply sort and select parameters to the LazyFrame."""
-        if self.options.sort is not None:
-            parts = unpack_values(self.options.sort, "sort", SORT_CHOICES)
-            cols = [part.replace("-", "") for part in parts]
-            desc = [part.startswith("-") for part in parts]
-            self.lf = self.lf.sort(cols, descending=desc)
-
-        if self.options.select is not None:
-            required_cols = required_columns(
-                get_input_data_frame(**dict(self.dataset_dimensions)),
-                include_grid_cell=True,
-                include_value=True,
-            )
-            select_cols = unpack_values(self.options.select, "select", required_cols)
-            self.lf = self.lf.select(select_cols)
-
-    def _get_group_by_columns(self):
-        """Get a list of group_by column names."""
-        if self.options.group_by is not None and self.options.group_aggregate is None:
-            msg = "group_aggregate must be specified when group_by is used"
-            raise HTTPException(status_code=400, detail=msg)
-
-        if self.options.group_by is None:
-            return [True]
-        return unpack_values(self.options.group_by, "group_by", DIMENSION_CHOICES)
-
-    def _has_selective_dimension_filter(self):
-        """Whether this request already carries something that shrinks the row count
-        reaching a vector group_by well below "the whole dataset" -- the signal
-        `api.fold.should_fold_group_by` uses to skip the fold on an already-cheap query.
-
-        `filter_dimensions` values are pushed down as Hive-partition filters inside
-        `get_lazy_frame`/`read_parquet`, before `self.lf` exists at all -- the measured
-        case where a `grid_cell` group-by drops from 9.8 GB to 285 MB. `options.grid_cell`
-        (a real `.filter()` on specific cell IDs) and a `where` DIMENSION conjunct (an
-        arbitrary SQL `.filter()`, applied to `self.lf` itself in `_apply_filter_params`)
-        are the same kind of row-dropping filter, so they count too --
-        `self._where_has_dimension_conjunct` (set by `_apply_filter_params`) is checked
-        here rather than `self.options.where is not None`, since `where` may now hold
-        only a VALUE conjunct, which never reaches this method as a row filter at all
-        (see the next paragraph).
-
-        A `where` VALUE conjunct and the `calculate` parameters (`negate`/`multiply10`/
-        `multiply100`) are deliberately NOT included: wherever this method's caller
-        (`_apply_group_params`, gating a vector `group_by`) applies, a value conjunct is
-        always a `with_columns` mask, never a row-dropping `.filter()` -- masking is
-        exactly what lets it compose with the group_by's own aggregate instead of
-        changing its denominator (see `_apply_filter_params`) -- so it never changes how
-        many rows reach the group-by, doesn't affect whether it's cliff-shaped, and
-        (unlike a `.filter()`) doesn't block the fold's `.slice()` from reaching the scan
-        either.
+    def _collapse_group(self, group_by_cols):
+        """Record, in `self.raster_groups`, which band rows belong to which output
+        group -- no pixels are read here; a later stage (transform, tile, or write)
+        collapses the recorded groups against actual band data.
         """
-        return (
-            self.options.grid_cell is not None
-            or self._where_has_dimension_conjunct
-            or any(v is not None for v in dict(self.filter_dimensions).values())
-        )
+        if self.options.group_aggregate == "count":
+            # group_aggregate is the raster band-COLLAPSE step
+            # (`raster_source.HORIZONTAL_RASTER_AGGREGATES`), reducing ACROSS one
+            # pixel's selected bands -- unlike the zonal summarize aggregate this
+            # option shares its name and values with, "how many of these bands
+            # contributed to this pixel" has no natural per-pixel scalar meaning the
+            # way max/mean/min/sum do (see the `AggregateFunction.count` comment in
+            # types.py). Rejected explicitly here rather than left to fail as a raw
+            # `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` deep in a later stage.
+            self._error("group_aggregate 'count' is not supported for raster grids")
 
-    def _apply_group_params(self):
-        """Apply group and aggregate parameters to the LazyFrame or image."""
-        if self.options.group_by is None and self.options.group_aggregate is None:
-            return
-
-        if self.options.group_aggregate == "count_by_value":
-            # count_by_value changes the OUTPUT SHAPE (one row per group per distinct
-            # value) instead of collapsing a group to one row the way every other
-            # group_aggregate value does -- on both grid types, `group_by`/
-            # `group_aggregate` is a COLLAPSE step (raster band-collapse across selected
-            # bands per pixel, vector dimension-collapse across rows per grid_cell) that
-            # has no way to also multiply its own row count by the number of distinct
-            # values without breaking that collapse's "one row per group" contract.
-            # Rejected here, before any file is read, rather than left to fail deep in
-            # `HORIZONTAL_RASTER_AGGREGATES`/`getattr(pl.col("value"), ...)` -- the same
-            # pattern the raster-only `group_aggregate == "count"` rejection below uses.
-            # summarize_by/summarize_aggregate=count_by_value is the only way to reach it.
-            self._error(
-                "group_aggregate 'count_by_value' is not supported -- "
-                "use summarize_by and summarize_aggregate=count_by_value instead"
-            )
-
-        group_by_cols = self._get_group_by_columns()
-        if self._is_raster_metadata_table():
-            if self.options.group_aggregate == "count":
-                # group_aggregate is the raster band-COLLAPSE step
-                # (`raster_source.HORIZONTAL_RASTER_AGGREGATES`), reducing ACROSS one
-                # pixel's selected bands -- unlike the zonal summarize aggregate this
-                # option shares its name and values with, "how many of these bands
-                # contributed to this pixel" has no natural per-pixel scalar meaning the
-                # way max/mean/min/sum do (see the `AggregateFunction.count` comment in
-                # types.py). Rejected explicitly here rather than left to fail as a raw
-                # `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` deep in a later stage.
-                self._error("group_aggregate 'count' is not supported for raster grids")
-
-            # agg_groups() is deprecated and panics when grouping on a literal (the
-            # group_aggregate-without-group_by case, group_by_cols == [True]), so track
-            # row positions via with_row_index instead.
-            self.raster_groups = (
-                self.lf.with_row_index("row_idxs").group_by(*group_by_cols).agg(pl.col("row_idxs"))
-            )
-        else:
-            # Set dimension columns to null if they are not part of the group by clause.
-            required_cols = required_columns(get_input_data_frame(**dict(self.dataset_dimensions)))
-            null_cols = [col for col in required_cols if col not in group_by_cols]
-
-            # grid_cell must always be part of the group key in long format since each
-            # row represents a single grid_cell -- this is exactly the high-cardinality
-            # collapse the fold exists for (see api.fold's module docstring: 126,174
-            # distinct grid_cell values, ~9.8 GB unfolded). `should_fold_group_by` sees
-            # only the OUTPUT key names (plain strings; `group_by_cols` may also contain
-            # the literal `True` for the group_aggregate-without-group_by case, which
-            # never matches a high-cardinality column name and is harmless to include).
-            key_names = [col for col in group_by_cols if isinstance(col, str)] + ["grid_cell"]
-            if should_fold_group_by(
-                key_names, has_selective_filter=self._has_selective_dimension_filter()
-            ):
-                source_lf = self.lf
-                try:
-                    collapsed = fold_group_by(
-                        lambda: source_lf, [*group_by_cols, "grid_cell"], self.options.group_aggregate
-                    )
-                except FoldError as exc:
-                    self._error(str(exc))
-                self.lf = collapsed.lazy()
-            else:
-                self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
-                    getattr(pl.col("value"), self.options.group_aggregate)()
-                )
-
-            if null_cols:
-                self.lf = self.lf.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
-
-    async def _apply_transform_params(self):
-        """Apply transform and extract parameters to the LazyFrame or image."""
-        if self._is_raster_metadata_table():
-            await self._apply_transform_params_raster()
-        else:
-            self._apply_transform_params_vector()
-        self._apply_unpivot_param()
-
-    def _validate_summarize_params(self):
-        """Validate summarize parameters and parse summary grid_cell IDs, if present.
-
-        Returns True if summarize_by/summarize_aggregate were provided, False if neither was.
-        """
-        if self.options.summarize_by is None and self.options.summarize_aggregate is None:
-            return False
-
-        if self.options.summarize_by is None or self.options.summarize_aggregate is None:
-            msg = "summarize_by and summarize_aggregate parameters must be used together"
-            raise HTTPException(status_code=400, detail=msg)
-
-        # Extract and validate summary grid_cell IDs, if present.
-        if self.options.summarize_grid_cell:
-            # summarize_grid = GRIDS[self.options.summarize_by]
-            # TODO: Validate that the given IDs fall within the grid min and max.
-            self.summarize_grid_cell_ids = [
-                int(geo_id) for geo_id in unpack_values(self.options.summarize_grid_cell, "summarize_grid_cell")
-            ]
-
-        return True
-
-    def _reject_calculate_with_count_by_value(self):
-        """count_by_value counts DISTINCT values; a calculate parameter (negate,
-        multiply10, multiply100) rescales a value BEFORE it would be counted, which
-        changes which raw values collapse into "the same" category without changing what
-        the caller meant by "distinct" -- e.g. multiply10 turns land-type codes 1 and 2
-        into 10 and 20, not into two different categories, but does change what a
-        downstream consumer sees as the reported "value" for each count. Every other
-        aggregate folds a calculate parameter through unremarkably (a scaled number is
-        still a meaningful sum/mean/min/max), so this is a rejection specific to
-        count_by_value, not a general calculate/summarize incompatibility. Checked against
-        `self.options` directly (not `self.lf`) so it fires before the eventual `group_by`
-        even if `_apply_calculate_params` already ran earlier in the pipeline.
-        """
-        if self.options.negate is not None or self.options.multiply10 is not None or self.options.multiply100 is not None:
-            self._error("calculate parameters (negate/multiply10/multiply100) cannot be combined with count_by_value")
-
-    def _apply_transform_params_vector(self):
-        """Apply transform and extract parameters to the LazyFrame."""
-
-        if not self._validate_summarize_params():
-            return
-
-        # Generate column expressions.
-        crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.parquet"
-        crosswalk_path = config.CROSSWALKS_PATH / crosswalk_name
-
-        # scan_parquet is lazy and won't raise for a missing file until collection,
-        # so check up front to report the missing crosswalk as a 400.
-        if not crosswalk_path.exists():
-            msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
-            raise HTTPException(status_code=400, detail=msg)
-
-        crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
-
-        if self.grid_cell_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in self.grid_cell_ids]))
-
-        if self.summarize_grid_cell_ids:
-            crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(self.summarize_grid_cell_ids))
-
-        dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
-
-        if self.options.summarize_aggregate == "count_by_value":
-            # No `scale_factor` multiply here (see _reject_calculate_with_count_by_value's
-            # docstring for the same reasoning applied to the crosswalk's own scale
-            # factor: rescaling a categorical code before counting it would change which
-            # raw values collapse into "the same" category). Group by the destination
-            # zone (aliased to `grid_cell`, matching every other summarize output) plus
-            # the value itself -- `count_by_value_frame` bounds this group key's
-            # cardinality; see its docstring for the math.
-            self._reject_calculate_with_count_by_value()
-            joined = self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
-                pl.col("dst_id").alias("grid_cell")
-            )
-            try:
-                self.lf = count_by_value_frame(
-                    joined, [*dim_cols, "grid_cell"], "value", COUNT_BY_VALUE_MAX_DISTINCT
-                ).with_columns(geographic_unit=pl.lit(self.options.summarize_by))
-            except ExpressionError as exc:
-                self._error(str(exc))
-            return
-
-        # Join the data on grid_cell == src_id, scale the values, then aggregate
-        # per destination grid_cell. The join replaces the wide-format horizontal
-        # aggregation that was used when each source grid_cell was a column.
-        agg_fn = self.options.summarize_aggregate
-
-        def _scale_and_join(chunk):
-            return chunk.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
-                value=pl.col("value") * pl.col("scale_factor")
-            )
-
-        # The destination zone is aliased to `grid_cell` here too, so the same
-        # high-cardinality signal `_apply_group_params` uses applies -- and it has to:
-        # some crosswalks land on a FINER destination than the source grid (e.g.
-        # hydro_compartment_v001 -> clara_grid_cell_v001, 109,854 distinct destination
-        # cells), so this reaggregation is not uniformly safe just because most
-        # `summarize_by` targets (ecoregion, parish, hydro_compartment, ...) are small.
-        # `summarize_grid_cell` narrows destinations the same way `grid_cell` narrows
-        # sources, so it's added to the same selective-filter signal here.
-        key_names = [*dim_cols, "grid_cell"]
-        has_selective_filter = (
-            self._has_selective_dimension_filter() or self.options.summarize_grid_cell is not None
-        )
-        if should_fold_group_by(key_names, has_selective_filter=has_selective_filter):
-            source_lf = self.lf
-            try:
-                collapsed = fold_group_by(
-                    lambda: source_lf,
-                    [*dim_cols, pl.col("dst_id").alias("grid_cell")],
-                    agg_fn,
-                    chunk_transform=_scale_and_join,
-                )
-            except FoldError as exc:
-                self._error(str(exc))
-            self.lf = collapsed.lazy().with_columns(geographic_unit=pl.lit(self.options.summarize_by))
-        else:
-            joined = self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
-                value=pl.col("value") * pl.col("scale_factor")
-            )
-            self.lf = (
-                joined.group_by(*dim_cols, pl.col("dst_id").alias("grid_cell"))
-                .agg(getattr(pl.col("value"), agg_fn)())
-                .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
-            )
+        # agg_groups() is deprecated and panics when grouping on a literal (the
+        # group_aggregate-without-group_by case, group_by_cols == [True]), so track
+        # row positions via with_row_index instead.
+        self.raster_groups = self.lf.with_row_index("row_idxs").group_by(*group_by_cols).agg(pl.col("row_idxs"))
 
     def _get_raster_dimension_frame(self, df):
         """Get a DataFrame with one row per output raster band, aligned by row order
@@ -680,13 +175,13 @@ class Dataset(LazyFrameSource):
             group_df = group_df.with_columns(*[pl.lit(None).alias(col) for col in null_cols])
         return group_df
 
-    async def _apply_transform_params_raster(self):
+    async def _apply_transform_params_impl(self):
         """Apply transform and extract parameters to the image.
 
         Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
         pre-generated zone-ID crosswalk raster (see
         `python -m cpra.mp.data.cli crosswalk`), converting the result into a tabular
-        LazyFrame in the same shape produced by `_apply_transform_params_vector`
+        LazyFrame in the same shape produced by `VectorGridAnalysis`'s transform hook
         (dimension columns, a `grid_cell` column holding the destination grid_cell ID, a
         `value` column, and a `geographic_unit` column).
 
@@ -727,11 +222,11 @@ class Dataset(LazyFrameSource):
         crosswalk_path = config.CROSSWALKS_PATH / crosswalk_name
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
-            raise HTTPException(status_code=400, detail=msg)
+            self._error(msg)
 
         df = self.materialize()
         if df.is_empty():
-            raise HTTPException(status_code=404, detail="Dataset does not exist")
+            self._error("Dataset does not exist", status_code=404)
 
         dim_df = self._get_raster_dimension_frame(df)
         n_bands = len(dim_df)
@@ -802,7 +297,7 @@ class Dataset(LazyFrameSource):
 
         # Assemble in wide format (one column per zone) to line up with `result`'s shape,
         # then unpivot to the long-format grid_cell/value contract used everywhere else --
-        # matching _apply_transform_params_vector's join-based output shape.
+        # matching VectorGridAnalysis's join-based output shape.
         dim_cols = dim_df.columns
         self.lf = (
             dim_df.hstack(pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row"))
@@ -815,7 +310,7 @@ class Dataset(LazyFrameSource):
         """Zonal aggregate via the Polars IO plugin (`raster_source.scan_rasters`).
 
         The single implementation of the zonal summarize step (see
-        `_apply_transform_params_raster`): a calculate (multiplier) parameter and a
+        `_apply_transform_params_impl`): a calculate (multiplier) parameter and a
         group_aggregate pre-collapse are applied here via the
         `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES` vocabulary, in that
         order (multiply, then collapse). `scan_rasters` masks nodata to null against each
@@ -898,159 +393,6 @@ class Dataset(LazyFrameSource):
             max_distinct=COUNT_BY_VALUE_MAX_DISTINCT,
         )
 
-    def _apply_unpivot_param(self):
-        """Apply the unpivot parameter."""
-        # Data is already in long format on disk; nothing to do here. The parameter
-        # is kept for backward API compatibility.
-
-    async def apply_params(self):
-        """Apply the query parameters to the LazyFrame."""
-        await self._apply_filter_params()
-        self._apply_calculate_params()
-        self._apply_group_params()
-        await self._apply_transform_params()
-        self._apply_sort_params()
-
-    def estimate_data_size(self):
-        """Estimate the size, in bytes, of data. This does not include dimension columns."""
-        required_cols = required_columns(
-            get_input_data_frame(**dict(self.dataset_dimensions)), include_dataset=False, include_metadata=False
-        )
-        group_by_cols = self._get_group_by_columns()
-        has_group_by = self.options.group_aggregate is not None
-
-        # Estimate rows.
-        rows = 1
-        for col in required_cols:
-            # If there is a group by clause, only the group by columns contribute
-            # to the number of output rows.
-            if has_group_by and col not in group_by_cols:
-                continue
-
-            dimension = DIMENSIONS[col]
-
-            value_count = None
-            values = getattr(self.filter_dimensions, col)
-            if values is not None:
-                value_count = len(values)
-            # Compare against None explicitly: dimension.values is a DataFrame, and
-            # Polars raises on bool() rather than reporting emptiness.
-            elif dimension.values is not None:
-                value_count = len(dimension.values)
-            elif col == "calendar_year":
-                if self.dataset_dimensions.time_unit == "decadal":
-                    value_count = 6
-                else:
-                    value_count = 52
-            elif col == "calendar_day":
-                if self.dataset_dimensions.time_unit == "monthly":
-                    value_count = 52 * 12
-                else:
-                    value_count = 52 * 365
-
-            if value_count is None:
-                return None
-
-            rows *= value_count
-
-        # Estimate columns.
-        columns = None
-        if self.grid_cell_ids is not None:
-            columns = len(self.grid_cell_ids)
-        else:
-            grid = GRIDS[self.dataset_dimensions.grid]
-            columns = getattr(self.grid, "id_count", None)
-
-            if columns is None:
-                height = getattr(grid, "height", None)
-                width = getattr(grid, "width", None)
-                if height and width:
-                    columns = height * width
-
-        if columns is None:
-            return None
-
-        # Calculate bytes per value.
-        variable = VARIABLES[self.dataset_dimensions.variable]
-        dtype_digits = re.findall(r"\d+", str(variable.dtype))
-        if len(dtype_digits) != 1:
-            return None
-
-        return rows * columns * int(dtype_digits[0]) / 8
-
-    def validate_tile(self):
-        """Validate that the tile is raster and will have a single band."""
-
-        if self.output_type == OutputType.vector:
-            raise HTTPException(
-                status_code=400,
-                detail="invalid output type for tile: vector",
-            )
-
-        group_lf = self.raster_groups if self.raster_groups is not None else self.lf
-        groups = group_lf.select(pl.len()).collect().item()
-        if groups > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"tile contains more than one band: {groups} bands found",
-            )
-
-    def validate_vector_tile(self):
-        """Validate that the tile is a vector grid with an available PMTiles file."""
-        if self.output_type != OutputType.vector:
-            raise HTTPException(status_code=400, detail="invalid output type for vector tile: raster")
-
-        grid_name = self.options.summarize_by or self.grid.name
-        if not (config.TILES_PATH / f"{grid_name}.pmtiles").exists():
-            raise HTTPException(status_code=404, detail=f"no tile file for grid: {grid_name}")
-
-    @asynctiming
-    async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:
-        """Get an MVT tile with dataset values injected into pre-generated geometry."""
-        from cpra.mp.data.api.vector import (
-            _data_to_id_value,
-            inject_and_serialize,
-            parse_tile,
-            read_pmtile,
-        )
-
-        grid_name = self.options.summarize_by or self.grid.name
-        tile = mercantile.Tile(x, y, z)
-
-        compressed = read_pmtile(grid_name, tile)
-        if compressed is None:
-            return None
-
-        # Parse once: get the VectorTile object and boundary feature IDs together.
-        # The parsed object is reused for injection, avoiding a second decompress+parse.
-        vt, raw_ids = parse_tile(compressed)
-        if not raw_ids:
-            return None
-
-        tile_id_strs = [str(fid) for fid in raw_ids]
-        if self.summarize_grid_cell_ids is not None:
-            valid = {str(gid) for gid in self.summarize_grid_cell_ids}
-            val_cols = [c for c in tile_id_strs if c in valid]
-        elif self.grid_cell_ids is not None:
-            valid = {str(gid) for gid in self.grid_cell_ids}
-            val_cols = [c for c in tile_id_strs if c in valid]
-        else:
-            val_cols = tile_id_strs
-
-        if not val_cols:
-            return None
-
-        tile_ints = [int(c) for c in val_cols]
-        df = self.lf.filter(pl.col("grid_cell").is_in(tile_ints)).collect()
-        if df.is_empty():
-            return None
-
-        id_values = _data_to_id_value(df)
-        if not id_values:
-            return None
-
-        return inject_and_serialize(vt, id_values)
-
     async def _read_raster_bands(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
         """Read one window's raw bands into a single ``(len(df), h, w)`` array in df row order.
 
@@ -1063,7 +405,7 @@ class Dataset(LazyFrameSource):
         ``use_gdal_env`` is forwarded to ``parallel_read_rasters``/``_read_window``, which enter
         ``raster_gdal_env()`` on the worker thread performing each read rather than here. Default
         ``False`` so callers (e.g. ``get_tile``) that deliberately don't want it keep working
-        unchanged; ``_apply_transform_params_raster`` and ``_write_raster_windowed`` pass
+        unchanged; ``_apply_transform_params_impl`` and ``_write_raster_windowed`` pass
         ``True``.
         """
         band_reads = await parallel_read_rasters(rasters, window, out_shape, bands=bands, use_gdal_env=use_gdal_env)
@@ -1299,7 +641,7 @@ class Dataset(LazyFrameSource):
         with ExitStack() as stack:
             # GDAL_NUM_THREADS' decompression speedup only takes effect for a dataset that
             # was *opened* with it in effect (measured on real data -- see
-            # _apply_transform_params_raster); entering it here, before the sources (and the
+            # _apply_transform_params_impl); entering it here, before the sources (and the
             # output, for the same reason on the write side) are opened, is what makes it
             # apply to them. Scoped narrowly to just the opens, not the whole loop below, so
             # this doesn't hold a process-global GDAL config open (and leaking into unrelated

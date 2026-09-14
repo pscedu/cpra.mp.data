@@ -1,4 +1,4 @@
-"""Tests for the two raster download paths in api.dataset.
+"""Tests for the two raster download paths in analysis.raster.
 
 ``write_raster`` either streams a band-separate VRT through GDAL (``_write_raster_vrt``) or
 reads windows into NumPy (``_write_raster_windowed``). The two agree pixel for pixel and are
@@ -20,7 +20,7 @@ import pytest
 import rasterio
 from rasterio.shutil import copy as rio_copy
 
-from cpra.mp.data.api.dataset import Dataset
+from cpra.mp.data.analysis.raster import RasterGridAnalysis
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import (
     DECADE_GROUP_YEARS,
@@ -81,14 +81,14 @@ def _index_frame(cog_path, bands, multiplier=1):
 
 
 def _dataset(df, raster_groups=None, group_aggregate=None):
-    """A Dataset with only the state the write paths touch.
+    """A RasterGridAnalysis with only the state the write paths touch.
 
-    ``Dataset.__init__`` builds a LazyFrame from on-disk data and a grid definition, none of
+    ``RasterGridAnalysis.__init__`` builds a LazyFrame from on-disk data and a grid definition, none of
     which these paths use -- they read ``materialize()``, ``raster_groups`` and
     ``options.group_aggregate`` only.
     """
 
-    dataset = object.__new__(Dataset)
+    dataset = object.__new__(RasterGridAnalysis)
     dataset.options = SimpleNamespace(group_aggregate=group_aggregate)
     dataset.materialize = lambda: df
     dataset.raster_groups = raster_groups
@@ -106,7 +106,7 @@ def _write_vrt(dataset, df, out_path, **kwargs):
 
     Called explicitly rather than via the dispatcher because these fixtures are small
     enough that write_raster routes them to the windowed path on memory grounds (see
-    Dataset._windowed_read_is_lighter), which would make VRT assertions vacuous.
+    RasterGridAnalysis._windowed_read_is_lighter), which would make VRT assertions vacuous.
     """
 
     return asyncio.run(dataset._write_raster_vrt(df, str(out_path), **kwargs))
@@ -231,7 +231,7 @@ def test_aggregated_selection_uses_windowed_path(multiband_cog, tmp_path, monkey
     def fail(*args, **kwargs):
         raise AssertionError("aggregated selections must not use the VRT path")
 
-    monkeypatch.setattr(Dataset, "_write_raster_vrt", fail)
+    monkeypatch.setattr(RasterGridAnalysis, "_write_raster_vrt", fail)
 
     df = _index_frame(multiband_cog, (1, 2, 3, 4))
     out_path = tmp_path / "out.tif"
@@ -403,13 +403,13 @@ def test_kill_switch_falls_back_to_windowed_path(multiband_cog, tmp_path, monkey
     path -- without that this would pass whether or not the switch works.
     """
 
-    monkeypatch.setattr("cpra.mp.data.api.dataset.RASTER_WINDOW_BUFFER_LIMIT_MB", 0)
+    monkeypatch.setattr("cpra.mp.data.analysis.raster.RASTER_WINDOW_BUFFER_LIMIT_MB", 0)
 
     def fail(*args, **kwargs):
         raise AssertionError("VRT path should be disabled")
 
-    monkeypatch.setattr(Dataset, "_write_raster_vrt", fail)
-    monkeypatch.setattr("cpra.mp.data.api.dataset.RASTER_USE_VRT_COPY", False)
+    monkeypatch.setattr(RasterGridAnalysis, "_write_raster_vrt", fail)
+    monkeypatch.setattr("cpra.mp.data.analysis.raster.RASTER_USE_VRT_COPY", False)
 
     df = _index_frame(multiband_cog, (1, 2))
     out_path = tmp_path / "out.tif"
@@ -424,7 +424,7 @@ def test_narrow_selection_is_dispatched_to_windowed_path(multiband_cog, tmp_path
     def fail(*args, **kwargs):
         raise AssertionError("a narrow selection should not use the VRT path")
 
-    monkeypatch.setattr(Dataset, "_write_raster_vrt", fail)
+    monkeypatch.setattr(RasterGridAnalysis, "_write_raster_vrt", fail)
 
     df = _index_frame(multiband_cog, (1, 2))
     out_path = tmp_path / "out.tif"
@@ -437,12 +437,12 @@ def test_wide_selection_is_dispatched_to_vrt_path(multiband_cog, tmp_path, monke
     """Once the windowed buffer would exceed the limit, the VRT copy is the lighter choice."""
 
     # The fixture grid is tiny, so lower the limit rather than build a huge raster.
-    monkeypatch.setattr("cpra.mp.data.api.dataset.RASTER_WINDOW_BUFFER_LIMIT_MB", 0)
+    monkeypatch.setattr("cpra.mp.data.analysis.raster.RASTER_WINDOW_BUFFER_LIMIT_MB", 0)
 
     def fail(*args, **kwargs):
         raise AssertionError("a wide selection should not use the windowed path")
 
-    monkeypatch.setattr(Dataset, "_write_raster_windowed", fail)
+    monkeypatch.setattr(RasterGridAnalysis, "_write_raster_windowed", fail)
 
     df = _index_frame(multiband_cog, (1, 2))
     out_path = tmp_path / "out.tif"

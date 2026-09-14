@@ -27,13 +27,13 @@ import rasterio as rio
 from fastapi import HTTPException
 
 from cpra.mp.data import config
-from cpra.mp.data.api.geography import (
+from cpra.mp.data.analysis.geography import (
     parse_coordinate_pairs,
     project_coordinates,
     representative_points,
     resolve_vector_grid_cell,
 )
-from cpra.mp.data.api.utils import unpack_values
+from cpra.mp.data.analysis.utils import unpack_values
 from cpra.mp.data.grids import GRIDS, WGS84
 
 # Every conversion outside the vector-to-vector crosswalk tables maps a grid cell to

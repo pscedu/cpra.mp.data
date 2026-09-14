@@ -43,9 +43,16 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from cpra.mp.data.api.expressions import ExpressionError, classify_where
-from cpra.mp.data.api.fold import FoldError, validate_decomposable
-from cpra.mp.data.api.types import AggregateFunction, DataFormat, Grid, TileFormat, TimeUnit, Variable
+from cpra.mp.data.analysis.expressions import ExpressionError, classify_where
+from cpra.mp.data.analysis.fold import FoldError, validate_decomposable
+from cpra.mp.data.analysis.types import (
+    AggregateFunction,
+    DataFormat,
+    Grid,
+    TileFormat,
+    TimeUnit,
+    Variable,
+)
 
 
 class PipelineError(ValueError):

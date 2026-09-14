@@ -11,13 +11,12 @@ import rasterio as rio
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from cpra.mp.data.analysis.types import CompressionAlgorithm
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.raster import COMPRESSION_LEVEL_OPTIONS, RasterioStreamingResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
-from cpra.mp.data.api.types import CompressionAlgorithm
 from cpra.mp.data.api.vector import VectorTileResponse
-
 from tests.factories import RASTER_KWARGS, write_raster_dataset
 
 DIMENSIONS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
@@ -178,7 +177,6 @@ class TestRasterioStreamingResponse:
 class TestVectorTileResponse:
     async def test_missing_tile_raises(self, dataset_factory, base_path, tiles_path):
         from cpra.mp.data.tabular import write_parquet
-
         from tests.factories import ANNUAL_KWARGS, annual_frame
 
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
@@ -196,7 +194,6 @@ class TestVectorTileResponse:
         from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 
         from cpra.mp.data.tabular import write_parquet
-
         from tests.factories import ANNUAL_KWARGS, annual_frame, write_pmtiles
 
         tile = mercantile.Tile(x=1, y=2, z=3)

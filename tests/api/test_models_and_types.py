@@ -5,15 +5,7 @@ from enum import Enum
 
 import pytest
 
-from cpra.mp.data.api.models import (
-    Compression,
-    DataQuery,
-    DatasetDimensions,
-    FilterDimensions,
-    Options,
-    TileQuery,
-)
-from cpra.mp.data.api.types import (
+from cpra.mp.data.analysis.types import (
     AggregateFunction,
     CompressionAlgorithm,
     DataFormat,
@@ -21,6 +13,14 @@ from cpra.mp.data.api.types import (
     TileFormat,
     VectorGrid,
     dimension_type,
+)
+from cpra.mp.data.api.models import (
+    Compression,
+    DataQuery,
+    DatasetDimensions,
+    FilterDimensions,
+    Options,
+    TileQuery,
 )
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS

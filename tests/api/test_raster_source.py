@@ -14,18 +14,17 @@ import pytest
 import rasterio as rio
 from polars.io.plugins import register_io_source
 
-from cpra.mp.data.api import raster_source
-from cpra.mp.data.api import utils as api_utils
-from cpra.mp.data.api.raster_source import (
+from cpra.mp.data.analysis import sources as raster_source
+from cpra.mp.data.analysis import utils as api_utils
+from cpra.mp.data.analysis.sources import (
     _batched_windows,
     guarded_aggregate,
     scan_broadcast,
     scan_paired,
     scan_rasters,
 )
-from cpra.mp.data.api.utils import raster_blocks_per_batch
+from cpra.mp.data.analysis.utils import raster_blocks_per_batch
 from cpra.mp.data.grids import GRIDS
-
 from tests.factories import RASTER_KWARGS, write_raster_crosswalk, write_raster_dataset
 
 GRID = GRIDS[RASTER_KWARGS["grid"]]

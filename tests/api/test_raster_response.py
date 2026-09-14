@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from cpra.mp.data.analysis.types import CompressionAlgorithm
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.raster import RasterioStreamingResponse
-from cpra.mp.data.api.types import CompressionAlgorithm
 
 
 def _response(max_z_error, compression=None):

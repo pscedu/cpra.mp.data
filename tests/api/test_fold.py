@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from cpra.mp.data.api.fold import (
+from cpra.mp.data.analysis.fold import (
     DECOMPOSABLE_AGGREGATES,
     FoldError,
     fold_group_by,
@@ -197,7 +197,7 @@ import sys
 
 import polars as pl
 
-from cpra.mp.data.api.fold import fold_group_by
+from cpra.mp.data.analysis.fold import fold_group_by
 
 mode, path, step = sys.argv[1], sys.argv[2], int(sys.argv[3])
 if mode == "folded":

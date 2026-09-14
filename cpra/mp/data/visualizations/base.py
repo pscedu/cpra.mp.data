@@ -336,10 +336,10 @@ class DatasetVisualization(BaseVisualization):
                 for i, (lng, lat) in enumerate(pairs)
             ]
 
-        # Imported lazily: the api package pulls in fastapi and the geospatial stack, and
-        # a notebook that only builds specs shouldn't need either. Same reason map.py
-        # imports Dataset where it uses it.
-        from cpra.mp.data.api.geography import resolve_vector_grid_cell_sync
+        # Imported lazily: this pulls in the geospatial stack, and a notebook that only
+        # builds specs shouldn't need it. Same reason map.py imports `create_analysis`
+        # where it's used.
+        from cpra.mp.data.analysis.geography import resolve_vector_grid_cell_sync
 
         ids = resolve_vector_grid_cell_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])
 

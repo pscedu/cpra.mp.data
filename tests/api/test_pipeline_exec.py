@@ -5,15 +5,15 @@ Three layers, mirroring the module's own structure:
 * **Compile-time checks** (`TestCompileChecks`) -- the plain-function rules this module
   owns (dimension-name validity, `project` cardinality, `join` alignment, `filter.where`
   namespace, the row ceiling, the output single-value-column count). Exercised directly,
-  no `Dataset`/file IO involved where avoidable.
-* **`PairedPlan._prepare`/`_collapse_expr`** (`TestPairedPlanPrepare`) -- the per-band
+  no `BaseAnalysis`/file IO involved where avoidable.
+* **`PairedAnalysis._prepare`/`_collapse_expr`** (`TestPairedAnalysisPrepare`) -- the per-band
   `of`-kind resolution and the per-pixel collapse expression, tested against small fake
   "dataset" stand-ins (only `.materialize()` and `.dataset_dimensions.grid` are needed)
   rather than real files, since none of this logic touches a crosswalk or a raster file.
 * **End-to-end compiles and ASGI routes** (`TestCompileSingleInputChain`,
   `TestCompilePairedNotebookShape`, `TestNotebookQueryEndToEnd`,
   `TestSingleInputEndToEnd`, `TestProjectOnlyReaggregationEndToEnd`,
-  `TestRejections`) -- the three MUST-WORK shapes from the spec, built on real `Dataset`s
+  `TestRejections`) -- the three MUST-WORK shapes from the spec, built on real `BaseAnalysis`
   over `tmp_path` fixtures, following `tests/factories.py`'s "genuine variables/grids"
   convention.
 
@@ -28,7 +28,7 @@ own shape. The single-input and project-only-reaggregation shapes below, which h
 `vct`/`veg_grid_cell_v001` fixtures directly, per that module's own established convention
 -- the compiler cares about grid TYPES and SHAPES, not real-world variable semantics.
 
-**A note on raster `filter` steps.** `Dataset._apply_transform_params_raster` rejects a
+**A note on raster `filter` steps.** `RasterGridAnalysis._apply_transform_params_impl` rejects a
 `where` value-conjunct on a raster grid outright unless paired with `summarize_by`/
 `summarize_aggregate` ("a plain, non-summarized raster selection has no ... per-pixel
 frame the API exposes ... at all") -- a pre-existing constraint of the machinery this
@@ -51,25 +51,31 @@ import rasterio as rio
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.api.dataset import Dataset
-from cpra.mp.data.api.pipeline import GroupStep, PipelineError, parse_pipeline, pipeline_to_query
-from cpra.mp.data.api import pipeline_exec as pipeline_exec_module
-from cpra.mp.data.api.pipeline_exec import (
-    PairedPlan,
+from cpra.mp.data.analysis import paired as paired_module
+from cpra.mp.data.analysis.base import BaseAnalysis
+from cpra.mp.data.analysis.paired import (
+    PairedAnalysis,
+    _validate_paired_group_aggregate,
+)
+from cpra.mp.data.analysis.pipeline import (
+    GroupStep,
+    PipelineError,
+    parse_pipeline,
+    pipeline_to_query,
+)
+from cpra.mp.data.analysis.planner import (
     _check_input_dimensions,
     _check_join_row_ceiling,
     _project_direction,
     _validate_filter_where,
     _validate_join_alignment,
     _validate_output_columns,
-    _validate_paired_group_aggregate,
     _validate_project_cardinality,
     compile_pipeline,
 )
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
 from cpra.mp.data.tabular import write_parquet
-
 from tests.factories import (
     ANNUAL_KWARGS,
     RASTER_KWARGS,
@@ -246,7 +252,7 @@ def accumulator_edge_case_data(base_path, crosswalk_path, monkeypatch):
 
 @pytest.fixture
 def count_edge_case_data(base_path, crosswalk_path, monkeypatch):
-    """Backing data for `TestPairedPlanCountConsistency`: five equal row bands, one per
+    """Backing data for `TestPairedAnalysisCountConsistency`: five equal row bands, one per
     zero-vs-nodata case `count`'s design calls out. `sal` (zone 1 only) is a uniform 6.0
     in both years (always satisfies the query's `sal > 5.5`), so every zone-1 band's
     count outcome below is driven purely by `marsh`/nodata/pairing, exactly as
@@ -306,7 +312,7 @@ def _tile_for_grid(base_path, grid_glob="*.tif", zoom=8):
 
 
 # --------------------------------------------------------------------------------------
-# Compile-time checks (pure functions, no Dataset/file IO)
+# Compile-time checks (pure functions, no BaseAnalysis/file IO)
 # --------------------------------------------------------------------------------------
 
 
@@ -339,9 +345,9 @@ class TestCompileChecks:
         actually scanned `vct`'s data, as a bare `ColumnNotFoundError` naming no input,
         dimension, or valid alternative (reproduced by hand against pre-fix code: a
         `vct`/`veg_grid_cell_v001` single-input pipeline filtering `aggregate_type`
-        compiles to a `Dataset` and only raises
+        compiles to a `BaseAnalysis` and only raises
         `polars.exceptions.ColumnNotFoundError: unable to find column "aggregate_type"`
-        once `Dataset.apply_params()` runs).
+        once `BaseAnalysis.apply_params()` runs).
         """
         selection = self._selection(aggregate_type="2_wk_max")
         with pytest.raises(PipelineError, match="not one this dataset"):
@@ -453,7 +459,7 @@ class TestCompileChecks:
 
 
 # --------------------------------------------------------------------------------------
-# PairedPlan._prepare / _collapse_expr, against fake datasets (no crosswalk/raster IO)
+# PairedAnalysis._prepare / _collapse_expr, against fake datasets (no crosswalk/raster IO)
 # --------------------------------------------------------------------------------------
 
 
@@ -466,7 +472,7 @@ class _FakeDataset:
         return self._df
 
 
-class TestPairedPlanPrepare:
+class TestPairedAnalysisPrepare:
     FINE_DF = pl.DataFrame(
         {
             "path": ["a.tif", "b.tif"],
@@ -478,7 +484,7 @@ class TestPairedPlanPrepare:
     COARSE_DF = pl.DataFrame({"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [2030.01, 2040.01]})
 
     def _plan(self, of, where=None, aggregate="min"):
-        return PairedPlan(
+        return PairedAnalysis(
             fine_dataset=_FakeDataset(self.FINE_DF, "veg_grid_cell_v001"),
             coarse_dataset=_FakeDataset(self.COARSE_DF, "hydro_compartment_v001"),
             fine_name="marsh",
@@ -677,7 +683,7 @@ class TestCompileSingleInputChain:
             }
         )
         compiled = compile_pipeline(pipeline, base_path=base_path)
-        assert isinstance(compiled, Dataset)
+        assert isinstance(compiled, BaseAnalysis)
 
 
 # --------------------------------------------------------------------------------------
@@ -749,11 +755,11 @@ class TestCompilePairedNotebookShape:
 
     def test_accepts_and_compiles_to_a_paired_plan(self, notebook_query_data):
         compiled = compile_pipeline(parse_pipeline(NOTEBOOK_QUERY), base_path=notebook_query_data)
-        assert isinstance(compiled, PairedPlan)
+        assert isinstance(compiled, PairedAnalysis)
 
     def test_rejects_count_aggregate_with_non_default_of(self, notebook_query_data):
-        # End-to-end version of `TestPairedPlanPrepare.test_count_rejects_non_default_of`
-        # -- `compile_pipeline` runs `PairedPlan._prepare()` as its very last step, so
+        # End-to-end version of `TestPairedAnalysisPrepare.test_count_rejects_non_default_of`
+        # -- `compile_pipeline` runs `PairedAnalysis._prepare()` as its very last step, so
         # this is a real plan-time (not merely unit-level) 400 for the mistake.
         bad = copy.deepcopy(NOTEBOOK_QUERY)
         bad["steps"][3] = {"op": "group", "by": [], "aggregate": "count", "of": "calendar_year"}
@@ -764,7 +770,7 @@ class TestCompilePairedNotebookShape:
         query = copy.deepcopy(NOTEBOOK_QUERY)
         query["steps"][3] = {"op": "group", "by": [], "aggregate": "count"}
         compiled = compile_pipeline(parse_pipeline(query), base_path=notebook_query_data)
-        assert isinstance(compiled, PairedPlan)
+        assert isinstance(compiled, PairedAnalysis)
         assert compiled.of_kind == "count"
 
 
@@ -862,7 +868,7 @@ class TestPairedAccumulatorEdgeCases:
         assert (data[2 * third :, :] == 2040).all()
 
 
-class TestPairedPlanCountConsistency:
+class TestPairedAnalysisCountConsistency:
     """`count` on a paired pipeline: the zero-vs-nodata fixture scenarios (`count_edge_
     case_data`'s five row bands), the accumulator/wide-fallback consistency proof, and
     an ASGI tile test. `count` is in `_STREAMING_AGGREGATES` now, so a real request takes
@@ -903,7 +909,7 @@ class TestPairedPlanCountConsistency:
             streaming_data = src.read(1)
 
         # Force every aggregate, `count` included, onto `_collapse_paired_window_wide`.
-        monkeypatch.setattr(pipeline_exec_module, "_STREAMING_AGGREGATES", frozenset())
+        monkeypatch.setattr(paired_module, "_STREAMING_AGGREGATES", frozenset())
         wide_response = client.post("/v1/analysis.tif", json=self._pipeline())
         assert wide_response.status_code == 200, wide_response.text
         with rio.open(io.BytesIO(wide_response.content)) as src:
@@ -1069,10 +1075,10 @@ class TestRejections:
         assert "invalid output type" in response.json()["detail"]
 
     def test_raster_filter_without_summarize_is_400(self, client, base_path, monkeypatch):
-        """The pre-existing `Dataset` constraint this module's docstring calls out:
+        """The pre-existing `BaseAnalysis` constraint this module's docstring calls out:
         a `filter` over a raw (non-reaggregated) raster grid has no per-pixel frame to
         filter -- compiles fine (nothing wrong with the pipeline shape itself) but 400s
-        once `Dataset.apply_params()` actually runs.
+        once `BaseAnalysis.apply_params()` actually runs.
         """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         monkeypatch.setattr(config, "BASE_PATH", base_path)

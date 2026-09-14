@@ -16,7 +16,6 @@ from cpra.mp.data.api.models import (
     MPDDimensionValue,
     Options,
 )
-
 from tests.factories import ANNUAL_KWARGS, RASTER_KWARGS
 
 # Dimension values the real MPD serves but the structure CSVs do not. Described as plain
@@ -66,15 +65,15 @@ def client(mpd_engine):
 
 @pytest.fixture
 def dataset_factory(base_path):
-    """Build a Dataset against an isolated base_path.
+    """Build a `BaseAnalysis` subclass against an isolated base_path.
 
-    Mirrors how the route handlers construct one, but with the base path injected so the
-    query never reaches the configured data directory.
+    Mirrors how the route handlers construct one (via `create_analysis`), but with the
+    base path injected so the query never reaches the configured data directory.
     """
-    from cpra.mp.data.api.dataset import Dataset
+    from cpra.mp.data.analysis import create_analysis
 
     def build(dimensions, filters=None, base=None, **options):
-        return Dataset(
+        return create_analysis(
             DatasetDimensions(**dimensions),
             FilterDimensions(**(filters or {})),
             Options(**options),

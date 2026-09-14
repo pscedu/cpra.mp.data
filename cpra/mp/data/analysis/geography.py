@@ -1,18 +1,25 @@
-"""Convert between vector grid cell IDs and lat/lng coordinates using grid geometry."""
+"""Convert between vector grid cell IDs and lat/lng coordinates using grid geometry.
+
+Formerly `api/geography.py`; moved here because `VectorGridAnalysis._apply_grid_cell`
+(the vector half of the old `Dataset._apply_grid_cell_vector`) resolves `grid_cell`
+coordinates through this module directly, and `cpra.mp.data.analysis` may not import
+FastAPI (see this package's other modules, and `tests/api/test_analysis_boundary.py`) --
+so every `HTTPException` this module used to raise is an `AnalysisError` instead.
+"""
 
 import asyncio
 
 import pyogrio
-from fastapi import HTTPException
-from rasterio.crs import CRS
 
 # Rasterio doesn't re-export its GDAL error classes from `rasterio.errors`, and this is
 # the only handle on the failure PROJ reports for an unprojectable point.
 from rasterio._err import CPLE_BaseError
+from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import Point
 
 from cpra.mp.data import config
+from cpra.mp.data.analysis.base import AnalysisError
 
 
 def parse_coordinate_pairs(values):
@@ -26,10 +33,10 @@ def parse_coordinate_pairs(values):
     try:
         coords = [float(value) for value in values]
     except ValueError:
-        raise HTTPException(status_code=400, detail="grid_cell contains non-numeric coordinates")
+        raise AnalysisError("grid_cell contains non-numeric coordinates", status_code=400)
 
     if len(coords) % 2:
-        raise HTTPException(status_code=400, detail="grid_cell contain an even number of coordinates")
+        raise AnalysisError("grid_cell contain an even number of coordinates", status_code=400)
 
     lngs = []
     lats = []
@@ -37,7 +44,7 @@ def parse_coordinate_pairs(values):
         lng, lat = coords[start_idx : start_idx + 2]
         if not -180 <= lng <= 180 or not -90 <= lat <= 90:
             msg = f"grid_cell contains invalid coordinate pair: {lng}, {lat}"
-            raise HTTPException(status_code=400, detail=msg)
+            raise AnalysisError(msg, status_code=400)
         lngs.append(lng)
         lats.append(lat)
 
@@ -58,7 +65,7 @@ def project_coordinates(lngs: list[float], lats: list[float], dst_crs) -> tuple[
     except CPLE_BaseError:
         pairs = [f"{lng}, {lat}" for lng, lat in zip(lngs, lats) if _is_unprojectable(lng, lat, dst_crs)]
         msg = f"grid_cell contains coordinate pairs outside the grid's projection: {'; '.join(pairs)}"
-        raise HTTPException(status_code=400, detail=msg)
+        raise AnalysisError(msg, status_code=400)
 
     return list(xs), list(ys)
 
@@ -93,7 +100,7 @@ def _geometry_path(grid_name: str):
     """Locate a vector grid's geometry file, reporting a missing one as a 400."""
     fgb_path = config.GRIDS_PATH / f"{grid_name}.fgb"
     if not fgb_path.exists():
-        raise HTTPException(status_code=400, detail=f"No geometry file for grid: {grid_name}")
+        raise AnalysisError(f"No geometry file for grid: {grid_name}", status_code=400)
     return fgb_path
 
 

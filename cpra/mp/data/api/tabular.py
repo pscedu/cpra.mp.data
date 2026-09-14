@@ -5,9 +5,9 @@ import anyio
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
+from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.sources import LazyFrameSource
-from cpra.mp.data.api.types import CompressionAlgorithm, DataFormat
 
 
 def stream_or_write_to_file(source, out_path, format, compression, collect_in_memory):

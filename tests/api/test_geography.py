@@ -1,19 +1,18 @@
 """Tests for converting between coordinates and grid cell IDs using geometry files."""
 
 import pytest
-from fastapi import HTTPException
 from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.api.geography import (
+from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis.geography import (
     parse_coordinate_pairs,
     project_coordinates,
     representative_points,
     resolve_vector_grid_cell,
     resolve_vector_grid_cell_sync,
 )
-
 from tests.factories import write_grid_geometry
 
 
@@ -55,7 +54,7 @@ async def test_point_outside_every_polygon_resolves_to_none(ecoregion_geometry):
 
 
 async def test_missing_geometry_file_raises_400(geometry_path):
-    with pytest.raises(HTTPException) as excinfo:
+    with pytest.raises(AnalysisError) as excinfo:
         await resolve_vector_grid_cell("ecoregion_v001", [-91.0], [29.5])
     assert excinfo.value.status_code == 400
     assert "No geometry file" in excinfo.value.detail
@@ -89,14 +88,14 @@ class TestProjectCoordinates:
     def test_unprojectable_coordinates_raise_400(self):
         """The grids' UTM zone has no image for the origin, which PROJ reports as an error
         rather than as a coordinate — a request, not a server, problem."""
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             project_coordinates([0.0], [0.0], CRS.from_epsg(26915))
         assert excinfo.value.status_code == 400
         assert "outside the grid's projection" in excinfo.value.detail
 
     def test_only_the_unprojectable_pairs_are_reported(self):
         """PROJ fails the whole batch, so the pair at fault has to be found afterwards."""
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             project_coordinates([-91.0, 0.0], [30.0, 0.0], CRS.from_epsg(26915))
         assert "0.0, 0.0" in excinfo.value.detail
         assert "-91.0" not in excinfo.value.detail
@@ -112,13 +111,13 @@ class TestParseCoordinatePairs:
     def test_nan_is_an_invalid_coordinate(self):
         """`float` accepts "nan" and every bounds comparison against it is False, so a
         magnitude check would pass it through to project to infinity."""
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             parse_coordinate_pairs(["nan", "nan"])
         assert excinfo.value.status_code == 400
         assert "invalid coordinate pair" in excinfo.value.detail
 
     def test_infinity_is_an_invalid_coordinate(self):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             parse_coordinate_pairs(["inf", "0"])
         assert excinfo.value.status_code == 400
         assert "invalid coordinate pair" in excinfo.value.detail
@@ -126,7 +125,7 @@ class TestParseCoordinatePairs:
 
 async def test_unprojectable_point_raises_400(ecoregion_geometry):
     """The vector lookup projects before it reads, so it fails the same way."""
-    with pytest.raises(HTTPException) as excinfo:
+    with pytest.raises(AnalysisError) as excinfo:
         await resolve_vector_grid_cell("ecoregion_v001", [0.0], [0.0])
     assert excinfo.value.status_code == 400
     assert "outside the grid's projection" in excinfo.value.detail

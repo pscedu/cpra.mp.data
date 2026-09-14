@@ -4,9 +4,16 @@ from fastapi import HTTPException
 from starlette.responses import FileResponse, Response
 from starlette.types import Receive, Scope, Send
 
-from cpra.mp.data.api.dataset import Dataset
+from cpra.mp.data.analysis.paired import PairedAnalysis
+from cpra.mp.data.analysis.raster import RasterGridAnalysis
+from cpra.mp.data.analysis.types import CompressionAlgorithm
 from cpra.mp.data.api.models import Compression
-from cpra.mp.data.api.types import CompressionAlgorithm
+
+# Either a raster-grid analysis or a paired (notebook-shape) plan -- both expose the same
+# duck-typed `write_raster`/`get_tile`/`variable` surface these responses need (see
+# `PairedAnalysis`'s class docstring for why it's a sibling of `BaseAnalysis`, not a
+# subclass, despite implementing the same methods).
+RasterLike = RasterGridAnalysis | PairedAnalysis
 
 COMPRESSION_LEVEL_OPTIONS = {
     CompressionAlgorithm.deflate: "zlevel",
@@ -21,7 +28,7 @@ class RasterioStreamingResponse(FileResponse):
     mime_types = {"tif": "image/tiff; application=geotiff"}
 
     def __init__(
-        self, dataset: Dataset, format: str, compression: Compression, **kwargs
+        self, dataset: RasterLike, format: str, compression: Compression, **kwargs
     ) -> None:
         self.dataset = dataset
         self.format = format
@@ -69,7 +76,7 @@ class RasterioTileResponse(Response):
 
     def __init__(
         self,
-        dataset: Dataset,
+        dataset: RasterLike,
         x: int,
         y: int,
         z: int,

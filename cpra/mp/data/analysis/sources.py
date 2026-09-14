@@ -20,8 +20,12 @@ import rasterio as rio
 from polars.io.plugins import register_io_source
 from rasterio import windows
 
-from cpra.mp.data.api.expressions import count_by_value_frame, rewrite_value_column, value_predicate_mask
-from cpra.mp.data.api.utils import raster_blocks_per_batch, raster_gdal_env
+from cpra.mp.data.analysis.expressions import (
+    count_by_value_frame,
+    rewrite_value_column,
+    value_predicate_mask,
+)
+from cpra.mp.data.analysis.utils import raster_blocks_per_batch, raster_gdal_env
 
 NUMPY_TO_POLARS = {
     "int8": pl.Int8,
@@ -69,7 +73,7 @@ POLARS_RASTER_AGGREGATES = {
 # rejects it outright (`dataset.py`'s own `group_aggregate == "count"` check) rather than
 # giving it a meaning here. A PAIRED analysis pipeline's `group.aggregate == "count"`
 # ("how many calendar steps satisfied the condition") is a DIFFERENT question that a
-# `where` clause makes meaningful -- `pipeline_exec.PairedPlan` implements that locally
+# `where` clause makes meaningful -- `pipeline_exec.PairedAnalysis` implements that locally
 # (`_band_valid_expr`/`_collapse_expr`'s own `count` branch), never by adding a key here.
 # Do not "unify" the two by adding `count` to this dict.
 HORIZONTAL_RASTER_AGGREGATES = {

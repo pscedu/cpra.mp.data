@@ -6,7 +6,11 @@ from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITES_BASE_URL, STATIC_TILES_
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
-from cpra.mp.data.visualizations.display import display_number_format, display_unit, to_display
+from cpra.mp.data.visualizations.display import (
+    display_number_format,
+    display_unit,
+    to_display,
+)
 
 # Used when feature IDs are too sparse for array indexing.
 COLOR_OBJECT_EXPR = ["coalesce", ["get", ["to-string", ["id"]], ["global-state", "colors"]], "transparent"]
@@ -48,7 +52,7 @@ class Map(DatasetVisualization):
 
         import polars.selectors as cs
 
-        from cpra.mp.data.api.dataset import Dataset
+        from cpra.mp.data.analysis import create_analysis
         from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 
         dataset_dimensions = DatasetDimensions(
@@ -65,7 +69,7 @@ class Map(DatasetVisualization):
         options_fields = set(Options.model_fields.keys())
         options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
 
-        dataset = Dataset(dataset_dimensions, filter_dimensions, options)
+        dataset = create_analysis(dataset_dimensions, filter_dimensions, options)
         dataset._apply_calculate_params()
         dataset._apply_group_params()
 

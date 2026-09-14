@@ -11,15 +11,14 @@ import numpy as np
 import polars as pl
 import pytest
 import rasterio as rio
-from fastapi import HTTPException
 from PIL import Image
 from rasterio.windows import Window
 
-from cpra.mp.data.api import dataset as dataset_module
-from cpra.mp.data.api.dataset import _batched_block_windows
-from cpra.mp.data.api.types import OutputType
+from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis import raster as dataset_module
+from cpra.mp.data.analysis.raster import _batched_block_windows
+from cpra.mp.data.analysis.types import OutputType
 from cpra.mp.data.grids import GRIDS
-
 from tests.factories import (
     RASTER_KWARGS,
     raster_array,
@@ -115,14 +114,14 @@ class TestGridCellSampling:
 
     async def test_non_numeric_coordinates_raise_400(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, grid_cell="west,north")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "non-numeric coordinates" in excinfo.value.detail
 
     async def test_odd_coordinate_count_raises_400(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5,-90.0")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "even number of coordinates" in excinfo.value.detail
@@ -134,7 +133,7 @@ class TestGridCellSampling:
         self, dataset_factory, raster_data, grid_cell
     ):
         dataset = dataset_factory(DIMENSIONS, grid_cell=grid_cell)
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "invalid coordinate pair" in excinfo.value.detail
@@ -142,7 +141,7 @@ class TestGridCellSampling:
     async def test_unprojectable_coordinates_raise_400(self, dataset_factory, raster_data):
         """A pair can be valid WGS84 and still have no place in the grid's UTM zone."""
         dataset = dataset_factory(DIMENSIONS, grid_cell="0,0")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "outside the grid's projection" in excinfo.value.detail
@@ -266,7 +265,7 @@ class TestSummarizeStage:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="parish_v2020", summarize_aggregate="mean"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "No crosswalk from veg_grid_cell_v001 to parish_v2020" in excinfo.value.detail
@@ -280,7 +279,7 @@ class TestSummarizeStage:
         column blocks (512, 512, 28 px wide), so 1 vs. 1000 genuinely exercises chunked
         vs. whole-row batching, not just a no-op override.
         """
-        from cpra.mp.data.api import utils as api_utils
+        from cpra.mp.data.analysis import utils as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 1)
         chunked_dataset = dataset_factory(
@@ -382,7 +381,7 @@ class TestSummarizeStage:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 404
 
@@ -526,7 +525,7 @@ class TestValidateTile:
     async def test_multiple_bands_raise_400(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset.validate_tile()
         assert excinfo.value.status_code == 400
         assert "2 bands found" in excinfo.value.detail
@@ -540,7 +539,7 @@ class TestValidateTile:
 
     async def test_vector_output_raises_400(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, grid_cell="-91.0,29.5")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset.validate_tile()
         assert "invalid output type for tile: vector" in excinfo.value.detail
 
@@ -548,7 +547,7 @@ class TestValidateTile:
 class TestValidateVectorTile:
     async def test_raster_output_raises_400(self, dataset_factory, raster_data, tiles_path):
         dataset = dataset_factory(DIMENSIONS)
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset.validate_vector_tile()
         assert excinfo.value.status_code == 400
         assert "invalid output type for vector tile: raster" in excinfo.value.detail
@@ -557,7 +556,7 @@ class TestValidateVectorTile:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset.validate_vector_tile()
         assert excinfo.value.status_code == 404
         assert "no tile file for grid: hydro_compartment_v001" in excinfo.value.detail
@@ -1004,7 +1003,7 @@ class TestValueWherePixelPredicate:
         value conjunct given without summarize_by/summarize_aggregate is rejected
         outright, with an error that says so."""
         dataset = dataset_factory(DIMENSIONS, where="value > 3")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "summarize" in excinfo.value.detail
@@ -1052,7 +1051,7 @@ class TestValueWherePixelPredicate:
         to this pixel" has no natural per-pixel meaning (see the AggregateFunction.count
         comment in types.py)."""
         dataset = dataset_factory(DIMENSIONS, group_aggregate="count")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "count" in excinfo.value.detail
@@ -1085,7 +1084,7 @@ class TestValueWherePixelPredicate:
             summarize_aggregate="count",
             where="value > not_a_column",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "not_a_column" in excinfo.value.detail
@@ -1111,7 +1110,7 @@ class TestValueWherePixelPredicate:
             summarize_aggregate="count",
             where="value = min(value)",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "min" in excinfo.value.detail
@@ -1139,7 +1138,7 @@ class TestValueWherePixelPredicate:
             summarize_aggregate="count",
             where="calendar_year in (select max(calendar_year) from self)",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert not called
@@ -1166,7 +1165,7 @@ class TestValueWherePixelPredicate:
             summarize_aggregate="count",
             where="value in (select max(value) from self)",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert not called
@@ -1287,7 +1286,7 @@ class TestCountByValue:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "single" in excinfo.value.detail
@@ -1308,14 +1307,14 @@ class TestCountByValue:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "distinct" in excinfo.value.detail
 
     async def test_group_aggregate_count_by_value_is_rejected(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="count_by_value")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "count_by_value" in excinfo.value.detail
@@ -1329,7 +1328,7 @@ class TestCountByValue:
             summarize_aggregate="count_by_value",
             multiply10="1 = 1",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "count_by_value" in excinfo.value.detail

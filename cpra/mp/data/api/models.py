@@ -1,93 +1,18 @@
 from datetime import date
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, create_model
+from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
 
-from cpra.mp.data.api.types import (
-    AggregateFunction,
+from cpra.mp.data.analysis.parameters import (  # noqa: F401
+    DatasetDimensions,
+    FilterDimensions,
+    Options,
+)
+from cpra.mp.data.analysis.types import (
     CompressionAlgorithm,
-    VectorGrid,
-    dimension_type,
 )
-from cpra.mp.data.api.types import Grid as GridName
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
-
-BaseDatasetDimensions = create_model(
-    "BaseDatasetDimensions",
-    __config__=ConfigDict(protected_namespaces=()),
-    **{dim.name: (dimension_type(dim.name), None) for dim in DATASET_DIMENSIONS.values()},
-)
-
-BaseFilterDimensions = create_model(
-    "BaseFilterDimensions",
-    __config__=ConfigDict(protected_namespaces=()),
-    **{
-        dim.name: (
-            list[dimension_type(dim.name)] | None,
-            None,
-        )
-        for dim in DIMENSIONS.values()
-        if dim.type not in ("dataset", "metadata")
-    },
-)
-
-
-class DatasetDimensions(BaseDatasetDimensions):
-    model_config = ConfigDict(use_enum_values=True)
-
-
-class FilterDimensions(BaseFilterDimensions):
-    model_config = ConfigDict(use_enum_values=True)
-
-
-class Options(BaseModel):
-    model_config = ConfigDict(use_enum_values=True)
-
-    grid_cell: str | None = None
-    # Accepts both DIMENSION conditions (against the raster metadata table's path/band/
-    # dimensions, or a vector frame's dimension columns -- historically the only kind
-    # `where` accepted) and VALUE conditions (against actual pixel/cell VALUES, written
-    # against the placeholder column `value` -- historically the separate, now-retired
-    # `value_where` parameter), AND-ed together in one string, e.g.
-    # `calendar_year > 2040 AND value > 3`. `api.expressions.classify_where` splits
-    # `where` on top-level `AND` and sorts each conjunct by which kind it is: a dimension
-    # conjunct is handed to `lf.sql()` largely unrestricted, the same as always; a value
-    # conjunct is parsed through `api.expressions.parse_value_expr`'s restricted
-    # whitelist instead, since it runs on the hot per-row path an aggregate or a subquery
-    # inside it can force off of streaming pushdown entirely -- see `api/expressions.py`'s
-    # module docstring. A single AND-term may not reference both kinds (rejected with an
-    # error explaining the rule); write dimension and value conditions as separate AND-ed
-    # conjuncts instead.
-    #
-    # For an AGGREGATING request (`group_aggregate`/`summarize_aggregate`), a value
-    # conjunct's non-matching value is masked to null, not dropped as a row, so it
-    # composes with the aggregate's existing null-skipping behaviour (including `count`,
-    # which is what makes "count pixels where value > x" possible) instead of adding a
-    # second "predicate failed" code path. For a PLAIN (non-aggregating) request, a row
-    # failing a value conjunct is dropped instead, since there is no aggregate downstream
-    # for a masked null to fall into unnoticed.
-    where: str | None = None
-    # Sign-flips `value` (composing with `group_aggregate=sum` across two requests to
-    # produce a difference -- see `AggregateFunction`/`group_aggregate` and the data
-    # portal's own use of this idiom). LIMITATION: a cell/pixel present in only ONE of
-    # the two merged selections is indistinguishable, after the sum, from a cell/pixel
-    # present in both with the other side's value at zero -- the "difference" silently
-    # degrades to just the surviving side's value, with no flag that anything was
-    # missing. Every grid this codebase currently serves is dense (no such ragged
-    # selection exists), which is the only reason this has not needed a fix.
-    negate: str | None = None
-    multiply10: str | None = None
-    multiply100: str | None = None
-    group_by: str | None = None
-    group_aggregate: AggregateFunction | None = None
-    color_map: str | None = None
-    unpivot: bool = False
-    summarize_by: VectorGrid | None = None
-    summarize_aggregate: AggregateFunction | None = None
-    summarize_grid_cell: str | None = None
-    sort: str | None = None
-    select: str | None = None
+from cpra.mp.data.analysis.types import Grid as GridName
 
 
 class Compression(BaseModel):

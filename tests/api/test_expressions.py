@@ -9,7 +9,7 @@ FastAPI below the translation layer" design constraint.
 import polars as pl
 import pytest
 
-from cpra.mp.data.api.expressions import (
+from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
     count_by_value_frame,

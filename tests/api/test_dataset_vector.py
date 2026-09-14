@@ -6,15 +6,14 @@ filter -> calculate -> group and aggregate -> transform and extract -> sort.
 
 import polars as pl
 import pytest
-from fastapi import HTTPException
 from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.api import dataset as dataset_module
-from cpra.mp.data.api.types import DataFormat, OutputType
+from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis import vector as dataset_module
+from cpra.mp.data.analysis.types import DataFormat, OutputType
 from cpra.mp.data.tabular import write_parquet
-
 from tests.factories import (
     ANNUAL_KWARGS,
     DAILY_KWARGS,
@@ -105,7 +104,7 @@ class TestCustomColorMap:
 
     def test_discrete_with_a_bound_per_color_is_rejected(self, dataset_factory, annual_data):
         """The implicit open-ended bound means an equal count is one value too many."""
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset_factory(DIMENSIONS, color_map="discrete:#ff0000,1,#00ff00,2").legend
         assert "mismatched colors and values" in excinfo.value.detail
 
@@ -121,18 +120,18 @@ class TestCustomColorMap:
         assert legend.break_points["upper_bound"].to_list() == [0.0, 10.0]
 
     def test_invalid_map_type_raises_400(self, dataset_factory, annual_data):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset_factory(DIMENSIONS, color_map="sideways:#ff0000,1").legend
         assert excinfo.value.status_code == 400
         assert "invalid color map type" in excinfo.value.detail
 
     def test_non_numeric_values_raise_400(self, dataset_factory, annual_data):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset_factory(DIMENSIONS, color_map="continuous:low,#ff0000").legend
         assert "invalid color map values" in excinfo.value.detail
 
     def test_mismatched_colors_and_values_raise_400(self, dataset_factory, annual_data):
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             dataset_factory(DIMENSIONS, color_map="continuous:0,#ff0000,10").legend
         assert "mismatched colors and values" in excinfo.value.detail
 
@@ -258,21 +257,21 @@ class TestValueWhereStage:
         naming the offending token, raised before any data is read.
         """
         dataset = dataset_factory(DIMENSIONS, where="value > not_a_column")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "not_a_column" in excinfo.value.detail
 
     async def test_aggregate_inside_the_predicate_is_rejected(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, where="value = min(value)")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "min" in excinfo.value.detail
 
     async def test_disallowed_function_is_rejected(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, where="upper(value) = 'X'")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -289,7 +288,7 @@ class TestValueWhereStage:
         calling `dataset.materialize()` below already establishes.
         """
         dataset = dataset_factory(DIMENSIONS, where="value in (select max(value) from self)")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -301,7 +300,7 @@ class TestValueWhereStage:
         dataset = dataset_factory(
             DIMENSIONS, where="calendar_year in (select max(calendar_year) from self)"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -402,7 +401,7 @@ class TestGridCellCoordinates:
 
     async def test_no_geometry_file_raises_400(self, dataset_factory, annual_data, geometry_path):
         dataset = dataset_factory(DIMENSIONS, grid_cell=_lng_lat(500500, 3300500))
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "No geometry file" in excinfo.value.detail
@@ -458,7 +457,7 @@ class TestCalculateStage:
 class TestGroupStage:
     async def test_group_by_without_aggregate_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, group_by="calendar_year")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "group_aggregate must be specified" in excinfo.value.detail
@@ -508,7 +507,7 @@ class TestGroupStage:
 
     async def test_invalid_group_by_dimension_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, group_by="nope", group_aggregate="sum")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -526,14 +525,14 @@ class TestSummarizeStage:
 
     async def test_summarize_by_without_aggregate_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, summarize_by="hydro_compartment_v001")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "must be used together" in excinfo.value.detail
 
     async def test_aggregate_without_summarize_by_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, summarize_aggregate="sum")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -546,7 +545,7 @@ class TestSummarizeStage:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="parish_v2020", summarize_aggregate="sum"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "No crosswalk from ecoregion_v001 to parish_v2020" in excinfo.value.detail
@@ -849,14 +848,14 @@ class TestCountByValue:
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count_by_value"
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "distinct" in excinfo.value.detail
 
     async def test_group_aggregate_count_by_value_is_rejected(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="count_by_value")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "count_by_value" in excinfo.value.detail
@@ -870,7 +869,7 @@ class TestCountByValue:
             summarize_aggregate="count_by_value",
             negate="1 = 1",
         )
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
         assert "count_by_value" in excinfo.value.detail
@@ -898,7 +897,7 @@ class TestSortAndSelectStage:
 
     async def test_invalid_sort_key_raises_400(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, sort="nonsense")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 
@@ -909,7 +908,7 @@ class TestSortAndSelectStage:
 
     async def test_select_rejects_unknown_columns(self, dataset_factory, annual_data):
         dataset = dataset_factory(DIMENSIONS, select="calendar_year,nope")
-        with pytest.raises(HTTPException) as excinfo:
+        with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
         assert excinfo.value.status_code == 400
 

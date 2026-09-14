@@ -13,7 +13,7 @@ import copy
 import pytest
 from pydantic import ValidationError
 
-from cpra.mp.data.api.pipeline import (
+from cpra.mp.data.analysis.pipeline import (
     Pipeline,
     PipelineError,
     parse_pipeline,

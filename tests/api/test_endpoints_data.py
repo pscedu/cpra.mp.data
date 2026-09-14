@@ -18,9 +18,8 @@ from rasterio.warp import transform
 from shapely.geometry import box
 
 from cpra.mp.data import config
-from cpra.mp.data.api import fold as fold_module
+from cpra.mp.data.analysis import fold as fold_module
 from cpra.mp.data.tabular import write_parquet
-
 from tests.factories import (
     ANNUAL_KWARGS,
     RASTER_KWARGS,

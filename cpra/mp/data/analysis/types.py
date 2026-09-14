@@ -3,7 +3,6 @@ from enum import Enum
 
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS, WGS84
-from cpra.mp.data.legends import LEGENDS
 
 
 def dimension_type(dim_name):
@@ -38,7 +37,7 @@ class AggregateFunction(str, Enum):
     # analysis PIPELINE's paired `group.aggregate == "count"` is a different question --
     # "how many calendar steps satisfied this pipeline's own `where` clause" -- which the
     # `where` clause itself supplies the missing per-pixel meaning for; see
-    # `pipeline_exec.PairedPlan._band_valid_expr`/`_collapse_expr`, which implement that
+    # `pipeline_exec.PairedAnalysis._band_valid_expr`/`_collapse_expr`, which implement that
     # LOCALLY rather than by changing this rejection or `HORIZONTAL_RASTER_AGGREGATES`.
     count = "count"
     max = "max"

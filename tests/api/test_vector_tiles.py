@@ -1,4 +1,4 @@
-"""Tests for the MVT/PMTiles helpers in cpra.mp.data.api.vector."""
+"""Tests for the MVT/PMTiles helpers in cpra.mp.data.analysis.vector."""
 
 import gzip
 
@@ -9,13 +9,12 @@ from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from rasterio.crs import CRS
 from rasterio.warp import transform
 
-from cpra.mp.data.api.vector import (
+from cpra.mp.data.analysis.vector import (
     _data_to_id_value,
     inject_and_serialize,
     parse_tile,
     read_pmtile,
 )
-
 from tests.factories import write_pmtiles
 
 TILE = mercantile.Tile(x=1, y=2, z=3)
@@ -154,7 +153,6 @@ class TestGetVectorTile:
     @pytest.fixture
     def vector_data(self, base_path):
         from cpra.mp.data.tabular import write_parquet
-
         from tests.factories import annual_frame
 
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)

@@ -27,7 +27,7 @@ os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 import pytest  # noqa: E402
 
 from cpra.mp.data import config as cpra_config  # noqa: E402
-from cpra.mp.data.api.utils import _read_data_cached  # noqa: E402
+from cpra.mp.data.analysis.utils import _read_data_cached  # noqa: E402
 
 
 def pytest_configure(config):
@@ -43,7 +43,7 @@ def pytest_configure(config):
 def clear_read_cache():
     """Reset the API's TTL cache around every test.
 
-    ``api.utils._read_data_cached`` is wrapped in a ``TTLCache`` keyed only on the
+    ``analysis.utils._read_data_cached`` is wrapped in a ``TTLCache`` keyed only on the
     dimension kwargs. Without this, two tests using identical dimensions but different
     ``tmp_path`` directories would silently share the first test's LazyFrame.
     """
