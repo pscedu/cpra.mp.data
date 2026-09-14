@@ -1,9 +1,9 @@
 from collections import defaultdict
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Any
 
 import polars.selectors as cs
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
@@ -26,6 +26,8 @@ from cpra.mp.data.api.models import (
     Visualization,
     VisualizationQuery,
 )
+from cpra.mp.data.api.pipeline import PipelineError, parse_pipeline, pipeline_from_query
+from cpra.mp.data.api.pipeline_exec import compile_pipeline
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
@@ -282,6 +284,78 @@ async def get_vector_tile(
     await dataset.apply_params()
     dataset.validate_vector_tile()
     return VectorTileResponse(dataset, x, y, z)
+
+
+def _check_output_format_agreement(pipeline, url_format):
+    """`{format}`/`.png`|`.jpg` in the URL and the pipeline's own `output.format` are two
+    spellings of the same thing (the tile route's z/x/y segments leave no other place to
+    put it, and the flat data route mirrors that rather than special-casing one route to
+    trust the URL and the other to trust the body). Both are always present (`Output.format`
+    has no default), so this rejects outright rather than silently preferring one.
+    """
+    if pipeline.output.format != url_format:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"URL format {url_format.value!r} does not match the pipeline's own "
+                f"output.format {pipeline.output.format!r}"
+            ),
+        )
+
+
+async def _respond_to_analysis(pipeline, format):
+    try:
+        compiled = compile_pipeline(pipeline)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    validate_format(format, compiled.output_type)
+    await compiled.apply_params()
+
+    if compiled.output_type == OutputType.raster:
+        return RasterioStreamingResponse(compiled, format, Compression())
+
+    data_size = compiled.estimate_data_size()
+    collect_in_memory = data_size is not None and data_size <= (STREAM_THRESHOLD * pow(10, 6))
+    return PolarsStreamingResponse(compiled, format, Compression(), collect_in_memory)
+
+
+@app.post("/v1/analysis.{format}", tags=["Data and Analysis"])
+async def post_analysis(format: DataFormat, body: dict[str, Any] = Body(...)):
+    try:
+        pipeline = parse_pipeline(body)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _check_output_format_agreement(pipeline, format)
+    return await _respond_to_analysis(pipeline, format)
+
+
+@app.get("/v1/analysis.{format}", tags=["Data and Analysis"])
+async def get_analysis(format: DataFormat, request: Request):
+    try:
+        pipeline = pipeline_from_query(dict(request.query_params))
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _check_output_format_agreement(pipeline, format)
+    return await _respond_to_analysis(pipeline, format)
+
+
+@app.get("/v1/analysis/{z}/{x}/{y}.{format}", tags=["Data and Analysis"])
+async def get_analysis_tile(z: int, x: int, y: int, format: TileFormat, request: Request):
+    try:
+        pipeline = pipeline_from_query(dict(request.query_params))
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _check_output_format_agreement(pipeline, format)
+
+    try:
+        compiled = compile_pipeline(pipeline)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await compiled.apply_params()
+    compiled.validate_tile()
+    return RasterioTileResponse(compiled, x, y, z, format)
 
 
 @app.get("/v1/visualizations.json", tags=["Visualization"])

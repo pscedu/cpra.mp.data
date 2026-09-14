@@ -333,6 +333,36 @@ def rewrite_value_column(expr_str, column_name):
     return _VALUE_TOKEN_RE.sub(column_name, expr_str)
 
 
+def rewrite_named_columns(expr_str, column_map):
+    """Generalization of `rewrite_value_column` to more than one placeholder, rewritten
+    simultaneously rather than one at a time.
+
+    `api/pipeline.py`'s analysis pipelines don't write their `filter.where` against the
+    single `value` placeholder -- a step downstream of a spatial `join` (`api/raster_source
+    .scan_paired`) names each side by its own input/step name (e.g. `marsh > 0.5 AND sal >
+    5.5`), and that same expression has to be re-evaluated once per selected calendar band,
+    against that band's own synthetic columns (`scan_paired`'s `b<i>`/`p<i>` convention).
+    `column_map` is `{name: replacement}` for every name in scope at that step, e.g.
+    `{"marsh": "b0", "sal": "p0"}`.
+
+    Built as ONE regex with alternation over every key, substituted in a single pass --
+    not `column_map`'s items applied one at a time via repeated `rewrite_value_column`-
+    style calls -- so that a replacement string which happens to collide with another
+    key (or another replacement) is never re-substituted. Longer names are tried first
+    in the alternation so a shorter key that is a prefix of a longer one (unlikely given
+    the word-boundary anchor, but not ruled out) can't shadow it.
+
+    Like `rewrite_value_column`, this performs no validation of its own -- the caller is
+    expected to re-parse and re-whitelist the result with `parse_value_expr` immediately
+    after, against the replacement columns' own namespace.
+    """
+    if not column_map:
+        return expr_str
+    names = sorted(column_map, key=len, reverse=True)
+    pattern = re.compile(r"\b(" + "|".join(re.escape(name) for name in names) + r")\b")
+    return pattern.sub(lambda m: column_map[m.group(1)], expr_str)
+
+
 def value_predicate_mask(expr_str, allowed_columns):
     """Parse a value predicate and return it as a mask with `null` coerced to `False`.
 

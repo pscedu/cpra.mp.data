@@ -30,11 +30,16 @@ class AggregateFunction(str, Enum):
     # `count` is valid as a `summarize_aggregate`/`group_by`-vertical-reduce value on
     # both grid types (see raster_source.POLARS_RASTER_AGGREGATES and the vector
     # `getattr(pl.col("value"), aggregate)()` call sites, both of which resolve it to
-    # Polars' own null-skipping `Expr.count`), but NOT as a `group_aggregate` (the raster
-    # band-COLLAPSE step, `raster_source.HORIZONTAL_RASTER_AGGREGATES`): "how many of
-    # these bands contributed to this pixel" has no natural per-pixel scalar meaning the
-    # way max/mean/min/sum do, and `Dataset` rejects it there with an explicit error
-    # rather than let it fail deeper as a raw `KeyError`/`AttributeError`.
+    # Polars' own null-skipping `Expr.count`), but NOT as a FLAT-API `group_aggregate`
+    # (the raster band-COLLAPSE step, `raster_source.HORIZONTAL_RASTER_AGGREGATES`):
+    # "how many of these bands contributed to this pixel" has no natural per-pixel scalar
+    # meaning the way max/mean/min/sum do, and `Dataset` rejects it there with an explicit
+    # error rather than let it fail deeper as a raw `KeyError`/`AttributeError`. An
+    # analysis PIPELINE's paired `group.aggregate == "count"` is a different question --
+    # "how many calendar steps satisfied this pipeline's own `where` clause" -- which the
+    # `where` clause itself supplies the missing per-pixel meaning for; see
+    # `pipeline_exec.PairedPlan._band_valid_expr`/`_collapse_expr`, which implement that
+    # LOCALLY rather than by changing this rejection or `HORIZONTAL_RASTER_AGGREGATES`.
     count = "count"
     max = "max"
     mean = "mean"

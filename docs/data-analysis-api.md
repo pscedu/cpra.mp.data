@@ -198,3 +198,139 @@ This request counts, per hydro compartment, the pixels carrying each distinct la
 ```
 GET /v1/datasets/lndtyp/annual/morph_pixel_v001/data.csv?model_group_id=500&scenario_id=7&calendar_year=2050&summarize_by=hydro_compartment_v001&summarize_aggregate=count_by_value
 ```
+
+## Analysis Pipelines
+
+The data endpoints above operate on one dataset at a time. Analysis pipelines let a request name **several** datasets, move them onto a common grid, join them, and filter/aggregate the result -- e.g. "wherever marsh coverage exceeds a threshold *and* salinity exceeds a threshold, what is the earliest year that became true?" A pipeline request is a small, named-step program rather than a set of query parameters, since expressing that kind of cross-dataset condition as flat parameters on a single dataset's endpoint has no natural spelling.
+
+Three endpoints accept a pipeline, sharing one request model:
+
+```
+POST /v1/analysis.<format>
+GET  /v1/analysis.<format>
+GET  /v1/analysis/{z}/{x}/{y}.<png|jpg>
+```
+
+`POST` takes the pipeline as a JSON body. `GET` (both the flat and the tile form) takes the identical pipeline flattened into a dotted query string, so a pipeline can be embedded in a map tile URL template. In every case, `<format>` in the URL must agree with the pipeline's own `output.format` -- a mismatch (e.g. a `.csv` URL for a pipeline whose `output.format` is `"tif"`) is rejected with a 400 before anything is read.
+
+### Request Shape
+
+A pipeline has three parts:
+
+```json
+{
+  "inputs": {
+    "<name>": {"variable": "...", "time_unit": "...", "grid": "...", "<dimension>": "..."}
+  },
+  "steps": [ {"op": "...", ...} ],
+  "output": {"format": "...", "color_map": "..."}
+}
+```
+
+**`inputs`** names one or more dataset selections. Each is the same `variable`/`time_unit`/`grid` triple the flat data endpoints take, plus any number of dimension filters (e.g. `model_group_id`, `scenario_id`) as extra keys -- a scalar or a comma-separated/JSON-list of values, exactly as on the flat endpoints.
+
+**`steps`** is an ordered list of operations, each consuming a named input or a previous step's own output:
+
+| Op | Fields | Description |
+|---|---|---|
+| `project` | `input` (optional, chains from the previous step if omitted), `to` (target grid), `aggregate` (required moving to a coarser grid, forbidden moving to a finer one), `as` | Move a named input onto a different grid via a crosswalk. |
+| `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine named inputs/step outputs on shared dimensions and `grid_cell`. |
+| `filter` | `where` | A SQL-style predicate over the in-scope named columns (e.g. `marsh > 0.5 AND sal > 5.5`), always over the previous step's output. |
+| `group` | `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate`, `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held") | Collapse rows/bands, always over the previous step's output. |
+
+`filter` and `group` never take an explicit input -- they always consume whatever the immediately preceding step produced -- so the **first** step of every pipeline must be a `project` (naming its input explicitly) or a `join` (naming two or more inputs explicitly). A single-input pipeline that changes no grid at all still opens with an identity `project` (`to` equal to the input's own grid) purely to satisfy this rule.
+
+**`output`** gives the response `format` (any tabular/`tif` format, or a tile format for the tile route) and an optional `color_map` for rendered raster output.
+
+### What Compiles Today
+
+Not every step sequence a pipeline could describe is executable yet. Three shapes are supported; anything else is rejected with a `PipelineError`-derived 400 naming the specific unsupported shape and why, rather than a generic failure. The response's `detail` text is intended to be actionable, e.g. it names the exact rule that failed (a cardinality direction, a row ceiling, a missing `group` step) rather than just "invalid pipeline."
+
+1. **Single-input chains equivalent to a flat dataset request**: one input, an opening `project` (identity, or many-to-one onto a coarser grid with `aggregate`), then optionally `filter` step(s) and at most one trailing `group`, to any tabular or `tif`/tile format. This compiles onto the same machinery the flat data endpoints use (`project`'s `to`/`aggregate` become `summarize_by`/`summarize_aggregate`; `filter.where` and `group` become `where`/`group_by`/`group_aggregate`) -- a single-input pipeline and the equivalent flat request return the same data.
+2. **Project-only reaggregation**: the same shape as (1), specialized to a many-to-one `project` (e.g. raster pixels reaggregated onto a coarser vector zone) with a tabular output -- no `filter`/`group` needed.
+3. **The paired (spatially-joined) shape**: exactly two inputs -- a coarser one broadcast (one-to-many `project`, no `aggregate`) onto a finer *raster* grid, immediately `join`ed against that raster input, then any number of `filter` steps and exactly one trailing `group` with `by: []` (a per-pixel collapse across bands, e.g. across years -- not a zonal collapse) and a numeric `of` (`calendar_year`, or the running `value`) for every aggregate except `count`, which has none (see below). Because this shape's result is inherently one raster surface, only `tif`/`png`/`jpg` output is implemented for it; a tabular paired output is rejected outright (materializing every joined pixel row into a table is exactly the memory cost this shape's execution plan avoids -- see "Memory Behavior" below). This shape's `group.aggregate` supports `min`, `max`, `sum`, `mean`, and `count`: `count` reports, per pixel, how many bands (e.g. calendar steps) satisfy the preceding `filter` step(s)' `where` clause (or, with no `filter` at all, how many bands have real fine+paired data) -- it has no aggregand, so `of` must be left at its default (omitted) rather than naming a column. A pixel with zero satisfying bands reports a real `0`, not a missing value (consistent with `count` everywhere else in this API); nodata is reserved for a pixel entirely outside the pairing crosswalk's domain.
+
+A `join`'s two sides must agree on every dimension they share (present on all joined inputs and filtered to the same value(s)), and a dimension present on only one side must be pinned to a single value there, since there is no row on the other side to align it against. The coarse/zone side of a `project`/`join` is also capped at a configured row ceiling (`ANALYSIS_JOIN_MAX_ROWS`), checked before that side is materialized, so an unbounded selection is rejected rather than silently read in full.
+
+Everything else -- three or more inputs, a `join` not immediately preceded by its broadcasting `project`, a tabular output for the paired shape, `filter`/`group` in an order the compiler doesn't recognize, and so on -- is rejected informatively rather than silently misexecuted.
+
+### Memory Behavior
+
+The paired shape (3) exists specifically to avoid materializing a full joined table: naively broadcasting a coarse dataset onto every pixel of a fine raster grid, across every year, and then grouping, means holding one column per year for every pixel in memory at once before the aggregate can drop most of it. Instead, the compiled plan reads both inputs' small ROW metadata up front (file paths/bands for the raster input; the already row-ceiling-bounded coarse table), then executes as a single pass over the raster's own block windows: for each window, it reads that window from every year's band plus the pairing crosswalk, looks up each pixel's paired coarse value, applies the `filter`/`group` collapse for just that window, and writes the collapsed window straight back at its own position -- never holding a full-extent array of any per-pixel intermediate.
+
+### Examples
+
+#### The Exit-Criterion Query: Earliest Year Marsh and Salinity Both Cross a Threshold
+
+This pipeline broadcasts annual salinity (by hydro compartment) onto the vegetation grid, pairs it against marsh coverage there, keeps only pixel-years where marsh coverage exceeds 0.5 *and* paired salinity exceeds 5.5, and reports the earliest (`min`) such `calendar_year` per pixel, as a GeoTIFF:
+
+```json
+POST /v1/analysis.tif
+{
+  "inputs": {
+    "marsh": {
+      "variable": "ffibs_coverage_ratio", "time_unit": "annual", "grid": "veg_grid_cell_v001",
+      "model_group_id": 500, "scenario_id": 7, "ffibs_type": "pl_fm"
+    },
+    "salinity": {
+      "variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001",
+      "model_group_id": 500, "scenario_id": 7, "aggregate_type": "2_wk_max"
+    }
+  },
+  "steps": [
+    {"op": "project", "input": "salinity", "to": "veg_grid_cell_v001", "as": "sal"},
+    {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
+    {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
+    {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"}
+  ],
+  "output": {"format": "tif"}
+}
+```
+
+The same pipeline as a `GET` request, using the dotted query encoding (dot = nesting, an integer segment = a 1-based list position, comma = a list value -- never inside `where`, which is one opaque string):
+
+```
+GET /v1/analysis.tif?input.marsh.variable=ffibs_coverage_ratio&input.marsh.time_unit=annual&input.marsh.grid=veg_grid_cell_v001&input.marsh.model_group_id=500&input.marsh.scenario_id=7&input.marsh.ffibs_type=pl_fm&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&input.salinity.model_group_id=500&input.salinity.scenario_id=7&input.salinity.aggregate_type=2_wk_max&step.1.op=project&step.1.input=salinity&step.1.to=veg_grid_cell_v001&step.1.as=sal&step.2.op=join&step.2.type=spatial&step.2.inputs=marsh,sal&step.2.as=paired&step.3.op=filter&step.3.where=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.4.op=group&step.4.by=&step.4.aggregate=min&step.4.of=calendar_year&output.format=tif
+```
+
+And as map tiles, replacing `output.format=tif` with `output.format=png`:
+
+```
+GET /v1/analysis/{z}/{x}/{y}.png?...same query as above, with output.format=png
+```
+
+#### Single-Input Pipeline Equivalent to a Flat Request
+
+An identity `project` (no grid change), a `filter`, and a `group`, equivalent to the same query and aggregate on the flat `sal`/`hydro_compartment_v001` endpoint:
+
+```json
+POST /v1/analysis.csv
+{
+  "inputs": {
+    "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001", "model_group_id": 520, "scenario_id": 7}
+  },
+  "steps": [
+    {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
+    {"op": "filter", "where": "sal > 5"},
+    {"op": "group", "by": ["calendar_day"], "aggregate": "max"}
+  ],
+  "output": {"format": "csv"}
+}
+```
+
+#### Project-Only Reaggregation
+
+Reaggregate raster elevation onto hydro compartments as a zonal mean, with no `filter`/`group` needed:
+
+```json
+POST /v1/analysis.csv
+{
+  "inputs": {
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001", "model_group_id": 500, "scenario_id": 7, "calendar_year": 2050}
+  },
+  "steps": [
+    {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "mean"}
+  ],
+  "output": {"format": "csv"}
+}
+```

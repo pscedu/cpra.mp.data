@@ -118,6 +118,18 @@ RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_ba
 # (the largest is a few dozen categories) while still catching a continuous column early.
 COUNT_BY_VALUE_MAX_DISTINCT = int(get_config("COUNT_BY_VALUE_MAX_DISTINCT", "1000"))
 
+# Ceiling on the number of rows an analysis pipeline's coarse (zone-side) input may have
+# before a `project`/spatial `join` step is executed (api.pipeline_exec) -- the same
+# "probe before collecting" shape as the retired `BROADCAST_MAX_ROWS` constant this
+# replaces: `lf.select(pl.len()).collect(engine="streaming").item()` is checked against
+# this BEFORE the coarse frame is materialized into the per-step dense lookup arrays
+# `raster_source._dense_lookup_array` builds, since that array is sized to the coarse
+# frame's own row count (one entry per coarse id) and is held in memory for the whole
+# scan. 200,000 is comfortably above any real vector grid in this dataset (the largest,
+# clara_grid_cell_v001, has 126,174 zones) while still catching a caller who points a
+# pipeline's `project`/`join` step at something unbounded.
+ANALYSIS_JOIN_MAX_ROWS = int(get_config("ANALYSIS_JOIN_MAX_ROWS", "200000"))
+
 # Row-offset chunk size for the tabular "fold" (api.fold.fold_group_by), which bounds a
 # high-cardinality `group_by` (e.g. `grid_cell`, 126,174 distinct values in
 # clara_grid_cell_v001) to at most this many input rows per `group_by`/`agg`/`collect`
