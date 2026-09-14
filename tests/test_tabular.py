@@ -14,7 +14,6 @@ import pytest
 from cpra.mp.data import config
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.tabular import compact_parquet, read_parquet, write_parquet
-
 from tests.factories import (
     ANNUAL_KWARGS,
     DAILY_KWARGS,

@@ -27,7 +27,6 @@ from cpra.mp.data.utils import (
     validate_data_frame,
     validate_grid,
 )
-
 from tests.factories import annual_frame, daily_frame
 
 

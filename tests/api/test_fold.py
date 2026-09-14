@@ -8,7 +8,6 @@ the same pattern applied to that module).
 """
 
 import json
-import resource
 import subprocess
 import sys
 

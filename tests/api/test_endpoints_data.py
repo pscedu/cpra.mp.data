@@ -4,7 +4,6 @@ Unlike the Dataset unit tests, these go through real routing and query-string pa
 they cover the parameter binding that FastAPI does before a Dataset is ever built.
 """
 
-import datetime
 import io
 import json
 
@@ -21,7 +20,6 @@ from cpra.mp.data import config
 from cpra.mp.data.analysis import fold as fold_module
 from cpra.mp.data.tabular import write_parquet
 from tests.factories import (
-    ANNUAL_KWARGS,
     RASTER_KWARGS,
     annual_frame,
     daily_frame,

@@ -6,7 +6,6 @@ import pytest
 
 from cpra.mp.data import compact_data, read_data, write_data
 from cpra.mp.data.exceptions import ValidationError
-
 from tests.factories import (
     ANNUAL_KWARGS,
     RASTER_KWARGS,

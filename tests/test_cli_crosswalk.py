@@ -12,9 +12,11 @@ import rasterio as rio
 from click.testing import CliRunner
 from shapely.geometry import box
 
-from cpra.mp.data.cli import cli, crosswalk  # noqa: F401 - side effect: registers `crosswalk`
+from cpra.mp.data.cli import (  # noqa: F401 - side effect: registers `crosswalk`
+    cli,
+    crosswalk,
+)
 from cpra.mp.data.grids import GRIDS
-
 from tests.factories import write_grid_geometry
 
 VECTOR_SRC = "hydro_compartment_v001"

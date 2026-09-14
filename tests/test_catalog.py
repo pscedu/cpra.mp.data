@@ -14,7 +14,12 @@ import pytest
 import rasterio
 
 from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
-from cpra.mp.data.catalog import CatalogQuery, contiguous_runs, raster_catalog_from_paths, unify_dtypes
+from cpra.mp.data.catalog import (
+    CatalogQuery,
+    contiguous_runs,
+    raster_catalog_from_paths,
+    unify_dtypes,
+)
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import _cog_profile, compact_cog, write_cog
 from cpra.mp.data.tabular import compact_parquet, write_parquet

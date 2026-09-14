@@ -227,10 +227,9 @@ def write_pmtiles(tiles_path, grid_name, tile, feature_ids):
     Each feature gets a trivial point geometry; only the feature IDs matter, since
     ``inject_and_serialize`` never decodes geometry.
     """
+    from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
     from pmtiles.tile import Compression, TileType
     from pmtiles.writer import Writer
-
-    from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 
     vt = VectorTile()
     layer = vt.layers.add()

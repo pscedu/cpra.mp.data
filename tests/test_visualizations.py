@@ -23,7 +23,6 @@ from cpra.mp.data.visualizations.base import (
 )
 from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
-
 from tests.factories import write_grid_geometry
 
 ANNUAL_VECTOR = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual")

@@ -11,7 +11,6 @@ following `tests/factories.py`'s own convention.
 import copy
 
 import pytest
-from pydantic import ValidationError
 
 from cpra.mp.data.analysis.pipeline import (
     Pipeline,

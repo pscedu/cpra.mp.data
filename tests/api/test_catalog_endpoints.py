@@ -165,7 +165,6 @@ class TestDatasetsIndex:
     def data(self, base_path, monkeypatch):
         from cpra.mp.data import config
         from cpra.mp.data.tabular import write_parquet
-
         from tests.factories import annual_frame
 
         write_parquet(annual_frame(), base_path=base_path)

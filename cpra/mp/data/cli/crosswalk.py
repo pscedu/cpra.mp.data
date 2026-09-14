@@ -28,7 +28,11 @@ import click
 
 from cpra.mp.data import config
 from cpra.mp.data.cli import cli
-from cpra.mp.data.crosswalks import read_geometry_tree, write_raster_crosswalk, write_vector_crosswalk
+from cpra.mp.data.crosswalks import (
+    read_geometry_tree,
+    write_raster_crosswalk,
+    write_vector_crosswalk,
+)
 from cpra.mp.data.grids import GRIDS
 
 

@@ -20,7 +20,6 @@ import rasterio as rio
 
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import _cog_profile, cog_path_expression, read_cog
-
 from tests.factories import RASTER_KWARGS
 
 

@@ -11,7 +11,6 @@ from cpra.mp.data import config
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import cog_path_expression, read_cog, vrt, write_cog
-
 from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
 
 DATASET_KWARGS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}

@@ -10,7 +10,11 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from cpra.mp.data.catalog import CAL_DIMS, EXCLUDE, Catalog, tabular_catalog_rows
-from cpra.mp.data.config import CATALOG_PATH_UNSET, get_base_path, get_write_catalog_path
+from cpra.mp.data.config import (
+    CATALOG_PATH_UNSET,
+    get_base_path,
+    get_write_catalog_path,
+)
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.utils import (
