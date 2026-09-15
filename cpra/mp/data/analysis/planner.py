@@ -25,12 +25,15 @@ Anything else raises `PipelineError` naming the reason -- see `compile_pipeline`
 """
 
 
+import re
+
 import polars as pl
 from pydantic import ValidationError
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
+    _check_no_dimension_subquery_or_aggregate,
     classify_where,
     parse_calculate_expression,
     parse_value_expr,
@@ -60,13 +63,6 @@ from cpra.mp.data.analysis.pipeline import (
 from cpra.mp.data.analysis.types import DataFormat, TileFormat
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
-
-# The column namespace a single-input pipeline's `filter.where` may reference once its own
-# running value has been rewritten to `value` (see `_compile_single_input_chain`): every
-# real filterable dimension, plus `grid_cell` and the placeholder itself. Built once at
-# import time -- `FilterDimensions.model_fields` is itself fixed at import time already
-# (built by `create_model` from `cpra.mp.data.dimensions.DIMENSIONS`).
-_FILTER_ALLOWED_DIMENSION_NAMES = frozenset(FilterDimensions.model_fields) | {"grid_cell"}
 
 _RASTER_OUTPUT_FORMATS = frozenset({DataFormat.tif.value, TileFormat.png.value, TileFormat.jpg.value})
 
@@ -199,10 +195,45 @@ def _validate_join_alignment(step_no, names, selections):
 
 
 def _validate_filter_where(step_no, where, extra_allowed_columns, op="filter"):
-    allowed = _FILTER_ALLOWED_DIMENSION_NAMES | set(extra_allowed_columns)
-    for conjunct in split_top_level_and(where):
+    """Validate a `filter`/`calculate` step's `where`, split into dimension and value
+    conjuncts exactly the way `classify_where` splits the flat `where=` parameter (see
+    that function's docstring for the full split/classify/reject contract) -- a
+    dimension conjunct gets only the subquery/aggregate safety check
+    (`_check_no_dimension_subquery_or_aggregate`), otherwise unrestricted (the same
+    treatment `Dataset._apply_filter_params` gives it, via an unrestricted `lf.sql()`
+    call); a value conjunct (referencing the running-value placeholder -- already
+    rewritten to the literal column `value` by the caller, see `rewrite_named_columns`)
+    gets the full `parse_value_expr` whitelist against `extra_allowed_columns` (always
+    `{"value"}` from both call sites below), exactly as before.
+
+    G8 (see `data-analysis-separation-plan.md`): this used to run EVERY top-level
+    conjunct through the value whitelist regardless of kind, which is narrower than what
+    the flat `where=` parameter accepts for a dimension predicate -- e.g. `not (a = x and
+    b = y)` (`not` is not in `ALLOWED_FUNCTIONS`), which is exactly the form the portal
+    emits for a three-image `concatenate` and which `classify_where`'s own two-path split
+    was built to allow for a dimension-only conjunct. Aligning this function with that
+    split closes the gap: a dimension conjunct is no longer namespace-restricted to a
+    known dimension name at pipeline-compile time (matching the flat surface, which has
+    no such check either -- an unknown dimension name fails at execution, via `lf.sql()`,
+    not here), only checked for the same aggregate/subquery shapes that would defeat
+    streaming pushdown.
+    """
+    try:
+        dimension_conjuncts, value_conjuncts = classify_where(where)
+    except ExpressionError as exc:
+        raise PipelineError(f"step {step_no} ({op}) where={where!r} is invalid: {exc}") from exc
+
+    for conjunct in dimension_conjuncts:
         try:
-            parse_value_expr(conjunct, allowed_columns=allowed)
+            _check_no_dimension_subquery_or_aggregate(conjunct)
+        except ExpressionError as exc:
+            raise PipelineError(
+                f"step {step_no} ({op}) where conjunct {conjunct!r} is invalid: {exc}"
+            ) from exc
+
+    for conjunct in value_conjuncts:
+        try:
+            parse_value_expr(conjunct, allowed_columns=extra_allowed_columns)
         except ExpressionError as exc:
             raise PipelineError(
                 f"step {step_no} ({op}) where conjunct {conjunct!r} is invalid: {exc}"
@@ -221,6 +252,16 @@ def _check_join_row_ceiling(step_no, name, lf):
 
 
 def _dataset_for(name, selection, base_path, **option_kwargs):
+    """Build the `BaseAnalysis` for one `InputSelection`, forwarding its reserved
+    `grid_cell` field (see `InputSelection`'s docstring) onto `Options.grid_cell`
+    unchanged -- the same option a flat `grid_cell=` query parameter already sets. Only
+    safe to call with a `selection.grid_cell` set for a shape whose dataset actually runs
+    `apply_params()` (single-input chains do; the paired shape's `fine_dataset`/
+    `coarse_dataset` do NOT, so `_compile_paired_notebook_shape` rejects a `grid_cell`
+    selection outright, before ever reaching here, rather than silently no-op-ing it).
+    """
+    if selection.grid_cell is not None:
+        option_kwargs["grid_cell"] = selection.grid_cell
     try:
         dataset_dimensions = DatasetDimensions(
             variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
@@ -258,6 +299,74 @@ def _validate_output_columns(pipeline: Pipeline) -> None:
             "with no subsequent `group` to narrow it) -- add a `group` step before this "
             "output"
         )
+
+
+# Accepted literal `grid_cell` filter shapes after a many-to-one `project` -- see
+# `_extract_post_project_grid_cell_filter`. Case-insensitive on `IN`, matching this
+# package's other case-insensitive SQL keyword handling (`split_top_level_and`'s "and").
+_GRID_CELL_EQ_RE = re.compile(r"^\s*grid_cell\s*=\s*(-?\d+)\s*$", re.IGNORECASE)
+_GRID_CELL_IN_RE = re.compile(r"^\s*grid_cell\s+in\s*\(\s*(-?\d+(?:\s*,\s*-?\d+)*)\s*\)\s*$", re.IGNORECASE)
+
+
+def _extract_post_project_grid_cell_filter(step_no, where):
+    """Recognize a `filter` step, occurring after a many-to-one (summarizing) `project`
+    in a single-input chain, whose ENTIRE predicate is a literal `grid_cell` selection --
+    and return it as the comma-separated ID string `Options.summarize_grid_cell` expects.
+    Returns `None` when `where` does not reference `grid_cell` at all (an ordinary
+    post-project filter, untouched by this rule, still folded into `Options.where` by the
+    caller exactly as before).
+
+    Why this exists: the executor's Filter stage (which `Options.where` feeds) runs
+    against the SOURCE (pre-summarize) rows, before the Transform/summarize stage that a
+    many-to-one `project` compiles onto ever narrows anything to the summarized grid --
+    so a `filter` naming `grid_cell` after such a `project` would, if simply folded into
+    `Options.where` like any other post-project filter, silently test the WRONG grid's
+    cell IDs (the source dataset's, not the summarized zones'). `summarize_grid_cell` is
+    the correct target (`BaseAnalysis._validate_summarize_params` applies it against the
+    summarized grid), but it only accepts a literal comma-separated ID list, never a
+    general SQL predicate -- so only the two literal forms below are recognized; ANY
+    other way a filter's `where` mentions `grid_cell` after such a `project` (mixed with
+    another column or another AND-ed conjunct, or a non-literal comparison like `grid_cell
+    > 100`) is rejected outright, so the mis-execution this function exists to avoid can
+    never be reached silently -- see `_compile_single_input_chain`'s `FilterStep` branch,
+    the only caller.
+    """
+    try:
+        conjuncts = split_top_level_and(where)
+    except ExpressionError as exc:
+        raise PipelineError(f"step {step_no} (filter) where={where!r} is invalid: {exc}") from exc
+
+    references_grid_cell = False
+    for conjunct in conjuncts:
+        try:
+            names = set(pl.sql_expr(conjunct).meta.root_names())
+        except Exception as exc:  # pl.sql_expr's own exception types are not part of its stable API
+            raise PipelineError(f"step {step_no} (filter) where conjunct {conjunct!r} is invalid: {exc}") from exc
+        if "grid_cell" in names:
+            references_grid_cell = True
+            if len(conjuncts) != 1 or names != {"grid_cell"}:
+                raise PipelineError(
+                    f"step {step_no} (filter) where={where!r} mixes `grid_cell` with "
+                    "another column or another AND-ed conjunct, after a many-to-one "
+                    "`project` -- a post-project `grid_cell` filter must be that step's "
+                    "ENTIRE predicate (e.g. `grid_cell = 5` or `grid_cell IN (5, 6)`), "
+                    "since it targets the SUMMARIZED grid's cells, not a per-row "
+                    "condition on the source dataset"
+                )
+
+    if not references_grid_cell:
+        return None
+
+    match = _GRID_CELL_EQ_RE.match(conjuncts[0]) or _GRID_CELL_IN_RE.match(conjuncts[0])
+    if not match:
+        raise PipelineError(
+            f"step {step_no} (filter) where={where!r} names `grid_cell` after a "
+            "many-to-one `project` but isn't a literal ID selection -- only `grid_cell = "
+            "<id>` or `grid_cell IN (<id>, ...)` can be lowered onto the summarized "
+            "grid's own cell filter; a comparison like `grid_cell > 100` has no such "
+            "translation"
+        )
+    return ",".join(part.strip() for part in match.group(1).split(","))
 
 
 # ------------------------------------------------------------------------------------------
@@ -322,6 +431,7 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     filters = []
     calculate_steps = []
     group_step = None
+    summarize_grid_cell = None
     for i, step in enumerate(steps[1:], start=2):
         if isinstance(step, FilterStep):
             if group_step is not None:
@@ -330,7 +440,24 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                     "after a group step in a single-input pipeline -- a filter cannot "
                     "run after the collapse a group performs"
                 )
-            filters.append((i, step.where, bool(calculate_steps)))
+            # Only a many-to-one (summarizing) `project` needs this special-casing --
+            # see `_extract_post_project_grid_cell_filter`'s docstring. An identity
+            # project (no `summarize_by` in `option_kwargs`) filters the same grid its
+            # own rows already carry, so a `grid_cell` filter there is an ordinary
+            # filter, folded into `Options.where` below exactly as before.
+            grid_cell_ids = None
+            if "summarize_by" in option_kwargs:
+                grid_cell_ids = _extract_post_project_grid_cell_filter(i, step.where)
+            if grid_cell_ids is not None:
+                if summarize_grid_cell is not None:
+                    raise PipelineError(
+                        f"step {i} (filter) is a second post-project `grid_cell` filter "
+                        "-- only one is supported; combine them into a single "
+                        "`grid_cell IN (...)` filter"
+                    )
+                summarize_grid_cell = grid_cell_ids
+            else:
+                filters.append((i, step.where, bool(calculate_steps)))
             if step.as_ is not None:
                 value_names.add(step.as_)
         elif isinstance(step, CalculateStep):
@@ -432,6 +559,34 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             option_kwargs["group_by"] = ",".join(group_step.by)
         option_kwargs["group_aggregate"] = group_step.aggregate
 
+    if summarize_grid_cell is not None:
+        option_kwargs["summarize_grid_cell"] = summarize_grid_cell
+
+    # `output.sort`/`output.select` lower onto exactly `Options.sort`/`.select` -- the
+    # same flat semantics a `sort=`/`select=` query parameter already has (see
+    # `Output`'s docstring) -- unconditionally here, so every single-input shape this
+    # function compiles (including the project-only-reaggregation degenerate case, where
+    # `steps[1:]` is empty and every other `option_kwargs` entry above is untouched)
+    # picks them up, not just a chain that also has a `filter`/`group` step.
+    if pipeline.output.sort is not None:
+        option_kwargs["sort"] = pipeline.output.sort
+    if pipeline.output.select is not None:
+        option_kwargs["select"] = pipeline.output.select
+    # `output.color_map` lowers onto exactly `Options.color_map` -- the same flat
+    # semantics a `color_map=` query parameter already has (`BaseAnalysis.legend` reads
+    # it directly) -- unconditionally here, alongside `sort`/`select` immediately above,
+    # for the same reason: every single-input shape this function compiles, including
+    # the project-only-reaggregation degenerate case, must pick it up, not just a chain
+    # that also has a `filter`/`calculate`/`group` step. This was the one place `pipeline.
+    # output.color_map` was NOT lowered (see G9 in the data-analysis-separation-plan.md):
+    # `_compile_paired_notebook_shape` lowers it onto `PairedAnalysis.color_map` directly
+    # (that shape has no `Options` at all), but this function -- the single-input chain,
+    # which is what a named/dataset-scoped analysis's raster PNG/JPEG tile route actually
+    # compiles onto -- silently dropped it, so `color_map` had no effect on any
+    # single-input pipeline's rendered output.
+    if pipeline.output.color_map is not None:
+        option_kwargs["color_map"] = pipeline.output.color_map
+
     return _dataset_for(input_name, selection, base_path, **option_kwargs)
 
 
@@ -464,6 +619,16 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
             "raster output) is implemented for this shape; a tabular paired output "
             "would need materializing the full joined frame, which this compiler "
             "avoids for memory reasons"
+        )
+    if pipeline.output.sort is not None or pipeline.output.select is not None:
+        raise PipelineError(
+            "not yet supported in analysis pipelines: `output.sort`/`output.select` in "
+            "the paired (spatially-joined) pipeline shape -- both lower onto "
+            "`Options.sort`/`.select`, which only take effect through "
+            "`BaseAnalysis.apply_params()`'s sort/select stage, but this shape's "
+            "`fine_dataset`/`coarse_dataset` never call `apply_params()` at all "
+            "(`PairedAnalysis._prepare()` calls `.materialize()` on them directly) -- "
+            "setting either here would silently no-op rather than sort/narrow anything"
         )
 
     steps = pipeline.steps
@@ -502,6 +667,18 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
 
     _check_input_dimensions(coarse_name, coarse_selection)
     _check_input_dimensions(fine_name, fine_selection)
+
+    if coarse_selection.grid_cell is not None or fine_selection.grid_cell is not None:
+        raise PipelineError(
+            "not yet supported in analysis pipelines: an input `grid_cell` filter in "
+            "the paired (spatially-joined) pipeline shape -- it lowers onto "
+            "`Options.grid_cell`, which only takes effect via "
+            "`BaseAnalysis._apply_grid_cell()`, itself only invoked from "
+            "`apply_params()`; this shape's `fine_dataset`/`coarse_dataset` never call "
+            "`apply_params()` (`PairedAnalysis._prepare()` calls `.materialize()` on "
+            "them directly), so setting it here would silently no-op rather than "
+            "filter anything"
+        )
 
     if GRIDS[fine_selection.grid].grid_type != "raster":
         raise PipelineError(

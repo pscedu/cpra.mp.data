@@ -40,6 +40,7 @@ without going through `parse_pipeline` still enforces it, just surfaced as
 
 import re
 from collections.abc import Mapping
+from datetime import date
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -76,9 +77,23 @@ class PipelineError(ValueError):
 _NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 RESERVED_NAMES = frozenset({"value", "grid_cell"})
 
-# Scalar JSON types an `InputSelection` dimension filter value may take, bare or as a list
-# of them -- see `InputSelection._normalize_dimension_filters`.
-_SCALAR_TYPES = (str, int, float, bool)
+# Scalar types an `InputSelection` dimension filter value may take, bare or as a list of
+# them -- see `InputSelection._normalize_dimension_filters`.
+#
+# `date` is here because it is a REAL dimension value type, not a convenience: `Date` is
+# one of the five dtypes `structure/dimensions.csv` declares (`calendar_day`), and
+# `types.dimension_type` maps it to `datetime.date`, so `FilterDimensions.calendar_day` is
+# `list[date]` and FastAPI binds `?calendar_day=2019-01-01` to a real `date` object. A
+# pipeline built from a request's own filters (every named analysis, via
+# `analyses.resolve_analysis`) therefore receives `date`s, not strings. Omitting it made
+# every date-dimension analysis -- e.g. a `difference` over `calendar_day` on a daily
+# dataset -- fail validation outright.
+#
+# `datetime` needs no entry of its own: it subclasses `date`, so `isinstance` covers it.
+# Serialization already round-trips correctly both ways out -- `pipeline_to_query` emits
+# `str(date(2019, 1, 1))` == `"2019-01-01"`, and `pipeline.json` uses
+# `model_dump(mode="json")`, which renders a `date` extra as the same ISO string.
+_SCALAR_TYPES = (str, int, float, bool, date)
 
 # Output formats that render to a single raster/image surface (a GeoTIFF band or a map
 # tile pixel) rather than a table -- these can only ever carry ONE value column. Reused
@@ -121,6 +136,13 @@ class InputSelection(BaseModel):
     a scalar or a list of scalars (`extra="allow"`; every non-dataset-dimension key
     lands in `model_extra` and is normalized to a list by `_normalize_dimension_filters`).
 
+    `grid_cell` is a RESERVED field, not a dimension filter -- it is a Filter-group
+    parameter (like `Options.grid_cell`, which is exactly where it lowers to; see
+    `planner._dataset_for`), never an `extra` key, so it never lands in
+    `dimension_filters`/`__pydantic_extra__` and `_check_input_dimensions`'s "unknown
+    dimension" check never has to special-case it. Comma-separated IDs (or coordinate
+    pairs, for a raster input) -- the same string `Options.grid_cell` itself accepts.
+
     This model validates SHAPE only. Whether an extra key names a real dimension (and
     whether its value(s) are the right type/in range for that dimension, and whether the
     dimension even applies to this `variable`/`grid` combination) all need the catalog --
@@ -132,6 +154,7 @@ class InputSelection(BaseModel):
     variable: Variable
     time_unit: TimeUnit
     grid: Grid
+    grid_cell: str | None = None
 
     @model_validator(mode="after")
     def _normalize_dimension_filters(self) -> "InputSelection":
@@ -172,7 +195,12 @@ class InputSelection(BaseModel):
 class ProjectStep(BaseModel):
     """Move a dataset across grids via a crosswalk. `input` is optional -- an omitted
     `input` chains from the previous step's output (see `validate_pipeline`'s chaining
-    rule). `aggregate`, when given, must be one of `fold.DECOMPOSABLE_AGGREGATES` (the
+    rule). `aggregate`, when given, must be one of `fold.DECOMPOSABLE_AGGREGATES` OR
+    `count_by_value` (the one non-decomposable aggregate a `project` may still use --
+    `count_by_value` is a ZONAL aggregate, meaningful for a many-to-one reaggregation
+    exactly the way `sum`/`mean`/etc. are, even though it can't be folded across a
+    crosswalk's row-group boundary the way those can; see `_validate_step_rules`'s
+    `ProjectStep` branch, and contrast `GroupStep`, which still rejects it outright). The
     many-to-one-REQUIRES-aggregate / one-to-many-REJECTS-aggregate rule itself needs
     crosswalk knowledge to check and is deferred to compile time -- see
     `validate_pipeline`'s docstring).
@@ -290,12 +318,20 @@ class Output(BaseModel):
     rendered format; not checked here (needs to know the output is single-valued first,
     which itself needs compile-time schema knowledge for the general case -- see
     `validate_pipeline`).
+
+    `sort`/`select` are exactly `DataOptions.sort`/`.select`'s own flat semantics (a
+    comma-separated `[-]column` list, and a comma-separated column subset, respectively)
+    -- reused verbatim rather than a second grammar; see `planner._compile_single_input_
+    chain`, which is the only shape that lowers them today (the paired shape rejects
+    both -- see `_compile_paired_notebook_shape`'s docstring on why).
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
 
     format: DataFormat | TileFormat
     color_map: str | None = None
+    sort: str | None = None
+    select: str | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -402,7 +438,14 @@ def validate_pipeline(pipeline: Pipeline) -> None:
 
 def _validate_step_rules(i: int, step: Any) -> None:
     if isinstance(step, ProjectStep):
-        if step.aggregate is not None:
+        # `count_by_value` is exempted here, specifically for `project` -- it is a ZONAL
+        # aggregate (one categorical-count value per zone: the machinery
+        # `expressions.count_by_value_frame` already implements, reused unchanged via
+        # `Options.summarize_aggregate`), unlike `GroupStep`'s aggregate, which folds a
+        # running per-row value across an offset-batched read and has no meaning for
+        # `count_by_value` at all -- see `ProjectStep`'s own docstring and
+        # `fold.DECOMPOSABLE_AGGREGATES`.
+        if step.aggregate is not None and step.aggregate != "count_by_value":
             _require_decomposable(step.aggregate, f"step {i} (project) aggregate")
     elif isinstance(step, JoinStep):
         if step.type == "attribute":
@@ -482,7 +525,11 @@ def parse_pipeline(data: Mapping[str, Any]) -> Pipeline:
 # `InputSelection._normalize_dimension_filters` would have produced anyway from a bare
 # scalar, so the two are indistinguishable after decoding -- see `pipeline_from_query`'s
 # docstring on why this loses no information the query encoding could represent).
-_INPUT_SCALAR_FIELDS = frozenset({"variable", "time_unit", "grid"})
+# `grid_cell` belongs here, not in the dimension-filter branch: it's a declared
+# `InputSelection` field (a reserved Filter-group parameter -- see that model's
+# docstring), never split into a list, exactly like `Options.grid_cell`'s own flat query
+# spelling elsewhere in this package.
+_INPUT_SCALAR_FIELDS = frozenset({"variable", "time_unit", "grid", "grid_cell"})
 
 # Per-op field whitelist and which of those fields are comma-list-valued, for the
 # `step.<i>.<field>` namespace. `where` is deliberately never in a list-fields set: it is
@@ -505,7 +552,7 @@ _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
     "group": frozenset({"by"}),
 }
 
-_OUTPUT_FIELDS = frozenset({"format", "color_map"})
+_OUTPUT_FIELDS = frozenset({"format", "color_map", "sort", "select"})
 
 
 def _insert_dotted(tree: dict[str, Any], segments: list[str], value: str, full_key: str) -> None:
@@ -708,6 +755,8 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
         params[f"{prefix}.variable"] = str(selection.variable)
         params[f"{prefix}.time_unit"] = str(selection.time_unit)
         params[f"{prefix}.grid"] = str(selection.grid)
+        if selection.grid_cell is not None:
+            params[f"{prefix}.grid_cell"] = selection.grid_cell
         for dim_name, values in selection.dimension_filters.items():
             params[f"{prefix}.{dim_name}"] = ",".join(str(v) for v in values)
 
@@ -749,5 +798,9 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
     params["output.format"] = str(pipeline.output.format)
     if pipeline.output.color_map is not None:
         params["output.color_map"] = pipeline.output.color_map
+    if pipeline.output.sort is not None:
+        params["output.sort"] = pipeline.output.sort
+    if pipeline.output.select is not None:
+        params["output.select"] = pipeline.output.select
 
     return dict(sorted(params.items(), key=lambda item: _query_sort_key(item[0])))

@@ -6,10 +6,10 @@ from sqlmodel import Field, SQLModel
 
 from cpra.mp.data.analysis.parameters import (  # noqa: F401
     CalculateEntry,
+    DataOptions,
     DatasetDimensions,
     FilterDimensions,
     Options,
-    ScalarOptions,
 )
 from cpra.mp.data.analysis.types import (
     CompressionAlgorithm,
@@ -22,12 +22,13 @@ class Compression(BaseModel):
     compression_level: int = 6
 
 
-class TileQuery(ScalarOptions, FilterDimensions):
-    """Inherits `ScalarOptions`, not `Options`: FastAPI binds every query-model field as
-    a flat scalar query parameter, and `Options.calculate` is a structured list with no
-    flat spelling -- it arrives as the dotted `calculate.N.*` parameters, parsed off the
-    raw query string by `api.__init__.parse_calculate_query` and set onto the `Options`
-    object this model's `options` property builds.
+class TileQuery(DataOptions, FilterDimensions):
+    """Inherits `DataOptions`, not `Options`: the data/tile HTTP endpoints accept exactly
+    dimension filters plus `grid_cell`/`where`/`sort`/`select`/`color_map` (and
+    compression, on `DataQuery` below) -- `Options`'s pipeline-execution fields
+    (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) are engine-internal as of
+    Phase 4 and are rejected explicitly if sent on the query string (see
+    `api.__init__.reject_retired_params`) rather than silently ignored.
     """
 
     model_config = ConfigDict(use_enum_values=True)
@@ -131,7 +132,63 @@ class Visualization(BaseModel):
     variables: list[str] | None = None
 
 
+class Analysis(BaseModel):
+    """Catalog entry for a named analysis (plan §3.2a/§5.2) -- served by
+    `/v1/analyses.json`, mirroring `Visualization`/`/v1/visualizations.json` exactly:
+    built from each registered class's `Meta.__dict__` (see `api/__init__.py::
+    analyses_catalog`), so a field this model doesn't recognize is silently dropped
+    (pydantic's default `extra="ignore"`) and one Meta doesn't declare (e.g. `legend` for
+    an analysis with none) falls back to its default here.
+    """
+
+    name: str
+    label: str
+    type: str
+    variables: list[str] | None = None
+    legend: str | None = None
+    result_kind: str | None = None
+
+
+class AnalysisQuery(DataOptions, FilterDimensions):
+    """Accepted request parameters for the named-analysis routes (plan §3.2a): the
+    dataset's dimension filters (from `FilterDimensions`) plus `DataOptions`'s
+    `grid_cell`/`where`/`sort`/`select`/`color_map`. Deliberately NOT `Options` -- that
+    also carries the `calculate`/`group_by`/`summarize_*` pipeline-execution fields,
+    none of which a named analysis accepts directly: a named analysis's transformation
+    is entirely its own declared parameters plus its `Meta`-fixed pipeline shape.
+
+    A named analysis's own declared parameters (`dimension`, `order`,
+    `marsh_threshold`, ...) have no fixed field set here -- they vary per analysis and
+    are read directly off the raw query string by the route (see
+    `api.__init__._analysis_extra_params`) and handed to `resolve_analysis(params=...)`
+    for the registry itself to validate.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    @property
+    def filter_dimensions(self):
+        return FilterDimensions(**dict(self))
+
+
+class AnalysisDataQuery(AnalysisQuery, Compression):
+    model_config = ConfigDict(use_enum_values=True)
+
+    @property
+    def compression(self):
+        return Compression(**dict(self))
+
+
 class VisualizationQuery(DataQuery):
+    # A named analysis (plan §5.3, `cpra.mp.data.analyses.ANALYSES`), e.g. `difference` or
+    # `concatenate`. Deliberately the ONLY field this model declares for the analysis --
+    # its own parameters (`dimension`/`order`/...) have no fixed field set (see
+    # `AnalysisQuery`'s docstring above) and are instead read directly off the raw request
+    # query string by the visualization layer itself (`DatasetVisualization.
+    # resolved_analysis`, in `cpra.mp.data.visualizations.base`), the same way
+    # `api.__init__._analysis_extra_params` does for the plain analysis routes -- so no
+    # other change is needed here, or in `api/__init__.py`, to thread them through.
+    analysis: str | None = None
     end_date: date | None = None
     height: int = 400
     start_date: date | None = None

@@ -1,7 +1,6 @@
 import datetime as dt
 import itertools
 import json
-import re
 from typing import final
 
 import altair as alt
@@ -30,13 +29,19 @@ class TimeSeriesLine(DatasetVisualization):
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
-        negate_param = self.params.get("negate")
-        negate_dimension = re.match(r"\w+", negate_param).group() if negate_param else None
+        # Which dimensions the resolved analysis's own pipeline already collapsed away
+        # (e.g. `difference`'s two selected values of its own `dimension` param). A
+        # collapsed dimension has nothing left to compare across; with no analysis
+        # selected, nothing is collapsed.
+        resolved = self.resolved_analysis
+        excluded_dimensions = set(resolved.collapsed_dimensions) if resolved is not None else set()
 
         compare_dimensions = {
             d: self.params[d]
             for d in DIMENSIONS.keys()
-            if isinstance(self.params.get(d), (list, tuple)) and len(self.params.get(d)) > 1 and d != negate_dimension
+            if isinstance(self.params.get(d), (list, tuple))
+            and len(self.params.get(d)) > 1
+            and d not in excluded_dimensions
         }
         # Limit compare dimensions to the number of available channels.
         # TODO: Adjust params to remove additional compare dimensions from the data.
@@ -139,7 +144,7 @@ class TimeSeriesLine(DatasetVisualization):
         layer = [main_line, points, rules]
 
         # Add a horizontal rule at zero for difference charts.
-        if self.params.get("negate"):
+        if resolved is not None and resolved.result_kind == "difference":
             layer.insert(
                 0,
                 self.get_base_chart(self.data_source, self.time_column)

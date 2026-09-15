@@ -9,6 +9,7 @@ following `tests/factories.py`'s own convention.
 """
 
 import copy
+from datetime import date
 
 import pytest
 
@@ -113,6 +114,26 @@ class TestInputSelection:
         with pytest.raises(ValueError):
             parse_pipeline(data)
 
+    def test_date_filter_value_accepted(self):
+        """`date` is a real dimension value type, not an exotic one: `calendar_day` is
+        declared `Date` in `structure/dimensions.csv`, so `types.dimension_type` types
+        `FilterDimensions.calendar_day` as `list[date]` and FastAPI binds
+        `?calendar_day=2019-01-01` to a `datetime.date`. Omitting it from the scalar
+        whitelist rejected every request that filtered a daily dataset by day.
+        """
+        data = simple_pipeline()
+        data["inputs"]["marsh"]["calendar_day"] = [date(2019, 1, 1), date(2070, 12, 31)]
+        pipeline = parse_pipeline(data)
+        assert pipeline.inputs["marsh"].dimension_filters == {
+            "calendar_day": [date(2019, 1, 1), date(2070, 12, 31)]
+        }
+
+    def test_scalar_date_filter_value_accepted(self):
+        data = simple_pipeline()
+        data["inputs"]["marsh"]["calendar_day"] = date(2019, 1, 1)
+        pipeline = parse_pipeline(data)
+        assert pipeline.inputs["marsh"].dimension_filters == {"calendar_day": [date(2019, 1, 1)]}
+
     def test_missing_required_dataset_dimension_rejected(self):
         data = simple_pipeline()
         del data["inputs"]["marsh"]["grid"]
@@ -124,6 +145,39 @@ class TestInputSelection:
         data["inputs"]["marsh"]["variable"] = "not_a_real_variable"
         with pytest.raises(ValueError):
             parse_pipeline(data)
+
+
+class TestInputSelectionGridCell:
+    """`grid_cell` on an input is a reserved Filter-group parameter (forwarded to
+    `Options.grid_cell` in `planner.py::_dataset_for`), not a dimension filter -- it must
+    never show up in `InputSelection.dimension_filters`, and it must round-trip through
+    the dotted-query encoding like any other declared input field.
+    """
+
+    def test_declared_field_not_a_dimension_filter(self):
+        data = simple_pipeline()
+        data["inputs"]["marsh"]["grid_cell"] = "5,6"
+        pipeline = parse_pipeline(data)
+        assert pipeline.inputs["marsh"].grid_cell == "5,6"
+        assert pipeline.inputs["marsh"].dimension_filters == {}
+
+    def test_omitted_grid_cell_defaults_to_none(self):
+        pipeline = parse_pipeline(simple_pipeline())
+        assert pipeline.inputs["marsh"].grid_cell is None
+
+    def test_round_trips_through_query(self):
+        data = simple_pipeline()
+        data["inputs"]["marsh"]["grid_cell"] = "5,6"
+        pipeline = parse_pipeline(data)
+        query = pipeline_to_query(pipeline)
+        assert query["input.marsh.grid_cell"] == "5,6"
+        pipeline2 = pipeline_from_query(query)
+        assert pipeline2.inputs["marsh"].grid_cell == "5,6"
+
+    def test_omitted_from_query_when_unset(self):
+        pipeline = parse_pipeline(simple_pipeline())
+        query = pipeline_to_query(pipeline)
+        assert "input.marsh.grid_cell" not in query
 
 
 class TestInputNaming:
@@ -150,11 +204,16 @@ class TestInputNaming:
 
 
 class TestProjectStep:
-    def test_aggregate_must_be_decomposable(self):
+    def test_count_by_value_accepted_as_zonal_aggregate(self):
+        # `count_by_value` is not in `fold.DECOMPOSABLE_AGGREGATES` (still correctly
+        # rejected for a `group` step -- see `TestGroupStep.test_aggregate_must_be_
+        # decomposable`), but it IS a valid ZONAL aggregate, so a `project` step permits
+        # it specifically -- this is the documented "Categorical Count per Zone" query
+        # (docs/data-analysis-api.md) expressed as a pipeline.
         data = simple_pipeline()
         data["steps"][0]["aggregate"] = "count_by_value"
-        with pytest.raises(PipelineError):
-            parse_pipeline(data)
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[0].aggregate == "count_by_value"
 
     def test_decomposable_aggregate_accepted(self):
         data = simple_pipeline()
@@ -528,6 +587,44 @@ class TestOutputRule:
             parse_pipeline(data)
 
 
+class TestOutputSortSelect:
+    """`output.sort`/`output.select` mirror `ScalarOptions.sort`/`.select`'s flat
+    semantics exactly (see `parameters.py`); at the pipeline-representation layer they
+    are just optional strings, parsed and round-tripped like `color_map`. Only
+    `_compile_single_input_chain` (planner.py) actually lowers them today -- see
+    `TestOutputSortSelectCompile`/`TestPairedOutputSortSelectRejection` in
+    test_pipeline_exec.py for the compile-time behavior these representation-level tests
+    don't cover.
+    """
+
+    def test_sort_and_select_parse(self):
+        data = simple_pipeline(output={"format": "csv", "sort": "-value", "select": "grid_cell,value"})
+        pipeline = parse_pipeline(data)
+        assert pipeline.output.sort == "-value"
+        assert pipeline.output.select == "grid_cell,value"
+
+    def test_omitted_sort_select_default_to_none(self):
+        pipeline = parse_pipeline(simple_pipeline())
+        assert pipeline.output.sort is None
+        assert pipeline.output.select is None
+
+    def test_sort_and_select_round_trip_through_query(self):
+        data = simple_pipeline(output={"format": "csv", "sort": "-value", "select": "grid_cell,value"})
+        pipeline = parse_pipeline(data)
+        query = pipeline_to_query(pipeline)
+        assert query["output.sort"] == "-value"
+        assert query["output.select"] == "grid_cell,value"
+        pipeline2 = pipeline_from_query(query)
+        assert pipeline2.output.sort == "-value"
+        assert pipeline2.output.select == "grid_cell,value"
+
+    def test_omitted_sort_select_absent_from_query(self):
+        pipeline = parse_pipeline(simple_pipeline())
+        query = pipeline_to_query(pipeline)
+        assert "output.sort" not in query
+        assert "output.select" not in query
+
+
 class TestPipelineShapeRules:
     def test_empty_inputs_rejected(self):
         data = simple_pipeline()
@@ -557,10 +654,13 @@ class TestPipelineShapeRules:
         """`Pipeline.model_validate` alone does not run `validate_pipeline`'s business
         rules -- e.g. a non-decomposable aggregate is shape-valid (a real
         `AggregateFunction` member) and so is accepted here, only to be rejected by
-        `validate_pipeline` explicitly.
+        `validate_pipeline` explicitly. `count_by_value` is used on a `group` step here
+        (not `project`, which permits it -- see `TestProjectStep.
+        test_count_by_value_accepted_as_zonal_aggregate` -- `group` still rejects it, the
+        one `AggregateFunction` member `fold.DECOMPOSABLE_AGGREGATES` excludes).
         """
         data = simple_pipeline()
-        data["steps"][0]["aggregate"] = "count_by_value"
+        data["steps"].append({"op": "group", "by": [], "aggregate": "count_by_value"})
         pipeline = Pipeline.model_validate(data)
         with pytest.raises(PipelineError):
             validate_pipeline(pipeline)
@@ -681,6 +781,14 @@ class TestQueryCodecRoundTrip:
         query = pipeline_to_query(pipeline)
         assert "step.1.as" not in query
         assert "output.color_map" not in query
+
+    def test_count_by_value_project_aggregate_round_trips(self):
+        # `count_by_value` is only special-cased at the compile layer (planner.py) --
+        # the representation/codec layer treats it like any other aggregate string.
+        data = simple_pipeline()
+        data["steps"][0]["aggregate"] = "count_by_value"
+        _, query = self._round_trip(data)
+        assert query["step.1.aggregate"] == "count_by_value"
 
 
 class TestQueryCodecMalformed:

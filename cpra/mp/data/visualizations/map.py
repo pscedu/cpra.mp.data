@@ -44,51 +44,71 @@ class Map(DatasetVisualization):
         so the map style only needs a single global-state lookup per feature
         rather than a full color expression evaluation per feature per frame.
 
+        Reads the resolved analysis first when `analysis=` is selected -- run through
+        EXACTLY the same `compile_pipeline` -> `apply_params` -> `materialize` machinery
+        the named-analysis HTTP routes use (see `api.__init__`'s `_compile_analysis_
+        pipeline`) -- falling back to a plain `create_analysis` + the same
+        `apply_params()` orchestration otherwise, so a plain (unanalyzed) map still
+        honors `grid_cell`/`where` -- calling only `_apply_calculate_params`/
+        `_apply_group_params` here used to silently skip them.
+
+        Bug this replaces: the storage format is long (one row per grid cell, after
+        grouping/aggregation collapses every other dimension), not the wide,
+        one-numeric-named-column-per-grid-cell shape a `cs.matches(r"^[0-9]")` selector
+        used to assume -- which matched nothing here and silently returned `{}` for every
+        caller, analysis or not.
+
         Returns:
             A dictionary mapping string grid cell IDs to hex color strings.
         """
         if self.grid.grid_type != "vector":
             return {}
 
-        import polars.selectors as cs
+        resolved = self.resolved_analysis
+        if resolved is not None:
+            import asyncio
 
-        from cpra.mp.data.analysis import create_analysis
-        from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+            from cpra.mp.data.analysis.planner import compile_pipeline
 
-        dataset_dimensions = DatasetDimensions(
-            variable=self.variable.name,
-            grid=self.grid.name,
-            time_unit=self.time_unit,
-        )
+            compiled = compile_pipeline(resolved.pipeline)
+            asyncio.run(compiled.apply_params())
+            df = compiled.materialize()
+        else:
+            import asyncio
 
-        filter_fields = set(FilterDimensions.model_fields.keys())
-        filter_dimensions = FilterDimensions(
-            **{k: v for k, v in self.params.items() if k in filter_fields and v is not None}
-        )
+            from cpra.mp.data.analysis import create_analysis
+            from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
 
-        options_fields = set(Options.model_fields.keys())
-        options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
+            dataset_dimensions = DatasetDimensions(
+                variable=self.variable.name,
+                grid=self.grid.name,
+                time_unit=self.time_unit,
+            )
 
-        dataset = create_analysis(dataset_dimensions, filter_dimensions, options)
-        dataset._apply_calculate_params()
-        dataset._apply_group_params()
+            filter_fields = set(FilterDimensions.model_fields.keys())
+            filter_dimensions = FilterDimensions(
+                **{k: v for k, v in self.params.items() if k in filter_fields and v is not None}
+            )
 
-        df = dataset.lf.collect()
+            options_fields = set(Options.model_fields.keys())
+            options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
 
-        if df.is_empty():
+            dataset = create_analysis(dataset_dimensions, filter_dimensions, options)
+            asyncio.run(dataset.apply_params())
+            df = dataset.materialize()
+
+        if df.is_empty() or "grid_cell" not in df.columns or "value" not in df.columns:
             return {}
 
-        value_cols = df.select(cs.matches(r"^[0-9]")).columns
-        if not value_cols:
+        values = {
+            int(row["grid_cell"]): row["value"]
+            for row in df.select("grid_cell", "value").iter_rows(named=True)
+            if row["value"] is not None
+        }
+        if not values:
             return {}
 
-        # Take the first row of values (single time point after grouping)
-        row = df.select(value_cols).row(0, named=True)
-        values = {int(col): val for col, val in row.items() if val is not None}
-
-        is_difference = self.params.get("negate") is not None
-
-        if is_difference:
+        if self._is_difference():
             stops = self._difference_breaks(self.variable)
             return {str(fid): self._interpolate_stop_color(val, stops) for fid, val in values.items()}
 
@@ -277,34 +297,63 @@ class Map(DatasetVisualization):
         }
 
     def _get_vector_tile_url_template(self) -> str:
-        """Generate the tile URL template for the dynamic MVT endpoint."""
-        base_url = str(
-            self.request.url_for(
-                "get_vector_tile",
-                variable=self.variable.name,
-                grid=self.grid.name,
-                time_unit=self.time_unit,
-                z="{z}",
-                x="{x}",
-                y="{y}",
+        """Generate the tile URL template for the dynamic MVT endpoint.
+
+        Routes to the named analysis's own vector-tile endpoint when `analysis=` is
+        selected. Builds the query string from a known field ALLOWLIST -- the target
+        route's own query model fields, plus (once an analysis is selected) whatever
+        extra parameters that analysis itself declares (`dimension`/`order`/...) -- rather
+        than a denylist of fields to strip: a denylist silently forwards any newly-added
+        `VisualizationQuery` field to a route that, once an analysis is selected, rejects
+        anything it doesn't recognize outright (its `Parameters` model is `extra=
+        "forbid"`; see `analyses/base.py`).
+        """
+        from cpra.mp.data.api.models import AnalysisQuery, TileQuery
+
+        resolved = self.resolved_analysis
+
+        if resolved is not None:
+            base_url = str(
+                self.request.url_for(
+                    "get_dataset_analysis_vector_tile",
+                    variable=self.variable.name,
+                    grid=self.grid.name,
+                    time_unit=self.time_unit,
+                    analysis_name=self._analysis_name,
+                    z="{z}",
+                    x="{x}",
+                    y="{y}",
+                )
             )
-        )
-        exclude = {
-            "color_map",
-            "end_date",
-            "height",
-            "is_overlay",
-            "request",
-            "show_grid_labels",
-            "show_grid_lines",
-            "show_projects",
-            "show_water",
-            "start_date",
-            "width",
-        }
+            allowed = set(AnalysisQuery.model_fields) | set(self._analysis_params)
+        else:
+            base_url = str(
+                self.request.url_for(
+                    "get_vector_tile",
+                    variable=self.variable.name,
+                    grid=self.grid.name,
+                    time_unit=self.time_unit,
+                    z="{z}",
+                    x="{x}",
+                    y="{y}",
+                )
+            )
+            allowed = set(TileQuery.model_fields)
+
+        # `self.params` alone is missing a named analysis's own parameters
+        # (`dimension`/`order`/...) for a request-driven visualization: `VisualizationQuery`
+        # doesn't declare them (it can't -- each analysis declares its own), so FastAPI's
+        # query-model binding never puts them in `self.params` at all -- only
+        # `_analysis_params`'s own extra scan of the raw query string recovers them (see
+        # its docstring in `base.py`). Merging it in here is what actually lets those
+        # parameters reach the follow-up tile request; `_analysis_params` never overlaps
+        # `self.params`'s own `VisualizationQuery`-declared keys, so this can't clobber
+        # anything already there.
+        params_source = {**self.params, **self._analysis_params} if resolved is not None else self.params
+
         query_params = []
-        for key, value in self.params.items():
-            if value is None or key in exclude:
+        for key, value in params_source.items():
+            if value is None or key not in allowed:
                 continue
             if isinstance(value, (list, tuple)):
                 for v in value:
@@ -827,35 +876,79 @@ class Map(DatasetVisualization):
     def _get_tile_url_template(self) -> str:
         """Generate the tile URL template for raster data.
 
+        Routes to the named analysis's own tile endpoint when `analysis=` is selected,
+        forwarding only that route's own known fields plus the analysis's own declared
+        parameters (`dimension`/`order`/...) -- see `_get_vector_tile_url_template`'s
+        docstring for why forwarding the full `VisualizationQuery` field set would
+        otherwise trip the analysis route's strict (`extra="forbid"`) parameter
+        validation. Unchanged (the plain per-dataset tile endpoint) when no analysis was
+        selected.
+
         Returns:
             A tile URL template with {z}/{x}/{y} placeholders.
         """
+        resolved = self.resolved_analysis
+        analysis_name = self._analysis_name
+
         if self.request:
-            base_url = str(
-                self.request.url_for(
-                    "get_model_tile",
-                    variable=self.variable.name,
-                    grid=self.grid.name,
-                    time_unit=self.time_unit,
-                    z="{z}",
-                    x="{x}",
-                    y="{y}",
-                    format="png",
+            if resolved is not None:
+                base_url = str(
+                    self.request.url_for(
+                        "get_dataset_analysis_tile",
+                        variable=self.variable.name,
+                        grid=self.grid.name,
+                        time_unit=self.time_unit,
+                        analysis_name=analysis_name,
+                        z="{z}",
+                        x="{x}",
+                        y="{y}",
+                        format="png",
+                    )
                 )
-            )
+            else:
+                base_url = str(
+                    self.request.url_for(
+                        "get_model_tile",
+                        variable=self.variable.name,
+                        grid=self.grid.name,
+                        time_unit=self.time_unit,
+                        z="{z}",
+                        x="{x}",
+                        y="{y}",
+                        format="png",
+                    )
+                )
         else:
-            base_url = (
+            base = (
                 f"https://api.mpdp.coastal.la.gov/v1/datasets"
                 f"/{self.variable.name}/{self.grid.name}/{self.time_unit}"
-                f"/data/{{z}}/{{x}}/{{y}}.png"
+            )
+            base_url = (
+                f"{base}/analyses/{analysis_name}/data/{{z}}/{{x}}/{{y}}.png"
+                if resolved is not None
+                else f"{base}/data/{{z}}/{{x}}/{{y}}.png"
             )
 
-        # Build query string from filter dimensions and options
+        if resolved is not None:
+            from cpra.mp.data.api.models import AnalysisQuery
+
+            allowed = set(AnalysisQuery.model_fields) | set(self._analysis_params)
+            # See `_get_vector_tile_url_template`'s identical merge for why
+            # `self._analysis_params` has to be folded in here: a named analysis's own
+            # parameters (`dimension`/`order`/...) never land in `self.params` itself for a
+            # request-driven visualization, since `VisualizationQuery` has no fixed field
+            # set for them.
+            params_source = {
+                k: v for k, v in {**self.params, **self._analysis_params}.items() if k in allowed
+            }
+        else:
+            # Build query string from filter dimensions and options
+            exclude = {"height", "width", "start_date", "end_date", "request"}
+            params_source = {k: v for k, v in self.params.items() if k not in exclude}
+
         query_params = []
-        for key, value in self.params.items():
+        for key, value in params_source.items():
             if value is None:
-                continue
-            if key in ("height", "width", "start_date", "end_date", "request"):
                 continue
             if isinstance(value, (list, tuple)):
                 for v in value:
@@ -887,7 +980,7 @@ class Map(DatasetVisualization):
         calendar_day = self.params.get("calendar_day", [])
         model_group_id = self.params.get("model_group_id", [])
 
-        is_difference = self.params.get("negate") is not None
+        is_difference = self._is_difference()
         is_overlay = self.params.get("is_overlay", True)
 
         # Insert data layers after "initial-conditions-water" so they render
@@ -902,7 +995,7 @@ class Map(DatasetVisualization):
             style["sources"]["data"] = (
                 self.difference_raster_source(tile_urls=[tile_url])
                 if is_difference
-                else self.raster_source(tile_urls=[tile_url], color_map=("lnd_chng" if self._is_lnd_chng() else None))
+                else self.raster_source(tile_urls=[tile_url], color_map=self._legend_name())
             )
             data_layers = self.raster_layers("data-layer", "data")
         else:
@@ -957,8 +1050,7 @@ class Map(DatasetVisualization):
             style["layers"].insert(water_insert_idx, style["layers"].pop(insert_idx - 1))
 
         # Include legend metadata for UI rendering
-        difference = self.params.get("negate") is not None
-        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(difference)]}}
+        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(is_difference)]}}
 
         # Set an empty object as the default value for selection colors.
         # TODO: Add support for setting initial selection colors based on the value
@@ -967,13 +1059,30 @@ class Map(DatasetVisualization):
 
         return style
 
-    def _is_lnd_chng(self) -> bool:
-        """Are we calculating land change?
+    def _is_difference(self) -> bool:
+        """Is this a difference result?
+
+        Reads the resolved analysis's own `result_kind` when `analysis=` is selected
+        (`difference`'s `Meta.result_kind = "difference"`); a map with no analysis
+        selected is never a difference.
 
         Returns:
-            Boolean indicating whether this is land change.
+            Boolean indicating whether this is a difference result.
         """
-        return self.variable.name == "lnd_type" and self.params.get("multiply10") is not None
+        resolved = self.resolved_analysis
+        return resolved is not None and resolved.result_kind == "difference"
+
+    def _legend_name(self) -> str | None:
+        """The named legend (a `cpra.mp.data.legends.LEGENDS` key) this map's coloring
+        should use, or `None` for "no override -- fall back to the variable's own
+        default legend" (see `_get_legend`, which does exactly that).
+
+        Reads the resolved analysis's own declared `legend` when `analysis=` is selected
+        (`concatenate`'s `Meta.legend = "lnd_chng"`; `difference` declares none); a map
+        with no analysis selected has no override.
+        """
+        resolved = self.resolved_analysis
+        return resolved.legend if resolved is not None else None
 
     def _get_legend(self) -> Legend | None:
         """Get the current legend.
@@ -981,11 +1090,7 @@ class Map(DatasetVisualization):
         Returns:
             A Legend instance for the current map.
         """
-        # If we're doing digit concatenation on land type, use the land change
-        # as the variable.
-        if self._is_lnd_chng():
-            return LEGENDS.get("lnd_chng")
-        return self.variable.legend or LEGENDS.get("default")
+        return LEGENDS.get(self._legend_name()) or self.variable.legend or LEGENDS.get("default")
 
     def _get_legend_metadata(self, difference: bool = False) -> dict[str, Any]:
         """Generate legend metadata for the style response.
@@ -1035,7 +1140,7 @@ class Map(DatasetVisualization):
             steps.append(step)
 
         return {
-            "title": "Land Change" if self._is_lnd_chng() else var.label,
+            "title": "Land Change" if self._legend_name() == "lnd_chng" else var.label,
             "subtitle": display_unit(var),
             "type": legend.type,
             "steps": steps,

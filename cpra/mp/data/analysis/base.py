@@ -22,8 +22,7 @@ LazyFrame) through five ordered stages, run once by `apply_params`:
    filter; raster: per band, once pixels are read). `options.grid_cell`, if given, is
    applied here too, via the `_apply_grid_cell` hook.
 2. **calculate** (`_apply_calculate_params`) -- the generic `calculate` entries
-   (expression/where pairs; the legacy `negate`/`multiply10`/`multiply100` parameters
-   are rewritten into them as sugar) conditionally rewrite `value` in place (vector), or
+   (expression/where pairs) conditionally rewrite `value` in place (vector), or
    are validated and stashed on `self._calculate_plans` for the pixel-read paths to
    apply per band (raster, whose `self.lf` at this point is still the band-metadata
    table, not pixels -- see `RasterGridAnalysis._band_calculate_passes`).
@@ -36,8 +35,6 @@ LazyFrame) through five ordered stages, run once by `apply_params`:
    convert to another grid's cells via the `_apply_transform_params_impl` hook (vector: a
    crosswalk-table join; raster: a zonal reduction against a crosswalk raster, which is
    also where a raster's `self.lf` first becomes a real per-pixel-derived tabular frame).
-   `_apply_unpivot_param` runs after; it is a documented no-op today (data is already long
-   format on disk) kept for the `unpivot` parameter's backward API compatibility.
 5. **sort/select** (`_apply_sort_params`) -- `sort`/`select` order and narrow the final
    columns.
 
@@ -141,11 +138,11 @@ class BaseAnalysis:
         # attribute instead now.
         self._value_where = None
         # Set by `_apply_calculate_params`: the validated `CalculatePlan`s for this
-        # request (generic `calculate` entries, or the legacy negate/multiply10/
-        # multiply100 sugar), in application order. Empty when the request has no
-        # calculate parameters at all. A vector frame consumes them immediately inside
-        # `_apply_calculate_params`; the raster pixel-read paths (tile/write/summarize)
-        # read this attribute later, per band, via `_band_calculate_passes`.
+        # request (the generic `calculate` entries), in application order. Empty when
+        # the request has no calculate parameters at all. A vector frame consumes them
+        # immediately inside `_apply_calculate_params`; the raster pixel-read paths
+        # (tile/write/summarize) read this attribute later, per band, via
+        # `_band_calculate_passes`.
         self._calculate_plans = []
         # Also set by `_apply_filter_params`: whether `where` produced at least one
         # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
@@ -386,38 +383,14 @@ class BaseAnalysis:
 
     def _resolve_calculate_entries(self):
         """The effective calculate entries for this request, as `(label, expression,
-        where)` triples in application order: the generic `options.calculate` list when
-        given, otherwise the legacy `negate`/`multiply10`/`multiply100` parameters
-        rewritten as their documented sugar (`value * -1` / `value * 10` / `value * 100`
-        against each parameter's own condition, in that fixed order). Mixing the two
-        surfaces in one request is rejected outright -- there is no defined interleaving
-        between a legacy parameter and an indexed entry, and entries compose sequentially,
-        so their relative order matters.
+        where)` triples in application order: the generic `options.calculate` list,
+        applied in list order (entry N+1 sees entry N's output).
         """
-        legacy = [
-            ("negate", self.options.negate, -1),
-            ("multiply10", self.options.multiply10, 10),
-            ("multiply100", self.options.multiply100, 100),
-        ]
-        legacy_given = [(name, where, factor) for name, where, factor in legacy if where is not None]
         generic = self.options.calculate or []
-
-        if generic and legacy_given:
-            names = ", ".join(name for name, _where, _factor in legacy_given)
-            self._error(
-                f"legacy calculate parameter(s) ({names}) cannot be mixed with generic "
-                "calculate entries in one request -- their relative application order "
-                "would be ambiguous, and calculate entries apply sequentially; rewrite "
-                "the legacy parameter(s) as entries instead (negate=X is "
-                "calculate.N.expression=value * -1 with calculate.N.where=X)"
-            )
-
-        if generic:
-            return [
-                (f"calculate.{i}", entry.expression, entry.where)
-                for i, entry in enumerate(generic, start=1)
-            ]
-        return [(name, f"value * {factor}", where) for name, where, factor in legacy_given]
+        return [
+            (f"calculate.{i}", entry.expression, entry.where)
+            for i, entry in enumerate(generic, start=1)
+        ]
 
     def _apply_calculate_params(self):
         """Apply the calculate stage: expression/where entries that rewrite `value` for
@@ -525,8 +498,8 @@ class BaseAnalysis:
         only a VALUE conjunct, which never reaches this method as a row filter at all
         (see the next paragraph).
 
-        A `where` VALUE conjunct and the `calculate` parameters (`negate`/`multiply10`/
-        `multiply100`) are deliberately NOT included: wherever this method's caller
+        A `where` VALUE conjunct and the `calculate` parameters are deliberately NOT
+        included: wherever this method's caller
         (`_apply_group_params`, gating a vector `group_by`) applies, a value conjunct is
         always a `with_columns` mask, never a row-dropping `.filter()` -- masking is
         exactly what lets it compose with the group_by's own aggregate instead of
@@ -584,7 +557,6 @@ class BaseAnalysis:
     async def _apply_transform_params(self):
         """Apply transform and extract parameters to the LazyFrame or image."""
         await self._apply_transform_params_impl()
-        self._apply_unpivot_param()
 
     async def _apply_transform_params_impl(self):
         """Apply `summarize_by`/`summarize_aggregate`. See the module/class docstring's
@@ -614,33 +586,20 @@ class BaseAnalysis:
         return True
 
     def _reject_calculate_with_count_by_value(self):
-        """count_by_value counts DISTINCT values; a calculate entry (generic, or the
-        legacy negate/multiply10/multiply100 sugar) rewrites a value BEFORE it would be
-        counted, which changes which raw values collapse into "the same" category without
-        changing what the caller meant by "distinct" -- e.g. multiply10 turns land-type
-        codes 1 and 2 into 10 and 20, not into two different categories, but does change
-        what a downstream consumer sees as the reported "value" for each count. Every
-        other aggregate folds a calculate entry through unremarkably (a rewritten number
-        is still a meaningful sum/mean/min/max), so this is a rejection specific to
-        count_by_value, not a general calculate/summarize incompatibility. Checked against
-        `self.options` directly (not `self.lf`) so it fires before the eventual `group_by`
-        even if `_apply_calculate_params` already ran earlier in the pipeline.
+        """count_by_value counts DISTINCT values; a calculate entry rewrites a value
+        BEFORE it would be counted, which changes which raw values collapse into "the
+        same" category without changing what the caller meant by "distinct" -- e.g. a
+        `value * 10` entry turns land-type codes 1 and 2 into 10 and 20, not into two
+        different categories, but does change what a downstream consumer sees as the
+        reported "value" for each count. Every other aggregate folds a calculate entry
+        through unremarkably (a rewritten number is still a meaningful sum/mean/min/max),
+        so this is a rejection specific to count_by_value, not a general
+        calculate/summarize incompatibility. Checked against `self.options` directly (not
+        `self.lf`) so it fires before the eventual `group_by` even if
+        `_apply_calculate_params` already ran earlier in the pipeline.
         """
-        if (
-            self.options.calculate
-            or self.options.negate is not None
-            or self.options.multiply10 is not None
-            or self.options.multiply100 is not None
-        ):
-            self._error(
-                "calculate parameters (calculate.N.*, or the legacy negate/multiply10/"
-                "multiply100) cannot be combined with count_by_value"
-            )
-
-    def _apply_unpivot_param(self):
-        """Apply the unpivot parameter."""
-        # Data is already in long format on disk; nothing to do here. The parameter
-        # is kept for backward API compatibility.
+        if self.options.calculate:
+            self._error("calculate parameters cannot be combined with count_by_value")
 
     # -- orchestration ----------------------------------------------------------------------
 

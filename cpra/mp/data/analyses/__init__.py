@@ -1,0 +1,133 @@
+"""Named-analysis registry: mirrors `cpra.mp.data.visualizations`'s `VISUALIZATIONS`
+pattern (`ANALYSES = {cls.Meta.name: cls for cls in [...]}`) for the small set of
+multi-step, non-visual analyses a route can resolve by NAME rather than requiring a caller
+to hand-author the equivalent `analysis.pipeline.Pipeline` JSON directly -- see
+`scratch/data-analysis-separation-plan.md` §5 for the design this replaces (the portal's
+own client-side-only `subtract-asc`/`subtract-desc`/`concatenate` derivation logic, and its
+un-enforced cardinality rules) and §5.4's constraint this package's own registry-drift test
+(`tests/test_analyses.py`) enforces: every entry's `pipeline()` must return a real
+`Pipeline`, run through the exact same `compile_pipeline` any hand-authored pipeline does
+-- nothing is reachable only through a named analysis.
+
+`ANALYSES`, `DatasetRef`, and `resolve_analysis` are the exact three names
+`cpra/mp/data/api/utils.py` already imports (guarded by `except ModuleNotFoundError`,
+since that module landed concurrently with this package) -- see that module's
+`get_analysis_class`, which resolves `ANALYSES[name].Meta.type` directly for its own
+404/400 (unknown name / wrong route kind) translation, independent of the exceptions
+`resolve_analysis` itself raises below for the parameter-validation/pipeline-construction
+half of the same job.
+"""
+
+from pydantic import ValidationError
+
+from cpra.mp.data.analyses.base import (
+    Analysis,
+    AnalysisRegistryError,
+    AnalysisTypeMismatchError,
+    DatasetRef,
+    InvalidAnalysisParametersError,
+    ResolvedAnalysis,
+    UnknownAnalysisError,
+)
+from cpra.mp.data.analyses.concatenate import Concatenate
+from cpra.mp.data.analyses.difference import Difference
+from cpra.mp.data.analyses.exit_criterion import ExitCriterion
+from cpra.mp.data.analysis.pipeline import PipelineError
+
+# Landed in this order (plan §8: `exit-criterion` first -- the only entry exercising the
+# `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and the
+# only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name ->
+# class` dict, so registration order has no behavioral effect.
+ANALYSES = {cls.Meta.name: cls for cls in [ExitCriterion, Difference, Concatenate]}
+
+__all__ = [
+    "ANALYSES",
+    "Analysis",
+    "AnalysisRegistryError",
+    "AnalysisTypeMismatchError",
+    "DatasetRef",
+    "InvalidAnalysisParametersError",
+    "ResolvedAnalysis",
+    "UnknownAnalysisError",
+    "resolve_analysis",
+]
+
+
+def resolve_analysis(
+    name: str,
+    *,
+    dataset: DatasetRef | None = None,
+    filters: dict | None = None,
+    params: dict | None = None,
+) -> ResolvedAnalysis:
+    """Resolve a named analysis into a `ResolvedAnalysis` (a real, `compile_pipeline`-
+    ready `Pipeline` plus presentation metadata): look `name` up in `ANALYSES`, check its
+    `Meta.type` against whether `dataset` was given (a `type="dataset"` analysis requires
+    one; a `type="custom"` analysis requires `dataset=None`), validate `params` against
+    its `Parameters` model, run its own `validate_selection` cardinality/consistency rule
+    against `filters`, then build and return its `pipeline()`.
+
+    `dataset` is `None` for a `type="custom"` analysis (its inputs are hardcoded in its
+    own `pipeline()` method -- see `exit_criterion.py`); `filters` is the dataset's
+    dimension filters plus an optional reserved `grid_cell` key, exactly as a
+    `type="dataset"` analysis's single pipeline input would take them (`request.sort`/
+    `.select`/`.color_map`/compression parameters are NOT part of `filters` -- those apply
+    to the RESOLVED `Pipeline`'s `.output`/response at the route layer, after this
+    function returns, the same way they would for a hand-authored pipeline); `params` is
+    the analysis's own declared parameters (`dimension`/`order` for `difference`,
+    `dimension` for `concatenate`, `model_group_id`/`scenario_id`/`marsh_threshold`/
+    `salinity_threshold` for `exit-criterion`), raw and unvalidated until this call.
+
+    Raises exactly one of three `AnalysisRegistryError` subclasses -- never a bare
+    `PipelineError`, even though `pipeline()` itself calls `parse_pipeline` and could
+    raise one; any `PipelineError` a pipeline-construction step (from valid-shaped, but
+    together nonsensical, parameters/filters) raises is caught and re-raised as
+    `InvalidAnalysisParametersError` below, so a caller only ever needs to catch this
+    module's three exception types:
+
+    - `UnknownAnalysisError` -- `name` is not in `ANALYSES` (maps to 404);
+    - `AnalysisTypeMismatchError` -- `name` resolves to an analysis whose `Meta.type`
+      doesn't match whether `dataset` was given (maps to 400);
+    - `InvalidAnalysisParametersError` -- `params` failed `Parameters` validation,
+      `filters` failed the analysis's `validate_selection` cardinality rule, or the
+      resulting `Pipeline` itself failed `parse_pipeline`'s validation (maps to 400).
+    """
+    filters = dict(filters or {})
+    params = dict(params or {})
+
+    analysis_class = ANALYSES.get(name)
+    if analysis_class is None:
+        raise UnknownAnalysisError(f"unknown analysis name {name!r} -- known: {sorted(ANALYSES)}")
+
+    expected_type = "custom" if dataset is None else "dataset"
+    if analysis_class.Meta.type != expected_type:
+        given = "no dataset given" if dataset is None else f"dataset given: {dataset!r}"
+        raise AnalysisTypeMismatchError(
+            f"analysis {name!r} is type={analysis_class.Meta.type!r}, but was resolved "
+            f"as if it were type={expected_type!r} ({given})"
+        )
+
+    try:
+        parameters = analysis_class.Parameters.model_validate(params)
+    except ValidationError as exc:
+        raise InvalidAnalysisParametersError(f"analysis {name!r} parameters: {exc}") from exc
+
+    analysis_class.validate_selection(parameters, filters)
+
+    analysis = analysis_class(dataset=dataset, filters=filters, parameters=parameters)
+    try:
+        pipeline = analysis.pipeline()
+    except PipelineError as exc:
+        raise InvalidAnalysisParametersError(
+            f"analysis {name!r} could not build a pipeline from the given parameters/"
+            f"filters: {exc}"
+        ) from exc
+
+    return ResolvedAnalysis(
+        pipeline=pipeline,
+        meta=analysis_class.Meta,
+        legend=analysis.legend,
+        result_kind=analysis.result_kind,
+        collapsed_dimensions=analysis.collapsed_dimensions,
+        title_suffix=analysis.title_suffix,
+    )

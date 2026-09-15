@@ -122,13 +122,50 @@ class BaseVisualization:
         return VARIABLES.get(source_name) or getattr(self, "variable", None)
 
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
-        """Get an API data URI."""
+        """Get an API data URI.
+
+        When a named analysis is selected (`resolved_analysis` -- a `DatasetVisualization`
+        property, absent/`None` on a visualization that doesn't have one, e.g.
+        `SedimentDynamics`), points at that analysis's own `.../analyses/{name}/data.csv`
+        route instead of the plain `.../data.csv` route. With no analysis selected, this
+        is unchanged -- there's no reason to route an unanalyzed filtered read through an
+        analysis; either way the data returned is already long format (grid_cell/value
+        columns), so there is no `unpivot` param to forward on either route.
+        """
 
         required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit, "grid": grid}))
         select = [self.get_time_column(time_unit), "grid_cell", "value"]
 
-        # Force unpivot to be true.
-        kwargs["unpivot"] = True
+        resolved = getattr(self, "resolved_analysis", None)
+        analysis_name = kwargs.pop("analysis", None)
+
+        if resolved is not None:
+            # Only the analysis route's own known fields, plus whatever extra parameters
+            # the named analysis itself declares (`dimension`/`order`/...), have any
+            # meaning here -- every OTHER `VisualizationQuery` field (the map-only display
+            # params, ...) would otherwise reach the analysis route as an unrecognized
+            # query parameter and be rejected outright, since its `Parameters` model is
+            # `extra="forbid"` (see `analyses/base.py`).
+            from cpra.mp.data.api.models import AnalysisDataQuery
+
+            # `kwargs` alone is missing a named analysis's own parameters (`dimension`/
+            # `order`/...) for a request-driven visualization: `VisualizationQuery` can't
+            # declare them (each analysis declares its own), so FastAPI's query-model
+            # binding never puts them in `self.params` -- and `kwargs` here traces back to
+            # exactly that dict (via `get_data_source`) -- only `_analysis_params`'s own
+            # extra scan of the raw query string recovers them (see its docstring above).
+            # Folding it in is what actually lets those parameters reach the emitted
+            # data.csv URL; it never overlaps `kwargs`'s own `VisualizationQuery`-declared
+            # keys, so this can't clobber anything already there.
+            extra_analysis_params = getattr(self, "_analysis_params", {})
+            allowed = set(AnalysisDataQuery.model_fields) | set(extra_analysis_params)
+            kwargs = {k: v for k, v in {**kwargs, **extra_analysis_params}.items() if k in allowed}
+
+        # A caller-supplied `select` (`SpeciesStackedBar.data_source`) replaces the computed
+        # one outright, but still has to be filtered below, so it is taken out of `kwargs`
+        # here and re-emitted as the single `select` parameter at the end rather than being
+        # passed straight through by the loop.
+        caller_select = kwargs.pop("select", None)
 
         params = []
         for param_name, param_values in kwargs.items():
@@ -143,11 +180,47 @@ class BaseVisualization:
             elif param_values is not None:
                 params.append((param_name, param_values))
 
-        # Set select param to limit columns returned.
-        if "select" not in kwargs:
-            params.append(("select", ",".join(select)))
+        if caller_select is not None:
+            select = caller_select.split(",") if isinstance(caller_select, str) else list(caller_select)
 
-        if self.request:
+        # A dimension the analysis COLLAPSES is gone from its output frame -- `difference`
+        # over `model_group_id` returns one value per grid cell per day, not one per model
+        # group -- so naming it in `select` asks for a column that no longer exists, and the
+        # analysis routes fail the whole read ("unable to find column"). The two values are
+        # exactly what a `difference` needs as FILTERS and still have to be SENT, so this
+        # drops only the `select` entry, never the parameter itself.
+        #
+        # Filtering one finished list rather than guarding each place a column is added is
+        # deliberate: a collapsed dimension reaches `select` three ways, and the multi-value
+        # branch above is only one of them. The time column goes in unconditionally at the
+        # top (so a `difference` over `calendar_day` hit the identical failure), and
+        # `caller_select` bypasses both (so `SpeciesStackedBar` did too, over `calendar_year`).
+        # `TimeSeriesLine`/`StackedBar` already exclude collapsed dimensions from their own
+        # compare-channel choices, for the same underlying reason -- a collapsed dimension
+        # has nothing left to compare across -- so this keeps the request in step with the
+        # chart that consumes it. With no analysis selected, nothing is collapsed.
+        if resolved is not None:
+            select = [column for column in select if column not in resolved.collapsed_dimensions]
+
+        # Set select param to limit columns returned.
+        params.append(("select", ",".join(select)))
+
+        if resolved is not None:
+            if self.request:
+                dataset_url = self.request.url_for(
+                    "get_dataset_analysis_data",
+                    variable=variable,
+                    time_unit=time_unit,
+                    grid=grid,
+                    analysis_name=analysis_name,
+                    format="csv",
+                )
+            else:
+                dataset_url = (
+                    f"https://api.mpdp.coastal.la.gov/v1/datasets/{variable}/{time_unit}/{grid}"
+                    f"/analyses/{analysis_name}/data.csv"
+                )
+        elif self.request:
             dataset_url = self.request.url_for(
                 "get_model_data",
                 variable=variable,
@@ -251,9 +324,74 @@ class DatasetVisualization(BaseVisualization):
         return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **self.params)
 
     @cached_property
+    def _analysis_name(self):
+        """The `analysis=` request parameter (plan §5.3), or `None` when not given."""
+        return self.params.get("analysis")
+
+    @cached_property
+    def _analysis_filters(self):
+        """Dimension filters + `grid_cell`/`where`, in the exact shape `resolve_analysis`'s
+        `filters` argument expects -- mirrors `api.__init__._analysis_filters`."""
+        from cpra.mp.data.api.models import FilterDimensions
+
+        filter_fields = set(FilterDimensions.model_fields)
+        filters = {k: v for k, v in self.params.items() if k in filter_fields and v is not None}
+        for extra_key in ("grid_cell", "where"):
+            value = self.params.get(extra_key)
+            if value is not None:
+                filters[extra_key] = value
+        return filters
+
+    @cached_property
+    def _analysis_params(self):
+        """The named analysis's own declared parameters (`dimension`/`order`/...), read off
+        whatever isn't a `VisualizationQuery` field -- mirrors
+        `api.__init__._analysis_extra_params`. A request-driven visualization only has
+        these in `self.params` when `self.request`'s raw query string carries them (a
+        route handler's `dict(query)` only ever carries `VisualizationQuery`'s own
+        declared fields, since the analysis's parameters have no fixed field set of their
+        own); a notebook caller that builds this class directly passes them as ordinary
+        keyword arguments instead, which already land in `self.params`.
+        """
+        from cpra.mp.data.api.models import VisualizationQuery
+
+        known = set(VisualizationQuery.model_fields)
+        extra_params = {k: v for k, v in self.params.items() if k not in known and v is not None}
+        if self.request is not None:
+            for key, value in self.request.query_params.items():
+                if key not in known and key not in extra_params:
+                    extra_params[key] = value
+        return extra_params
+
+    @cached_property
+    def resolved_analysis(self):
+        """The `analysis=` request parameter (plan §5.3), resolved into a real, ready-to-
+        compile `Pipeline` plus presentation metadata (`.legend`/`.result_kind`/
+        `.collapsed_dimensions`/`.title_suffix`) -- or `None` when no analysis was
+        selected, the signal every migrated hook in this module (and in `map.py`/
+        `time_series_line.py`/`stacked_bar.py`) falls back to its pre-existing legacy
+        behavior on.
+        """
+        name = self._analysis_name
+        if name is None:
+            return None
+
+        # Imported lazily: `cpra.mp.data.api`'s `__init__.py` imports `VISUALIZATIONS`
+        # from this package at module level, so importing it back from here at module
+        # level would be a circular import -- see `map.py`'s `feature_colors`, which
+        # already does the same thing for its own model imports.
+        from cpra.mp.data.analyses import DatasetRef, resolve_analysis
+
+        dataset = DatasetRef(variable=self.variable.name, time_unit=self.time_unit, grid=self.grid.name)
+        return resolve_analysis(name, dataset=dataset, filters=self._analysis_filters, params=self._analysis_params)
+
+    @cached_property
     def difference_suffix(self):
         """Suffix for the chart title and y-axis if this is a difference chart."""
-        return "" if self.params.get("negate") is None else " Difference"
+        resolved = self.resolved_analysis
+        if resolved is not None:
+            return resolved.title_suffix
+        return ""
 
     @cached_property
     def grid_cells(self):

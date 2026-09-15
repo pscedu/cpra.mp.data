@@ -160,6 +160,54 @@ class TestVisualizations:
             assert viz["type"] in ("dataset", "custom")
 
 
+class _FakeCatalogAnalysisMeta:
+    name = "concatenate"
+    label = "Concatenate"
+    type = "dataset"
+    variables = ["ssf"]
+    legend = None
+    result_kind = "vector"
+
+
+class _FakeCatalogAnalysis:
+    Meta = _FakeCatalogAnalysisMeta
+
+
+class TestAnalyses:
+    """`/v1/analyses.json` (plan §3.2a/§5.2), mirroring `TestVisualizations` above --
+    built the same way (`analysis.Meta.__dict__` per registered class). The real registry
+    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent Phase 2 change that may not have
+    landed yet (see `api/utils.py`'s guarded import), so this monkeypatches a small fake
+    registry onto both places `api/__init__.py`/`api/utils.py` bind the name, exercising
+    the route itself rather than the real analyses' content -- see
+    `tests/api/test_analyses_endpoints.py` for the full route-surface coverage.
+
+    The fake `Meta`/analysis classes above are module-level, not nested inside this test
+    class: a nested class body has no closure over its enclosing class body's namespace
+    (unlike a nested function), so `class _FakeAnalysis: Meta = _Meta` would raise
+    `NameError` at collection time if `_Meta` were itself just another sibling nested
+    class here.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_registry(self, monkeypatch):
+        import cpra.mp.data.api as api_module
+        import cpra.mp.data.api.utils as api_utils
+
+        fake = {"concatenate": _FakeCatalogAnalysis}
+        monkeypatch.setattr(api_utils, "ANALYSES", fake)
+        monkeypatch.setattr(api_module, "ANALYSES", fake)
+
+    def test_returns_analysis_metadata(self, client):
+        response = client.get("/v1/analyses.json")
+        assert response.status_code == 200
+        assert {a["name"] for a in response.json()} == {"concatenate"}
+
+    def test_each_entry_declares_a_type(self, client):
+        for analysis in client.get("/v1/analyses.json").json():
+            assert analysis["type"] in ("dataset", "custom")
+
+
 class TestDatasetsIndex:
     @pytest.fixture(autouse=True)
     def data(self, base_path, monkeypatch):

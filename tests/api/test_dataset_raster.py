@@ -156,11 +156,16 @@ class TestCalculateStage:
         assert dataset._calculate_plans == []
         assert "multiplier" not in dataset.materialize().columns
 
-    async def test_legacy_negate_records_its_sugar_plan(self, dataset_factory, raster_data):
-        dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
+    async def test_a_generic_negate_entry_records_its_plan(self, dataset_factory, raster_data):
+        """`negate` was flat-parameter sugar for this exact `calculate` entry -- retired
+        from `Options` (Phase 4) along with its HTTP spelling; the generic form it
+        expanded into is what's left to record a plan."""
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}]
+        )
         dataset._apply_calculate_params()
         (plan,) = dataset._calculate_plans
-        assert plan.label == "negate"
+        assert plan.label == "calculate.1"
         assert plan.expression == "value * -1"
         assert plan.dimension_where == "(calendar_year = 2030)"
 
@@ -179,7 +184,9 @@ class TestCalculateStage:
         """A calculate entry recorded at the calculate stage reaches the pixels through
         `_collapse_tile_bands`, the shared Polars-expression calculate/group_aggregate
         step every read path (tile, write, summarize) uses."""
-        dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
         data = np.array([[[30]], [[40]]], dtype="int32")
@@ -493,16 +500,17 @@ class TestSummarizeStage:
         df = dataset.materialize()
         assert "calendar_year" not in df.columns
 
-    async def test_unpivot_is_a_no_op_after_summarizing(
+    async def test_summarize_result_is_already_long_format(
         self, dataset_factory, raster_data, zone_crosswalk
     ):
-        """unpivot is retained only for API compatibility: the summarize result is
-        already long-format (grid_cell/value), so the parameter changes nothing."""
+        """A zonal summarize result is already long-format (grid_cell/value) unconditionally
+        -- there used to be an `unpivot` parameter that was a no-op here for exactly that
+        reason, but Phase 4 deleted it from `Options`/`DataOptions` outright rather than
+        keep a flag that never did anything after a summarize."""
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
-            unpivot=True,
         )
         await dataset.apply_params()
         df = dataset.materialize()
@@ -795,7 +803,9 @@ class TestTileBandCollapse:
         (test_non_aggregated_output_preserves_nodata), but a rendered pixel has to commit to
         a color, and 9999 is a legitimate value in some legends.
         """
-        dataset = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
         data = np.array([[[-9999, 30]], [[40, 40]]], dtype="int32")
@@ -862,7 +872,7 @@ class TestSummarizeCalculateAndGroupAggregate:
         aggregate, band by band -- negating one band doesn't touch the other."""
         dataset = dataset_factory(
             DIMENSIONS,
-            negate="calendar_year = 2030",
+            calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}],
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
@@ -881,7 +891,7 @@ class TestSummarizeCalculateAndGroupAggregate:
         dataset = dataset_factory(
             DIMENSIONS,
             group_aggregate="sum",
-            negate="calendar_year = 2030",
+            calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}],
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
@@ -1033,7 +1043,7 @@ class TestSummarizeRoutesThroughThePlugin:
     ):
         dataset = dataset_factory(
             DIMENSIONS,
-            negate="calendar_year = 2030",
+            calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}],
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="mean",
         )
@@ -1449,7 +1459,7 @@ class TestCountByValue:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count_by_value",
-            multiply10="1 = 1",
+            calculate=[{"expression": "value * 10"}],
         )
         with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()

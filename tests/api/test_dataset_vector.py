@@ -379,16 +379,13 @@ class TestGridCellCoordinates:
         await dataset.apply_params()
         assert dataset.materialize()["grid_cell"].unique().to_list() == [1]
 
-    async def test_unpivoting_reports_the_cell_id(
-        self, dataset_factory, annual_data, ecoregion_geometry
-    ):
-        """The shape every visualization requests, so the ID has to reach the grid_cell
-        column rather than the coordinate that selected it. Data is already long on disk,
-        so unpivot=True is a no-op here, but it's kept for backward API compatibility."""
-        label = _lng_lat(500500, 3300500)
-        dataset = dataset_factory(DIMENSIONS, grid_cell=label, unpivot=True)
-        await dataset.apply_params()
-        assert dataset.materialize()["grid_cell"].unique().to_list() == [1]
+    # `test_unpivoting_reports_the_cell_id` used to live here: it was
+    # `test_grid_cell_column_reports_the_resolved_cell` above plus a `unpivot=True` kwarg,
+    # pinning that the (already-long) vector shape was unaffected by the parameter. Phase 4
+    # deleted `unpivot` from `Options`/`DataOptions` entirely, so the kwarg is now silently
+    # dropped (pydantic's default `extra="ignore"`) rather than a no-op *option* -- the test
+    # was identical to its sibling with nothing left to distinguish, so it was removed
+    # rather than converted.
 
     async def test_a_select_naming_only_dimensions_still_works(
         self, dataset_factory, annual_data, ecoregion_geometry
@@ -408,8 +405,18 @@ class TestGridCellCoordinates:
 
 
 class TestCalculateStage:
+    """`negate`/`multiply10`/`multiply100` were flat-parameter sugar for one-line
+    `calculate` entries (`value * -1`/`* 10`/`* 100`); Phase 4 deleted the fields
+    themselves from `Options` (not just their HTTP spelling), along with the
+    sugar-expansion and legacy-vs-generic mixing-rejection logic in
+    `_resolve_calculate_entries` -- so what these tests pin is now expressed directly
+    as the generic `calculate` entry each legacy parameter used to expand into.
+    """
+
     async def test_negate_flips_matching_rows(self, dataset_factory, two_scenario_data):
-        dataset = dataset_factory(DIMENSIONS, negate="scenario_id = 8")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * -1", "where": "scenario_id = 8"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("scenario_id")
         assert df["value"][0] > 0
@@ -417,21 +424,27 @@ class TestCalculateStage:
 
     async def test_multiply10(self, dataset_factory, annual_data):
         base = annual_frame(years=(2030,))["1"][0]
-        dataset = dataset_factory(DIMENSIONS, multiply10="calendar_year = 2030")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * 10", "where": "calendar_year = 2030"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
         assert df["value"][0] == pytest.approx(base * 10, rel=1e-5)
 
     async def test_multiply100(self, dataset_factory, annual_data):
         base = annual_frame(years=(2030,))["1"][0]
-        dataset = dataset_factory(DIMENSIONS, multiply100="calendar_year = 2030")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * 100", "where": "calendar_year = 2030"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
         assert df["value"][0] == pytest.approx(base * 100, rel=1e-5)
 
     async def test_non_matching_rows_are_untouched(self, dataset_factory, annual_data):
         base = annual_frame(years=(2040,))["1"][0]
-        dataset = dataset_factory(DIMENSIONS, multiply10="calendar_year = 2030")
+        dataset = dataset_factory(
+            DIMENSIONS, calculate=[{"expression": "value * 10", "where": "calendar_year = 2030"}]
+        )
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
         assert df["value"][1] == pytest.approx(base, rel=1e-5)
@@ -442,24 +455,6 @@ class TestCalculateStage:
         await dataset.apply_params()
         df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
         assert df["value"][0] == pytest.approx(base, rel=1e-5)
-
-    async def test_legacy_parameters_compose_sequentially(self, dataset_factory, annual_data):
-        """Legacy parameters are sugar for calculate entries in negate, multiply10,
-        multiply100 order, and entries compose sequentially (entry N+1 sees entry N's
-        output) -- so a row matching both negate and multiply10 is multiplied by -10.
-
-        DELIBERATE behavior change from the pre-generic-calculate implementation, whose
-        single when/then chain was first-match-wins (the same request used to yield -base,
-        the negate alone): the legacy parameters are now defined as exactly their generic
-        sugar, and the generic entries' documented contract is sequential composition.
-        """
-        base = annual_frame(years=(2030,))["1"][0]
-        dataset = dataset_factory(
-            DIMENSIONS, negate="calendar_year = 2030", multiply10="calendar_year = 2030"
-        )
-        await dataset.apply_params()
-        df = dataset.materialize().filter(pl.col("grid_cell") == 1).sort("calendar_year")
-        assert df["value"][0] == pytest.approx(-10 * base, rel=1e-5)
 
 
 class TestGenericCalculate:
@@ -547,29 +542,14 @@ class TestGenericCalculate:
         assert df.filter(pl.col("grid_cell") == 1)["value"][0] is None
         assert df.filter(pl.col("grid_cell") == 2)["value"][0] == pytest.approx(3.0)
 
-    async def test_legacy_negate_equals_its_generic_sugar(self, dataset_factory, annual_data):
-        legacy = dataset_factory(DIMENSIONS, negate="calendar_year = 2030")
-        await legacy.apply_params()
-        generic = dataset_factory(
-            DIMENSIONS, calculate=[self._calc("value * -1", "calendar_year = 2030")]
-        )
-        await generic.apply_params()
-        sort_cols = ["grid_cell", "calendar_year"]
-        assert legacy.materialize().sort(sort_cols)["value"].to_list() == pytest.approx(
-            generic.materialize().sort(sort_cols)["value"].to_list()
-        )
-
-    async def test_mixing_legacy_and_generic_is_rejected(self, dataset_factory, annual_data):
-        dataset = dataset_factory(
-            DIMENSIONS,
-            negate="calendar_year = 2030",
-            calculate=[self._calc("value * 2")],
-        )
-        with pytest.raises(AnalysisError) as excinfo:
-            await dataset.apply_params()
-        assert excinfo.value.status_code == 400
-        assert "negate" in excinfo.value.detail
-        assert "ambiguous" in excinfo.value.detail
+    # `test_legacy_negate_equals_its_generic_sugar` and
+    # `test_mixing_legacy_and_generic_is_rejected` used to live here: the former proved
+    # the (now-deleted) `negate` field was equivalent to this exact `calculate` entry --
+    # see `TestCalculateStage.test_negate_flips_matching_rows` above, which pins that
+    # entry's behavior directly since there is no more legacy field to compare it
+    # against -- and the latter exercised `_resolve_calculate_entries`'s legacy/generic
+    # mixing-rejection branch, which Phase 4 deleted along with the fields that could
+    # ever be mixed. Neither has anything left to test.
 
     async def test_invalid_expression_is_a_400_naming_the_entry(
         self, dataset_factory, annual_data
@@ -1009,7 +989,7 @@ class TestCountByValue:
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="count_by_value",
-            negate="1 = 1",
+            calculate=[{"expression": "value * -1"}],
         )
         with pytest.raises(AnalysisError) as excinfo:
             await dataset.apply_params()
@@ -1056,28 +1036,34 @@ class TestSortAndSelectStage:
 
     async def test_select_allows_grid_cell_and_value(self, dataset_factory, annual_data):
         """grid_cell/value are always present in long format, but are still valid select
-        targets (unpivot=True is kept for backward API compatibility, and is a no-op)."""
-        dataset = dataset_factory(DIMENSIONS, unpivot=True, select="grid_cell,value")
+        targets."""
+        dataset = dataset_factory(DIMENSIONS, select="grid_cell,value")
         await dataset.apply_params()
         assert dataset.materialize().columns == ["grid_cell", "value"]
 
 
-class TestUnpivot:
+class TestLongFormatOutput:
+    """Vector data is always long (one row per grid_cell) on disk and materializes that way
+    unconditionally -- there used to be an `unpivot` parameter here too, but it was always a
+    no-op on vector data for exactly this reason, and Phase 4 deleted it from
+    `Options`/`DataOptions` outright rather than keep a flag that never did anything on this
+    grid type."""
+
     async def test_produces_grid_cell_and_value_columns(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, unpivot=True)
+        dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
         df = dataset.materialize()
         assert "grid_cell" in df.columns
         assert "value" in df.columns
 
     async def test_row_count_is_years_times_geographies(self, dataset_factory, annual_data):
-        dataset = dataset_factory(DIMENSIONS, unpivot=True)
+        dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
         assert dataset.materialize().height == 2 * 32
 
     async def test_values_are_preserved(self, dataset_factory, annual_data):
         source = annual_frame(years=(2030, 2040))
-        dataset = dataset_factory(DIMENSIONS, unpivot=True)
+        dataset = dataset_factory(DIMENSIONS)
         await dataset.apply_params()
         df = dataset.materialize().filter(
             (pl.col("calendar_year") == 2030) & (pl.col("grid_cell") == 1)

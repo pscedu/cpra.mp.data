@@ -642,9 +642,9 @@ class RasterGridAnalysis(BaseAnalysis):
         source once and never materializes the stack -- see ``raster_copy_gdal_env`` for the
         swath/cache settings that make this pay off.  Band descriptions are applied to the
         VRT XML rather than to pixels in Python. Only plain selections reach this path --
-        ``write_raster`` routes any request with calculate entries (including the legacy
-        negate/multiply10/multiply100 sugar) to the windowed path, which can express a
-        general elementwise rewrite and its NoData contract; a VRT ScaleRatio cannot.
+        ``write_raster`` routes any request with calculate entries to the windowed path,
+        which can express a general elementwise rewrite and its NoData contract; a VRT
+        ScaleRatio cannot.
         """
 
         sources = list(zip(df["path"].to_list(), df["band"].to_list()))

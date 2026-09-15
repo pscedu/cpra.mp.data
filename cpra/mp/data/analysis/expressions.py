@@ -405,8 +405,8 @@ def parse_calculate_expression(expr_str, allowed_columns=("value",)):
 class CalculatePlan(NamedTuple):
     """One validated calculate entry, split the way the two grid types consume it.
 
-    `label` names the entry in errors (`calculate.1`, or a legacy parameter name like
-    `negate` once rewritten as sugar). `expression` is the validated arithmetic string,
+    `label` names the entry in errors (`calculate.1`, `calculate.2`, ...). `expression`
+    is the validated arithmetic string,
     still written against the `value` placeholder -- kept as a STRING (not the parsed
     `Expr`) because the raster paths re-parse it once per band with `value` rewritten to
     that band's own synthetic column (`rewrite_value_column`), exactly like a `where`

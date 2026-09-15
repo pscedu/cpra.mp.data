@@ -13,6 +13,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
+from cpra.mp.data.analysis.base import AnalysisError
 from cpra.mp.data.analysis.expressions import (
     parse_value_expr,
     rewrite_named_columns,
@@ -123,6 +124,18 @@ class PairedAnalysis:
         self._prepare()
         if not self.band_sources:
             raise PipelineError("no data available to render a tile for this pipeline")
+
+    def validate_vector_tile(self):
+        """A paired pipeline's output is always raster (see `output_type` above) -- there
+        is no vector-tile shape to validate further, so this always rejects, exactly like
+        `BaseAnalysis.validate_vector_tile`'s own raster-output branch (same message, same
+        status code), which is what a `.pbf` route call actually needs: an `AnalysisError`
+        the route layer's registered exception handler turns into a graceful 400, not an
+        unhandled exception. `PipelineError` (what `validate_tile` raises above) has no
+        such handler registered and no call site wraps this method in a try/except, so it
+        would surface as a raw 500 instead.
+        """
+        raise AnalysisError("invalid output type for vector tile: raster", status_code=400)
 
     async def write_raster(self, out_path, **kwargs):
         self._prepare()

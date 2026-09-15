@@ -66,6 +66,7 @@ from cpra.mp.data.analysis.pipeline import (
 from cpra.mp.data.analysis.planner import (
     _check_input_dimensions,
     _check_join_row_ceiling,
+    _extract_post_project_grid_cell_filter,
     _project_direction,
     _validate_filter_where,
     _validate_join_alignment,
@@ -83,6 +84,7 @@ from tests.factories import (
     raster_array,
     write_raster_crosswalk,
     write_raster_dataset,
+    write_vector_crosswalk,
 )
 
 # The analysis-pipeline design's own exit-criterion example, byte-exact (see
@@ -399,9 +401,49 @@ class TestCompileChecks:
     def test_validate_filter_where_accepts_known_column(self):
         _validate_filter_where(3, "marsh > 0.5", {"marsh", "sal"})
 
-    def test_validate_filter_where_rejects_unknown_column(self):
-        with pytest.raises(PipelineError, match="invalid"):
-            _validate_filter_where(3, "not_a_column > 0.5", {"marsh", "sal"})
+    def test_validate_filter_where_accepts_unknown_dimension_column(self):
+        # G8: a conjunct that does not reference the `value` placeholder is a DIMENSION
+        # conjunct under `classify_where`'s split (see that function's docstring), and a
+        # dimension conjunct is no longer namespace-restricted here -- exactly like the
+        # flat `where=` parameter (`Dataset._apply_filter_params`), which has no
+        # compile-time namespace check for a dimension conjunct either; an unrecognized
+        # name fails at EXECUTION (`lf.sql()`), not at pipeline-compile time. This
+        # replaces a prior version of this test (`test_validate_filter_where_rejects_
+        # unknown_column`) that asserted the opposite -- that assertion was itself G8's
+        # bug: it only held because every conjunct, dimension or not, was wrongly run
+        # through the value-expression whitelist's namespace check.
+        _validate_filter_where(3, "not_a_column > 0.5", {"marsh", "sal"})
+
+    def test_validate_filter_where_rejects_dimension_subquery(self):
+        # Still rejected -- `_check_no_dimension_subquery_or_aggregate` is exactly the
+        # safety net a dimension conjunct keeps under the new split.
+        with pytest.raises(PipelineError, match="subquery"):
+            _validate_filter_where(3, "not_a_column in (select 1)", {"marsh", "sal"})
+
+    def test_validate_filter_where_rejects_dimension_aggregate(self):
+        with pytest.raises(PipelineError, match="aggregate function"):
+            _validate_filter_where(3, "not_a_column = max(not_a_column)", {"marsh", "sal"})
+
+    def test_validate_filter_where_accepts_dimension_not(self):
+        # The actual portal shape G8 exists to unblock: `not (a = x and b = y)` is a pure
+        # dimension conjunct (references no `value`), and `not` is not in
+        # `ALLOWED_FUNCTIONS` -- it would have been rejected by the old (single-path)
+        # implementation even though it is exactly what the unrestricted `lf.sql()` path
+        # the flat `where=` surface already accepts.
+        _validate_filter_where(3, "not (marsh = 1 and sal = 2)", {"marsh", "sal"})
+
+    def test_validate_filter_where_rejects_value_conjunct_outside_whitelist(self):
+        # A conjunct that DOES reference `value` is still routed through the restricted
+        # value-expression whitelist -- G8 does not weaken this half at all.
+        with pytest.raises(PipelineError, match="not in the allowed whitelist"):
+            _validate_filter_where(3, "not (value > 1)", {"value"})
+
+    def test_validate_filter_where_rejects_mixed_conjunct(self):
+        # `classify_where` itself rejects a single conjunct that references both a
+        # dimension column and `value` -- surfaced here as a `PipelineError` naming the
+        # conjunct, not silently misclassified as one kind or the other.
+        with pytest.raises(PipelineError, match="references both"):
+            _validate_filter_where(3, "value > marsh", {"marsh", "value"})
 
     def test_check_join_row_ceiling_accepts_under_limit(self):
         lf = pl.LazyFrame({"grid_cell": range(10)})
@@ -456,6 +498,25 @@ class TestCompileChecks:
         # shape doesn't implement, present-day `count_by_value` included.
         with pytest.raises(PipelineError, match="not yet supported in analysis pipelines"):
             _validate_paired_group_aggregate(types.SimpleNamespace(aggregate="count_by_value"))
+
+    def test_extract_post_project_grid_cell_filter_returns_none_when_absent(self):
+        # An ordinary value/dimension filter that never mentions `grid_cell` at all --
+        # not this function's business, fold into `Options.where` as before.
+        assert _extract_post_project_grid_cell_filter(2, "calendar_year = 2030") is None
+
+    def test_extract_post_project_grid_cell_filter_accepts_eq(self):
+        assert _extract_post_project_grid_cell_filter(2, "grid_cell = 5") == "5"
+
+    def test_extract_post_project_grid_cell_filter_accepts_in(self):
+        assert _extract_post_project_grid_cell_filter(2, "grid_cell IN (5, 6, 7)") == "5,6,7"
+
+    def test_extract_post_project_grid_cell_filter_rejects_mixed_column(self):
+        with pytest.raises(PipelineError, match="mixes `grid_cell`"):
+            _extract_post_project_grid_cell_filter(2, "grid_cell = 5 AND calendar_year = 2030")
+
+    def test_extract_post_project_grid_cell_filter_rejects_non_literal_comparison(self):
+        with pytest.raises(PipelineError, match="literal ID selection"):
+            _extract_post_project_grid_cell_filter(2, "grid_cell > 100")
 
 
 # --------------------------------------------------------------------------------------
@@ -760,6 +821,187 @@ class TestCalculateStepCompile:
             compile_pipeline(pipeline, base_path=base_path)
 
 
+class TestInputGridCellCompile:
+    """`grid_cell` on an `InputSelection` is a reserved Filter-group field (not a
+    dimension filter -- see `TestInputSelectionGridCell` in test_pipeline.py), forwarded
+    unchanged onto `Options.grid_cell` by `planner.py::_dataset_for`."""
+
+    def test_lowers_onto_options_grid_cell(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "eco": {
+                        **{k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "5,6",
+                    }
+                },
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.grid_cell == "5,6"
+
+    def test_omitted_grid_cell_leaves_options_grid_cell_unset(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.grid_cell is None
+
+
+class TestOutputSortSelectCompile:
+    """`output.sort`/`output.select` lower onto exactly `Options.sort`/`.select` -- and
+    must do so for BOTH single-input-chain sub-shapes: a chain with a `filter`/`group`
+    tail, and the degenerate project-only-reaggregation shape (no `steps[1:]` at all),
+    since the lowering sits unconditionally at the tail of
+    `_compile_single_input_chain` rather than inside the per-step loop.
+    """
+
+    def test_lowers_for_a_chain_with_filter_and_group(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "eco > 0"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "csv", "sort": "-value", "select": "grid_cell,value"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.sort == "-value"
+        assert compiled.options.select == "grid_cell,value"
+
+    def test_lowers_for_project_only_reaggregation(self, base_path, crosswalk_path):
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}
+                ],
+                "output": {"format": "csv", "sort": "-value"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.sort == "-value"
+
+    def test_omitted_sort_select_leave_options_unset(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.sort is None
+        assert compiled.options.select is None
+
+
+class TestOutputColorMapCompile:
+    """`output.color_map` (G9) lowers onto exactly `Options.color_map` for a single-input
+    chain -- `_compile_single_input_chain` used to never set it at all, so `color_map` had
+    no effect on any single-input pipeline (only the paired shape, `_compile_paired_
+    notebook_shape`, forwarded it, onto `PairedAnalysis.color_map` directly). Mirrors
+    `TestOutputSortSelectCompile`'s two sub-shapes -- the lowering sits unconditionally at
+    the tail of `_compile_single_input_chain`, alongside `sort`/`select`, so both the
+    ordinary chain and the degenerate project-only-reaggregation shape must pick it up.
+    """
+
+    def test_lowers_for_a_chain_with_filter_and_group(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "eco > 0"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "csv", "color_map": "ffibs"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.color_map == "ffibs"
+
+    def test_lowers_for_project_only_reaggregation(self, base_path, crosswalk_path):
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}
+                ],
+                "output": {"format": "csv", "color_map": "ffibs"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.color_map == "ffibs"
+
+    def test_omitted_color_map_leaves_options_unset(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.color_map is None
+
+
+class TestProjectAggregateCountByValueCompile:
+    """`count_by_value` as a `project` aggregate -- a ZONAL aggregate, not subject to
+    `fold.DECOMPOSABLE_AGGREGATES` (see `pipeline.py::_validate_step_rules`'s `ProjectStep`
+    branch) -- lowers onto exactly the same `Options.summarize_aggregate` a `mean`/`sum`
+    project aggregate would.
+    """
+
+    def test_lowers_onto_summarize_aggregate(self, base_path):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {
+                        "op": "project",
+                        "input": "eco",
+                        "to": "hydro_compartment_v001",
+                        "aggregate": "count_by_value",
+                    }
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.summarize_by == "hydro_compartment_v001"
+        assert compiled.options.summarize_aggregate == "count_by_value"
+
+
 # --------------------------------------------------------------------------------------
 # Shape 2: the paired (notebook) shape
 # --------------------------------------------------------------------------------------
@@ -847,6 +1089,36 @@ class TestCompilePairedNotebookShape:
         assert isinstance(compiled, PairedAnalysis)
         assert compiled.of_kind == "count"
 
+    def test_rejects_grid_cell_on_the_fine_input(self, notebook_query_data):
+        # `PairedAnalysis`'s `fine_dataset`/`coarse_dataset` never call `apply_params()`
+        # (see `_dataset_for`'s own docstring) -- only `_apply_grid_cell()` (a stage hook
+        # of `apply_params()`) reads `Options.grid_cell`, so blindly forwarding it here
+        # would silently no-op rather than filter anything.
+        bad = copy.deepcopy(NOTEBOOK_QUERY)
+        bad["inputs"]["marsh"]["grid_cell"] = "1"
+        with pytest.raises(PipelineError, match="grid_cell"):
+            compile_pipeline(parse_pipeline(bad), base_path=notebook_query_data)
+
+    def test_rejects_grid_cell_on_the_coarse_input(self, notebook_query_data):
+        bad = copy.deepcopy(NOTEBOOK_QUERY)
+        bad["inputs"]["salinity"]["grid_cell"] = "1"
+        with pytest.raises(PipelineError, match="grid_cell"):
+            compile_pipeline(parse_pipeline(bad), base_path=notebook_query_data)
+
+    def test_rejects_output_sort(self, notebook_query_data):
+        # `_apply_sort_params` is likewise only ever invoked from `apply_params()`, so
+        # `output.sort` would silently no-op on this shape the same way `grid_cell` would.
+        bad = copy.deepcopy(NOTEBOOK_QUERY)
+        bad["output"]["sort"] = "-value"
+        with pytest.raises(PipelineError, match="sort"):
+            compile_pipeline(parse_pipeline(bad), base_path=notebook_query_data)
+
+    def test_rejects_output_select(self, notebook_query_data):
+        bad = copy.deepcopy(NOTEBOOK_QUERY)
+        bad["output"]["select"] = "grid_cell"
+        with pytest.raises(PipelineError, match="select"):
+            compile_pipeline(parse_pipeline(bad), base_path=notebook_query_data)
+
 
 # --------------------------------------------------------------------------------------
 # End-to-end ASGI routes -- the three MUST-WORK shapes
@@ -880,6 +1152,51 @@ class TestNotebookQueryEndToEnd:
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_pbf_tile_rejects_the_paired_shape_gracefully(self, client, notebook_query_data):
+        """`PairedAnalysis.validate_vector_tile()` -- the paired/notebook shape's output is
+        always raster (see that method's docstring), so a `.pbf` request against it must
+        400 through the SAME `compiled.validate_vector_tile()` call
+        `get_analysis_vector_tile` makes for a single-input pipeline
+        (`TestAnalysisVectorTileRoute.test_rejects_a_raster_output_grid` in
+        `test_vector_tiles.py`), not an unhandled `AttributeError`/500 -- which is exactly
+        what happened before `PairedAnalysis` implemented this method at all (only a
+        route-layer `hasattr` shim, since removed, papered over it).
+        """
+        query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
+        tile = _tile_for_grid(notebook_query_data)
+        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.pbf", params=query)
+        assert response.status_code == 400, response.text
+        assert "invalid output type for vector tile" in response.json()["detail"]
+
+    def test_raster_tile_pipeline_error_is_a_400_not_a_500(
+        self, client, notebook_query_data, monkeypatch
+    ):
+        """The sibling of the `.pbf` case above, for the RASTER tile route.
+
+        `PairedAnalysis.validate_tile()` raises `PipelineError` (not `AnalysisError`) when
+        a prepared paired plan has no band sources, and the routes catch `PipelineError`
+        only around `pipeline_from_query`/`compile_pipeline` -- not around the
+        `validate_tile()` call that follows. So that raise escaped as a 500 for what is a
+        client error. An `@app.exception_handler(PipelineError)` backstop now gives it the
+        same 400 the explicit `except` clauses produce.
+
+        `validate_tile`'s own no-band-sources branch needs a paired plan that prepares to
+        zero bands, which this fixture can't produce, so the raise is monkeypatched -- the
+        handler mapping is what's under test here, not the branch's own condition.
+        """
+        monkeypatch.setattr(
+            PairedAnalysis,
+            "validate_tile",
+            lambda self: (_ for _ in ()).throw(PipelineError("no data available")),
+        )
+        tile_query = copy.deepcopy(NOTEBOOK_QUERY)
+        tile_query["output"] = {"format": "png"}
+        query = pipeline_to_query(parse_pipeline(tile_query))
+        tile = _tile_for_grid(notebook_query_data)
+        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        assert response.status_code == 400, response.text
+        assert "no data available" in response.json()["detail"]
 
 
 class TestPairedAccumulatorEdgeCases:
@@ -1070,6 +1387,346 @@ class TestSingleInputEndToEnd:
         assert get_df.equals(post_df)
 
 
+class TestFilterWhereDimensionNotEndToEnd:
+    """G8: a pipeline `filter` step's `where` must accept exactly what the flat `where=`
+    parameter accepts for a dimension-only conjunct -- including a `not (...)` group, which
+    the portal actually emits (e.g. `not (model_group_id=X and <dim>=Y)`). Before this fix,
+    every top-level conjunct (dimension or value) was forced through
+    `expressions.parse_value_expr`'s restricted whitelist, which has no `not` in
+    `ALLOWED_FUNCTIONS` and so rejected this shape outright, even though it never
+    references `value` at all.
+
+    The real assertion here isn't just "the pipeline compiles" (that's
+    `TestCompileChecks.test_validate_filter_where_accepts_dimension_not`) -- it's that the
+    pipeline surface and the flat `where=` surface, given the logically identical
+    predicate, return the SAME ROWS.
+    """
+
+    def test_not_filter_matches_flat_where_equivalent(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                {"op": "filter", "where": "not (calendar_year = 2030 and grid_cell = 5)"},
+            ],
+            "output": {"format": "csv"},
+        }
+        pipeline_response = client.post("/v1/analysis.csv", json=pipeline)
+        assert pipeline_response.status_code == 200, pipeline_response.text
+        pipeline_df = pl.read_csv(io.BytesIO(pipeline_response.content)).sort(
+            ["calendar_year", "grid_cell"]
+        )
+
+        # One row -- (calendar_year=2030, grid_cell=5) -- is excluded out of 64 total
+        # (32 grid cells x 2 years); every other combination is kept.
+        assert pipeline_df.height == 63
+        assert not (
+            (pipeline_df["calendar_year"] == 2030) & (pipeline_df["grid_cell"] == 5)
+        ).any()
+
+        flat_response = client.get(
+            "/v1/datasets/ssf/annual/ecoregion_v001/data.csv",
+            params={"where": "not (calendar_year = 2030 and grid_cell = 5)"},
+        )
+        assert flat_response.status_code == 200, flat_response.text
+        flat_df = pl.read_csv(io.BytesIO(flat_response.content)).sort(["calendar_year", "grid_cell"])
+
+        assert flat_df.select(["calendar_year", "grid_cell", "value"]).equals(
+            pipeline_df.select(["calendar_year", "grid_cell", "value"])
+        )
+
+
+class TestInputGridCellEndToEnd:
+    """`input.<name>.grid_cell` (G1), through both request encodings, filters the input
+    the same way a flat `grid_cell=` query parameter would."""
+
+    PIPELINE = {
+        "inputs": {
+            "eco": {
+                **{k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                "grid_cell": "5,6",
+            }
+        },
+        "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+        "output": {"format": "csv"},
+    }
+
+    def test_grid_cell_filters_the_input(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        response = client.post("/v1/analysis.csv", json=self.PIPELINE)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert sorted(df["grid_cell"].to_list()) == [5, 6]
+
+    def test_get_dotted_query_matches_post(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.PIPELINE))
+        assert query["input.eco.grid_cell"] == "5,6"
+        post_df = pl.read_csv(
+            io.BytesIO(client.post("/v1/analysis.csv", json=self.PIPELINE).content)
+        ).sort("grid_cell")
+        get_response = client.get("/v1/analysis.csv", params=query)
+        assert get_response.status_code == 200, get_response.text
+        get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
+        assert get_df.equals(post_df)
+
+
+class TestOutputSortSelectEndToEnd:
+    """`output.sort`/`output.select` (G2) actually sort/narrow the response, not just
+    lower onto the right `Options` attributes (see `TestOutputSortSelectCompile`)."""
+
+    def test_sort_and_select_applied(self, client, base_path, monkeypatch):
+        # `sort`/`select`'s flat semantics (parameters.py/base.py) accept DIMENSION names
+        # (`SORT_CHOICES` is built from `DIMENSIONS`, which has no `grid_cell`/"value"
+        # entry) -- so this sorts by `calendar_year`, descending, matching the existing
+        # flat-endpoint convention (`test_endpoints_data.py`'s `sort=-calendar_year`).
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+            "output": {"format": "csv", "sort": "-calendar_year", "select": "calendar_year,value"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert list(df.columns) == ["calendar_year", "value"]
+        assert df["calendar_year"].to_list() == sorted(df["calendar_year"].to_list(), reverse=True)
+
+
+class TestOutputColorMapEndToEnd:
+    """`output.color_map` (G9) actually changes the rendered raster tile's pixels for a
+    SINGLE-INPUT pipeline -- the shape Phase 2 could only demonstrate working through the
+    paired shape (`TestCustomAnalysisColorMap` in test_analyses_endpoints.py, against the
+    `exit-criterion` analysis), because `_compile_single_input_chain` silently dropped
+    `output.color_map` until this fix, even though the route layer accepted and forwarded
+    it correctly. A dataset-scoped single-input pipeline rendered as a raster PNG tile
+    (`/v1/analysis/{z}/{x}/{y}.png`) is exactly the combination the plan's G9 names as
+    blocking Phase 3 (the portal's difference map on a raster grid), so this proves the
+    real consumer shape, not just that `compiled.options.color_map` gets set (see
+    `TestOutputColorMapCompile` for that).
+    """
+
+    def test_color_map_changes_rendered_pixels(self, client, base_path, monkeypatch):
+        # A uniform fill of 30 falls in a distinct bucket under both legends used below:
+        # `default`'s "0 to 49" bucket vs. `ffibs`'s last (open-ended, > 17) "Saline
+        # Marsh" bucket -- so the two color maps are guaranteed to paint different colors
+        # for the same pixels, not just POSSIBLY differ depending on how the fixture data
+        # happens to fall relative to two arbitrary legends' bucket edges.
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 30)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        tile = _tile_for_grid(base_path)
+
+        def _pipeline(color_map):
+            return {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "vct", "to": "veg_grid_cell_v001"}],
+                "output": {"format": "png", "color_map": color_map},
+            }
+
+        default_query = pipeline_to_query(parse_pipeline(_pipeline("default")))
+        ffibs_query = pipeline_to_query(parse_pipeline(_pipeline("ffibs")))
+
+        default_response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=default_query)
+        ffibs_response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=ffibs_query)
+
+        assert default_response.status_code == 200, default_response.text
+        assert ffibs_response.status_code == 200, ffibs_response.text
+        assert default_response.content != ffibs_response.content
+
+
+class TestProjectAggregateCountByValueEndToEnd:
+    """`count_by_value` as a `project` aggregate (G3) -- the documented "Categorical
+    Count per Zone" query (docs/data-analysis-api.md) expressed as a pipeline. Locally
+    constructed categorical fixture, modeled on `test_endpoints_data.py`'s
+    `categorical_vector_data` (off limits to import from directly per this task's file
+    ownership split)."""
+
+    def test_categorical_count_per_zone(self, client, base_path, crosswalk_path, monkeypatch):
+        # geo_id 1..16 -> zone 100, geo_id 17..32 -> zone 200; value = geo_id % 3, so
+        # each zone's per-value counts are hand-computable below.
+        write_parquet(
+            annual_frame(years=(2030,), value_fn=lambda _year, geo_id: float(geo_id % 3)),
+            base_path=base_path,
+        )
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(geo_id, 100 if geo_id <= 16 else 200, 1.0) for geo_id in range(1, 33)],
+        )
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {
+                    "op": "project",
+                    "input": "eco",
+                    "to": "hydro_compartment_v001",
+                    "aggregate": "count_by_value",
+                }
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+
+        expected = {}
+        for geo_id in range(1, 33):
+            zone = 100 if geo_id <= 16 else 200
+            value = float(geo_id % 3)
+            expected[(zone, value)] = expected.get((zone, value), 0) + 1
+        actual = {
+            (int(row["grid_cell"]), float(row["value"])): int(row["count"])
+            for row in df.iter_rows(named=True)
+        }
+        assert actual == expected
+
+    def test_rejected_as_a_group_aggregate(self, client, base_path, monkeypatch):
+        """The other half of G3: `count_by_value` stays rejected as a `group.aggregate`
+        (a running per-row fold across an offset-batched read has no meaning for it) --
+        end-to-end confirmation that `pipeline.py::_validate_step_rules` still enforces
+        this for `group` even though `project` now permits it.
+        """
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                {"op": "group", "by": [], "aggregate": "count_by_value"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 400
+        assert "offset-batched fold" in response.json()["detail"]
+
+
+class TestPostProjectGridCellFilterEndToEnd:
+    """A `filter` naming `grid_cell` after a many-to-one `project` (G4) must be lowered
+    onto `summarize_grid_cell` -- i.e. filter the SUMMARIZED zones, not the source
+    grid's own cells (which would silently drop everything, since the source grid's
+    cell IDs and the summarized zone IDs live in different ID spaces here)."""
+
+    def _setup(self, base_path, crosswalk_path, monkeypatch):
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        return zones
+
+    def test_grid_cell_eq_lowers_onto_summarize_grid_cell(self, client, base_path, crosswalk_path, monkeypatch):
+        zones = self._setup(base_path, crosswalk_path, monkeypatch)
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                {"op": "filter", "where": "grid_cell = 1"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["grid_cell"].to_list() == [1]
+        categories = raster_array()
+        expected_mean = categories[zones == 1].astype("float64").mean()
+        assert df["value"][0] == pytest.approx(expected_mean, rel=1e-4)
+
+    def test_grid_cell_in_lowers_onto_summarize_grid_cell(self, client, base_path, crosswalk_path, monkeypatch):
+        self._setup(base_path, crosswalk_path, monkeypatch)
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                {"op": "filter", "where": "grid_cell IN (1, 2)"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert sorted(df["grid_cell"].to_list()) == [1, 2]
+
+    def test_identity_project_grid_cell_filter_is_unaffected(self, client, base_path, monkeypatch):
+        """Non-regression: an identity project (no `summarize_by`) still folds a
+        `grid_cell` filter into `Options.where` as an ordinary source-grid filter -- G4's
+        recognition only special-cases a many-to-one (summarizing) `project`."""
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                {"op": "filter", "where": "grid_cell = 5"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["grid_cell"].to_list() == [5]
+
+
+class TestPostProjectGridCellFilterRejections:
+    """The other half of G4, which must ship together with the success path: any
+    post-project `grid_cell` filter that ISN'T a clean literal ID selection is rejected
+    outright rather than silently mis-executed against the wrong grid."""
+
+    def _pipeline(self, where):
+        return parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                    {"op": "filter", "where": where},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+
+    def test_rejects_mixed_grid_cell_and_other_column(self, base_path):
+        pipeline = self._pipeline("grid_cell = 1 AND calendar_year = 2030")
+        with pytest.raises(PipelineError, match="mixes `grid_cell`"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_rejects_non_extractable_predicate(self, base_path):
+        pipeline = self._pipeline("grid_cell > 100")
+        with pytest.raises(PipelineError, match="literal ID selection"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_rejects_second_grid_cell_filter(self, base_path):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                    {"op": "filter", "where": "grid_cell = 1"},
+                    {"op": "filter", "where": "grid_cell = 2"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(PipelineError, match="second post-project"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+
 class TestCalculateStepEndToEnd:
     """The `calculate` op through all three request encodings (POST JSON, dotted GET,
     tile route), plus the paired-shape rejection and the flat-request equivalence."""
@@ -1137,15 +1794,98 @@ class TestCalculateStepEndToEnd:
         assert response.status_code == 200, response.text
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
 
-    def test_matches_the_equivalent_flat_request(self, client, base_path, monkeypatch):
-        """A calculate step compiles onto the same machinery as the flat calculate.N.*
-        parameters, so the two spellings of one request return the same data."""
+    def test_weighted_sum_with_a_grid_cell_filter(self, client, base_path, monkeypatch):
+        """The confidence-weighting idiom (moved here from `test_endpoints_data.py`'s
+        retired `TestCalculateParams`, Phase 4: `calculate.N.expression`/`calculate.N.where`
+        have no flat spelling anymore), combined with a `grid_cell` filter on the
+        pipeline's own input -- `InputSelection.grid_cell` is a reserved field, exactly
+        like `Options.grid_cell`'s flat spelling."""
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        pipeline_df = pl.read_csv(
-            io.BytesIO(client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE).content)
-        ).sort("grid_cell")
+        pipeline = {
+            "inputs": {
+                "ssf": {
+                    "variable": "ssf",
+                    "time_unit": "annual",
+                    "grid": "ecoregion_v001",
+                    "grid_cell": "1",
+                }
+            },
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "calculate", "expression": "value * 0.5", "where": "calendar_year = 2030"},
+                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {"op": "group", "by": [], "aggregate": "sum"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(
+            2030.01 * 0.5 + 2040.01 * 0.25, rel=1e-5
+        )
+
+    def test_non_matching_rows_pass_through_with_no_group_step(self, client, base_path, monkeypatch):
+        """Rows/bands not matching a `calculate` step's `where` pass through unchanged --
+        `calculate` never drops data, unlike `filter` (moved here from
+        `test_endpoints_data.py`'s retired `TestCalculateParams`, Phase 4)."""
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {
+                "ssf": {
+                    "variable": "ssf",
+                    "time_unit": "annual",
+                    "grid": "ecoregion_v001",
+                    "grid_cell": "1",
+                }
+            },
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "calculate", "expression": "value * 0", "where": "calendar_year = 2030"},
+            ],
+            "output": {"format": "csv", "sort": "calendar_year"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["value"].to_list() == pytest.approx([0.0, 2040.01], rel=1e-5)
+
+    def test_weighted_band_sum_on_the_data_route(self, client, base_path, monkeypatch):
+        """The same weighted band-sum idiom rendered through the plain (non-tile)
+        `.tif` output, complementing `test_tile_route` above (moved here from
+        `test_endpoints_data.py`'s retired `TestCalculateParams`, Phase 4)."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                {"op": "calculate", "expression": "value * 0.5", "where": "calendar_year = 2030"},
+                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {"op": "group", "by": [], "aggregate": "sum"},
+            ],
+            "output": {"format": "tif"},
+        }
+        response = client.post("/v1/analysis.tif", json=pipeline)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 1
+            assert src.read(1)[0, 0] == 25
+
+    def test_flat_calculate_params_are_retired_on_the_data_route(self, client, base_path, monkeypatch):
+        """The flat `calculate.N.expression`/`calculate.N.where` query parameters this
+        class used to compare its pipeline steps against are retired from the plain data
+        route (Phase 4): the `calculate` pipeline step above is now the only way to
+        express this, and a request still spelling it the old way gets a loud 400 naming
+        the replacement rather than being silently ignored."""
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
         flat_response = client.get(
             "/v1/datasets/ssf/annual/ecoregion_v001/data.csv",
             params={
@@ -1156,9 +1896,10 @@ class TestCalculateStepEndToEnd:
                 "group_aggregate": "sum",
             },
         )
-        assert flat_response.status_code == 200
-        flat_df = pl.read_csv(io.BytesIO(flat_response.content)).sort("grid_cell")
-        assert flat_df.equals(pipeline_df)
+        assert flat_response.status_code == 400
+        detail = flat_response.json()["detail"]
+        assert "calculate" in detail
+        assert "group_aggregate" in detail
 
     def test_paired_shape_rejects_calculate(self, client, notebook_query_data):
         pipeline = copy.deepcopy(NOTEBOOK_QUERY)

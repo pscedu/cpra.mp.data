@@ -10,7 +10,9 @@ See the [data structure documentation](docs/index.md) for details about variable
 
 Several APIs that depend on the Python library are implemented in the `cpra.mp.data.api` submodule:
 
-* [Data and Analysis API](docs/data-analysis-api.md)
+* [Data API](docs/data-api.md)
+* [Analysis API](docs/analysis-api.md)
+* [Named Analyses (Registry) API](docs/analyses-api.md)
 
 ## Writing Data
 
@@ -136,87 +138,129 @@ with rio.open(vrt(cog_df["path"])) as multiband:
 
 ## Analyzing Data
 
-While `read_data` provides raw access, `analyze_data` runs a full analysis — filtering,
-value predicates, aggregation, zonal summaries, and multi-dataset pipelines — using the
-same engine the Data and Analysis API runs, with no HTTP round trip. It works identically
-on vector and raster grids, and it accepts the same parameter names as the API's query
-strings.
+Two functions cover everything beyond a raw, single-dataset read:
 
-`analyze_data` is an `async` function. In a Jupyter notebook, just `await` it — no
-`asyncio` imports needed:
+* `read_data` selects and narrows one dataset's stored values — the library form of the
+  [Data API](docs/data-api.md).
+* `analyze_data` runs a pipeline — filtering, calculating, aggregating, projecting onto a
+  different grid, spatially joining across datasets — the library form of the
+  [Analysis API](docs/analysis-api.md).
+
+Neither makes an HTTP request; both read Parquet/COG files directly.
+
+### `read_data`
+
+```python
+def read_data(*, variable, time_unit, grid, base_path=None, **selection)
+```
+
+`variable`, `time_unit`, and `grid` select the dataset. Every other keyword goes into
+`**selection`: a dimension filter (a scalar or a list of values, e.g. `scenario_id=7` or
+`scenario_id=[7, 8]`), or one of the reserved selection keys `grid_cell`, `where`, `sort`,
+`select` — the same parameters and semantics documented for the
+[Data API](docs/data-api.md#filter)'s query string. `read_data` only ever selects and
+narrows a single dataset; it never transforms, aggregates, or joins.
+
+### `analyze_data`
+
+```python
+async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False)
+```
+
+`pipeline` is required, and is a `dict`/JSON document in exactly the shape the
+[Analysis API](docs/analysis-api.md#request-shape) accepts (`inputs`/`steps`/`output`).
+There is no separate flat-keyword-argument form — every transformation, including a
+single-dataset filter/calculate/group, is expressed as a (possibly one-input) pipeline.
+`analyze_data` is `async`; in a notebook, just `await` it, or wrap the call with
+`asyncio.run` in a plain script.
+
+The return value depends on the pipeline's own `output.format`:
+
+* **Tabular** output (`csv`/`ndjson`/`parquet`) returns a Polars `DataFrame` — or a
+  `LazyFrame` if `lazy=True`.
+* **Raster** output (`tif`/tile formats) requires `output_path=` (there is no in-memory
+  raster return) and returns the written file's `pathlib.Path`.
 
 ```python
 from cpra.mp.data import analyze_data
 
 # Count the days each hydro compartment's salinity exceeded 5.5 in one scenario.
-df = await analyze_data(
-    variable="sal", time_unit="daily", grid="hydro_compartment_v001",
-    model_group_id=500, scenario_id=7,
-    where="value > 5.5",
-    group_aggregate="count",
-)
-# → one row per grid_cell. The grid cell is always part of the grouping key (this
-#   stage never merges across cells — that's summarize_by's job); group_by lists any
-#   ADDITIONAL dimensions to keep as columns, and everything unlisted is collapsed.
-#   Omitting group_by, as here, collapses across all days to one count per compartment.
+df = await analyze_data({
+    "inputs": {
+        "sal": {
+            "variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001",
+            "model_group_id": 500, "scenario_id": 7, "aggregate_type": "mean",
+        }
+    },
+    "steps": [
+        {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
+        {"op": "filter", "where": "value > 5.5"},
+        {"op": "group", "by": [], "aggregate": "count"},
+    ],
+    "output": {"format": "csv"},
+})
+# → one row per grid_cell (an empty group.by collapses every day into one count).
 ```
-
-In a plain Python script, wrap the call once with `asyncio.run`:
-
-```python
-import asyncio
-df = asyncio.run(analyze_data(...))
-```
-
-Dimension filters accept a scalar or a list (`scenario_id=7` or `scenario_id=[7, 8]`), and
-a misspelled parameter raises an error naming it and listing the valid ones. Pass
-`lazy=True` to receive a Polars `LazyFrame` instead of a materialized `DataFrame`.
 
 ### Raster Analyses
 
-Raster analyses whose result is a table return a data frame like any other — surviving
-dimensions become columns, so there is no band bookkeeping:
+A pipeline that reaggregates raster pixels onto a coarser vector zone (a many-to-one
+`project`) still returns a table — surviving dimensions become columns, so there is no
+band bookkeeping:
 
 ```python
 # Mean elevation per hydro compartment, per year, averaged across two scenarios.
-df = await analyze_data(
-    variable="elev", time_unit="annual", grid="morph_pixel_v001",
-    model_group_id=500, scenario_id=[7, 8],
-    group_by="calendar_year", group_aggregate="mean",
-    summarize_by="hydro_compartment_v001", summarize_aggregate="mean",
-)
+df = await analyze_data({
+    "inputs": {
+        "elev": {
+            "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
+            "model_group_id": 500, "scenario_id": [7, 8],
+        }
+    },
+    "steps": [
+        {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "mean"},
+        {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+    ],
+    "output": {"format": "csv"},
+})
 # columns: grid_cell, calendar_year, value — one row per (compartment, year)
 ```
 
-An analysis whose result is a full-resolution raster image (a band collapse with no
-`summarize_by` or `grid_cell`) has no sensible tabular form, so it requires an
-`output_path` and writes a GeoTIFF instead, returning the path. Band descriptions carry
-the surviving dimension values (e.g. `calendar_year=2050`):
+A pipeline whose result is a full-resolution raster image (a band collapse with no
+zonal `project`) has no sensible tabular form, so it requires `output_path` and writes a
+GeoTIFF instead, returning the path:
 
 ```python
 path = await analyze_data(
-    variable="elev", time_unit="annual", grid="morph_pixel_v001",
-    model_group_id=500, scenario_id=[7, 8],
-    group_by="calendar_year", group_aggregate="mean",
+    {
+        "inputs": {
+            "elev": {
+                "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
+                "model_group_id": 500, "scenario_id": [7, 8],
+            }
+        },
+        "steps": [
+            {"op": "project", "input": "elev", "to": "morph_pixel_v001"},
+            {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+        ],
+        "output": {"format": "tif"},
+    },
     output_path="mean_elev_by_year.tif",
 )
 ```
 
-Omitting `output_path` on a raster-shaped request raises an error explaining which
-parameters (`summarize_by`, `grid_cell`) produce frames instead.
-
 ### Multi-Dataset Pipelines
 
 For analyses spanning several datasets — projecting one grid onto another, spatially
-joining, filtering across both — pass a `pipeline` instead of flat parameters. The
-pipeline document is identical to the one the API's `/v1/analysis` endpoints accept (see
-the [Data and Analysis API documentation](docs/data-analysis-api.md#analysis-pipelines)
-for the full request shape and operations):
+joining, filtering across both — the pipeline names more than one entry under `inputs`.
+The pipeline document is identical to the one the API's `/v1/analysis` endpoints accept
+(see the [Analysis API documentation](docs/analysis-api.md#request-shape) for the full
+request shape and operations):
 
 ```python
 # Earliest year each vegetation pixel has marsh coverage > 0.5 AND salinity > 5.5.
 path = await analyze_data(
-    pipeline={
+    {
         "inputs": {
             "marsh": {
                 "variable": "ffibs_coverage_ratio", "time_unit": "annual",
@@ -241,14 +285,7 @@ path = await analyze_data(
 )
 ```
 
-`pipeline` and flat parameters are mutually exclusive in one call. A flat call and its
-single-input pipeline equivalent return identical results — the two forms are different
-spellings of the same engine.
-
-> [!TIP]
-> For object-level control (inspecting the analysis before running it, streaming the
-> result, or writing rasters with custom profiles), use `cpra.mp.data.analysis` directly:
-> `create_analysis(...)` accepts the same plain values and returns the underlying analysis
-> object (`await obj.apply_params()`, then `obj.materialize()` or
-> `obj.write_raster(path)`). Errors from either surface are ordinary exceptions
-> (`AnalysisError`, `PipelineError`) — no web framework is involved.
+A small set of pre-built pipelines — a difference between two scenarios, a land-type
+concatenation, this same earliest-exceedance-year query — is also available by name with
+no hand-authored pipeline document at all; see the
+[named-analysis registry documentation](docs/analyses-api.md).

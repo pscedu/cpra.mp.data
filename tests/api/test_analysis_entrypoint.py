@@ -3,19 +3,29 @@ entry point `cpra.mp.data.analysis/__init__.py`'s module docstring documents for
 notebook, a script, or a future `read_data` extension. These call `create_analysis`
 directly (no ASGI, no `dataset_factory`/query-model fixtures) to exercise exactly what a
 library caller would use.
+
+`TestAnalysisCompression` below is the one exception: G6 (compression on analysis
+responses) is a query-binding/routing concern, not a `create_analysis` calling-convention
+one, so it goes through the real ASGI app (the `client` fixture from
+`tests/api/conftest.py`) instead.
 """
+
+import io
 
 import numpy as np
 import polars as pl
 import pytest
+import rasterio as rio
 from polars.testing import assert_frame_equal
 
+from cpra.mp.data import config
 from cpra.mp.data.analysis import AnalysisError, create_analysis
 from cpra.mp.data.analysis.parameters import (
     DatasetDimensions,
     FilterDimensions,
     Options,
 )
+from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.tabular import write_parquet
 from tests.factories import (
@@ -162,3 +172,109 @@ class TestRasterPlainValues:
 
         zone_1 = df.filter(pl.col("grid_cell") == 1)
         assert zone_1["value"][0] == pytest.approx(30)
+
+
+class TestAnalysisCompression:
+    """G6 -- `Compression` is bound as its own query model on `/v1/analysis.{format}`
+    (POST and GET-dotted), which previously hardcoded `Compression()` regardless of what
+    a caller sent. Exercised through the real ASGI routes (`api/__init__.py::post_analysis`,
+    `get_analysis`), since this is about query binding and routing, not `create_analysis`.
+    """
+
+    RASTER_PIPELINE = {
+        "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+        "steps": [
+            {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+            {"op": "group", "by": [], "aggregate": "max"},
+        ],
+        "output": {"format": "tif"},
+    }
+
+    VECTOR_PIPELINE = {
+        "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+        "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+        "output": {"format": "csv"},
+    }
+
+    def test_post_compression_reaches_the_raster_profile(self, client, base_path, monkeypatch):
+        """A non-default `compression_algorithm`/`compression_level` given on the POST
+        form actually reaches the written GeoTIFF's profile -- the same proof
+        `test_responses.py::TestRasterioStreamingResponse.test_compression_reaches_the_
+        output_profile` uses for `RasterioStreamingResponse` directly, run here through
+        the full route so the query binding itself is exercised.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        response = client.post(
+            "/v1/analysis.tif",
+            json=self.RASTER_PIPELINE,
+            params={"compression_algorithm": "deflate", "compression_level": 9},
+        )
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.profile["compress"].lower() == "deflate"
+
+    def test_get_dotted_compression_reaches_the_raster_profile(self, client, base_path, monkeypatch):
+        """Same proof as above, through the GET dotted-query form."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.RASTER_PIPELINE))
+        query.update({"compression_algorithm": "deflate", "compression_level": "9"})
+        response = client.get("/v1/analysis.tif", params=query)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.profile["compress"].lower() == "deflate"
+
+    def test_get_dotted_pipeline_ignores_compression_keys(self, client, base_path, monkeypatch):
+        """`compression_algorithm`/`compression_level` must be stripped from the raw
+        query dict before it reaches `pipeline_from_query` -- neither is `input.*`/
+        `step.*`/`output.*`, so left in place they would 400 as an "unknown top-level
+        parameter group" (see `pipeline.pipeline_from_query`'s docstring) rather than
+        being consumed as compression parameters.
+        """
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
+        query["compression_algorithm"] = "zstd"
+        query["compression_level"] = "3"
+        response = client.get("/v1/analysis.csv", params=query)
+        assert response.status_code == 200, response.text
+
+    def test_post_mismatched_compression_and_format_is_400(self, client, base_path, monkeypatch):
+        """A raster-only compression algorithm requested against a tabular format is
+        rejected by `validate_compression` -- proof the analysis routes now actually
+        validate the caller's compression choice instead of silently ignoring it behind
+        the old hardcoded `Compression()`.
+        """
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        response = client.post(
+            "/v1/analysis.csv", json=self.VECTOR_PIPELINE, params={"compression_algorithm": "lzw"}
+        )
+        assert response.status_code == 400
+        assert "Compression algorithm" in response.json()["detail"]
+
+    def test_get_dotted_mismatched_compression_and_format_is_400(self, client, base_path, monkeypatch):
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
+        query["compression_algorithm"] = "lzw"
+        response = client.get("/v1/analysis.csv", params=query)
+        assert response.status_code == 400
+        assert "Compression algorithm" in response.json()["detail"]
+
+    def test_get_compression_defaults_when_unspecified(self, client, base_path, monkeypatch):
+        """No compression params given -> falls back to `Compression()`'s own field
+        defaults, so the new binding doesn't regress the previously-hardcoded behaviour
+        for callers that don't care about compression."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.RASTER_PIPELINE))
+        response = client.get("/v1/analysis.tif", params=query)
+        assert response.status_code == 200, response.text

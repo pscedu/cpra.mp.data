@@ -24,6 +24,7 @@ from cpra.mp.data.analysis.utils import (
 from cpra.mp.data.api.models import Compression, DatasetDimensions, FilterDimensions
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.utils import (
+    get_analysis_class,
     get_visualization_class,
     validate_compression,
     validate_format,
@@ -140,6 +141,76 @@ class TestGetVisualizationClass:
 
     def test_type_is_optional(self):
         assert get_visualization_class("sediment-dynamics") is not None
+
+
+class _FakeAnalysisDatasetMeta:
+    type = "dataset"
+
+
+class _FakeAnalysisCustomMeta:
+    type = "custom"
+
+
+class _FakeDatasetAnalysisClass:
+    Meta = _FakeAnalysisDatasetMeta
+
+
+class _FakeCustomAnalysisClass:
+    Meta = _FakeAnalysisCustomMeta
+
+
+class TestGetAnalysisClass:
+    """`get_analysis_class` (plan §3.2a) -- the named-analysis counterpart to
+    `get_visualization_class` above, generalizing its exact 404 (unknown name) / 400
+    (wrong route kind) split rather than reinventing it. The real registry
+    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent Phase 2 change that may not exist
+    yet (see `api/utils.py`'s guarded import) -- these tests monkeypatch a small fake
+    registry directly onto `cpra.mp.data.api.utils.ANALYSES` (the module-global name
+    `get_analysis_class` itself reads), so they pass identically whether or not the real
+    package has landed.
+
+    The fake `Meta`/analysis classes above are module-level, not nested inside this test
+    class: a nested class body has no closure over its enclosing class body's namespace
+    (unlike a nested function), so `class _FakeDatasetAnalysis: Meta = _DatasetMeta` would
+    raise `NameError` at collection time if `_DatasetMeta` were itself just another
+    sibling nested class here.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_registry(self, monkeypatch):
+        import cpra.mp.data.api.utils as api_utils
+
+        monkeypatch.setattr(
+            api_utils,
+            "ANALYSES",
+            {"concatenate": _FakeDatasetAnalysisClass, "exit-criterion": _FakeCustomAnalysisClass},
+        )
+
+    def test_returns_a_known_analysis(self):
+        assert get_analysis_class("concatenate").Meta.type == "dataset"
+
+    def test_unknown_name_raises_404(self):
+        with pytest.raises(HTTPException) as excinfo:
+            get_analysis_class("nope")
+        assert excinfo.value.status_code == 404
+        assert "Unknown analysis name" in excinfo.value.detail
+
+    def test_matching_type_is_accepted(self):
+        assert get_analysis_class("concatenate", "dataset") is not None
+
+    def test_mismatched_type_raises_400(self):
+        with pytest.raises(HTTPException) as excinfo:
+            get_analysis_class("concatenate", "custom")
+        assert excinfo.value.status_code == 400
+        assert "Invalid analysis type" in excinfo.value.detail
+
+    def test_custom_type_mismatch_the_other_direction(self):
+        with pytest.raises(HTTPException) as excinfo:
+            get_analysis_class("exit-criterion", "dataset")
+        assert excinfo.value.status_code == 400
+
+    def test_type_is_optional(self):
+        assert get_analysis_class("exit-criterion") is not None
 
 
 class TestGetLazyFrame:

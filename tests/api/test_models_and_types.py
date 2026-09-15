@@ -118,9 +118,9 @@ class TestFilterDimensions:
 class TestOptions:
     def test_defaults(self):
         options = Options()
-        assert options.unpivot is False
         assert options.grid_cell is None
         assert options.group_aggregate is None
+        assert options.calculate is None
 
     def test_aggregate_enum_is_unwrapped(self):
         assert Options(group_aggregate="sum").group_aggregate == "sum"
@@ -139,17 +139,23 @@ class TestQuerySplitting:
     """TileQuery and DataQuery arrive flat from the query string and are split apart."""
 
     def test_tile_query_splits_filters_from_options(self):
-        query = TileQuery(model_group_id=[500], unpivot=True, group_aggregate="sum")
+        # `group_by`/`group_aggregate`/`calculate`/... are `Options`-only fields, not
+        # `TileQuery`'s (Phase 4: `TileQuery` inherits `DataOptions`, not `Options` --
+        # see `TileQuery`'s docstring) -- so only a `DataOptions` field (`where`) is
+        # exercised here; `query.options` still reports `Options` defaults for the
+        # fields `TileQuery` itself doesn't carry.
+        query = TileQuery(model_group_id=[500], where="calendar_year > 2035", grid_cell="1,2")
         assert query.filter_dimensions.model_group_id == [500]
-        assert query.options.unpivot is True
-        assert query.options.group_aggregate == "sum"
+        assert query.options.where == "calendar_year > 2035"
+        assert query.options.grid_cell == "1,2"
+        assert query.options.group_aggregate is None
 
     def test_filter_dimensions_drops_option_fields(self):
-        query = TileQuery(model_group_id=[500], unpivot=True)
-        assert not hasattr(query.filter_dimensions, "unpivot")
+        query = TileQuery(model_group_id=[500], where="calendar_year > 2035")
+        assert not hasattr(query.filter_dimensions, "where")
 
     def test_options_drops_filter_fields(self):
-        query = TileQuery(model_group_id=[500], unpivot=True)
+        query = TileQuery(model_group_id=[500], where="calendar_year > 2035")
         assert not hasattr(query.options, "model_group_id")
 
     def test_data_query_exposes_compression(self):

@@ -15,7 +15,7 @@ from cpra.mp.data.analysis.vector import (
     parse_tile,
     read_pmtile,
 )
-from tests.factories import write_pmtiles
+from tests.factories import ANNUAL_KWARGS, annual_frame, write_pmtiles
 
 TILE = mercantile.Tile(x=1, y=2, z=3)
 
@@ -227,3 +227,80 @@ class TestGetVectorTile:
         expected = annual_frame(years=(2030,))["1"][0]
         assert len(result.layers[0].values) == 1
         assert result.layers[0].values[0].double_value == pytest.approx(expected, rel=1e-5)
+
+
+class TestAnalysisVectorTileRoute:
+    """`/v1/analysis/{z}/{x}/{y}.pbf` (G5) -- the pipeline counterpart to
+    `get_vector_tile`/`TestGetVectorTile` above, exercised through the real ASGI app
+    (`client`) rather than `BaseAnalysis.get_vector_tile()` directly, since the point of
+    this gap is the route itself: it did not exist before.
+    """
+
+    VECTOR_PIPELINE = {
+        "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+        "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+        "output": {"format": "csv"},
+    }
+
+    async def test_serves_a_real_vector_tile(self, client, base_path, tiles_path, monkeypatch):
+        from cpra.mp.data import config
+        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from cpra.mp.data.tabular import write_parquet
+
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        write_pmtiles(tiles_path, "ecoregion_v001", TILE, [1, 2, 3])
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
+        response = client.get(f"/v1/analysis/{TILE.z}/{TILE.x}/{TILE.y}.pbf", params=query)
+
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
+        result = VectorTile()
+        result.ParseFromString(response.content)
+        expected = annual_frame(years=(2030,))["1"][0]
+        assert result.layers[0].values[0].double_value == pytest.approx(expected, rel=1e-5)
+
+    async def test_rejects_a_raster_output_grid(self, client, base_path, monkeypatch):
+        """A pipeline whose final grid is raster (no `grid_cell`/`summarize_by` narrowing
+        it to tabular) 400s on `.pbf` via `compiled.validate_vector_tile()` -- the same
+        rule `get_vector_tile` enforces on the data route, reached here without ever
+        needing a PMTiles archive on disk (the rejection fires before any tile lookup).
+        """
+        from cpra.mp.data import config
+        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from tests.factories import RASTER_KWARGS, write_raster_dataset
+
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                {"op": "group", "by": [], "aggregate": "max"},
+            ],
+            "output": {"format": "tif"},
+        }
+        query = pipeline_to_query(parse_pipeline(pipeline))
+        response = client.get("/v1/analysis/3/1/2.pbf", params=query)
+
+        assert response.status_code == 400
+        assert "invalid output type for vector tile" in response.json()["detail"]
+
+    async def test_missing_tile_returns_404(self, client, base_path, monkeypatch):
+        """Same pipeline as the success case, but with no PMTiles archive written for
+        the grid -- `validate_vector_tile` itself 404s (no tile file for grid), never
+        reaching `VectorTileResponse`."""
+        from cpra.mp.data import config
+        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from cpra.mp.data.tabular import write_parquet
+
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
+        response = client.get(f"/v1/analysis/{TILE.z}/{TILE.x}/{TILE.y}.pbf", params=query)
+
+        assert response.status_code == 404
+        assert "no tile file for grid" in response.json()["detail"]

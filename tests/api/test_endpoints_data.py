@@ -6,6 +6,7 @@ they cover the parameter binding that FastAPI does before a Dataset is ever buil
 
 import io
 import json
+from urllib.parse import parse_qs, urlparse
 
 import mercantile
 import numpy as np
@@ -76,6 +77,24 @@ def salinity_data(base_path, monkeypatch):
         pl.Series("3", [0.0, 0.04], dtype=pl.Float32),
     )
     write_parquet(df, base_path=base_path, validate=False, sort=False)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return base_path
+
+
+@pytest.fixture
+def two_model_group_salinity_data(base_path, monkeypatch):
+    """Two model groups of daily sal, the shape a `difference` over `model_group_id` needs.
+
+    ``validate=False`` for the same reason as ``salinity_data``: three grid cell columns
+    rather than the grid's full 1,657.
+    """
+    for model_group_id in (500, 521):
+        write_parquet(
+            daily_frame(model_group_id=model_group_id),
+            base_path=base_path,
+            validate=False,
+            sort=False,
+        )
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
 
@@ -152,7 +171,10 @@ class TestFloatPrecision:
     receives, and a reader would parse "12.3" and "12.3456" into indistinguishable floats.
     """
 
-    QUERY = "?unpivot=true&select=calendar_day,grid_cell,value"
+    # Data is served in long format (grid_cell/value columns) unconditionally now --
+    # `unpivot` used to force this shape and is retired (Phase 4); no query-string
+    # equivalent is needed since there's no other shape left to ask for.
+    QUERY = "?select=calendar_day,grid_cell,value"
 
     def test_csv_values_are_rounded_to_one_decimal(self, client, salinity_data):
         response = client.get(f"{SALINITY_URL}/data.csv{self.QUERY}")
@@ -174,7 +196,7 @@ class TestFloatPrecision:
 
     def test_an_unrounded_variable_is_unaffected(self, client, vector_data):
         """ssf sets no precision, so its floats are written at full width."""
-        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell=1&unpivot=true&select=value")
+        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell=1&select=value")
         assert response.status_code == 200
         assert response.text.strip().splitlines()[1:] == ["2030.01", "2040.01"]
 
@@ -225,19 +247,21 @@ class TestVectorData:
         assert df["grid_cell"].unique().to_list() == [1]
         assert label not in df.columns
 
-    def test_unpivot(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell=1")
+    def test_data_is_reported_in_long_format(self, client, vector_data):
+        """Data is served long (grid_cell/value columns) unconditionally now -- `unpivot`
+        used to request this shape and is retired (Phase 4)."""
+        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell=1")
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"grid_cell", "value"} <= set(df.columns)
 
-    def test_unpivot_reports_cell_ids_for_a_coordinate_selection(
+    def test_reports_cell_ids_for_a_coordinate_selection(
         self, client, vector_data, ecoregion_geometry
     ):
-        """The shape every visualization requests: unpivoted, and still keyed by ID, so the
-        caller can join it against anything else the vector grid keys that way."""
+        """The shape every visualization requests: long format, and still keyed by ID, so
+        the caller can join it against anything else the vector grid keys that way."""
         label = _lng_lat(500500, 3300500)
 
-        response = client.get(f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell={label}")
+        response = client.get(f"{VECTOR_URL}/data.csv?grid_cell={label}")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["grid_cell"].unique().to_list() == [1]
@@ -250,7 +274,7 @@ class TestVectorData:
         first, second = _lng_lat(500400, 3300400), _lng_lat(500600, 3300600)
 
         response = client.get(
-            f"{VECTOR_URL}/data.csv?unpivot=true&grid_cell={first},{second}&calendar_year=2030"
+            f"{VECTOR_URL}/data.csv?grid_cell={first},{second}&calendar_year=2030"
         )
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
@@ -291,9 +315,13 @@ class TestVectorData:
         response = client.get(f"{VECTOR_URL}/data.csv?sort=nonsense")
         assert response.status_code == 400
 
-    def test_group_by_without_aggregate_is_400(self, client, vector_data):
+    def test_group_by_is_retired_on_the_data_route(self, client, vector_data):
+        """`group_by` is retired from the flat data route (Phase 4) -- rejected outright
+        rather than validated (it used to 400 here for lacking `group_aggregate`; now it
+        400s regardless, before that check is ever reached)."""
         response = client.get(f"{VECTOR_URL}/data.csv?group_by=calendar_year")
         assert response.status_code == 400
+        assert "group_by" in response.json()["detail"]
 
     def test_conditional_count_is_one_request(self, client, vector_data):
         """"Count cells where value > x" -- one `where` value conjunct +
@@ -301,9 +329,25 @@ class TestVectorData:
         trip on the client side. Cell (year, geo) holds year + geo/100 (see
         `annual_frame`), so a threshold between the two written years isolates exactly
         one year's worth of matches.
+
+        `group_aggregate` (like `group_by`) is retired from the flat data route
+        (Phase 4) -- this now goes through the ad-hoc `/v1/analysis.csv` pipeline route's
+        `filter` + `group` steps instead, the pipeline equivalent of the same request.
+        The leading identity `project` (`to` the input's own grid) exists purely to give
+        `filter` something to chain from -- a pipeline's first step must name its input
+        explicitly, which only `project`/`join` can do.
         """
-        response = client.get(f"{VECTOR_URL}/data.csv", params={"where": "value > 2035", "group_aggregate": "count"})
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "filter", "where": "value > 2035"},
+                {"op": "group", "by": [], "aggregate": "count"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.height == 32
         assert df["value"].to_list() == [1] * 32
@@ -311,10 +355,11 @@ class TestVectorData:
     def test_cliff_shaped_group_aggregate_goes_through_the_fold(self, client, base_path, monkeypatch):
         """A request shaped exactly like the memory cliff this package's `api.fold`
         module fixes -- no `group_by`, no selective filter, `group_aggregate` set, so
-        the group key is `grid_cell` alone -- routed end to end through the ASGI app,
-        not a directly constructed `Dataset`. `TABULAR_FOLD_STEP` is monkeypatched down
-        to 40 so this fixture-scale dataset (50 years x 32 cells = 1,600 rows) is still
-        forced through ~40 real fold chunks and merges, rather than degenerating to the
+        the group key is `grid_cell` alone -- routed end to end through the ASGI app via
+        the `/v1/analysis.csv` pipeline route's `group` step (`group_aggregate` has no
+        flat spelling anymore, Phase 4). `TABULAR_FOLD_STEP` is monkeypatched down to 40
+        so this fixture-scale dataset (50 years x 32 cells = 1,600 rows) is still forced
+        through ~40 real fold chunks and merges, rather than degenerating to the
         single-chunk case every other fixture-scale test in this suite exercises.
         """
         monkeypatch.setattr(fold_module, "TABULAR_FOLD_STEP", 40)
@@ -322,8 +367,16 @@ class TestVectorData:
         write_parquet(annual_frame(years=years), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        response = client.get(f"{VECTOR_URL}/data.csv", params={"group_aggregate": "sum"})
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "group", "by": [], "aggregate": "sum"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content)).sort("grid_cell")
 
         assert df.height == 32
@@ -332,16 +385,21 @@ class TestVectorData:
         assert df["value"].to_list() == pytest.approx(expected, rel=1e-5)
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_vector_data):
-        """"How many cells carry each distinct value per zone" -- one `summarize_by` +
-        `summarize_aggregate=count_by_value` request, asserting the long output shape
-        (grid_cell/value/count/geographic_unit), end to end through routing and
-        query-string parsing rather than a directly constructed `Dataset`.
+        """"How many cells carry each distinct value per zone" -- one `project`-to-a-
+        coarser-grid step with `aggregate=count_by_value`, asserting the long output
+        shape (grid_cell/value/count/geographic_unit), through the `/v1/analysis.csv`
+        pipeline route (`summarize_by`/`summarize_aggregate` have no flat spelling
+        anymore, Phase 4 -- `project`+`aggregate` is their pipeline equivalent).
         """
-        response = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={"summarize_by": "hydro_compartment_v001", "summarize_aggregate": "count_by_value"},
-        )
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "hydro_compartment_v001", "aggregate": "count_by_value"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
 
@@ -357,18 +415,39 @@ class TestVectorData:
             assert actual == value_counts
 
     def test_mixed_dimension_and_value_where_aggregating(self, client, vector_data):
-        """A single `where` string with one dimension conjunct and one value conjunct,
-        AND-ed together (`calendar_year > 2035 AND value > 0`), end to end through
-        routing and query-string parsing. `calendar_year > 2035` (a dimension conjunct)
-        is a real row filter, isolating the 2040 rows; `value > 0` (a value conjunct) is
+        """A dimension conjunct and a value conjunct, through the `/v1/analysis.csv`
+        pipeline route's `filter` + `group` steps (`group_aggregate` has no flat
+        spelling anymore, Phase 4). `calendar_year > 2035` (a dimension conjunct) is a
+        real row filter, isolating the 2040 rows; `value > 0` (a value conjunct) is
         vacuously true for every remaining cell (see `annual_frame`'s
-        `year + geo_id / 100`), so `group_aggregate=count` should still see all 32 cells.
+        `year + geo_id / 100`), so `aggregate=count` should still see all 32 cells.
+
+        The two conjuncts are deliberately spelled as two separate `filter` steps
+        rather than one `"calendar_year > 2035 AND value > 0"` string: a single-input
+        pipeline compiles every `filter` step's `where` onto one combined
+        `Options.where` by wrapping each step's clause in its own parens and AND-ing
+        them together (`planner._compile_single_input_chain`), which is exactly right
+        when each step's own clause is a single conjunct, but corrupts a step whose own
+        `where` is *itself* multiple AND-ed conjuncts (the parens hide the inner AND
+        from the executor's own later re-split of `Options.where` into dimension/value
+        conjuncts, so a perfectly valid one-dimension-one-value `where` gets rejected
+        as if it were one mixed conjunct). That's a pre-existing pipeline-compiler
+        limitation, not a Phase 4 regression, and out of scope for this change --
+        splitting across two `filter` steps here avoids it entirely without giving up
+        anything this test is meant to demonstrate.
         """
-        response = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={"where": "calendar_year > 2035 AND value > 0", "group_aggregate": "count"},
-        )
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+            "steps": [
+                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "filter", "where": "calendar_year > 2035"},
+                {"op": "filter", "where": "value > 0"},
+                {"op": "group", "by": [], "aggregate": "count"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.height == 32
         assert df["value"].to_list() == [1] * 32
@@ -438,23 +517,29 @@ class TestRasterData:
 
     def test_conditional_count_per_zone_is_one_request(self, client, gradient_raster_with_zones):
         """The plan's target query -- "count pixels per compartment where value > X" --
-        expressed as one API request (`summarize_by` + `summarize_aggregate=count` + a
-        `where` value conjunct), end to end through routing and query-string parsing
-        rather than a directly constructed `Dataset`.
+        expressed as one `/v1/analysis.csv` pipeline request (a `project`-to-a-coarser-
+        grid step with `aggregate=count`, followed by a `filter` step): `summarize_by`/
+        `summarize_aggregate` have no flat spelling anymore (Phase 4), so this moved off
+        the plain data route onto the pipeline route their `project`+`aggregate` step
+        compiles onto. The `filter` step comes AFTER `project` in pipeline order but
+        (per `planner._compile_single_input_chain`) folds onto the same `Options.where`
+        a flat request would have used, which the underlying engine always applies
+        before the zonal aggregation -- the pixel-level threshold, not a post-count one.
         """
         _base_path, _grid, zones = gradient_raster_with_zones
         gradient = raster_array()
         threshold = 100_000
 
-        response = client.get(
-            f"{RASTER_URL}/data.csv",
-            params={
-                "summarize_by": "hydro_compartment_v001",
-                "summarize_aggregate": "count",
-                "where": f"value > {threshold}",
-            },
-        )
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"vct": {"variable": "vct", "time_unit": "annual", "grid": "veg_grid_cell_v001"}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "count"},
+                {"op": "filter", "where": f"value > {threshold}"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         for zone_id in (1, 2):
             expected = int((gradient[zones == zone_id] > threshold).sum())
@@ -463,18 +548,23 @@ class TestRasterData:
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_raster_with_zones):
         """"How many pixels of each land-type value per hydro compartment" -- one
-        `summarize_by` + `summarize_aggregate=count_by_value` request, asserting the long
-        output shape (grid_cell/value/count/geographic_unit), end to end through routing
-        and query-string parsing rather than a directly constructed `Dataset`.
+        `project`-to-a-coarser-grid step with `aggregate=count_by_value`, asserting the
+        long output shape (grid_cell/value/count/geographic_unit), through the
+        `/v1/analysis.csv` pipeline route (`summarize_by`/`summarize_aggregate` have no
+        flat spelling anymore, Phase 4).
         """
         _base_path, _grid, zones = categorical_raster_with_zones
         categories = raster_array() % 5
 
-        response = client.get(
-            f"{RASTER_URL}/data.csv",
-            params={"summarize_by": "hydro_compartment_v001", "summarize_aggregate": "count_by_value"},
-        )
-        assert response.status_code == 200
+        pipeline = {
+            "inputs": {"vct": {"variable": "vct", "time_unit": "annual", "grid": "veg_grid_cell_v001"}},
+            "steps": [
+                {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "count_by_value"},
+            ],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
 
@@ -538,152 +628,86 @@ def two_year_raster_data(base_path, monkeypatch):
     return base_path
 
 
-class TestCalculateParams:
-    """The indexed `calculate.N.expression`/`calculate.N.where` query parameters, end to
-    end through routing: FastAPI's query models can't bind dotted names, so these go
-    through `api.parse_calculate_query`/`parameters.parse_indexed_calculate`, and any
-    malformed spelling must come back as a 400 naming the exact rule violated."""
+class TestRetiredParams:
+    """Phase 4: every flat analysis parameter this class used to name (the indexed
+    `calculate.N.expression`/`calculate.N.where` query parameters, plus `negate`/
+    `multiply10`/`multiply100`/`group_aggregate`/`summarize_by`/`summarize_aggregate`/
+    `summarize_grid_cell`/`unpivot`) is retired from the HTTP surface -- see
+    `api.reject_retired_params`/`api._RETIRED_PARAMS`. What used to be end-to-end
+    functional coverage of the indexed `calculate.N.*` encoding and the legacy
+    negate/multiply sugar (weighted sums, band selection, tile rendering, the
+    mixing-rejection rule) moved to `tests/api/test_pipeline_exec.py`'s
+    `TestCalculateStepEndToEnd`, which exercises the same functionality through the
+    `calculate`/`group` pipeline steps that are its only surviving spelling. What
+    remains here is one rejection test per retired name -- proving each one 400s with a
+    detail message naming its pipeline replacement, rather than being silently ignored
+    the way FastAPI/pydantic treat any other unrecognized query parameter. (`group_by`
+    and `value_where` have their own rejection tests in `TestVectorData` above.)
+    """
 
-    def test_weighted_sum_on_a_vector_grid(self, client, vector_data):
-        """The confidence-weighting idiom on a vector grid: each selection scaled by its
-        own coefficient, collapsed with group_aggregate=sum."""
-        response = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={
-                "grid_cell": "1",
-                "calculate.1.expression": "value * 0.5",
-                "calculate.1.where": "calendar_year = 2030",
-                "calculate.2.expression": "value * 0.25",
-                "calculate.2.where": "calendar_year = 2040",
-                "group_aggregate": "sum",
-            },
-        )
-        assert response.status_code == 200
-        df = pl.read_csv(io.BytesIO(response.content))
-        assert df.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(
-            2030.01 * 0.5 + 2040.01 * 0.25, rel=1e-5
-        )
-
-    def test_non_matching_rows_pass_through(self, client, vector_data):
-        response = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={
-                "grid_cell": "1",
-                "calculate.1.expression": "value * 0",
-                "calculate.1.where": "calendar_year = 2030",
-                "sort": "calendar_year",
-            },
-        )
-        assert response.status_code == 200
-        df = pl.read_csv(io.BytesIO(response.content))
-        assert df["value"].to_list() == pytest.approx([0.0, 2040.01], rel=1e-5)
-
-    def test_weighted_band_sum_on_a_raster_grid(self, client, two_year_raster_data):
-        """Band selection via a dimension condition in calculate.N.where, through the
-        full GeoTIFF render path: 30*0.5 + 40*0.25 = 25 at every pixel."""
-        response = client.get(
-            f"{RASTER_URL}/data.tif",
-            params={
-                "calculate.1.expression": "value * 0.5",
-                "calculate.1.where": "calendar_year = 2030",
-                "calculate.2.expression": "value * 0.25",
-                "calculate.2.where": "calendar_year = 2040",
-                "group_aggregate": "sum",
-            },
-        )
-        assert response.status_code == 200
-        with rio.open(io.BytesIO(response.content)) as src:
-            assert src.count == 1
-            assert src.read(1)[0, 0] == 25
-
-    def test_weighted_band_sum_renders_as_a_tile(self, client, two_year_raster_data):
-        """The same weighting request on the tile route -- the confidence-weighted
-        surface use case, rendered."""
-        with rio.open(next(two_year_raster_data.rglob("*.tif"))) as src:
-            from rasterio.warp import transform_bounds
-
-            west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
-        tile = mercantile.tile((west + east) / 2, (south + north) / 2, 8)
-
-        response = client.get(
-            f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.png",
-            params={
-                "calculate.1.expression": "value * 0.5",
-                "calculate.1.where": "calendar_year = 2030",
-                "calculate.2.expression": "value * 0.25",
-                "calculate.2.where": "calendar_year = 2040",
-                "group_aggregate": "sum",
-            },
-        )
-        assert response.status_code == 200
-        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
-
-    def test_non_contiguous_indices_are_400(self, client, vector_data):
-        response = client.get(
-            f"{VECTOR_URL}/data.csv", params={"calculate.2.expression": "value * 2"}
-        )
+    def test_negate_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"negate": "calendar_year = 2030"})
         assert response.status_code == 400
-        assert "contiguous" in response.json()["detail"]
+        assert "negate" in response.json()["detail"]
 
-    def test_zero_index_is_400(self, client, vector_data):
-        response = client.get(
-            f"{VECTOR_URL}/data.csv", params={"calculate.0.expression": "value * 2"}
-        )
+    def test_multiply10_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"multiply10": "calendar_year = 2030"})
         assert response.status_code == 400
-        assert "1-based" in response.json()["detail"]
+        assert "multiply10" in response.json()["detail"]
 
-    def test_unknown_field_is_400(self, client, vector_data):
-        response = client.get(f"{VECTOR_URL}/data.csv", params={"calculate.1.expr": "value * 2"})
+    def test_multiply100_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"multiply100": "calendar_year = 2030"})
         assert response.status_code == 400
-        assert "expr" in response.json()["detail"]
-        assert "expression" in response.json()["detail"]
+        assert "multiply100" in response.json()["detail"]
 
-    def test_bare_calculate_parameter_is_400(self, client, vector_data):
+    def test_group_aggregate_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"group_aggregate": "sum"})
+        assert response.status_code == 400
+        assert "group_aggregate" in response.json()["detail"]
+
+    def test_summarize_by_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"summarize_by": "hydro_compartment_v001"})
+        assert response.status_code == 400
+        assert "summarize_by" in response.json()["detail"]
+
+    def test_summarize_aggregate_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"summarize_aggregate": "sum"})
+        assert response.status_code == 400
+        assert "summarize_aggregate" in response.json()["detail"]
+
+    def test_summarize_grid_cell_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"summarize_grid_cell": "1"})
+        assert response.status_code == 400
+        assert "summarize_grid_cell" in response.json()["detail"]
+
+    def test_unpivot_is_retired(self, client, vector_data):
+        response = client.get(f"{VECTOR_URL}/data.csv", params={"unpivot": "true"})
+        assert response.status_code == 400
+        assert "unpivot" in response.json()["detail"]
+
+    def test_bare_calculate_parameter_is_retired(self, client, vector_data):
         response = client.get(f"{VECTOR_URL}/data.csv", params={"calculate": "value * 2"})
         assert response.status_code == 400
-        assert "calculate.<N>.expression" in response.json()["detail"]
+        assert "calculate" in response.json()["detail"]
 
-    def test_where_without_expression_is_400(self, client, vector_data):
+    def test_indexed_calculate_parameters_are_retired(self, client, vector_data):
         response = client.get(
-            f"{VECTOR_URL}/data.csv", params={"calculate.1.where": "calendar_year = 2030"}
-        )
-        assert response.status_code == 400
-        assert "expression" in response.json()["detail"]
-
-    def test_mixing_legacy_and_generic_is_400(self, client, vector_data):
-        response = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={"negate": "calendar_year = 2030", "calculate.1.expression": "value * 2"},
-        )
-        assert response.status_code == 400
-        detail = response.json()["detail"]
-        assert "negate" in detail
-        assert "ambiguous" in detail
-
-    def test_legacy_negate_still_works_and_equals_its_sugar(self, client, vector_data):
-        legacy = client.get(
-            f"{VECTOR_URL}/data.csv",
-            params={"negate": "calendar_year = 2030", "sort": "calendar_year"},
-        )
-        generic = client.get(
             f"{VECTOR_URL}/data.csv",
             params={
-                "calculate.1.expression": "value * -1",
+                "calculate.1.expression": "value * 0.5",
                 "calculate.1.where": "calendar_year = 2030",
-                "sort": "calendar_year",
             },
         )
-        assert legacy.status_code == generic.status_code == 200
-        legacy_df = pl.read_csv(io.BytesIO(legacy.content)).sort("grid_cell", "calendar_year")
-        generic_df = pl.read_csv(io.BytesIO(generic.content)).sort("grid_cell", "calendar_year")
-        assert legacy_df.equals(generic_df)
-
-    def test_invalid_expression_is_400_naming_the_entry(self, client, vector_data):
-        response = client.get(
-            f"{VECTOR_URL}/data.csv", params={"calculate.1.expression": "max(value)"}
-        )
         assert response.status_code == 400
-        assert "calculate.1" in response.json()["detail"]
+        assert "calculate" in response.json()["detail"]
+
+    def test_retired_params_are_rejected_on_the_tile_route_too(self, client, raster_data):
+        """`reject_retired_params` is wired onto the tile/visualization routes as well as
+        the flat data route (see `api.get_model_tile`/`get_vector_tile`); spot-checked
+        here on `.tif` rather than repeated per retired name."""
+        response = client.get(f"{RASTER_URL}/data/8/0/0.png", params={"group_aggregate": "sum"})
+        assert response.status_code == 400
+        assert "group_aggregate" in response.json()["detail"]
 
 
 class TestVectorTiles:
@@ -815,6 +839,193 @@ class TestVisualizationEndpoints:
     def test_dataset_visualization_rejected_on_the_custom_route(self, client, vector_data):
         response = client.get("/v1/visualizations/time-series-line.json?grid_cell=1")
         assert response.status_code == 400
+
+
+class TestMapAnalysisTileRouting:
+    """`Map._get_tile_url_template`/`_get_vector_tile_url_template` route to the named
+    analysis's own tile endpoints (`/analyses/{name}/data/{z}/{x}/{y}.png` and
+    `/analyses/{name}/tiles/{z}/{x}/{y}.pbf`) once `analysis=` is selected, forwarding only
+    an allowlisted set of query parameters -- these go through the real ASGI app and the
+    real `ANALYSES` registry (unlike `test_analyses_endpoints.py`'s fake-registry route
+    tests), inspecting the `map.json` style spec's `sources.data.tiles[0]` URL, the same
+    thing a MapLibre client would actually fetch.
+    """
+
+    def test_raster_map_routes_to_the_analysis_tile_endpoint(self, client, two_year_raster_data):
+        response = client.get(
+            f"{RASTER_URL}/visualization/map.json"
+            "?analysis=difference&dimension=calendar_year&order=asc"
+            "&calendar_year=2030&calendar_year=2040"
+        )
+        assert response.status_code == 200
+        tile_url = response.json()["sources"]["data"]["tiles"][0]
+        assert "/analyses/difference/data/" in tile_url
+        assert "dimension=calendar_year" in tile_url
+        assert "order=asc" in tile_url
+        assert "calendar_year=2030" in tile_url
+        assert "calendar_year=2040" in tile_url
+
+    def test_raster_map_without_an_analysis_still_uses_the_plain_tile_endpoint(
+        self, client, two_year_raster_data
+    ):
+        response = client.get(f"{RASTER_URL}/visualization/map.json?calendar_year=2030")
+        assert response.status_code == 200
+        tile_url = response.json()["sources"]["data"]["tiles"][0]
+        assert "/analyses/" not in tile_url
+        assert "/data/" in tile_url
+
+    def test_vector_map_routes_to_the_analysis_vector_tile_endpoint(self, client, vector_data):
+        response = client.get(
+            f"{VECTOR_URL}/visualization/map.json"
+            "?analysis=difference&dimension=calendar_year&order=asc"
+            "&calendar_year=2030&calendar_year=2040"
+        )
+        assert response.status_code == 200
+        tile_url = response.json()["sources"]["data"]["tiles"][0]
+        assert "/analyses/difference/tiles/" in tile_url
+        assert "dimension=calendar_year" in tile_url
+        assert "order=asc" in tile_url
+
+    def test_vector_map_over_a_date_dimension(self, client, salinity_data):
+        """Regression, reported from the live portal: a difference map over `calendar_day`
+        returned 400 ("dimension filter 'calendar_day' must be a scalar or a list of
+        scalars, got date in it") for every daily dataset. The `calendar_year` cases above
+        all bind to `int`, so nothing here exercised a dimension whose declared dtype makes
+        FastAPI hand `resolve_analysis` a real `datetime.date`.
+        """
+        response = client.get(
+            f"{SALINITY_URL}/visualization/map.json"
+            "?analysis=difference&dimension=calendar_day&order=asc"
+            "&calendar_day=2030-01-01&calendar_day=2030-01-02"
+            "&model_group_id=500&scenario_id=7&aggregate_type=mean"
+        )
+        assert response.status_code == 200
+        tile_url = response.json()["sources"]["data"]["tiles"][0]
+        assert "/analyses/difference/tiles/" in tile_url
+        assert "dimension=calendar_day" in tile_url
+        assert "calendar_day=2030-01-01" in tile_url
+        assert "calendar_day=2030-01-02" in tile_url
+
+    def test_vector_map_without_an_analysis_still_uses_the_plain_vector_tile_endpoint(
+        self, client, vector_data
+    ):
+        response = client.get(f"{VECTOR_URL}/visualization/map.json?calendar_year=2030")
+        assert response.status_code == 200
+        tile_url = response.json()["sources"]["data"]["tiles"][0]
+        assert "/analyses/" not in tile_url
+        assert "/tiles/" in tile_url
+
+    def test_time_series_line_data_csv_url_also_forwards_the_analysis_parameters(
+        self, client, vector_data
+    ):
+        """`get_data_uri` (base.py) has the exact same forwarding requirement as the tile
+        URL templates above -- covered separately here since it's a different call site
+        (the chart's own `data.csv` source, not a tile), reached through a visualization
+        that actually has one (`Map`'s vector branch only builds a `data.csv` URL as a
+        PMTiles-mode fallback with no `request`, so `time-series-line` is used here
+        instead)."""
+        response = client.get(
+            f"{VECTOR_URL}/visualization/time-series-line.json"
+            "?analysis=difference&dimension=calendar_year&order=asc"
+            "&calendar_year=2030&calendar_year=2040&grid_cell=1"
+        )
+        assert response.status_code == 200
+        data_url = response.json()["data"]["url"]
+        assert "/analyses/difference/data.csv" in data_url
+        assert "dimension=calendar_year" in data_url
+        assert "order=asc" in data_url
+
+
+class TestChartDataUrlIsFetchable:
+    """A chart's emitted `data.url` must not just LOOK right -- it must come back 200.
+
+    `TestMapAnalysisTileRouting` above asserts on the shape of the emitted URL (which
+    parameters it forwards); these follow the URL through and actually fetch it. That
+    distinction is the whole point: the difference time-series chart emitted a URL that
+    passed every shape assertion and still 400'd, because `get_data_uri` added the
+    analysis's own collapsed dimension to `select` -- a column the analysis's output frame
+    no longer has ("unable to find column \\"model_group_id\\"").
+    """
+
+    def _data_url(self, client, query):
+        response = client.get(f"{SALINITY_URL}/visualization/time-series-line.json?{query}")
+        assert response.status_code == 200
+        return response.json()["data"]["url"]
+
+    def test_difference_over_model_group_id_is_fetchable(self, client, two_model_group_salinity_data):
+        data_url = self._data_url(
+            client,
+            "analysis=difference&dimension=model_group_id&order=asc"
+            "&model_group_id=500&model_group_id=521"
+            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        )
+        assert "/analyses/difference/data.csv" in data_url
+        assert client.get(data_url).status_code == 200
+
+    def test_the_collapsed_dimension_is_not_selected_back(
+        self, client, two_model_group_salinity_data
+    ):
+        """It still has to be SENT -- the two values are what the difference is taken
+        between -- so this pins the asymmetry, not just the absence."""
+        data_url = self._data_url(
+            client,
+            "analysis=difference&dimension=model_group_id&order=asc"
+            "&model_group_id=500&model_group_id=521"
+            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        )
+        query = parse_qs(urlparse(data_url).query)
+        assert query["model_group_id"] == ["500", "521"]
+        assert "model_group_id" not in query["select"][0].split(",")
+
+    def test_a_collapsed_time_column_is_also_dropped(self, client, two_model_group_salinity_data):
+        """The time column reaches `select` by a DIFFERENT path than the multi-value
+        dimensions -- it goes in unconditionally -- so a `difference` over `calendar_day`
+        hit the identical "unable to find column" failure even once the multi-value path was
+        guarded. Guarding the finished list instead of each append is what covers both.
+
+        (A time-series chart differencing across time has no time axis left to plot; that
+        degeneracy is the portal's to prevent. This only ensures the request itself is
+        well-formed rather than a 400.)
+        """
+        data_url = self._data_url(
+            client,
+            "analysis=difference&dimension=calendar_day&order=asc"
+            "&calendar_day=2030-01-01&calendar_day=2030-01-02"
+            "&model_group_id=500&model_group_id=521"
+            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        )
+        query = parse_qs(urlparse(data_url).query)
+        assert "calendar_day" not in query["select"][0].split(",")
+        assert query["calendar_day"] == ["2030-01-01", "2030-01-02"]
+        assert client.get(data_url).status_code == 200
+
+    def test_a_multi_valued_dimension_the_analysis_keeps_is_still_selected_back(
+        self, client, two_model_group_salinity_data
+    ):
+        """The guard must be narrow: an uncollapsed dimension given two values is a real
+        compare channel and still belongs in `select`. Here the difference is taken over
+        `calendar_day`, so `model_group_id` survives the analysis and must come back."""
+        data_url = self._data_url(
+            client,
+            "analysis=difference&dimension=calendar_day&order=asc"
+            "&calendar_day=2030-01-01&calendar_day=2030-01-02"
+            "&model_group_id=500&model_group_id=521"
+            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        )
+        query = parse_qs(urlparse(data_url).query)
+        assert "model_group_id" in query["select"][0].split(",")
+        assert client.get(data_url).status_code == 200
+
+    def test_without_an_analysis_a_multi_valued_dimension_is_still_selected_back(
+        self, client, two_model_group_salinity_data
+    ):
+        data_url = self._data_url(
+            client,
+            "model_group_id=500&model_group_id=521&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        )
+        query = parse_qs(urlparse(data_url).query)
+        assert "model_group_id" in query["select"][0].split(",")
+        assert client.get(data_url).status_code == 200
 
 
 class TestCors:

@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.analysis import AnalysisError, create_analysis
-from cpra.mp.data.analysis.parameters import parse_indexed_calculate
 from cpra.mp.data.analysis.pipeline import (
     PipelineError,
     parse_pipeline,
@@ -24,6 +23,9 @@ from cpra.mp.data.analysis.types import (
 )
 from cpra.mp.data.api.crosswalk import Crosswalk
 from cpra.mp.data.api.models import (
+    Analysis,
+    AnalysisDataQuery,
+    AnalysisQuery,
     Compression,
     CrosswalkQuery,
     DataQuery,
@@ -43,7 +45,13 @@ from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileRespo
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.utils import (
+    ANALYSES,
+    AnalysisRegistryError,
+    DatasetRef,
+    UnknownAnalysisError,
+    get_analysis_class,
     get_visualization_class,
+    resolve_analysis,
     validate_compression,
     validate_format,
 )
@@ -76,50 +84,74 @@ def get_mpd_session():
 
 MPDSession = Annotated[Session, Depends(get_mpd_session)]
 
-# `value_where` was retired in favor of a single `where` parameter that accepts both
-# dimension and value conditions (see `Options.where`'s comment and
-# `api.expressions.classify_where`). It is no longer a field on `Options`/`DataQuery`/
-# `TileQuery`/`VisualizationQuery`, and FastAPI/pydantic silently ignore an unrecognized
-# query parameter by default (no `model_config = ConfigDict(extra=...)` is set anywhere
-# in models.py) -- confirmed empirically: a request with a bogus query param returns 200
-# with the rest of the query answered normally. Left alone, a caller still sending
-# `value_where` would have their filter silently vanish rather than fail loudly, so this
-# dependency checks the raw query string directly (the only place the retired name is
-# still visible at all) and rejects it explicitly.
-def reject_retired_value_where(request: Request) -> None:
-    if "value_where" in request.query_params:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "'value_where' has been retired -- use 'where' instead, which now accepts both "
-                "dimension and value conditions (e.g. 'calendar_year > 2040 AND value > 3')"
-            ),
-        )
+# Phase 4 (plan §3.1/§6.1): the flat data/tile/visualization endpoints only ever accept
+# `DataOptions`'s fields (dimension filters, `grid_cell`/`where`/`sort`/`select`/
+# `color_map`, plus compression) -- every parameter that used to describe how a compiled
+# pipeline *executes* (`negate`/`multiply10`/`multiply100`, the indexed
+# `calculate.N.expression`/`calculate.N.where`, `group_by`/`group_aggregate`,
+# `summarize_by`/`summarize_aggregate`/`summarize_grid_cell`, `unpivot`) is retired from
+# the HTTP surface, along with the already-retired `value_where`. `Options` (the engine
+# type `BaseAnalysis` consumes, and what a named analysis's own pipeline lowers onto --
+# see `analyses/*.py` and `planner.py`) still has most of these fields; they simply have
+# no flat HTTP spelling anymore, on either the plain data endpoints or the pipeline
+# surface's own query-string binding.
+#
+# FastAPI/pydantic silently ignore an unrecognized query parameter by default (no
+# `model_config = ConfigDict(extra=...)` is set anywhere in models.py) -- confirmed
+# empirically: a request with a bogus query param returns 200 with the rest of the query
+# answered normally. Left alone, a caller still sending one of these would have it
+# silently vanish rather than fail loudly, so this dependency checks the raw query
+# string directly (the only place a retired name is still visible at all) and rejects it
+# explicitly, naming the pipeline equivalent that replaces it.
+_RETIRED_PARAMS = {
+    "value_where": "'where', which now accepts both dimension and value conditions (e.g. 'calendar_year > 2040 AND value > 3')",
+    "negate": "a 'difference' named analysis (see /v1/analyses.json), or the 'calculate' pipeline step directly (negate=X is calculate expression 'value * -1' with where=X)",
+    "multiply10": "the 'calculate' pipeline step directly (multiply10=X is calculate expression 'value * 10' with where=X)",
+    "multiply100": "the 'calculate' pipeline step directly (multiply100=X is calculate expression 'value * 100' with where=X)",
+    "group_by": "the 'group' pipeline step (see /v1/analysis.json or a named analysis)",
+    "group_aggregate": "the 'group' pipeline step (see /v1/analysis.json or a named analysis)",
+    # There is no `summarize` op in the pipeline grammar -- the ops are project/join/
+    # filter/calculate/group. `summarize_by`/`summarize_aggregate` are what a `project`
+    # step lowers ONTO (`planner.py`: `option_kwargs["summarize_by"] = first.to`,
+    # `["summarize_aggregate"] = first.aggregate`), and `summarize_grid_cell` is what a
+    # `grid_cell` filter placed AFTER that project lowers onto (G4). Name those, not a
+    # step that does not exist -- a 400 that points at nothing is worse than no hint.
+    "summarize_by": "a 'project' step's `to` (the grid to summarize onto; see /v1/analysis.json or a named analysis)",
+    "summarize_aggregate": "a 'project' step's `aggregate` (see /v1/analysis.json or a named analysis)",
+    "summarize_grid_cell": "a 'filter' step naming `grid_cell`, placed after the 'project' step (see /v1/analysis.json or a named analysis)",
+    "unpivot": "nothing -- data is already served in long format (grid_cell/value columns); the parameter was already a documented no-op",
+    # The generic calculate entries used to arrive as indexed, dotted query parameters
+    # (`calculate.1.expression=...&calculate.1.where=...`), parsed off the raw query
+    # string since FastAPI's query models can't bind dotted names. There is no flat HTTP
+    # spelling for `calculate` at all anymore -- checked below via a startswith/exact-key
+    # match rather than a plain dict lookup, since the retired name is a whole family of
+    # keys (`calculate`, `calculate.1.expression`, `calculate.2.where`, ...), not one.
+    "calculate": "the 'calculate' pipeline step directly (see /v1/analysis.json, or a named analysis's own pipeline)",
+}
 
 
-RejectRetiredValueWhere = Depends(reject_retired_value_where)
+def reject_retired_params(request: Request) -> None:
+    found = [key for key in _RETIRED_PARAMS if key in request.query_params]
+    if any(key == "calculate" or key.startswith("calculate.") for key in request.query_params):
+        if "calculate" not in found:
+            found.append("calculate")
+
+    if found:
+        details = "; ".join(f"{name!r} has been retired -- use {_RETIRED_PARAMS[name]}" for name in found)
+        raise HTTPException(status_code=400, detail=details)
 
 
-# The generic calculate entries arrive as indexed, dotted query parameters
-# (`calculate.1.expression=...&calculate.1.where=...`), which FastAPI's query models
-# cannot bind (a query model's fields are flat scalars -- see `api.models.TileQuery`'s
-# docstring), so this dependency reads them off the raw query string and validates them
-# via `analysis.parameters.parse_indexed_calculate` (contiguous 1-based indices,
-# expression required per entry, no unknown fields -- each rejection a 400 naming the
-# exact rule). Returns None when the request has no calculate.* parameters at all; the
-# route handlers set a non-None result onto the built `Options` before `create_analysis`.
-def parse_calculate_query(request: Request):
-    return parse_indexed_calculate(request.query_params)
+RejectRetiredParams = Depends(reject_retired_params)
 
 
-CalculateParams = Depends(parse_calculate_query)
-
-
-def _options_with_calculate(query, calculate):
-    options = query.options
-    if calculate is not None:
-        options.calculate = calculate
-    return options
+# Compression is bound as its own query model (`Query(Compression)`) on the flat analysis
+# routes below rather than riding inside the pipeline -- it's a transport concern, and
+# `pipeline.pipeline_from_query` rejects any top-level query key that isn't
+# `input.*`/`step.*`/`output.*` (see that function's docstring), so `compression_algorithm`/
+# `compression_level` have to be stripped out of the raw query dict before it reaches the
+# pipeline decoder. This mirrors how `get_dataset_visualization` strips `grid` before handing
+# its own query dict onward.
+_COMPRESSION_QUERY_FIELDS = frozenset(Compression.model_fields)
 
 app = FastAPI(
     title="CPRA Master Plan APIs",
@@ -143,6 +175,37 @@ app.add_middleware(
 @app.exception_handler(AnalysisError)
 async def analysis_error_handler(request: Request, exc: AnalysisError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+# The analogous translation point for `cpra.mp.data.analyses.resolve_analysis` (plan
+# §3.2a) -- a distinct, FastAPI-free exception family from `AnalysisError` above (see
+# `cpra/mp/data/analyses/base.py`'s `AnalysisRegistryError`, a plain `ValueError`
+# subclass), raised by `resolve_analysis` itself for the one case `get_analysis_class`
+# cannot pre-empt: `InvalidAnalysisParametersError`, when an analysis's own `Parameters`
+# validation or `validate_selection` cardinality rule (or the `Pipeline` its `pipeline()`
+# builds) rejects otherwise-well-formed request params/filters. Without this handler that
+# case would propagate as a bare 500 instead of the 400 its docstring calls for.
+# `UnknownAnalysisError`/`AnalysisTypeMismatchError` are already fully pre-empted by every
+# route's `get_analysis_class(name, type)` call before `resolve_analysis` is ever reached
+# (same registry, same `Meta.type` check), so this handler is unreachable for those two in
+# practice -- registered anyway so the mapping is correct if that ever changes.
+@app.exception_handler(AnalysisRegistryError)
+async def analysis_registry_error_handler(request: Request, exc: AnalysisRegistryError) -> JSONResponse:
+    status_code = 404 if isinstance(exc, UnknownAnalysisError) else 400
+    return JSONResponse(status_code=status_code, content={"detail": str(exc)})
+
+
+# The routes catch `PipelineError` explicitly around `pipeline_from_query` and
+# `compile_pipeline` -- the two places a malformed pipeline is normally caught -- but not
+# around the `validate_tile()`/`validate_vector_tile()` calls that follow, which can raise
+# it too (`PairedAnalysis.validate_tile` does, when a prepared paired plan has no band
+# sources). Unhandled, that surfaced as a 500 for what is a client error. This backstop
+# gives every escaping `PipelineError` the same 400 the explicit `except` clauses already
+# produce, so the two paths agree; it does not replace them, since they attach route
+# context the bare exception lacks.
+@app.exception_handler(PipelineError)
+async def pipeline_error_handler(request: Request, exc: PipelineError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 @app.get("/v1/variables.json", tags=["Catalog"])
@@ -268,18 +331,17 @@ async def query_catalog(
 
 @app.get(
     "/v1/datasets/{variable}/{time_unit}/{grid}/data.{format}",
-    tags=["Data and Analysis"],
+    tags=["Data"],
 )
 async def get_model_data(
     format: DataFormat,
     query: Annotated[DataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
-    calculate=CalculateParams,
-    _reject_value_where: None = RejectRetiredValueWhere,
+    _reject_retired: None = RejectRetiredParams,
 ):
     compression = query.compression
     validate_compression(compression, format)
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     validate_format(format, dataset.output_type)
     await dataset.apply_params()
     if dataset.output_type == OutputType.raster:
@@ -292,7 +354,7 @@ async def get_model_data(
 
 @app.get(
     "/v1/datasets/{variable}/{time_unit}/{grid}/data/{z}/{x}/{y}.{format}",
-    tags=["Data and Analysis"],
+    tags=["Data"],
 )
 async def get_model_tile(
     format: TileFormat,
@@ -301,10 +363,9 @@ async def get_model_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
-    calculate=CalculateParams,
-    _reject_value_where: None = RejectRetiredValueWhere,
+    _reject_retired: None = RejectRetiredParams,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     dataset.validate_tile()
     return RasterioTileResponse(dataset, x, y, z, format)
@@ -312,7 +373,7 @@ async def get_model_tile(
 
 @app.get(
     "/v1/datasets/{variable}/{time_unit}/{grid}/tiles/{z}/{x}/{y}.pbf",
-    tags=["Data and Analysis"],
+    tags=["Data"],
 )
 async def get_vector_tile(
     z: int,
@@ -320,10 +381,9 @@ async def get_vector_tile(
     y: int,
     query: Annotated[TileQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
-    calculate=CalculateParams,
-    _reject_value_where: None = RejectRetiredValueWhere,
+    _reject_retired: None = RejectRetiredParams,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, _options_with_calculate(query, calculate))
+    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
     await dataset.apply_params()
     dataset.validate_vector_tile()
     return VectorTileResponse(dataset, x, y, z)
@@ -346,7 +406,8 @@ def _check_output_format_agreement(pipeline, url_format):
         )
 
 
-async def _respond_to_analysis(pipeline, format):
+async def _respond_to_analysis(pipeline, format, compression):
+    validate_compression(compression, format)
     try:
         compiled = compile_pipeline(pipeline)
     except PipelineError as exc:
@@ -356,34 +417,77 @@ async def _respond_to_analysis(pipeline, format):
     await compiled.apply_params()
 
     if compiled.output_type == OutputType.raster:
-        return RasterioStreamingResponse(compiled, format, Compression())
+        return RasterioStreamingResponse(compiled, format, compression)
 
     data_size = compiled.estimate_data_size()
     collect_in_memory = data_size is not None and data_size <= (STREAM_THRESHOLD * pow(10, 6))
-    return PolarsStreamingResponse(compiled, format, Compression(), collect_in_memory)
+    return PolarsStreamingResponse(compiled, format, compression, collect_in_memory)
 
 
-@app.post("/v1/analysis.{format}", tags=["Data and Analysis"])
-async def post_analysis(format: DataFormat, body: dict[str, Any] = Body(...)):
+@app.post("/v1/analysis.{format}", tags=["Analysis"])
+async def post_analysis(
+    format: DataFormat,
+    compression: Annotated[Compression, Query()],
+    body: dict[str, Any] = Body(...),
+):
     try:
         pipeline = parse_pipeline(body)
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _check_output_format_agreement(pipeline, format)
-    return await _respond_to_analysis(pipeline, format)
+    return await _respond_to_analysis(pipeline, format, compression)
 
 
-@app.get("/v1/analysis.{format}", tags=["Data and Analysis"])
-async def get_analysis(format: DataFormat, request: Request):
+@app.get("/v1/analysis.{format}", tags=["Analysis"])
+async def get_analysis(format: DataFormat, compression: Annotated[Compression, Query()], request: Request):
+    # `compression` is bound above as its own query model; strip its fields out of the raw
+    # query dict before decoding the rest as a pipeline -- see `_COMPRESSION_QUERY_FIELDS`.
+    pipeline_params = {
+        k: v for k, v in request.query_params.items() if k not in _COMPRESSION_QUERY_FIELDS
+    }
+    try:
+        pipeline = pipeline_from_query(pipeline_params)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _check_output_format_agreement(pipeline, format)
+    return await _respond_to_analysis(pipeline, format, compression)
+
+
+# The vector-tile counterpart to `get_analysis_tile` below -- reuses `VectorTileResponse`
+# and `compiled.validate_vector_tile()`, mirroring `get_vector_tile` (the data-route
+# equivalent) as closely as the pipeline surface allows. Unlike the `.{format}` tile route,
+# there is no `{format}` path segment to bind and cross-check against `pipeline.output.format`
+# here: `pbf` is not a member of `DataFormat`/`TileFormat` (see `pipeline.Output.format`'s
+# docstring), so a pipeline can never spell its output format as `pbf` and
+# `_check_output_format_agreement` has nothing on the URL side to compare against. The route
+# synthesizes the check that actually matters instead: `compiled.validate_vector_tile()`
+# rejects outright a pipeline whose final grid isn't a vector grid, the same rule
+# `get_vector_tile` enforces on the data route. (Whatever format the pipeline's own `output`
+# block declares -- e.g. `csv` -- is irrelevant here; it's never used to render the tile.)
+#
+# Must be declared before `get_analysis_tile`'s `.{format}` route: both match
+# `/v1/analysis/{z}/{x}/{y}.pbf` (`{format}` is a wildcard suffix), and FastAPI/Starlette
+# dispatches to the first route whose path matches, trying dependency validation only
+# after that choice is made -- if `.{format}` were tried first, `"pbf"` would fail to
+# coerce into `TileFormat` and this route would never be reached.
+@app.get("/v1/analysis/{z}/{x}/{y}.pbf", tags=["Analysis"])
+async def get_analysis_vector_tile(z: int, x: int, y: int, request: Request):
     try:
         pipeline = pipeline_from_query(dict(request.query_params))
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _check_output_format_agreement(pipeline, format)
-    return await _respond_to_analysis(pipeline, format)
+
+    try:
+        compiled = compile_pipeline(pipeline)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await compiled.apply_params()
+    compiled.validate_vector_tile()
+    return VectorTileResponse(compiled, x, y, z)
 
 
-@app.get("/v1/analysis/{z}/{x}/{y}.{format}", tags=["Data and Analysis"])
+@app.get("/v1/analysis/{z}/{x}/{y}.{format}", tags=["Analysis"])
 async def get_analysis_tile(z: int, x: int, y: int, format: TileFormat, request: Request):
     try:
         pipeline = pipeline_from_query(dict(request.query_params))
@@ -415,7 +519,7 @@ async def get_dataset_visualization(
     visualization_name,
     query: Annotated[VisualizationQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
-    _reject_value_where: None = RejectRetiredValueWhere,
+    _reject_retired: None = RejectRetiredParams,
 ):
     VisualizationClass = get_visualization_class(visualization_name, "dataset")
     query_dict = {k: v for k, v in dict(query).items() if k != "grid"}
@@ -437,7 +541,7 @@ async def get_visualization(
     request: Request,
     visualization_name,
     query: Annotated[VisualizationQuery, Query()],
-    _reject_value_where: None = RejectRetiredValueWhere,
+    _reject_retired: None = RejectRetiredParams,
 ):
     VisualizationClass = get_visualization_class(visualization_name, "custom")
     visualization = VisualizationClass(
@@ -445,3 +549,276 @@ async def get_visualization(
         **dict(query),
     )
     return JSONResponse(visualization.spec)
+
+
+# ----------------------------------------------------------------------------------------
+# Named analyses (plan §3.2a) -- a registered pipeline plus parameters, resolved through
+# `cpra.mp.data.analyses.resolve_analysis` into a real `Pipeline` and executed through
+# EXACTLY the same `compile_pipeline` -> response machinery the explicit `/v1/analysis.*`
+# routes above already use (`_respond_to_analysis`, `_compile_analysis_pipeline` below).
+# This is sugar over §3.2, never a second engine -- see plan §5.4 -- so nothing here reads
+# a file, opens a dataset, or reimplements a planner rule; it only builds the request-level
+# inputs `resolve_analysis` asks for and applies the request-level `Output` overrides
+# (`format`/`color_map`/`sort`/`select`) that are NEVER the registry's concern (plan §3.2a:
+# "color_map is a request parameter here, not a registry field").
+# ----------------------------------------------------------------------------------------
+
+
+def _analysis_filters(query: AnalysisQuery) -> dict:
+    """Dimension filters + `grid_cell` + `where` from the request, forwarded verbatim to
+    `resolve_analysis`'s `filters` argument.
+
+    `where` is bundled in here rather than spliced into the resolved pipeline's own
+    `steps` afterward: the pipeline's shape (how many steps, whether it's the paired
+    project+join shape) is the registry's to know, not this route's, and grafting an
+    extra `FilterStep` in from outside risks exactly the "second engine" plan §5.4 warns
+    against -- e.g. corrupting the paired shape's fixed `project` + `join` step-order
+    invariant (`planner._compile_paired_notebook_shape`). Letting `resolve_analysis`
+    fold it into its own pipeline construction keeps that structural knowledge in one
+    place.
+    """
+    filters = {k: v for k, v in dict(query).items() if k in FilterDimensions.model_fields and v is not None}
+    if query.grid_cell is not None:
+        filters["grid_cell"] = query.grid_cell
+    if query.where is not None:
+        filters["where"] = query.where
+    return filters
+
+
+def _analysis_extra_params(request: Request, known: frozenset) -> dict:
+    """Everything in the query string besides `known` (the bound query model's own
+    fields) is the named analysis's own declared parameter set -- `dimension`/`order` for
+    `difference`, `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold`
+    for `exit-criterion`, etc. There is no fixed field set for these at the route level
+    (it varies per analysis), so they are read directly off the raw query string and
+    handed to `resolve_analysis(params=...)` for the registry itself to validate --
+    the same "no flat spelling a route-level query model can bind" reasoning
+    `reject_retired_params` above uses to check the raw query string directly for the
+    retired `calculate.*` family.
+    """
+    return {k: v for k, v in request.query_params.items() if k not in known}
+
+
+def _apply_output_overrides(pipeline, query: AnalysisQuery, format=None) -> None:
+    """Overwrite the resolved pipeline's `Output` with the request's own `format`/
+    `color_map`/`sort`/`select` -- never the registry's concern (plan §3.2a: "the same
+    value can be drawn with different ramps, and the portal already varies it per map").
+    `format` is omitted (left as whatever `resolve_analysis` produced) for `pipeline.json`,
+    which has no `{format}`/`.pbf` URL segment to source one from.
+    """
+    if format is not None:
+        pipeline.output.format = format
+    if query.color_map is not None:
+        pipeline.output.color_map = query.color_map
+    if query.sort is not None:
+        pipeline.output.sort = query.sort
+    if query.select is not None:
+        pipeline.output.select = query.select
+
+
+def _compile_analysis_pipeline(pipeline):
+    try:
+        return compile_pipeline(pipeline)
+    except PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _dataset_ref(dataset_dimensions: DatasetDimensions):
+    return DatasetRef(
+        variable=dataset_dimensions.variable,
+        time_unit=dataset_dimensions.time_unit,
+        grid=dataset_dimensions.grid,
+    )
+
+
+@app.get("/v1/analyses.json", tags=["Analyses"])
+def analyses_catalog() -> list[Analysis]:
+    return [analysis.Meta.__dict__ for analysis in ANALYSES.values()]
+
+
+@app.get(
+    "/v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/data.{format}",
+    tags=["Analyses"],
+)
+async def get_dataset_analysis_data(
+    format: DataFormat,
+    analysis_name: str,
+    request: Request,
+    query: Annotated[AnalysisDataQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    get_analysis_class(analysis_name, "dataset")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=_dataset_ref(dataset_dimensions),
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query, format=format)
+    return await _respond_to_analysis(pipeline, format, query.compression)
+
+
+@app.get(
+    "/v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/data/{z}/{x}/{y}.{format}",
+    tags=["Analyses"],
+)
+async def get_dataset_analysis_tile(
+    format: TileFormat,
+    analysis_name: str,
+    z: int,
+    x: int,
+    y: int,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    get_analysis_class(analysis_name, "dataset")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=_dataset_ref(dataset_dimensions),
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query, format=format)
+    compiled = _compile_analysis_pipeline(pipeline)
+    await compiled.apply_params()
+    compiled.validate_tile()
+    return RasterioTileResponse(compiled, x, y, z, format)
+
+
+@app.get(
+    "/v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/tiles/{z}/{x}/{y}.pbf",
+    tags=["Analyses"],
+)
+async def get_dataset_analysis_vector_tile(
+    analysis_name: str,
+    z: int,
+    x: int,
+    y: int,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    get_analysis_class(analysis_name, "dataset")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=_dataset_ref(dataset_dimensions),
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query)
+    compiled = _compile_analysis_pipeline(pipeline)
+    await compiled.apply_params()
+    compiled.validate_vector_tile()
+    return VectorTileResponse(compiled, x, y, z)
+
+
+@app.get(
+    "/v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/pipeline.json",
+    tags=["Analyses"],
+)
+async def get_dataset_analysis_pipeline(
+    analysis_name: str,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+    dataset_dimensions: DatasetDimensions = Depends(),
+):
+    get_analysis_class(analysis_name, "dataset")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=_dataset_ref(dataset_dimensions),
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query)
+    return JSONResponse(content=pipeline.model_dump(mode="json"))
+
+
+@app.get("/v1/analyses/{analysis_name}/data.{format}", tags=["Analyses"])
+async def get_custom_analysis_data(
+    format: DataFormat,
+    analysis_name: str,
+    request: Request,
+    query: Annotated[AnalysisDataQuery, Query()],
+):
+    get_analysis_class(analysis_name, "custom")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=None,
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query, format=format)
+    return await _respond_to_analysis(pipeline, format, query.compression)
+
+
+@app.get("/v1/analyses/{analysis_name}/data/{z}/{x}/{y}.{format}", tags=["Analyses"])
+async def get_custom_analysis_tile(
+    format: TileFormat,
+    analysis_name: str,
+    z: int,
+    x: int,
+    y: int,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+):
+    get_analysis_class(analysis_name, "custom")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=None,
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query, format=format)
+    compiled = _compile_analysis_pipeline(pipeline)
+    await compiled.apply_params()
+    compiled.validate_tile()
+    return RasterioTileResponse(compiled, x, y, z, format)
+
+
+@app.get("/v1/analyses/{analysis_name}/tiles/{z}/{x}/{y}.pbf", tags=["Analyses"])
+async def get_custom_analysis_vector_tile(
+    analysis_name: str,
+    z: int,
+    x: int,
+    y: int,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+):
+    get_analysis_class(analysis_name, "custom")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=None,
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query)
+    compiled = _compile_analysis_pipeline(pipeline)
+    await compiled.apply_params()
+    compiled.validate_vector_tile()
+    return VectorTileResponse(compiled, x, y, z)
+
+
+@app.get("/v1/analyses/{analysis_name}/pipeline.json", tags=["Analyses"])
+async def get_custom_analysis_pipeline(
+    analysis_name: str,
+    request: Request,
+    query: Annotated[AnalysisQuery, Query()],
+):
+    get_analysis_class(analysis_name, "custom")
+    resolved = resolve_analysis(
+        analysis_name,
+        dataset=None,
+        filters=_analysis_filters(query),
+        params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
+    )
+    pipeline = resolved.pipeline
+    _apply_output_overrides(pipeline, query)
+    return JSONResponse(content=pipeline.model_dump(mode="json"))

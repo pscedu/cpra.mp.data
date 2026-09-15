@@ -3,6 +3,44 @@ from fastapi import HTTPException
 from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
+# The named-analysis registry (plan §3.2a/§5.2) lands in a concurrent Phase 2 change
+# under `cpra/mp/data/analyses/` -- a package this module (and `api/__init__.py`, which
+# re-imports these three names from here) does not own and must not create or edit. This
+# import is guarded so the rest of the API keeps working -- and the whole app keeps
+# importing -- whether or not that package has landed yet: every `/v1/analyses*` route
+# simply finds `ANALYSES` empty (a 404 "unknown analysis name" for any name) until it
+# does. Only `ModuleNotFoundError` is swallowed here, not `ImportError` in general -- if
+# the package exists but this exact name set is wrong (e.g. a rename during
+# reconciliation), that must fail loudly rather than silently fall back to this stub.
+try:
+    from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis
+    from cpra.mp.data.analyses.base import (
+        AnalysisRegistryError,
+        AnalysisTypeMismatchError,
+        InvalidAnalysisParametersError,
+        UnknownAnalysisError,
+    )
+except ModuleNotFoundError:  # pragma: no cover -- exercised once the registry package lands
+    ANALYSES = {}
+    DatasetRef = None
+    resolve_analysis = None
+
+    class AnalysisRegistryError(ValueError):
+        """Stand-in for `cpra.mp.data.analyses.base.AnalysisRegistryError`, used only so
+        `api/__init__.py`'s exception handler has something to register against while the
+        registry package hasn't landed yet -- never actually raised in that case, since
+        `resolve_analysis` itself is `None` and unreachable (every route 404s via
+        `get_analysis_class` first)."""
+
+    class UnknownAnalysisError(AnalysisRegistryError):
+        pass
+
+    class AnalysisTypeMismatchError(AnalysisRegistryError):
+        pass
+
+    class InvalidAnalysisParametersError(AnalysisRegistryError):
+        pass
+
 RASTER_COMPRESSION_ALGORITHMS = [
     CompressionAlgorithm.deflate,
     CompressionAlgorithm.lzw,
@@ -61,3 +99,27 @@ def get_visualization_class(name: str, type: str | None = None):
         raise HTTPException(status_code=400, detail=msg)
 
     return VisualizationClass
+
+
+def get_analysis_class(name: str, type: str | None = None):
+    """Get a named-analysis class by name, and optionally, by type ("dataset" or
+    "custom").
+
+    The same 404 (unknown name) / 400 (wrong route kind) distinction
+    `get_visualization_class` above already makes, generalized rather than reinvented --
+    see plan §3.2a: a `type="dataset"` analysis is rejected on `/v1/analyses/{name}/...`
+    and a `type="custom"` analysis is rejected on the dataset-scoped route, both via this
+    one function.
+    """
+
+    AnalysisClass = ANALYSES.get(name, None)
+
+    if AnalysisClass is None:
+        msg = f"Unknown analysis name: {name}"
+        raise HTTPException(status_code=404, detail=msg)
+
+    if type is not None and AnalysisClass.Meta.type != type:
+        msg = f"Invalid analysis type: expected {type}, got {AnalysisClass.Meta.type}"
+        raise HTTPException(status_code=400, detail=msg)
+
+    return AnalysisClass

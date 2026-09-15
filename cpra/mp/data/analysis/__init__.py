@@ -8,10 +8,12 @@ which walks every module here and asserts it. `analysis.base.AnalysisError` stan
 `HTTPException`; `api/__init__.py` registers the one place that translates it back into an
 HTTP response.
 
-This module is also the supported library entry point for running an analysis without
-FastAPI or its request-model objects -- a notebook, a script, or a future `read_data`
-extension. `create_analysis` takes plain values (dimension names, filter values, option
-names under their existing API names) rather than the `DatasetDimensions`/
+This module is also a supported library entry point for running an analysis without
+FastAPI or its request-model objects -- a notebook or a script that wants the plain-value
+calling convention directly, rather than `cpra.mp.data.analyze_data`'s pipeline-shaped
+wrapper around it (see that function's docstring for the split between it and
+`cpra.mp.data.read_data`). `create_analysis` takes plain values (dimension names, filter
+values, option names under their existing API names) rather than the `DatasetDimensions`/
 `FilterDimensions`/`Options` pydantic models `analysis.parameters` normalizes those values
 into internally -- that split is an implementation detail, not something callers need to
 know about:
