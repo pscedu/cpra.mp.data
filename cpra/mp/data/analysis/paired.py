@@ -97,9 +97,10 @@ from cpra.mp.data.legends import LEGENDS, Legend
 # (built by `create_model` from `cpra.mp.data.dimensions.DIMENSIONS`).
 
 def _legend_for(color_map):
-    """Standalone reimplementation of `BaseAnalysis.legend`'s custom color-map parsing,
-    for a `PairedAnalysis` -- which has no backing `BaseAnalysis` instance to delegate
-    to and must raise `PipelineError`, not `BaseAnalysis._error`'s `AnalysisError`.
+    """Standalone reimplementation of `analysis.output.resolve_legend`'s custom color-map
+    parsing, for a `PairedAnalysis` -- which has no backing `BaseAnalysis` instance to
+    delegate to and must raise `PipelineError`, not the `AnalysisError` that function
+    raises.
     """
     color_map = color_map or ""
     if ":" in color_map:

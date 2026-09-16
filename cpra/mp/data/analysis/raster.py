@@ -27,6 +27,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
+from cpra.mp.data.analysis import stages
 from cpra.mp.data.analysis.base import BaseAnalysis, op_error_boundary
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
@@ -834,7 +835,10 @@ class RasterGridAnalysis(BaseAnalysis):
             except ExpressionError as exc:
                 self._error(str(exc))
 
-        if not self._validate_summarize_params():
+        has_summarize, self.summarize_grid_cell_ids = stages.validate_summarize_options(
+            self.options.summarize_by, self.options.summarize_aggregate, self.options.summarize_grid_cell
+        )
+        if not has_summarize:
             if self._value_where is not None:
                 self._error("where's value condition(s) require summarize_by and summarize_aggregate for raster grids")
             return
@@ -880,7 +884,7 @@ class RasterGridAnalysis(BaseAnalysis):
                     f"count_by_value is only supported for a single raster band per request, got {raw_band_count} -- "
                     "narrow the request (e.g. to one calendar_year) and don't combine it with group_by/group_aggregate"
                 )
-            self._reject_calculate_with_count_by_value()
+            stages.reject_calculate_with_count_by_value(self.options.calculate)
 
             try:
                 result_df = await asyncio.to_thread(

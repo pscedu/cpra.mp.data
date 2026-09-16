@@ -59,9 +59,10 @@ subclass produced it.
   metadata and appends a `self._band_ops` entry that a later stage (transform, tile, or
   write) replays against actual band data.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
-  converting to another grid's cells. Called only after `_validate_summarize_params`
-  confirms both parameters (or neither) were given; a hook implementation returns
-  immediately if neither was. Must leave `self.lf` in the shared summarize output shape:
+  converting to another grid's cells. Each implementation starts by calling
+  `stages.validate_summarize_options`, which confirms both parameters (or neither) were
+  given and parses `summarize_grid_cell`; the implementation returns immediately if
+  neither was. Must leave `self.lf` in the shared summarize output shape:
   dimension columns, a `grid_cell` column holding the destination cell ID, a `value`
   column, and a `geographic_unit` column naming the destination grid.
 
@@ -74,35 +75,53 @@ methods (`get_tile`/`write_raster`/`validate_tile` for a raster response,
 `get_vector_tile`/`validate_vector_tile` for a vector tile response) -- present on
 whichever subclass actually supports them; `validate_tile`/`validate_vector_tile`
 themselves need no per-subclass override, since both check `self.output_type` (which can
-diverge from `self.grid.grid_type` -- see `output_type`'s own docstring) rather than which
-subclass `self` is.
+diverge from `self.grid.grid_type` -- see `analysis/output.py`'s `resolve_output_type`)
+rather than which subclass `self` is.
+
+**Where the LOGIC of that surface lives.** The rendering half is `analysis/output.py`
+(`tabular_kwargs`/`stream_tabular`/`write_tabular`/`resolve_legend`/`resolve_output_type`)
+and the tile-request validation half is `analysis/tiles.py`
+(`validate_raster_tile`/`validate_vector_tile`), both modules of plain free functions. The
+members named above are delegations to them, kept on the class only because
+`api/tabular.py` and `api/__init__.py` reach for them by duck typing. None of that is op
+algebra, and none of it depends on which ops ran. The catalog and frame-shape lookups
+(`variable`, `estimate_data_size`) are the same story, in `analysis/metadata.py`.
+
+**Where the LOGIC of the five stages lives.** Two layers, split by what they depend on.
+The ALGEBRA -- `apply_dimension_filter`/`apply_value_filter`/`apply_calculate_plans`
+below, plus `vector.apply_group_by`/`apply_project`/`apply_long_op` and `raster`'s
+`apply_*_band_wide` family -- is re-entrant and op-shaped: each takes an `lf` and returns
+one, so an interpreter walking a `list[ops.Op]` can invoke it once per op in whatever
+order the request declared. The OPTION HANDLING that reads `Options` and decides what to
+hand the algebra is `analysis/stages.py`, another module of plain free functions. The four
+`_apply_*_params` methods below are what is left once both layers are factored out: they
+read `self.options`, store results back on `self`, dispatch the subclass hook, and convert
+a typed library error to a 400 via `op_error_boundary` -- and nothing else.
 """
 
-import re
 from contextlib import contextmanager
 
 import polars as pl
 from polars.exceptions import ColumnNotFoundError
 
-from cpra.mp.data import config
+from cpra.mp.data.analysis import metadata, output, stages, tiles
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
-    compile_calculate_entries,
     parse_value_expr,
     value_predicate_mask,
 )
 from cpra.mp.data.analysis.fold import FoldError
-from cpra.mp.data.analysis.types import DataFormat, OutputType
-from cpra.mp.data.analysis.utils import get_lazy_frame, timing, unpack_values
+from cpra.mp.data.analysis.types import OutputType
+from cpra.mp.data.analysis.utils import get_lazy_frame, unpack_values
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.legends import LEGENDS, Legend
-from cpra.mp.data.utils import get_input_data_frame, required_columns
-from cpra.mp.data.variables import VARIABLES, Variable
+from cpra.mp.data.legends import Legend
+from cpra.mp.data.variables import Variable
 
+# The accepted `group_by` values. (`sort`'s own choice list is `stages.SORT_CHOICES`,
+# next to the sort/select stage logic that validates against it.)
 DIMENSION_CHOICES = list(DIMENSIONS.keys())
-SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 
 
 # -- re-entrant stage cores ---------------------------------------------------------
@@ -334,110 +353,40 @@ class BaseAnalysis:
             raise AnalysisError("Dataset does not exist", status_code=404)
 
     def tabular_kwargs(self, format):
-        """Round CSV output to the variable's `float_precision`, when it sets one.
+        """Writer arguments this dataset needs for `format` -- see `output.tabular_kwargs`."""
+        return output.tabular_kwargs(format, self.variable.float_precision)
 
-        CSV only: it's the one writer polars gives a `float_precision`, and the only format
-        here that renders floats as text at all -- the binary formats hand over the stored
-        value and leave rounding to whatever reads them.
-
-        This deliberately applies to every float column in the response, not just `value`.
-        Nothing else in a tabular response is a float today (dimensions are integers,
-        strings, or dates), and a bare `.round()` on `value` would be wrong anyway: it
-        would change the number in the binary formats too, where the request asked for the
-        stored value.
-        """
-        precision = self.variable.float_precision
-        if format == DataFormat.csv and precision is not None:
-            return {"float_precision": precision}
-        return {}
-
-    @timing
     def stream_tabular(self, out_path, format, *args, **kwargs):
-        sink_method = {
-            "arrow": "sink_ipc",
-            "csv": "sink_csv",
-            "ndjson": "sink_ndjson",
-            "parquet": "sink_parquet",
-        }[format]
-        # TODO: Set parquet compression and row group parameters.
-        self.materialize(sink_method, out_path, *args, **kwargs)
+        """Sink the frame to `out_path` -- see `output.stream_tabular`."""
+        output.stream_tabular(self.materialize, out_path, format, *args, **kwargs)
 
-    @timing
     def write_tabular(self, out_path, format, *args, **kwargs):
-        write_method = {
-            "arrow": "write_ipc",
-            "csv": "write_csv",
-            "ndjson": "write_ndjson",
-            "parquet": "write_parquet",
-        }[format]
-        # TODO: Set parquet compression and row group parameters.
-        df = self.materialize()
-        getattr(df, write_method)(out_path, *args, **kwargs)
+        """Collect and write the frame to `out_path` -- see `output.write_tabular`."""
+        output.write_tabular(self.materialize, out_path, format, *args, **kwargs)
 
     # -- output surface: shared properties -----------------------------------------------
 
     @property
     def legend(self) -> Legend:
-        color_map = self.options.color_map or ""
-
-        if ":" in color_map:
-            map_type, color_str = color_map.split(":", 1)
-
-            if map_type not in ["continuous", "discrete"]:
-                self._error(f"invalid color map type: {map_type}")
-
-            color_strs = color_str.split(",")
-            if map_type == "continuous":
-                colors = color_strs[1::2]
-                value_strs = color_strs[::2]
-            else:
-                colors = color_strs[::2]
-                value_strs = color_strs[1::2]
-
-            # TODO: Check that the color strings are valid.
-
-            try:
-                values = [float(val) for val in value_strs]
-            except ValueError:
-                self._error("invalid color map values")
-
-            # Add a null upper bound value to discrete color maps.
-            if map_type == "discrete":
-                values += [None]
-
-            if len(values) != len(colors):
-                self._error("mismatched colors and values in color map")
-
-            return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
-
-        return LEGENDS.get(self.options.color_map) or self.variable.legend or LEGENDS["default"]
+        """The `Legend` this request renders with -- see `output.resolve_legend`."""
+        return output.resolve_legend(self.options.color_map, self.variable.legend)
 
     @property
     def output_type(self) -> OutputType:
-        """Get the output type for this dataset based on its parameters.
-
-        Not simply `self.grid.grid_type`: a raster grid still answers as `vector` once
-        `grid_cell` (pointwise sampling) or `summarize_by` (zonal summarize) narrows it
-        to a tabular result, which is why `validate_tile`/`validate_vector_tile` check
-        this property rather than which subclass `self` is.
+        """The output type for this dataset given its parameters -- see
+        `output.resolve_output_type`, which explains why this is not simply
+        `self.grid.grid_type`.
         """
-        if self.grid.grid_type == "vector" or self.options.grid_cell or self.options.summarize_by:
-            return OutputType.vector
-        return OutputType.raster
+        return output.resolve_output_type(
+            self.grid.grid_type,
+            grid_cell=self.options.grid_cell,
+            summarize_by=self.options.summarize_by,
+        )
 
     @property
     def variable(self) -> Variable:
-        return VARIABLES[self.dataset_dimensions.variable]
-
-    def _is_raster_metadata_table(self):
-        """Whether self.lf still holds the raster band-metadata table (dimension columns
-        and a path column), as opposed to a tabular result already derived from raster
-        pixels (via grid_cell sampling or summarize_by). Unlike `output_type`, which
-        reflects the dataset's final response shape and is stable for the whole request,
-        this reflects self.lf's shape at the point it's called, since summarize_by's
-        raster-to-tabular conversion doesn't happen until the transform stage.
-        """
-        return self.grid.grid_type == "raster" and "path" in self.lf.collect_schema().names()
+        """The catalog `Variable` this dataset selects -- see `metadata.variable_for`."""
+        return metadata.variable_for(self.dataset_dimensions)
 
     def _is_aggregating(self):
         """Whether this request collapses rows via an aggregate -- `group_aggregate`
@@ -451,92 +400,43 @@ class BaseAnalysis:
         return self.options.group_aggregate is not None or self.options.summarize_aggregate is not None
 
     def validate_tile(self):
-        """Validate that the tile is raster and will have a single band."""
-
-        if self.output_type == OutputType.vector:
-            self._error("invalid output type for tile: vector", status_code=400)
-
-        # For a raster, `self.lf` is the band metadata, whose height IS the band count
-        # at every point in the request -- before any group (one row per selected band)
-        # and after one (one row per surviving group, kept non-degenerate by
-        # `raster.BAND_INDEX`). For a vector frame it is the ordinary row count, which is
-        # what a vector tile's own single-band check has always meant.
-        groups = self.lf.select(pl.len()).collect().item()
-        if groups > 1:
-            self._error(f"tile contains more than one band: {groups} bands found", status_code=400)
+        """Validate that the tile is raster and will have a single band -- see
+        `tiles.validate_raster_tile`.
+        """
+        tiles.validate_raster_tile(self.lf, self.output_type)
 
     def validate_vector_tile(self):
-        """Validate that the tile is a vector grid with an available PMTiles file."""
-        if self.output_type != OutputType.vector:
-            self._error("invalid output type for vector tile: raster", status_code=400)
-
-        grid_name = self.options.summarize_by or self.grid.name
-        if not (config.TILES_PATH / f"{grid_name}.pmtiles").exists():
-            self._error(f"no tile file for grid: {grid_name}", status_code=404)
+        """Validate that the tile is a vector grid with an available PMTiles file -- see
+        `tiles.validate_vector_tile`.
+        """
+        tiles.validate_vector_tile(self.output_type, self.options.summarize_by or self.grid.name)
 
     # -- stage 1: filter ------------------------------------------------------------------
 
     async def _apply_filter_params(self):
         """Apply filter parameters to the LazyFrame.
 
-        `where` accepts both DIMENSION conditions and VALUE conditions (against the
-        placeholder column `value`), AND-ed together in one string --
-        `expressions.classify_where` splits it on top-level `AND` and sorts each
-        conjunct by which kind it is (see that function's docstring for the full split/
-        classify/reject contract, including why a conjunct referencing both kinds is
-        rejected outright). Dimension conjuncts are recombined and handed to the same
-        unrestricted `lf.sql()` path `where` has always used; value conjuncts are
-        recombined into `self._value_where`, the internal successor to the retired
-        `Options.value_where` field, for this method (vector) and every raster-side
-        consumer (`RasterGridAnalysis._apply_transform_params_impl`,
-        `_summarize_zone_stats_plugin`, `_summarize_count_by_value_plugin`) to read
-        instead.
+        The `where` half is `stages.apply_filter_options`, which reads the option, splits
+        it into dimension and value conjuncts, and decides mask-vs-drop -- see that
+        function for the whole contract. What stays here is what touches `self`: storing
+        its three results (`self.lf`, `self._value_where` -- the internal successor to the
+        retired `Options.value_where` field, which every raster-side consumer reads -- and
+        `self._where_has_dimension_conjunct`), converting its typed `ExpressionError` into
+        a 400 at this stage's own boundary, and dispatching the `_apply_grid_cell` hook the
+        subclass supplies.
 
-        A thin caller over `apply_dimension_filter`/`apply_value_filter`: the logic
-        itself now lives in
-        those two re-entrant, `self`-free functions so the long-shape op lowering
-        (`vector.apply_long_op`, called by both interpreters) can invoke the identical
-        Polars behavior once per `FilterOp`, in declared order, instead of once for the
-        whole combined `where` string here. This method's OWN behavior is unchanged by that
-        split -- it still runs once, against `self.options.where` as a whole, for every
-        non-interpreter request, which now means every FLAT (non-pipeline) request.
+        The option is read as a whole, once, exactly as before: an interpreter walking a
+        `list[ops.Op]` instead calls the underlying re-entrant algebra
+        (`apply_dimension_filter`/`apply_value_filter`) once per `FilterOp` in declared
+        order, via `vector.apply_long_op`, and never reaches this method at all.
         """
-        if self.options.where:
-            try:
-                self.lf, self._value_where, self._where_has_dimension_conjunct = apply_dimension_filter(
-                    self.lf, self.options.where
-                )
-            except ExpressionError as exc:
-                self._error(str(exc))
-
-        # A vector frame already carries a real `value` column at this point, so a
-        # `where` value conjunct can be applied directly here. A raster's `value`
-        # doesn't exist yet -- `self.lf` is still the band-metadata table (path/band/
-        # dimensions), one row per selected band, not one row per pixel -- so the
-        # raster half of this same option is applied later, per band, once pixels are
-        # actually read (see `RasterGridAnalysis._apply_transform_params_impl` /
-        # `_summarize_zone_stats_plugin`).
-        #
-        # AGGREGATING requests (group_aggregate/summarize_aggregate, including
-        # summarize_aggregate=count_by_value) mask a non-matching value to null rather
-        # than dropping its row: that's what lets the predicate compose with whatever
-        # aggregate the request goes on to apply via their EXISTING null-skipping
-        # behavior (`guarded_aggregate`'s count()-based denominator, count_by_value's
-        # own non-null filter, ...), rather than needing a second, predicate-aware code
-        # path. Dropping the row instead would also erase the group/zone's siblings
-        # that DO belong in the denominator for min/max/mean, and would make "count how
-        # many values passed" indistinguishable from "count how many rows exist".
-        #
-        # PLAIN (non-aggregating) requests have no aggregate downstream to skip a null
-        # for, so a masked-to-null value would just surface as a null in the response --
-        # observably different from "this row failed the filter" and indistinguishable
-        # from a genuine nodata value. There, the row is dropped outright instead (a
-        # deliberate behavior change from the old value_where, which always masked).
-        if self._value_where is not None and self.grid.grid_type == "vector":
-            try:
-                self.lf = apply_value_filter(self.lf, self._value_where, mask=self._is_aggregating())
-            except ExpressionError as exc:
-                self._error(str(exc))
+        with op_error_boundary():
+            self.lf, self._value_where, self._where_has_dimension_conjunct = stages.apply_filter_options(
+                self.lf,
+                self.options.where,
+                grid_type=self.grid.grid_type,
+                is_aggregating=self._is_aggregating(),
+            )
 
         if self.options.grid_cell:
             await self._apply_grid_cell()
@@ -549,76 +449,40 @@ class BaseAnalysis:
 
     # -- stage 2: calculate -----------------------------------------------------------------
 
-    def _resolve_calculate_entries(self):
-        """The effective calculate entries for this request, as `(label, expression,
-        where)` triples in application order: the generic `options.calculate` list,
-        applied in list order (entry N+1 sees entry N's output).
-        """
-        generic = self.options.calculate or []
-        return [
-            (f"calculate.{i}", entry.expression, entry.where)
-            for i, entry in enumerate(generic, start=1)
-        ]
-
     def _apply_calculate_params(self):
         """Apply the calculate stage: expression/where entries that rewrite `value` for
-        the rows/bands/pixels matching each entry's `where`, sequentially in entry order
-        (entry N+1 sees entry N's output). Rows NOT matching a `where` pass through
-        unchanged -- calculate never drops or masks data (that is Filter's job) -- and a
-        missing value stays missing (`is_not_null()` guards every rewrite, so NoData in
-        means NoData out regardless of what the expression could compute).
+        the rows/bands/pixels matching each entry's `where`, sequentially in entry order.
 
-        Everything is validated here (`expressions.compile_calculate_entries`), before
-        any pixel is read, for both grid types. A vector/tabular frame (including a
-        raster already narrowed to a table by `grid_cell` sampling) is rewritten in
-        place; for a raster whose `self.lf` is still the band-metadata table the
-        validated plans are only stashed on `self._calculate_plans` -- the entry's
-        dimension `where` selects BANDS and its expression/value-`where` are applied per
-        band, against actual pixels, by every raster read path
-        (`_summarize_zone_stats_plugin`, `_collapse_tile_bands`,
-        `_write_raster_windowed`) via `raster.apply_calculate_band_wide`.
+        Validation and application are `stages.resolve_calculate_plans` and
+        `stages.apply_calculate_options` -- see those two for what each entry means and
+        why a raster's band-metadata table is left for the pixel-read paths to rewrite.
+        What stays here is what touches `self`: stashing the validated plans on
+        `self._calculate_plans` (which every raster read path replays per band), storing
+        the rewritten frame back on `self.lf`, and converting the typed `ExpressionError`
+        either one raises into a 400 at this stage's own boundary.
 
-        A thin caller over `apply_calculate_plans` for the vector/tabular rewrite
-        itself -- pulled out so
-        `vector.VectorGridAnalysis.apply_steps` (the ops interpreter) can invoke the
-        identical Polars behavior once per `CalculateOp`, in declared order, instead of
-        once for the whole `options.calculate` list here. Validation
-        (`compile_calculate_entries`) and the raster-metadata-table early return stay here
-        unchanged -- both are about THIS method's own entry source (`options.calculate`)
-        and grid-type dispatch, neither of which the interpreter shares.
+        The option list is read as a whole, once, exactly as before: an interpreter
+        instead calls the underlying re-entrant algebra (`apply_calculate_plans`) once per
+        `CalculateOp`, in declared order, and never reaches this method at all.
         """
-        entries = self._resolve_calculate_entries()
-        try:
-            self._calculate_plans = compile_calculate_entries(entries)
-        except ExpressionError as exc:
-            self._error(str(exc))
-
-        if not self._calculate_plans or self._is_raster_metadata_table():
-            return
-
-        try:
-            self.lf = apply_calculate_plans(self.lf, self._calculate_plans)
-        except ExpressionError as exc:
-            self._error(str(exc))
+        with op_error_boundary():
+            self._calculate_plans = stages.resolve_calculate_plans(self.options.calculate)
+            self.lf = stages.apply_calculate_options(self.lf, self._calculate_plans, self.grid.grid_type)
 
     # -- stage 5: sort/select ---------------------------------------------------------------
 
     def _apply_sort_params(self):
-        """Apply sort and select parameters to the LazyFrame."""
-        if self.options.sort is not None:
-            parts = unpack_values(self.options.sort, "sort", SORT_CHOICES)
-            cols = [part.replace("-", "") for part in parts]
-            desc = [part.startswith("-") for part in parts]
-            self.lf = self.lf.sort(cols, descending=desc)
+        """Apply sort and select parameters to the LazyFrame -- see
+        `stages.apply_sort_options`.
 
-        if self.options.select is not None:
-            required_cols = required_columns(
-                get_input_data_frame(**dict(self.dataset_dimensions)),
-                include_grid_cell=True,
-                include_value=True,
-            )
-            select_cols = unpack_values(self.options.select, "select", required_cols)
-            self.lf = self.lf.select(select_cols)
+        Both interpreters call this at the end of their own op walk (see their
+        `apply_params` overrides), because `sort`/`select` are response SHAPING options
+        that have no op form and so always run last, whatever order the ops themselves
+        declared.
+        """
+        self.lf = stages.apply_sort_options(
+            self.lf, self.options.sort, self.options.select, self.dataset_dimensions
+        )
 
     # -- stage 3: group ---------------------------------------------------------------------
 
@@ -678,30 +542,15 @@ class BaseAnalysis:
     def _apply_group_params(self):
         """Apply group and aggregate parameters to the LazyFrame or image.
 
-        The shared preamble (`group_by_cols` resolution and the `count_by_value`
-        rejection, neither of which differs by grid type) lives here; the actual
-        collapse is the `_collapse_group` hook -- see the module/class docstring.
+        The shared preamble (the `count_by_value` rejection, which differs by neither grid
+        type nor instance and so lives in `stages.reject_count_by_value_group`, and
+        `group_by_cols` resolution) runs here; the actual collapse is the
+        `_collapse_group` hook -- see the module/class docstring.
         """
         if self.options.group_by is None and self.options.group_aggregate is None:
             return
 
-        if self.options.group_aggregate == "count_by_value":
-            # count_by_value changes the OUTPUT SHAPE (one row per group per distinct
-            # value) instead of collapsing a group to one row the way every other
-            # group_aggregate value does -- on both grid types, `group_by`/
-            # `group_aggregate` is a COLLAPSE step (raster band-collapse across selected
-            # bands per pixel, vector dimension-collapse across rows per grid_cell) that
-            # has no way to also multiply its own row count by the number of distinct
-            # values without breaking that collapse's "one row per group" contract.
-            # Rejected here, before any file is read, rather than left to fail deep in
-            # `HORIZONTAL_RASTER_AGGREGATES`/`getattr(pl.col("value"), ...)` -- the same
-            # pattern the raster-only `group_aggregate == "count"` rejection (in
-            # `RasterGridAnalysis._collapse_group`) uses. summarize_by/
-            # summarize_aggregate=count_by_value is the only way to reach it.
-            self._error(
-                "group_aggregate 'count_by_value' is not supported -- "
-                "use summarize_by and summarize_aggregate=count_by_value instead"
-            )
+        stages.reject_count_by_value_group(self.options.group_aggregate)
 
         group_by_cols = self._get_group_by_columns()
         self._collapse_group(group_by_cols)
@@ -726,47 +575,18 @@ class BaseAnalysis:
         """
         raise NotImplementedError
 
-    def _validate_summarize_params(self):
-        """Validate summarize parameters and parse summary grid_cell IDs, if present.
-
-        Returns True if summarize_by/summarize_aggregate were provided, False if neither was.
-        """
-        if self.options.summarize_by is None and self.options.summarize_aggregate is None:
-            return False
-
-        if self.options.summarize_by is None or self.options.summarize_aggregate is None:
-            self._error("summarize_by and summarize_aggregate parameters must be used together")
-
-        # Extract and validate summary grid_cell IDs, if present.
-        if self.options.summarize_grid_cell:
-            # summarize_grid = GRIDS[self.options.summarize_by]
-            # TODO: Validate that the given IDs fall within the grid min and max.
-            self.summarize_grid_cell_ids = [
-                int(geo_id) for geo_id in unpack_values(self.options.summarize_grid_cell, "summarize_grid_cell")
-            ]
-
-        return True
-
-    def _reject_calculate_with_count_by_value(self):
-        """count_by_value counts DISTINCT values; a calculate entry rewrites a value
-        BEFORE it would be counted, which changes which raw values collapse into "the
-        same" category without changing what the caller meant by "distinct" -- e.g. a
-        `value * 10` entry turns land-type codes 1 and 2 into 10 and 20, not into two
-        different categories, but does change what a downstream consumer sees as the
-        reported "value" for each count. Every other aggregate folds a calculate entry
-        through unremarkably (a rewritten number is still a meaningful sum/mean/min/max),
-        so this is a rejection specific to count_by_value, not a general
-        calculate/summarize incompatibility. Checked against `self.options` directly (not
-        `self.lf`) so it fires before the eventual `group_by` even if
-        `_apply_calculate_params` already ran earlier in the pipeline.
-        """
-        if self.options.calculate:
-            self._error("calculate parameters cannot be combined with count_by_value")
-
     # -- orchestration ----------------------------------------------------------------------
 
     async def apply_params(self):
-        """Apply the query parameters to the LazyFrame."""
+        """Apply the query parameters to the LazyFrame, in the fixed five-stage order.
+
+        The one member of this flow that is still a method rather than a free function in
+        `analysis/stages.py`, and deliberately so: every call below reaches a subclass
+        hook (`_apply_filter_params` -> `_apply_grid_cell`, `_apply_group_params` ->
+        `_collapse_group`, `_apply_transform_params` -> `_apply_transform_params_impl`),
+        so a free-function version would take the instance under another name and gain
+        nothing. It becomes extractable when those hooks stop being hooks, not before.
+        """
         await self._apply_filter_params()
         self._apply_calculate_params()
         self._apply_group_params()
@@ -774,68 +594,16 @@ class BaseAnalysis:
         self._apply_sort_params()
 
     def estimate_data_size(self):
-        """Estimate the size, in bytes, of data. This does not include dimension columns."""
-        required_cols = required_columns(
-            get_input_data_frame(**dict(self.dataset_dimensions)), include_dataset=False, include_metadata=False
+        """Estimate the size, in bytes, of data -- see `metadata.estimate_data_size`.
+
+        `self.grid` is `GRIDS[self.dataset_dimensions.grid]` (set in `__init__` and never
+        reassigned), which is the single grid object the estimate needs.
+        """
+        return metadata.estimate_data_size(
+            self.dataset_dimensions,
+            self.filter_dimensions,
+            self.grid,
+            self._get_group_by_columns(),
+            has_group_by=self.options.group_aggregate is not None,
+            grid_cell_ids=self.grid_cell_ids,
         )
-        group_by_cols = self._get_group_by_columns()
-        has_group_by = self.options.group_aggregate is not None
-
-        # Estimate rows.
-        rows = 1
-        for col in required_cols:
-            # If there is a group by clause, only the group by columns contribute
-            # to the number of output rows.
-            if has_group_by and col not in group_by_cols:
-                continue
-
-            dimension = DIMENSIONS[col]
-
-            value_count = None
-            values = getattr(self.filter_dimensions, col)
-            if values is not None:
-                value_count = len(values)
-            # Compare against None explicitly: dimension.values is a DataFrame, and
-            # Polars raises on bool() rather than reporting emptiness.
-            elif dimension.values is not None:
-                value_count = len(dimension.values)
-            elif col == "calendar_year":
-                if self.dataset_dimensions.time_unit == "decadal":
-                    value_count = 6
-                else:
-                    value_count = 52
-            elif col == "calendar_day":
-                if self.dataset_dimensions.time_unit == "monthly":
-                    value_count = 52 * 12
-                else:
-                    value_count = 52 * 365
-
-            if value_count is None:
-                return None
-
-            rows *= value_count
-
-        # Estimate columns.
-        columns = None
-        if self.grid_cell_ids is not None:
-            columns = len(self.grid_cell_ids)
-        else:
-            grid = GRIDS[self.dataset_dimensions.grid]
-            columns = getattr(self.grid, "id_count", None)
-
-            if columns is None:
-                height = getattr(grid, "height", None)
-                width = getattr(grid, "width", None)
-                if height and width:
-                    columns = height * width
-
-        if columns is None:
-            return None
-
-        # Calculate bytes per value.
-        variable = VARIABLES[self.dataset_dimensions.variable]
-        dtype_digits = re.findall(r"\d+", str(variable.dtype))
-        if len(dtype_digits) != 1:
-            return None
-
-        return rows * columns * int(dtype_digits[0]) / 8

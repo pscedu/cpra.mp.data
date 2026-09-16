@@ -11,6 +11,7 @@ from rasterio.warp import transform
 from shapely.geometry import box
 
 from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis import stages
 from cpra.mp.data.analysis import vector as dataset_module
 from cpra.mp.data.analysis.types import DataFormat, OutputType
 from cpra.mp.data.tabular import write_parquet
@@ -408,8 +409,8 @@ class TestCalculateStage:
     """`negate`/`multiply10`/`multiply100` were flat-parameter sugar for one-line
     `calculate` entries (`value * -1`/`* 10`/`* 100`); the fields
     themselves have since been deleted from `Options` (not just their HTTP spelling), along with the
-    sugar-expansion and legacy-vs-generic mixing-rejection logic in
-    `_resolve_calculate_entries` -- so what these tests pin is now expressed directly
+    sugar-expansion and legacy-vs-generic mixing-rejection logic that used to sit beside
+    what is now `stages.resolve_calculate_entries` -- so what these tests pin is now expressed directly
     as the generic `calculate` entry each legacy parameter used to expand into.
     """
 
@@ -547,8 +548,8 @@ class TestGenericCalculate:
     # the (now-deleted) `negate` field was equivalent to this exact `calculate` entry --
     # see `TestCalculateStage.test_negate_flips_matching_rows` above, which pins that
     # entry's behavior directly since there is no more legacy field to compare it
-    # against -- and the latter exercised `_resolve_calculate_entries`'s legacy/generic
-    # mixing-rejection branch, which was deleted along with the fields that could
+    # against -- and the latter exercised the legacy/generic mixing-rejection branch of
+    # what is now `stages.resolve_calculate_entries`, deleted along with the fields that could
     # ever be mixed. Neither has anything left to test.
 
     async def test_invalid_expression_is_a_400_naming_the_entry(
@@ -747,14 +748,22 @@ class TestSummarizeStage:
         assert df["value"][0] == pytest.approx(source["3"][0] * 0.5, rel=1e-5)
 
     async def test_summarize_grid_cell_ids_are_cast_to_int(self, dataset_factory, annual_data):
+        """The parse itself. That the parsed IDs then actually narrow the crosswalk's
+        destinations is `test_summarize_grid_cell_narrows_destinations` above.
+        """
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
             summarize_grid_cell="100, 200",
         )
-        dataset._validate_summarize_params()
-        assert dataset.summarize_grid_cell_ids == [100, 200]
+        has_summarize, summarize_grid_cell_ids = stages.validate_summarize_options(
+            dataset.options.summarize_by,
+            dataset.options.summarize_aggregate,
+            dataset.options.summarize_grid_cell,
+        )
+        assert has_summarize is True
+        assert summarize_grid_cell_ids == [100, 200]
 
     async def test_summarize_switches_output_to_vector(self, dataset_factory, annual_data):
         dataset = dataset_factory(

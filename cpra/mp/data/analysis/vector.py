@@ -18,6 +18,7 @@ from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from pmtiles.reader import MmapSource, Reader
 
 from cpra.mp.data import config
+from cpra.mp.data.analysis import stages
 from cpra.mp.data.analysis.base import (
     AnalysisError,
     BaseAnalysis,
@@ -321,7 +322,10 @@ class VectorGridAnalysis(BaseAnalysis):
         module's docstring for why the vector/raster pair collapses to a single hook.
         """
 
-        if not self._validate_summarize_params():
+        has_summarize, self.summarize_grid_cell_ids = stages.validate_summarize_options(
+            self.options.summarize_by, self.options.summarize_aggregate, self.options.summarize_grid_cell
+        )
+        if not has_summarize:
             return
 
         # Generate column expressions.
@@ -345,14 +349,14 @@ class VectorGridAnalysis(BaseAnalysis):
         dim_cols = cs.expand_selector(self.lf, DIMENSION_COLUMNS)
 
         if self.options.summarize_aggregate == "count_by_value":
-            # No `scale_factor` multiply here (see _reject_calculate_with_count_by_value's
+            # No `scale_factor` multiply here (see `stages.reject_calculate_with_count_by_value`'s
             # docstring for the same reasoning applied to the crosswalk's own scale
             # factor: rescaling a categorical code before counting it would change which
             # raw values collapse into "the same" category). Group by the destination
             # zone (aliased to `grid_cell`, matching every other summarize output) plus
             # the value itself -- `count_by_value_frame` bounds this group key's
             # cardinality; see its docstring for the math.
-            self._reject_calculate_with_count_by_value()
+            stages.reject_calculate_with_count_by_value(self.options.calculate)
             joined = self.lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
                 pl.col("dst_id").alias("grid_cell")
             )
@@ -504,12 +508,12 @@ class VectorGridAnalysis(BaseAnalysis):
         `geographic_unit` (added once, at the very end, exactly like
         `_apply_transform_params_impl` adds it once) is added only if `current_grid` ever
         actually changed -- an identity project (`op.to == current_grid`, skipped
-        entirely, matching `_apply_transform_params_impl`'s own `_validate_summarize_
-        params` early return for a project with no `summarize_by`) leaves it at `self.
-        grid.name` and adds nothing, the same "no-op transform stage" behavior the old
+        entirely, matching `_apply_transform_params_impl`'s own `stages.validate_
+        summarize_options` early return for a project with no `summarize_by`) leaves it at
+        `self.grid.name` and adds nothing, the same "no-op transform stage" behavior the old
         engine gives an identity project.
 
-        `count_by_value` + `calculate`: mirrors `_reject_calculate_with_count_by_value`'s
+        `count_by_value` + `calculate`: mirrors `stages.reject_calculate_with_count_by_value`'s
         rejection (checked against `self.options.calculate`, which the planner still
         populates identically regardless of which engine executes -- see `_dataset_for`)
         rather than re-deriving it from `ordered_ops`, since `Options.calculate` is already
@@ -533,7 +537,7 @@ class VectorGridAnalysis(BaseAnalysis):
                     if op.to == current_grid:
                         continue
                     if op.aggregate == "count_by_value":
-                        self._reject_calculate_with_count_by_value()
+                        stages.reject_calculate_with_count_by_value(self.options.calculate)
                     lf = apply_project(
                         lf,
                         current_grid,

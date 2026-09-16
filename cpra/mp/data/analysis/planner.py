@@ -323,7 +323,8 @@ def _extract_post_project_grid_cell_filter(step_no, where):
     so a `filter` naming `grid_cell` after such a `project` would, if simply folded into
     `Options.where` like any other post-project filter, silently test the WRONG grid's
     cell IDs (the source dataset's, not the summarized zones'). `summarize_grid_cell` is
-    the correct target (`BaseAnalysis._validate_summarize_params` applies it against the
+    the correct target (`stages.validate_summarize_options` parses it, and both
+    `_apply_transform_params_impl` implementations apply it against the
     summarized grid), but it only accepts a literal comma-separated ID list, never a
     general SQL predicate -- so only the two literal forms below are recognized; ANY
     other way a filter's `where` mentions `grid_cell` after such a `project` (mixed with

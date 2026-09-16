@@ -16,6 +16,7 @@ from rasterio.windows import Window
 
 from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis import raster as dataset_module
+from cpra.mp.data.analysis.metadata import is_raster_metadata_table
 from cpra.mp.data.analysis.raster import _batched_block_windows, band_dimension_keep
 from cpra.mp.data.analysis.types import OutputType
 from cpra.mp.data.grids import GRIDS
@@ -76,7 +77,8 @@ class TestOutputType:
         assert dataset.output_type == OutputType.vector
 
     def test_metadata_table_is_detected(self, dataset_factory, raster_data):
-        assert dataset_factory(DIMENSIONS)._is_raster_metadata_table() is True
+        dataset = dataset_factory(DIMENSIONS)
+        assert is_raster_metadata_table(dataset.lf, dataset.grid.grid_type) is True
 
     async def test_metadata_table_is_false_after_summarizing(
         self, dataset_factory, raster_data, zone_crosswalk
@@ -85,7 +87,7 @@ class TestOutputType:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="mean"
         )
         await dataset.apply_params()
-        assert dataset._is_raster_metadata_table() is False
+        assert is_raster_metadata_table(dataset.lf, dataset.grid.grid_type) is False
 
 
 class TestGridCellSampling:
