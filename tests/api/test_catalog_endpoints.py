@@ -174,9 +174,9 @@ class _FakeCatalogAnalysis:
 
 
 class TestAnalyses:
-    """`/v1/analyses.json` (plan §3.2a/§5.2), mirroring `TestVisualizations` above --
+    """`/v1/analyses.json`, mirroring `TestVisualizations` above --
     built the same way (`analysis.Meta.__dict__` per registered class). The real registry
-    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent Phase 2 change that may not have
+    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent change that may not have
     landed yet (see `api/utils.py`'s guarded import), so this monkeypatches a small fake
     registry onto both places `api/__init__.py`/`api/utils.py` bind the name, exercising
     the route itself rather than the real analyses' content -- see

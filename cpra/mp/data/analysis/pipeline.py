@@ -234,17 +234,32 @@ class JoinStep(BaseModel):
 
 
 class FilterStep(BaseModel):
-    """A predicate over in-scope named columns, e.g. `marsh > 0.5 AND sal > 5.5`. Always
-    consumes the previous step's output (there is no `input` field -- see
-    `validate_pipeline`'s chaining rule, which is also why `filter`/`group` can never be
-    a pipeline's first step). `as` is not in the spec's table for this op but is accepted
-    here anyway, generalizing the chaining rule's own "a prior step's `as`" phrasing,
-    which does not restrict which op can produce a name a later step references.
+    """A predicate over in-scope named columns, e.g. `marsh > 0.5 AND sal > 5.5`. `input`
+    is optional -- an omitted `input` chains from the previous step's output, mirroring
+    `ProjectStep.input` exactly (same optionality, same "explicit name or chain" meaning,
+    same rule for who may use it: see `validate_pipeline`'s chaining rule). This is what
+    lets a `filter` lead a pipeline: the engine's fixed stage order always runs every
+    filter's `where` before a `project`'s aggregation, regardless of declared order, so a
+    value-testing `filter` declared AFTER a many-to-one `project` would silently run
+    against the pre-aggregation rows instead of the aggregated result --
+    `planner._compile_single_input_chain` rejects that shape outright rather than return
+    a wrong answer. Before `input` existed there was no way to write the filter the other
+    way around either, since `filter`/`calculate`/`group` all lacked any way to name an
+    input and so could never be a pipeline's first step -- only `project`/`join` could
+    satisfy the chaining rule's "first step must name its input" requirement. Naming
+    `input` explicitly is what lets `filter` satisfy that same requirement now, exactly
+    the way `project.input` already does, so the value-testing filter can be declared
+    BEFORE the project instead; `calculate`/`group` still have no `input` field and so
+    still can never lead a pipeline. `as` is not in the spec's table for this op but is
+    accepted here anyway, generalizing the chaining rule's own "a prior step's `as`"
+    phrasing, which does not restrict which op can produce a name a later step
+    references.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     op: Literal["filter"] = "filter"
+    input: str | None = None
     where: str
     as_: str | None = Field(default=None, alias="as")
 
@@ -257,15 +272,27 @@ class CalculateStep(BaseModel):
     way `filter.where` names columns -- or by the `value` placeholder); `where` uses the
     same dimension-and/or-value-condition grammar as `filter.where`, and an omitted
     `where` applies the expression to everything. Rows/bands NOT matching `where` pass
-    through unchanged -- `calculate` never drops data; use `filter` for that. Always
-    consumes the previous step's output (there is no `input` field), so like
-    `filter`/`group` it can never be a pipeline's first step. `as` follows `FilterStep`'s
-    reasoning: accepted, naming this step's output for a later step to reference.
+    through unchanged -- `calculate` never drops data; use `filter` for that. `input` is
+    optional -- an omitted `input` chains from the previous step's output, mirroring
+    `FilterStep.input` exactly and for the identical reason: `Options.calculate` lowers
+    onto `BaseAnalysis.apply_params`'s Calculate stage (stage 2), which runs
+    unconditionally before the Transform stage (stage 4) that a `project`'s aggregation
+    lowers onto, for BOTH the raster and the vector-interpreter engines -- so a
+    `calculate` declared as a leading step, ahead of the `project` it precedes, executes
+    in exactly the position it is declared in, regardless of grid type. There is no
+    ordering question here the way there is for a POST-project `calculate`, which
+    `planner._compile_single_input_chain` still rejects after a many-to-one `project`
+    (the same silent-misexecution risk `FilterStep`'s docstring describes for a
+    post-project value filter). `group` still has no `input` field (see `GroupStep`'s
+    docstring for why that one is left alone) and so still can never lead a pipeline.
+    `as` follows `FilterStep`'s reasoning: accepted, naming this step's output for a
+    later step to reference.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     op: Literal["calculate"] = "calculate"
+    input: str | None = None
     expression: str
     where: str | None = None
     as_: str | None = Field(default=None, alias="as")
@@ -276,7 +303,24 @@ class GroupStep(BaseModel):
     `aggregate` (required; must be in `fold.DECOMPOSABLE_AGGREGATES`) applied to `of`
     (defaults to `"value"`, generalizing the aggregand -- "first year a condition held"
     is `aggregate="min", of="calendar_year"`). Always consumes the previous step's
-    output, like `filter`.
+    output (there is no `input` field, unlike `filter`'s and `calculate`'s -- see
+    `FilterStep`'s and `CalculateStep`'s docstrings), so it can never be a pipeline's
+    first step.
+
+    EXPLICIT DECISION: unlike `filter`
+    and `calculate`, `group` deliberately did NOT gain an `input` field alongside them.
+    `Options.group_by`/`Options.group_aggregate` are scalar fields, not a list like
+    `Options.calculate` -- a leading (pre-project) `group` and a post-project `group`
+    (still legal today, subject to `planner._compile_single_input_chain`'s "only one"
+    limit, which applies to a raster input but not to a vector one) would have to share that
+    one bucket. `calculate`'s equivalent bucket is a LIST that already accumulates
+    leading and trailing entries side by side without collision (see `CalculateStep`'s
+    docstring); `group`'s does not, so allowing a leading `group` would need either a
+    second `Options` field (a real schema change beyond this step's scope) or a new
+    compile-time rejection of "leading group + trailing group in the same pipeline" to
+    keep raster's single bucket from being silently overwritten -- genuinely separate
+    design work, not a mechanical extension of the `filter`/`calculate` pattern. Left
+    alone; a `group` step still cannot lead a pipeline.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True, use_enum_values=True)
@@ -296,11 +340,13 @@ Step = Annotated[
 
 def _step_explicit_inputs(step: Any) -> list[str]:
     """The names a step references BY ITSELF, before any chaining default is applied --
-    `[]` means "consumes the previous step's output" (only `project` can also mean this
-    via an omitted `input`; `filter`/`calculate`/`group` always mean this, having no
-    field to be explicit with).
+    `[]` means "consumes the previous step's output" (`project`, `filter`, and
+    `calculate` can also mean this via an omitted `input`; `group` always means this,
+    having no field to be explicit with -- see `GroupStep`'s docstring for why it alone
+    was left out of the `input`-field extension `calculate` received alongside
+    `filter`'s).
     """
-    if isinstance(step, ProjectStep):
+    if isinstance(step, (ProjectStep, FilterStep, CalculateStep)):
         return [step.input] if step.input is not None else []
     if isinstance(step, JoinStep):
         return list(step.inputs)
@@ -363,11 +409,14 @@ def validate_pipeline(pipeline: Pipeline) -> None:
     Checks performed:
 
     - every input name matches the identifier/reserved-name rule (`_validate_name`);
-    - **chaining**: the first step must name its input(s) explicitly (`project.input` or
-      `join.inputs` -- `filter`/`calculate`/`group` never can, so none may be the first step); a
-      later step with no explicit reference consumes the immediately preceding step's
-      output; every explicit reference (an input name, or a prior -- not later -- step's
-      `as`) must already be known at that point;
+    - **chaining**: the first step must name its input(s) explicitly (`project.input`,
+      `filter.input`, `calculate.input`, or `join.inputs` -- `group` never can, so it may
+      never be the first step, see `GroupStep`'s docstring for why it alone was left out
+      of the `input`-field extension `calculate` received alongside `filter`'s); a later
+      step with no explicit
+      reference consumes the immediately preceding step's output; every explicit
+      reference (an input name, or a prior -- not later -- step's `as`) must already be
+      known at that point;
     - every step's `as`, when given, matches the identifier/reserved-name rule and does
       not collide with an input name or an earlier step's `as`;
     - `project`/`group` aggregates are in `fold.DECOMPOSABLE_AGGREGATES` (reusing
@@ -420,7 +469,8 @@ def validate_pipeline(pipeline: Pipeline) -> None:
         elif i == 1:
             raise PipelineError(
                 f"step 1 ({step.op}) has no input to chain from -- the first step must "
-                "name its input explicitly (project.input or join.inputs)"
+                "name its input explicitly (project.input, filter.input, "
+                "calculate.input, or join.inputs)"
             )
 
         as_name = getattr(step, "as_", None)

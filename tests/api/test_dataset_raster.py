@@ -158,7 +158,7 @@ class TestCalculateStage:
 
     async def test_a_generic_negate_entry_records_its_plan(self, dataset_factory, raster_data):
         """`negate` was flat-parameter sugar for this exact `calculate` entry -- retired
-        from `Options` (Phase 4) along with its HTTP spelling; the generic form it
+        from `Options` along with its HTTP spelling; the generic form it
         expanded into is what's left to record a plan."""
         dataset = dataset_factory(
             DIMENSIONS, calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}]
@@ -234,7 +234,7 @@ class TestCalculateStage:
         self, dataset_factory, raster_data
     ):
         """`aep` is a real dimension globally, but not one vct's band-metadata table
-        carries -- the plan records fine at the calculate stage (band applicability is a
+        carries -- the calculate plan records fine (band applicability is a
         pixel-read-time question) and 400s, naming the entry, once a read path tries to
         resolve which bands it selects."""
         dataset = dataset_factory(
@@ -267,20 +267,20 @@ class TestGroupStage:
     async def test_grouping_records_row_indices(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
         await dataset.apply_params()
-        assert dataset.raster_groups is not None
-        assert dataset.raster_groups.collect().height == 1
+        assert dataset._band_groups is not None
+        assert len(dataset._band_groups) == 1
 
     async def test_group_by_a_dimension_keeps_one_group_per_value(
         self, dataset_factory, raster_data
     ):
         dataset = dataset_factory(DIMENSIONS, group_by="calendar_year", group_aggregate="max")
         await dataset.apply_params()
-        assert dataset.raster_groups.collect().height == 2
+        assert len(dataset._band_groups) == 2
 
     async def test_aggregate_collapses_bands(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
         await dataset.apply_params()
-        df = dataset.materialize()
+        df = dataset._band_frame()
         data = np.array([[[30]], [[40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, -9999)
@@ -296,7 +296,7 @@ class TestGroupStage:
     ):
         dataset = dataset_factory(DIMENSIONS, group_aggregate=aggregate)
         await dataset.apply_params()
-        df = dataset.materialize()
+        df = dataset._band_frame()
         data = np.array([[[30]], [[40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, -9999)
@@ -505,8 +505,8 @@ class TestSummarizeStage:
     ):
         """A zonal summarize result is already long-format (grid_cell/value) unconditionally
         -- there used to be an `unpivot` parameter that was a no-op here for exactly that
-        reason, but Phase 4 deleted it from `Options`/`DataOptions` outright rather than
-        keep a flag that never did anything after a summarize."""
+        reason, but it was deleted from `Options`/`DataOptions` outright rather than
+        keeping a flag that never did anything after a summarize."""
         dataset = dataset_factory(
             DIMENSIONS,
             summarize_by="hydro_compartment_v001",
@@ -772,7 +772,7 @@ class TestTileBandCollapse:
     async def test_nodata_is_excluded_from_the_aggregate(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
         await dataset.apply_params()
-        df = dataset.materialize()
+        df = dataset._band_frame()
         # Three pixels: nodata in one band, nodata in both, real data in both.
         data = np.array([[[-9999, -9999, 30]], [[40, -9999, 40]]], dtype="int32")
 
@@ -787,7 +787,7 @@ class TestTileBandCollapse:
         """`sum`'s additive identity is 0, which would render as a real value of zero."""
         dataset = dataset_factory(DIMENSIONS, group_aggregate="sum")
         await dataset.apply_params()
-        df = dataset.materialize()
+        df = dataset._band_frame()
         data = np.array([[[-9999, 30]], [[-9999, 40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, -9999)
@@ -820,7 +820,7 @@ class TestTileBandCollapse:
         """`nodata=None` means every pixel is real, including one that looks like -9999."""
         dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
         await dataset.apply_params()
-        df = dataset.materialize()
+        df = dataset._band_frame()
         data = np.array([[[-9999]], [[40]]], dtype="int32")
 
         out = dataset._collapse_tile_bands(df, data, None)

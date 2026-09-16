@@ -26,8 +26,8 @@ class TileQuery(DataOptions, FilterDimensions):
     """Inherits `DataOptions`, not `Options`: the data/tile HTTP endpoints accept exactly
     dimension filters plus `grid_cell`/`where`/`sort`/`select`/`color_map` (and
     compression, on `DataQuery` below) -- `Options`'s pipeline-execution fields
-    (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) are engine-internal as of
-    Phase 4 and are rejected explicitly if sent on the query string (see
+    (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) are engine-internal and are
+    rejected explicitly if sent on the query string (see
     `api.__init__.reject_retired_params`) rather than silently ignored.
     """
 
@@ -133,7 +133,7 @@ class Visualization(BaseModel):
 
 
 class Analysis(BaseModel):
-    """Catalog entry for a named analysis (plan §3.2a/§5.2) -- served by
+    """Catalog entry for a named analysis -- served by
     `/v1/analyses.json`, mirroring `Visualization`/`/v1/visualizations.json` exactly:
     built from each registered class's `Meta.__dict__` (see `api/__init__.py::
     analyses_catalog`), so a field this model doesn't recognize is silently dropped
@@ -150,7 +150,7 @@ class Analysis(BaseModel):
 
 
 class AnalysisQuery(DataOptions, FilterDimensions):
-    """Accepted request parameters for the named-analysis routes (plan §3.2a): the
+    """Accepted request parameters for the named-analysis routes: the
     dataset's dimension filters (from `FilterDimensions`) plus `DataOptions`'s
     `grid_cell`/`where`/`sort`/`select`/`color_map`. Deliberately NOT `Options` -- that
     also carries the `calculate`/`group_by`/`summarize_*` pipeline-execution fields,
@@ -180,7 +180,7 @@ class AnalysisDataQuery(AnalysisQuery, Compression):
 
 
 class VisualizationQuery(DataQuery):
-    # A named analysis (plan §5.3, `cpra.mp.data.analyses.ANALYSES`), e.g. `difference` or
+    # A named analysis (`cpra.mp.data.analyses.ANALYSES`), e.g. `difference` or
     # `concatenate`. Deliberately the ONLY field this model declares for the analysis --
     # its own parameters (`dimension`/`order`/...) have no fixed field set (see
     # `AnalysisQuery`'s docstring above) and are instead read directly off the raw request

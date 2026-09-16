@@ -55,7 +55,7 @@ class InvalidAnalysisParametersError(AnalysisRegistryError):
 class AnalysisTypeMismatchError(AnalysisRegistryError):
     """An analysis was resolved against the wrong route kind: a `type="custom"` analysis
     given a `dataset`, or a `type="dataset"` analysis resolved with `dataset=None`. Maps
-    to a 400 at the route layer -- see plan §3.2a, and `api/utils.py`'s
+    to a 400 at the route layer -- see `api/utils.py`'s
     `get_analysis_class(name, type=...)`, which makes the identical distinction for
     visualizations already.
     """
@@ -170,7 +170,7 @@ def dataset_input_selection(dataset: DatasetRef, filters: dict[str, Any]) -> dic
 def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     """The dimensions a pipeline's result no longer varies over: every dimension any of
     its inputs carries, minus whatever the pipeline's OWN trailing `group.by` still keeps
-    (derived structurally, per plan §5.2, rather than each analysis hand-declaring it) --
+    (derived structurally, rather than each analysis hand-declaring it) --
     `frozenset()` when the last step isn't a `group` at all (nothing has been collapsed).
     For `exit-criterion`, whose trailing `group.by` is always `[]`, this is simply every
     dimension either input carries (both are pinned single-valued dataset selections, so
@@ -217,7 +217,7 @@ class Analysis:
       own request-specific parameters;
     - a `pipeline()` method building a real `analysis.pipeline.Pipeline` from
       `self.dataset`/`self.filters`/`self.parameters` -- the ONLY thing a resolved
-      analysis exposes for actually running it (plan §5.4: nothing may be reachable only
+      analysis exposes for actually running it (nothing may be reachable only
       through a named analysis, so this always funnels through the same
       `compile_pipeline` any hand-authored pipeline does);
     - optionally, a `validate_selection` classmethod for a cardinality/consistency rule

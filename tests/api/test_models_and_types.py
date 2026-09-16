@@ -140,7 +140,7 @@ class TestQuerySplitting:
 
     def test_tile_query_splits_filters_from_options(self):
         # `group_by`/`group_aggregate`/`calculate`/... are `Options`-only fields, not
-        # `TileQuery`'s (Phase 4: `TileQuery` inherits `DataOptions`, not `Options` --
+        # `TileQuery`'s (`TileQuery` inherits `DataOptions`, not `Options` --
         # see `TileQuery`'s docstring) -- so only a `DataOptions` field (`where`) is
         # exercised here; `query.options` still reports `Options` defaults for the
         # fields `TileQuery` itself doesn't carry.

@@ -1,16 +1,17 @@
-"""Plan §5.3 (final part): tests for the visualization-layer migration to named analyses.
+"""Tests for the visualization-layer migration to named analyses.
 
 Covers what `tests/api/test_analyses_registry.py` and `tests/test_visualizations.py` don't:
 
 * **Named-analysis absolute values** (`TestNamedAnalysisResults`) -- for each of `difference`
   asc/desc and `concatenate` two-image/three-image, an `analysis=` request materializes the
-  expected `(grid_cell, value)` rows. Through Phase 3 this class instead compared a named
+  expected `(grid_cell, value)` rows. This class used to instead compare a named
   analysis's result against the OLD legacy-parameter request's (`negate`/`multiply10`/
-  `multiply100` + `group_by`/`group_aggregate`) as a non-breaking-migration proof; Phase 4
-  deleted those fields from `Options` entirely (not just their HTTP spelling), so there is no
-  more legacy request left to compute the other side of that comparison from -- the absolute
-  values these tests were already separately asserting (`assert set(named["value"].to_list())
-  == {...}`) are what's left, and are now each test's sole assertion.
+  `multiply100` + `group_by`/`group_aggregate`) as a non-breaking-migration proof; those
+  fields were later deleted from `Options` entirely (not just their HTTP spelling), so there
+  is no more legacy request left to compute the other side of that comparison from -- the
+  absolute values these tests were already separately asserting (`assert
+  set(named["value"].to_list()) == {...}`) are what's left, and are now each test's sole
+  assertion.
 * **The `feature_colors` bug fix** (`TestFeatureColorsBugFix`) -- `Map.feature_colors` used
   to silently return `{}` for EVERY caller (a `cs.matches(r"^[0-9]")` selector that assumed
   a wide, one-column-per-grid-cell shape against data stored long). Proven here by asserting
@@ -21,7 +22,7 @@ Covers what `tests/api/test_analyses_registry.py` and `tests/test_visualizations
   `compare_dimensions`/`chart()`'s compare channels, on the resolved-analysis path and the
   no-analysis-selected path. The legacy fallback path this class also used to cover (the
   `lnd_type`+`multiply10` "lnd_chng" special case, and `StackedBar`'s `negate_dimension`
-  sniffing) was deleted outright in Phase 4 (see `visualizations/map.py`'s `_is_difference`/
+  sniffing) was later deleted outright (see `visualizations/map.py`'s `_is_difference`/
   `_legend_name` and `visualizations/stacked_bar.py`'s `compare_dimensions`, which now only
   ever consult `resolved_analysis`) -- there is nothing left of it to test.
   None of these need any data on disk: `resolve_analysis` only builds a `Pipeline` in
@@ -80,12 +81,13 @@ async def _materialize_named(name, filters, params, base_path):
 class TestNamedAnalysisResults:
     """A named analysis must materialize the expected `(grid_cell, value)` rows.
 
-    Through Phase 3 these tests instead proved a legacy-parameter request and the
+    These tests used to instead prove a legacy-parameter request and the
     equivalent named analysis materialized IDENTICAL rows -- the non-breaking contract
-    the migration rested on. Phase 4 deleted the legacy fields (`negate`/`multiply10`/
-    `multiply100`) from `Options` entirely, so there is no more legacy request to build
-    the other half of that comparison from; each test's absolute-value assertion (already
-    present, as a secondary check) is what's left, and is now the whole test.
+    the migration rested on. The legacy fields (`negate`/`multiply10`/
+    `multiply100`) were later deleted from `Options` entirely, so there is no more legacy
+    request to build the other half of that comparison from; each test's absolute-value
+    assertion (already present, as a secondary check) is what's left, and is now the whole
+    test.
     """
 
     async def test_difference_asc(self, base_path):
@@ -242,8 +244,9 @@ class TestFeatureColorsBugFix:
 
 class TestResolvedAnalysisMetadataHooks:
     """`_is_difference`/`_legend_name`/`difference_suffix`, resolved-analysis path only.
-    Phase 4 deleted the legacy-fallback sniffing these hooks used to fall back to
-    (`self.params.get("negate"/"multiply10")`) outright, not merely hid it from HTTP --
+    The legacy-fallback sniffing these hooks used to fall back to
+    (`self.params.get("negate"/"multiply10")`) was later deleted outright, not merely
+    hidden from HTTP --
     there is no legacy branch left to test, so the equivalent legacy-fallback tests that
     used to live here (`test_legacy_negate_is_a_difference_with_no_special_legend`,
     `test_legacy_lnd_type_multiply10_uses_the_lnd_chng_legend`,
@@ -280,9 +283,10 @@ class TestCompareDimensionsExclusion:
     collapsed -- not just some dimension happening to be absent from the selection.
     `model_group_id` here is deliberately given 2 values and NOT collapsed by either
     analysis, so it stays a real compare axis; only `calendar_year` (and, for the
-    three-image case, `model_group_id` too) should ever be excluded. Phase 4 deleted
-    `StackedBar.negate_dimension` outright (the no-`analysis=`-selected fallback exclusion
-    it powered no longer exists), so the legacy-fallback test that used to sit alongside
+    three-image case, `model_group_id` too) should ever be excluded.
+    `StackedBar.negate_dimension` was later deleted outright (the no-`analysis=`-selected
+    fallback exclusion it powered no longer exists), so the legacy-fallback test that used
+    to sit alongside
     these (`test_legacy_negate_dimension_sniffing_is_unaffected`) was removed rather than
     converted -- there is no property left on `StackedBar` for it to call.
     """

@@ -1,8 +1,8 @@
-"""The plan §9 registry-drift test, plus an exit-criterion end-to-end functional check.
+"""The registry-drift test, plus an exit-criterion end-to-end functional check.
 
 Every entry in `cpra.mp.data.analyses.ANALYSES` must resolve (via `resolve_analysis`) to a
 real `Pipeline` that `compile_pipeline` accepts against a representative, on-disk dataset --
-plan §5.4's constraint that nothing is reachable only through a named analysis, only through
+enforcing the constraint that nothing is reachable only through a named analysis, only through
 the exact same compiler any hand-authored pipeline goes through. This module is deliberately
 independent of the concurrently-developed `cpra/mp/data/api/` route layer (a different
 in-flight package this task does not own and should not couple to): everything here drives
@@ -97,8 +97,8 @@ def _write_sal_annual(base_path, values_by_year, geo_id=1, model_group_id=500, s
 
 @pytest.fixture
 def exit_criterion_data(base_path, crosswalk_path, monkeypatch):
-    """Marsh (fine, raster) 0.3->2030, 0.7->2040 (crosses `marsh > 0.5` only in 2040);
-    salinity (coarse, vector, one zone) 4.0->2030, 6.0->2040 (crosses `sal > 5.5` only in
+    """Marsh (raster) 0.3->2030, 0.7->2040 (crosses `marsh > 0.5` only in 2040);
+    salinity (vector, one zone) 4.0->2030, 6.0->2040 (crosses `sal > 5.5` only in
     2040) -- every `veg_grid_cell_v001` pixel maps to the same single
     `hydro_compartment_v001` zone, so `{"aggregate": "min", "of": "calendar_year"}`'s
     expected output is a uniform 2040 raster. Identical to
@@ -116,7 +116,7 @@ def exit_criterion_data(base_path, crosswalk_path, monkeypatch):
 
 
 # ------------------------------------------------------------------------------------------
-# Plan §9: every registered analysis compiles
+# Every registered analysis compiles
 # ------------------------------------------------------------------------------------------
 
 
@@ -124,7 +124,7 @@ class TestRegistryDrift:
     """Every `ANALYSES` entry, expanded via `resolve_analysis` and run through
     `compile_pipeline` against a representative on-disk dataset -- catches an analysis
     added to the registry whose `pipeline()` builds something `compile_pipeline` doesn't
-    actually accept (plan §5.4: nothing may be reachable only through a named analysis).
+    actually accept (nothing may be reachable only through a named analysis).
     """
 
     def test_every_registered_analysis_name_is_covered_by_this_test(self):

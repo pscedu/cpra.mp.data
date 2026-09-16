@@ -52,7 +52,7 @@ from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis import paired as paired_module
-from cpra.mp.data.analysis.base import BaseAnalysis
+from cpra.mp.data.analysis.base import AnalysisError, BaseAnalysis
 from cpra.mp.data.analysis.paired import (
     PairedAnalysis,
     _validate_paired_group_aggregate,
@@ -63,6 +63,8 @@ from cpra.mp.data.analysis.pipeline import (
     parse_pipeline,
     pipeline_to_query,
 )
+from cpra.mp.data.analysis.raster import RasterGridAnalysis
+from cpra.mp.data.analysis.vector import VectorGridAnalysis
 from cpra.mp.data.analysis.planner import (
     _check_input_dimensions,
     _check_join_row_ceiling,
@@ -687,15 +689,66 @@ class TestCompileSingleInputChain:
         with pytest.raises(PipelineError, match="broadcasts onto a finer grid"):
             compile_pipeline(pipeline, base_path=base_path)
 
-    def test_rejects_filter_after_group(self, base_path):
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+    async def test_filter_after_group_compiles_and_executes_for_vector_input(self, base_path):
+        """VECTOR ORDERING RELAXATION: a `filter` after
+        a `group` step used to be rejected unconditionally -- it is now accepted for a
+        VECTOR input (`ecoregion_v001` here), since `VectorGridAnalysis.apply_steps`
+        applies a post-`GroupOp` `FilterOp` against the already-collapsed rows, in
+        declared order, with no shared `Options` bucket to collide over (see
+        `planner._compile_single_input_chain`'s `not is_vector_input` guard on this
+        rejection for the full argument). Compiling is not the point here -- correctness
+        is -- so this test hand-computes the hand-verifiable hand-computed answer, not
+        just the absence of an exception.
+
+        DECLARED (and, since the interpreter runs ops in declared order, ACTUAL): a
+        single year means `group(by=[], aggregate=max)` collapses each grid_cell's ONE
+        row onto itself unchanged (1.0, 2.0, 3.0, 4.0 for geo_ids 1-4) -- then
+        `filter(eco > 2)` keeps only grid_cell 3 (3.0) and grid_cell 4 (4.0).
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
         pipeline = parse_pipeline(
             {
                 "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
                 "steps": [
                     {"op": "project", "input": "eco", "to": "ecoregion_v001"},
                     {"op": "group", "by": [], "aggregate": "max"},
-                    {"op": "filter", "where": "eco > 2035"},
+                    {"op": "filter", "where": "eco > 2"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == {3: 3.0, 4: 4.0}
+
+    def test_rejects_filter_after_group_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above: the raster
+        interpreter still defers a group's collapse as row indices into
+        `self._band_groups` rather than collapsing the frame outright, and a dimension
+        filter declared after that group would drop columns from the band-metadata
+        frame -- renaming the surviving bands, since `b0..bN` are positional -- so the
+        recorded indices would no longer refer to the bands they were captured for. This
+        rejection must keep firing for raster until the raster side stops carrying
+        positions across a metadata change. This is a pure compile-time rejection (like
+        `TestPostProjectGridCellFilterRejections`
+        above, which follows the same pattern) -- the rejection fires inside
+        `_compile_single_input_chain`'s step loop, before `_dataset_for` ever needs a
+        crosswalk or a raster file to exist, so none is written here.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                    {"op": "filter", "where": "vct > 2035"},
                 ],
                 "output": {"format": "csv"},
             }
@@ -718,13 +771,64 @@ class TestCompileSingleInputChain:
         with pytest.raises(PipelineError, match="only aggregate its own running value"):
             compile_pipeline(pipeline, base_path=base_path)
 
-    def test_rejects_two_group_steps(self, base_path):
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+    async def test_two_group_steps_compile_and_execute_for_vector_input(self, base_path):
+        """VECTOR ORDERING RELAXATION: the "more than
+        one `group` step" limit is lifted for a VECTOR input -- `Options.group_by`/
+        `group_aggregate` are scalar fields, so a SECOND `group` step had nowhere to
+        lower onto but to collide with the first; the vector interpreter has no such
+        bucket, applying each `GroupOp` in declared order against whatever the previous
+        op left behind (see `planner._compile_single_input_chain`'s `not is_vector_input`
+        guard on this rejection for the full argument).
+
+        DECLARED (and, since the interpreter runs ops in declared order, ACTUAL): two
+        years (2030, 2040) mean the FIRST `group(by=[], aggregate=max)` collapses each
+        grid_cell's two rows into one -- grid_cell 1: max(10.0, 11.0) = 11.0; grid_cell
+        2: max(20.0, 21.0) = 21.0. The SECOND `group(by=[], aggregate=min)` then runs
+        against that already-one-row-per-grid_cell result, where min of a single value
+        is that same value -- so it is a no-op here, but still proves the second group
+        step is actually applied (not silently dropped) against the first group's
+        OUTPUT, not the original per-year rows.
+        """
+        write_parquet(
+            annual_frame(
+                years=(2030, 2040),
+                geo_ids=(1, 2),
+                value_fn=lambda year, geo_id: float(geo_id) * 10 + (0.0 if year == 2030 else 1.0),
+            ),
+            base_path=base_path,
+            validate=False,
+        )
         pipeline = parse_pipeline(
             {
                 "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
                 "steps": [
                     {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "group", "by": [], "aggregate": "max", "as": "g1"},
+                    {"op": "group", "by": [], "aggregate": "min"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == {1: 11.0, 2: 21.0}
+
+    def test_rejects_two_group_steps_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above: the raster engine
+        records each group's band positions against the original, uncollapsed band set,
+        so a second group would silently replace the first instead of composing with
+        it -- this rejection must keep firing for raster even though it is lifted for
+        vector. Pure compile-time rejection, like
+        `TestPostProjectGridCellFilterRejections` -- no data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
                     {"op": "group", "by": [], "aggregate": "max", "as": "g1"},
                     {"op": "group", "by": [], "aggregate": "min"},
                 ],
@@ -776,27 +880,106 @@ class TestCalculateStepCompile:
             {"expression": "value * 0.5", "where": None},
         ]
 
-    def test_rejects_calculate_after_group(self, base_path):
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+    async def test_calculate_after_group_compiles_and_executes_for_vector_input(self, base_path):
+        """VECTOR ORDERING RELAXATION: a `calculate`
+        after a `group` step used to be rejected unconditionally -- now accepted for a
+        VECTOR input, since `VectorGridAnalysis.apply_steps` applies a post-`GroupOp`
+        `CalculateOp` against the already-collapsed rows, in declared order (see
+        `planner._compile_single_input_chain`'s `not is_vector_input` guard on this
+        rejection). Compiling is not the point -- correctness is.
+
+        DECLARED (and ACTUAL): a single year means `group(by=[], aggregate=max)`
+        collapses each grid_cell's one row onto itself unchanged (1.0, 2.0, 3.0, 4.0 for
+        geo_ids 1-4) -- then `calculate(eco * 0.6)` rewrites each: 0.6, 1.2, 1.8, 2.4.
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
         pipeline = self._pipeline(
             [
                 {"op": "group", "by": [], "aggregate": "max"},
                 {"op": "calculate", "expression": "eco * 0.6"},
             ]
         )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == pytest.approx({1: 0.6, 2: 1.2, 3: 1.8, 4: 2.4})
+
+    def test_rejects_calculate_after_group_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above: a raster input still
+        lowers onto `Options.calculate`, applied in the fixed Calculate stage (stage 2) --
+        unconditionally BEFORE the Group stage (stage 3) -- so this rejection must keep
+        firing for raster even though it is lifted for vector. Pure compile-time
+        rejection -- no data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                    {"op": "calculate", "expression": "vct * 0.6"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
         with pytest.raises(PipelineError, match="comes after a group step"):
             compile_pipeline(pipeline, base_path=base_path)
 
-    def test_rejects_value_filter_after_calculate(self, base_path):
-        """The flat machinery applies every filter before any calculate entry, so a
-        value condition ordered after a calculate step would test the pre-calculate
-        value -- rejected rather than silently misexecuted."""
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+    async def test_value_filter_after_calculate_compiles_and_executes_for_vector_input(self, base_path):
+        """VECTOR ORDERING RELAXATION: a value-testing
+        `filter` after a `calculate` step used to be rejected unconditionally -- now
+        accepted for a VECTOR input, since `VectorGridAnalysis.apply_steps` applies a
+        post-`CalculateOp` `FilterOp` against the already-recalculated `value` column, in
+        declared order (see `planner._compile_single_input_chain`'s `not is_vector_input`
+        guard on this rejection). Compiling is not the point -- correctness is.
+
+        DECLARED (and ACTUAL): `calculate(eco * 0.6)` rewrites geo_ids 1-4's values
+        (1.0, 2.0, 3.0, 4.0) to 0.6, 1.2, 1.8, 2.4 -- then `filter(eco > 1)` tests the
+        POST-calculate value (not the pre-calculate one), keeping geo_ids 2, 3, 4 (1.2,
+        1.8, 2.4) and dropping geo_id 1 (0.6, which does not exceed 1).
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
         pipeline = self._pipeline(
             [
                 {"op": "calculate", "expression": "eco * 0.6"},
-                {"op": "filter", "where": "eco > 100"},
+                {"op": "filter", "where": "eco > 1"},
             ]
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == pytest.approx({2: 1.2, 3: 1.8, 4: 2.4})
+
+    def test_rejects_value_filter_after_calculate_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above: a raster input still
+        lowers onto a single `Options.where` applied in the fixed Filter stage (stage 1) --
+        unconditionally BEFORE the Calculate stage (stage 2) -- so a value-testing
+        filter declared after a calculate would test the PRE-calculate value; this
+        rejection must keep firing for raster even though it is lifted for vector. Pure
+        compile-time rejection -- no data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "calculate", "expression": "vct * 0.6"},
+                    {"op": "filter", "where": "vct > 100"},
+                ],
+                "output": {"format": "csv"},
+            }
         )
         with pytest.raises(PipelineError, match="pre-calculate"):
             compile_pipeline(pipeline, base_path=base_path)
@@ -1000,6 +1183,1067 @@ class TestProjectAggregateCountByValueCompile:
         compiled = compile_pipeline(pipeline, base_path=base_path)
         assert compiled.options.summarize_by == "hydro_compartment_v001"
         assert compiled.options.summarize_aggregate == "count_by_value"
+
+
+class TestPostProjectOrderingGuard:
+    """SUMMARIZING-PROJECT ORDER GUARD (see `planner._compile_single_input_chain`'s
+    comment of that name for the full argument): `_compile_single_input_chain` lowers a
+    pipeline's whole `project -> ...` chain onto `Options`, whose stage order is FIXED
+    regardless of declared step order: filter(1) -> calculate(2) -> group(3) ->
+    transform(4) -> sort(5) (`BaseAnalysis.apply_params`, base.py:606-612). A `project`
+    step's `summarize_by`/`summarize_aggregate` lower onto the TRANSFORM stage (4th), so
+    any `filter`/`calculate`/`group` DECLARED after a many-to-one (summarizing) `project`
+    actually RUNS before it -- silently, with no error, producing a plausible-looking
+    wrong answer. This class pins the compile-time rejections that close
+    that hole, using a worked example byte-for-byte: ecoregions 1-4 valued
+    1.0/2.0/3.0/4.0, crosswalked (1,2)->hydro_compartment 100 and (3,4)->200 at scale
+    1.0, `aggregate="sum"`.
+
+    This guard must not change behavior for an IDENTITY project
+    (`to` equal to the input's own grid) -- it sets no `summarize_by` at all, so there is
+    no stage-4 work for anything to run "before". Every registered analysis
+    (`difference`/`concatenate`/`exit_criterion`) projects to its own grid, which is
+    exactly why the full existing suite (none of it touches a cross-grid project
+    followed by a filter/calculate/group) must stay green with these rejections in
+    place -- see `test_identity_project_is_unaffected` below for the explicit version
+    of that claim.
+    """
+
+    def _write_fixture(self, base_path, crosswalk_path):
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 1.0), (2, 100, 1.0), (3, 200, 1.0), (4, 200, 1.0)],
+        )
+
+    def _pipeline(self, steps_after_project):
+        return parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    *steps_after_project,
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+
+    def test_rejects_value_filter_after_summarizing_project(self, base_path, crosswalk_path):
+        # DECLARED (sum, then keep value > 2): {100: 3.0, 200: 7.0} (1.0+2.0=3.0 kept
+        # since 3.0>2; 3.0+4.0=7.0 kept since 7.0>2).
+        # ACTUAL, absent this rejection: the
+        # flat machinery runs its whole Filter stage before the project's Transform-stage
+        # crosswalk join, so the filter drops ecoregion 1 and 2's SOURCE rows (1.0 and
+        # 2.0 both fail `> 2`) before the join ever sees them -- compartment 100 then
+        # sums an EMPTY set to 0.0: {100: 0.0, 200: 7.0}. No error raised; a
+        # plausible-looking wrong answer. This is exactly why it must be rejected at
+        # compile time rather than left as an unimplemented feature.
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline([{"op": "filter", "where": "eco > 2"}])
+        with pytest.raises(PipelineError, match="tests the running value after a many-to-one"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_rejects_calculate_after_summarizing_project(self, base_path, crosswalk_path):
+        # DECLARED (sum, then square): {100: 9.0, 200: 49.0} (3.0**2, 7.0**2).
+        # ACTUAL, absent this rejection:
+        # `calculate` lowers onto the Calculate stage (2nd), before the project's
+        # Transform-stage (4th) aggregation, so each SOURCE cell is squared before
+        # summing: {100: 1.0+4.0=5.0, 200: 9.0+16.0=25.0}. Silently wrong, no error.
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline([{"op": "calculate", "expression": "eco * eco"}])
+        with pytest.raises(PipelineError, match="comes after a many-to-one"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_rejects_group_after_summarizing_project(self, base_path, crosswalk_path):
+        # This test doesn't work out numbers the way the filter/calculate tests above
+        # do, but the mechanism pinning this rejection is identical: `group` lowers onto
+        # `Options.group_by`/`group_aggregate`, applied in the Group stage (3rd),
+        # still strictly before the project's Transform-stage (4th) aggregation
+        # regardless of declared order, so it would collapse pre-project source rows
+        # rather than the declared post-project zones.
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline([{"op": "group", "by": [], "aggregate": "max"}])
+        with pytest.raises(PipelineError, match="comes after a many-to-one"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_leading_filter_without_explicit_input_still_rejected(self, base_path, crosswalk_path):
+        """Gaining an optional `input` field did not make it implicit: a `filter` at
+        step 1 that omits `input` still fails exactly the pre-existing chaining-rule
+        message (`pipeline.py`'s `validate_pipeline`) -- a leading filter must still
+        name its input explicitly, exactly the way a leading `project` already must.
+        This is the schema-level (`parse_pipeline`) half of what makes a leading filter
+        possible at all; `test_leading_filter_before_project_compiles_and_executes_
+        declared_order` below is the planner-level (`compile_pipeline`) half.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        with pytest.raises(PipelineError, match="has no input to chain from"):
+            parse_pipeline(
+                {
+                    "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                    "steps": [
+                        {"op": "filter", "where": "eco > 1"},
+                        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+
+    async def test_leading_filter_before_project_compiles_and_executes_declared_order(
+        self, base_path, crosswalk_path
+    ):
+        """The remediation this whole class's guard exists to unblock: `filter` naming
+        its `input` explicitly as step 1, BEFORE the many-to-one `project` -- the
+        spelling `test_rejects_value_filter_after_summarizing_project`'s rejection
+        message above points authors at ("move a value condition before the project
+        step"). Declared and executed order now agree by construction: the filter
+        lowers onto `Options.where`, applied in the Filter stage (stage 1), strictly
+        before the project's Transform-stage aggregation (stage 4) -- there is no
+        reordering left to verify against, unlike the post-project case above.
+
+        DECLARED (and, since the filter genuinely runs first, ACTUAL): keep eco >= 2
+        (drops ecoregion 1's value 1.0 as a SOURCE row), then sum per compartment --
+        compartment 100 keeps only ecoregion 2 (value 2.0) -> 2.0; compartment 200 keeps
+        ecoregions 3 and 4 (3.0 + 4.0) -> 7.0.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "filter", "input": "eco", "where": "eco >= 2"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        assert compiled.options.where == "(value >= 2)"
+        assert compiled.options.summarize_by == "hydro_compartment_v001"
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == {100: 2.0, 200: 7.0}
+
+    def test_leading_filter_does_not_exempt_a_later_value_filter_from_the_guard(
+        self, base_path, crosswalk_path
+    ):
+        """The guard must survive intact: adding the leading-filter acceptance must not
+        accidentally widen it to also accept a value filter declared AFTER the project.
+        A `filter` BEFORE the project is accepted (classified as a leading filter, never
+        reaching the `is_summarizing_project` check at all), while a second `filter`
+        placed AFTER the same project is still rejected exactly as
+        `test_rejects_value_filter_after_summarizing_project` pins above.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "filter", "input": "eco", "where": "eco > 0"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    {"op": "filter", "where": "eco > 2"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(PipelineError, match="tests the running value after a many-to-one"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+    def test_accepts_dimension_only_filter_after_summarizing_project(self, base_path, crosswalk_path):
+        """A DIMENSION condition commutes with a many-to-one `project` -- a projection
+        rewrites `grid_cell` and `value` (it re-keys rows onto a coarser zone and
+        re-aggregates their values), never a dimension column -- the identical argument
+        the pre-existing calculate-then-filter rule already relies on (planner.py's
+        comment near the `after_calculate` check). Stays accepted, folded into
+        `Options.where` exactly as before.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline([{"op": "filter", "where": "calendar_year = 2030"}])
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        assert compiled.options.where == "(calendar_year = 2030)"
+
+    def test_grid_cell_filter_after_summarizing_project_is_unaffected(self, base_path, crosswalk_path):
+        """The pre-existing `summarize_grid_cell` special-case
+        (`_extract_post_project_grid_cell_filter`) is untouched by this guard -- a
+        `grid_cell` filter after a summarizing `project` is still routed onto
+        `Options.summarize_grid_cell`, the one post-project filter shape the compiler
+        already honors correctly rather than rejecting.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline([{"op": "filter", "where": "grid_cell = 100"}])
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled.options.summarize_grid_cell == "100"
+
+    async def test_second_post_project_grid_cell_filter_compiles_and_executes_for_vector_input(
+        self, base_path, crosswalk_path
+    ):
+        """VECTOR ORDERING RELAXATION: a SECOND
+        post-project `grid_cell` filter used to be rejected unconditionally ("only one is
+        supported") -- now accepted for a VECTOR input. `Options.summarize_grid_cell` is
+        a single scalar bucket, but it stopped being what actually filters the
+        materialized rows once the vector interpreter landed: `apply_steps` applies each
+        post-`ProjectOp` `FilterOp` -- including a `grid_cell` one -- directly against
+        the already-projected `grid_cell` column, in declared order, same as any other
+        filter (see `planner._compile_single_input_chain`'s `not is_vector_input` guard
+        on this rejection, and `TestVectorInterpreterDifferential
+        .test_summarizing_project_then_grid_cell_filter`, which already pins the single-
+        filter case frame-for-frame against the legacy engine).
+
+        DECLARED (and, since the interpreter runs ops in declared order, ACTUAL):
+        `project(sum)` gives {100: 3.0 (1.0+2.0), 200: 7.0 (3.0+4.0)} -- the FIRST filter
+        `grid_cell IN (100, 200)` keeps both zones unchanged -- the SECOND filter
+        `grid_cell = 100` then narrows further, to just zone 100.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = self._pipeline(
+            [
+                {"op": "filter", "where": "grid_cell IN (100, 200)"},
+                {"op": "filter", "where": "grid_cell = 100"},
+            ]
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == {100: 3.0}
+
+    async def test_identity_project_is_unaffected(self, base_path):
+        """The whole point of the guard, made explicit: an IDENTITY project (`to` ==
+        the input's own grid) sets no `summarize_by` at all (see the `if`/`else` at the
+        top of `_compile_single_input_chain`), so there is no stage-4 work for a later
+        step to silently run "before" -- every registered analysis
+        (`difference`/`concatenate`/`exit_criterion`) projects to its own grid, so this
+        is the one shape that MUST compile and execute identically to before this
+        change. Exercised end to end (compiled, `apply_params()`, `materialize()`) with
+        a filter, a calculate, another (dimension) filter, and a trailing group all
+        present, to prove none of the three new rejections above ever fire for it.
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "eco > 0"},
+                    {"op": "calculate", "expression": "eco * 2"},
+                    {"op": "filter", "where": "calendar_year = 2030"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        # Identity project (no `summarize_by`): 4 ecoregion rows survive untouched by
+        # this class's rejections, each doubled by `calculate` (2.0, 4.0, 6.0, 8.0);
+        # `group by=[]` collapses over `calendar_year` (a single value here), so the
+        # per-grid_cell values are unchanged by it.
+        assert sorted(zip(df["grid_cell"].to_list(), df["value"].to_list())) == [
+            (1, 2.0),
+            (2, 4.0),
+            (3, 6.0),
+            (4, 8.0),
+        ]
+
+    async def test_mixed_dimension_and_value_conjuncts_in_one_filter_step_apply_correctly(self, base_path):
+        """Pre-existing bug, fixed alongside the ordering-guard work above even though
+        it is unrelated to ordering: the compiler used to wrap each FILTER STEP's whole (possibly
+        multi-conjunct) `where` in a single paren before joining multiple steps with
+        `AND` (the old `" AND ".join(f"({w})" for w in rewritten_filters)`). A single
+        filter step mixing a dimension conjunct and a value conjunct in one `where` --
+        e.g. `"model_group_id = 500 AND eco > 2"` -- used to combine to
+        `Options.where = "(model_group_id = 500 AND eco > 2)"`. At EXECUTION time,
+        `BaseAnalysis._apply_filter_params` re-runs `classify_where` on that combined
+        string (base.py:329), and the outer paren keeps the inner `AND` at paren-depth 1
+        the whole way through, so `split_top_level_and` returns ONE conjunct spanning
+        both columns -- which `classify_where` then rejects outright ("references both a
+        dimension column and `value`"), a false rejection of a perfectly legal filter at
+        RUNTIME, on a pipeline this module's own `compile_pipeline` had already accepted.
+        Splitting into atomic conjuncts at COMPILE time (this fix) prevents that: each
+        atomic conjunct is now wrapped individually.
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "model_group_id = 500 AND eco > 2"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        # Each atomic conjunct wrapped on its own -- NOT
+        # "(model_group_id = 500 AND value > 2)", the old shape that hid the inner `AND`.
+        assert compiled.options.where == "(model_group_id = 500) AND (value > 2)"
+        await compiled.apply_params()
+        df = compiled.materialize()
+        assert sorted(df["grid_cell"].to_list()) == [3, 4]
+
+
+class TestLeadingCalculateInputExtension:
+    """`CalculateStep` gains an optional `input` field, extending
+    `FilterStep.input`'s existing pattern: letting a
+    `calculate` step lead a pipeline exactly the way a leading `filter` already can.
+    Unlike the vector-only ordering relaxations above (`TestPostProjectOrderingGuard`'s
+    grid_cell/group/calculate/filter classes), this extension is NOT vector-only:
+    `Options.calculate` is a list that already accumulates leading and post-project
+    entries side by side without collision, and the Calculate stage (stage 2) runs
+    unconditionally before the Transform stage (stage 4) a `project`'s aggregation lowers
+    onto, for BOTH engines -- see `CalculateStep`'s docstring in pipeline.py. `GroupStep`
+    deliberately did NOT gain the same field (see `GroupStep`'s docstring for why --
+    `Options.group_by`/`group_aggregate` are scalar, not list, buckets); this class also
+    pins that a `group` step still cannot lead a pipeline, unaffected by this change.
+    """
+
+    def _write_fixture(self, base_path, crosswalk_path):
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 1.0), (2, 100, 1.0), (3, 200, 1.0), (4, 200, 1.0)],
+        )
+
+    def test_leading_calculate_without_explicit_input_still_rejected(self, base_path, crosswalk_path):
+        """Gaining an optional `input` field did not make it implicit: a `calculate` at
+        step 1 that omits `input` still fails the pre-existing chaining-rule message
+        (`pipeline.py`'s `validate_pipeline`) -- exactly `test_leading_filter_without_
+        explicit_input_still_rejected`'s claim (`TestPostProjectOrderingGuard`),
+        mirrored for `calculate`.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        with pytest.raises(PipelineError, match="has no input to chain from"):
+            parse_pipeline(
+                {
+                    "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                    "steps": [
+                        {"op": "calculate", "expression": "eco * 2"},
+                        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+
+    def test_leading_group_step_still_rejected(self, base_path, crosswalk_path):
+        """`GroupStep` was deliberately excluded from this extension (see this class's
+        docstring and `GroupStep`'s own docstring) -- a `group` step at position 1 still
+        fails the chaining rule exactly as it did before `CalculateStep` gained its
+        optional `input` field, since `GroupStep` still has no `input`
+        field to satisfy it with.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        with pytest.raises(PipelineError, match="has no input to chain from"):
+            parse_pipeline(
+                {
+                    "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                    "steps": [
+                        {"op": "group", "by": [], "aggregate": "sum"},
+                        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+
+    async def test_leading_calculate_before_summarizing_project_compiles_and_executes_declared_order(
+        self, base_path, crosswalk_path
+    ):
+        """The vector-side proof this class exists for, worked against the exact numbers
+        `TestPostProjectOrderingGuard.test_rejects_calculate_after_summarizing_
+        project` uses for the REJECTED (post-project) shape -- that test's own comment
+        records what the silently-wrong answer for `calculate` declared
+        after a summarizing project would have been, absent that rejection: squaring 1.0/2.0/3.0/4.0 as SOURCE
+        rows before summing, {100: 5.0, 200: 25.0} (1+4, 9+16). A LEADING `calculate`
+        (this test) declares exactly that same execution order on purpose -- square each
+        ecoregion's value first, then sum per compartment -- so the numbers match, but
+        here they are the DECLARED and CORRECT answer rather than a silent bug, because
+        the calculate step is honestly declared before the project rather than being
+        reordered underneath a later declaration.
+        """
+        self._write_fixture(base_path, crosswalk_path)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "calculate", "input": "eco", "expression": "eco * eco"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        assert [dict(e) for e in compiled.options.calculate] == [{"expression": "value * value", "where": None}]
+        assert compiled.options.summarize_by == "hydro_compartment_v001"
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == pytest.approx({100: 5.0, 200: 25.0})
+
+    async def test_leading_calculate_before_summarizing_project_compiles_and_executes_for_raster_input(
+        self, base_path, client, monkeypatch
+    ):
+        """The raster side of the same claim: a leading `calculate` lowers onto
+        `Options.calculate` (Calculate stage 2) exactly as a post-project one does --
+        this is the point of `CalculateStep`'s docstring's claim that the extension is
+        NOT vector-only, unlike the vector-only ordering relaxations above. Mirrors
+        `TestCalculateStepEndToEnd.test_weighted_band_sum_on_the_data_route`'s weighted
+        band-sum idiom byte-for-byte, except both `calculate` steps are declared BEFORE
+        `project` here instead of after -- same fixture (year 2030 filled 30, year 2040
+        filled 40, i.e. `fill_fn=lambda y: y - 2000`), same weights (0.5 for 2030, 0.25
+        for 2040), same expected pixel value (30*0.5 + 40*0.25 = 15 + 10 = 25).
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [
+                {"op": "calculate", "input": "vct", "expression": "vct * 0.5", "where": "calendar_year = 2030"},
+                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {"op": "project", "to": "veg_grid_cell_v001"},
+                {"op": "group", "by": [], "aggregate": "sum"},
+            ],
+            "output": {"format": "tif"},
+        }
+        response = client.post("/v1/analysis.tif", json=pipeline)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 1
+            assert src.read(1)[0, 0] == 25
+
+    async def test_leading_filter_after_leading_calculate_preserves_declared_order_for_vector_input(
+        self, base_path, crosswalk_path
+    ):
+        """Correctness for the interleaving fix (planner.py's unified `leading_steps`
+        pass, tracking a running `leading_after_calculate` bool): a leading `filter`
+        declared AFTER a leading `calculate` must inherit `after_calculate=True` --
+        exactly like a POST-project filter declared after a POST-project calculate
+        (`TestCalculateStepCompile.test_value_filter_after_calculate_compiles_and_
+        executes_for_vector_input`) -- so it tests the POST-calculate value, not the
+        pre-calculate one. A first draft of this fix used two SEPARATE lists for leading
+        filters/calculates, which would have silently lost this ordering information;
+        this test is what would have caught that regression.
+
+        DECLARED (and, since both leading steps run in declared order, ACTUAL):
+        `calculate(eco * 0.6)` rewrites geo_ids 1-4's values (1.0, 2.0, 3.0, 4.0) to 0.6,
+        1.2, 1.8, 2.4 -- then `filter(eco > 1)` tests the POST-calculate value, keeping
+        geo_ids 2, 3, 4 (1.2, 1.8, 2.4) and dropping geo_id 1 (0.6, which does not exceed
+        1). Identical numbers to the post-project analog above, on purpose.
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "calculate", "input": "eco", "expression": "eco * 0.6"},
+                    {"op": "filter", "where": "eco > 1"},
+                    {"op": "project", "to": "ecoregion_v001"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual == pytest.approx({2: 1.2, 3: 1.8, 4: 2.4})
+
+    def test_leading_filter_after_leading_calculate_still_rejected_for_raster_input(self, base_path):
+        """The raster side of the same interleaving fix: `Options.where` is applied
+        unconditionally in the fixed Filter stage (stage 1), strictly before the
+        Calculate stage (stage 2), regardless of whether the calculate/filter pair was
+        declared leading or post-project -- so a leading filter declared after a leading
+        calculate must still be rejected for a raster input, exactly like
+        `test_rejects_value_filter_after_calculate_for_raster_input`
+        (`TestCalculateStepCompile`) pins for the post-project shape. Pure compile-time
+        rejection -- no data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "calculate", "input": "vct", "expression": "vct * 0.6"},
+                    {"op": "filter", "where": "vct > 100"},
+                    {"op": "project", "to": "veg_grid_cell_v001"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(PipelineError, match="pre-calculate"):
+            compile_pipeline(pipeline, base_path=base_path)
+
+
+class TestVectorInterpreterLoadBearing:
+    """The ops interpreter
+    (`vector.VectorGridAnalysis.apply_steps`) is wired into `_compile_single_input_chain`
+    as a SECOND engine, gated on the INPUT grid's type (`GRIDS[selection.grid].grid_type
+    == "vector"`, planner.py's "OPS-INTERPRETER FAST PATH" comment) -- `dataset._pipeline_ops`
+    is attached to `ops.compile_ops(pipeline)` for that shape, and `VectorGridAnalysis
+    .apply_params` dispatches to `apply_steps` instead of `BaseAnalysis`'s fixed five-stage
+    flow whenever that attribute is set. A wiring mistake here would be invisible to every
+    OTHER test in this module: they all assert on `materialize()`'s output, which stays
+    correct even if `_pipeline_ops` were attached but silently ignored, as long as the old
+    engine still runs underneath. This class exists solely to rule that out -- confirming
+    the attribute really is set for a vector pipeline, really is `None` for the raster-input
+    shape that must stay on the old engine, and `apply_steps` really is the method invoked.
+    """
+
+    async def test_interpreter_actually_runs_for_a_vector_pipeline(self, base_path, monkeypatch):
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        # The fast path's own precondition: an ops list was actually attached, not left
+        # `None` (which would silently fall through to the old engine regardless of the
+        # spy below -- this assertion is what makes the spy's count below meaningful).
+        assert compiled._pipeline_ops is not None
+
+        calls = []
+        original_apply_steps = VectorGridAnalysis.apply_steps
+
+        async def _spy(self, ordered_ops):
+            calls.append(ordered_ops)
+            return await original_apply_steps(self, ordered_ops)
+
+        monkeypatch.setattr(VectorGridAnalysis, "apply_steps", _spy)
+        await compiled.apply_params()
+        # Proves `apply_steps` is load-bearing, not dead code that happens to pass because
+        # the legacy flow still runs underneath: it was invoked exactly once, with exactly
+        # the ops list the planner attached.
+        assert calls == [compiled._pipeline_ops]
+        df = compiled.materialize()
+        assert sorted(df["grid_cell"].to_list()) == [1, 2, 3, 4]
+
+    async def test_raster_input_summarizing_onto_a_vector_grid_now_takes_the_raster_interpreter(
+        self, base_path, crosswalk_path
+    ):
+        """The fast
+        path's gate admits a raster input too (`RasterGridAnalysis.apply_steps`, gated on
+        `is_raster_input and selection.grid_cell is None` in `_compile_single_input_chain`).
+        See `TestRasterInterpreterLoadBearing` below for
+        the raster counterpart of this whole class (the load-bearing spy, the one raster
+        shape that STILL stays on the old engine, and the differential tests against the
+        legacy `Options`-lowering engine).
+        """
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled._pipeline_ops is not None
+
+
+class TestVectorInterpreterDifferential:
+    """The ops interpreter
+    (`vector.VectorGridAnalysis.apply_steps`) must compute EXACTLY what the legacy
+    `Options`-lowering engine (`BaseAnalysis.apply_params`'s fixed five-stage flow)
+    computes, for every declared-order shape `planner._compile_single_input_chain`
+    accepts -- the fast path added to planner.py is only supposed to change WHICH ENGINE
+    runs a pipeline, never WHAT a pipeline computes.
+
+    Each test compiles the SAME pipeline via TWO independent `compile_pipeline` calls
+    against the same fixture data: one left exactly as the planner produces it (takes the
+    interpreter, since its input grid is vector), and one with `_pipeline_ops` forced back
+    to `None` immediately after compiling -- which reroutes `VectorGridAnalysis
+    .apply_params` onto `super().apply_params()`, i.e. the untouched legacy flow, per its
+    own `if self._pipeline_ops is not None: ... else: await super().apply_params()`
+    dispatch. Both are then materialized and compared with `_assert_frames_equal
+    _ignoring_order` -- sorted by every column, so row order (which the two engines are
+    not obliged to agree on) doesn't cause a false mismatch.
+
+    Pipelines below are deliberately drawn from shapes already pinned END-TO-END elsewhere
+    in this module (`TestPostProjectOrderingGuard`, `TestProjectAggregateCountByValue
+    EndToEnd`) -- reusing a shape whose CORRECT answer is independently known lets each
+    test check two things at once: the interpreter's answer is right, AND it agrees with
+    the legacy engine.
+    """
+
+    @staticmethod
+    def _assert_frames_equal_ignoring_order(a, b):
+        assert sorted(a.columns) == sorted(b.columns)
+        cols = sorted(a.columns)
+        assert a.select(cols).sort(cols).equals(b.select(cols).sort(cols))
+
+    async def _run_both_engines(self, pipeline, base_path):
+        interpreter_compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert interpreter_compiled._pipeline_ops is not None
+        legacy_compiled = compile_pipeline(pipeline, base_path=base_path)
+        legacy_compiled._pipeline_ops = None
+
+        await interpreter_compiled.apply_params()
+        await legacy_compiled.apply_params()
+        return interpreter_compiled.materialize(), legacy_compiled.materialize()
+
+    async def test_leading_filter_then_summarizing_project(self, base_path, crosswalk_path):
+        # Same fixture/pipeline as
+        # TestPostProjectOrderingGuard.test_leading_filter_before_project_compiles_and_executes_declared_order
+        # (known-correct answer: {100: 2.0, 200: 7.0}).
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 1.0), (2, 100, 1.0), (3, 200, 1.0), (4, 200, 1.0)],
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "filter", "input": "eco", "where": "eco >= 2"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp_df, legacy_df = await self._run_both_engines(pipeline, base_path)
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+        actual = dict(zip(interp_df["grid_cell"].to_list(), interp_df["value"].to_list()))
+        assert actual == {100: 2.0, 200: 7.0}
+
+    async def test_identity_project_filter_calculate_filter_group(self, base_path):
+        # Same fixture/pipeline as
+        # TestPostProjectOrderingGuard.test_identity_project_is_unaffected
+        # (known-correct answer: [(1,2.0),(2,4.0),(3,6.0),(4,8.0)]) -- exercises all of
+        # filter/calculate/filter/group in one chain, over an identity project.
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "eco > 0"},
+                    {"op": "calculate", "expression": "eco * 2"},
+                    {"op": "filter", "where": "calendar_year = 2030"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp_df, legacy_df = await self._run_both_engines(pipeline, base_path)
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+        assert sorted(zip(interp_df["grid_cell"].to_list(), interp_df["value"].to_list())) == [
+            (1, 2.0),
+            (2, 4.0),
+            (3, 6.0),
+            (4, 8.0),
+        ]
+
+    async def test_mixed_dimension_and_value_conjunct_in_one_filter_step(self, base_path):
+        # Same fixture/pipeline as
+        # TestPostProjectOrderingGuard
+        # .test_mixed_dimension_and_value_conjuncts_in_one_filter_step_apply_correctly
+        # (known-correct answer: grid_cell in [3, 4]).
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "ecoregion_v001"},
+                    {"op": "filter", "where": "model_group_id = 500 AND eco > 2"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp_df, legacy_df = await self._run_both_engines(pipeline, base_path)
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+        assert sorted(interp_df["grid_cell"].to_list()) == [3, 4]
+
+    async def test_summarizing_project_then_grid_cell_filter(self, base_path, crosswalk_path):
+        """The post-project `grid_cell` filter shape
+        (`_extract_post_project_grid_cell_filter`/`Options.summarize_grid_cell`) lowers
+        onto a genuinely different MECHANISM in each engine: the legacy engine narrows the
+        crosswalk join itself (`Options.summarize_grid_cell`, applied inside the Transform
+        stage), while the interpreter runs an ordinary post-`ProjectOp` `FilterOp` on the
+        already-projected `grid_cell` column, dropped in plain declared order like any
+        other filter (`apply_steps`'s `FilterOp` branch). This is the one shape in this
+        class where the two engines' internals genuinely diverge rather than merely their
+        code path, which is exactly why it is worth checking frame-for-frame.
+        """
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id)),
+            base_path=base_path,
+            validate=False,
+        )
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 1.0), (2, 100, 1.0), (3, 200, 1.0), (4, 200, 1.0)],
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "eco", "to": "hydro_compartment_v001", "aggregate": "sum"},
+                    {"op": "filter", "where": "grid_cell = 100"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp_df, legacy_df = await self._run_both_engines(pipeline, base_path)
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+        assert interp_df["grid_cell"].to_list() == [100]
+        assert interp_df["value"].to_list() == [3.0]
+
+    async def test_summarizing_project_with_count_by_value_aggregate(self, base_path, crosswalk_path):
+        # Modeled on
+        # TestProjectAggregateCountByValueEndToEnd.test_categorical_count_per_zone --
+        # geo_id 1,3 -> value 1.0, geo_id 2,4 -> value 0.0, all crosswalked to one of two
+        # zones, so each zone's per-value counts are hand-verifiable.
+        write_parquet(
+            annual_frame(years=(2030,), geo_ids=(1, 2, 3, 4), value_fn=lambda _year, geo_id: float(geo_id % 2)),
+            base_path=base_path,
+            validate=False,
+        )
+        write_vector_crosswalk(
+            crosswalk_path,
+            "ecoregion_v001",
+            "hydro_compartment_v001",
+            [(1, 100, 1.0), (2, 100, 1.0), (3, 200, 1.0), (4, 200, 1.0)],
+        )
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {
+                        "op": "project",
+                        "input": "eco",
+                        "to": "hydro_compartment_v001",
+                        "aggregate": "count_by_value",
+                    },
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp_df, legacy_df = await self._run_both_engines(pipeline, base_path)
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+        actual = {
+            (int(row["grid_cell"]), float(row["value"])): int(row["count"])
+            for row in interp_df.iter_rows(named=True)
+        }
+        assert actual == {(100, 1.0): 1, (100, 0.0): 1, (200, 1.0): 1, (200, 0.0): 1}
+
+
+class TestRasterInterpreterLoadBearing:
+    """The raster counterpart
+    of `TestVectorInterpreterLoadBearing` -- proves `RasterGridAnalysis.apply_steps`
+    (the band-wide interpreter) is really invoked for the raster shapes the fast path now
+    admits, rather than dead code that happens to pass because the old fixed-stage engine
+    still runs underneath, and that the one raster shape still excluded from the fast path
+    (`InputSelection.grid_cell` set -- see `apply_steps`' own docstring for why) really
+    does still get `_pipeline_ops is None`.
+    """
+
+    async def test_interpreter_actually_runs_for_a_raster_pipeline(self, base_path, monkeypatch):
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        # The fast path's own precondition, mirroring the vector test above.
+        assert compiled._pipeline_ops is not None
+
+        calls = []
+        original_apply_steps = RasterGridAnalysis.apply_steps
+
+        async def _spy(self, ordered_ops):
+            calls.append(ordered_ops)
+            return await original_apply_steps(self, ordered_ops)
+
+        monkeypatch.setattr(RasterGridAnalysis, "apply_steps", _spy)
+        await compiled.apply_params()
+        assert calls == [compiled._pipeline_ops]
+        # Both raw bands (2030, 2040) collapsed into a single group (`group by=[]`) --
+        # proof `_collapse_group` really ran from inside `apply_steps`, not skipped.
+        row_idxs = compiled._get_group_row_idxs()
+        assert len(row_idxs) == 1
+        assert sorted(row_idxs[0]) == [0, 1]
+
+    async def test_raster_input_with_grid_cell_stays_on_the_old_engine(self, base_path):
+        """`RasterGridAnalysis._apply_grid_cell` reshapes `self.lf` straight to a long
+        (grid_cell/value) frame via `.unpivot(...)` before any pipeline op could run --
+        a shape change `apply_steps`' PRE-project mode (which assumes `self.lf` starts as
+        the band-metadata table) does not accommodate, so this one shape must keep
+        `_pipeline_ops is None` even though its input grid is raster.
+        """
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
+                "steps": [{"op": "project", "input": "vct", "to": "veg_grid_cell_v001"}],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled._pipeline_ops is None
+
+
+class TestRasterInterpreterDifferential:
+    """The raster counterpart
+    of `TestVectorInterpreterDifferential` -- the ops interpreter
+    (`RasterGridAnalysis.apply_steps`) must compute EXACTLY what the legacy
+    `Options`-lowering engine (`BaseAnalysis.apply_params`'s fixed five-stage flow)
+    computes, for every declared-order raster shape `planner._compile_single_input_chain`
+    now admits to the fast path.
+
+    Same two-compile pattern as the vector class: one `compile_pipeline` call left as the
+    planner produces it (takes the interpreter), one with `_pipeline_ops` forced back to
+    `None` (reroutes `RasterGridAnalysis.apply_params` onto `super().apply_params()`, the
+    untouched legacy flow).
+    """
+
+    async def _run_both_engines(self, pipeline, base_path):
+        interpreter_compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert interpreter_compiled._pipeline_ops is not None
+        legacy_compiled = compile_pipeline(pipeline, base_path=base_path)
+        legacy_compiled._pipeline_ops = None
+
+        await interpreter_compiled.apply_params()
+        await legacy_compiled.apply_params()
+        return interpreter_compiled, legacy_compiled
+
+    @staticmethod
+    def _assert_frames_equal_ignoring_order(a, b):
+        assert sorted(a.columns) == sorted(b.columns)
+        cols = sorted(a.columns)
+        assert a.select(cols).sort(cols).equals(b.select(cols).sort(cols))
+
+    async def test_tif_output_identity_project_group_only(self, base_path, tmp_path):
+        # Same fixture/pipeline as
+        # TestSingleInputEndToEnd.test_raster_identity_project_group_only
+        # (known-correct answer: every pixel is 40, the max of the two years' fills).
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        interp, legacy = await self._run_both_engines(pipeline, base_path)
+
+        interp_path = tmp_path / "interp.tif"
+        legacy_path = tmp_path / "legacy.tif"
+        await interp.write_raster(interp_path)
+        await legacy.write_raster(legacy_path)
+
+        with rio.open(interp_path) as src:
+            interp_data = src.read()
+        with rio.open(legacy_path) as src:
+            legacy_data = src.read()
+        assert np.array_equal(interp_data, legacy_data)
+        assert (interp_data == 40).all()
+
+    async def test_tabular_output_summarize_to_vector_mean(self, base_path, crosswalk_path):
+        # Same fixture/pipeline as
+        # TestProjectOnlyReaggregationEndToEnd.test_raster_to_vector_mean.
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp, legacy = await self._run_both_engines(pipeline, base_path)
+        interp_df, legacy_df = interp.materialize(), legacy.materialize()
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+
+        categories = raster_array()
+        actual = dict(zip(interp_df["grid_cell"].to_list(), interp_df["value"].to_list()))
+        for zone_id in (1, 2):
+            expected_mean = categories[zones == zone_id].astype("float64").mean()
+            assert actual[zone_id] == pytest.approx(expected_mean, rel=1e-4)
+
+    async def test_value_filter_before_summarizing_project_masks_not_drops(self, base_path, crosswalk_path):
+        """Exercises the pushdown gate (`_write_raster_windowed`'s
+        `apply_value_filter_band_wide` call): a pre-project value `FilterOp` stashes onto
+        `self._value_where` (this method's PRE-project branch) rather than dropping rows,
+        and `_summarize_zone_stats_plugin` masks each band's raw pixel value against it
+        before the `mean` collapse -- exactly like the legacy engine's own `where=`
+        value-conjunct handling for a summarizing raster request.
+        """
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.ones((grid.height, grid.width), dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "filter", "input": "vct", "where": "vct > 100"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp, legacy = await self._run_both_engines(pipeline, base_path)
+        interp_df, legacy_df = interp.materialize(), legacy.materialize()
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+
+        categories = raster_array()
+        expected_mean = categories[categories > 100].astype("float64").mean()
+        actual = dict(zip(interp_df["grid_cell"].to_list(), interp_df["value"].to_list()))
+        assert actual[1] == pytest.approx(expected_mean, rel=1e-4)
+
+    async def test_post_project_grid_cell_filter_matches_the_legacy_crosswalk_narrowing(
+        self, base_path, crosswalk_path
+    ):
+        # Same fixture/pipeline as
+        # TestPostProjectGridCellFilterEndToEnd.test_grid_cell_eq_lowers_onto_summarize_grid_cell,
+        # but exercised as a differential: the legacy engine narrows the crosswalk's
+        # `zone_ids` via `Options.summarize_grid_cell` (`_extract_post_project_grid_cell_
+        # filter`), while the interpreter runs an ordinary post-`ProjectOp` `FilterOp` on
+        # the already-projected `grid_cell` column instead (see `apply_steps`' own
+        # docstring for why those are numerically equivalent) -- so this is the one shape
+        # where the two engines' internal MECHANISM genuinely diverges, worth checking
+        # frame-for-frame rather than just at the ASGI-route level.
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                    {"op": "filter", "where": "grid_cell = 1"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        interp, legacy = await self._run_both_engines(pipeline, base_path)
+        interp_df, legacy_df = interp.materialize(), legacy.materialize()
+        self._assert_frames_equal_ignoring_order(interp_df, legacy_df)
+
+        assert interp_df["grid_cell"].to_list() == [1]
+        categories = raster_array()
+        expected_mean = categories[zones == 1].astype("float64").mean()
+        assert interp_df["value"].to_list() == [pytest.approx(expected_mean, rel=1e-4)]
+
+    async def test_standalone_value_filter_without_summarize_still_rejected_by_both_engines(
+        self, base_path
+    ):
+        """The trickiest ordering edge case this step had to get right: `project`
+        (identity) declared BEFORE a value `FilterOp`, with no `summarize_by`/
+        `summarize_aggregate` anywhere. The legacy engine's stage 4
+        (`_apply_transform_params_impl`) always runs LAST, regardless of declared order,
+        and is what raises this rejection -- so `apply_steps` must reproduce that exact
+        "runs last" positioning for an identity project (see its own docstring), rather
+        than resolving the project immediately at its declared (earlier) position and
+        never re-checking once the later filter stashes `self._value_where`. Same
+        fixture/pipeline shape as
+        `TestRejections.test_raster_filter_without_summarize_is_400`, exercised against
+        both engines directly rather than through the ASGI route.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "filter", "where": "vct > 35"},
+                    {"op": "group", "by": [], "aggregate": "min"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        interpreter_compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert interpreter_compiled._pipeline_ops is not None
+        legacy_compiled = compile_pipeline(pipeline, base_path=base_path)
+        legacy_compiled._pipeline_ops = None
+
+        with pytest.raises(AnalysisError, match="summarize_by"):
+            await interpreter_compiled.apply_params()
+        with pytest.raises(AnalysisError, match="summarize_by"):
+            await legacy_compiled.apply_params()
 
 
 # --------------------------------------------------------------------------------------
@@ -1503,15 +2747,16 @@ class TestOutputSortSelectEndToEnd:
 
 
 class TestOutputColorMapEndToEnd:
-    """`output.color_map` (G9) actually changes the rendered raster tile's pixels for a
-    SINGLE-INPUT pipeline -- the shape Phase 2 could only demonstrate working through the
+    """`output.color_map` actually changes the rendered raster tile's pixels for a
+    SINGLE-INPUT pipeline. Previously this could only be demonstrated working through the
     paired shape (`TestCustomAnalysisColorMap` in test_analyses_endpoints.py, against the
     `exit-criterion` analysis), because `_compile_single_input_chain` silently dropped
     `output.color_map` until this fix, even though the route layer accepted and forwarded
     it correctly. A dataset-scoped single-input pipeline rendered as a raster PNG tile
-    (`/v1/analysis/{z}/{x}/{y}.png`) is exactly the combination the plan's G9 names as
-    blocking Phase 3 (the portal's difference map on a raster grid), so this proves the
-    real consumer shape, not just that `compiled.options.color_map` gets set (see
+    (`/v1/analysis/{z}/{x}/{y}.png`) is exactly the combination that was blocked before
+    this fix (the portal's difference map on a raster grid is the motivating consumer),
+    so this proves the real consumer shape works, not just that
+    `compiled.options.color_map` gets set (see
     `TestOutputColorMapCompile` for that).
     """
 
@@ -1711,20 +2956,61 @@ class TestPostProjectGridCellFilterRejections:
         with pytest.raises(PipelineError, match="literal ID selection"):
             compile_pipeline(pipeline, base_path=base_path)
 
-    def test_rejects_second_grid_cell_filter(self, base_path):
+    async def test_second_post_project_grid_cell_filter_compiles_and_executes_for_raster_input(
+        self, base_path, crosswalk_path
+    ):
+        """This replaces a prior test that pinned the
+        `PipelineError` this rejection used to raise unconditionally for a raster input.
+        That rejection is now relaxed for raster too, on the same grounds it was already
+        relaxed for vector (`planner._compile_single_input_chain`'s comment on this
+        rejection): a `ProjectOp` that summarizes onto a coarser grid genuinely
+        materializes `self.lf` before any post-project `FilterOp` runs
+        (`RasterGridAnalysis.apply_steps`'s POST-project branch), so a SECOND `grid_cell`
+        filter is just an ordinary additional row-drop, ANDed with the first, exactly like
+        vector's `test_second_post_project_grid_cell_filter_compiles_and_executes_for_
+        vector_input` above -- no `Options.summarize_grid_cell` bucket to collide over at
+        execution time even though it is still the (single, last-write-wins) bucket used
+        to narrow the initial crosswalk scan.
+
+        This is a HAND-COMPUTED correctness check, not a legacy-engine differential: the
+        OLD fixed-stage engine cannot compute the right answer for this shape at all --
+        `_extract_post_project_grid_cell_filter` absorbs BOTH `grid_cell` filters into the
+        same single `Options.summarize_grid_cell` bucket (last-write-wins), so the legacy
+        engine would narrow the crosswalk scan to only the SECOND filter's zones ({2, 3})
+        and never intersect it with the first ({1, 2}) at all -- it would wrongly keep
+        zone 3. Only the interpreter's real sequential `FilterOp` application computes the
+        declared intersection correctly, so comparing against the legacy engine here would
+        be comparing against a wrong answer, not a matching one.
+        """
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        third = grid.height // 3
+        zones = np.empty((grid.height, grid.width), dtype="int32")
+        zones[:third, :] = 1
+        zones[third : 2 * third, :] = 2
+        zones[2 * third :, :] = 3
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
         pipeline = parse_pipeline(
             {
                 "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
                 "steps": [
                     {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
-                    {"op": "filter", "where": "grid_cell = 1"},
-                    {"op": "filter", "where": "grid_cell = 2"},
+                    {"op": "filter", "where": "grid_cell IN (1, 2)"},
+                    {"op": "filter", "where": "grid_cell IN (2, 3)"},
                 ],
                 "output": {"format": "csv"},
             }
         )
-        with pytest.raises(PipelineError, match="second post-project"):
-            compile_pipeline(pipeline, base_path=base_path)
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert isinstance(compiled, BaseAnalysis)
+        await compiled.apply_params()
+        df = compiled.materialize()
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+
+        categories = raster_array()
+        expected_mean = categories[zones == 2].astype("float64").mean()
+        assert actual == pytest.approx({2: expected_mean}, rel=1e-4)
 
 
 class TestCalculateStepEndToEnd:
@@ -1796,7 +3082,7 @@ class TestCalculateStepEndToEnd:
 
     def test_weighted_sum_with_a_grid_cell_filter(self, client, base_path, monkeypatch):
         """The confidence-weighting idiom (moved here from `test_endpoints_data.py`'s
-        retired `TestCalculateParams`, Phase 4: `calculate.N.expression`/`calculate.N.where`
+        retired `TestCalculateParams`, since `calculate.N.expression`/`calculate.N.where`
         have no flat spelling anymore), combined with a `grid_cell` filter on the
         pipeline's own input -- `InputSelection.grid_cell` is a reserved field, exactly
         like `Options.grid_cell`'s flat spelling."""
@@ -1830,7 +3116,7 @@ class TestCalculateStepEndToEnd:
     def test_non_matching_rows_pass_through_with_no_group_step(self, client, base_path, monkeypatch):
         """Rows/bands not matching a `calculate` step's `where` pass through unchanged --
         `calculate` never drops data, unlike `filter` (moved here from
-        `test_endpoints_data.py`'s retired `TestCalculateParams`, Phase 4)."""
+        `test_endpoints_data.py`'s retired `TestCalculateParams`)."""
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
@@ -1857,7 +3143,7 @@ class TestCalculateStepEndToEnd:
     def test_weighted_band_sum_on_the_data_route(self, client, base_path, monkeypatch):
         """The same weighted band-sum idiom rendered through the plain (non-tile)
         `.tif` output, complementing `test_tile_route` above (moved here from
-        `test_endpoints_data.py`'s retired `TestCalculateParams`, Phase 4)."""
+        `test_endpoints_data.py`'s retired `TestCalculateParams`)."""
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
@@ -1880,7 +3166,7 @@ class TestCalculateStepEndToEnd:
     def test_flat_calculate_params_are_retired_on_the_data_route(self, client, base_path, monkeypatch):
         """The flat `calculate.N.expression`/`calculate.N.where` query parameters this
         class used to compare its pipeline steps against are retired from the plain data
-        route (Phase 4): the `calculate` pipeline step above is now the only way to
+        route: the `calculate` pipeline step above is now the only way to
         express this, and a request still spelling it the old way gets a loud 400 naming
         the replacement rather than being silently ignored."""
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)

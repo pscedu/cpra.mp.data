@@ -381,8 +381,8 @@ class TestGridCellCoordinates:
 
     # `test_unpivoting_reports_the_cell_id` used to live here: it was
     # `test_grid_cell_column_reports_the_resolved_cell` above plus a `unpivot=True` kwarg,
-    # pinning that the (already-long) vector shape was unaffected by the parameter. Phase 4
-    # deleted `unpivot` from `Options`/`DataOptions` entirely, so the kwarg is now silently
+    # pinning that the (already-long) vector shape was unaffected by the parameter.
+    # `unpivot` has since been deleted from `Options`/`DataOptions` entirely, so the kwarg is now silently
     # dropped (pydantic's default `extra="ignore"`) rather than a no-op *option* -- the test
     # was identical to its sibling with nothing left to distinguish, so it was removed
     # rather than converted.
@@ -406,8 +406,8 @@ class TestGridCellCoordinates:
 
 class TestCalculateStage:
     """`negate`/`multiply10`/`multiply100` were flat-parameter sugar for one-line
-    `calculate` entries (`value * -1`/`* 10`/`* 100`); Phase 4 deleted the fields
-    themselves from `Options` (not just their HTTP spelling), along with the
+    `calculate` entries (`value * -1`/`* 10`/`* 100`); the fields
+    themselves have since been deleted from `Options` (not just their HTTP spelling), along with the
     sugar-expansion and legacy-vs-generic mixing-rejection logic in
     `_resolve_calculate_entries` -- so what these tests pin is now expressed directly
     as the generic `calculate` entry each legacy parameter used to expand into.
@@ -548,7 +548,7 @@ class TestGenericCalculate:
     # see `TestCalculateStage.test_negate_flips_matching_rows` above, which pins that
     # entry's behavior directly since there is no more legacy field to compare it
     # against -- and the latter exercised `_resolve_calculate_entries`'s legacy/generic
-    # mixing-rejection branch, which Phase 4 deleted along with the fields that could
+    # mixing-rejection branch, which was deleted along with the fields that could
     # ever be mixed. Neither has anything left to test.
 
     async def test_invalid_expression_is_a_400_naming_the_entry(
@@ -1045,7 +1045,7 @@ class TestSortAndSelectStage:
 class TestLongFormatOutput:
     """Vector data is always long (one row per grid_cell) on disk and materializes that way
     unconditionally -- there used to be an `unpivot` parameter here too, but it was always a
-    no-op on vector data for exactly this reason, and Phase 4 deleted it from
+    no-op on vector data for exactly this reason, and it has since been deleted from
     `Options`/`DataOptions` outright rather than keep a flag that never did anything on this
     grid type."""
 

@@ -184,7 +184,7 @@ class TestCompareDimensions:
         would draw the difference and both of its operands at once. `compare_dimensions`
         excludes `self.resolved_analysis.collapsed_dimensions`; `negate_dimension`, the
         property that used to compute this without a resolved analysis, was deleted along
-        with the legacy `negate` parameter it read (Phase 4) -- `test_the_negate_parameter_
+        with the legacy `negate` parameter it read -- `test_the_negate_parameter_
         may_name_a_value_too` and `test_no_negate_parameter_leaves_no_negate_dimension`,
         which pinned that property directly, were deleted rather than converted, since
         there is nothing left on `StackedBar` for them to call."""

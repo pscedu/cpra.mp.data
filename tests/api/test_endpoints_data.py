@@ -172,8 +172,8 @@ class TestFloatPrecision:
     """
 
     # Data is served in long format (grid_cell/value columns) unconditionally now --
-    # `unpivot` used to force this shape and is retired (Phase 4); no query-string
-    # equivalent is needed since there's no other shape left to ask for.
+    # `unpivot` used to force this shape and is retired; no query-string equivalent is
+    # needed since there's no other shape left to ask for.
     QUERY = "?select=calendar_day,grid_cell,value"
 
     def test_csv_values_are_rounded_to_one_decimal(self, client, salinity_data):
@@ -249,7 +249,7 @@ class TestVectorData:
 
     def test_data_is_reported_in_long_format(self, client, vector_data):
         """Data is served long (grid_cell/value columns) unconditionally now -- `unpivot`
-        used to request this shape and is retired (Phase 4)."""
+        used to request this shape and is retired."""
         response = client.get(f"{VECTOR_URL}/data.csv?grid_cell=1")
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"grid_cell", "value"} <= set(df.columns)
@@ -316,7 +316,7 @@ class TestVectorData:
         assert response.status_code == 400
 
     def test_group_by_is_retired_on_the_data_route(self, client, vector_data):
-        """`group_by` is retired from the flat data route (Phase 4) -- rejected outright
+        """`group_by` is retired from the flat data route -- rejected outright
         rather than validated (it used to 400 here for lacking `group_aggregate`; now it
         400s regardless, before that check is ever reached)."""
         response = client.get(f"{VECTOR_URL}/data.csv?group_by=calendar_year")
@@ -331,7 +331,7 @@ class TestVectorData:
         one year's worth of matches.
 
         `group_aggregate` (like `group_by`) is retired from the flat data route
-        (Phase 4) -- this now goes through the ad-hoc `/v1/analysis.csv` pipeline route's
+        -- this now goes through the ad-hoc `/v1/analysis.csv` pipeline route's
         `filter` + `group` steps instead, the pipeline equivalent of the same request.
         The leading identity `project` (`to` the input's own grid) exists purely to give
         `filter` something to chain from -- a pipeline's first step must name its input
@@ -357,7 +357,7 @@ class TestVectorData:
         module fixes -- no `group_by`, no selective filter, `group_aggregate` set, so
         the group key is `grid_cell` alone -- routed end to end through the ASGI app via
         the `/v1/analysis.csv` pipeline route's `group` step (`group_aggregate` has no
-        flat spelling anymore, Phase 4). `TABULAR_FOLD_STEP` is monkeypatched down to 40
+        flat spelling anymore). `TABULAR_FOLD_STEP` is monkeypatched down to 40
         so this fixture-scale dataset (50 years x 32 cells = 1,600 rows) is still forced
         through ~40 real fold chunks and merges, rather than degenerating to the
         single-chunk case every other fixture-scale test in this suite exercises.
@@ -389,7 +389,7 @@ class TestVectorData:
         coarser-grid step with `aggregate=count_by_value`, asserting the long output
         shape (grid_cell/value/count/geographic_unit), through the `/v1/analysis.csv`
         pipeline route (`summarize_by`/`summarize_aggregate` have no flat spelling
-        anymore, Phase 4 -- `project`+`aggregate` is their pipeline equivalent).
+        anymore -- `project`+`aggregate` is their pipeline equivalent).
         """
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
@@ -417,7 +417,7 @@ class TestVectorData:
     def test_mixed_dimension_and_value_where_aggregating(self, client, vector_data):
         """A dimension conjunct and a value conjunct, through the `/v1/analysis.csv`
         pipeline route's `filter` + `group` steps (`group_aggregate` has no flat
-        spelling anymore, Phase 4). `calendar_year > 2035` (a dimension conjunct) is a
+        spelling anymore). `calendar_year > 2035` (a dimension conjunct) is a
         real row filter, isolating the 2040 rows; `value > 0` (a value conjunct) is
         vacuously true for every remaining cell (see `annual_frame`'s
         `year + geo_id / 100`), so `aggregate=count` should still see all 32 cells.
@@ -432,8 +432,8 @@ class TestVectorData:
         from the executor's own later re-split of `Options.where` into dimension/value
         conjuncts, so a perfectly valid one-dimension-one-value `where` gets rejected
         as if it were one mixed conjunct). That's a pre-existing pipeline-compiler
-        limitation, not a Phase 4 regression, and out of scope for this change --
-        splitting across two `filter` steps here avoids it entirely without giving up
+        limitation, not something introduced by this test, and out of scope for this
+        change -- splitting across two `filter` steps here avoids it entirely without giving up
         anything this test is meant to demonstrate.
         """
         pipeline = {
@@ -516,15 +516,32 @@ class TestRasterData:
         assert client.get(f"{RASTER_URL}/data.tif").status_code == 404
 
     def test_conditional_count_per_zone_is_one_request(self, client, gradient_raster_with_zones):
-        """The plan's target query -- "count pixels per compartment where value > X" --
-        expressed as one `/v1/analysis.csv` pipeline request (a `project`-to-a-coarser-
-        grid step with `aggregate=count`, followed by a `filter` step): `summarize_by`/
-        `summarize_aggregate` have no flat spelling anymore (Phase 4), so this moved off
-        the plain data route onto the pipeline route their `project`+`aggregate` step
-        compiles onto. The `filter` step comes AFTER `project` in pipeline order but
-        (per `planner._compile_single_input_chain`) folds onto the same `Options.where`
-        a flat request would have used, which the underlying engine always applies
-        before the zonal aggregation -- the pixel-level threshold, not a post-count one.
+        """"Count pixels per compartment where value > X" expressed as one
+        `/v1/analysis.csv` pipeline request: a LEADING `filter` step
+        (naming its `input` explicitly, since it is step 1 -- see `FilterStep.input`'s
+        docstring) followed by a `project`-to-a-coarser-grid step with `aggregate=count`.
+        `summarize_by`/`summarize_aggregate` have no flat spelling, so
+        this goes through the pipeline route whose `project`+`aggregate` step compiles onto
+        those `Options` fields rather than the plain data route.
+
+        The filter is now declared exactly where it executes: both steps lower onto
+        `Options` (`where`, and `summarize_by`/`summarize_aggregate` respectively), and
+        the flat engine always applies the Filter stage (stage 1 of
+        `BaseAnalysis.apply_params`) before the Transform stage's zonal aggregation
+        (stage 4) -- so declaring the filter first is what makes "pixel-level threshold,
+        not a post-count one" the TRUTH of the declared order, not a fact the reader has
+        to already know about the underlying engine to get the right answer.
+
+        This pipeline used to be spelled the other way around --
+        `project(aggregate=count) -> filter(value > X)`, filter declared AFTER project --
+        and relied on the engine silently reordering the filter before the project's
+        aggregation to produce the right answer despite the declared order promising the
+        opposite. `planner._compile_single_input_chain`'s SUMMARIZING-PROJECT ORDER GUARD
+        (its `is_summarizing_project` checks) now rejects that old spelling outright
+        (a value-testing `filter` declared after a many-to-one `project` is a verified
+        wrong answer, not just an unimplemented feature -- see the guard's own
+        `PipelineError` for the numeric counterexample); the leading-filter spelling
+        below is its replacement.
         """
         _base_path, _grid, zones = gradient_raster_with_zones
         gradient = raster_array()
@@ -533,8 +550,8 @@ class TestRasterData:
         pipeline = {
             "inputs": {"vct": {"variable": "vct", "time_unit": "annual", "grid": "veg_grid_cell_v001"}},
             "steps": [
-                {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "count"},
-                {"op": "filter", "where": f"value > {threshold}"},
+                {"op": "filter", "input": "vct", "where": f"vct > {threshold}"},
+                {"op": "project", "to": "hydro_compartment_v001", "aggregate": "count"},
             ],
             "output": {"format": "csv"},
         }
@@ -550,8 +567,9 @@ class TestRasterData:
         """"How many pixels of each land-type value per hydro compartment" -- one
         `project`-to-a-coarser-grid step with `aggregate=count_by_value`, asserting the
         long output shape (grid_cell/value/count/geographic_unit), through the
-        `/v1/analysis.csv` pipeline route (`summarize_by`/`summarize_aggregate` have no
-        flat spelling anymore, Phase 4).
+        `/v1/analysis.csv` pipeline route (`summarize_by`/`summarize_aggregate` are
+        retired flat-query parameters with no pipeline-step equivalent by that name --
+        this test exercises their `project`/`aggregate` replacement instead).
         """
         _base_path, _grid, zones = categorical_raster_with_zones
         categories = raster_array() % 5
@@ -629,7 +647,7 @@ def two_year_raster_data(base_path, monkeypatch):
 
 
 class TestRetiredParams:
-    """Phase 4: every flat analysis parameter this class used to name (the indexed
+    """Every flat analysis parameter this class used to name (the indexed
     `calculate.N.expression`/`calculate.N.where` query parameters, plus `negate`/
     `multiply10`/`multiply100`/`group_aggregate`/`summarize_by`/`summarize_aggregate`/
     `summarize_grid_cell`/`unpivot`) is retired from the HTTP surface -- see

@@ -1,8 +1,8 @@
-"""Tests for the named-analysis HTTP routes (plan §3.2a): the 9 routes exposing a
+"""Tests for the named-analysis HTTP routes: the 9 routes exposing a
 REGISTERED pipeline (`ANALYSES`/`resolve_analysis`) through exactly the same
 `compile_pipeline` -> response machinery the explicit `/v1/analysis.*` routes already use.
 
-The real registry package (`cpra.mp.data.analyses`) is a concurrent Phase 2 change and may
+The real registry package (`cpra.mp.data.analyses`) is a concurrent change and may
 not exist yet -- `api/utils.py` guards that import so the app keeps working either way (see
 its module docstring). These tests monkeypatch a FAKE registry directly onto the two
 places `api/__init__.py` and `api/utils.py` bind the names (`ANALYSES`/`resolve_analysis`/
@@ -19,12 +19,12 @@ internals. Once `cpra/mp/data/analyses` lands for real, these should keep passin
 unchanged and can be supplemented (not replaced) with tests against the real registered
 analyses.
 
-Two fake analyses stand in for the plan's own three examples:
+Two fake analyses stand in for the registry's three real entries:
 
 * ``concatenate`` (type="dataset") -- an identity `project` over whatever dataset the
   dataset-scoped route names, optionally filtered by `grid_cell`/`where`/dimension
   filters forwarded from the request. Exercises the 4 dataset-scoped routes.
-* ``exit-criterion`` (type="custom") -- literally the plan's own worked example
+* ``exit-criterion`` (type="custom") -- literally the same worked example
   (`tests.api.test_pipeline_exec.NOTEBOOK_QUERY`, imported rather than re-typed so this
   file can't drift from the byte-exact fixture that module's own tests already pin).
   Exercises the 4 multi-input routes, including the paired (notebook) shape, which is the
@@ -148,7 +148,7 @@ def fake_registry(monkeypatch):
 
 
 class TestRouteKindRejection:
-    """The `type="dataset"` vs `type="custom"` split (plan §3.2a), both directions --
+    """The `type="dataset"` vs `type="custom"` split, both directions --
     generalized via `get_analysis_class`, not reinvented per route.
     """
 
@@ -263,8 +263,9 @@ class TestDatasetAnalysisVectorTile:
 
 
 class TestDatasetAnalysisPipelineJson:
-    """`.../analyses/{name}/pipeline.json` -- the expanded `Pipeline` (plan §5.4's "pure
-    sugar" claim): must itself compile via `compile_pipeline`, and must reflect the
+    """`.../analyses/{name}/pipeline.json` -- the expanded `Pipeline`, proving the
+    named-analysis machinery really is pure sugar over a hand-authored pipeline: must
+    itself compile via `compile_pipeline`, and must reflect the
     request's own `sort`/`select`/`color_map` overrides (never the registry's concern).
     """
 
@@ -310,7 +311,7 @@ class TestDatasetAnalysisPipelineJson:
 
 class TestCustomAnalysisData:
     """The multi-input `/v1/analyses/{name}/data.{format}` route over the fake
-    `exit-criterion` analysis (the plan's own worked example, `NOTEBOOK_QUERY`).
+    `exit-criterion` analysis (the worked example, `NOTEBOOK_QUERY`).
     """
 
     def test_post_equivalent_result(self, client, notebook_query_data):
@@ -331,7 +332,7 @@ class TestCustomAnalysisPipelineJson:
 
 
 class TestCustomAnalysisColorMap:
-    """`color_map` is a REQUEST parameter (plan §3.2a), never the registry's concern --
+    """`color_map` is a REQUEST parameter, never the registry's concern --
     proven here by actually rendering two different PNG tiles for the same analysis and
     confirming the pixels differ, not merely that the parameter round-trips through
     `pipeline.json`. `exit-criterion` compiles onto the PAIRED (notebook) shape, which is

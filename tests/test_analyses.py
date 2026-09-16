@@ -6,7 +6,7 @@ derivation.
 Pure/in-memory throughout -- `resolve_analysis`/`Analysis.pipeline()` never touch disk (see
 `analyses/base.py`'s `required_dataset_dimensions` docstring), so nothing here needs
 `base_path`/`tmp_path`. `tests/api/test_analyses_registry.py` covers the disk-touching half
-(the plan §9 registry-drift test, and an exit-criterion end-to-end compile+materialize
+(the registry-drift test, and an exit-criterion end-to-end compile+materialize
 check).
 """
 

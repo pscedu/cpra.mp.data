@@ -3,7 +3,7 @@ from fastapi import HTTPException
 from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
-# The named-analysis registry (plan §3.2a/§5.2) lands in a concurrent Phase 2 change
+# The named-analysis registry lands in a concurrent change
 # under `cpra/mp/data/analyses/` -- a package this module (and `api/__init__.py`, which
 # re-imports these three names from here) does not own and must not create or edit. This
 # import is guarded so the rest of the API keeps working -- and the whole app keeps
@@ -106,8 +106,8 @@ def get_analysis_class(name: str, type: str | None = None):
     "custom").
 
     The same 404 (unknown name) / 400 (wrong route kind) distinction
-    `get_visualization_class` above already makes, generalized rather than reinvented --
-    see plan §3.2a: a `type="dataset"` analysis is rejected on `/v1/analyses/{name}/...`
+    `get_visualization_class` above already makes, generalized rather than reinvented:
+    a `type="dataset"` analysis is rejected on `/v1/analyses/{name}/...`
     and a `type="custom"` analysis is rejected on the dataset-scoped route, both via this
     one function.
     """

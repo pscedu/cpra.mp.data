@@ -69,7 +69,7 @@ class TestReadData:
 
 
 class TestReadDataSelection:
-    """`read_data`'s `grid_cell`/`where`/`sort`/`select` selection parameters (Phase 5).
+    """`read_data`'s `grid_cell`/`where`/`sort`/`select` selection parameters.
 
     The shape decision these tests pin down: with no selection arguments (or dimension
     filters only), `read_data` returns EXACTLY what it always has (see `TestReadData`

@@ -5,7 +5,7 @@ script can run an analysis without HTTP and without touching the underlying
 (`read_data` is `/v1/datasets`'s; its own tests, including its new `grid_cell`/`where`/
 `sort`/`select` selection parameters, live in `tests/test_init.py`).
 
-As of Phase 5, `analyze_data` has no flat/keyword calling surface at all -- `pipeline` is
+`analyze_data` has no flat/keyword calling surface at all -- `pipeline` is
 its one required, positional-first argument, with no `**params` left to catch a stray
 keyword (`TestPipelineOnlySurface::test_flat_keywords_are_rejected_by_python_itself` below
 proves what a caller still spelling a request the old way gets: Python's own `TypeError`,
@@ -200,7 +200,7 @@ class TestPipelineOnlySurface:
         assert df.height == 32
 
     async def test_flat_keywords_are_rejected_by_python_itself(self):
-        """`analyze_data`'s flat/keyword calling surface is gone entirely as of Phase 5:
+        """`analyze_data`'s flat/keyword calling surface is gone entirely:
         no mutual-exclusivity check, no `**params` -- `pipeline` is the only argument, and
         it is required and positional-first. A caller still spelling a request the old
         way (`variable=`, `where=`, `group_aggregate=`, ...) gets Python's own `TypeError`

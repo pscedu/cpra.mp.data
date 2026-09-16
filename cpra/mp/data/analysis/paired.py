@@ -1,4 +1,54 @@
-"""Paired-shape execution for analysis pipelines (the former api/pipeline_exec.py, execution half)."""
+"""Paired-shape execution for analysis pipelines (the former `api/pipeline_exec.py`,
+execution half -- `analysis/planner.py`'s `_compile_paired_notebook_shape` is the compile
+half that builds a `PairedAnalysis` in the first place).
+
+The paired shape: a coarse input `project`-broadcast onto a finer raster grid, `join`-ed
+against the finer input, then collapsed by a trailing per-pixel `group` -- exactly the
+notebook exit-criterion query's shape. `PairedAnalysis` implements the duck-typed subset
+of `RasterioStreamingResponse`/`RasterioTileResponse`'s interface that a raster output
+needs, standing in for a `BaseAnalysis` instance (`BaseAnalysis` has no "join two datasets"
+concept -- see that class's own docstring and `PairedAnalysis`'s, immediately below).
+
+**Why not `sources.scan_paired`, which already does exactly this join?**
+`scan_paired` (`analysis/sources.py`) requires a mandatory OUTPUT zone crosswalk
+(`zones_path`/`zone_ids`) and returns one row per (surviving pixel, output zone) --
+exactly right for a TABULAR/zonal paired aggregate, but its output frame carries NO
+positional (row/col) information at all, only a zone id. That makes it structurally
+unusable for driving a raster WRITE or a tile render, which need to put each pixel's
+collapsed value back at that pixel's own window position -- not because `scan_paired`'s
+`zone_ids` array is large (it is a small, sorted array of destination zone ids, e.g. 1657
+for `hydro_compartment_v001`, not a per-pixel array), but because the shape of what it
+returns has already thrown the position away. So `PairedAnalysis` instead runs its own
+direct rasterio block-window loop (`_write_paired_notebook_raster`/
+`_paired_notebook_tile`), reusing `scan_paired`'s and `scan_rasters`'s own low-level
+primitives (`_dense_lookup_array`, `_paired_lookup_values`, `_batched_windows`,
+`raster_blocks_per_batch`, `horizontal_aggregate_expr`) directly, never its Polars
+IO-plugin/LazyFrame machinery itself -- see `PairedAnalysis._prepare`. Because a paired
+plan's output is unconditionally pixel-local (one row per pixel until the trailing
+per-pixel `group` collapses across bands, never across pixels), only `tif`/`png`/`jpg`
+output is implemented for this shape; a tabular paired output is deliberately left
+unsupported (see `planner._compile_paired_notebook_shape`'s rejection) rather than
+materializing the full joined frame, which is exactly the memory cliff this whole design
+avoids.
+
+That blocker no longer exists. `scan_paired` now carries a `_px` row-major pixel-index
+column on every row (measured to plateau in peak RSS across a wide pixel-count sweep --
+see its own benchmark notes), its output zone crosswalk (`zones_path`/`zone_ids`) is
+optional exactly like `scan_rasters`' `attach_zone`/`filter_to_zones` split, and it takes a
+list of named `PairedCrosswalk`s instead of one baked-in pairing crosswalk, so more than
+one coarse dataset can be paired onto the same fine scan in one pass (`_dense_lookup_array`
+kept as the O(1) band-wide lowering of each `join`, unchanged). `_write_paired_notebook_
+raster` is now ported onto exactly that plugin, driven by `collect_batches` the same way
+`raster._write_raster_windowed` already proved (measured -- see that function's own
+docstring). `_paired_notebook_tile` is NOT ported -- it reprojects every fine band
+and the pairing crosswalk through `WarpedVRT` onto the requested tile's CRS/transform,
+and `scan_paired` has no reprojection support to offer it (the same blocker the
+single-input tile port hit in `raster.py` for the identical reason). Retiring this
+class as a whole is not done here -- `PairedAnalysis` keeps both
+the ported write path and the old hand-written tile loop, side by side, until the tile
+path either grows reprojection support or the paired shape's tile route is redesigned
+around it.
+"""
 from contextlib import ExitStack
 from io import BytesIO
 
@@ -21,14 +71,18 @@ from cpra.mp.data.analysis.expressions import (
 from cpra.mp.data.analysis.pipeline import (
     PipelineError,
 )
+from cpra.mp.data.analysis.raster import _take_window_rows
 from cpra.mp.data.analysis.sources import (
+    PairedCrosswalk,
     _batched_windows,
     _dense_lookup_array,
     _paired_lookup_values,
     horizontal_aggregate_expr,
+    scan_paired,
 )
 from cpra.mp.data.analysis.types import OutputType
 from cpra.mp.data.analysis.utils import (
+    group_rows_by_path,
     raster_blocks_per_batch,
     raster_gdal_env,
 )
@@ -74,7 +128,7 @@ class PairedAnalysis:
     """The compiled paired shape: a coarse input broadcast onto a finer raster grid via
     `project`, joined against the finer input via `join`, collapsed by a trailing `group`
     step -- the notebook query's exact shape (see the module docstring for why this
-    doesn't use `raster_source.scan_paired`). Implements the duck-typed subset of
+    doesn't use `sources.scan_paired`). Implements the duck-typed subset of
     `LazyFrameSource`'s interface `RasterioStreamingResponse`/`RasterioTileResponse` need,
     standing in for a `BaseAnalysis` instance (which has no "join two datasets" concept).
 
@@ -226,18 +280,30 @@ class PairedAnalysis:
             (c for c in ("calendar_year", "calendar_day") if c in fine_df.columns and c in coarse_df.columns),
             None,
         )
+        # `self.lookup_arrays` (pre-built dense arrays, `_dense_lookup_array`'s own
+        # output) still feeds the OLD tile path (`_paired_notebook_tile`, unported --
+        # see the module docstring's blocker note) via `_paired_lookup_values`.
+        # `self._crosswalk_lookups` is the parallel RAW-array form (`{step: (ids,
+        # values)}`) `PairedCrosswalk.lookups` expects -- `scan_paired` builds its own
+        # dense array from these internally (see that function's own `lookup_arrays_by_
+        # crosswalk`), so building the dense form here too would be pure waste for the
+        # write path alone; both dicts are populated from the same `coarse_df.group_by`
+        # pass below rather than computed twice.
         self.lookup_arrays = {}
+        self._crosswalk_lookups = {}
         if calendar_col is not None:
             self.calendar_values = fine_df[calendar_col].to_list()
             for key, group in coarse_df.group_by(calendar_col):
-                self.lookup_arrays[key[0]] = _dense_lookup_array(
-                    group["grid_cell"].to_numpy(), group["value"].to_numpy().astype("float64")
-                )
+                ids = group["grid_cell"].to_numpy()
+                values = group["value"].to_numpy().astype("float64")
+                self.lookup_arrays[key[0]] = _dense_lookup_array(ids, values)
+                self._crosswalk_lookups[key[0]] = (ids, values)
         else:
             self.calendar_values = [None] * len(self.band_sources)
-            self.lookup_arrays[None] = _dense_lookup_array(
-                coarse_df["grid_cell"].to_numpy(), coarse_df["value"].to_numpy().astype("float64")
-            )
+            ids = coarse_df["grid_cell"].to_numpy()
+            values = coarse_df["value"].to_numpy().astype("float64")
+            self.lookup_arrays[None] = _dense_lookup_array(ids, values)
+            self._crosswalk_lookups[None] = (ids, values)
 
         self._prepared = True
 
@@ -390,23 +456,32 @@ def _validate_paired_group_aggregate(group_step):
         )
 
 
-# The dispatch knob `_write_paired_notebook_raster` reads to pick `_accumulate_paired_
-# window` (streaming) vs. `_collapse_paired_window_wide` (wide-frame) for a given
-# `group_step.aggregate` -- equal to `_SUPPORTED_PAIRED_AGGREGATES` today (every
-# supported aggregate has a streaming implementation), but kept as its own name/frozenset
-# rather than reusing that one directly, precisely so a caller (or a test -- see
-# `TestPairedAnalysisCountConsistency.test_accumulator_matches_wide_fallback`, and `/tmp/
-# pipetest/scale_probe.py`'s identical trick for scale measurement) can monkeypatch THIS
-# set alone to force every aggregate onto the wide path without also disabling
-# `_validate_paired_group_aggregate`'s support check for the duration of the patch.
+# Formerly the dispatch knob `_write_paired_notebook_raster` read to pick
+# `_accumulate_paired_window` (streaming) vs. `_collapse_paired_window_wide` (wide-frame)
+# for a given `group_step.aggregate`. Now that the write path is ported onto `scan_paired`,
+# it no longer dispatches on this at all -- it runs one `scan_paired` + `collect_batches`
+# pipeline for every supported aggregate (see that function's own docstring) -- so this frozenset is
+# now VESTIGIAL for that caller specifically. It stays defined, unchanged, purely because
+# `tests/api/test_pipeline_exec.py::TestPairedAnalysisCountConsistency.
+# test_accumulator_matches_wide_fallback` monkeypatches it
+# (`monkeypatch.setattr(paired_module, "_STREAMING_AGGREGATES", frozenset())`, which
+# requires the attribute to already exist) -- deleting it would break that test's ability
+# to patch it at all, even though the patch itself is now a no-op against the ported
+# write path (both of that test's two requests now run identical code regardless of this
+# value, which is why it still passes). `_accumulate_paired_window`/
+# `_collapse_paired_window_wide` themselves are ALSO no longer called by the write path --
+# see their own docstrings for why they're still here.
 
 _STREAMING_AGGREGATES = _SUPPORTED_PAIRED_AGGREGATES
 
 
 def _count_zone_gate(plan, flat_values, pairing_valid):
-    """`count`'s zero-vs-nodata split, applied identically after EITHER collapse path
-    (`_accumulate_paired_window`/`_collapse_paired_window_wide`/`_paired_notebook_tile`)
-    computes a flat per-pixel band tally -- a no-op for every other aggregate.
+    """`count`'s zero-vs-nodata split, applied identically after ANY of this module's
+    collapse paths (the ported `_write_paired_notebook_raster`'s `scan_paired`-driven
+    `.select()`, `_paired_notebook_tile`'s inline collapse, or the two retained
+    reference implementations `_accumulate_paired_window`/`_collapse_paired_window_wide`
+    -- see their own docstrings) computes a flat per-pixel band tally -- a no-op for
+    every other aggregate.
 
     `pairing_valid` (this pixel's own membership in the pairing crosswalk -- the only
     "is this pixel even in this plan's output domain at all" signal a `PairedAnalysis` has;
@@ -419,7 +494,7 @@ def _count_zone_gate(plan, flat_values, pairing_valid):
     and so must treat both the same (nodata) -- `count` can tell the two apart because it
     has `pairing_valid` in hand, and telling them apart matters: "zero contributing bands"
     is `count`'s own correct answer for an in-domain pixel, not an edge case standing in
-    for an undefined one (see `raster_source.guarded_aggregate`'s identical `count`
+    for an undefined one (see `sources.guarded_aggregate`'s identical `count`
     bypass for the flat API's vertical/zonal count, and `PairedAnalysis._band_valid_expr`).
     """
     if plan.group_step.aggregate != "count":
@@ -428,17 +503,20 @@ def _count_zone_gate(plan, flat_values, pairing_valid):
 
 
 def _collapse_paired_window_wide(plan, fine_srcs, window, pairing_ids, pairing_valid, shape, collapse_expr):
-    """The original per-window collapse: every fine band and its paired lookup read
-    into one `2 * len(band_sources)`-column frame, then `plan._collapse_expr()`
-    evaluated once across all of it. Kept verbatim (moved, not rewritten) as the
-    fallback for any `group_step.aggregate` outside `_STREAMING_AGGREGATES` -- see that
-    set's own docstring. Also the path the TILE renderer always uses (`_paired_notebook_
-    tile` evaluates `plan._collapse_expr()` the same way, inline, over a full tile frame
-    rather than calling this function directly) and the one a test can force for every
-    aggregate, `count` included, by monkeypatching `_STREAMING_AGGREGATES` to empty --
-    see `TestPairedAnalysisCountConsistency` for why that matters: `count`'s wide form here
-    and its streaming form in `_accumulate_paired_window` must produce bit-identical
-    output, and `_count_zone_gate`'s call at the end of each is what that proof rests on.
+    """The pre-port per-window collapse: every fine band and its paired lookup
+    read into one `2 * len(band_sources)`-column frame, then `plan._collapse_expr()`
+    evaluated once across all of it. `_write_paired_notebook_raster` no longer calls
+    this (it now runs `plan._collapse_expr()` against a `scan_paired`-produced LazyFrame
+    instead -- see that function's own docstring) -- kept, unmodified, as a pinned
+    reference implementation: `tests/api/test_paired_port.py`'s differential test calls
+    this function directly and diffs its output against the ported write path's actual
+    COG output (`np.array_equal` on real pixel arrays), which is what proves the port
+    didn't silently change any of the four aggregates' math.
+    `TestPairedAnalysisCountConsistency.test_accumulator_matches_wide_fallback`'s
+    `_STREAMING_AGGREGATES` monkeypatch no longer reaches this function at all through
+    the ASGI write path it drives -- see that frozenset's own comment for why the test
+    still passes anyway (both of its requests now run the identical ported code
+    regardless of the patched value).
     """
     cols = {}
     for i, (path, band) in enumerate(plan.band_sources):
@@ -461,13 +539,17 @@ def _collapse_paired_window_wide(plan, fine_srcs, window, pairing_ids, pairing_v
 
 
 def _accumulate_paired_window(plan, fine_srcs, window, pairing_ids, pairing_valid, shape):
-    """Per-band streaming counterpart to `_collapse_paired_window_wide`: folds one
-    band's masked value (`plan._band_masked_value` -- the exact per-band piece
-    `_collapse_expr` itself would compute) into a running accumulator, so at most one
-    band's fine/paired arrays are ever alive at once instead of all
-    `len(band_sources)` of them plus the wide Polars frame built from them. Bit-
-    identical to `horizontal_aggregate_expr`'s own null-skipping reduction (see
-    raster_source.py): `min`/`max` seed their running accumulator at +-inf so a pixel no
+    """Per-band streaming counterpart to `_collapse_paired_window_wide`, from before
+    the write path's port onto `scan_paired`: folds one band's masked value
+    (`plan._band_masked_value` -- the exact per-band piece `_collapse_expr` itself would
+    compute) into a running accumulator, so at most one band's fine/paired arrays are ever
+    alive at once instead of all `len(band_sources)` of them plus the wide Polars frame
+    built from them. Like `_collapse_paired_window_wide`, no longer called by
+    `_write_paired_notebook_raster` (which now streams via `scan_paired` + `collect_batches`
+    instead of this hand-rolled accumulator -- see that function's own docstring) -- kept,
+    unmodified, as `tests/api/test_paired_port.py`'s differential-test oracle alongside its
+    wide-frame sibling. Bit-identical to `horizontal_aggregate_expr`'s own null-skipping
+    reduction (see sources.py): `min`/`max` seed their running accumulator at +-inf so a pixel no
     band ever validates for never updates it; `sum` seeds at 0 and only adds a band's
     value where that band is valid (Polars' own `sum_horizontal` treats a null band the
     same way -- as a zero contribution, not as excluding the row); `mean` accumulates a
@@ -550,58 +632,104 @@ def _accumulate_paired_window(plan, fine_srcs, window, pairing_ids, pairing_vali
 
 
 def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwargs):
-    """Direct rasterio block-window loop: read every fine band and the pairing
-    crosswalk over the SAME window, look up each pixel's paired coarse value, collapse
-    per pixel, and write the collapsed window straight back at its own position --
-    never materializing a full-extent array of any kind. See the module docstring for
-    why `scan_paired` cannot drive this instead.
+    """`scan_paired` + `collect_batches`, driven exactly like `raster._write_raster_
+    windowed` -- the port the module docstring above describes: one dense-mode paired
+    scan (`zones_path=None` --
+    every fine pixel survives, in raster order, identified only by `_px`; see
+    `scan_paired`'s own docstring for the three-mode split) feeding `plan._collapse_
+    expr()` -- the SAME expression the old hand-rolled wide path
+    (`_collapse_paired_window_wide`) and the still-unported tile path
+    (`_paired_notebook_tile`) both evaluate -- through one `.select()`, pulled back out
+    window-at-a-time by `_take_window_rows` and written once per window, exactly the
+    discipline `_write_raster_windowed` already proved (one `output.write` per window;
+    nothing GDAL-related crosses a `yield` -- that constraint lives inside `scan_paired`
+    itself, not here).
 
-    The per-window collapse itself dispatches on `group_step.aggregate`:
-    `_accumulate_paired_window` (a per-band streaming accumulator -- see its own
-    docstring) for every aggregate it covers, `_collapse_paired_window_wide` (the
-    original wide-frame collapse, unchanged) for anything it doesn't -- see
-    `_STREAMING_AGGREGATES`.
+    `count`'s own zero-vs-nodata split (`_count_zone_gate`) needs `pairing_valid` --
+    whether each pixel is even inside the pairing crosswalk's domain, independent of any
+    band's own lookup miss -- which a dense-mode scan alone cannot supply (dense mode
+    has no `grid_cell` at all). Only for `count` (`is_count` below), the SAME pairing-
+    crosswalk file is ALSO passed as `zones_path` in attach-only mode (`zone_ids=None`):
+    this attaches a raw, unfiltered `grid_cell` column carrying the crosswalk's own
+    pixel value, nodata sentinel included -- exactly what `_count_zone_gate` needs, at
+    the cost of one extra crosswalk read per window that every other aggregate skips
+    (`_accumulate_paired_window`/`_collapse_paired_window_wide`'s old cost was one such
+    read for EVERY aggregate; this port only pays it where it's actually needed).
+    `_STREAMING_AGGREGATES`'s wide-vs-streaming dispatch has no counterpart here -- both
+    old collapse functions are superseded on this path (kept, unmodified, as this port's
+    own differential-test oracle and the tile path's continued dependency -- see
+    `tests/api/test_paired_port.py`).
     """
     if not plan.band_sources:
         return False
 
-    with ExitStack() as stack, raster_gdal_env():
-        ref_path, _ref_band = plan.band_sources[0]
-        ref_src = stack.enter_context(rio.open(ref_path))
-        profile = ref_src.profile.copy()
-        block_height, block_width = ref_src.block_shapes[0]
-        itemsize = np.dtype(plan.out_dtype).itemsize
-        n_units = max(len(plan.band_sources) * 2, 1)
-        blocks_per_batch = raster_blocks_per_batch(n_units, block_height, block_width, itemsize)
-        window_list = list(_batched_windows(ref_src, blocks_per_batch))
+    band_df = pl.DataFrame(
+        {
+            "path": [path for path, _ in plan.band_sources],
+            "band": [band for _, band in plan.band_sources],
+        }
+    )
+    paths, row_indices, bands = group_rows_by_path(band_df)
+    pairing_path = str(plan.pairing_crosswalk_path)
+    is_count = plan.group_step.aggregate == "count"
 
-        fine_srcs = {path: stack.enter_context(rio.open(path)) for path in {p for p, _ in plan.band_sources}}
-        pairing_src = stack.enter_context(rio.open(str(plan.pairing_crosswalk_path)))
+    with ExitStack() as stack:
+        with raster_gdal_env():
+            ref_path, _ref_band = plan.band_sources[0]
+            ref_src = stack.enter_context(rio.open(ref_path))
+            profile = ref_src.profile.copy()
+            block_height, block_width = ref_src.block_shapes[0]
+            itemsize = np.dtype(plan.out_dtype).itemsize
+            n_units = max(len(plan.band_sources) * 2, 1)
+            blocks_per_batch = raster_blocks_per_batch(n_units, block_height, block_width, itemsize)
+            window_list = list(_batched_windows(ref_src, blocks_per_batch))
 
-        profile.update(count=1, dtype=plan.out_dtype, nodata=plan.nodata_value, compress="deflate")
-        profile.update(profile_kwargs)
-        dst = stack.enter_context(rio.open(str(out_path), "w", **profile))
+            pairing_nodata = None
+            if is_count:
+                with rio.open(pairing_path) as pairing_src:
+                    pairing_nodata = pairing_src.nodata
 
-        streaming = plan.group_step.aggregate in _STREAMING_AGGREGATES
-        collapse_expr = None if streaming else plan._collapse_expr()
+            profile.update(count=1, dtype=plan.out_dtype, nodata=plan.nodata_value, compress="deflate")
+            profile.update(profile_kwargs)
+            output = stack.enter_context(rio.open(str(out_path), "w", **profile))
+
+        crosswalks = [PairedCrosswalk(name="p", path=pairing_path, lookups=plan._crosswalk_lookups)]
+        collapse_expr = plan._collapse_expr()
+
+        lf = scan_paired(
+            paths,
+            row_indices,
+            bands,
+            crosswalks,
+            plan.calendar_values,
+            zones_path=pairing_path if is_count else None,
+        )
+        # Never `.filter()` this lf: `_take_window_rows` requires strict, gapless
+        # raster-pixel order (see its own docstring) -- `count`'s `grid_cell` column is
+        # carried along for `_count_zone_gate` to MASK afterward, never to drop rows.
+        select_cols = [pl.col("grid_cell"), collapse_expr] if is_count else [collapse_expr]
+        lf = lf.select(select_cols)
+
+        chunk_size = blocks_per_batch * block_height * block_width
+        batch_iter = iter(lf.collect_batches(chunk_size=chunk_size, maintain_order=True))
+        buffer = None
 
         for window in window_list:
-            pairing_raw = pairing_src.read(1, window=window)
-            shape = pairing_raw.shape
-            pairing_ids = pairing_raw.ravel().astype("int64")
-            pairing_nodata = pairing_src.nodata
-            if pairing_nodata is not None:
-                pairing_valid = pairing_ids != int(pairing_nodata)
-            else:
-                pairing_valid = np.ones(pairing_ids.shape, dtype=bool)
+            needed = window.height * window.width
+            result, buffer = _take_window_rows(batch_iter, buffer, needed)
 
-            if streaming:
-                values = _accumulate_paired_window(plan, fine_srcs, window, pairing_ids, pairing_valid, shape)
-            else:
-                values = _collapse_paired_window_wide(
-                    plan, fine_srcs, window, pairing_ids, pairing_valid, shape, collapse_expr
-                )
-            dst.write(values.astype(plan.out_dtype), 1, window=window)
+            values = result["value"].to_numpy()
+            if is_count:
+                grid_cell = result["grid_cell"].to_numpy()
+                if pairing_nodata is not None:
+                    pairing_valid = grid_cell != int(pairing_nodata)
+                else:
+                    pairing_valid = np.ones(grid_cell.shape, dtype=bool)
+                values = _count_zone_gate(plan, values, pairing_valid)
+
+            block = values.astype(plan.out_dtype, copy=False).reshape((1, window.height, window.width))
+            output.write(block, window=window)
+            del result, block
 
     return True
 

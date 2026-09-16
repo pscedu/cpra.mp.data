@@ -1,13 +1,12 @@
 """Named-analysis registry: mirrors `cpra.mp.data.visualizations`'s `VISUALIZATIONS`
 pattern (`ANALYSES = {cls.Meta.name: cls for cls in [...]}`) for the small set of
 multi-step, non-visual analyses a route can resolve by NAME rather than requiring a caller
-to hand-author the equivalent `analysis.pipeline.Pipeline` JSON directly -- see
-`scratch/data-analysis-separation-plan.md` §5 for the design this replaces (the portal's
-own client-side-only `subtract-asc`/`subtract-desc`/`concatenate` derivation logic, and its
-un-enforced cardinality rules) and §5.4's constraint this package's own registry-drift test
-(`tests/test_analyses.py`) enforces: every entry's `pipeline()` must return a real
-`Pipeline`, run through the exact same `compile_pipeline` any hand-authored pipeline does
--- nothing is reachable only through a named analysis.
+to hand-author the equivalent `analysis.pipeline.Pipeline` JSON directly -- replacing the
+portal's own client-side-only `subtract-asc`/`subtract-desc`/`concatenate` derivation logic
+and its un-enforced cardinality rules. This package's own registry-drift test
+(`tests/test_analyses.py`) enforces the constraint that keeps this honest: every entry's
+`pipeline()` must return a real `Pipeline`, run through the exact same `compile_pipeline`
+any hand-authored pipeline does -- nothing is reachable only through a named analysis.
 
 `ANALYSES`, `DatasetRef`, and `resolve_analysis` are the exact three names
 `cpra/mp/data/api/utils.py` already imports (guarded by `except ModuleNotFoundError`,
@@ -34,7 +33,7 @@ from cpra.mp.data.analyses.difference import Difference
 from cpra.mp.data.analyses.exit_criterion import ExitCriterion
 from cpra.mp.data.analysis.pipeline import PipelineError
 
-# Landed in this order (plan §8: `exit-criterion` first -- the only entry exercising the
+# Landed in this order (`exit-criterion` first -- the only entry exercising the
 # `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and the
 # only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name ->
 # class` dict, so registration order has no behavioral effect.

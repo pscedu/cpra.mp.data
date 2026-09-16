@@ -99,8 +99,8 @@ class Options(DataOptions):
     """`DataOptions` plus the fields that describe how a compiled pipeline *executes*:
     `group_by`/`group_aggregate`/`summarize_*` collapse or transform rows, and
     `calculate` rewrites `value` -- all lowered onto this class by `planner.py` (see
-    `analyses/*.py`) and consumed by `BaseAnalysis`. These are internal to the engine as
-    of Phase 4: not reachable as flat HTTP query parameters on the data endpoints (which
+    `analyses/*.py`) and consumed by `BaseAnalysis`. These are internal to the engine:
+    not reachable as flat HTTP query parameters on the data endpoints (which
     accept only `DataOptions`'s fields) -- a named analysis's own request parameters are
     validated separately and lowered into these fields by the planner instead.
     """

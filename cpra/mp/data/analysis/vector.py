@@ -18,13 +18,25 @@ from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from pmtiles.reader import MmapSource, Reader
 
 from cpra.mp.data import config
-from cpra.mp.data.analysis.base import BaseAnalysis
-from cpra.mp.data.analysis.expressions import ExpressionError, count_by_value_frame
+from cpra.mp.data.analysis.base import (
+    AnalysisError,
+    BaseAnalysis,
+    apply_calculate_plans,
+    apply_dimension_filter,
+    apply_value_filter,
+)
+from cpra.mp.data.analysis.expressions import (
+    ExpressionError,
+    compile_calculate_entries,
+    count_by_value_frame,
+    rewrite_named_columns,
+)
 from cpra.mp.data.analysis.fold import FoldError, fold_group_by, should_fold_group_by
 from cpra.mp.data.analysis.geography import (
     parse_coordinate_pairs,
     resolve_vector_grid_cell,
 )
+from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp
 from cpra.mp.data.analysis.utils import asynctiming, unpack_values
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 
@@ -90,6 +102,98 @@ def inject_and_serialize(vt: VectorTile, id_values: dict[int, float]) -> bytes:
     return vt.SerializeToString()
 
 
+# -- re-entrant stage cores, shared by the fixed-stage flow and the ops interpreter --
+#
+# `apply_group_by`/`apply_project` are the same two Polars logic blocks
+# `_collapse_group`/`_apply_transform_params_impl` below run against `self.lf`/
+# `self.options`, pulled out to take their own arguments and return a new `lf` instead of
+# mutating an instance -- exactly the `apply_dimension_filter`/`apply_value_filter`/
+# `apply_calculate_plans` pattern `analysis/base.py` establishes for filter/calculate; see
+# that module's docstring for why each one raises a plain `FoldError`/`AnalysisError`
+# rather than calling `self._error`. `apply_steps` (this module, below) is their one
+# caller besides the `VectorGridAnalysis` methods themselves.
+def apply_group_by(lf, by, aggregate, *, of="value", has_selective_filter):
+    """Collapse `lf` by `[*by, "grid_cell"]`, aggregating `of` with `aggregate` -- the
+    re-entrant core of `_collapse_group`, generalized to an explicit value column (`of`)
+    instead of assuming `"value"`, so `GroupOp.of` (meaningful for the paired/join shape's
+    own synthetic value columns -- see that op's docstring; a single-input pipeline's
+    `GroupOp.of` is always `"value"`, per `planner._compile_single_input_chain`'s own
+    `of != "value"` rejection) can be honored uniformly if a future join-shaped
+    interpreter reuses this function. Folds through `analysis.fold.fold_group_by` when
+    `should_fold_group_by` says the collapse is cliff-shaped -- identical routing to
+    `_collapse_group`, just over an explicit `lf`/`has_selective_filter` rather than
+    `self.lf`/`self._has_selective_dimension_filter()`. May raise `FoldError` (see
+    `fold_group_by`); callers convert to `AnalysisError`.
+    """
+    key_names = [*by, "grid_cell"]
+    if should_fold_group_by(key_names, has_selective_filter=has_selective_filter):
+        source_lf = lf
+        collapsed = fold_group_by(lambda: source_lf, key_names, aggregate, value_column=of)
+        return collapsed.lazy()
+    return lf.group_by(*by, "grid_cell").agg(getattr(pl.col(of), aggregate)())
+
+
+def apply_project(lf, from_grid, to_grid, aggregate, *, has_selective_filter):
+    """Move `lf`'s rows from `from_grid`'s cells onto `to_grid`'s cells via a crosswalk-
+    table join, aggregating with `aggregate` -- the re-entrant core of
+    `_apply_transform_params_impl`'s join/reaggregate logic, generalized to explicit grid
+    names/aggregate instead of `self.grid`/`self.options.summarize_by`/`self.options.
+    summarize_aggregate`, for `apply_steps` (below) to call directly against a
+    `ProjectOp`.
+
+    Deliberately does NOT pre-filter the crosswalk by `grid_cell_ids`/
+    `summarize_grid_cell_ids` the way `_apply_transform_params_impl` does -- those are a
+    performance narrowing specific to the OLD engine's `Options.grid_cell`/
+    `summarize_grid_cell`, not a correctness requirement: a post-project `grid_cell`
+    filter reaches this interpreter as an ordinary `FilterOp` on the joined result's own
+    `grid_cell` column (compile_ops copies the raw `Pipeline`'s steps verbatim -- it has
+    no notion of `_extract_post_project_grid_cell_filter`'s Options-only special case),
+    and filtering the DESTINATION rows after the join is mathematically identical to
+    filtering the crosswalk's `dst_id` before it, just less optimized. Also, unlike
+    `_apply_transform_params_impl`, never appends `geographic_unit` itself -- a pipeline's
+    `ProjectOp` may not be the request's LAST grid change (though a single-input chain
+    without a `join` step can contain at most one -- see `apply_steps`'s docstring), so
+    `apply_steps` adds that column once, itself, from the final grid.
+
+    May raise `AnalysisError` (missing crosswalk file) or `FoldError`/`ExpressionError`
+    (via `fold_group_by`/`count_by_value_frame`); callers convert the latter two.
+    """
+    crosswalk_path = config.CROSSWALKS_PATH / f"{from_grid}__{to_grid}.parquet"
+    if not crosswalk_path.exists():
+        raise AnalysisError(f"No crosswalk from {from_grid} to {to_grid}")
+    crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
+
+    dim_cols = cs.expand_selector(lf, DIMENSION_COLUMNS)
+
+    if aggregate == "count_by_value":
+        joined = lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+            pl.col("dst_id").alias("grid_cell")
+        )
+        return count_by_value_frame(joined, [*dim_cols, "grid_cell"], "value", COUNT_BY_VALUE_MAX_DISTINCT)
+
+    key_names = [*dim_cols, "grid_cell"]
+
+    def _scale_and_join(chunk):
+        return chunk.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+            value=pl.col("value") * pl.col("scale_factor")
+        )
+
+    if should_fold_group_by(key_names, has_selective_filter=has_selective_filter):
+        source_lf = lf
+        collapsed = fold_group_by(
+            lambda: source_lf,
+            [*dim_cols, pl.col("dst_id").alias("grid_cell")],
+            aggregate,
+            chunk_transform=_scale_and_join,
+        )
+        return collapsed.lazy()
+
+    joined = lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
+        value=pl.col("value") * pl.col("scale_factor")
+    )
+    return joined.group_by(*dim_cols, pl.col("dst_id").alias("grid_cell")).agg(getattr(pl.col("value"), aggregate)())
+
+
 class VectorGridAnalysis(BaseAnalysis):
     async def _apply_grid_cell(self):
         """Apply the grid_cell filter to a vector-grid dataset.
@@ -140,31 +244,23 @@ class VectorGridAnalysis(BaseAnalysis):
         the collapsed dimensions were simply gone. A `select` naming a since-collapsed
         dimension now surfaces as a clean `ColumnNotFoundError` -> 400 out of
         `materialize`, rather than silently returning an all-null column.
+
+        A thin caller over the module-level `apply_group_by` -- the fold-vs-plain routing
+        (`should_fold_group_by`, the "9.8 GB cliff" comment) now lives there, generalized
+        to an explicit `lf`/`of`/
+        `has_selective_filter` instead of `self.lf`/`self.options.group_aggregate`/`self.
+        _has_selective_dimension_filter()`, so `apply_steps` (below) can invoke the
+        identical logic once per `GroupOp`.
         """
-        # grid_cell must always be part of the group key in long format since each
-        # row represents a single grid_cell -- this is exactly the high-cardinality
-        # collapse the fold exists for (see analysis.fold's module docstring: 126,174
-        # distinct grid_cell values, ~9.8 GB unfolded). `should_fold_group_by` sees
-        # only the OUTPUT key names, and `group_by_cols` here is always plain dimension
-        # name strings (never the `[True]` literal sentinel -- see
-        # `BaseAnalysis._get_group_by_columns`), so no filtering is needed before adding
-        # grid_cell to build the fold-routing key.
-        key_names = [*group_by_cols, "grid_cell"]
-        if should_fold_group_by(
-            key_names, has_selective_filter=self._has_selective_dimension_filter()
-        ):
-            source_lf = self.lf
-            try:
-                collapsed = fold_group_by(
-                    lambda: source_lf, [*group_by_cols, "grid_cell"], self.options.group_aggregate
-                )
-            except FoldError as exc:
-                self._error(str(exc))
-            self.lf = collapsed.lazy()
-        else:
-            self.lf = self.lf.group_by(*group_by_cols, "grid_cell").agg(
-                getattr(pl.col("value"), self.options.group_aggregate)()
+        try:
+            self.lf = apply_group_by(
+                self.lf,
+                group_by_cols,
+                self.options.group_aggregate,
+                has_selective_filter=self._has_selective_dimension_filter(),
             )
+        except FoldError as exc:
+            self._error(str(exc))
 
     async def _apply_transform_params_impl(self):
         """Apply transform and extract parameters to the LazyFrame.
@@ -260,6 +356,176 @@ class VectorGridAnalysis(BaseAnalysis):
                 .agg(getattr(pl.col("value"), agg_fn)())
                 .with_columns(geographic_unit=pl.lit(self.options.summarize_by))
             )
+
+    # -- ops interpreter: applies a pipeline's ops in declared order, vector shape -------
+
+    async def apply_params(self):
+        """Dispatch to the ops interpreter (`apply_steps`) when `self._pipeline_ops` was
+        attached -- `planner._compile_single_input_chain`'s vector fast path, taken for a
+        pipeline whose INPUT is on a vector grid (see that function's trailing wiring for
+        exactly why input, not output, grid type decides this) -- else fall through to
+        `BaseAnalysis.apply_params`'s fixed five-stage flow unchanged. Every flat
+        (non-pipeline) request reaches this dataset with `self._pipeline_ops` still at its
+        `None` default (only `_compile_single_input_chain` ever sets it), so this override
+        changes nothing for the entire existing flat surface -- only a pipeline request
+        that both (a) has a single vector input and no `join` and (b) actually compiled
+        (passed every existing check in `_compile_single_input_chain`, the SUMMARIZING-
+        PROJECT ORDER GUARD included -- this override runs strictly after that function
+        returns) takes the new path.
+        """
+        if self._pipeline_ops is not None:
+            await self.apply_steps(self._pipeline_ops)
+            self._apply_sort_params()
+            return
+        await super().apply_params()
+
+    async def apply_steps(self, ordered_ops: list[Op]):
+        """The vector ("long"-shape) interpreter: walk `ordered_ops`
+        (`ops.compile_ops`'s output) and apply each op's `ops.LOWERING_TABLE` row against
+        `self.lf`, IN DECLARED ORDER -- unlike `BaseAnalysis.apply_params`'s fixed five-
+        stage flow (filter always before calculate always before group always before
+        transform), which silently produces the wrong answer whenever a pipeline's
+        declared order differs from that fixed order (see `planner.py`'s SUMMARIZING-
+        PROJECT ORDER GUARD comment for the measured reproductions this interpreter makes
+        unnecessary for the shapes it covers). Nothing here ever reorders `ordered_ops`; it
+        is walked once, front to back, and every op's own re-entrant core
+        (`apply_dimension_filter`/`apply_value_filter`/
+        `apply_calculate_plans` from `analysis/base.py`, `apply_group_by`/`apply_project`
+        above) is exactly what the corresponding fixed-stage method already used, called
+        once per op instead of once per whole-request option.
+
+        `self.options.grid_cell` (an INPUT-level filter -- `InputSelection.grid_cell`,
+        never a pipeline step, so it never appears in `ordered_ops` at all) is applied
+        once, up front, via the existing `_apply_grid_cell` hook -- the same relative
+        timing `BaseAnalysis.apply_params`'s stage 1 gives it (before any calculate/group/
+        transform), and the only sensible spot here too, since it is a SOURCE-grid cell
+        filter and must run before a `ProjectOp` ever changes what `grid_cell` means.
+
+        `rename_map`: every name a `FilterOp.where`/`CalculateOp.expression` may reference
+        the running value BY -- the pipeline's own input name, plus every step's own
+        EXPLICIT `as_` alias -- rewritten to the literal `value` placeholder before
+        parsing, via `expressions.rewrite_named_columns`. Required because `ops.
+        compile_ops` copies `where`/`expression` VERBATIM from the validated `Pipeline`
+        (see that module's own docstring), the same rewrite `planner._compile_single_
+        input_chain` already applies (its own `rename_map`, built the identical way --
+        `input_name` plus each step's own `.as_` when not `None`) before lowering onto
+        `Options.where`/`Options.calculate`.
+
+        Deliberately EXCLUDES an op's SYNTHETIC default output name (`ops.
+        _default_output_name`'s `str(step_no)`, used for any step with no explicit `as_`)
+        -- including it here was tried and is actively wrong, not merely redundant: a
+        synthetic name is a bare digit string (`"1"`, `"2"`, ...), and `rewrite_named_
+        columns`'s regex has no way to tell "the token `2` because a caller's `where`
+        legitimately compares against the number 2" from "the token `2` because it
+        happens to equal step 2's made-up output name" -- both look identical to a plain
+        word-boundary match. Concretely: a leading `filter(where="eco >= 2")` followed by
+        a `project` step (no `as_` on either) synthesizes output names `"1"`/`"2"`; if
+        `"2"` were in `rename_map`, `"eco >= 2"` would rewrite to `"value >= value"` (a
+        tautology, filtering nothing) instead of `"value >= 2"`. `ops._default_output_
+        name`'s own docstring proves the exact filter used below is safe: a real `as_`/
+        input name is required (`pipeline._validate_name`'s `_NAME_RE`) to start with a
+        lowercase letter or underscore, so `op.output[0].isdigit()` is `True` if and only
+        if `output` is synthetic.
+
+        `ordered_ops[0].input` is always the pipeline's own (single, since this method is
+        only ever reached for a single-input, no-`join` chain) input name -- `compile_ops`
+        resolves every implicit chain, and a chain's first step always names its input
+        explicitly (`pipeline.validate_pipeline`'s chaining rule).
+
+        `current_grid` tracks which grid `self.lf`'s `grid_cell` column actually indexes:
+        starts at `self.grid.name` (the input's own grid) and becomes a `ProjectOp.to`
+        once one runs. A single-input, no-`join` pipeline can contain at most one
+        `ProjectOp` -- `_compile_single_input_chain`'s post-project step loop has no
+        `ProjectStep` branch at all, so a second `project` falls into that loop's
+        exhaustive `else` and is rejected with a `PipelineError` well before this method
+        is ever reached -- so this is a plain reassignment, never a stack, and
+        `geographic_unit` (added once, at the very end, exactly like
+        `_apply_transform_params_impl` adds it once) is added only if `current_grid` ever
+        actually changed -- an identity project (`op.to == current_grid`, skipped
+        entirely, matching `_apply_transform_params_impl`'s own `_validate_summarize_
+        params` early return for a project with no `summarize_by`) leaves it at `self.
+        grid.name` and adds nothing, the same "no-op transform stage" behavior the old
+        engine gives an identity project.
+
+        `count_by_value` + `calculate`: mirrors `_reject_calculate_with_count_by_value`'s
+        rejection (checked against `self.options.calculate`, which the planner still
+        populates identically regardless of which engine executes -- see `_dataset_for`)
+        rather than re-deriving it from `ordered_ops`, since `Options.calculate` is already
+        the exact signal that method's caller (`_apply_transform_params_impl`) checks.
+
+        Filter semantics: a `FilterOp`'s value conjunct is always a ROW DROP here
+        (`apply_value_filter(..., mask=False)`), never `_apply_filter_params`'s
+        conditional mask-vs-drop (`_is_aggregating()`). `ops.LOWERING_TABLE` states the
+        long-shape filter lowering as a literal, unconditional "row filter" (see
+        `ops.FilterOp`'s docstring), and under TRUE declared-order execution a drop is the
+        only semantically coherent choice: a mask exists solely to compose with a
+        downstream aggregate's own null-skipping behavior when the filter and the
+        aggregate are applied out of their declared order (the old engine's Filter-always-
+        before-Group/Transform flow) -- here the aggregate already runs in its own
+        declared position, so there is no "downstream" null left to skip around.
+        """
+        if self.options.grid_cell:
+            await self._apply_grid_cell()
+
+        lf = self.lf
+        current_grid = self.grid.name
+        value_names = {ordered_ops[0].input}
+        value_names.update(op.output for op in ordered_ops if not op.output[0].isdigit())
+        rename_map = {name: "value" for name in value_names}
+
+        for op in ordered_ops:
+            if isinstance(op, ProjectOp):
+                if op.to == current_grid:
+                    continue
+                if op.aggregate == "count_by_value":
+                    self._reject_calculate_with_count_by_value()
+                try:
+                    lf = apply_project(
+                        lf,
+                        current_grid,
+                        op.to,
+                        op.aggregate,
+                        has_selective_filter=self._has_selective_dimension_filter(),
+                    )
+                except (ExpressionError, FoldError) as exc:
+                    self._error(str(exc))
+                current_grid = op.to
+            elif isinstance(op, FilterOp):
+                rewritten = rewrite_named_columns(op.where, rename_map)
+                try:
+                    lf, value_where, has_dimension_conjunct = apply_dimension_filter(lf, rewritten)
+                    lf = apply_value_filter(lf, value_where, mask=False)
+                except ExpressionError as exc:
+                    self._error(str(exc))
+                self._where_has_dimension_conjunct = (
+                    self._where_has_dimension_conjunct or has_dimension_conjunct
+                )
+            elif isinstance(op, CalculateOp):
+                expression = rewrite_named_columns(op.expression, rename_map)
+                where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
+                try:
+                    plans = compile_calculate_entries([(f"step.{op.step_no}", expression, where)])
+                    lf = apply_calculate_plans(lf, plans)
+                except ExpressionError as exc:
+                    self._error(str(exc))
+            elif isinstance(op, GroupOp):
+                try:
+                    lf = apply_group_by(
+                        lf,
+                        op.by,
+                        op.aggregate,
+                        of=op.of,
+                        has_selective_filter=self._has_selective_dimension_filter(),
+                    )
+                except FoldError as exc:
+                    self._error(str(exc))
+            else:  # pragma: no cover -- a `JoinOp` never reaches a single-input chain
+                self._error(f"unsupported op in the vector interpreter: {op.op!r}")
+
+        if current_grid != self.grid.name:
+            lf = lf.with_columns(geographic_unit=pl.lit(current_grid))
+
+        self.lf = lf
 
     @asynctiming
     async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:

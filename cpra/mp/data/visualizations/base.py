@@ -325,7 +325,7 @@ class DatasetVisualization(BaseVisualization):
 
     @cached_property
     def _analysis_name(self):
-        """The `analysis=` request parameter (plan §5.3), or `None` when not given."""
+        """The `analysis=` request parameter, or `None` when not given."""
         return self.params.get("analysis")
 
     @cached_property
@@ -365,7 +365,7 @@ class DatasetVisualization(BaseVisualization):
 
     @cached_property
     def resolved_analysis(self):
-        """The `analysis=` request parameter (plan §5.3), resolved into a real, ready-to-
+        """The `analysis=` request parameter, resolved into a real, ready-to-
         compile `Pipeline` plus presentation metadata (`.legend`/`.result_kind`/
         `.collapsed_dimensions`/`.title_suffix`) -- or `None` when no analysis was
         selected, the signal every migrated hook in this module (and in `map.py`/

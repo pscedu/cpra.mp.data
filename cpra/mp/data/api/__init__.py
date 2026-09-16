@@ -84,7 +84,7 @@ def get_mpd_session():
 
 MPDSession = Annotated[Session, Depends(get_mpd_session)]
 
-# Phase 4 (plan §3.1/§6.1): the flat data/tile/visualization endpoints only ever accept
+# The flat data/tile/visualization endpoints only ever accept
 # `DataOptions`'s fields (dimension filters, `grid_cell`/`where`/`sort`/`select`/
 # `color_map`, plus compression) -- every parameter that used to describe how a compiled
 # pipeline *executes* (`negate`/`multiply10`/`multiply100`, the indexed
@@ -177,8 +177,8 @@ async def analysis_error_handler(request: Request, exc: AnalysisError) -> JSONRe
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-# The analogous translation point for `cpra.mp.data.analyses.resolve_analysis` (plan
-# §3.2a) -- a distinct, FastAPI-free exception family from `AnalysisError` above (see
+# The analogous translation point for `cpra.mp.data.analyses.resolve_analysis` --
+# a distinct, FastAPI-free exception family from `AnalysisError` above (see
 # `cpra/mp/data/analyses/base.py`'s `AnalysisRegistryError`, a plain `ValueError`
 # subclass), raised by `resolve_analysis` itself for the one case `get_analysis_class`
 # cannot pre-empt: `InvalidAnalysisParametersError`, when an analysis's own `Parameters`
@@ -552,15 +552,15 @@ async def get_visualization(
 
 
 # ----------------------------------------------------------------------------------------
-# Named analyses (plan §3.2a) -- a registered pipeline plus parameters, resolved through
+# Named analyses -- a registered pipeline plus parameters, resolved through
 # `cpra.mp.data.analyses.resolve_analysis` into a real `Pipeline` and executed through
 # EXACTLY the same `compile_pipeline` -> response machinery the explicit `/v1/analysis.*`
 # routes above already use (`_respond_to_analysis`, `_compile_analysis_pipeline` below).
-# This is sugar over §3.2, never a second engine -- see plan §5.4 -- so nothing here reads
+# This is sugar, never a second engine, so nothing here reads
 # a file, opens a dataset, or reimplements a planner rule; it only builds the request-level
 # inputs `resolve_analysis` asks for and applies the request-level `Output` overrides
-# (`format`/`color_map`/`sort`/`select`) that are NEVER the registry's concern (plan §3.2a:
-# "color_map is a request parameter here, not a registry field").
+# (`format`/`color_map`/`sort`/`select`) that are NEVER the registry's concern --
+# color_map is a request parameter here, not a registry field.
 # ----------------------------------------------------------------------------------------
 
 
@@ -571,8 +571,8 @@ def _analysis_filters(query: AnalysisQuery) -> dict:
     `where` is bundled in here rather than spliced into the resolved pipeline's own
     `steps` afterward: the pipeline's shape (how many steps, whether it's the paired
     project+join shape) is the registry's to know, not this route's, and grafting an
-    extra `FilterStep` in from outside risks exactly the "second engine" plan §5.4 warns
-    against -- e.g. corrupting the paired shape's fixed `project` + `join` step-order
+    extra `FilterStep` in from outside risks becoming a second, route-level pipeline
+    engine -- e.g. corrupting the paired shape's fixed `project` + `join` step-order
     invariant (`planner._compile_paired_notebook_shape`). Letting `resolve_analysis`
     fold it into its own pipeline construction keeps that structural knowledge in one
     place.
@@ -601,8 +601,8 @@ def _analysis_extra_params(request: Request, known: frozenset) -> dict:
 
 def _apply_output_overrides(pipeline, query: AnalysisQuery, format=None) -> None:
     """Overwrite the resolved pipeline's `Output` with the request's own `format`/
-    `color_map`/`sort`/`select` -- never the registry's concern (plan §3.2a: "the same
-    value can be drawn with different ramps, and the portal already varies it per map").
+    `color_map`/`sort`/`select` -- never the registry's concern: the same
+    value can be drawn with different ramps, and the portal already varies it per map.
     `format` is omitted (left as whatever `resolve_analysis` produced) for `pipeline.json`,
     which has no `{format}`/`.pbf` URL segment to source one from.
     """

@@ -249,7 +249,7 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
     re-derived from the parameters given directly:
 
     * A **tabular-shaped** result (`output_type` is `OutputType.vector` -- every vector
-      grid, plus a raster grid narrowed to a table by a `project`-to-a-coarser-grid or a
+      grid, plus a raster grid narrowed to a table by a `project`-to-a-vector-grid or a
       trailing `group` step) returns a polars `DataFrame` (the default) or a `LazyFrame`
       when `lazy=True` (`collect()` it yourself when ready). `output_path=` makes no
       sense here -- there is no file format decision to make once the caller already
@@ -259,7 +259,7 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
       raster-shaped) REQUIRES `output_path=`: the GeoTIFF is written there via
       `write_raster` and the path is returned as a `pathlib.Path`. Omitting
       `output_path=` raises `AnalysisError` explaining that this request produces a
-      raster and needs `output_path=` -- add a `project`-to-a-coarser-grid or a trailing
+      raster and needs `output_path=` -- add a `project`-to-a-vector-grid or a trailing
       `group` step instead if a frame was actually wanted. `lazy=True` together with a
       raster-shaped result also raises `AnalysisError`: there is no lazy raster.
     """
@@ -281,7 +281,7 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
             raise AnalysisError(
                 "analyze_data(): this request produces a raster (its output is an image, "
                 "not a table) and needs output_path= to say where to write the GeoTIFF -- "
-                "add a project-to-a-coarser-grid or a trailing group step to the pipeline "
+                "add a project-to-a-vector-grid or a trailing group step to the pipeline "
                 "instead if you wanted a polars frame back",
                 status_code=400,
             )

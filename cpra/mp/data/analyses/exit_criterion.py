@@ -6,7 +6,7 @@ the paired (project + spatial join) pipeline shape documented at
 `docs/data-analysis-api.md`'s "The Exit-Criterion Query" example, landed here as a named
 analysis rather than requiring a caller to hand-author that exact JSON.
 
-Lands FIRST among the three v1 entries (plan §8): it is the only one exercising the
+Lands FIRST among the three v1 entries: it is the only one exercising the
 `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and has no
 existing consumer (unlike `difference`/`concatenate`, which replace real portal catalog
 entries).

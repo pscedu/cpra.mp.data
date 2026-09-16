@@ -25,11 +25,11 @@ LazyFrame) through five ordered stages, run once by `apply_params`:
    (expression/where pairs) conditionally rewrite `value` in place (vector), or
    are validated and stashed on `self._calculate_plans` for the pixel-read paths to
    apply per band (raster, whose `self.lf` at this point is still the band-metadata
-   table, not pixels -- see `RasterGridAnalysis._band_calculate_passes`).
+   table, not pixels -- see `RasterGridAnalysis._simple_band_collapse_inputs`).
 3. **group** (`_apply_group_params`) -- `group_by`/`group_aggregate` collapse rows via the
    `_collapse_group` hook (vector: dimension-collapse across rows per grid_cell, folding
    through `analysis.fold` when the collapse is cliff-shaped; raster: records which band
-   rows belong to which output group in `self.raster_groups`, collapsed later against
+   rows belong to which output group in `self._band_groups`, collapsed later against
    actual pixels).
 4. **transform** (`_apply_transform_params`) -- `summarize_by`/`summarize_aggregate`
    convert to another grid's cells via the `_apply_transform_params_impl` hook (vector: a
@@ -56,7 +56,7 @@ subclass produced it.
   `analysis.fold.fold_group_by` when cliff-shaped), DROPPING dimension columns left out
   of the group (they no longer have a value, so they no longer have a column -- see the
   method's own comment). Raster: no pixels are read here -- this only records the row
-  groups (`self.raster_groups`) that a later stage (transform, tile, or write) collapses
+  groups (`self._band_groups`) that a later stage (transform, tile, or write) collapses
   against actual band data.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
   converting to another grid's cells. Called only after `_validate_summarize_params`
@@ -103,6 +103,103 @@ DIMENSION_CHOICES = list(DIMENSIONS.keys())
 SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHOICES]
 
 
+# -- re-entrant stage cores ---------------------------------------------------------
+#
+# Each function below is the same Polars logic `_apply_filter_params`/`_apply_calculate_
+# params` used to run only against `self.lf`/`self.options`, pulled out to take its own
+# arguments and return a new `lf` instead of mutating an instance -- so a caller walking a
+# `list[ops.Op]` in DECLARED order (`vector.VectorGridAnalysis.apply_steps`, the ops
+# interpreter) can invoke exactly the same stage logic once per op, in whatever order the
+# pipeline actually declared, rather than the fixed five-stage order `apply_params` always
+# runs in. Each one raises the plain `ExpressionError`/`FoldError` its Polars-adjacent
+# helpers already raise -- never `AnalysisError` -- since these are library functions with
+# no `self._error` to call; every caller (a `BaseAnalysis` stage method, or the
+# interpreter) catches and converts at its own boundary, exactly like `_apply_filter_
+# params`/`_apply_calculate_params` already did for the logic now living here.
+def apply_dimension_filter(lf, where):
+    """Split `where` into DIMENSION and VALUE conjuncts (`expressions.classify_where`) and
+    apply the dimension half to `lf` via the same unrestricted `lf.sql()` path `where` has
+    always used. Returns `(lf, value_where, has_dimension_conjunct)`: `value_where` is the
+    combined value-conjunct string (`None` if `where` had none), left for the caller to
+    apply separately, since MASK-vs-DROP (see `apply_value_filter`) is a policy decision
+    this function -- which only ever handles the columnar dimension half -- does not make.
+    `has_dimension_conjunct` is `bool(dimension_conjuncts)`, the signal `_has_selective_
+    dimension_filter` needs to decide whether a downstream `group_by`/`project` is
+    cliff-shaped (see that method's docstring).
+
+    A falsy `where` (`None` or `""`) is a no-op: returns `(lf, None, False)` unchanged,
+    matching `_apply_filter_params`'s own `if self.options.where:` guard.
+    """
+    if not where:
+        return lf, None, False
+    dimension_conjuncts, value_conjuncts = classify_where(where)
+    has_dimension_conjunct = bool(dimension_conjuncts)
+    if dimension_conjuncts:
+        combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
+        lf = lf.sql(f"select * from self where {combined}")
+    value_where = None
+    if value_conjuncts:
+        value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
+    return lf, value_where, has_dimension_conjunct
+
+
+def apply_value_filter(lf, value_where, *, mask):
+    """Apply a combined value-conjunct predicate (`value_where`, already reduced to one
+    string by `apply_dimension_filter` or an equivalent split) to `lf`: as a MASK
+    (`mask=True`, `pl.when(...).then(value).otherwise(None)` -- nulls a non-matching value
+    rather than dropping its row, composing with a downstream aggregate's own null-
+    skipping behavior) or a row DROP (`mask=False`, `lf.filter(...)`). `_apply_filter_
+    params`'s docstring explains exactly when the OLD (fixed five-stage) engine picks
+    which: mask for an aggregating request (`_is_aggregating()`), drop otherwise. The
+    ops interpreter (`vector.apply_steps`) always passes `mask=False` -- see that
+    method's own docstring for why a straight drop, not that conditional, is the only
+    semantically coherent choice once filter/group/project run in their own declared
+    positions instead of a fixed order.
+
+    A `None` `value_where` (no value conjunct) is a no-op: returns `lf` unchanged.
+    """
+    if value_where is None:
+        return lf
+    mask_expr = value_predicate_mask(value_where, lf.collect_schema().names())
+    if mask:
+        return lf.with_columns(pl.when(mask_expr).then(pl.col("value")).otherwise(None).alias("value"))
+    return lf.filter(mask_expr)
+
+
+def apply_calculate_plans(lf, calculate_plans):
+    """Apply already-validated `expressions.CalculatePlan`s to a vector/tabular `lf`,
+    sequentially in list order (entry N+1 sees entry N's output) -- the re-entrant core of
+    `_apply_calculate_params`'s vector-side rewrite (the raster band-metadata early return
+    there has no equivalent here: this function always assumes `lf` already carries a real
+    `value` column, which is exactly what `_apply_calculate_params` checks with `_is_
+    raster_metadata_table()` before ever calling the logic now living here). A missing
+    value stays missing (`is_not_null()` guards every rewrite) and a row not matching a
+    plan's own `where` passes through unchanged, for the same reasons `_apply_calculate_
+    params`'s docstring gives.
+
+    An empty `calculate_plans` is a no-op: returns `lf` unchanged.
+    """
+    if not calculate_plans:
+        return lf
+    schema_names = set(lf.collect_schema().names())
+    for plan in calculate_plans:
+        condition = pl.col("value").is_not_null()
+        if plan.dimension_where is not None:
+            dimension_expr = pl.sql_expr(plan.dimension_where)
+            missing = set(dimension_expr.meta.root_names()) - schema_names
+            if missing:
+                raise ExpressionError(
+                    f"{plan.label}: where references column(s) not present in this "
+                    f"dataset: {sorted(missing)} -- available columns: {sorted(schema_names)}"
+                )
+            condition = condition & dimension_expr.fill_null(False)
+        if plan.value_where is not None:
+            condition = condition & value_predicate_mask(plan.value_where, ["value"])
+        new_value = parse_value_expr(plan.expression, ["value"])
+        lf = lf.with_columns(pl.when(condition).then(new_value).otherwise(pl.col("value")).alias("value"))
+    return lf
+
+
 class AnalysisError(Exception):
     """Raised throughout `cpra.mp.data.analysis` in place of FastAPI's `HTTPException`
     (see this module's docstring for why). Carries the same `status_code`/`detail` shape.
@@ -128,7 +225,27 @@ class BaseAnalysis:
         self.dataset_bounds = None
         self.grid_cell_ids = None
         self.summarize_grid_cell_ids = None
-        self.raster_groups = None
+        # `RasterGridAnalysis`-only bookkeeping for a `group_by` step (a vector frame
+        # never sets any of these three -- its own `_collapse_group` just reassigns
+        # `self.lf` directly, since a row-per-grid_cell frame has no positional band
+        # columns to keep aligned). `self.lf` for a raster analysis starts as the
+        # per-band metadata table (one row per selected (path, band)); the FIRST
+        # `_collapse_group` call snapshots that table into `_raw_band_frame` before
+        # reassigning `self.lf` to the collapsed (dimension-only) metadata, since every
+        # later pixel-read still needs the original (path, band) rows to build its scan
+        # even once `self.lf` itself has moved on. `_band_groups` is, for each CURRENT
+        # row of `self.lf`, the list of ORIGINAL `_raw_band_frame` row positions that
+        # collapsed into it -- composed across however many `group`/post-group
+        # dimension-filter steps have run so far, so it stays correct through more than
+        # one of either (see `RasterGridAnalysis._collapse_group`). `_band_ops` is the
+        # ordered pixel-VALUE replay recipe (calculate/group/filter entries, one per
+        # step actually declared, in declared order) a pixel-read consumer replays
+        # against the raw scan once at least one group has run -- see
+        # `RasterGridAnalysis.apply_band_ops` and that class's three pixel-read
+        # methods.
+        self._raw_band_frame = None
+        self._band_groups = None
+        self._band_ops = []
         # Set by `_apply_filter_params`, the first step `apply_params` runs, from
         # `where`'s value conjuncts (see `expressions.classify_where`) -- the internal
         # successor to the retired `Options.value_where` field. `None` means `where`
@@ -141,8 +258,8 @@ class BaseAnalysis:
         # request (the generic `calculate` entries), in application order. Empty when
         # the request has no calculate parameters at all. A vector frame consumes them
         # immediately inside `_apply_calculate_params`; the raster pixel-read paths
-        # (tile/write/summarize) read this attribute later, per band, via
-        # `_band_calculate_passes`.
+        # (tile/write/summarize) flush it into `_band_ops` and read it back, per band,
+        # via `_simple_band_collapse_inputs`.
         self._calculate_plans = []
         # Also set by `_apply_filter_params`: whether `where` produced at least one
         # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
@@ -150,6 +267,14 @@ class BaseAnalysis:
         # which used to just check `options.where is not None` and is now wrong to,
         # since `where` may hold only a value conjunct (a mask, not a row filter).
         self._where_has_dimension_conjunct = False
+        # Set by `planner._compile_single_input_chain`'s vector fast path to
+        # `ops.compile_ops(pipeline)`'s
+        # `list[Op]` -- never by this constructor itself, and never by anything on the
+        # flat (non-pipeline) request surface. `None` (the default here) means "no op IR
+        # was attached", the signal `VectorGridAnalysis.apply_params`'s override reads to
+        # decide between the interpreter (`apply_steps`) and this class's own fixed
+        # five-stage flow -- see that override's docstring.
+        self._pipeline_ops = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
         self.grid = GRIDS[self.dataset_dimensions.grid]
@@ -292,8 +417,10 @@ class BaseAnalysis:
         if self.output_type == OutputType.vector:
             self._error("invalid output type for tile: vector", status_code=400)
 
-        group_lf = self.raster_groups if self.raster_groups is not None else self.lf
-        groups = group_lf.select(pl.len()).collect().item()
+        if self._band_groups is not None:
+            groups = len(self._band_groups)
+        else:
+            groups = self.lf.select(pl.len()).collect().item()
         if groups > 1:
             self._error(f"tile contains more than one band: {groups} bands found", status_code=400)
 
@@ -323,19 +450,24 @@ class BaseAnalysis:
         consumer (`RasterGridAnalysis._apply_transform_params_impl`,
         `_summarize_zone_stats_plugin`, `_summarize_count_by_value_plugin`) to read
         instead.
+
+        A thin caller over `apply_dimension_filter`/`apply_value_filter`: the logic
+        itself now lives in
+        those two re-entrant, `self`-free functions so `vector.VectorGridAnalysis.
+        apply_steps` (the ops interpreter) can invoke the identical Polars behavior once
+        per `FilterOp`, in declared order, instead of once for the whole combined `where`
+        string here. This method's OWN behavior is unchanged by that split -- it still
+        runs once, against `self.options.where` as a whole, for every non-interpreter
+        request (every flat request, and any pipeline the vector fast path doesn't
+        select).
         """
         if self.options.where:
             try:
-                dimension_conjuncts, value_conjuncts = classify_where(self.options.where)
+                self.lf, self._value_where, self._where_has_dimension_conjunct = apply_dimension_filter(
+                    self.lf, self.options.where
+                )
             except ExpressionError as exc:
                 self._error(str(exc))
-
-            self._where_has_dimension_conjunct = bool(dimension_conjuncts)
-            if dimension_conjuncts:
-                combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
-                self.lf = self.lf.sql(f"select * from self where {combined}")
-            if value_conjuncts:
-                self._value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
 
         # A vector frame already carries a real `value` column at this point, so a
         # `where` value conjunct can be applied directly here. A raster's `value`
@@ -362,13 +494,9 @@ class BaseAnalysis:
         # deliberate behavior change from the old value_where, which always masked).
         if self._value_where is not None and self.grid.grid_type == "vector":
             try:
-                mask = value_predicate_mask(self._value_where, self.lf.collect_schema().names())
+                self.lf = apply_value_filter(self.lf, self._value_where, mask=self._is_aggregating())
             except ExpressionError as exc:
                 self._error(str(exc))
-            if self._is_aggregating():
-                self.lf = self.lf.with_columns(pl.when(mask).then(pl.col("value")).otherwise(None).alias("value"))
-            else:
-                self.lf = self.lf.filter(mask)
 
         if self.options.grid_cell:
             await self._apply_grid_cell()
@@ -409,7 +537,16 @@ class BaseAnalysis:
         `RasterGridAnalysis._band_applicability`) and its expression/value-`where` are
         applied per band, against actual pixels, by every raster read path
         (`_summarize_zone_stats_plugin`, `_collapse_tile_bands`,
-        `_write_raster_windowed`) via `_band_calculate_passes`.
+        `_write_raster_windowed`) via `_simple_band_collapse_inputs`.
+
+        A thin caller over `apply_calculate_plans` for the vector/tabular rewrite
+        itself -- pulled out so
+        `vector.VectorGridAnalysis.apply_steps` (the ops interpreter) can invoke the
+        identical Polars behavior once per `CalculateOp`, in declared order, instead of
+        once for the whole `options.calculate` list here. Validation
+        (`compile_calculate_entries`) and the raster-metadata-table early return stay here
+        unchanged -- both are about THIS method's own entry source (`options.calculate`)
+        and grid-type dispatch, neither of which the interpreter shares.
         """
         entries = self._resolve_calculate_entries()
         try:
@@ -420,25 +557,10 @@ class BaseAnalysis:
         if not self._calculate_plans or self._is_raster_metadata_table():
             return
 
-        schema_names = set(self.lf.collect_schema().names())
-        for plan in self._calculate_plans:
-            condition = pl.col("value").is_not_null()
-            if plan.dimension_where is not None:
-                dimension_expr = pl.sql_expr(plan.dimension_where)
-                missing = set(dimension_expr.meta.root_names()) - schema_names
-                if missing:
-                    self._error(
-                        f"{plan.label}: where references column(s) not present in this "
-                        f"dataset: {sorted(missing)} -- available columns: "
-                        f"{sorted(schema_names)}"
-                    )
-                condition = condition & dimension_expr.fill_null(False)
-            if plan.value_where is not None:
-                condition = condition & value_predicate_mask(plan.value_where, ["value"])
-            new_value = parse_value_expr(plan.expression, ["value"])
-            self.lf = self.lf.with_columns(
-                pl.when(condition).then(new_value).otherwise(pl.col("value")).alias("value")
-            )
+        try:
+            self.lf = apply_calculate_plans(self.lf, self._calculate_plans)
+        except ExpressionError as exc:
+            self._error(str(exc))
 
     # -- stage 5: sort/select ---------------------------------------------------------------
 
@@ -546,9 +668,10 @@ class BaseAnalysis:
         self._collapse_group(group_by_cols)
 
     def _collapse_group(self, group_by_cols):
-        """Collapse `self.lf`/`self.raster_groups` per `group_by_cols`. See the module/
-        class docstring's hook contract -- overridden per subclass; there is no
-        grid-agnostic default.
+        """Collapse `self.lf` (a vector frame) or `self.lf`/`self._band_groups`/
+        `self._band_ops` (a raster frame) per `group_by_cols`. See the module/class
+        docstring's hook contract -- overridden per subclass; there is no grid-agnostic
+        default.
         """
         raise NotImplementedError
 

@@ -191,8 +191,7 @@ class TestShouldFoldGroupBy:
 
 # Runs in a subprocess so each measurement gets its own `ru_maxrss` high-water mark
 # (a single process's peak only grows, so folded-then-unfolded in one process would
-# report the unfolded run's peak for both). Mirrors scratch/raster_io_plugin/mitigate.py's
-# own `peak_mb()` pattern.
+# report the unfolded run's peak for both).
 _MEMORY_WORKER = """
 import json
 import resource

@@ -8,8 +8,8 @@ conjuncts are handed to `pl.sql_expr` -- or even a full `lf.sql(...)` call -- la
 unrestricted, the same as always. A value conjunct is different in kind, not just in
 which columns it can name: it runs on the hot path Polars can stream, so an expression
 shaped wrong doesn't just give a bad answer -- it can force a full materialization the
-query would otherwise never need. The measured example (see raster_source.py's module
-docstring and the plan this module implements): two queries returning the identical
+query would otherwise never need. The measured example (see `sources.py`'s module
+docstring): two queries returning the identical
 126,174-group result set differ 94x in memory (285 MB vs 26859 MB) purely on whether one
 comparison in the predicate was `pl.col(x) == pl.col(x).min()` instead of a literal. An
 aggregate inside a filter forces Polars to see every row before it can evaluate what was

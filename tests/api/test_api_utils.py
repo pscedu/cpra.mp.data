@@ -160,10 +160,10 @@ class _FakeCustomAnalysisClass:
 
 
 class TestGetAnalysisClass:
-    """`get_analysis_class` (plan §3.2a) -- the named-analysis counterpart to
+    """`get_analysis_class` -- the named-analysis counterpart to
     `get_visualization_class` above, generalizing its exact 404 (unknown name) / 400
     (wrong route kind) split rather than reinventing it. The real registry
-    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent Phase 2 change that may not exist
+    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent change that may not exist
     yet (see `api/utils.py`'s guarded import) -- these tests monkeypatch a small fake
     registry directly onto `cpra.mp.data.api.utils.ANALYSES` (the module-global name
     `get_analysis_class` itself reads), so they pass identically whether or not the real

@@ -13,6 +13,7 @@ https://docs.pola.rs/user-guide/plugins/io_plugins/
 """
 
 import itertools
+from typing import NamedTuple
 
 import numpy as np
 import polars as pl
@@ -298,10 +299,9 @@ def count_by_value(paths, row_indices, bands, crosswalk_path, zone_ids, value_wh
     calling in (via its already-computed `n_bands`), since a multi-band request has no
     single natural (zone, value) shape: counting each band's values into the same `value`
     column would silently conflate unrelated variables/years, and counting them into
-    separate columns would need a different output shape per band count. Per the plan's
-    "silently wrong multi-band results are not acceptable" rule, this is refused rather
-    than guessed at -- re-asserted here defensively rather than only trusted from the
-    caller.
+    separate columns would need a different output shape per band count. A silently wrong
+    multi-band result is not acceptable, so this is refused rather than guessed at --
+    re-asserted here defensively rather than only trusted from the caller.
 
     `value_where`, when given, is applied the same way `_summarize_zone_stats_plugin` (the
     other summarize_aggregate path) applies it: masked to null against the (single) band's
@@ -394,13 +394,37 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
     descriptions, so a caller can map result columns straight back to its own dimension
     rows without depending on metadata a source file may not carry.
 
-    ``zone_ids``, when given, is the sorted array of destination zone IDs to summarize
-    (as resolved in `Dataset._apply_transform_params_raster`): a `grid_cell` column holds
-    the destination zone ID from the crosswalk raster at `zones_path`, and pixels whose
-    zone is not in `zone_ids` (including crosswalk nodata) are dropped in the source.
-    ``zone_ids=None`` is the dense, one-row-per-pixel shape instead: every pixel, in raster
-    order, no crosswalk read and no `grid_cell` column -- not used by summarize, but the
-    shape a future full-resolution consumer (e.g. downloads) would need.
+    ``zones_path``/``zone_ids`` are now two INDEPENDENT knobs rather than one coupled
+    pair: scanning bands windowed is split from joining zone IDs, so the latter can be
+    the band-wide lowering of `project` instead of being baked into the scan.
+
+    - ``zones_path=None`` (`zone_ids` must then also be `None` -- see the guard below):
+      the original dense, one-row-per-pixel shape -- every pixel, in raster order, no
+      crosswalk read and no `grid_cell` column at all. Unchanged from before this split.
+    - ``zones_path`` given, ``zone_ids=None``: NEW -- attach a `grid_cell` column
+      (this window's own zone-crosswalk pixel value, read positionally alongside the
+      band data) to EVERY pixel, dropping none. Still the dense, position-preserving
+      shape (pixel count in == pixel count out), just carrying an extra column. This is
+      the "join zone IDs" half of `project`'s band-wide lowering: `scan_rasters` only
+      ATTACHES the raw zone id here; deciding which zones survive and collapsing them
+      is an ordinary downstream `filter`+`group_by`, so `project` can run at whatever
+      position a pipeline declares it, rather than always being folded into the initial
+      scan. (`raster.apply_project_band_wide` used to be that downstream consumer; it was
+      deleted as unused once the raster interpreter landed and none of the raster-side
+      rejections it would have served turned out to be relaxable. This attach-only mode
+      is still exercised directly by
+      `tests/api/test_raster_source.py::TestScanRastersAttachWithoutFilter`.)
+    - ``zones_path`` and ``zone_ids`` both given: the original zoned/TABULAR shape --
+      a `grid_cell` column holds the destination zone ID, and pixels whose zone is not
+      in `zone_ids` (including crosswalk nodata) are DROPPED in the source. Unchanged:
+      this is still what `Dataset._summarize_zone_stats_plugin`/`count_by_value` use,
+      and dropping here (rather than in a downstream `filter`) remains correct for them
+      specifically because their output is immediately `group_by`'d -- row COUNT was
+      never part of their contract, only group membership -- unlike a raster-output
+      query, whose pixel count is its contract.
+
+    ``zone_ids`` without ``zones_path`` is rejected: there is no crosswalk to source a
+    zone ID from.
 
     ``value_dtype=None`` infers the schema from `paths[0]` -- see `_raster_dtype`.
 
@@ -411,8 +435,11 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
     """
     if not paths:
         raise ValueError("scan_rasters requires at least one source path")
+    if zone_ids is not None and zones_path is None:
+        raise ValueError("scan_rasters: zone_ids requires zones_path")
     zones_path = str(zones_path) if zones_path is not None else None
-    dense = zone_ids is None
+    attach_zone = zones_path is not None
+    filter_to_zones = zone_ids is not None
 
     names_by_path = [[f"b{i}" for i in indices] for indices in row_indices]
     bands_by_path = [
@@ -424,7 +451,7 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
         value_dtype = _raster_dtype(paths[0])
 
     cols_schema = {name: value_dtype for name in all_names}
-    schema = pl.Schema(cols_schema if dense else {"grid_cell": pl.Int32, **cols_schema})
+    schema = pl.Schema({"grid_cell": pl.Int32, **cols_schema} if attach_zone else cols_schema)
 
     def source(with_columns, predicate, n_rows, batch_size):
         # --- projection pushdown: only decompress the bands the query asks for ---
@@ -477,17 +504,26 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
             # thread, so entering the env here takes the thread-local path and cannot leak
             # into a concurrent request the way entering it on the calling coroutine could.
             with raster_gdal_env():
-                if dense:
+                if not attach_zone:
                     keep = None
                     zones = None
                 else:
                     with rio.open(zones_path) as zsrc:
                         zones = zsrc.read(1, window=window).ravel()
 
-                    # Source-level spatial filter: keep only pixels in a summarized zone.
-                    keep = _zone_keep_positions(zone_ids, zones)
-                    if keep.size == 0:
-                        continue
+                    if filter_to_zones:
+                        # Source-level spatial filter: keep only pixels in a
+                        # summarized zone (the original zoned-mode behavior, unchanged).
+                        keep = _zone_keep_positions(zone_ids, zones)
+                        if keep.size == 0:
+                            continue
+                    else:
+                        # NEW: attach every pixel's own zone id, dropping nothing --
+                        # the "join zone IDs" half of `project`'s band-wide lowering,
+                        # split from the "filter to these specific destination zones"
+                        # half so a downstream op can do the latter at its own
+                        # declared position instead of it being baked into this scan.
+                        keep = None
 
                 cols = {}
                 nodata_by_col = {}
@@ -501,10 +537,11 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
                         nodata_by_col[name] = nodata
                     del data
 
-            if dense:
+            if not attach_zone:
                 df = pl.DataFrame(cols)
             else:
-                df = pl.DataFrame({"grid_cell": zones[keep].astype("int32"), **cols})
+                zone_col = zones if keep is None else zones[keep]
+                df = pl.DataFrame({"grid_cell": zone_col.astype("int32"), **cols})
             del cols
 
             # Nodata -> null, so every downstream aggregate skips it (including `mean`'s
@@ -720,104 +757,129 @@ def _paired_lookup_values(lookup_array, pairing_ids, pairing_valid):
     return out
 
 
+class PairedCrosswalk(NamedTuple):
+    """One `project`/`join` step's coarse crosswalk, generalizing
+    `scan_paired`'s former single ``pairing_crosswalk_path``/``paired_lookups`` pair so
+    more than one coarse dataset can be paired onto the same fine scan in a single pass.
+
+    `name` is the caller's own identifier for the join step producing this crosswalk --
+    it becomes the prefix of every column this crosswalk emits (``f"{name}{i}"``, ``i``
+    the same row-position index ``b<i>``/``_px`` share), rather than every join
+    converging on one baked-in ``p<i>`` column the way the single-crosswalk shape did.
+    A caller pairing exactly one coarse dataset, wanting the original naming back, gets
+    it back by passing ``name="p"``.
+
+    `path` is a pairing-crosswalk raster co-registered with the fine grid -- may be the
+    SAME file across two different `PairedCrosswalk`s (e.g. two join steps both pairing
+    against `hydro_compartment_v001` with different coarse selections); nothing here
+    assumes distinct files. `lookups` is ``{calendar_step: (ids, values)}``, exactly the
+    per-crosswalk shape the old `paired_lookups` parameter had -- one such mapping per
+    crosswalk instead of one for the whole call.
+    """
+
+    name: str
+    path: object
+    lookups: dict
+
+
 def scan_paired(
     paths,
     row_indices,
     bands,
-    zones_path,
-    zone_ids,
-    pairing_crosswalk_path,
-    paired_lookups,
+    crosswalks,
     calendar_steps,
+    zones_path=None,
+    zone_ids=None,
     value_dtype=None,
     mask_nodata=True,
 ):
-    """Return a LazyFrame of (grid_cell, <b<i> fine columns>, <p<i> paired columns>)
-    over one or more co-registered fine-grid COGs, generalizing `scan_rasters` so a
-    fine dataset's own pixel values and a coarse dataset's PAIRED, per-calendar-step
-    values coexist as aligned columns in one frame, per pixel, per shared calendar step.
+    """Return a LazyFrame of (``[grid_cell]``, ``_px``, ``<b<i> fine columns>``,
+    ``<crosswalk paired columns>``) over one or more co-registered fine-grid COGs,
+    generalizing `scan_rasters` so a fine dataset's own pixel values and one or more
+    coarse datasets' PAIRED, per-calendar-step values coexist as aligned columns in one
+    frame, per pixel, per shared calendar step.
 
     This is the executor for an analysis pipeline's spatial join over co-registered
     rasters: the key is grid_cell plus every shared dimension, executed positionally
-    rather than as a hash join -- the fine dataset's pixels and the coarse dataset's
+    rather than as a hash join -- the fine dataset's pixels and a coarse dataset's
     projection onto those same pixels never need one at all, because a pairing
     crosswalk raster already gives, for every fine pixel, the coarse zone id whose
     value it should be paired with. That is the same insight `scan_broadcast` already
     exploits (an O(1) lookup array beats a join when the key range is small and dense)
     generalized across a calendar axis: `scan_broadcast` broadcasts ONE coarse
     selection onto every pixel; this broadcasts a DIFFERENT coarse selection per fine
-    band, one per calendar step.
+    band, one per calendar step -- and potentially more than one coarse dataset at
+    once, each keeping `_dense_lookup_array`'s O(1) lookup as the
+    band-wide lowering of its own `join` rather than a hash join against a small dense
+    key range (measured better in `scan_broadcast`'s own docstring; not replaced here).
 
     ``paths``, ``row_indices`` and ``bands`` are exactly `group_rows_by_path`'s return
     values, identically to `scan_rasters` -- one fine-grid dataset per unique file, the
     caller's own row positions, and the (1-based) band numbers each file supplies. Fine
     value columns are named ``b<row index>`` exactly as `scan_rasters` names them, so a
-    caller can map columns back to its own dimension rows the same way. Each fine band
-    gets a PAIRED column, named ``p<row index>`` (same row index as its ``b<row
-    index>`` sibling), holding the coarse value looked up through `pairing_crosswalk_path`
-    for that band's calendar step.
+    caller can map columns back to its own dimension rows the same way.
 
-    ``zones_path``/``zone_ids`` name the OUTPUT zone crosswalk -- exactly `scan_rasters`'
-    zoned-mode machinery, including a possibly different crosswalk than the pairing one:
-    a `grid_cell` column holds the destination zone id, and a pixel outside `zone_ids`
-    (including this crosswalk's own nodata) is DROPPED, matching `scan_rasters`. Unlike
-    `scan_rasters`, this zone set is mandatory here (there is no dense, zone-less mode) --
-    a paired scan's whole point is to attach a per-pixel output zone identity alongside
-    the paired value, and `project`/`join`'s planned output always groups by one.
+    ``crosswalks`` is a sequence of `PairedCrosswalk`. Each fine band gets one PAIRED
+    column PER crosswalk, named ``f"{crosswalk.name}{row index}"`` (same row index as
+    its ``b<row index>`` sibling), holding that crosswalk's coarse value looked up for
+    that band's calendar step. Crosswalk names must be unique (enforced below) -- they
+    are the only thing keeping two joins' columns apart in one frame.
 
-    ``pairing_crosswalk_path`` is a THIRD raster -- independent of ``zones_path`` (though
-    it may be the same file, e.g. re-summarizing a paired value back onto the same zones
-    that supplied it) -- read per window to get each pixel's coarse (pairing) zone id.
+    ``zones_path``/``zone_ids`` name the OUTPUT zone crosswalk and are now two
+    INDEPENDENT, OPTIONAL knobs, mirroring `scan_rasters`' own `attach_zone`/
+    `filter_to_zones` split -- the output zone crosswalk is optional because a
+    raster-output query has no output zones:
 
-    ``paired_lookups`` is ``{calendar_step: (ids, values)}``: for every calendar step any
-    selected fine band needs (see ``calendar_steps`` below), the coarse dataset's own
-    selection collapsed to one row per pairing-zone id -- ``ids`` sorted, ``values`` any
-    numeric NumPy dtype aligned to it, exactly `scan_broadcast`'s ``broadcast_ids``/
-    ``broadcast_values`` contract, one such pair per shared calendar step instead of one
-    for the whole call. A calendar step present in ``calendar_steps`` but absent from
-    ``paired_lookups`` (the coarse dataset simply has no row for that step at all) is
-    treated identically to "id absent from an existing lookup": every pixel's paired
-    value for that band is null. The dense lookup array for each calendar step is built
-    once, up front (see `_dense_lookup_array`), not per window -- the same reasoning
-    `scan_broadcast` documents for why this is a lookup and not a `.join()`.
+    - ``zones_path=None`` (`zone_ids` must then also be `None`): NO output zone at all
+      -- no `grid_cell` column, nothing filtered. This is the raster-output/write shape:
+      every fine pixel survives, in raster order, identified only by `_px` (see below).
+    - ``zones_path`` given, ``zone_ids=None``: attach a `grid_cell` column (this
+      window's own zone-crosswalk pixel value) to EVERY pixel, dropping none -- the
+      position-preserving "join zone IDs without filtering" shape `scan_rasters` added
+      for the same reason.
+    - ``zones_path`` and ``zone_ids`` both given: the original zoned/TABULAR shape -- a
+      `grid_cell` column holds the destination zone id, and a pixel outside `zone_ids`
+      (including this crosswalk's own nodata) is DROPPED. This is what a zonal paired
+      aggregate uses today.
 
-    ``calendar_steps`` aligns each ROW POSITION (the same index space ``row_indices``'
-    integers live in, and that `f"b{i}"`/`f"p{i}"` are named after) to the calendar key
-    (e.g. a `calendar_year` value) whose ``paired_lookups`` entry supplies that band's
-    coarse value -- so ``calendar_steps[i]`` is the key for band ``i``, for every ``i``
-    appearing anywhere in ``row_indices``. This keeps calendar alignment a caller-side
-    fact (the caller already knows which calendar step each of its own rows is), rather
-    than something this source re-derives; the source only does the per-pixel lookup
-    once alignment has been decided.
+    ``_px`` is a ROW-MAJOR pixel index over the FULL raster extent (``row * width +
+    col``, not window-relative), carried on every row regardless of which of the three
+    modes above is in effect. It costs one `arange`-and-broadcast per window -- no file
+    read -- so, like `grid_cell` above, it is always computed and attached rather than
+    gated on projection pushdown. This is
+    the positional information `paired.py`'s module docstring says `scan_paired` lacked
+    -- carrying it is what makes a dense-mode scan (no `zones_path`) usable to drive a
+    raster WRITE or a tile render, putting each pixel's value back at its own window
+    position, rather than only ever a TABULAR zonal aggregate.
 
     ``value_dtype=None`` infers the fine schema from ``paths[0]``, exactly `scan_rasters`.
     ``mask_nodata=True`` nulls each fine column's own nodata sentinel before anything
     downstream sees it, exactly `scan_rasters` -- paired columns have no sentinel of
-    their own to mask; their null-or-not comes entirely from the pairing lookup below.
+    their own to mask; their null-or-not comes entirely from their own pairing lookup.
 
     Null semantics -- three distinct miss kinds, two different outcomes:
 
-    - **Output zone miss** (this pixel's ``zones_path`` id is nodata or not in
-      ``zone_ids``): the pixel is DROPPED entirely, matching `scan_rasters` and
-      `scan_broadcast` -- there is no output zone to attribute it to, so no row of any
-      shape can represent it.
+    - **Output zone miss** (only possible when ``zones_path``/``zone_ids`` filter --
+      this pixel's zone crosswalk id is nodata or not in ``zone_ids``): the pixel is
+      DROPPED entirely, matching `scan_rasters` and `scan_broadcast` -- there is no
+      output zone to attribute it to, so no row of any shape can represent it.
     - **Fine nodata** (this pixel's raw value at a selected band equals that file's own
       nodata sentinel): that band's ``b<i>`` is NULL, matching `scan_rasters`; the row
       SURVIVES, since other bands/paired columns at this pixel may still be valid.
-    - **Pairing miss** (this pixel's ``pairing_crosswalk_path`` id is nodata/absent, OR
-      that id has no row in this band's calendar step's ``paired_lookups`` entry, OR
-      that calendar step is missing from ``paired_lookups`` altogether): that band's
-      ``p<i>`` is NULL. The row SURVIVES -- this is the deliberate divergence from
-      `scan_broadcast`'s drop-on-miss rule. `scan_broadcast` can drop, because dropping
-      and nulling are indistinguishable to every aggregate a caller applies afterwards
-      (`count`/`sum`/`mean`/`min`/`max` all skip a row the same way they skip a null).
-      A paired scan has no such guarantee: the exit-criterion query
-      (``marsh > 0.5 AND sal > 5.5``) is a predicate over BOTH columns at once, and
-      Polars' `&` propagates null in a way that still lets the fine side's own
-      condition matter to which branch of an `OR` fires, or to a later step that only
-      reads ``b<i>``. Dropping the row here would silently discard information a
-      downstream predicate over the fine column alone is entitled to see; keeping it
-      null instead defers that decision to whatever operator consumes this frame next.
+    - **Pairing miss** (this pixel's crosswalk id is nodata/absent, OR that id has no
+      row in this band's calendar step's ``lookups`` entry, OR that calendar step is
+      missing from ``lookups`` altogether): that band's paired column is NULL. The row
+      SURVIVES -- this is the deliberate divergence from `scan_broadcast`'s drop-on-miss
+      rule. `scan_broadcast` can drop, because dropping and nulling are indistinguishable
+      to every aggregate a caller applies afterwards (`count`/`sum`/`mean`/`min`/`max`
+      all skip a row the same way they skip a null). A paired scan has no such
+      guarantee: the exit-criterion query (``marsh > 0.5 AND sal > 5.5``) is a predicate
+      over BOTH columns at once, and Polars' `&` propagates null in a way that still
+      lets the fine side's own condition matter to which branch of an `OR` fires, or to
+      a later step that only reads ``b<i>``. Dropping the row here would silently
+      discard information a downstream predicate over the fine column alone is entitled
+      to see; keeping it null instead defers that decision to whatever operator
+      consumes this frame next.
 
     GDAL/threading discipline is identical to `scan_rasters`/`scan_broadcast`: nothing
     GDAL-related (an entered env, an open dataset handle) may cross the `yield` below,
@@ -829,36 +891,61 @@ def scan_paired(
     """
     if not paths:
         raise ValueError("scan_paired requires at least one fine-grid source path")
-    zones_path = str(zones_path)
-    pairing_crosswalk_path = str(pairing_crosswalk_path)
+    if zone_ids is not None and zones_path is None:
+        raise ValueError("scan_paired: zone_ids requires zones_path")
+    zones_path = str(zones_path) if zones_path is not None else None
+    attach_zone = zones_path is not None
+    filter_to_zones = zone_ids is not None
+
+    crosswalks = [cw._replace(path=str(cw.path)) for cw in crosswalks]
+    crosswalk_by_name = {cw.name: cw for cw in crosswalks}
+    if len(crosswalk_by_name) != len(crosswalks):
+        raise ValueError("scan_paired: crosswalk names must be unique")
 
     fine_names_by_path = [[f"b{i}" for i in indices] for indices in row_indices]
-    paired_names_by_path = [[f"p{i}" for i in indices] for indices in row_indices]
     calendar_keys_by_path = [[calendar_steps[i] for i in indices] for indices in row_indices]
     bands_by_path = [
         list(path_bands) if path_bands is not None else list(range(1, len(names) + 1))
         for path_bands, names in zip(bands, fine_names_by_path)
     ]
     all_fine_names = [n for names in fine_names_by_path for n in names]
-    all_paired_names = [n for names in paired_names_by_path for n in names]
     fine_name_set = set(all_fine_names)
-    paired_name_set = set(all_paired_names)
 
     if value_dtype is None:
         value_dtype = _raster_dtype(paths[0])
 
-    # Built once, up front -- not per window, exactly `scan_broadcast`'s reasoning for
-    # why its own lookup is built outside `source()`. A calendar step that never
-    # appears in `paired_lookups` simply has no entry here; `_paired_lookup_values`
-    # treats a missing entry (`.get(...)` returning `None`) the same as an existing but
-    # empty one.
-    lookup_arrays = {
-        step: _dense_lookup_array(np.asarray(ids), np.asarray(values)) for step, (ids, values) in paired_lookups.items()
+    # Per-crosswalk column names, one row-position-indexed list per path, shaped exactly
+    # like `fine_names_by_path` above so projection pushdown can be computed the same
+    # way for either. Lookup arrays are built once here, up front, per crosswalk -- not
+    # per window -- the same reasoning `scan_broadcast` documents for why this is a
+    # lookup and not a `.join()`. A calendar step absent from a crosswalk's own
+    # `lookups` simply has no entry; `_paired_lookup_values` treats a missing entry
+    # (`.get(...)` returning `None`) the same as an existing but empty one.
+    names_by_crosswalk = {cw.name: [[f"{cw.name}{i}" for i in indices] for indices in row_indices] for cw in crosswalks}
+    lookup_arrays_by_crosswalk = {
+        cw.name: {step: _dense_lookup_array(np.asarray(ids), np.asarray(values)) for step, (ids, values) in cw.lookups.items()}
+        for cw in crosswalks
     }
+    all_paired_names = [name for names in names_by_crosswalk.values() for path_names in names for name in path_names]
+    paired_name_set = set(all_paired_names)
+
+    # A crosswalk named e.g. "b" would emit "b0", "b1", ... -- indistinguishable from
+    # the fine columns' own `f"b{i}"` names, and a "grid_cell"/"_px"-named crosswalk
+    # would collide with those two reserved columns. Any of these would silently
+    # overwrite a column in the `dict` merge below rather than raise, which is exactly
+    # the kind of silent-wrong-answer failure the rest of this module tries hard to
+    # avoid -- reject it here instead, at scan-construction time.
+    reserved = fine_name_set | {"grid_cell", "_px"}
+    colliding = paired_name_set & reserved
+    if colliding:
+        raise ValueError(
+            f"scan_paired: crosswalk name collides with a reserved column name: {sorted(colliding)}"
+        )
 
     schema = pl.Schema(
         {
-            "grid_cell": pl.Int32,
+            **({"grid_cell": pl.Int32} if attach_zone else {}),
+            "_px": pl.Int64,
             **{name: value_dtype for name in all_fine_names},
             **{name: pl.Float64 for name in all_paired_names},
         }
@@ -869,13 +956,17 @@ def scan_paired(
 
         # --- projection pushdown: only decompress a band, or look up a paired value,
         # the query actually asks for. A paired column needs no file read at all (its
-        # value comes entirely from the pairing crosswalk plus the precomputed lookup
-        # array), so requesting `p<i>` alone never opens `b<i>`'s backing file.
+        # value comes entirely from a pairing crosswalk plus its precomputed lookup
+        # array), so requesting one crosswalk's column alone never opens the fine file,
+        # nor any OTHER crosswalk's raster. `grid_cell` and `_px` are excluded from this
+        # decision (like `scan_rasters`' `grid_cell`) -- both are cheap to attach
+        # wholesale and are computed unconditionally below.
         wanted = (
-            fine_name_set | paired_name_set if with_columns is None else {c for c in with_columns if c != "grid_cell"}
+            fine_name_set | paired_name_set
+            if with_columns is None
+            else {c for c in with_columns if c not in ("grid_cell", "_px")}
         )
         wanted_fine = wanted & fine_name_set
-        wanted_paired = wanted & paired_name_set
 
         plan = []
         for path, names, path_bands in zip(paths, fine_names_by_path, bands_by_path):
@@ -883,38 +974,51 @@ def scan_paired(
             if picked:
                 plan.append((str(path), [n for n, _ in picked], [b for _, b in picked]))
 
-        paired_specs = [
-            (name, lookup_arrays.get(step))
-            for names, keys in zip(paired_names_by_path, calendar_keys_by_path)
-            for name, step in zip(names, keys)
-            if name in wanted_paired
-        ]
+        crosswalk_plans = []
+        for cw in crosswalks:
+            specs = [
+                (name, lookup_arrays_by_crosswalk[cw.name].get(step))
+                for names, keys in zip(names_by_crosswalk[cw.name], calendar_keys_by_path)
+                for name, step in zip(names, keys)
+                if name in wanted
+            ]
+            if specs:
+                crosswalk_plans.append((cw, specs))
 
-        if not plan and not paired_specs:
+        if not plan and not crosswalk_plans:
             return
 
         n_selected_fine = sum(len(names) for _p, names, _b in plan)
-        n_selected_paired = len(paired_specs)
+        n_selected_paired = sum(len(specs) for _cw, specs in crosswalk_plans)
 
         # Window/batch sizing follows `scan_rasters`' shape: derived once, from the
         # first source surviving projection pushdown, using the shared
         # `raster_blocks_per_batch` budget rather than a source-specific knob. The
         # reference raster for block shape is a fine-grid file when one is open (its
-        # tiling is what actually governs decompression cost); when no fine file is
-        # open at all (a request selecting only paired columns), `zones_path` -- always
-        # opened -- stands in, since it is co-registered with the fine grid by
-        # construction. Each paired column's per-pixel footprint is a Float64 lookup
-        # result plus a same-shape pairing-id/validity intermediate (mirroring
-        # `scan_broadcast`'s own inflation reasoning for its lookup arrays), approximated
-        # here as 2 "band units" at the reference itemsize rather than re-deriving a
-        # separate constant.
-        ref_path = plan[0][0] if plan else zones_path
+        # tiling is what actually governs decompression cost); failing that, the output
+        # zone crosswalk when attached; failing that, the first surviving pairing
+        # crosswalk -- all co-registered with the fine grid by construction, so any one
+        # of them gives the same block geometry. Each paired column's per-pixel
+        # footprint is a Float64 lookup result plus a same-shape pairing-id/validity
+        # intermediate (mirroring `scan_broadcast`'s own inflation reasoning for its
+        # lookup arrays), approximated here as 2 "band units" at the reference itemsize
+        # per COLUMN rather than per crosswalk raster opened -- an intentional
+        # over-estimate when several columns share one crosswalk file (that file's own
+        # id/validity arrays are read once per window, not once per column), which
+        # only makes the batch-size heuristic more conservative, never less.
+        if plan:
+            ref_path = plan[0][0]
+        elif zones_path is not None:
+            ref_path = zones_path
+        else:
+            ref_path = crosswalk_plans[0][0].path
         with raster_gdal_env(), rio.open(ref_path) as ref_src:
             block_height, block_width = ref_src.block_shapes[0]
             ref_itemsize = max(np.dtype(ref_src.dtypes[0]).itemsize, 8)
             n_units = max(n_selected_fine + n_selected_paired * 2, 1)
             blocks_per_batch = raster_blocks_per_batch(n_units, block_height, block_width, ref_itemsize)
             window_list = list(_batched_windows(ref_src, blocks_per_batch))
+            raster_width = ref_src.width
 
         for window in window_list:
             if remaining is not None and remaining <= 0:
@@ -923,24 +1027,33 @@ def scan_paired(
             # See `scan_rasters`'s identical comment at its own `yield`: nothing
             # GDAL-related may cross the `yield` below.
             with raster_gdal_env():
-                with rio.open(zones_path) as zsrc:
-                    zones = zsrc.read(1, window=window).ravel()
-
-                keep = _zone_keep_positions(zone_ids, zones)
-                if keep.size == 0:
-                    continue
-
-                pairing_ids = None
-                pairing_valid = None
-                if paired_specs:
-                    with rio.open(pairing_crosswalk_path) as psrc:
-                        pairing_ids_full = psrc.read(1, window=window).ravel()
-                        pairing_nodata = psrc.nodata
-                    pairing_ids = pairing_ids_full[keep]
-                    if pairing_nodata is not None:
-                        pairing_valid = pairing_ids != pairing_nodata
+                if attach_zone:
+                    with rio.open(zones_path) as zsrc:
+                        zones = zsrc.read(1, window=window).ravel()
+                    if filter_to_zones:
+                        # Source-level spatial filter: keep only pixels in a
+                        # summarized output zone (the original zoned-mode behavior).
+                        keep = _zone_keep_positions(zone_ids, zones)
+                        if keep.size == 0:
+                            continue
                     else:
-                        pairing_valid = np.ones(pairing_ids.shape, dtype=bool)
+                        # Attach every pixel's own output zone id, dropping nothing --
+                        # mirrors `scan_rasters`' identical split.
+                        keep = None
+                else:
+                    # No output zone crosswalk at all: the raster-output/write shape.
+                    # Nothing is read here and nothing is dropped; `_px` alone
+                    # identifies each surviving row's position.
+                    zones = None
+                    keep = None
+
+                # Row-major pixel index over the FULL raster extent (not window-
+                # relative) -- see this function's own docstring for why this is
+                # always computed, never gated on projection pushdown.
+                rows = np.arange(window.row_off, window.row_off + window.height, dtype="int64")
+                px_cols = np.arange(window.col_off, window.col_off + window.width, dtype="int64")
+                px_full = (rows[:, None] * raster_width + px_cols[None, :]).ravel()
+                px = px_full if keep is None else px_full[keep]
 
                 cols = {}
                 nodata_by_col = {}
@@ -950,17 +1063,31 @@ def scan_paired(
                         nodata = src.nodata
                     for i, name in enumerate(names):
                         flat = data[i].ravel()
-                        cols[name] = flat[keep]
+                        cols[name] = flat if keep is None else flat[keep]
                         nodata_by_col[name] = nodata
                     del data
 
-                paired_cols = {
-                    name: _paired_lookup_values(lookup_array, pairing_ids, pairing_valid)
-                    for name, lookup_array in paired_specs
-                }
+                paired_cols = {}
+                for cw, specs in crosswalk_plans:
+                    with rio.open(cw.path) as psrc:
+                        pairing_ids_full = psrc.read(1, window=window).ravel()
+                        pairing_nodata = psrc.nodata
+                    pairing_ids = pairing_ids_full if keep is None else pairing_ids_full[keep]
+                    if pairing_nodata is not None:
+                        pairing_valid = pairing_ids != pairing_nodata
+                    else:
+                        pairing_valid = np.ones(pairing_ids.shape, dtype=bool)
+                    for name, lookup_array in specs:
+                        paired_cols[name] = _paired_lookup_values(lookup_array, pairing_ids, pairing_valid)
 
-            df = pl.DataFrame({"grid_cell": zones[keep].astype("int32"), **cols, **paired_cols})
-            del cols, paired_cols
+            data = {}
+            if attach_zone:
+                data["grid_cell"] = (zones if keep is None else zones[keep]).astype("int32")
+            data["_px"] = px
+            data.update(cols)
+            data.update(paired_cols)
+            df = pl.DataFrame(data)
+            del cols, paired_cols, data
 
             # Fine-side nodata -> null, identical to `scan_rasters`.
             if mask_nodata:
@@ -975,8 +1102,9 @@ def scan_paired(
             # Paired-column misses arrive as `nan` (see `_paired_lookup_values`); turn
             # them into a true Polars null here, once, rather than at every miss branch
             # above.
-            if paired_specs:
-                df = df.with_columns([pl.col(name).fill_nan(None) for name, _ in paired_specs])
+            if crosswalk_plans:
+                fill_names = [name for _cw, specs in crosswalk_plans for name, _ in specs]
+                df = df.with_columns([pl.col(name).fill_nan(None) for name in fill_names])
 
             # --- predicate pushdown: drop rows before they leave the source ---
             if predicate is not None:
