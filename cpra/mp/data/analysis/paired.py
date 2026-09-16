@@ -86,6 +86,7 @@ from cpra.mp.data.analysis.utils import (
     group_rows_by_path,
     raster_blocks_per_batch,
     raster_gdal_env,
+    tile_read_shape,
     tile_source_window,
     warp_window_to_tile,
 )
@@ -512,15 +513,16 @@ def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwar
     return True
 
 
-def _paired_scan(plan, read_windows=None):
+def _paired_scan(plan, read_windows=None, read_shapes=None):
     """The scan both output paths share: every raster band, plus the pivoted vector table
     looked up per pixel through the pairing crosswalk.
 
     A free function taking `plan` rather than a method, because what it builds belongs to
     the REQUEST (these bands, this pairing crosswalk, this pivot) and not to the plan
     object, and because having the write path and the tile path call one function is the
-    whole point -- the two differ only in `read_windows` (the whole raster, batched, versus
-    one tile's source footprint) and in what they do with the collapsed rows.
+    whole point -- the two differ only in `read_windows`/`read_shapes` (the whole raster,
+    batched, at full resolution, versus one tile's source footprint decimated to roughly the
+    tile's own resolution) and in what they do with the collapsed rows.
 
     Returns `(lf, metadata_df)`; the caller selects `plan._collapse_expr()` off `lf` and,
     for `count`, keeps `PAIRED_CROSSWALK_NAME` beside it for `_count_zone_gate`.
@@ -561,6 +563,7 @@ def _paired_scan(plan, read_windows=None):
             )
         ],
         read_windows=read_windows,
+        read_shapes=read_shapes,
     )
     return lf, metadata_df
 
@@ -592,7 +595,8 @@ def _paired_select_columns(plan, collapse_expr):
 
 async def _paired_notebook_tile(plan: PairedAnalysis, x, y, z, format, tile_size=256):
     """The same `_paired_scan` the write path runs, restricted to the one source window the
-    tile's footprint covers, collapsed the same way, and warped onto the tile grid LAST.
+    tile's footprint covers -- and decimated to roughly the tile's own resolution while
+    reading it -- collapsed the same way, and warped onto the tile grid LAST.
 
     The tile is rendered in the sources' OWN CRS and reprojected only once the per-pixel
     band algebra is done, which is what lets that algebra be the identical scan-and-collapse
@@ -625,17 +629,26 @@ async def _paired_notebook_tile(plan: PairedAnalysis, x, y, z, format, tile_size
         # rendered tile of nothing, not a missing tile.
         tile_values = np.full((1, tile_size, tile_size), plan.nodata_value, dtype=plan.out_dtype)
     else:
-        lf, _metadata_df = _paired_scan(plan, read_windows=[window])
+        # The scan is charged per PIXEL of the window, and a low-zoom tile's window is most
+        # of the raster: at z=6 on morph_pixel that is ~108M pixels through the collapse to
+        # render 65,536. `tile_read_shape` decimates the read to about the tile's own
+        # resolution (GDAL serves it from the source's overviews), so the row count follows
+        # the tile rather than the zoom. None -- a window already at tile resolution,
+        # z >~ 12 -- scans and warps exactly as it did before.
+        read_shape = tile_read_shape(window, tile_size)
+        lf, _metadata_df = _paired_scan(plan, read_windows=[window], read_shapes=[read_shape])
         frame = lf.select(_paired_select_columns(plan, plan._collapse_expr())).collect()
         values = _collapse_paired_frame(plan, frame)
+        rows, cols = read_shape if read_shape is not None else (window.height, window.width)
         tile_values = warp_window_to_tile(
-            values.astype(plan.out_dtype, copy=False).reshape((1, window.height, window.width)),
+            values.astype(plan.out_dtype, copy=False).reshape((1, rows, cols)),
             window=window,
             src_transform=src_transform,
             src_crs=src_crs,
             tile_bounds=tile_bounds,
             tile_size=tile_size,
             nodata=plan.nodata_value,
+            out_shape=read_shape,
         )
 
     legend = _legend_for(plan.color_map)

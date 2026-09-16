@@ -45,8 +45,10 @@ from cpra.mp.data.analysis import utils as utils_module
 from cpra.mp.data.analysis.utils import (
     TILE_CRS,
     TILE_READ_BUFFER_PX,
+    TILE_READ_OVERSAMPLE,
     _warp_array_to_tile,
     group_rows_by_path,
+    tile_read_shape,
     tile_source_window,
     warp_window_to_tile,
 )
@@ -119,6 +121,61 @@ def _window_then_warp(src, tile_bounds):
         tile_bounds=tile_bounds,
         tile_size=TILE_SIZE,
         nodata=NODATA,
+    )[0]
+
+
+def _window_then_warp_decimated(src, tile_bounds):
+    """The production geometry INCLUDING the decimated read: `tile_read_shape` picks the
+    shape, the read is decimated to it (GDAL serves that from an overview), and
+    `warp_window_to_tile` is told what it was decimated to so it can scale the
+    georeferencing to the array it is actually handed.
+
+    Identical to `_window_then_warp` wherever `tile_read_shape` returns None.
+    """
+    window = tile_source_window(src, tile_bounds)
+    if window is None:
+        return np.full((TILE_SIZE, TILE_SIZE), NODATA, dtype=src.dtypes[0])
+    out_shape = tile_read_shape(window, TILE_SIZE)
+    data = src.read(1, window=window, out_shape=out_shape)
+    return warp_window_to_tile(
+        data[np.newaxis, :, :],
+        window=window,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        tile_bounds=tile_bounds,
+        tile_size=TILE_SIZE,
+        nodata=NODATA,
+        out_shape=out_shape,
+    )[0]
+
+
+def _window_then_warp_decimated_unscaled_transform(src, tile_bounds):
+    """THE CONTROL FOR THE DECIMATED PATH. Identical to `_window_then_warp_decimated`
+    except that the georeferencing handed to the warp is the WINDOW's transform -- the
+    source's own resolution -- rather than one scaled to the decimated array.
+
+    This is the specific mistake a decimated read makes available: the array is smaller
+    than the window while covering the same ground, so the window's transform describes it
+    at the wrong scale and the tile renders from the wrong corner of the source. Like the
+    unrounded-transform control above it has no symptom of its own -- real values, right
+    dtype, a plausible picture -- so without it a zero-displacement result for the decimated
+    path would prove nothing.
+
+    It reaches `_warp_array_to_tile` directly, because `warp_window_to_tile` derives the
+    transform from the window AND the decimated shape and so cannot express this mistake.
+    """
+    window = tile_source_window(src, tile_bounds)
+    if window is None:
+        return np.full((TILE_SIZE, TILE_SIZE), NODATA, dtype=src.dtypes[0])
+    out_shape = tile_read_shape(window, TILE_SIZE)
+    data = src.read(1, window=window, out_shape=out_shape)
+    return _warp_array_to_tile(
+        data[np.newaxis, :, :],
+        windows.transform(window, src.transform),
+        src.crs,
+        tile_bounds,
+        TILE_SIZE,
+        NODATA,
     )[0]
 
 
@@ -222,10 +279,14 @@ def _score(reference, candidate):
     return displaced, gaps, int(has_reference.sum())
 
 
-def _sweep(src, zooms=range(9, 15)):
+def _sweep(src, zooms=range(9, 15), centre_lon_lat=None):
     """Every tile in a 3x3 neighbourhood of the grid's centre, at each zoom, that the
-    pre-port implementation renders any data into at all."""
-    lon, lat = _tile_centre()
+    pre-port implementation renders any data into at all.
+
+    `centre_lon_lat` overrides the grid registry's centre, for a source that is not on one
+    of the registered grids at all (`wide_unique_pixel_raster`).
+    """
+    lon, lat = centre_lon_lat if centre_lon_lat is not None else _tile_centre()
     for zoom in zooms:
         centre = mercantile.tile(lon, lat, zoom)
         for dx in (-1, 0, 1):
@@ -258,6 +319,29 @@ class TestPortedTileGeometryMatchesTheWarpFirstOrder:
 
         assert displaced == 0, f"{displaced} of {valid} pixels moved -- the tile grid is shifted"
         assert gaps == 0, f"{gaps} pixels gained or lost data at the boundary"
+
+    def test_the_decimated_read_changes_nothing_on_a_grid_it_never_decimates(self, unique_pixel_raster):
+        """The decimated variant's row of the same table.
+
+        `veg_grid_cell_v001` is 1052x365, smaller on its short axis than the 528 pixels
+        `tile_read_shape` needs before it will decimate anything, so every tile in this
+        sweep reads its window whole and the production path is byte-for-byte what it was.
+        That is the row worth pinning here -- decimation must not leak into the zooms it was
+        never meant to touch. `TestDecimatedTileReads` measures the zooms it does.
+        """
+        displaced = gaps = valid = tiles = 0
+        with rio.open(unique_pixel_raster) as src:
+            for bounds, reference in _sweep(src):
+                window = tile_source_window(src, bounds)
+                assert tile_read_shape(window, TILE_SIZE) is None
+                d, g, v = _score(reference, _window_then_warp_decimated(src, bounds))
+                displaced += d
+                gaps += g
+                valid += v
+                tiles += 1
+
+        assert tiles >= 20 and valid > 100_000
+        assert displaced == 0 and gaps == 0
 
     def test_the_unrounded_transform_control_diverges(self, unique_pixel_raster):
         """Without this the test above proves nothing.
@@ -304,6 +388,215 @@ class TestPortedTileGeometryMatchesTheWarpFirstOrder:
         )
         assert clipped_gaps == 0
         assert padded_gaps > clipped_gaps
+
+
+#: Side, in pixels, of `wide_unique_pixel_raster`. Big enough that a tile covering the whole
+#: raster decimates by 4 under `tile_read_shape` (which needs
+#: `4 * TILE_READ_OVERSAMPLE * (256 + 2 * TILE_READ_BUFFER_PX)` = 2112 pixels on the shorter
+#: axis), and a multiple of the 256-pixel block size so every overview level is whole.
+WIDE_SIZE = 2176
+
+#: Ground resolution of `wide_unique_pixel_raster`, in metres. Only its ratio to a tile's
+#: own ground size matters here; 10 m over 2176 pixels puts the whole raster inside one tile
+#: at z=7 and roughly one tile's own footprint at z=11, so one sweep over z=7..14 crosses
+#: every decimation factor the rule produces for this raster -- 4, then 2, then 1.
+WIDE_RES = 10.0
+
+#: The zooms `wide_unique_pixel_raster` is swept over: wide enough to reach a factor of 4 at
+#: the top and to be a no-op for several zooms at the bottom.
+WIDE_ZOOMS = range(7, 15)
+
+
+@pytest.fixture(scope="module")
+def wide_unique_pixel_raster(tmp_path_factory):
+    """A unique-per-pixel raster big enough that `tile_read_shape` actually decimates, with
+    NEAREST overviews like the production COGs carry.
+
+    `unique_pixel_raster` above cannot measure decimation at all: `veg_grid_cell_v001` is
+    1052x365 pixels, so a tile's source window never reaches the 528 pixels per axis
+    `tile_read_shape` requires before it will decimate anything, at any zoom. The production
+    grid does -- `morph_pixel_v001` is 20674x8285 and a z=6 tile's window is 13107x8285 --
+    and that is the case this file otherwise has no fixture for.
+
+    The overviews matter as much as the size: `raster._cog_profile` writes ``resampling
+    NEAREST``, so an overview pixel is a real source pixel rather than a blend, and that is
+    what lets the offsets measured below be read as "which source pixel was picked" instead
+    of "how much was it smoothed". Values are `row * WIDE_SIZE + col`, so every rendered
+    pixel decodes straight back to the source pixel it came from.
+    """
+    path = tmp_path_factory.mktemp("wide") / "wide_unique.tif"
+    centre_x = (GRID.bounds[0] + GRID.bounds[2]) / 2
+    centre_y = (GRID.bounds[1] + GRID.bounds[3]) / 2
+    half = WIDE_SIZE * WIDE_RES / 2
+    with rio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=WIDE_SIZE,
+        height=WIDE_SIZE,
+        count=1,
+        dtype="int32",
+        crs=GRID.crs,
+        transform=from_bounds(
+            centre_x - half, centre_y - half, centre_x + half, centre_y + half, WIDE_SIZE, WIDE_SIZE
+        ),
+        nodata=NODATA,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        compress="deflate",
+    ) as dst:
+        dst.write(np.arange(WIDE_SIZE * WIDE_SIZE, dtype="int32").reshape(WIDE_SIZE, WIDE_SIZE), 1)
+        dst.build_overviews([2, 4, 8], Resampling.nearest)
+    return path
+
+
+def _wide_centre(src):
+    """Lon/lat at the middle of a source's own extent."""
+    west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+    return (west + east) / 2, (south + north) / 2
+
+
+def _source_pixel_offsets(reference, candidate):
+    """``(|drow|, |dcol|)`` in SOURCE pixels, per pixel both tiles rendered.
+
+    Only meaningful on a raster whose values encode their own position, which is exactly
+    what `wide_unique_pixel_raster` is for. A decimated read cannot be scored by value
+    equality the way `_score` scores the full-resolution paths -- each tile pixel takes one
+    DECIMATED source pixel, which is a different (equally real) source pixel from the one a
+    full-resolution read would pick -- so what has to be bounded is how far away it is, not
+    whether it is the same one.
+    """
+    both = (reference != NODATA) & (candidate != NODATA)
+    reference_row, reference_col = np.divmod(reference[both].astype("int64"), WIDE_SIZE)
+    candidate_row, candidate_col = np.divmod(candidate[both].astype("int64"), WIDE_SIZE)
+    return np.abs(candidate_row - reference_row), np.abs(candidate_col - reference_col)
+
+
+class TestDecimatedTileReads:
+    """The read volume a tile costs, and what decimating it does to the picture.
+
+    Both tile paths used to read their source window at FULL resolution and warp afterwards
+    -- 434 MB per band for the 65,536 pixels of one z=6 tile on `morph_pixel_v001`, and on
+    the paired path the whole Polars collapse over every one of those pixels. `tile_read_shape`
+    decimates that read onto an overview instead. These tests pin the volume property that
+    change exists for, and bound the geometric cost of getting it.
+    """
+
+    def test_the_read_is_bounded_by_the_tile_rather_than_the_zoom(self, wide_unique_pixel_raster):
+        """The whole point of the fix, and the one property nothing else here pins: what a
+        tile reads must not grow without limit as the zoom goes out.
+
+        The bound is a constant -- `tile_read_shape` never returns more than twice its own
+        target per axis, because the factor is the largest power of two at or below the
+        exact ratio -- so it holds at any zoom, on any source, for any window.
+        """
+        limit = 2 * TILE_READ_OVERSAMPLE * (TILE_SIZE + 2 * TILE_READ_BUFFER_PX)
+        best_saving = 0
+        with rio.open(wide_unique_pixel_raster) as src:
+            lon, lat = _wide_centre(src)
+            for zoom in WIDE_ZOOMS:
+                centre = mercantile.tile(lon, lat, zoom)
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        tile = mercantile.Tile(centre.x + dx, centre.y + dy, zoom)
+                        window = tile_source_window(src, _tile_bounds(tile))
+                        if window is None:
+                            continue
+                        out_shape = tile_read_shape(window, TILE_SIZE)
+                        read_height, read_width = out_shape if out_shape else (window.height, window.width)
+                        assert read_height <= limit and read_width <= limit, (
+                            f"z={zoom} reads {read_height}x{read_width}, past the {limit}px bound -- "
+                            "a tile read is growing with the zoom again"
+                        )
+                        best_saving = max(
+                            best_saving, (window.height * window.width) / (read_height * read_width)
+                        )
+
+        # ... and it is actually buying something at the outermost zoom, rather than the
+        # bound above holding vacuously because nothing was ever big enough to decimate.
+        assert best_saving >= 8, f"the widest window read 1/{best_saving:.1f} of its pixels -- nothing was saved"
+
+    def test_no_rendered_pixel_moves_further_than_the_decimation_factor(self, wide_unique_pixel_raster):
+        """Displacement, in the units it is actually bounded in.
+
+        A decimated tile pixel is a decimated source pixel, so it is NOT the same pixel a
+        full-resolution read picks and value equality (what `_score` measures) is expected to
+        differ. What must hold is that it comes from within the decimation factor's own
+        neighbourhood -- i.e. that the georeferencing tracked the decimation rather than a
+        grid shift creeping in with it.
+        """
+        worst = 0
+        decimating_tiles = compared = 0
+        with rio.open(wide_unique_pixel_raster) as src:
+            for bounds, reference in _sweep(src, zooms=WIDE_ZOOMS, centre_lon_lat=_wide_centre(src)):
+                window = tile_source_window(src, bounds)
+                out_shape = tile_read_shape(window, TILE_SIZE)
+                if out_shape is None:
+                    continue
+                decimating_tiles += 1
+                # Each axis is decimated by its own factor, so each axis is bounded by its
+                # own -- a sliver window decimated 4x vertically and not at all horizontally
+                # may not move a pixel sideways.
+                height_factor = round(window.height / out_shape[0])
+                width_factor = round(window.width / out_shape[1])
+                rows, cols = _source_pixel_offsets(reference, _window_then_warp_decimated(src, bounds))
+                compared += rows.size
+                worst = max(worst, int(rows.max()), int(cols.max()))
+                assert rows.max() <= 2 * height_factor and cols.max() <= 2 * width_factor, (
+                    f"a pixel came from ({rows.max()}, {cols.max()}) source pixels away at "
+                    f"decimation ({height_factor}, {width_factor}) -- further than decimating "
+                    "alone accounts for"
+                )
+
+        assert decimating_tiles >= 4, f"only {decimating_tiles} tiles decimated -- nothing was measured"
+        assert compared > 100_000, f"only {compared} pixels compared -- nothing was measured"
+        # Measured: 4 source pixels, at a factor of 4, which at these zooms is a small
+        # fraction of one tile pixel. `TILE_READ_OVERSAMPLE` is what keeps it there.
+        assert worst <= 4
+
+    def test_the_unscaled_transform_control_diverges(self, wide_unique_pixel_raster):
+        """Without this the test above proves nothing.
+
+        Handing the warp the WINDOW's transform for a decimated array is a whole-grid scale
+        error, so the source pixel each tile pixel lands on is hundreds of pixels from the
+        right one -- two orders of magnitude past the bound asserted above.
+        """
+        worst = 0
+        decimating_tiles = 0
+        with rio.open(wide_unique_pixel_raster) as src:
+            for bounds, reference in _sweep(src, zooms=WIDE_ZOOMS, centre_lon_lat=_wide_centre(src)):
+                window = tile_source_window(src, bounds)
+                if tile_read_shape(window, TILE_SIZE) is None:
+                    continue
+                decimating_tiles += 1
+                rows, cols = _source_pixel_offsets(
+                    reference, _window_then_warp_decimated_unscaled_transform(src, bounds)
+                )
+                worst = max(worst, int(max(rows.max(), cols.max())))
+
+        assert decimating_tiles >= 4
+        assert worst > 100, (
+            f"the control moved a pixel only {worst} source pixels -- this differential cannot "
+            "detect a mis-scaled transform, so the bound above is not evidence"
+        )
+
+    def test_where_it_does_not_decimate_it_is_bit_identical(self, wide_unique_pixel_raster):
+        """The other half: at the zooms whose windows are already at tile resolution
+        (z >~ 12, the majority of real traffic) the decimated path must not merely be close
+        to the current one, it must be the same bytes."""
+        identical_tiles = 0
+        with rio.open(wide_unique_pixel_raster) as src:
+            for bounds, _reference in _sweep(src, zooms=WIDE_ZOOMS, centre_lon_lat=_wide_centre(src)):
+                window = tile_source_window(src, bounds)
+                if tile_read_shape(window, TILE_SIZE) is not None:
+                    continue
+                identical_tiles += 1
+                assert np.array_equal(
+                    _window_then_warp_decimated(src, bounds), _window_then_warp(src, bounds)
+                )
+
+        assert identical_tiles >= 20, f"only {identical_tiles} tiles read whole -- nothing was compared"
 
 
 class TestWarpWindowToTileRejectsAMismatchedWindow:

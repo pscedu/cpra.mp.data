@@ -150,6 +150,63 @@ class TestScanRastersAttachWithoutFilter:
         assert out["_px"].to_list()[:4] == [20 * GRID.width + c for c in range(4)]
         assert out["_px"].to_list()[8:12] == [0, 1, 2, 3]
 
+    def test_read_shapes_decimate_every_raster_a_window_touches(self, base_path, zone_crosswalk_path):
+        """`read_shapes` is what lets a low-zoom tile scan cost the tile rather than the
+        zoom (`paired._paired_notebook_tile`, via `utils.tile_read_shape`): the window's
+        pixels arrive decimated instead of whole.
+
+        The property that matters is that EVERY raster the window touches -- the bands and
+        the attached crosswalk alike -- is decimated to the same shape, so a row still
+        describes one ground position. Decimating the bands but not the crosswalk would pair
+        each value with some other pixel's zone, silently.
+        """
+        import rasterio as rio
+        from rasterio.windows import Window
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _: _gradient())
+        paths = list(base_path.rglob("*.tif"))
+        window = Window(col_off=0, row_off=0, width=64, height=32)
+
+        out = scan_rasters(
+            paths,
+            [[0]],
+            [None],
+            zones_path=zone_crosswalk_path,
+            read_windows=[window],
+            read_shapes=[(8, 16)],
+        ).collect()
+
+        assert out.height == 8 * 16
+
+        with rio.open(paths[0]) as src:
+            expected_bands = src.read(1, window=window, out_shape=(8, 16)).ravel()
+        with rio.open(zone_crosswalk_path) as zsrc:
+            expected_zones = zsrc.read(1, window=window, out_shape=(8, 16)).ravel()
+
+        assert np.array_equal(out["b0"].to_numpy(), expected_bands)
+        assert np.array_equal(out["grid_cell"].to_numpy(), expected_zones)
+
+    def test_read_shapes_without_read_windows_is_rejected(self, base_path):
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _: 1)
+        paths = list(base_path.rglob("*.tif"))
+
+        with pytest.raises(ValueError, match="one shape per read_windows entry"):
+            scan_rasters(paths, [[0]], [None], read_shapes=[(4, 4)])
+
+    def test_read_shapes_with_px_is_rejected(self, base_path):
+        """`_px` indexes the FULL raster's own pixel grid, and a decimated row is not one of
+        those pixels -- there is no honest value to put in that column, so the combination is
+        refused rather than filled in with something a positional consumer would trust."""
+        from rasterio.windows import Window
+
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _: 1)
+        paths = list(base_path.rglob("*.tif"))
+
+        with pytest.raises(ValueError, match="cannot be combined with with_px"):
+            scan_rasters(
+                paths, [[0]], [None], with_px=True, read_windows=[Window(0, 0, 8, 8)], read_shapes=[(4, 4)]
+            )
+
     def test_zone_ids_without_zones_path_is_rejected(self, base_path):
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _: 1)
         paths = list(base_path.rglob("*.tif"))

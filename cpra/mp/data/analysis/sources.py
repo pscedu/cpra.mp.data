@@ -382,6 +382,7 @@ def scan_rasters(
     crosswalks=(),
     with_px=False,
     read_windows=None,
+    read_shapes=None,
 ):
     """Return a LazyFrame of (grid_cell, <crosswalk columns>, <band columns>) over one or
     more multiband COGs.
@@ -489,6 +490,22 @@ def scan_rasters(
     memory at once, and splitting them would break the "row `k` of the stream is pixel `k`
     of window `w`" correspondence that a positional consumer reassembles from.
 
+    ``read_shapes`` pairs with ``read_windows`` one-for-one: entry `i` is the
+    ``(height, width)`` window `i` is DECIMATED to as it is read (None reads it whole), so
+    the rows emitted for that window are its decimated pixels rather than its full-
+    resolution ones. Every raster a window touches -- bands, the zone raster, each attached
+    crosswalk -- is read to the same shape, which is what keeps the columns of a row
+    describing one ground position. It exists for the TILE path
+    (`paired._paired_notebook_tile`, via `utils.tile_read_shape`): a low-zoom tile's window
+    is most of the raster, and scanning it at full resolution pushes tens of millions of
+    pixels through the collapse to render 65,536 of them.
+
+    ``read_shapes`` is rejected with ``with_px``: ``_px`` is an index over the FULL raster's
+    own pixel grid, and a decimated row is not one of those pixels, so there is no honest
+    value to put in that column. No caller wants both (the tile path is the only decimating
+    one and does not ask for ``_px``), and silently emitting window-relative or
+    resolution-relative indices there would corrupt any positional consumer downstream.
+
     ``value_dtype=None`` infers the schema from `paths[0]` -- see `_raster_dtype`.
 
     ``mask_nodata=True`` maps each BAND column's stored nodata sentinel (read per-file, so
@@ -500,6 +517,11 @@ def scan_rasters(
         raise ValueError("scan_rasters requires at least one source path")
     if zone_ids is not None and zones_path is None:
         raise ValueError("scan_rasters: zone_ids requires zones_path")
+    if read_shapes is not None:
+        if read_windows is None or len(read_shapes) != len(read_windows):
+            raise ValueError("scan_rasters: read_shapes must be one shape per read_windows entry")
+        if with_px:
+            raise ValueError("scan_rasters: read_shapes cannot be combined with with_px")
     zones_path = str(zones_path) if zones_path is not None else None
     attach_zone = zones_path is not None
     filter_to_zones = zone_ids is not None
@@ -648,6 +670,7 @@ def scan_rasters(
                 # nothing left to decide. `raster_width` above is still the FULL raster's,
                 # which is what `_px` is indexed against.
                 window_list = list(read_windows)
+                shape_list = list(read_shapes) if read_shapes is not None else [None] * len(window_list)
             else:
                 itemsize = np.dtype(first_src.dtypes[0]).itemsize
                 if n_selected_values:
@@ -655,8 +678,9 @@ def scan_rasters(
                 n_units = n_selected_bands + 2 * n_selected_values
                 blocks_per_batch = raster_blocks_per_batch(max(n_units, 1), block_height, block_width, itemsize)
                 window_list = list(_batched_windows(first_src, blocks_per_batch))
+                shape_list = [None] * len(window_list)
 
-        for window in window_list:
+        for window, out_shape in zip(window_list, shape_list):
             if remaining is not None and remaining <= 0:
                 break
 
@@ -684,7 +708,7 @@ def scan_rasters(
                     zones = None
                 else:
                     with rio.open(zones_path) as zsrc:
-                        zones = zsrc.read(1, window=window).ravel()
+                        zones = zsrc.read(1, window=window, out_shape=out_shape).ravel()
 
                     if filter_to_zones:
                         # Source-level spatial filter: keep only pixels in a
@@ -709,7 +733,7 @@ def scan_rasters(
                 value_cols = {}
                 for cw, want_zone, specs in crosswalk_plan:
                     with rio.open(cw.path) as csrc:
-                        cw_flat = csrc.read(1, window=window).ravel()
+                        cw_flat = csrc.read(1, window=window, out_shape=out_shape).ravel()
                         cw_nodata = csrc.nodata
                     cw_ids = (cw_flat if keep is None else cw_flat[keep]).astype("int32")
                     if want_zone:
@@ -725,7 +749,7 @@ def scan_rasters(
                 nodata_by_col = {}
                 for path, names, path_bands in plan:
                     with rio.open(path) as src:
-                        data = src.read(path_bands, window=window)
+                        data = src.read(path_bands, window=window, out_shape=out_shape)
                         nodata = src.nodata
                     for i, name in enumerate(names):
                         flat = data[i].ravel()

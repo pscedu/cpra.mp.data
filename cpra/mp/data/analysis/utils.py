@@ -10,7 +10,7 @@ from cachetools import TTLCache, cached
 from rasterio import windows
 from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
-from rasterio.transform import from_bounds
+from rasterio.transform import Affine, from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
@@ -173,8 +173,9 @@ def raster_gdal_env():
     call in the calling coroutine (see callers) is an acceptably small, bounded exposure
     given how fast an open is relative to the read/write loop that follows it.
 
-    Deliberately not applied to tile requests -- those read a decimated 256x256 window
-    through existing overviews and measured no benefit from threading.
+    Deliberately not applied to tile requests. Those read a window decimated to roughly the
+    tile's own resolution (``tile_read_shape``), which GDAL serves out of the source's
+    overviews -- a small enough read that threading measured no benefit on it.
     """
 
     return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB)
@@ -317,6 +318,83 @@ def tile_source_window(src, tile_bounds, buffer_px=TILE_READ_BUFFER_PX):
     return windows.Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
+#: How much finer than the tile's own pixel grid a decimated tile read is kept.
+#:
+#: A tile pixel takes ONE source pixel under `Resampling.nearest`, so if the decimated grid
+#: were at the tile's own resolution the pixel it picks could be up to ~1.5 decimated pixels
+#: -- i.e. more than a whole tile pixel -- away from the one a full-resolution read would
+#: have picked. Measured over 38 tiles (z=7..14, 1,741,449 rendered pixels compared) of the
+#: 2176x2176 unique-per-pixel fixture `tests/api/test_tile_warp.py` builds: reading at the
+#: tile's own resolution displaces a rendered pixel by up to 0.75 tile pixels, reading twice
+#: as fine by up to 0.15. The cost is 4x the pixels of a 1:1 rule, which at low zoom is still
+#: two orders of magnitude below a full-resolution read (434 MB -> 3.4 MB per band at z=6 on
+#: `morph_pixel_v001`, versus 0.8 MB at 1:1).
+#:
+#: It is a margin, not a guarantee: a decimated read still takes a different source pixel
+#: than a full-resolution one, which is what `TestDecimatedTileReads` bounds rather than
+#: asserts away.
+TILE_READ_OVERSAMPLE = 2
+
+
+def _axis_decimation_factor(extent, target):
+    """The largest power of two by which `extent` source pixels can be decimated and still
+    leave at least `target` of them -- 1 (read this axis whole) when it cannot be halved."""
+    ratio = int(extent // target)
+    if ratio < 2:
+        return 1
+    return 1 << (ratio.bit_length() - 1)
+
+
+def tile_read_shape(window, tile_size, buffer_px=TILE_READ_BUFFER_PX, oversample=TILE_READ_OVERSAMPLE):
+    """The ``(height, width)`` to decimate `window` to while reading it for a tile, or None
+    when `window` is already small enough to read whole.
+
+    A tile's source window is only as small as the tile's ground footprint, which at low
+    zoom is most of the raster: `tile_source_window` on a 20674x8285 source returns a
+    13107x8285 window at z=6, 434 MB per band for the 65,536 pixels a 256x256 tile actually
+    renders. Reading that window into a smaller buffer makes GDAL serve it from the source's
+    overviews (rasterio passes ``out_shape`` straight through to GDAL's own overview
+    selection), so the decompressed volume drops with the square of the factor.
+
+    The factor is chosen so that:
+
+    * it never decimates below `oversample` times the tile's own resolution -- the target is
+      `tile_size` plus `tile_source_window`'s buffer on both sides, so the returned shape
+      still covers the same ground as the window at a resolution finer than the tile grid
+      it is about to be warped onto (see `TILE_READ_OVERSAMPLE` for what the margin buys);
+    * it never UPSAMPLES -- an axis already at or below that size keeps every one of its
+      pixels, and a window small enough on BOTH axes returns None, which the callers read
+      exactly as they did before this existed;
+    * it is a power of two, so it lands on a real overview level (the COGs this reads carry
+      ``[2, 4, 8, 16, 32, 64]``, built with NEAREST -- see `raster._cog_profile` -- which is
+      what keeps every decimated pixel a real source value rather than a blend) rather than
+      making GDAL resample down from a finer one;
+    * it is chosen PER AXIS. A single factor taken from the shorter axis would leave the
+      read unbounded on the longer one: a tile straddling the source's edge gets a window
+      clipped to a sliver -- 2176x817 on the test fixture, 20674 x a few hundred on
+      morph_pixel -- whose short axis forbids decimating at all while its long axis is still
+      the whole raster. Per axis, the returned shape is under
+      ``2 * oversample * (tile_size + 2 * buffer_px)`` on BOTH axes for every window there
+      is, which is the bound that makes a tile's cost a function of the tile rather than of
+      the zoom (`tests/api/test_tile_warp.py::TestDecimatedTileReads` pins it). When the two
+      factors differ GDAL can serve only one axis straight off the matching overview level
+      and decimates the other itself; the array handed back is bounded either way, and under
+      `Resampling.nearest` both axes stay whole source values.
+
+    The returned shape is `window` floor-divided by those factors, not ceil-divided: the
+    effective ratio has to be at least the factor for GDAL to pick that overview level
+    rather than the next finer one. The shape still describes the WHOLE window -- it is the
+    same ground extent at a coarser resolution -- which is what `warp_window_to_tile` needs
+    to scale the georeferencing by.
+    """
+    target = oversample * (tile_size + 2 * buffer_px)
+    height_factor = _axis_decimation_factor(window.height, target)
+    width_factor = _axis_decimation_factor(window.width, target)
+    if height_factor == 1 and width_factor == 1:
+        return None
+    return (max(1, int(window.height) // height_factor), max(1, int(window.width) // width_factor))
+
+
 def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata):
     """Warp `data` (a ``(bands, height, width)`` array georeferenced by `array_transform`
     in `src_crs`) onto a tile's own Web Mercator pixel grid, through an in-memory dataset.
@@ -363,30 +441,39 @@ def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, 
                 return vrt.read()
 
 
-def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, tile_size, nodata):
+def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, tile_size, nodata, out_shape=None):
     """Warp one window's worth of per-pixel results onto a tile's pixel grid.
 
-    `data` is ``(bands, window.height, window.width)`` -- whatever a caller computed over
-    the pixels of `window`, still in the source CRS and still on the source's own grid --
-    and `window`/`src_transform` are the window that was READ and the transform of the
-    dataset it was read from. The georeferencing handed to the warp is derived here, from
-    those two, rather than accepted from the caller: a transform built from anything other
-    than the window actually read is a sub-pixel origin error that displaces every rendered
-    pixel, with no symptom short of a differential against another implementation (see
-    `tests/api/test_tile_warp.py`, which measures exactly that).
+    `data` is whatever a caller computed over the pixels of `window`, still in the source
+    CRS and still on the source's own grid, and `window`/`src_transform` are the window that
+    was READ and the transform of the dataset it was read from. `out_shape` is the
+    ``(height, width)`` that window was DECIMATED to on the way in (`tile_read_shape`), or
+    None when it was read whole -- `data` is ``(bands, *out_shape)`` in the first case and
+    ``(bands, window.height, window.width)`` in the second.
 
-    The shape check below is the mechanical half of the same guarantee -- a `window` that
-    does not describe `data` cannot reach the warp at all.
+    The georeferencing handed to the warp is derived here, from those three, rather than
+    accepted from the caller: a transform built from anything other than the array actually
+    handed to the warp is a sub-pixel origin error that displaces every rendered pixel, with
+    no symptom short of a differential against another implementation (see
+    `tests/api/test_tile_warp.py`, which measures exactly that). A decimated read is where
+    that is easiest to get wrong -- the array is smaller than the window while covering the
+    same ground, so the window's own transform describes it at the wrong resolution -- which
+    is why the scaling lives here too and not at either call site.
+
+    The shape check below is the mechanical half of the same guarantee -- an array that
+    matches neither the window nor the shape it was decimated to cannot reach the warp.
     """
-    if tuple(data.shape[-2:]) != (window.height, window.width):
+    expected = tuple(out_shape) if out_shape is not None else (window.height, window.width)
+    if tuple(data.shape[-2:]) != expected:
         raise ValueError(
             f"warp_window_to_tile: data is {data.shape[-2:]} but window is "
-            f"({window.height}, {window.width}) -- the array must be exactly the window "
+            f"{expected} -- the array must be exactly the window "
             "that was read, or its georeferencing is wrong"
         )
-    return _warp_array_to_tile(
-        data, windows.transform(window, src_transform), src_crs, tile_bounds, tile_size, nodata
-    )
+    array_transform = windows.transform(window, src_transform)
+    if out_shape is not None:
+        array_transform *= Affine.scale(window.width / expected[1], window.height / expected[0])
+    return _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata)
 
 
 def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None, use_gdal_env=False):

@@ -54,6 +54,7 @@ from cpra.mp.data.analysis.utils import (
     raster_blocks_per_batch,
     raster_copy_gdal_env,
     raster_gdal_env,
+    tile_read_shape,
     tile_source_window,
     unpack_values,
     warp_window_to_tile,
@@ -1224,6 +1225,12 @@ class RasterGridAnalysis(BaseAnalysis):
     async def _read_raster_bands(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
         """Read one window's raw bands into a single ``(len(df), h, w)`` array in df row order.
 
+        ``out_shape``, when given, is the ``(height, width)`` each dataset's window is
+        DECIMATED to while reading -- rasterio hands it to GDAL, which serves the read from
+        an overview when one matches, so the returned array is ``(len(df), *out_shape)``
+        rather than the window's own shape. ``get_tile`` is the caller that uses it (see
+        ``utils.tile_read_shape``); with None every read is at the source's full resolution.
+
         ``rasters`` holds one dataset per unique file backing ``df`` (rows sharing a
         multiband COG are grouped onto the same raster/band-list by ``group_rows_by_path``),
         with ``row_indices``/``bands`` mapping each raster back to the df rows and band
@@ -1544,7 +1551,17 @@ class RasterGridAnalysis(BaseAnalysis):
                 # That is a rendered tile of nothing, not a missing tile.
                 tile_data = np.full((1, tile_size, tile_size), nodata, dtype=inputs[0].dtypes[0])
             else:
-                data = await self._read_raster_bands(df, inputs, row_indices, bands, window)
+                # A low-zoom tile's footprint is most of the raster -- 434 MB per band at
+                # z=6 on morph_pixel -- for the 65,536 pixels it renders. `tile_read_shape`
+                # decimates that read to about the tile's own resolution, which GDAL serves
+                # from the source's overviews; `warp_window_to_tile` takes the same shape so
+                # the georeferencing it derives describes the decimated array rather than
+                # the window. None (a window already at tile resolution, z >~ 12) reads and
+                # warps exactly as it did before.
+                read_shape = tile_read_shape(window, tile_size)
+                data = await self._read_raster_bands(
+                    df, inputs, row_indices, bands, window, out_shape=read_shape
+                )
                 tile_data = warp_window_to_tile(
                     self._collapse_tile_bands(df, data, nodata),
                     window=window,
@@ -1553,6 +1570,7 @@ class RasterGridAnalysis(BaseAnalysis):
                     tile_bounds=tile_bounds,
                     tile_size=tile_size,
                     nodata=nodata,
+                    out_shape=read_shape,
                 )
             color = self.legend.colorize_pixels(tile_data)
             # JPEG has no alpha channel, so drop it. fromarray infers RGB vs RGBA from the

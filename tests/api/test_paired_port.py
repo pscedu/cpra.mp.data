@@ -748,3 +748,91 @@ class TestTilePortMatchesTheWarpFirstImplementation:
         reference_pixels = _legend_for(plan.color_map).colorize_pixels(reference)
 
         assert np.array_equal(ported_pixels, reference_pixels)
+
+
+def _force_read_shape(monkeypatch, shape_of):
+    """Make the tile path decimate its read to `shape_of(window)`, whatever it would
+    have chosen.
+
+    `veg_grid_cell_v001` is 1052x365 cells, so a tile's source window is never more than
+    a few hundred pixels on its short axis and `tile_read_shape` correctly declines to
+    decimate it at every zoom -- this fixture cannot reach the decimating branch on its
+    own, and a paired fixture wide enough to (morph_pixel is 20674x8285) is not one a
+    test can afford to write. Forcing the shape exercises the plumbing that branch adds
+    on the fixture that exists; `tests/api/test_tile_warp.py` measures the GEOMETRY of a
+    decimated read, including the control that proves the measurement can fail.
+    """
+    real = paired_module.tile_read_shape
+
+    def forced(window, tile_size, *args, **kwargs):
+        assert real(window, tile_size, *args, **kwargs) is None, (
+            "this fixture's windows are supposed to be too small to decimate -- forcing a "
+            "shape here would be hiding the real choice"
+        )
+        return shape_of(window)
+
+    monkeypatch.setattr(paired_module, "tile_read_shape", forced)
+
+
+class TestTheTilePathDecimatesItsRead:
+    """The tile scan is charged per PIXEL of the source window, so the paired path carries
+    the decimated read through three places the raster path does not: `_paired_scan` has to
+    forward the shape to `scan_rasters`, the collapsed rows have to be reshaped to it rather
+    than to the window, and `warp_window_to_tile` has to be told about it.
+
+    Each of those three raises rather than quietly mis-rendering if it is skipped -- the
+    scan would return window-many rows and the reshape would fail; a window-shaped reshape
+    of decimated rows would fail; and warping an array that is not the shape it was told to
+    expect is exactly the ValueError `warp_window_to_tile` opens with. So a tile that
+    renders at all under a forced non-square decimation is the assertion.
+    """
+
+    async def test_a_decimated_read_is_scanned_reshaped_and_warped_as_one_shape(
+        self, paired_port_data, monkeypatch
+    ):
+        base_path, _fifth = paired_port_data
+        plan = compile_pipeline(parse_pipeline(_pipeline_query("max")), base_path=base_path)
+        x, y, z = _grid_tile(base_path)
+
+        # Deliberately unequal factors: a shape that is merely transposed or taken from the
+        # window would not reshape, so this pins the decimated shape itself rather than
+        # "some smaller array arrived".
+        _force_read_shape(monkeypatch, lambda w: (int(w.height) // 2, int(w.width) // 4))
+        scan_calls = _spy(monkeypatch, "scan_rasters")
+        warped = _capture_returns(monkeypatch, "warp_window_to_tile")
+
+        assert await plan.get_tile(x, y, z, "png", tile_size=256) is not None
+        (window,) = scan_calls[0][1]["read_windows"]
+        (shape,) = scan_calls[0][1]["read_shapes"]
+        assert shape == (int(window.height) // 2, int(window.width) // 4)
+        assert shape[0] * shape[1] < window.height * window.width
+
+        (tile,) = warped
+        assert tile.shape == (1, 256, 256)
+        assert int((tile != plan.nodata_value).sum()) > 1000, "the decimated tile rendered nothing"
+
+    async def test_a_read_shape_equal_to_the_window_renders_the_identical_tile(
+        self, paired_port_data, monkeypatch
+    ):
+        """Decimation by a factor of one is the only case where the decimated path has an
+        exact oracle: same pixels read, same rows collapsed, and a transform scaled by 1.0.
+        Anything the plumbing does to the array on its way through -- a reshape in the wrong
+        order, a transform scaled the wrong way round -- shows up as a tile that differs from
+        the one the same fixture renders with no shape at all.
+        """
+        base_path, _fifth = paired_port_data
+        plan = compile_pipeline(parse_pipeline(_pipeline_query("max")), base_path=base_path)
+        x, y, z = _grid_tile(base_path)
+
+        undecimated = _capture_returns(monkeypatch, "warp_window_to_tile")
+        assert await plan.get_tile(x, y, z, "png", tile_size=256) is not None
+        (reference,) = undecimated
+
+        monkeypatch.undo()
+        _force_read_shape(monkeypatch, lambda w: (int(w.height), int(w.width)))
+        passed_through = _capture_returns(monkeypatch, "warp_window_to_tile")
+        assert await plan.get_tile(x, y, z, "png", tile_size=256) is not None
+        (ported,) = passed_through
+
+        assert int((reference != plan.nodata_value).sum()) > 1000, "nothing was compared"
+        assert np.array_equal(ported, reference)
