@@ -129,8 +129,8 @@ def band_calculate_passes(raw_names, plans, applicability):
 
     `plans` are `expressions.CalculatePlan`s; `applicability[k][i]` says whether plan
     `k`'s dimension `where` matched the band-metadata row behind `raw_names[i]` (the
-    caller evaluates that against its own rows -- see
-    `RasterGridAnalysis._band_applicability`). A plan's `value_where`, being per-pixel,
+    caller evaluates that against its own rows -- see `raster.apply_calculate_band_wide`,
+    the only caller). A plan's `value_where`, being per-pixel,
     is folded into each band's own rewrite condition here instead, rewritten per band by
     `rewrite_value_column` exactly like a filter value condition. A band this plan does
     not apply to is simply left out of that pass -- pass-through, never dropped or
@@ -139,7 +139,7 @@ def band_calculate_passes(raw_names, plans, applicability):
     The `is_not_null()` guard on every rewrite makes "NoData in, NoData out" a structural
     property rather than a per-expression obligation: a nodata pixel (already masked to
     null by the caller -- `scan_rasters(mask_nodata=True)`, or the nodata pass
-    `band_collapse_exprs` prepends) never matches, so even an expression that COULD
+    `raster.apply_band_ops` prepends) never matches, so even an expression that COULD
     backfill (`coalesce(value, 0)` is whitelisted) only ever runs on real values.
     """
     passes = []
@@ -160,75 +160,6 @@ def band_calculate_passes(raw_names, plans, applicability):
         if exprs:
             passes.append(exprs)
     return passes
-
-
-def band_collapse_exprs(raw_names, calculate_passes, group_row_idxs, aggregate, dtype, nodata=None):
-    """The whole calculate/group_aggregate step for a raster selection, as expressions.
-
-    Operates on a DataFrame whose columns are `raw_names` -- one raw band per selected
-    (path, band) row, in df row order. Returns `(out_names, passes, exprs)`: apply each
-    list in `passes` as one `with_columns` call, in order (the nodata mask, then each
-    calculate entry -- sequential passes, since entry N+1 must see entry N's output),
-    then `exprs` as a final `select`, producing one output column per output band named
-    by `out_names`. `calculate_passes` is `band_calculate_passes`' output (empty list for
-    a request with no calculate entries) and `group_row_idxs` (the contributing row
-    positions for each aggregated output band, or None for a 1:1 selection) is indexed by
-    df row position too, so everything lines up. `dtype` is the raw bands' numpy dtype
-    name, which is also the output dtype before any calculate expression promotes it.
-
-    This is the single implementation of that step, shared by every caller that needs it
-    (`Dataset._write_raster_windowed`, `Dataset._collapse_tile_bands`, and -- expressed over
-    the plugin's own scan rather than a per-window frame -- `_summarize_zone_stats_plugin`),
-    so the four aggregates and the calculate-before-collapse order are defined once.
-
-    Passing `nodata` masks each band against its own raw pixel value BEFORE any calculate
-    entry runs, since rewriting a sentinel would stop it matching the sentinel it started
-    as (and would violate the calculate stage's NoData-in-NoData-out contract). A masked
-    pixel then drops out of the collapse instead of contributing a sentinel to it, and the
-    sentinel comes back only where nothing contributed. Pass None to leave pixels untouched,
-    which is what a caller wants when its output has to preserve whatever was stored rather
-    than reinterpret it -- only valid with no calculate passes, or for a source that
-    declares no nodata at all.
-
-    No null reaches the output columns: a masked-out band's null is filled back with the
-    sentinel, by `horizontal_aggregate_expr`'s `no_contributor` branch for an aggregated
-    selection and by an explicit `fill_null` for a 1:1 one. So a caller gets a column it can
-    hand straight to numpy in the dtype family it would have had unmasked -- which the tile
-    path depends on, since a null would arrive as NaN and land in whichever legend bin NaN
-    happens to digitize into (the last one).
-    """
-    passes = []
-    if nodata is not None:
-        passes.append(
-            [pl.when(pl.col(name) == nodata).then(None).otherwise(pl.col(name)).alias(name) for name in raw_names]
-        )
-    passes.extend(calculate_passes)
-
-    cols = [pl.col(name) for name in raw_names]
-
-    if group_row_idxs is None:
-        out_names = [f"out{k}" for k in range(len(cols))]
-        if nodata is not None:
-            fill = pl.lit(nodata).cast(NUMPY_TO_POLARS[dtype])
-            cols = [c.fill_null(fill) for c in cols]
-        return out_names, passes, [c.alias(name) for c, name in zip(cols, out_names)]
-
-    # No band contributed anything to this pixel (every band in the group was nodata
-    # there): the raster's own nodata sentinel, not NaN. Unlike the summarize path's Float64
-    # result, an integer output band cannot hold NaN -- this is a deliberate difference from
-    # that path's NaN marker, not an oversight. With no masking there is never a null to
-    # select it, so 0 (in the output dtype) is a harmless placeholder for that case.
-    no_contributor = (
-        pl.lit(nodata).cast(NUMPY_TO_POLARS[dtype])
-        if nodata is not None
-        else pl.lit(0, dtype=NUMPY_TO_POLARS[dtype])
-    )
-    out_names = [f"out{k}" for k in range(len(group_row_idxs))]
-    exprs = [
-        horizontal_aggregate_expr(aggregate, [cols[i] for i in row_idxs], no_contributor).alias(name)
-        for name, row_idxs in zip(out_names, group_row_idxs)
-    ]
-    return out_names, passes, exprs
 
 
 def guarded_aggregate(aggregate, name):
@@ -410,10 +341,10 @@ def scan_rasters(paths, row_indices, bands, zones_path=None, zone_ids=None, valu
       is an ordinary downstream `filter`+`group_by`, so `project` can run at whatever
       position a pipeline declares it, rather than always being folded into the initial
       scan. (`raster.apply_project_band_wide` used to be that downstream consumer; it was
-      deleted as unused once the raster interpreter landed and none of the raster-side
-      rejections it would have served turned out to be relaxable. This attach-only mode
-      is still exercised directly by
-      `tests/api/test_raster_source.py::TestScanRastersAttachWithoutFilter`.)
+      deleted as unused -- the raster interpreter reaches a summarizing `project` through
+      `_apply_transform_params_impl`/`_summarize_zone_stats_plugin` instead, which use the
+      zoned/filtered mode below. This attach-only mode is still exercised directly by
+      `tests/api/test_raster_ops.py::TestScanRastersAttachWithoutFilter`.)
     - ``zones_path`` and ``zone_ids`` both given: the original zoned/TABULAR shape --
       a `grid_cell` column holds the destination zone ID, and pixels whose zone is not
       in `zone_ids` (including crosswalk nodata) are DROPPED in the source. Unchanged:

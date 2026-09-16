@@ -238,12 +238,11 @@ class FilterStep(BaseModel):
     is optional -- an omitted `input` chains from the previous step's output, mirroring
     `ProjectStep.input` exactly (same optionality, same "explicit name or chain" meaning,
     same rule for who may use it: see `validate_pipeline`'s chaining rule). This is what
-    lets a `filter` lead a pipeline: the engine's fixed stage order always runs every
-    filter's `where` before a `project`'s aggregation, regardless of declared order, so a
-    value-testing `filter` declared AFTER a many-to-one `project` would silently run
-    against the pre-aggregation rows instead of the aggregated result --
-    `planner._compile_single_input_chain` rejects that shape outright rather than return
-    a wrong answer. Before `input` existed there was no way to write the filter the other
+    lets a `filter` lead a pipeline: `planner._compile_single_input_chain` rejects a
+    value-testing `filter` declared AFTER a many-to-one `project` outright, for both grid
+    types (its SUMMARIZING-PROJECT ORDER GUARD -- a filter and a re-aggregation do not
+    commute, and that shape's correctness has not been established for either engine),
+    rather than risk returning a wrong answer. Before `input` existed there was no way to write the filter the other
     way around either, since `filter`/`calculate`/`group` all lacked any way to name an
     input and so could never be a pipeline's first step -- only `project`/`join` could
     satisfy the chaining rule's "first step must name its input" requirement. Naming
@@ -274,16 +273,15 @@ class CalculateStep(BaseModel):
     `where` applies the expression to everything. Rows/bands NOT matching `where` pass
     through unchanged -- `calculate` never drops data; use `filter` for that. `input` is
     optional -- an omitted `input` chains from the previous step's output, mirroring
-    `FilterStep.input` exactly and for the identical reason: `Options.calculate` lowers
-    onto `BaseAnalysis.apply_params`'s Calculate stage (stage 2), which runs
-    unconditionally before the Transform stage (stage 4) that a `project`'s aggregation
-    lowers onto, for BOTH the raster and the vector-interpreter engines -- so a
-    `calculate` declared as a leading step, ahead of the `project` it precedes, executes
-    in exactly the position it is declared in, regardless of grid type. There is no
-    ordering question here the way there is for a POST-project `calculate`, which
-    `planner._compile_single_input_chain` still rejects after a many-to-one `project`
-    (the same silent-misexecution risk `FilterStep`'s docstring describes for a
-    post-project value filter). `group` still has no `input` field (see `GroupStep`'s
+    `FilterStep.input` exactly and for the identical reason: a `calculate` declared as a
+    leading step, ahead of the `project` it precedes, executes in exactly the position it
+    is declared in on every engine -- the interpreters run it there because they run every
+    op in declared order, and the fixed-stage flow runs it there because its Calculate
+    stage (2) precedes the Transform stage (4) a `project`'s aggregation lowers onto
+    anyway. There is no ordering question here the way there is for a POST-project
+    `calculate`, which `planner._compile_single_input_chain` still rejects after a
+    many-to-one `project` (the same unestablished-commutativity risk `FilterStep`'s
+    docstring describes for a post-project value filter). `group` still has no `input` field (see `GroupStep`'s
     docstring for why that one is left alone) and so still can never lead a pipeline.
     `as` follows `FilterStep`'s reasoning: accepted, naming this step's output for a
     later step to reference.
@@ -312,14 +310,15 @@ class GroupStep(BaseModel):
     `Options.group_by`/`Options.group_aggregate` are scalar fields, not a list like
     `Options.calculate` -- a leading (pre-project) `group` and a post-project `group`
     (still legal today, subject to `planner._compile_single_input_chain`'s "only one"
-    limit, which applies to a raster input but not to a vector one) would have to share that
-    one bucket. `calculate`'s equivalent bucket is a LIST that already accumulates
+    limit, which now applies only to the one shape that still executes the fixed-stage
+    flow: a `grid_cell`-bearing raster selection) would have to share that one bucket. `calculate`'s equivalent bucket is a LIST that already accumulates
     leading and trailing entries side by side without collision (see `CalculateStep`'s
     docstring); `group`'s does not, so allowing a leading `group` would need either a
     second `Options` field (a real schema change beyond this step's scope) or a new
     compile-time rejection of "leading group + trailing group in the same pipeline" to
-    keep raster's single bucket from being silently overwritten -- genuinely separate
-    design work, not a mechanical extension of the `filter`/`calculate` pattern. Left
+    keep that single bucket from being silently overwritten for the shapes that still read
+    it -- genuinely separate design work, not a mechanical extension of the
+    `filter`/`calculate` pattern. Left
     alone; a `group` step still cannot lead a pipeline.
     """
 

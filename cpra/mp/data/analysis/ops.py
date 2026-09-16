@@ -132,8 +132,8 @@ class GroupOp(BaseModel):
     """Collapse `by` (empty means "one row per `grid_cell`") with `aggregate` applied to
     `of`. `long` lowers this onto `group_by(...).agg(...)` (or `analysis.fold`'s
     cliff-shaped fold, for a non-decomposable-but-foldable aggregate); band-wide onto a
-    HORIZONTAL reduce across band columns (again `sources.band_collapse_exprs`'s existing
-    vocabulary) -- see `LOWERING_TABLE`.
+    HORIZONTAL reduce across band columns (again `sources.HORIZONTAL_RASTER_AGGREGATES`'s
+    existing vocabulary) -- see `LOWERING_TABLE`.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)

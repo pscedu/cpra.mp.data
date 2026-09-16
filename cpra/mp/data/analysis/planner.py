@@ -404,16 +404,24 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # ordinary re-entrant transform -- so those specific rejections are now artifacts of
     # an engine a vector pipeline no longer runs through, not real limitations.
     #
-    # A raster input ALSO routes through an interpreter (`RasterGridAnalysis.apply_steps`)
-    # for every shape except a `grid_cell`-bearing selection (see the fast-path comment
-    # below for why that one is excluded) -- but that interpreter does NOT yet make these
-    # rejections safe to lift. It still defers the group collapse by recording absolute
-    # row indices into `self._band_groups`, and band columns are named `b0..bN` BY
-    # POSITION in the band-metadata frame, recomputed at read time. Any op that changes
-    # that frame's membership or order after a group has been recorded silently
-    # invalidates the stored indices. So the rejections below stay in force for raster
-    # and are lifted only for vector.
+    # A raster input ALSO routes through an interpreter (`RasterGridAnalysis.apply_steps`),
+    # and that interpreter carries no positions across a metadata change either: an op is
+    # recorded with the caller's OWN predicate/plans/group key (`self._band_ops`), and
+    # `raster.apply_band_ops` resolves each one against the band metadata the replay has
+    # reached by that point, recomputing the `b0..bN` column names at every step. So the
+    # four ordering rejections raster used to need (a dimension filter after a group, a
+    # calculate after a group, a second group, a value filter after a calculate) are lifted
+    # for raster too -- but only for the shapes that actually reach that interpreter.
+    #
+    # `runs_ops_interpreter` is exactly the fast-path condition applied at the bottom of
+    # this function, evaluated here so the rejections and the engine choice cannot drift
+    # apart. A `grid_cell`-bearing RASTER selection is the one shape that still executes
+    # `BaseAnalysis.apply_params`'s fixed five-stage flow (`RasterGridAnalysis.
+    # _apply_grid_cell` reshapes `self.lf` to a long frame before any op could run -- see
+    # the fast-path comment below), and against that flow all four shapes are still silent
+    # wrong answers rather than errors, so those four rejections stay armed for it alone.
     is_vector_input = GRIDS[selection.grid].grid_type == "vector"
+    runs_ops_interpreter = is_vector_input or selection.grid_cell is None
 
     steps = pipeline.steps
 
@@ -617,21 +625,22 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             # group already produced, because there is no separate fixed "Filter stage"
             # for it to have instead landed in. So this is lifted for vector.
             #
-            # It is NOT lifted for raster. The raster interpreter still defers the
-            # collapse as row indices in `self._band_groups`, and a dimension filter
-            # after a group drops columns from the band-metadata frame -- which renames
-            # the surviving bands, since `b0..bN` are positional. `band_group_row_idxs`
-            # then indexes a band that no longer exists at that position (a recorded
-            # `b2` against a frame narrowed to two columns). Lift this once the raster
-            # side stops carrying positions across a metadata change.
-            if not is_vector_input and group_step is not None:
+            # Also lifted for raster, wherever the raster interpreter actually runs.
+            # `RasterGridAnalysis.apply_steps` records a post-group dimension filter as
+            # `("filter", where)` at its own position and narrows the running band metadata
+            # with `raster.band_metadata_filter`, the same primitive `apply_band_ops`
+            # replays it with at pixel-read time -- so the filter is resolved against the
+            # GROUPED bands it names, and the renumbering `b0..bN` undergoes when columns
+            # are dropped is recomputed rather than stored.
+            if not runs_ops_interpreter and group_step is not None:
                 raise PipelineError(
                     f"not yet supported in analysis pipelines: step {i} (filter) comes "
-                    "after a group step in a raster-input pipeline -- the raster engine "
-                    "records the group's band positions before any bands are read, and a "
-                    "later filter renames the surviving bands, so the recorded positions "
-                    "would no longer refer to the bands they were captured for. Move this "
-                    "filter step before the group step."
+                    "after a group step in a raster-input pipeline that also selects a "
+                    "`grid_cell` -- that one shape still runs the fixed-stage engine, "
+                    "whose single Filter stage runs before its Group stage regardless of "
+                    "declared order, so this filter would narrow the pre-group bands "
+                    "instead of the declared post-group result. Move this filter step "
+                    "before the group step, or drop the `grid_cell` selection."
                 )
             # Only a many-to-one (summarizing) `project` needs this special-casing --
             # see `_extract_post_project_grid_cell_filter`'s docstring. An identity
@@ -691,20 +700,23 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             # `CalculateOp` after a `GroupOp` runs against the already-collapsed rows --
             # lifted for vector.
             #
-            # Still rejected for raster: `sources.band_collapse_exprs` hardcodes a
-            # calculate-before-collapse pass order, so a calculate declared after a group
-            # runs BEFORE it regardless. That is a silent wrong answer, not an error --
-            # a declared `mean(x)**2` evaluates as `mean(x**2)`, which for bands [2, 4]
-            # returns 10 instead of 9. Lift this once the pass order follows the declared
-            # order instead of that fixed one.
-            if not is_vector_input and group_step is not None:
+            # Also lifted for raster, wherever the raster interpreter actually runs. There
+            # is no longer a hardcoded calculate-before-collapse pass order: `apply_steps`
+            # flushes the pending calculate entries into `self._band_ops` at the position
+            # they were declared at, and `apply_band_ops` replays that list in order, so a
+            # declared `mean(x)**2` really evaluates as `mean(x)**2` (9 for bands [2, 4])
+            # instead of `mean(x**2)` (10). The fixed-stage engine still gets it wrong, and
+            # silently, so the `grid_cell` shape keeps the rejection.
+            if not runs_ops_interpreter and group_step is not None:
                 raise PipelineError(
                     f"not yet supported in analysis pipelines: step {i} (calculate) "
-                    "comes after a group step in a raster-input pipeline -- the raster "
-                    "engine applies every calculate before the group collapse regardless "
-                    "of declared order, which would silently compute the aggregate of "
-                    "the expression instead of the expression of the aggregate. Move "
-                    "this calculate step before the group step."
+                    "comes after a group step in a raster-input pipeline that also selects "
+                    "a `grid_cell` -- that one shape still runs the fixed-stage engine, "
+                    "which applies every calculate before the group collapse regardless of "
+                    "declared order, so this would silently compute the aggregate of the "
+                    "expression instead of the expression of the aggregate. Move this "
+                    "calculate step before the group step, or drop the `grid_cell` "
+                    "selection."
                 )
             if is_summarizing_project:
                 # SUMMARIZING-PROJECT ORDER GUARD -- see the long comment above `is_summarizing_project`'s
@@ -750,19 +762,24 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             # "last write wins" simplification for `Options.group_by`/`group_aggregate`,
             # which the vector interpreter's execution path does not consult).
             #
-            # Still rejected for raster: `_collapse_group` re-derives row positions
-            # against `self.lf`, which the first group never touched (it only recorded
-            # indices), and then assigns over `self._band_groups`. The second group
-            # therefore discards the first rather than composing with it -- structurally,
-            # not as an edge case. Lift this once the collapse is applied to the frame
-            # instead of recorded beside it.
-            if not is_vector_input and group_step is not None:
+            # Also lifted for raster, wherever the raster interpreter actually runs.
+            # `RasterGridAnalysis._collapse_group` now APPLIES each group to the running
+            # band metadata (`band_metadata_group`) and appends its own
+            # `("group", by, aggregate)` entry, so a second group resolves against the first
+            # one's collapsed output on both halves -- the metadata here and the pixels at
+            # replay time -- instead of being re-derived against the untouched original band
+            # set. `apply_steps` also passes the `GroupOp`'s OWN aggregate, since the
+            # `Options.group_aggregate` reassignment below is last-write-wins. The
+            # fixed-stage engine has only those scalar `Options` fields and calls
+            # `_collapse_group` exactly once, so the `grid_cell` shape keeps the rejection.
+            if not runs_ops_interpreter and group_step is not None:
                 raise PipelineError(
                     "not yet supported in analysis pipelines: more than one `group` step "
-                    f"in a raster-input pipeline (step {i}) -- the raster engine records "
-                    "each group's band positions against the original, uncollapsed band "
-                    "set, so a second group would silently replace the first instead of "
-                    "collapsing its result."
+                    f"in a raster-input pipeline that also selects a `grid_cell` (step {i})"
+                    " -- that one shape still runs the fixed-stage engine, which has a "
+                    "single group_by/group_aggregate slot and collapses exactly once, so a "
+                    "second group would silently replace the first instead of collapsing "
+                    "its result. Drop the `grid_cell` selection to declare both."
                 )
             if is_summarizing_project:
                 # SUMMARIZING-PROJECT ORDER GUARD -- see the long comment above `is_summarizing_project`'s
@@ -834,20 +851,22 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
         # the already-recalculated `value` column, in declared order, with no separate
         # fixed "Filter stage" to instead run ahead of the calculate.
         #
-        # Still rejected for raster: the band-wide write path runs every calculate pass
-        # first (`for pass_exprs in passes: lf = lf.with_columns(pass_exprs)`) and only
-        # then the collapse, a fixed order that a per-cell value mask declared after a
-        # calculate cannot get in front of. The mask would test the raw pixel value, not
-        # the calculated one the declared order promises. Lift this once those passes run
-        # in declared order.
-        if value_conjuncts and after_calculate and not is_vector_input:
+        # Also lifted for raster, wherever the raster interpreter actually runs:
+        # `apply_steps` flushes the pending calculate entries into `self._band_ops` before
+        # appending this filter's own `("filter_value", where)` entry, and `apply_band_ops`
+        # replays the list in that order -- so the per-cell mask tests the REWRITTEN pixel
+        # value, exactly as the declared order promises. The fixed-stage engine cannot, so
+        # the `grid_cell` shape keeps the rejection.
+        if value_conjuncts and after_calculate and not runs_ops_interpreter:
             raise PipelineError(
                 f"not yet supported in analysis pipelines: step {i} (filter) tests "
-                f"`value` and comes after a calculate step in a raster-input pipeline "
-                f"(where={where!r}) -- the raster engine applies calculates in a fixed "
-                "order ahead of any value mask, so this filter would test the "
-                "pre-calculate value instead of the post-calculate one. Move this filter "
-                "step before the calculate step, or restrict it to dimension conditions."
+                "`value` and comes after a calculate step in a raster-input pipeline that "
+                f"also selects a `grid_cell` (where={where!r}) -- that one shape still runs "
+                "the fixed-stage engine, which applies calculates in a fixed order ahead of "
+                "any value mask, so this filter would test the pre-calculate value instead "
+                "of the post-calculate one. Move this filter step before the calculate "
+                "step, restrict it to dimension conditions, or drop the `grid_cell` "
+                "selection."
             )
         if value_conjuncts and after_summarizing_project:
             # SUMMARIZING-PROJECT ORDER GUARD -- see the long comment above `is_summarizing_project`'s
@@ -995,15 +1014,15 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # same as before this change: `selection.grid` is `raster` for a raster input
     # summarizing (many-to-one) onto a VECTOR `summarize_by` grid -- a real, existing shape
     # (the `direction == "many_to_one"` branch above) that is NOT `is_vector_input`, so it
-    # falls to the `is_raster_input` branch below instead, not this one. A vector input can
-    # never reach a raster `to` at all -- `_project_direction` rejects raster-to-raster
+    # falls to the raster disjunct below instead, not this one. A vector input can never
+    # reach a raster `to` at all -- `_project_direction` rejects raster-to-raster
     # outright, and this function itself rejects a vector input's one-to-many broadcast a
     # few lines above ("broadcasts onto a finer grid ... pair it with a join instead") --
     # so checking the input's own grid type here is equivalent to "is `dataset` actually a
     # `VectorGridAnalysis`" without importing that class just to `isinstance`-check it.
     #
-    # `is_raster_input` admits a raster-input shape EXCEPT when `selection.grid_cell` is
-    # set (lowered a few lines above, in `_dataset_for`, onto `option_kwargs["grid_cell"]`
+    # `runs_ops_interpreter`'s second disjunct admits a raster-input shape EXCEPT when
+    # `selection.grid_cell` is set (lowered a few lines above, in `_dataset_for`, onto `option_kwargs["grid_cell"]`
     # -> `Options.grid_cell`): `RasterGridAnalysis._apply_grid_cell` reshapes `self.lf`
     # from the band-metadata table straight into a long (grid_cell/value) frame via
     # `.unpivot(...)` before any pipeline op could run at all, a shape change the raster
@@ -1013,8 +1032,7 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # entirely, exactly as it did before this change (`RasterGridAnalysis.apply_params`'s
     # override still falls through to `BaseAnalysis.apply_params` whenever
     # `_pipeline_ops is None`).
-    is_raster_input = GRIDS[selection.grid].grid_type == "raster"
-    if is_vector_input or (is_raster_input and selection.grid_cell is None):
+    if runs_ops_interpreter:
         dataset._pipeline_ops = compile_ops(pipeline)
 
     return dataset

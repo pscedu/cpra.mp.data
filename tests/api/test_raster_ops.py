@@ -1,26 +1,17 @@
-"""Direct tests for the band-wide op lowerings in `analysis.raster`
-(`apply_value_filter_band_wide`, `apply_dimension_filter_band_wide`,
-`apply_calculate_band_wide`, `apply_group_band_wide`, plus the `band_dimension_keep`/
-`band_group_row_idxs` helpers they share) and for the widened third mode of
-`analysis.sources.scan_rasters` they build on top of.
+"""Direct tests for the band-wide op lowerings in `analysis.raster` and for the widened
+third mode of `analysis.sources.scan_rasters` they build on top of.
 
-These functions are the
-band-wide analogue of `vector.py`'s `apply_group_by`/`apply_project`, each the re-entrant
-core of an existing `RasterGridAnalysis` method pulled out to take explicit arguments
-instead of `self`. `apply_value_filter_band_wide` and `band_dimension_keep` ARE wired into
-`RasterGridAnalysis` (`_write_raster_windowed`'s value-filter gate and
-`_band_applicability`'s delegation, respectively) but are still exercised directly here
-too, at the primitive level; `apply_dimension_filter_band_wide`, `apply_calculate_band_wide`,
-`band_group_row_idxs`, and `apply_group_band_wide` are NOT wired into any live request
-path -- each is retained specifically because a still-blocked raster pipeline-ordering
-rejection in `planner.py` needs it (see `raster.py`'s module comment block for exactly
-which rejection needs which function), not merely "kept just in case" -- so these are
-exercised directly, the same way `sources.scan_rasters` itself is exercised directly in
-`test_raster_source.py` rather than only through `_summarize_zone_stats_plugin`.
+Every op there has the same signature -- `(band_wide_lf, metadata_df) -> (band_wide_lf,
+metadata_df)` -- and the tests here exercise each one at that primitive level: the pixel
+half AND the metadata half, since the metadata frame a step returns is the column
+dictionary the NEXT step reads its band names out of. `RasterGridAnalysis` wires all of
+them through `apply_band_ops`, which the request-level tests in `test_dataset_raster.py`,
+`test_write_raster.py`, and `test_pipeline_exec.py` cover end to end; this file is the
+per-primitive layer underneath, the same way `sources.scan_rasters` is exercised directly
+in `test_raster_source.py` rather than only through `_summarize_zone_stats_plugin`.
 
 A sixth function, `apply_project_band_wide`, used to be tested here too; it was deleted
-once no rejection turned out to need it -- see the comment at the end of this file and
-`raster.py`'s module comment block.
+unused -- see the comment at the end of this file.
 """
 
 import numpy as np
@@ -29,12 +20,18 @@ import pytest
 
 from cpra.mp.data.analysis.expressions import ExpressionError, compile_calculate_entries
 from cpra.mp.data.analysis.raster import (
+    BAND_INDEX,
+    apply_band_ops,
     apply_calculate_band_wide,
     apply_dimension_filter_band_wide,
     apply_group_band_wide,
     apply_value_filter_band_wide,
+    band_column_names,
     band_dimension_keep,
     band_group_row_idxs,
+    band_metadata_filter,
+    band_metadata_group,
+    band_ops_for_pixel_read,
 )
 from cpra.mp.data.analysis.sources import scan_rasters
 from cpra.mp.data.grids import GRIDS
@@ -63,10 +60,11 @@ def zone_crosswalk_path(crosswalk_path):
 
 class TestScanRastersAttachWithoutFilter:
     """`scan_rasters`' third mode: `zones_path` given, `zone_ids=None` -- attach every
-    pixel's own zone id without dropping any. This is what
-    `apply_project_band_wide` is built to consume; the two PRE-EXISTING modes (dense,
-    zoned/filtered) are covered by `test_raster_source.py::TestScanRasters` and are not
-    re-litigated here beyond confirming this mode doesn't disturb them.
+    pixel's own zone id without dropping any. No live path consumes it -- the function
+    written to consume it, `apply_project_band_wide`, was deleted (see the comment at the
+    end of this file); the two PRE-EXISTING modes (dense, zoned/filtered) are covered by
+    `test_raster_source.py::TestScanRasters` and are not re-litigated here beyond
+    confirming this mode doesn't disturb them.
     """
 
     def test_attaches_grid_cell_without_dropping_any_pixel(self, base_path, zone_crosswalk_path):
@@ -106,37 +104,54 @@ class TestScanRastersAttachWithoutFilter:
             scan_rasters(paths, [[0]], [None], zone_ids=np.array([1], dtype="int64"))
 
 
+class TestBandColumnNames:
+    """The band-wide invariant: column `b<i>` is the band described by metadata row `i`."""
+
+    def test_names_one_column_per_metadata_row(self):
+        assert band_column_names(pl.DataFrame({"calendar_year": [2030, 2040, 2050]})) == ["b0", "b1", "b2"]
+
+    def test_an_empty_metadata_frame_names_no_columns(self):
+        assert band_column_names(pl.DataFrame({"calendar_year": []})) == []
+
+
 class TestApplyValueFilterBandWide:
     """`ops.LOWERING_TABLE[("filter (value)", Shape.band_wide)]`: a per-cell MASK, never
     a row drop -- reuses `sources.masked_value_predicate_exprs` unchanged."""
 
     def test_masks_failing_cells_without_dropping_rows(self):
         lf = pl.LazyFrame({"b0": [1, 20, 3], "b1": [10, 2, 30]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
-        out = apply_value_filter_band_wide(lf, ["b0", "b1"], "value > 5").collect()
+        out, out_metadata = apply_value_filter_band_wide(lf, metadata, "value > 5")
 
-        assert out.height == 3  # pixel count preserved -- the whole point of masking
-        assert out["b0"].to_list() == [None, 20, None]
-        assert out["b1"].to_list() == [10, None, 30]
+        collected = out.collect()
+        assert collected.height == 3  # pixel count preserved -- the whole point of masking
+        assert collected["b0"].to_list() == [None, 20, None]
+        assert collected["b1"].to_list() == [10, None, 30]
+        # A mask preserves band identity, so the column dictionary is unchanged.
+        assert out_metadata.equals(metadata)
 
     def test_falsy_where_is_a_no_op(self):
         lf = pl.LazyFrame({"b0": [1, 2, 3]})
+        metadata = pl.DataFrame({"calendar_year": [2030]})
 
-        out = apply_value_filter_band_wide(lf, ["b0"], None).collect()
+        out, out_metadata = apply_value_filter_band_wide(lf, metadata, None)
 
-        assert out["b0"].to_list() == [1, 2, 3]
+        assert out.collect()["b0"].to_list() == [1, 2, 3]
+        assert out_metadata.equals(metadata)
 
     def test_extra_columns_stay_available_to_the_predicate(self):
-        """A grid_cell column already attached by an earlier `project` can be referenced
-        by a value predicate scoped to it (e.g. "value > 5 and grid_cell == 1"),
-        mirroring `masked_value_predicate_exprs`'s own `extra_columns` contract."""
+        """A grid_cell column attached by a zoned scan can be referenced by a value
+        predicate scoped to it (e.g. "value > 5 and grid_cell == 1"), mirroring
+        `masked_value_predicate_exprs`'s own `extra_columns` contract."""
         lf = pl.LazyFrame({"grid_cell": [1, 1, 2], "b0": [10, 10, 10]})
+        metadata = pl.DataFrame({"calendar_year": [2030]})
 
-        out = apply_value_filter_band_wide(
-            lf, ["b0"], "value > 5 and grid_cell == 1", extra_columns=["grid_cell"]
-        ).collect()
+        out, _ = apply_value_filter_band_wide(
+            lf, metadata, "value > 5 and grid_cell == 1", extra_columns=["grid_cell"]
+        )
 
-        assert out["b0"].to_list() == [10, 10, None]
+        assert out.collect()["b0"].to_list() == [10, 10, None]
 
 
 class TestBandDimensionKeep:
@@ -158,40 +173,61 @@ class TestBandDimensionKeep:
             band_dimension_keep(df, "not_a_real_column == 1")
 
 
+class TestBandMetadataFilter:
+    """The metadata half of a dimension filter, shared by the in-flight narrowing
+    `RasterGridAnalysis.apply_steps` does and the replay `apply_band_ops` does."""
+
+    def test_narrows_rows_and_reports_which_survived(self):
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040, 2050]})
+
+        out, keep = band_metadata_filter(metadata, "calendar_year >= 2040")
+
+        assert keep == [False, True, True]
+        assert out["calendar_year"].to_list() == [2040, 2050]
+        # The surviving bands are renamed by their NEW positions, not their old ones.
+        assert band_column_names(out) == ["b0", "b1"]
+
+
 class TestApplyDimensionFilterBandWide:
     """`ops.LOWERING_TABLE[("filter (dimension)", Shape.band_wide)]`: a COLUMN SELECTION
     (projection pushdown), since a dimension lives in column identity, not per-cell."""
 
-    def test_keeps_only_columns_whose_band_matches(self):
+    def test_keeps_only_columns_whose_band_matches_and_renumbers_them(self):
         lf = pl.LazyFrame({"b0": [1, 2], "b1": [3, 4], "b2": [5, 6]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040, 2050]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040, 2050]})
 
-        out, kept = apply_dimension_filter_band_wide(
-            lf, band_metadata, ["b0", "b1", "b2"], "calendar_year >= 2040"
-        )
+        out, out_metadata = apply_dimension_filter_band_wide(lf, metadata, "calendar_year >= 2040")
 
-        assert kept == ["b1", "b2"]
-        assert out.collect().columns == ["b1", "b2"]
+        collected = out.collect()
+        # b1/b2 survive, renamed to b0/b1 so `band_column_names(out_metadata)` stays true
+        # for whatever op runs next -- that renumbering is the invariant, not cosmetics.
+        assert collected.columns == ["b0", "b1"]
+        assert band_column_names(out_metadata) == ["b0", "b1"]
+        assert collected["b0"].to_list() == [3, 4]
+        assert collected["b1"].to_list() == [5, 6]
+        assert out_metadata["calendar_year"].to_list() == [2040, 2050]
 
     def test_extra_columns_survive_the_selection(self):
         lf = pl.LazyFrame({"grid_cell": [1, 2], "b0": [1, 2], "b1": [3, 4]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
-        out, kept = apply_dimension_filter_band_wide(
-            lf, band_metadata, ["b0", "b1"], "calendar_year == 2040", extra_columns=["grid_cell"]
+        out, out_metadata = apply_dimension_filter_band_wide(
+            lf, metadata, "calendar_year == 2040", extra_columns=["grid_cell"]
         )
 
-        assert kept == ["b1"]
-        assert out.collect().columns == ["grid_cell", "b1"]
+        collected = out.collect()
+        assert collected.columns == ["grid_cell", "b0"]
+        assert collected["b0"].to_list() == [3, 4]
+        assert out_metadata.height == 1
 
     def test_falsy_where_is_a_no_op(self):
         lf = pl.LazyFrame({"b0": [1], "b1": [2]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
-        out, kept = apply_dimension_filter_band_wide(lf, band_metadata, ["b0", "b1"], None)
+        out, out_metadata = apply_dimension_filter_band_wide(lf, metadata, None)
 
-        assert kept == ["b0", "b1"]
         assert out.collect().columns == ["b0", "b1"]
+        assert out_metadata.equals(metadata)
 
 
 class TestApplyCalculateBandWide:
@@ -201,53 +237,87 @@ class TestApplyCalculateBandWide:
 
     def test_applies_expression_to_every_band_with_no_where(self):
         lf = pl.LazyFrame({"b0": [1, 2], "b1": [3, 4]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
         plans = compile_calculate_entries([("calculate.1", "value * 2", None)])
 
-        out = apply_calculate_band_wide(lf, band_metadata, ["b0", "b1"], plans).collect()
+        out, out_metadata = apply_calculate_band_wide(lf, metadata, plans)
 
-        assert out["b0"].to_list() == [2, 4]
-        assert out["b1"].to_list() == [6, 8]
+        collected = out.collect()
+        assert collected["b0"].to_list() == [2, 4]
+        assert collected["b1"].to_list() == [6, 8]
+        # A rewrite preserves band identity, so the column dictionary is unchanged.
+        assert out_metadata.equals(metadata)
 
     def test_where_restricts_to_matching_bands(self):
         lf = pl.LazyFrame({"b0": [1, 2], "b1": [3, 4]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
         plans = compile_calculate_entries([("calculate.1", "value * 10", "calendar_year == 2040")])
 
-        out = apply_calculate_band_wide(lf, band_metadata, ["b0", "b1"], plans).collect()
+        out, _ = apply_calculate_band_wide(lf, metadata, plans)
 
-        assert out["b0"].to_list() == [1, 2]  # calendar_year 2030 -- untouched
-        assert out["b1"].to_list() == [30, 40]  # calendar_year 2040 -- rewritten
+        collected = out.collect()
+        assert collected["b0"].to_list() == [1, 2]  # calendar_year 2030 -- untouched
+        assert collected["b1"].to_list() == [30, 40]  # calendar_year 2040 -- rewritten
+
+    def test_where_is_resolved_against_the_metadata_it_is_handed(self):
+        """The same plan, the same band-wide frame, DIFFERENT metadata -- and therefore a
+        different set of bands rewritten. This is the property a stored row index cannot
+        have: applicability is a question about the frame this call was handed, answered
+        now, not one answered once at scan time and carried forward."""
+        lf = pl.LazyFrame({"b0": [1], "b1": [2]})
+        plans = compile_calculate_entries([("calculate.1", "value * 10", "calendar_year == 2040")])
+
+        first, _ = apply_calculate_band_wide(lf, pl.DataFrame({"calendar_year": [2030, 2040]}), plans)
+        second, _ = apply_calculate_band_wide(lf, pl.DataFrame({"calendar_year": [2040, 2030]}), plans)
+
+        assert first.collect().row(0) == (1, 20)
+        assert second.collect().row(0) == (10, 2)
 
     def test_sequential_passes_compose(self):
         """Entry N+1 must see entry N's own rewrite -- `band_calculate_passes`'
         documented sequential-composition contract."""
         lf = pl.LazyFrame({"b0": [1]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030]})
+        metadata = pl.DataFrame({"calendar_year": [2030]})
         plans = compile_calculate_entries(
             [("calculate.1", "value + 1", None), ("calculate.2", "value * 10", None)]
         )
 
-        out = apply_calculate_band_wide(lf, band_metadata, ["b0"], plans).collect()
+        out, _ = apply_calculate_band_wide(lf, metadata, plans)
 
-        assert out["b0"].to_list() == [20]  # (1 + 1) * 10
+        assert out.collect()["b0"].to_list() == [20]  # (1 + 1) * 10
 
     def test_empty_plans_is_a_no_op(self):
         lf = pl.LazyFrame({"b0": [1, 2]})
-        band_metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        metadata = pl.DataFrame({"calendar_year": [2030]})
 
-        out = apply_calculate_band_wide(lf, band_metadata, ["b0"], []).collect()
+        out, out_metadata = apply_calculate_band_wide(lf, metadata, [])
 
-        assert out["b0"].to_list() == [1, 2]
+        assert out.collect()["b0"].to_list() == [1, 2]
+        assert out_metadata.equals(metadata)
+
+    def test_an_unevaluable_where_names_the_offending_entry(self):
+        """The plan's own label is prefixed onto the failure, which is what lets a caller
+        turn it into a 400 that names `calculate.1` rather than an anonymous error."""
+        lf = pl.LazyFrame({"b0": [1]})
+        metadata = pl.DataFrame({"calendar_year": [2030]})
+        plans = compile_calculate_entries([("calculate.1", "value * 2", "aep = 0.2")])
+
+        with pytest.raises(ExpressionError, match="calculate.1"):
+            apply_calculate_band_wide(lf, metadata, plans)
 
 
 class TestBandGroupRowIdxs:
     def test_groups_by_column(self):
         df = pl.DataFrame({"model_group_id": [500, 500, 600]})
 
-        groups = sorted(band_group_row_idxs(df, ["model_group_id"]))
+        assert band_group_row_idxs(df, ["model_group_id"]) == [[0, 1], [2]]
 
-        assert groups == [[0, 1], [2]]
+    def test_group_order_is_first_occurrence_order(self):
+        """Group `k` becomes output band `b<k>`, so the output band order has to be a
+        property of the data rather than of Polars' hash-partition scheduling."""
+        df = pl.DataFrame({"model_group_id": [600, 500, 600, 500]})
+
+        assert band_group_row_idxs(df, ["model_group_id"]) == [[0, 2], [1, 3]]
 
     def test_empty_by_collapses_to_one_group(self):
         df = pl.DataFrame({"model_group_id": [500, 600, 700]})
@@ -255,63 +325,245 @@ class TestBandGroupRowIdxs:
         assert band_group_row_idxs(df, []) == [[0, 1, 2]]
 
 
+class TestBandMetadataGroup:
+    """The metadata half of a group, shared by `RasterGridAnalysis._collapse_group` and
+    the `apply_band_ops` replay."""
+
+    def test_keeps_one_row_per_group_and_drops_collapsed_dimensions(self):
+        metadata = pl.DataFrame({"calendar_year": [2030, 2030, 2040], "model_group_id": [500, 600, 500]})
+
+        out, group_row_idxs = band_metadata_group(metadata, ["calendar_year"])
+
+        assert group_row_idxs == [[0, 1], [2]]
+        assert out["calendar_year"].to_list() == [2030, 2040]
+        # model_group_id was collapsed across, so it no longer has a single value to
+        # report -- and therefore no longer has a column.
+        assert "model_group_id" not in out.columns
+        assert band_column_names(out) == ["b0", "b1"]
+
+    def test_an_empty_by_still_reports_one_band(self):
+        """`group_aggregate` with no `group_by` collapses away every dimension column, and
+        Polars cannot represent "zero columns, N rows" -- `BAND_INDEX` is what keeps the
+        resulting frame's height meaningful."""
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+
+        out, group_row_idxs = band_metadata_group(metadata, [])
+
+        assert group_row_idxs == [[0, 1]]
+        assert out.columns == [BAND_INDEX]
+        assert out.height == 1
+        assert band_column_names(out) == ["b0"]
+
+
 class TestApplyGroupBandWide:
     """`ops.LOWERING_TABLE[("group", Shape.band_wide)]`: a horizontal reduce across band
-    columns -- reuses `sources.band_collapse_exprs` unchanged, with `calculate_passes=[]`
-    since a preceding `CalculateOp` already ran as its own op in this interpreter."""
+    columns, keyed by the group's own `by` columns in the metadata it is handed."""
 
     def test_mean_collapses_two_groups(self):
         lf = pl.LazyFrame({"b0": [10, 20], "b1": [30, 40], "b2": [1, 2]})
-        # group 0 = {b0, b1}, group 1 = {b2} alone
-        group_row_idxs = [[0, 1], [2]]
+        # group 0 = {b0, b1} (model_group_id 500), group 1 = {b2} alone (600)
+        metadata = pl.DataFrame({"model_group_id": [500, 500, 600]})
 
-        out, out_names = apply_group_band_wide(lf, ["b0", "b1", "b2"], group_row_idxs, "mean", "int32")
+        out, out_metadata = apply_group_band_wide(lf, metadata, ["model_group_id"], "mean")
 
         collected = out.collect()
-        assert out_names == ["out0", "out1"]
-        assert collected["out0"].to_list() == [20.0, 30.0]  # mean(10,30), mean(20,40)
-        assert collected["out1"].to_list() == [1, 2]
+        assert band_column_names(out_metadata) == ["b0", "b1"]
+        assert collected.columns == ["b0", "b1"]
+        assert collected["b0"].to_list() == [20.0, 30.0]  # mean(10,30), mean(20,40)
+        assert collected["b1"].to_list() == [1, 2]
 
     def test_nodata_masked_pixel_drops_out_of_the_collapse(self):
-        """A band's own nodata sentinel is excluded from the group before reducing --
-        the same contract `_write_raster_windowed`/`_collapse_tile_bands` depend on."""
-        lf = pl.LazyFrame({"b0": [-9999, 5], "b1": [10, -9999]})
+        """A null (a masked nodata sentinel, or a rejected value predicate) is excluded
+        from the group before reducing -- the contract every pixel-read path depends on."""
+        lf = pl.LazyFrame({"b0": [None, 5], "b1": [10, None]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
-        out, out_names = apply_group_band_wide(lf, ["b0", "b1"], [[0, 1]], "sum", "int32", nodata=-9999)
+        out, _ = apply_group_band_wide(lf, metadata, [], "sum")
 
-        collected = out.collect()
         # row 0: only b1 contributes (10); row 1: only b0 contributes (5)
-        assert collected[out_names[0]].to_list() == [10, 5]
+        assert out.collect()["b0"].to_list() == [10, 5]
 
-    def test_no_contributor_falls_back_to_nodata_sentinel(self):
-        out, out_names = apply_group_band_wide(
-            pl.LazyFrame({"b0": [-9999], "b1": [-9999]}),
-            ["b0", "b1"],
-            [[0, 1]],
-            "mean",
-            "int32",
-            nodata=-9999,
-        )
+    def test_a_group_with_no_contributor_stays_null(self):
+        """Not a sentinel: a later op in the same chain has to be able to tell "nothing
+        here" from a real value, so the refill happens once, at the end of
+        `apply_band_ops`, never inside the group itself."""
+        lf = pl.LazyFrame({"b0": [None], "b1": [None]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
-        assert out.collect()[out_names[0]].to_list() == [-9999]
+        out, _ = apply_group_band_wide(lf, metadata, [], "mean")
+
+        assert out.collect()["b0"].to_list() == [None]
+
+    def test_extra_columns_survive_the_collapse(self):
+        lf = pl.LazyFrame({"grid_cell": [1, 2], "b0": [10, 20], "b1": [30, 40]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+
+        out, _ = apply_group_band_wide(lf, metadata, [], "sum", extra_columns=["grid_cell"])
+
+        assert out.collect().columns == ["grid_cell", "b0"]
 
     def test_count_aggregate_is_rejected(self):
         """`RasterGridAnalysis._collapse_group` rejects `group_aggregate="count"` with
         this exact message before any pixel-read stage runs -- this function has no
         `self` to raise an `AnalysisError` off of, so it raises `ExpressionError`
-        instead, with the identical text, rather than letting `band_collapse_exprs`
-        raise a bare `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` for a caller that
-        reaches this function without going through `_collapse_group` first."""
+        instead, with the identical text, rather than letting a bare `KeyError` out of
+        `HORIZONTAL_RASTER_AGGREGATES` reach a caller that got here without going through
+        `_collapse_group` first."""
         lf = pl.LazyFrame({"b0": [10, 20], "b1": [30, 40]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
         with pytest.raises(ExpressionError, match="group_aggregate 'count' is not supported for raster grids"):
-            apply_group_band_wide(lf, ["b0", "b1"], [[0, 1]], "count", "int32")
+            apply_group_band_wide(lf, metadata, [], "count")
+
+
+class TestBandOpsForPixelRead:
+    """How a standalone value `where` -- one with no declared position, because the flat
+    request surface has no positions -- is folded into a recorded op list."""
+
+    def test_a_standalone_value_where_is_prepended(self):
+        assert band_ops_for_pixel_read([("group", [], "mean")], "value > 5") == [
+            ("filter_value", "value > 5"),
+            ("group", [], "mean"),
+        ]
+
+    def test_an_already_positioned_value_filter_is_left_where_it_was(self):
+        """A pipeline request records the conjunct at its declared position AND combines
+        it onto `_value_where` (which validation still reads), so prepending it again
+        would apply the same mask twice, once in the wrong place."""
+        band_ops = [("calculate", []), ("filter_value", "value > 5")]
+
+        assert band_ops_for_pixel_read(band_ops, "value > 5") == band_ops
+
+    def test_no_value_where_at_all_changes_nothing(self):
+        assert band_ops_for_pixel_read([("group", [], "mean")], None) == [("group", [], "mean")]
+
+
+class TestApplyBandOps:
+    """The replay: every op in declared order, metadata recomputed at each step."""
+
+    @staticmethod
+    def _frame():
+        # Two bands, one pixel row: b0 = calendar_year 2030, b1 = calendar_year 2040.
+        return (
+            pl.DataFrame({"b0": [2], "b1": [4]}),
+            pl.DataFrame({"calendar_year": [2030, 2040]}),
+        )
+
+    def test_a_calculate_after_a_group_sees_the_grouped_band(self):
+        """mean(x) ** 2 over bands [2, 4] is 3 ** 2 = 9. A hardcoded
+        calculate-before-collapse order computes mean(x ** 2) = (4 + 16) / 2 = 10
+        instead, which is why the declared position has to be honored."""
+        lf, metadata = self._frame()
+        band_ops = [
+            ("group", [], "mean"),
+            ("calculate", compile_calculate_entries([("calculate.1", "value * value", None)])),
+        ]
+
+        out, out_metadata = apply_band_ops(lf, metadata, band_ops)
+
+        assert band_column_names(out_metadata) == ["b0"]
+        assert out["b0"].to_list() == [9]
+
+    def test_a_calculate_before_a_group_still_collapses_after_rewriting(self):
+        """The same two ops in the other declared order: mean(x ** 2) = 10."""
+        lf, metadata = self._frame()
+        band_ops = [
+            ("calculate", compile_calculate_entries([("calculate.1", "value * value", None)])),
+            ("group", [], "mean"),
+        ]
+
+        out, _ = apply_band_ops(lf, metadata, band_ops)
+
+        assert out["b0"].to_list() == [10]
+
+    def test_a_dimension_filter_after_a_group_keys_off_the_grouped_metadata(self):
+        """The filter names `calendar_year`, a column that only still exists because the
+        group grouped BY it -- and it indexes the collapsed bands, not the raw ones."""
+        lf = pl.DataFrame({"b0": [1], "b1": [2], "b2": [4]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040, 2040]})
+        band_ops = [("group", ["calendar_year"], "sum"), ("filter", "calendar_year = 2040")]
+
+        out, out_metadata = apply_band_ops(lf, metadata, band_ops)
+
+        assert out.columns == ["b0"]
+        assert out["b0"].to_list() == [6]  # 2 + 4, the 2040 group
+        assert out_metadata["calendar_year"].to_list() == [2040]
+
+    def test_a_second_group_composes_with_the_first(self):
+        """The second group has to reduce the FIRST group's outputs. Bands
+        (2030, 500) = 1, (2030, 600) = 2, (2040, 500) = 4: group by both, then by
+        calendar_year alone, giving sums 3 and 4 -- not a re-derivation against the raw
+        bands that would discard the first group entirely."""
+        lf = pl.DataFrame({"b0": [1], "b1": [2], "b2": [4]})
+        metadata = pl.DataFrame(
+            {"calendar_year": [2030, 2030, 2040], "model_group_id": [500, 600, 500]}
+        )
+        band_ops = [
+            ("group", ["calendar_year", "model_group_id"], "sum"),
+            ("group", ["calendar_year"], "sum"),
+        ]
+
+        out, out_metadata = apply_band_ops(lf, metadata, band_ops)
+
+        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert out["b0"].to_list() == [3]
+        assert out["b1"].to_list() == [4]
+
+    def test_a_value_filter_after_a_calculate_masks_the_rewritten_value(self):
+        """Declared order decides which number the predicate tests: `value * 10` then
+        `value > 25` keeps 30 (from 3) and drops 20 (from 2)."""
+        lf = pl.DataFrame({"b0": [2], "b1": [3]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+        band_ops = [
+            ("calculate", compile_calculate_entries([("calculate.1", "value * 10", None)])),
+            ("filter_value", "value > 25"),
+        ]
+
+        out, _ = apply_band_ops(lf, metadata, band_ops)
+
+        assert out["b0"].to_list() == [None]
+        assert out["b1"].to_list() == [30]
+
+    def test_dtype_masks_nodata_first_and_restores_the_sentinel_last(self):
+        lf = pl.DataFrame({"b0": [-9999, 5], "b1": [-9999, 7]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+
+        out, _ = apply_band_ops(
+            lf, metadata, [("group", [], "sum")], dtype="int32", nodata=-9999
+        )
+
+        # Row 0: every band was nodata, so nothing contributed -- the sentinel comes back.
+        # Row 1: a real sum, with no sentinel anywhere near the arithmetic.
+        assert out["b0"].to_list() == [-9999, 12]
+
+    def test_no_dtype_leaves_a_no_contributor_group_null(self):
+        """What the summarize path needs: a genuine null propagates into the vertical
+        `guarded_aggregate` instead of a fabricated sentinel entering its denominator."""
+        lf = pl.DataFrame({"b0": [None], "b1": [None]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+
+        out, _ = apply_band_ops(lf, metadata, [("group", [], "sum")])
+
+        assert out["b0"].to_list() == [None]
+
+    def test_an_empty_op_list_passes_the_frame_through_untouched(self):
+        lf = pl.DataFrame({"b0": [1], "b1": [2]})
+        metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
+
+        out, out_metadata = apply_band_ops(lf, metadata, [])
+
+        assert out.row(0) == (1, 2)
+        assert out_metadata.equals(metadata)
+
+    def test_an_unknown_entry_kind_is_rejected(self):
+        with pytest.raises(ValueError, match="unknown band op kind"):
+            apply_band_ops(pl.DataFrame({"b0": [1]}), pl.DataFrame({"calendar_year": [2030]}), [("nope",)])
 
 
 # `apply_project_band_wide` and its `TestApplyProjectBandWide` tests (formerly here) were
-# DELETED -- see `raster.py`'s module comment block for the full
-# reasoning: no rejection needed it, unlike the other four
-# functions in that module, which are retained specifically because a still-blocked
-# rejection needs each of them. The `scan_rasters` zone-attach-only scan mode
-# `apply_project_band_wide` consumed is untouched and still exercised directly by
-# `TestScanRastersAttachWithoutFilter`, above.
+# DELETED. The other band-wide ops in `raster.py` are each wired into `apply_band_ops`,
+# which every pixel-read path replays; a band-wide `project` never joined them, because a
+# summarizing `project` reaches the crosswalk through `_apply_transform_params_impl` ->
+# `_summarize_zone_stats_plugin` (the zoned/filtered `scan_rasters` mode) instead. The
+# zone-attach-only scan mode it would have consumed is untouched and still exercised
+# directly by `TestScanRastersAttachWithoutFilter`, above.

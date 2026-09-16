@@ -63,6 +63,7 @@ from cpra.mp.data.analysis.pipeline import (
     parse_pipeline,
     pipeline_to_query,
 )
+from cpra.mp.data.analysis import raster as raster_module
 from cpra.mp.data.analysis.raster import RasterGridAnalysis
 from cpra.mp.data.analysis.vector import VectorGridAnalysis
 from cpra.mp.data.analysis.planner import (
@@ -728,23 +729,50 @@ class TestCompileSingleInputChain:
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
         assert actual == {3: 3.0, 4: 4.0}
 
-    def test_rejects_filter_after_group_for_raster_input(self, base_path):
-        """The raster side of the vector ordering relaxation above: the raster
-        interpreter still defers a group's collapse as row indices into
-        `self._band_groups` rather than collapsing the frame outright, and a dimension
-        filter declared after that group would drop columns from the band-metadata
-        frame -- renaming the surviving bands, since `b0..bN` are positional -- so the
-        recorded indices would no longer refer to the bands they were captured for. This
-        rejection must keep firing for raster until the raster side stops carrying
-        positions across a metadata change. This is a pure compile-time rejection (like
-        `TestPostProjectGridCellFilterRejections`
-        above, which follows the same pattern) -- the rejection fires inside
-        `_compile_single_input_chain`'s step loop, before `_dataset_for` ever needs a
-        crosswalk or a raster file to exist, so none is written here.
+    def test_accepts_filter_after_group_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above, now lifted too: the
+        raster interpreter records a post-group dimension filter at its own position and
+        narrows the running band metadata with the same primitive the pixel-read replay
+        uses, so nothing indexes a band by a position captured before the group. Only the
+        compile is asserted here (the shape no longer raises) -- the answer it produces is
+        pinned by
+        `TestRasterInterpreterDeclaredOrder::test_dimension_filter_after_group_selects_from_the_grouped_bands`.
         """
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
         pipeline = parse_pipeline(
             {
                 "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "max"},
+                    {"op": "filter", "where": "calendar_year = 2030"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        assert isinstance(compile_pipeline(pipeline, base_path=base_path), BaseAnalysis)
+
+    def test_rejects_filter_after_group_for_a_grid_cell_raster_input(self, base_path):
+        """A `grid_cell`-bearing raster selection is the one shape that still executes
+        `BaseAnalysis.apply_params`'s fixed five-stage flow (`_apply_grid_cell` reshapes
+        `self.lf` to a long frame before any op could run, so the planner withholds
+        `_pipeline_ops` -- see
+        `TestRasterInterpreterLoadBearing::test_raster_input_with_grid_cell_stays_on_the_old_engine`).
+        That flow has a single Filter stage running strictly before its Group stage, so a
+        filter declared after a group would silently narrow the PRE-group bands -- the
+        rejection stays armed for it alone. Pure compile-time rejection (like
+        `TestPostProjectGridCellFilterRejections` above, which follows the same pattern) --
+        it fires inside `_compile_single_input_chain`'s step loop, before `_dataset_for`
+        ever needs a crosswalk or a raster file to exist, so none is written here.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
                 "steps": [
                     {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
                     {"op": "group", "by": [], "aggregate": "max"},
@@ -816,17 +844,43 @@ class TestCompileSingleInputChain:
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
         assert actual == {1: 11.0, 2: 21.0}
 
-    def test_rejects_two_group_steps_for_raster_input(self, base_path):
-        """The raster side of the vector ordering relaxation above: the raster engine
-        records each group's band positions against the original, uncollapsed band set,
-        so a second group would silently replace the first instead of composing with
-        it -- this rejection must keep firing for raster even though it is lifted for
-        vector. Pure compile-time rejection, like
-        `TestPostProjectGridCellFilterRejections` -- no data file needed.
+    def test_accepts_two_group_steps_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above, now lifted too: each
+        group is APPLIED to the running band metadata and recorded as its own entry, so a
+        second group collapses the first one's output instead of replacing it. The answer
+        is pinned by
+        `TestRasterInterpreterDeclaredOrder::test_a_second_group_collapses_the_first_groups_output`.
         """
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
         pipeline = parse_pipeline(
             {
                 "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "max", "as": "g1"},
+                    {"op": "group", "by": [], "aggregate": "min"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        assert isinstance(compile_pipeline(pipeline, base_path=base_path), BaseAnalysis)
+
+    def test_rejects_two_group_steps_for_a_grid_cell_raster_input(self, base_path):
+        """Still rejected for the one raster shape that stays on the fixed-stage engine
+        (see `test_rejects_filter_after_group_for_a_grid_cell_raster_input` above): that
+        engine has a single `Options.group_by`/`group_aggregate` slot and calls
+        `_collapse_group` exactly once, so a second group would silently replace the first.
+        Pure compile-time rejection, like `TestPostProjectGridCellFilterRejections` -- no
+        data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
                 "steps": [
                     {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
                     {"op": "group", "by": [], "aggregate": "max", "as": "g1"},
@@ -910,16 +964,41 @@ class TestCalculateStepCompile:
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
         assert actual == pytest.approx({1: 0.6, 2: 1.2, 3: 1.8, 4: 2.4})
 
-    def test_rejects_calculate_after_group_for_raster_input(self, base_path):
-        """The raster side of the vector ordering relaxation above: a raster input still
-        lowers onto `Options.calculate`, applied in the fixed Calculate stage (stage 2) --
-        unconditionally BEFORE the Group stage (stage 3) -- so this rejection must keep
-        firing for raster even though it is lifted for vector. Pure compile-time
-        rejection -- no data file needed.
+    def test_accepts_calculate_after_group_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above, now lifted too: the
+        pending calculate entries are flushed into the recorded op list at the position
+        they were declared at, so nothing applies them ahead of the collapse any more. The
+        answer is pinned by
+        `TestRasterInterpreterDeclaredOrder::test_calculate_after_group_squares_the_mean_not_the_other_way_round`.
         """
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
         pipeline = parse_pipeline(
             {
                 "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                    {"op": "calculate", "expression": "vct * 0.6"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        assert isinstance(compile_pipeline(pipeline, base_path=base_path), BaseAnalysis)
+
+    def test_rejects_calculate_after_group_for_a_grid_cell_raster_input(self, base_path):
+        """Still rejected for the one raster shape that stays on the fixed-stage engine:
+        that engine's Calculate stage (2) runs unconditionally before its Group stage (3),
+        so this would compute the aggregate of the expression instead of the expression of
+        the aggregate. Pure compile-time rejection -- no data file needed.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
                 "steps": [
                     {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
                     {"op": "group", "by": [], "aggregate": "max"},
@@ -962,17 +1041,46 @@ class TestCalculateStepCompile:
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
         assert actual == pytest.approx({2: 1.2, 3: 1.8, 4: 2.4})
 
-    def test_rejects_value_filter_after_calculate_for_raster_input(self, base_path):
-        """The raster side of the vector ordering relaxation above: a raster input still
-        lowers onto a single `Options.where` applied in the fixed Filter stage (stage 1) --
-        unconditionally BEFORE the Calculate stage (stage 2) -- so a value-testing
-        filter declared after a calculate would test the PRE-calculate value; this
-        rejection must keep firing for raster even though it is lifted for vector. Pure
+    def test_accepts_value_filter_after_calculate_for_raster_input(self, base_path):
+        """The raster side of the vector ordering relaxation above, now lifted too: the
+        pending calculate entries are flushed into the recorded op list before the filter's
+        own masking entry is appended, so the mask tests the REWRITTEN pixel value. The
+        answer is pinned by
+        `TestRasterInterpreterDeclaredOrder::test_value_filter_after_calculate_masks_the_rewritten_value`
+        (which pairs the same two steps with the summarizing `project` a raster value
+        filter needs -- `_apply_transform_params_impl` rejects a standalone one, as
+        `TestRasterInterpreterDifferential::
+        test_standalone_value_filter_without_summarize_still_rejected_by_both_engines`
+        pins, and that rejection is a runtime concern unaffected by this compile).
+        """
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "calculate", "expression": "vct * 0.6"},
+                    {"op": "filter", "where": "vct > 100"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        assert isinstance(compile_pipeline(pipeline, base_path=base_path), BaseAnalysis)
+
+    def test_rejects_value_filter_after_calculate_for_a_grid_cell_raster_input(self, base_path):
+        """Still rejected for the one raster shape that stays on the fixed-stage engine:
+        that engine applies a single `Options.where` in the Filter stage (1), before the
+        Calculate stage (2), so the mask would test the PRE-calculate value. Pure
         compile-time rejection -- no data file needed.
         """
         pipeline = parse_pipeline(
             {
-                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
                 "steps": [
                     {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
                     {"op": "calculate", "expression": "vct * 0.6"},
@@ -1678,19 +1786,26 @@ class TestLeadingCalculateInputExtension:
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
         assert actual == pytest.approx({2: 1.2, 3: 1.8, 4: 2.4})
 
-    def test_leading_filter_after_leading_calculate_still_rejected_for_raster_input(self, base_path):
-        """The raster side of the same interleaving fix: `Options.where` is applied
-        unconditionally in the fixed Filter stage (stage 1), strictly before the
-        Calculate stage (stage 2), regardless of whether the calculate/filter pair was
-        declared leading or post-project -- so a leading filter declared after a leading
-        calculate must still be rejected for a raster input, exactly like
-        `test_rejects_value_filter_after_calculate_for_raster_input`
-        (`TestCalculateStepCompile`) pins for the post-project shape. Pure compile-time
-        rejection -- no data file needed.
+    def test_leading_filter_after_leading_calculate_still_rejected_for_a_grid_cell_raster_input(
+        self, base_path
+    ):
+        """`leading_after_calculate` (the flag this class exists to pin) is still consulted:
+        a `grid_cell`-bearing raster selection stays on the fixed-stage engine, whose
+        `Options.where` is applied in the Filter stage (1) strictly before the Calculate
+        stage (2) regardless of whether the calculate/filter pair was declared leading or
+        post-project -- so the leading shape is rejected for exactly the inputs the
+        post-project shape is (`TestCalculateStepCompile::
+        test_rejects_value_filter_after_calculate_for_a_grid_cell_raster_input`). Pure
+        compile-time rejection -- no data file needed.
         """
         pipeline = parse_pipeline(
             {
-                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "-91.0,29.5",
+                    }
+                },
                 "steps": [
                     {"op": "calculate", "input": "vct", "expression": "vct * 0.6"},
                     {"op": "filter", "where": "vct > 100"},
@@ -2022,9 +2137,9 @@ class TestRasterInterpreterLoadBearing:
         assert calls == [compiled._pipeline_ops]
         # Both raw bands (2030, 2040) collapsed into a single group (`group by=[]`) --
         # proof `_collapse_group` really ran from inside `apply_steps`, not skipped.
-        row_idxs = compiled._get_group_row_idxs()
-        assert len(row_idxs) == 1
-        assert sorted(row_idxs[0]) == [0, 1]
+        assert compiled._band_ops == [("group", [], "max")]
+        assert compiled._band_frame().height == 2
+        assert compiled.materialize().height == 1
 
     async def test_raster_input_with_grid_cell_stays_on_the_old_engine(self, base_path):
         """`RasterGridAnalysis._apply_grid_cell` reshapes `self.lf` straight to a long
@@ -2102,6 +2217,39 @@ class TestRasterInterpreterDifferential:
         await interp.write_raster(interp_path)
         await legacy.write_raster(legacy_path)
 
+        with rio.open(interp_path) as src:
+            interp_data = src.read()
+        with rio.open(legacy_path) as src:
+            legacy_data = src.read()
+        assert np.array_equal(interp_data, legacy_data)
+        assert (interp_data == 40).all()
+
+    async def test_dimension_filter_before_group_narrows_the_scan(self, base_path, tmp_path):
+        """The pushdown prefix: a dimension filter declared before any `group` is applied
+        straight to the band-metadata frame `_band_frame` hands the pixel reader, so the
+        dropped year's file is never opened at all -- and the answer still matches the
+        legacy engine's own `Options.where` dimension conjunct, band for band.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "filter", "where": "calendar_year = 2040"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        interp, legacy = await self._run_both_engines(pipeline, base_path)
+        # One band reaches the reader, not two -- the filter really narrowed the scan.
+        assert interp._band_frame().height == 1
+
+        interp_path = tmp_path / "interp.tif"
+        legacy_path = tmp_path / "legacy.tif"
+        await interp.write_raster(interp_path)
+        await legacy.write_raster(legacy_path)
         with rio.open(interp_path) as src:
             interp_data = src.read()
         with rio.open(legacy_path) as src:
@@ -2244,6 +2392,263 @@ class TestRasterInterpreterDifferential:
             await interpreter_compiled.apply_params()
         with pytest.raises(AnalysisError, match="summarize_by"):
             await legacy_compiled.apply_params()
+
+
+class TestRasterInterpreterDeclaredOrder:
+    """The four raster shapes `planner._compile_single_input_chain` used to reject
+    outright, one test each, every answer hand-computed.
+
+    A differential against the legacy engine (`TestRasterInterpreterDifferential`, above)
+    is the wrong instrument here: these are precisely the shapes the legacy engine gets
+    WRONG -- it would agree with the interpreter only if the interpreter reproduced the
+    bug. So each test states the declared meaning, states the number the old fixed stage
+    order would have produced instead, and asserts the declared one.
+    """
+
+    @staticmethod
+    async def _write_tif(pipeline, base_path, out_path):
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled._pipeline_ops is not None
+        await compiled.apply_params()
+        await compiled.write_raster(out_path)
+        with rio.open(out_path) as src:
+            return src.read()
+
+    async def test_calculate_after_group_squares_the_mean_not_the_other_way_round(
+        self, base_path, tmp_path
+    ):
+        """Bands [2, 4]. DECLARED: `group(mean)` then `calculate(vct * vct)` -- mean(x)**2
+        = 3**2 = 9. The fixed calculate-before-collapse order this rejection existed for
+        computes mean(x**2) = (4 + 16) / 2 = 10 instead: a silent wrong answer, which is
+        why 9 vs 10 is the whole assertion.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: 2 if y == 2030 else 4)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "mean"},
+                    {"op": "calculate", "expression": "vct * vct"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        data = await self._write_tif(pipeline, base_path, tmp_path / "out.tif")
+
+        assert data.shape[0] == 1
+        assert (data == 9).all(), "mean(x)**2, not mean(x**2) (which would be 10)"
+
+    async def test_dimension_filter_after_group_selects_from_the_grouped_bands(
+        self, base_path, tmp_path
+    ):
+        """Bands 2030 -> 30, 2040 -> 40. DECLARED: `group(by=calendar_year, max)` -- which
+        keeps both bands, one per year -- then `filter(calendar_year = 2030)`, selecting
+        the FIRST of the two grouped bands. The rejection existed because the group's
+        member positions used to be recorded before the filter renumbered `b0..bN`; the
+        surviving band being 30 (not 40, and not an IndexError) is what proves the filter
+        resolves against the post-group metadata.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "max"},
+                    {"op": "filter", "where": "calendar_year = 2030"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        data = await self._write_tif(pipeline, base_path, tmp_path / "out.tif")
+
+        assert data.shape[0] == 1, "one band survives the filter, out of the group's two"
+        assert (data == 30).all()
+
+    async def test_a_second_group_collapses_the_first_groups_output(self, base_path, tmp_path):
+        """Bands [2, 4, 6]. DECLARED: `group(by=calendar_year, mean)` -- one band per year,
+        so still [2, 4, 6] -- then `group(by=[], sum)` over the FIRST group's three output
+        bands... which is 12 either way, so that shape would not discriminate. Instead the
+        first group is `by=[]` too: mean(2, 4, 6) = 4 collapsed into ONE band, and the
+        second group sums that single band to 4. A second group that re-derived itself
+        against the original, uncollapsed band set (the structural discard this rejection
+        existed for) would return sum(2, 4, 6) = 12.
+
+        It also pins the per-op aggregate: `Options.group_aggregate` is a single scalar the
+        planner overwrites last-write-wins, so both groups would use `sum` if `apply_steps`
+        did not pass each `GroupOp`'s own aggregate -- and sum(2, 4, 6) is again 12.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040, 2050), fill_fn={2030: 2, 2040: 4, 2050: 6}.get)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "mean", "as": "g1"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        data = await self._write_tif(pipeline, base_path, tmp_path / "out.tif")
+
+        assert data.shape[0] == 1
+        assert (data == 4).all(), "sum(mean(2, 4, 6)), not sum(2, 4, 6) = 12"
+
+    async def test_filter_after_group_naming_a_collapsed_dimension_is_a_400(self, base_path):
+        """The flip side of admitting a post-group filter: `group(by=[])` collapses EVERY
+        dimension away, so a filter declared after it that names one is asking about a
+        column the grouped bands no longer have. That has to surface as a 400 naming the
+        `where`, not as a raw Polars column-not-found escaping `apply_steps`.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                    {"op": "filter", "where": "calendar_year = 2030"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+
+        with pytest.raises(AnalysisError, match="calendar_year") as excinfo:
+            await compiled.apply_params()
+        assert excinfo.value.status_code == 400
+
+    async def test_value_filter_after_calculate_masks_the_rewritten_value(
+        self, base_path, crosswalk_path
+    ):
+        """DECLARED: `calculate(vct * 0.6)` then `filter(vct > 60)` -- the predicate tests
+        the POST-calculate value, so the surviving pixels are those whose RAW value exceeds
+        100, and the zone mean is taken over `raw * 0.6` for exactly those. The fixed
+        Filter-before-Calculate stage order this rejection existed for would instead test
+        the raw value against 60, keeping every pixel above 60 -- a strictly larger, and
+        differently-valued, population.
+
+        A raster value filter has to be paired with a summarizing `project` to run at all
+        (`_apply_transform_params_impl` rejects a standalone one), and a value filter
+        declared AFTER a summarizing project is still rejected by the summarizing-project
+        order guard -- so calculate/filter/project, in that order, is the one executable
+        arrangement of this shape.
+        """
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        zones = np.ones((grid.height, grid.width), dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array())
+
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "calculate", "input": "vct", "expression": "vct * 0.6"},
+                    {"op": "filter", "where": "vct > 60"},
+                    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled._pipeline_ops is not None
+        await compiled.apply_params()
+        df = compiled.materialize()
+
+        rewritten = raster_array().astype("float64") * 0.6
+        expected = rewritten[rewritten > 60].mean()
+        pre_calculate_reading = rewritten[raster_array() > 60].mean()
+        assert expected != pytest.approx(pre_calculate_reading), "fixture must discriminate"
+        actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        assert actual[1] == pytest.approx(expected, rel=1e-6)
+
+
+class TestRasterBandOpsReplayIsLoadBearing:
+    """Gate the newly-admitted shapes on the machinery actually being the thing that runs
+    them, not on the answers alone: a correct answer could in principle come from a
+    surviving fallback, and a deleted code path is only really deleted if nothing still
+    reaches for it.
+    """
+
+    async def test_apply_band_ops_receives_the_declared_op_list_and_produces_the_output(
+        self, base_path, tmp_path, monkeypatch
+    ):
+        """The spy: `raster.apply_band_ops` is called with the ops IN DECLARED ORDER, each
+        entry carrying the caller's own group key/plans/predicate rather than any resolved
+        band position, and the frame it returns is what gets written.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: 2 if y == 2030 else 4)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "max"},
+                    {"op": "filter", "where": "calendar_year = 2040"},
+                    {"op": "calculate", "expression": "vct * vct"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        await compiled.apply_params()
+
+        seen = []
+        original = raster_module.apply_band_ops
+
+        def _spy(lf, metadata_df, band_ops, **kwargs):
+            seen.append(band_ops)
+            return original(lf, metadata_df, band_ops, **kwargs)
+
+        monkeypatch.setattr(raster_module, "apply_band_ops", _spy)
+        out_path = tmp_path / "out.tif"
+        await compiled.write_raster(out_path)
+
+        assert seen, "the write path never reached apply_band_ops"
+        kinds = [entry[0] for entry in seen[0]]
+        assert kinds == ["group", "filter", "calculate"], "declared order, not a fixed stage order"
+        assert seen[0][0][:2] == ("group", ["calendar_year"])
+        assert seen[0][1] == ("filter", "(calendar_year = 2040)")
+        with rio.open(out_path) as src:
+            data = src.read()
+        assert data.shape[0] == 1
+        assert (data == 16).all()  # max over the 2040 band alone, squared
+
+    def test_the_stored_row_index_machinery_is_gone(self):
+        """The complementary half of the spy: the attributes the old, index-carrying path
+        was built out of no longer exist anywhere, so a shape that "works" cannot be
+        working through a surviving fallback.
+        """
+        from cpra.mp.data.analysis import sources as sources_module
+
+        assert not hasattr(RasterGridAnalysis, "_get_group_row_idxs")
+        assert not hasattr(RasterGridAnalysis, "_band_applicability")
+        assert not hasattr(RasterGridAnalysis, "_current_metadata_df")
+        assert not hasattr(RasterGridAnalysis, "_band_ops_is_simple")
+        assert not hasattr(sources_module, "band_collapse_exprs")
+
+    async def test_no_request_leaves_a_stored_band_group_attribute_behind(self, base_path):
+        """`_band_groups` -- the stored row-index structure every one of these rejections
+        traced back to -- is not set by any code path, on a shape that would have populated
+        it."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "max"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        await compiled.apply_params()
+
+        assert not hasattr(compiled, "_band_groups")
+        assert compiled._band_ops == [("group", ["calendar_year"], "max")]
 
 
 # --------------------------------------------------------------------------------------

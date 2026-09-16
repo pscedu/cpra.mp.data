@@ -21,7 +21,7 @@ import rasterio
 from rasterio.shutil import copy as rio_copy
 
 from cpra.mp.data.analysis.expressions import compile_calculate_entries
-from cpra.mp.data.analysis.raster import RasterGridAnalysis
+from cpra.mp.data.analysis.raster import RasterGridAnalysis, band_column_names
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import (
     DECADE_GROUP_YEARS,
@@ -88,37 +88,34 @@ def _scale_plans(factor, where=None):
     return compile_calculate_entries([("calculate.1", f"value * {factor}", where)])
 
 
-def _dataset(df, band_groups=None, group_aggregate=None, calculate_plans=None, value_where=None):
+def _dataset(df, group_by=None, group_aggregate=None, calculate_plans=None, value_where=None):
     """A RasterGridAnalysis with only the state the write paths touch.
 
     ``RasterGridAnalysis.__init__`` builds a LazyFrame from on-disk data and a grid definition, none of
-    which these paths use -- they read ``lf``/``materialize()``, ``_band_groups``,
-    ``_raw_band_frame``, ``_band_ops``, ``_calculate_plans``,
-    ``options.group_aggregate``, and ``_value_where`` only. ``value_where=None`` matches
-    ``BaseAnalysis.__init__``'s own default, so every caller that doesn't pass it gets
-    the no-filter behavior.
+    which these paths use -- they read ``lf``/``materialize()``, ``_raw_band_frame``,
+    ``_band_ops``, ``_calculate_plans``, ``options.group_aggregate``, and ``_value_where``
+    only. ``value_where=None`` matches ``BaseAnalysis.__init__``'s own default, so every
+    caller that doesn't pass it gets the no-filter behavior.
 
-    ``band_groups`` is the row-idx-per-group list ``_collapse_group`` maintains: plain
-    Python lists of ``_raw_band_frame`` row positions, one list per output group, or
-    ``None`` for an ungrouped request. When it is given, ``_band_ops`` is built the way
-    ``_collapse_group`` builds it -- any ``calculate_plans`` flushed in first, then the
-    group -- since that ordered list, not ``_band_groups``, is what the write path reads
-    its collapse inputs from. Ungrouped, the plans stay pending and the write path's own
-    flush positions them.
+    ``group_by`` is a ``GroupOp``'s own key -- a list of ``df`` column names, empty for
+    "collapse every band into one", or ``None`` for an ungrouped request. When it is given,
+    ``_band_ops`` is built the way ``_collapse_group`` builds it -- any ``calculate_plans``
+    flushed in first, then the group -- since that ordered list is what the write path
+    replays. Ungrouped, the plans stay pending and the write path's own flush positions
+    them.
     """
 
     dataset = object.__new__(RasterGridAnalysis)
     dataset.options = SimpleNamespace(group_aggregate=group_aggregate)
     dataset.lf = df.lazy()
     dataset.materialize = lambda: df
-    dataset._band_groups = band_groups
     dataset._raw_band_frame = df
     dataset._band_ops = []
     dataset._calculate_plans = calculate_plans or []
     dataset._value_where = value_where
-    if band_groups is not None:
-        dataset._flush_calculate_plans_to_band_ops(df)
-        dataset._band_ops.append(("group", band_groups, group_aggregate))
+    if group_by is not None:
+        dataset._flush_calculate_plans_to_band_ops()
+        dataset._band_ops.append(("group", list(group_by), group_aggregate))
     return dataset
 
 
@@ -260,8 +257,20 @@ def test_vrt_labels_bands_from_legacy_source(base_path, tmp_path):
 
 
 def _aggregated(df, aggregate, groups=None):
-    groups = [list(range(len(df)))] if groups is None else groups
-    return _dataset(df, band_groups=[list(g) for g in groups], group_aggregate=aggregate)
+    """An aggregated dataset over ``df``.
+
+    ``groups``, when given, is a list of row-position lists -- one per intended output
+    band. A `GroupOp` keys its groups by a DIMENSION COLUMN, not by row position, so an
+    arbitrary grouping is expressed here by materializing exactly that column: each row
+    gets the index of the group it belongs to, and the group runs on it. ``None`` means the
+    whole selection collapses into one band, which is `group_by=[]` -- a real request shape
+    (``group_aggregate`` with no ``group_by``), not a synthetic one.
+    """
+    if groups is None:
+        return _dataset(df, group_by=[], group_aggregate=aggregate)
+    group_of = {row: index for index, rows in enumerate(groups) for row in rows}
+    keyed = df.with_columns(_group=pl.Series([group_of[row] for row in range(len(df))], dtype=pl.UInt32))
+    return _dataset(keyed, group_by=["_group"], group_aggregate=aggregate)
 
 
 def test_aggregated_selection_uses_windowed_path(multiband_cog, tmp_path, monkeypatch):
@@ -528,8 +537,7 @@ class TestValueFilterGate:
     unless `summarize_by`/`summarize_aggregate` are also given) -- these tests drive
     `_write_raster_windowed` directly via `_dataset(..., value_where=...)`, the same
     bypass-``__init__`` pattern every other test in this module already uses for
-    `_calculate_plans`/`_band_groups`, so this is infrastructure landed ahead of the
-    ops-order work that will route a real request through it.
+    `_calculate_plans`/`_band_ops`.
     """
 
     def test_value_filter_masks_in_place_without_misaligning_the_grid(self, multiband_cog, tmp_path):
@@ -589,18 +597,19 @@ class TestValueFilterGate:
     def test_reintroducing_a_bare_filter_fails_loudly_instead_of_misaligning(
         self, multiband_cog, tmp_path, monkeypatch
     ):
-        """Guards the gate's design, not just today's code: if the call site in
-        `_write_raster_windowed` were ever changed from `apply_value_filter_band_wide`
-        (mask) to a bare `.filter()`, `_take_window_rows`'s rolling flush would come up
-        short for some window -- a dropped pixel is a dropped ROW, and every later window
-        needs exactly `height * width` rows to reshape into -- and raise `RuntimeError`
-        rather than silently writing a misaligned grid. Proves the design fails safe,
-        rather than merely observing that today's call site avoids the mistake."""
+        """Guards the gate's design, not just today's code: if the value-filter lowering
+        `apply_band_ops` replays for the write path were ever changed from
+        `apply_value_filter_band_wide` (mask) to a bare `.filter()`,
+        `_take_window_rows`'s rolling flush would come up short for some window -- a
+        dropped pixel is a dropped ROW, and every later window needs exactly
+        `height * width` rows to reshape into -- and raise `RuntimeError` rather than
+        silently writing a misaligned grid. Proves the design fails safe, rather than
+        merely observing that today's lowering avoids the mistake."""
 
         import cpra.mp.data.analysis.raster as raster_module
 
-        def bare_filter(lf, band_names, value_where, extra_columns=()):
-            return lf.filter(pl.col(band_names[0]) > 0)
+        def bare_filter(lf, metadata_df, value_where, extra_columns=()):
+            return lf.filter(pl.col(band_column_names(metadata_df)[0]) > 0), metadata_df
 
         monkeypatch.setattr(raster_module, "apply_value_filter_band_wide", bare_filter)
 

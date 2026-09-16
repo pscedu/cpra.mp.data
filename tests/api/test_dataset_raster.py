@@ -16,7 +16,7 @@ from rasterio.windows import Window
 
 from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis import raster as dataset_module
-from cpra.mp.data.analysis.raster import _batched_block_windows
+from cpra.mp.data.analysis.raster import _batched_block_windows, band_dimension_keep
 from cpra.mp.data.analysis.types import OutputType
 from cpra.mp.data.grids import GRIDS
 from tests.factories import (
@@ -178,7 +178,7 @@ class TestCalculateStage:
         dataset._apply_calculate_params()
         df = dataset.materialize().sort("calendar_year")
         (plan,) = dataset._calculate_plans
-        assert dataset._band_applicability(df, plan) == [False, True]
+        assert band_dimension_keep(df, plan.dimension_where) == [False, True]
 
     async def test_calculate_reaches_the_pixels(self, dataset_factory, raster_data):
         """A calculate entry recorded at the calculate stage reaches the pixels through
@@ -264,18 +264,21 @@ class TestCalculateStage:
 
 
 class TestGroupStage:
-    async def test_grouping_records_row_indices(self, dataset_factory, raster_data):
+    async def test_grouping_records_a_band_op_and_collapses_the_metadata(
+        self, dataset_factory, raster_data
+    ):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
         await dataset.apply_params()
-        assert dataset._band_groups is not None
-        assert len(dataset._band_groups) == 1
+        assert dataset._band_ops == [("group", [], "max")]
+        assert dataset.materialize().height == 1
 
     async def test_group_by_a_dimension_keeps_one_group_per_value(
         self, dataset_factory, raster_data
     ):
         dataset = dataset_factory(DIMENSIONS, group_by="calendar_year", group_aggregate="max")
         await dataset.apply_params()
-        assert len(dataset._band_groups) == 2
+        assert dataset._band_ops == [("group", ["calendar_year"], "max")]
+        assert dataset.materialize().height == 2
 
     async def test_aggregate_collapses_bands(self, dataset_factory, raster_data):
         dataset = dataset_factory(DIMENSIONS, group_aggregate="max")
@@ -765,8 +768,8 @@ class TestTileBandCollapse:
     would hide most of what these pin. `get_tile`'s own tests cover the wiring.
 
     Nodata is handled here the way the write and summarize paths handle it (one shared
-    builder, `raster_source.band_collapse_exprs`). The NumPy reduce this replaced did not:
-    it scaled the sentinel by any calculate multiplier and averaged it in as a real value.
+    replay, `raster.apply_band_ops`). The NumPy reduce this replaced did not: it scaled the
+    sentinel by any calculate multiplier and averaged it in as a real value.
     """
 
     async def test_nodata_is_excluded_from_the_aggregate(self, dataset_factory, raster_data):

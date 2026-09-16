@@ -25,12 +25,12 @@ LazyFrame) through five ordered stages, run once by `apply_params`:
    (expression/where pairs) conditionally rewrite `value` in place (vector), or
    are validated and stashed on `self._calculate_plans` for the pixel-read paths to
    apply per band (raster, whose `self.lf` at this point is still the band-metadata
-   table, not pixels -- see `RasterGridAnalysis._simple_band_collapse_inputs`).
+   table, not pixels -- see `raster.apply_calculate_band_wide`).
 3. **group** (`_apply_group_params`) -- `group_by`/`group_aggregate` collapse rows via the
    `_collapse_group` hook (vector: dimension-collapse across rows per grid_cell, folding
-   through `analysis.fold` when the collapse is cliff-shaped; raster: records which band
-   rows belong to which output group in `self._band_groups`, collapsed later against
-   actual pixels).
+   through `analysis.fold` when the collapse is cliff-shaped; raster: collapses the band
+   METADATA and records the group as a `self._band_ops` entry, for a later stage to
+   replay against actual pixels).
 4. **transform** (`_apply_transform_params`) -- `summarize_by`/`summarize_aggregate`
    convert to another grid's cells via the `_apply_transform_params_impl` hook (vector: a
    crosswalk-table join; raster: a zonal reduction against a crosswalk raster, which is
@@ -55,9 +55,9 @@ subclass produced it.
   `_get_group_by_columns`). Vector: a real `group_by(...).agg(...)` (or
   `analysis.fold.fold_group_by` when cliff-shaped), DROPPING dimension columns left out
   of the group (they no longer have a value, so they no longer have a column -- see the
-  method's own comment). Raster: no pixels are read here -- this only records the row
-  groups (`self._band_groups`) that a later stage (transform, tile, or write) collapses
-  against actual band data.
+  method's own comment). Raster: no pixels are read here -- it collapses the band
+  metadata and appends a `self._band_ops` entry that a later stage (transform, tile, or
+  write) replays against actual band data.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
   converting to another grid's cells. Called only after `_validate_summarize_params`
   confirms both parameters (or neither) were given; a hook implementation returns
@@ -225,26 +225,28 @@ class BaseAnalysis:
         self.dataset_bounds = None
         self.grid_cell_ids = None
         self.summarize_grid_cell_ids = None
-        # `RasterGridAnalysis`-only bookkeeping for a `group_by` step (a vector frame
-        # never sets any of these three -- its own `_collapse_group` just reassigns
-        # `self.lf` directly, since a row-per-grid_cell frame has no positional band
-        # columns to keep aligned). `self.lf` for a raster analysis starts as the
-        # per-band metadata table (one row per selected (path, band)); the FIRST
-        # `_collapse_group` call snapshots that table into `_raw_band_frame` before
-        # reassigning `self.lf` to the collapsed (dimension-only) metadata, since every
-        # later pixel-read still needs the original (path, band) rows to build its scan
-        # even once `self.lf` itself has moved on. `_band_groups` is, for each CURRENT
-        # row of `self.lf`, the list of ORIGINAL `_raw_band_frame` row positions that
-        # collapsed into it -- composed across however many `group`/post-group
-        # dimension-filter steps have run so far, so it stays correct through more than
-        # one of either (see `RasterGridAnalysis._collapse_group`). `_band_ops` is the
-        # ordered pixel-VALUE replay recipe (calculate/group/filter entries, one per
-        # step actually declared, in declared order) a pixel-read consumer replays
-        # against the raw scan once at least one group has run -- see
-        # `RasterGridAnalysis.apply_band_ops` and that class's three pixel-read
-        # methods.
+        # `RasterGridAnalysis`-only band bookkeeping (a vector frame never sets either
+        # -- its own `_collapse_group` just reassigns `self.lf` directly, since a
+        # row-per-grid_cell frame has no band columns to keep a dictionary for).
+        #
+        # `self.lf` for a raster analysis starts as the per-band metadata table (one row
+        # per selected (path, band)) and stays band metadata until a summarize converts
+        # it to a tabular frame: it is the COLUMN DICTIONARY for the band-wide frame a
+        # pixel read will produce, narrowed and collapsed in step with the ops declared
+        # against it. `_raw_band_frame` is the snapshot the FIRST `_collapse_group` call
+        # takes before `self.lf` moves on to collapsed (dimension-only) metadata, since
+        # every pixel read still needs the original (path, band) rows to build its scan;
+        # it is also the "a group has run" flag, which is what
+        # `RasterGridAnalysis._band_frame` and the dimension-filter pushdown rule in
+        # `RasterGridAnalysis.apply_steps` both test.
+        #
+        # `_band_ops` is the ordered replay recipe: one entry per filter/calculate/group
+        # step actually declared, in declared order, each carrying only what the caller
+        # declared (a predicate string, a plan list, a group key) and never a row index
+        # or a frozen metadata copy. `raster.apply_band_ops` resolves each entry against
+        # the band-wide frame and the metadata the replay has reached by then -- see
+        # that function and `RasterGridAnalysis`'s three pixel-read methods.
         self._raw_band_frame = None
-        self._band_groups = None
         self._band_ops = []
         # Set by `_apply_filter_params`, the first step `apply_params` runs, from
         # `where`'s value conjuncts (see `expressions.classify_where`) -- the internal
@@ -258,8 +260,8 @@ class BaseAnalysis:
         # request (the generic `calculate` entries), in application order. Empty when
         # the request has no calculate parameters at all. A vector frame consumes them
         # immediately inside `_apply_calculate_params`; the raster pixel-read paths
-        # (tile/write/summarize) flush it into `_band_ops` and read it back, per band,
-        # via `_simple_band_collapse_inputs`.
+        # (tile/write/summarize) flush it into `_band_ops` (as a `("calculate", plans)`
+        # entry) and apply it per band via `raster.apply_calculate_band_wide`.
         self._calculate_plans = []
         # Also set by `_apply_filter_params`: whether `where` produced at least one
         # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
@@ -417,10 +419,12 @@ class BaseAnalysis:
         if self.output_type == OutputType.vector:
             self._error("invalid output type for tile: vector", status_code=400)
 
-        if self._band_groups is not None:
-            groups = len(self._band_groups)
-        else:
-            groups = self.lf.select(pl.len()).collect().item()
+        # For a raster, `self.lf` is the band metadata, whose height IS the band count
+        # at every point in the request -- before any group (one row per selected band)
+        # and after one (one row per surviving group, kept non-degenerate by
+        # `raster.BAND_INDEX`). For a vector frame it is the ordinary row count, which is
+        # what a vector tile's own single-band check has always meant.
+        groups = self.lf.select(pl.len()).collect().item()
         if groups > 1:
             self._error(f"tile contains more than one band: {groups} bands found", status_code=400)
 
@@ -533,11 +537,10 @@ class BaseAnalysis:
         raster already narrowed to a table by `grid_cell` sampling) is rewritten in
         place; for a raster whose `self.lf` is still the band-metadata table the
         validated plans are only stashed on `self._calculate_plans` -- the entry's
-        dimension `where` selects BANDS (evaluated against the metadata rows by
-        `RasterGridAnalysis._band_applicability`) and its expression/value-`where` are
-        applied per band, against actual pixels, by every raster read path
+        dimension `where` selects BANDS and its expression/value-`where` are applied per
+        band, against actual pixels, by every raster read path
         (`_summarize_zone_stats_plugin`, `_collapse_tile_bands`,
-        `_write_raster_windowed`) via `_simple_band_collapse_inputs`.
+        `_write_raster_windowed`) via `raster.apply_calculate_band_wide`.
 
         A thin caller over `apply_calculate_plans` for the vector/tabular rewrite
         itself -- pulled out so
@@ -668,8 +671,8 @@ class BaseAnalysis:
         self._collapse_group(group_by_cols)
 
     def _collapse_group(self, group_by_cols):
-        """Collapse `self.lf` (a vector frame) or `self.lf`/`self._band_groups`/
-        `self._band_ops` (a raster frame) per `group_by_cols`. See the module/class
+        """Collapse `self.lf` (a vector frame) or `self.lf`/`self._band_ops` (a raster
+        frame) per `group_by_cols`. See the module/class
         docstring's hook contract -- overridden per subclass; there is no grid-agnostic
         default.
         """
