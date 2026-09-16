@@ -17,12 +17,11 @@ from polars.io.plugins import register_io_source
 from cpra.mp.data.analysis import sources as raster_source
 from cpra.mp.data.analysis import utils as api_utils
 from cpra.mp.data.analysis.sources import (
-    PairedCrosswalk,
+    GridCrosswalk,
     _batched_windows,
     guarded_aggregate,
     masked_value_predicate_exprs,
     scan_broadcast,
-    scan_paired,
     scan_rasters,
 )
 from cpra.mp.data.analysis.utils import raster_blocks_per_batch
@@ -537,11 +536,11 @@ class TestWhichPredicateFormsPushDown:
 
 class TestScanBroadcast:
     """`scan_broadcast`: the cross-grid broadcast primitive that projects a small
-    coarse-grid selection onto a fine grid's pixels via two co-registered crosswalk
+    vector-grid selection onto a raster grid's pixels via two co-registered crosswalk
     rasters (see its own docstring). It currently has no API caller -- these tests
     exercise it directly (no `Dataset` involved) as the retained executor for a planned
     pipeline grid-projection operation, pinning its masking mechanics: crosswalk nodata,
-    and coarse ids absent from the lookup.
+    and vector-grid ids absent from the lookup.
     """
 
     @pytest.fixture
@@ -550,7 +549,7 @@ class TestScanBroadcast:
         `write_raster_crosswalk`'s hardcoded background value), [2H/3, H) -> zone 2 --
         the middle band exists specifically to pin crosswalk-nodata masking against a
         region that is neither zone 1 nor zone 2, distinct from "a real zone id that
-        happens to be missing from the coarse frame" (`missing_id_broadcast_ids` below).
+        happens to be missing from the vector frame" (`missing_id_broadcast_ids` below).
         """
         third = GRID.height // 3
         zones = np.zeros((GRID.height, GRID.width), dtype="int32")
@@ -588,9 +587,9 @@ class TestScanBroadcast:
         assert 0 not in raw["grid_cell"].to_list()
 
     def test_missing_id_pixels_are_dropped_not_defaulted(self, broadcast_crosswalk_path):
-        """The coarse frame supplies a value for zone 1 only -- zone 2 is a real,
+        """The vector frame supplies a value for zone 1 only -- zone 2 is a real,
         present zone id in the crosswalk raster, but absent from `broadcast_ids`/
-        `broadcast_values` (e.g. the coarse dataset had no row for that zone). Every
+        `broadcast_values` (e.g. the vector dataset had no row for that zone). Every
         zone-2 pixel must be dropped, matching the notebook's
         `np.where(ids == nodata, nan, ...)` masking treating an out-of-frame id no
         differently from nodata -- not defaulted to 0, NaN-as-a-value, or any other
@@ -611,7 +610,7 @@ class TestScanBroadcast:
 
     def test_output_zone_set_can_differ_from_the_broadcast_zone_set(self, crosswalk_path, broadcast_crosswalk_path):
         """Zonal stats of broadcast values over an entirely different zone set than the
-        one that supplied the coarse value: a SEPARATE output crosswalk groups the same
+        one that supplied the vector value: a SEPARATE output crosswalk groups the same
         broadcast values by a different zone layout (halves, at H//2, rather than the
         broadcast crosswalk's thirds), pinned here at the primitive level, independent
         of `Dataset`.
@@ -672,7 +671,7 @@ def _thirds_zones():
 def _thirds_with_nodata_middle_zones():
     """Rows [0, H/3) -> 1, [H/3, 2H/3) -> 0 (background/nodata), [2H/3, H) -> 2 -- a
     pairing crosswalk with a real nodata band in the middle, distinct from "a real zone
-    id simply absent from the coarse frame" (see `TestScanBroadcast`'s identical shape).
+    id simply absent from the vector frame" (see `TestScanBroadcast`'s identical shape).
     """
     zones = np.zeros((GRID.height, GRID.width), dtype="int32")
     third = GRID.height // 3
@@ -681,18 +680,44 @@ def _thirds_with_nodata_middle_zones():
     return zones
 
 
-class TestScanPaired:
-    """`scan_paired`: the pipeline `join` operation's executor for pairing a fine
-    dataset's own pixel values with a coarse dataset's per-calendar-step values, aligned
-    per pixel through a PAIRING crosswalk that may differ from the OUTPUT zone
-    crosswalk -- the same two-crosswalk shape as `TestScanBroadcast` above, generalized
-    across a calendar axis (one coarse lookup per fine band instead of one for the
-    whole call).
+def _crosswalk_values(name, lookups, calendar_steps):
+    """The band-wide value table a `GridCrosswalk` takes, built directly from the
+    per-step ``{step: (ids, values)}`` pairs these tests are written in terms of.
+
+    Deliberately NOT built via `raster.pivot_vector_to_band_wide`: these are tests of the
+    SOURCE's own contract, so they must not silently pass or fail on that helper's
+    correctness. The helper is pinned separately (`tests/api/test_raster_ops.py`), and the
+    two meeting in the middle is what `tests/api/test_paired_port.py`'s differential test
+    covers.
+
+    `calendar_steps[i]` is band row-position `i`'s step, so column `f"{name}{i}"` holds
+    that step's value; a step absent from `lookups` yields an all-null column, and a zone
+    absent from one step's ids yields a null in that column alone.
+    """
+    ids = sorted({int(i) for entry in lookups.values() for i in entry[0]})
+    cols = {name: pl.Series(ids, dtype=pl.Int64)}
+    for i, step in enumerate(calendar_steps):
+        entry = lookups.get(step)
+        if entry is None:
+            cols[f"{name}{i}"] = pl.Series([None] * len(ids), dtype=pl.Float64)
+        else:
+            by_id = {int(k): float(v) for k, v in zip(entry[0], entry[1])}
+            cols[f"{name}{i}"] = pl.Series([by_id.get(z) for z in ids], dtype=pl.Float64)
+    return pl.DataFrame(cols)
+
+
+class TestScanRastersCrosswalkValues:
+    """`scan_rasters`' `crosswalks=` read with a pivoted value table attached -- the
+    executor behind the pipeline `join` operation, pairing a raster dataset's own pixel
+    values with a vector dataset's per-calendar-step values, aligned per pixel through a
+    PAIRING crosswalk that may differ from the OUTPUT zone crosswalk. The same
+    two-crosswalk shape as `TestScanBroadcast` above, generalized across a calendar axis
+    (one vector lookup per raster band instead of one for the whole call).
 
     Every fixture below uses two deliberately different crosswalks, mirroring the
-    earlier `TestBroadcastStage` fixture: `pairing_crosswalk_path` (fine ->
-    hydro_compartment_v001, a halves split) supplies the coarse VALUE; `output_
-    crosswalk_path` (fine -> ecoregion_v001, a thirds split) supplies the OUTPUT zone
+    earlier `TestBroadcastStage` fixture: `pairing_crosswalk_path` (raster ->
+    hydro_compartment_v001, a halves split) supplies the vector VALUE; `output_
+    crosswalk_path` (raster -> ecoregion_v001, a thirds split) supplies the OUTPUT zone
     set results are grouped by.
     """
 
@@ -722,10 +747,10 @@ class TestScanPaired:
         write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "ecoregion_v001", zones)
         return crosswalk_path / f"{RASTER_KWARGS['grid']}__ecoregion_v001.tif"
 
-    def test_hand_computed_fine_and_paired_values_single_step(
+    def test_hand_computed_band_and_paired_values_single_step(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
-        """One calendar step, one fine band, uniform fill: `b0` must equal the fine
+        """One calendar step, one band, uniform fill: `b0` must equal the band
         fill everywhere, and `p0` must equal the pairing crosswalk's own half (100.0
         top, 200.0 bottom) -- the base case every other test in this class builds on.
         """
@@ -733,12 +758,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -755,7 +780,7 @@ class TestScanPaired:
     def test_calendar_alignment_across_two_steps(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
-        """Two fine bands, two different calendar steps: `p0` (2030's band) must pull
+        """Two bands, two different calendar steps: `p0` (2030's band) must pull
         from the 2030 lookup and `p1` (2040's band) from the 2040 lookup -- never
         cross-mixed, even though both bands share the same pairing crosswalk read."""
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: 10 if y == 2030 else 20)
@@ -766,12 +791,12 @@ class TestScanPaired:
             2040: (ids, np.array([300.0, 400.0], dtype="float64")),
         }
 
-        lf = scan_paired(
+        lf = scan_rasters(
             paths,
             [[0], [1]],
             [None, None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030, 2040],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030, 2040]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -785,7 +810,7 @@ class TestScanPaired:
         assert out.filter(pl.col("p1") == 300.0).height == half * GRID.width
         assert out.filter(pl.col("p1") == 400.0).height == (GRID.height - half) * GRID.width
 
-    def test_fine_nodata_yields_null_b_but_row_survives_with_paired_value(
+    def test_band_nodata_yields_null_b_but_row_survives_with_paired_value(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
         """The first 10 pixels (row 0, top half) are the nodata sentinel -- `b0` must be
@@ -803,12 +828,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -830,12 +855,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", nodata_pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", nodata_pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -845,10 +870,10 @@ class TestScanPaired:
         expected_middle_rows = (2 * third - third) * GRID.width
 
         assert out.height == GRID.height * GRID.width  # nothing dropped
-        assert (out["b0"] == 7).all()  # fine value present everywhere
+        assert (out["b0"] == 7).all()  # band value present everywhere
         assert out["p0"].null_count() == expected_middle_rows
 
-    def test_pairing_id_absent_from_coarse_frame_yields_null_not_drop(
+    def test_pairing_id_absent_from_vector_frame_yields_null_not_drop(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
         """Pairing zone 2 (bottom half) is a real id in the crosswalk raster but absent
@@ -859,12 +884,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1], dtype="int64"), np.array([100.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -880,18 +905,18 @@ class TestScanPaired:
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
         """`paired_lookups` has no entry at all for 2040 -- every pixel's `p1` must be
-        null, while `b1` (the fine value) stays present, and 2030's `p0` is unaffected."""
+        null, while `b1` (the band value) stays present, and 2030's `p0` is unaffected."""
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: 10 if y == 2030 else 20)
         paths = _paths_by_year(base_path)
         ids = np.array([1, 2], dtype="int64")
         paired_lookups = {2030: (ids, np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             paths,
             [[0], [1]],
             [None, None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030, 2040],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030, 2040]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -910,12 +935,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=output_crosswalk_path,
             zone_ids=np.array([1, 2], dtype="int64"),
         )
@@ -946,12 +971,12 @@ class TestScanPaired:
 
         monkeypatch.setattr(rio, "open", spy_open)
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -959,12 +984,12 @@ class TestScanPaired:
 
         assert not any(str(pairing_crosswalk_path) == p for p in opened)
 
-    def test_projection_pushdown_skips_fine_file_when_only_paired_column_wanted(
+    def test_projection_pushdown_skips_band_file_when_only_paired_column_wanted(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path, monkeypatch
     ):
         """Requesting `p0` alone must never open `b0`'s backing file at all -- a paired
         column's value comes entirely from the pairing crosswalk and the precomputed
-        lookup array, never from the fine dataset's own pixels. The second file (`b1`),
+        lookup array, never from the scanned raster's own pixels. The second file (`b1`),
         entirely unreferenced, is also never opened."""
         # Built BEFORE the spy is installed -- see the identical note in
         # `test_projection_pushdown_skips_pairing_crosswalk_when_no_paired_column_wanted`.
@@ -985,15 +1010,15 @@ class TestScanPaired:
 
         monkeypatch.setattr(rio, "open", spy_open)
 
-        lf = scan_paired(
+        lf = scan_rasters(
             paths,
             [[0], [1]],
             [None, None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030, 2040],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030, 2040]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
-            # Supplied explicitly so schema construction never has to sniff a fine
+            # Supplied explicitly so schema construction never has to sniff a band
             # file's dtype -- that one-time, outside-the-generator open is orthogonal
             # to per-window projection pushdown and would otherwise be indistinguishable
             # from the per-window read this test exists to rule out.
@@ -1017,12 +1042,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -1044,12 +1069,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -1071,12 +1096,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
         )
         out = lf.collect()
 
@@ -1098,12 +1123,12 @@ class TestScanPaired:
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
             zones_path=output_crosswalk_path,
         )
         out = lf.collect()
@@ -1117,11 +1142,11 @@ class TestScanPaired:
         self, base_path, crosswalk_path, pairing_crosswalk_path, uniform_output_crosswalk_path, monkeypatch
     ):
         """`crosswalks` is a LIST -- two different named
-        `PairedCrosswalk`s over two different rasters emit two independently correct
+        `GridCrosswalk`s over two different rasters emit two independently correct
         columns (`x0`/`y0`), and requesting only one must never open the other's
         backing raster, the same projection-pushdown guarantee the single-crosswalk
-        tests above pin for the fine/paired split. Names deliberately avoid the `b`
-        fine-column prefix (see the reserved-name guard `scan_paired` itself raises on)."""
+        tests above pin for the band/value split. Names deliberately avoid the `b`
+        band-column prefix (see the reserved-name guard `scan_rasters` itself raises on)."""
         write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "second_pairing_v001", _thirds_zones())
         second_crosswalk_path = crosswalk_path / f"{RASTER_KWARGS['grid']}__second_pairing_v001.tif"
 
@@ -1139,15 +1164,15 @@ class TestScanPaired:
 
         monkeypatch.setattr(rio, "open", spy_open)
 
-        lf = scan_paired(
+        lf = scan_rasters(
             [paths[0]],
             [[0]],
             [None],
+            with_px=True,
             crosswalks=[
-                PairedCrosswalk("x", pairing_crosswalk_path, lookups_x),
-                PairedCrosswalk("y", second_crosswalk_path, lookups_y),
+                GridCrosswalk("x", pairing_crosswalk_path, _crosswalk_values("x", lookups_x, [2030])),
+                GridCrosswalk("y", second_crosswalk_path, _crosswalk_values("y", lookups_y, [2030])),
             ],
-            calendar_steps=[2030],
             zones_path=uniform_output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -1167,7 +1192,7 @@ class TestScanPaired:
         assert full.filter(pl.col("y0") == 30.0).height == (GRID.height - 2 * third) * GRID.width
 
     def test_duplicate_crosswalk_names_are_rejected(self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path):
-        """Two `PairedCrosswalk`s sharing a `name` would silently overwrite one
+        """Two `GridCrosswalk`s sharing a `name` would silently overwrite one
         another's column in the per-window `dict` merge -- rejected eagerly instead,
         at scan-construction time, rather than left to surface as a confusing shape
         mismatch or a quietly wrong column later."""
@@ -1176,36 +1201,36 @@ class TestScanPaired:
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
         with pytest.raises(ValueError, match="unique"):
-            scan_paired(
+            scan_rasters(
                 [paths[0]],
                 [[0]],
                 [None],
+                with_px=True,
                 crosswalks=[
-                    PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups),
-                    PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups),
+                    GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030])),
+                    GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030])),
                 ],
-                calendar_steps=[2030],
                 zones_path=uniform_output_crosswalk_path,
                 zone_ids=np.array([1], dtype="int64"),
             )
 
-    def test_crosswalk_name_colliding_with_fine_column_namespace_is_rejected(
+    def test_crosswalk_name_colliding_with_band_column_namespace_is_rejected(
         self, base_path, pairing_crosswalk_path, uniform_output_crosswalk_path
     ):
-        """A crosswalk named `"b"` would emit `"b0"`, indistinguishable from the fine
-        column `scan_rasters`'/`scan_paired`'s own `f"b{i}"` naming -- rejected eagerly
-        rather than silently overwriting the fine column."""
+        """A crosswalk named `"b"` would emit `"b0"`, indistinguishable from the band
+        column `scan_rasters`' own `f"b{i}"` naming -- rejected eagerly
+        rather than silently overwriting the band column."""
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
         paths = _paths_by_year(base_path)
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
         with pytest.raises(ValueError, match="reserved"):
-            scan_paired(
+            scan_rasters(
                 [paths[0]],
                 [[0]],
                 [None],
-                crosswalks=[PairedCrosswalk("b", pairing_crosswalk_path, paired_lookups)],
-                calendar_steps=[2030],
+                with_px=True,
+                crosswalks=[GridCrosswalk("b", pairing_crosswalk_path, _crosswalk_values("b", paired_lookups, [2030]))],
                 zones_path=uniform_output_crosswalk_path,
                 zone_ids=np.array([1], dtype="int64"),
             )
@@ -1219,28 +1244,28 @@ class TestScanPaired:
         paired_lookups = {2030: (np.array([1, 2], dtype="int64"), np.array([100.0, 200.0], dtype="float64"))}
 
         with pytest.raises(ValueError, match="zones_path"):
-            scan_paired(
+            scan_rasters(
                 [paths[0]],
                 [[0]],
                 [None],
-                crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-                calendar_steps=[2030],
+                with_px=True,
+                crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030]))],
                 zone_ids=np.array([1], dtype="int64"),
             )
 
 
-class TestScanPairedNotebookShape:
+class TestCrosswalkValuesNotebookShape:
     """The notebook exit-criterion query, at library level: mask
-    ``fine > a AND paired > b``, then take the per-pixel ``min(calendar_year)`` over
+    ``band > a AND paired > b``, then take the per-pixel ``min(calendar_year)`` over
     surviving steps -- a horizontal min over per-year ``when(cond).then(year)``
     columns. Hand-computed on a small fixture, expressed purely with the primitives
-    `scan_paired` exposes plus ordinary Polars expressions (no new executor needed for
-    the notebook's `filter`/`group` steps -- this class is evidence `scan_paired`
+    `scan_rasters` exposes plus ordinary Polars expressions (no new executor needed for
+    the notebook's `filter`/`group` steps -- this class is evidence the general scan
     alone is sufficient plumbing for the exit criterion).
     """
 
     def test_first_qualifying_year_matches_hand_computed_expectation(self, base_path, crosswalk_path):
-        """Fine fill is uniform per year (5 in 2030, 6 in 2040) so `fine > 4` is always
+        """Band fill is uniform per year (5 in 2030, 6 in 2040) so `b > 4` is always
         true and the surviving-year decision is driven entirely by the paired
         threshold `paired > 5`, which differs by pairing half and by year:
 
@@ -1265,12 +1290,12 @@ class TestScanPairedNotebookShape:
             2040: (ids, np.array([7.0, 3.0], dtype="float64")),
         }
 
-        lf = scan_paired(
+        lf = scan_rasters(
             paths,
             [[0], [1]],
             [None, None],
-            crosswalks=[PairedCrosswalk("p", pairing_crosswalk_path, paired_lookups)],
-            calendar_steps=[2030, 2040],
+            with_px=True,
+            crosswalks=[GridCrosswalk("p", pairing_crosswalk_path, _crosswalk_values("p", paired_lookups, [2030, 2040]))],
             zones_path=output_crosswalk_path,
             zone_ids=np.array([1], dtype="int64"),
         )
@@ -1295,3 +1320,211 @@ class TestScanPairedNotebookShape:
         assert bottom_half.height == (GRID.height - half) * GRID.width
         assert (top_half["min_year"] == 2040).all()
         assert (bottom_half["min_year"] == 2030).all()
+
+
+class TestScanRastersCrosswalkEdges:
+    """The `crosswalks=`/`with_px=` read's own edges, separate from
+    `TestScanRastersCrosswalkValues`' pairing semantics: an attach-only crosswalk (no value
+    table), the shapes where a crosswalk or `_px` is the ONLY thing a query wants, and the
+    value table's own shape rejection.
+    """
+
+    @pytest.fixture
+    def pairing_crosswalk_path(self, crosswalk_path):
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", _halves_zones())
+        return crosswalk_path / f"{RASTER_KWARGS['grid']}__hydro_compartment_v001.tif"
+
+    def test_attach_only_crosswalk_emits_the_zone_column_and_no_value_columns(
+        self, base_path, pairing_crosswalk_path
+    ):
+        """`GridCrosswalk.values=None` is the "attach one zone id per vector grid" half on
+        its own -- one Int32 column, nothing filtered, no row dropped, and no per-band
+        value column at all."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        lf = scan_rasters([paths[0]], [[0]], [None], crosswalks=[GridCrosswalk("z", pairing_crosswalk_path)])
+        out = lf.collect()
+
+        assert out.columns == ["z", "b0"]
+        assert out.height == GRID.height * GRID.width
+        half = GRID.height // 2
+        assert out.filter(pl.col("z") == 1).height == half * GRID.width
+        assert out.filter(pl.col("z") == 2).height == (GRID.height - half) * GRID.width
+
+    def test_crosswalk_alone_is_still_one_row_per_pixel(self, base_path, pairing_crosswalk_path):
+        """Selecting only the crosswalk's zone column opens no band file, but must still
+        produce one row per pixel rather than an empty frame."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        lf = scan_rasters([paths[0]], [[0]], [None], crosswalks=[GridCrosswalk("z", pairing_crosswalk_path)])
+        out = lf.select("z").collect()
+
+        assert out.height == GRID.height * GRID.width
+
+    def test_px_alone_is_still_one_row_per_pixel(self, base_path):
+        """`_px` costs no file read at all, so nothing in the projection plan survives when
+        it is the only column wanted -- the emptiness test has to look at the REQUESTED
+        columns, not at the file plan, or this returns zero batches."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        out = scan_rasters([paths[0]], [[0]], [None], with_px=True).select("_px").collect()
+
+        assert out.height == GRID.height * GRID.width
+        assert set(out["_px"].to_list()) == set(range(GRID.height * GRID.width))
+
+    def test_value_table_missing_a_band_column_is_rejected(self, base_path, pairing_crosswalk_path):
+        """A value table short one band's column would leave that band with no value at
+        all. Rejected at scan-construction time rather than surfacing as a `KeyError` from
+        inside a Polars worker thread, where the traceback says nothing about which
+        crosswalk was wrong."""
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+        values = pl.DataFrame({"v": [1, 2], "v0": [1.0, 2.0]})
+
+        with pytest.raises(ValueError, match=r"missing columns.*v1"):
+            scan_rasters(paths, [[0], [1]], [None, None], crosswalks=[GridCrosswalk("v", pairing_crosswalk_path, values)])
+
+    def test_value_table_missing_its_key_column_is_rejected(self, base_path, pairing_crosswalk_path):
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+        values = pl.DataFrame({"grid_cell": [1, 2], "v0": [1.0, 2.0]})
+
+        with pytest.raises(ValueError, match=r"missing columns.*'v'"):
+            scan_rasters([paths[0]], [[0]], [None], crosswalks=[GridCrosswalk("v", pairing_crosswalk_path, values)])
+
+    def test_empty_value_table_yields_all_null_values_and_keeps_every_row(
+        self, base_path, pairing_crosswalk_path
+    ):
+        """No vector rows at all: every lookup misses, so every value is null -- and, as
+        with every other miss kind, the ROW SURVIVES. The dense lookup array is
+        zero-length here, which is its own branch."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+        values = pl.DataFrame(schema={"v": pl.Int64, "v0": pl.Float64})
+
+        out = scan_rasters(
+            [paths[0]], [[0]], [None], crosswalks=[GridCrosswalk("v", pairing_crosswalk_path, values)]
+        ).collect()
+
+        assert out.height == GRID.height * GRID.width
+        assert out["v0"].null_count() == out.height
+        assert (out["b0"] == 7).all()
+
+    def test_value_columns_alone_open_no_band_file_and_size_from_the_crosswalk(
+        self, base_path, pairing_crosswalk_path, monkeypatch
+    ):
+        """With every band projected away and no zone crosswalk attached, the surviving
+        `GridCrosswalk` is the only raster left to take the block geometry from -- the
+        third rung of the reference-path fallback."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+        values = pl.DataFrame({"v": [1, 2], "v0": [100.0, 200.0]})
+
+        opened = []
+        original_open = rio.open
+
+        def spy_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(rio, "open", spy_open)
+
+        out = (
+            scan_rasters(
+                [paths[0]],
+                [[0]],
+                [None],
+                value_dtype=pl.Int32,
+                crosswalks=[GridCrosswalk("v", pairing_crosswalk_path, values)],
+            )
+            .select("v0")
+            .collect()
+        )
+
+        assert not any(str(paths[0]) == p for p in opened)
+        half = GRID.height // 2
+        assert out.filter(pl.col("v0") == 100.0).height == half * GRID.width
+        assert out.filter(pl.col("v0") == 200.0).height == (GRID.height - half) * GRID.width
+
+
+class TestScanRastersEmitsExactlyTheProjection:
+    """A yielded frame must carry the projected columns and nothing else.
+
+    `grid_cell` and `_px` cost no band decompression, which makes attaching them
+    unconditionally look free. It isn't: a frame carrying a column the projection didn't
+    ask for makes `collect_batches(maintain_order=True)` hand this source's batches back
+    OUT OF RASTER ORDER on a multi-threaded pool, and every raster-output write path
+    reassembles windows from those batches positionally -- so the wrong pixels get real
+    values, silently, with the right value distribution.
+    """
+
+    @pytest.fixture
+    def zones_path(self, crosswalk_path):
+        write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", _halves_zones())
+        return crosswalk_path / f"{RASTER_KWARGS['grid']}__hydro_compartment_v001.tif"
+
+    def _captured_source(self, monkeypatch, build):
+        """The raw generator `scan_rasters` hands `register_io_source`, so a projection can
+        be passed in directly instead of hoping Polars pushes down the one wanted."""
+        captured = {}
+        original = raster_source.register_io_source
+
+        def spy(callable_, *, schema, **kwargs):
+            captured["source"] = callable_
+            return original(callable_, schema=schema, **kwargs)
+
+        monkeypatch.setattr(raster_source, "register_io_source", spy)
+        build()
+        return captured["source"]
+
+    def test_unrequested_grid_cell_and_px_are_not_attached(self, base_path, zones_path, monkeypatch):
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        source = self._captured_source(
+            monkeypatch,
+            lambda: scan_rasters([paths[0]], [[0]], [None], zones_path=zones_path, with_px=True),
+        )
+        frame = next(iter(source(["b0"], None, None, None)))
+
+        assert frame.columns == ["b0"]
+
+    def test_requested_grid_cell_and_px_are_still_attached(self, base_path, zones_path, monkeypatch):
+        """The complement: gating emission on the projection must not make either column
+        unreachable when it IS asked for."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        source = self._captured_source(
+            monkeypatch,
+            lambda: scan_rasters([paths[0]], [[0]], [None], zones_path=zones_path, with_px=True),
+        )
+        frame = next(iter(source(["grid_cell", "_px", "b0"], None, None, None)))
+
+        assert frame.columns == ["grid_cell", "_px", "b0"]
+
+    def test_zone_filtering_still_happens_when_grid_cell_is_not_projected(self, base_path, zones_path):
+        """Gating the COLUMN on the projection must not gate the zone READ that drops rows:
+        `zone_ids` filtering is a row-count effect, and a query that filters to one zone
+        without selecting the zone id is the ordinary shape."""
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 7)
+        paths = _paths_by_year(base_path)
+
+        out = (
+            scan_rasters(
+                [paths[0]],
+                [[0]],
+                [None],
+                zones_path=zones_path,
+                zone_ids=np.array([1], dtype="int64"),
+                with_px=True,
+            )
+            .select("b0")
+            .collect()
+        )
+
+        assert out.columns == ["b0"]
+        assert out.height == (GRID.height // 2) * GRID.width

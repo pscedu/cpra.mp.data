@@ -488,9 +488,9 @@ def rewrite_named_columns(expr_str, column_map):
 
     `api/pipeline.py`'s analysis pipelines don't write their `filter.where` against the
     single `value` placeholder -- a step downstream of a spatial `join` (`api/raster_source
-    .scan_paired`) names each side by its own input/step name (e.g. `marsh > 0.5 AND sal >
+    ._write_paired_notebook_raster`) names each side by its own input/step name (e.g. `marsh > 0.5 AND sal >
     5.5`), and that same expression has to be re-evaluated once per selected calendar band,
-    against that band's own synthetic columns (`scan_paired`'s `b<i>`/`p<i>` convention).
+    against that band's own synthetic columns (`scan_rasters`' `b<i>`/`p<i>` convention).
     `column_map` is `{name: replacement}` for every name in scope at that step, e.g.
     `{"marsh": "b0", "sal": "p0"}`.
 

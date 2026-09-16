@@ -27,7 +27,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.analysis.base import BaseAnalysis, apply_dimension_filter, apply_value_filter
+from cpra.mp.data.analysis.base import BaseAnalysis, op_error_boundary
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
@@ -36,7 +36,7 @@ from cpra.mp.data.analysis.expressions import (
     rewrite_named_columns,
 )
 from cpra.mp.data.analysis.geography import parse_coordinate_pairs, project_coordinates
-from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp
+from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, Shape
 from cpra.mp.data.analysis.sources import (
     NUMPY_TO_POLARS,
     band_calculate_passes,
@@ -58,6 +58,14 @@ from cpra.mp.data.analysis.utils import (
     raster_gdal_env,
     unpack_values,
 )
+# The LONG-shape lowering of `filter`/`calculate`/`group`, shared with the vector
+# interpreter rather than reimplemented here: a raster chain reaches that shape after a
+# `project` raster-to-vector (a summarizing `project` step, or a `grid_cell` pointwise
+# sample), and from that point on its frame is structurally a vector frame. It lives in
+# `analysis/vector.py` because `apply_group_by`/`apply_project`, the two lowerings it calls
+# that are not already in `analysis/base.py`, live there; `analysis/vector.py` imports
+# nothing from this module, so this direction is the acyclic one.
+from cpra.mp.data.analysis.vector import apply_long_op
 from cpra.mp.data.config import (
     COUNT_BY_VALUE_MAX_DISTINCT,
     RASTER_NUM_THREADS,
@@ -182,6 +190,34 @@ def band_metadata_filter(metadata_df, dimension_where):
     """
     keep = band_dimension_keep(metadata_df, dimension_where)
     return metadata_df.filter(pl.Series(keep)), keep
+
+
+def band_metadata_scan_filter(lf, dimension_where):
+    """The PUSHDOWN lowering of a dimension filter: narrow the band-metadata SCAN itself,
+    so the bands the predicate rejects are never opened at all.
+
+    Legal only over the prefix of a chain in which every preceding op preserves band
+    identity (`filter`/`calculate` do, `group` does not) -- see
+    `RasterGridAnalysis.apply_steps`' pushdown rule for the full argument. Once a `group`
+    has run, `band_metadata_filter` above is the lowering instead.
+
+    `lf.sql` rejects a SYNTACTICALLY malformed predicate eagerly, raising out of Polars'
+    SQL layer; that becomes an `ExpressionError` here so the interpreter's one error
+    boundary (`base.op_error_boundary`) sees the same typed exception every other lowering
+    raises, with the message text unchanged.
+
+    It does NOT cover an unknown COLUMN, and does not need to: `lf.sql` only PLANS, so name
+    resolution is deferred to the eventual `collect()`, where `BaseAnalysis.materialize`'s
+    own `ColumnNotFoundError` handler already turns it into the same 400. (That deferral is
+    load-bearing rather than incidental -- `_validate_filter_where` deliberately does not
+    namespace-restrict a dimension conjunct at plan time, matching the flat `where=`
+    surface, so an unknown dimension name is EXPECTED to reach execution.) Both halves are
+    pinned by `tests/api/test_raster_ops.py`'s `TestBandMetadataScanFilter`.
+    """
+    try:
+        return lf.sql(f"select * from self where {dimension_where}")
+    except Exception as exc:
+        raise ExpressionError(str(exc)) from exc
 
 
 def band_group_row_idxs(metadata_df, by):
@@ -356,6 +392,115 @@ def apply_group_band_wide(lf, metadata_df, by, aggregate, extra_columns=()):
         for name, row_idxs in zip(band_column_names(new_metadata_df), group_row_idxs)
     ]
     return lf.select([*extra_columns, *exprs]), new_metadata_df
+
+
+def crosswalk_value_column_names(metadata_df, prefix):
+    """The value column names `pivot_vector_to_band_wide` produces and
+    `sources.scan_rasters` emits for a crosswalk named `prefix`: `<prefix>0..<prefix>N`.
+
+    The same one-line invariant `band_column_names` is, for a crosswalk's value columns
+    instead of the band columns: `<prefix><i>` is the vector value paired with band `b<i>`,
+    so the two families stay index-aligned by construction and a caller writing an
+    expression over both zips two lists computed from one `metadata_df` rather than tracking
+    a stored mapping.
+    """
+    return [f"{prefix}{i}" for i in range(metadata_df.height)]
+
+
+def pivot_vector_to_band_wide(
+    metadata_df,
+    vector_df,
+    band_steps,
+    *,
+    step_column,
+    vector_zone_column="grid_cell",
+    value_column="value",
+    prefix="v",
+):
+    """Turn a LONG vector frame -- one row per `(zone, step)` -- into the BAND-WIDE value
+    table `sources.GridCrosswalk.values` takes: one row per zone, one column per band.
+
+    This is the long-to-band-wide conversion, and it is the half of projecting a vector
+    dataset onto a raster grid that has no raster in it at all. The other half -- which zone
+    each PIXEL is in -- is a positional crosswalk read, and belongs to the scan
+    (`scan_rasters(crosswalks=...)`), which also performs the final per-pixel lookup against
+    the table this returns. See `GridCrosswalk`'s own docstring for why the lookup cannot
+    currently sit between the two as an ordinary frame op.
+
+    Pivoting first is not an optimization. `vector_df` is LONG, so looking it up by zone
+    alone would match each pixel once PER STEP; expressed as a join that multiplies the
+    frame's height by the number of steps, and expressed as a lookup array it is simply
+    ill-defined -- which step's value did that zone get? A raster-output write requires one
+    row per pixel in raster order (`_take_window_rows` surfaces any short read as a hard
+    error, and a value filter has to be a mask for the same reason), so a height change is
+    not a performance question, it is a wrong answer. Pivoting by the dimension that defines
+    band identity makes the lookup single-valued: each band reads its own column.
+
+    `band_steps` is one step value per band, positionally aligned with
+    `band_column_names(metadata_df)`. Distinct steps are numbered and the vector frame is
+    pivoted on that numbering rather than on the step values themselves, so a step of any
+    dtype (Int32 year, `pl.Date`, string) works without the pivot's column names having to be
+    round-trippable strings. Two bands sharing a step both select that one pivoted column,
+    emitted twice under both names; a band whose step has no vector row at all gets an
+    all-null column, the same outcome as a zone with no matching row.
+
+    Duplicate zone ids resolve last-wins (`aggregate_function="last"`), which is NumPy's own
+    rule for the fancy-index assignment in `sources._dense_lookup_array` that consumes this,
+    and is kept identical deliberately. Rows with a null zone id or a step outside
+    `band_steps` are dropped here: they can never be selected by any band, and
+    `_dense_lookup_array` cannot index a null.
+
+    Returns a `pl.DataFrame` whose key column is named `prefix` -- matching the
+    `GridCrosswalk.name` it will be attached under, which is also the zone column that
+    crosswalk emits -- plus one Float64 column per name in
+    `crosswalk_value_column_names(metadata_df, prefix)`.
+    """
+    names = band_column_names(metadata_df)
+    if len(band_steps) != len(names):
+        raise ValueError(
+            f"pivot_vector_to_band_wide: {len(band_steps)} steps for {len(names)} bands -- "
+            "one step per band column is required"
+        )
+    out_names = crosswalk_value_column_names(metadata_df, prefix)
+
+    # Distinct steps in first-appearance order -> 0..K-1. `dict.fromkeys` both dedupes and
+    # fixes that order in one pass, and works for any hashable step value.
+    step_index = {step: i for i, step in enumerate(dict.fromkeys(band_steps))}
+
+    narrowed = (
+        vector_df.lazy()
+        .select(
+            pl.col(vector_zone_column).cast(pl.Int64, strict=False),
+            pl.col(step_column).replace_strict(step_index, default=None, return_dtype=pl.Int32).alias("_step_idx"),
+            pl.col(value_column).cast(pl.Float64).alias("_value"),
+        )
+        .drop_nulls([vector_zone_column, "_step_idx"])
+        .collect()
+    )
+    if narrowed.height == 0:
+        # `DataFrame.pivot` on an empty frame produces no value columns at all, so the
+        # select below would have nothing to reference. An empty table is a complete
+        # answer -- every lookup misses and every band's column is null -- so build it
+        # directly rather than special-casing the miss downstream.
+        return pl.DataFrame(schema={prefix: pl.Int64, **{n: pl.Float64 for n in out_names}})
+
+    wide = narrowed.pivot(
+        on="_step_idx",
+        index=vector_zone_column,
+        values="_value",
+        aggregate_function="last",
+    )
+    present = set(wide.columns)
+    return wide.select(
+        pl.col(vector_zone_column).alias(prefix),
+        *[
+            (pl.col(str(step_index[step])) if str(step_index[step]) in present else pl.lit(None, dtype=pl.Float64))
+            .cast(pl.Float64)
+            .fill_nan(None)
+            .alias(out_name)
+            for step, out_name in zip(band_steps, out_names)
+        ],
+    )
 
 
 def band_ops_for_pixel_read(band_ops, value_where):
@@ -892,11 +1037,10 @@ class RasterGridAnalysis(BaseAnalysis):
         attached -- mirrors `VectorGridAnalysis.apply_params` exactly; see that method's
         docstring for the shared reasoning (this override changes nothing for the flat,
         non-pipeline request surface, which never sets `_pipeline_ops`). `planner.
-        _compile_single_input_chain`'s fast path attaches `_pipeline_ops` for a raster
-        input too, as of this step, except when `selection.grid_cell is not None` (see
-        `apply_steps`' own docstring for why that one shape is excluded) -- so a raster
-        pipeline request with a `grid_cell` still falls through to `BaseAnalysis.
-        apply_params`'s fixed five-stage flow below, unchanged.
+        _compile_single_input_chain`'s fast path attaches `_pipeline_ops` for every raster
+        input shape, `selection.grid_cell` included -- `apply_steps` handles that one by
+        tracking the frame's SHAPE explicitly (see its docstring), rather than by being kept
+        away from it.
         """
         if self._pipeline_ops is not None:
             await self.apply_steps(self._pipeline_ops)
@@ -905,7 +1049,7 @@ class RasterGridAnalysis(BaseAnalysis):
         await super().apply_params()
 
     async def apply_steps(self, ordered_ops: list[Op]):
-        """The band-wide interpreter: walk `ordered_ops` and apply each op IN DECLARED
+        """The raster interpreter: walk `ordered_ops` and apply each op IN DECLARED
         ORDER, never reordering -- the raster half of what `vector.VectorGridAnalysis.
         apply_steps` already does for the long shape (see that method's docstring for the
         general argument against a fixed filter-then-calculate-then-group-then-transform
@@ -918,10 +1062,42 @@ class RasterGridAnalysis(BaseAnalysis):
         `apply_band_ops`, which is the only thing that ever resolves those against real
         columns, and does so freshly at each step.
 
-        Two modes, split on `current_grid`, exactly mirroring the two shapes `self.lf`
-        actually takes across a raster request's lifetime:
+        Two lowerings, selected by an explicit `shape` variable (`ops.Shape`) that names
+        which of the two frame shapes `self.lf` currently holds. `shape` is what picks the
+        IMPLEMENTATION of each declared op; it never picks the ORDER, which comes from
+        `ordered_ops` alone. It replaces an earlier `current_grid != self.grid.name` test
+        that stood in for the same question -- a proxy that happened to agree with the shape
+        only because a summarizing `project` was the one thing that could reshape the frame.
+        It no longer is: a `grid_cell` selection reshapes it too, before the walk even
+        starts, which is exactly the case the proxy could not express.
 
-        - PRE-project (`current_grid == self.grid.name`): `self.lf` is band metadata -- one
+        `Shape.band_wide` means one row per pixel and one column per band (`b0..bN`), with
+        `self.lf` holding that frame's band METADATA -- and it additionally means the frame
+        is POSITIONALLY ALIGNED to the raster: row `i` is pixel `i` of the output window,
+        for every op in the chain. Shape alone would not say that, and raster output
+        correctness depends on it, so every band-wide lowering here preserves row count by
+        construction -- a value filter is a per-cell MASK, never a row drop (see
+        `apply_value_filter_band_wide`), and `_take_window_rows` turns a short read into a
+        hard `RuntimeError` rather than letting a silently-shortened frame reach a write.
+        There is no band-wide frame in this package that is NOT raster-aligned (every one
+        originates from `sources.scan_rasters`' dense per-pixel scan), so alignment is
+        carried as an invariant of the lowerings -- pinned by `tests/api/test_raster_ops.py`'s
+        `TestBandWideRowAlignment`, which asserts that each band-wide lowering leaves
+        `height` unchanged -- rather than as a second type field whose only reachable value
+        would be `True`. That class also records the one exception: a dimension filter
+        matching no band leaves a frame with no columns, whose height is necessarily 0. It
+        is unreachable as a write, because the same predicate empties the band metadata and
+        `_apply_transform_params_impl` 404s on an empty band frame before any pixel is read.
+
+        `Shape.long` means the ordinary (dimension columns, `grid_cell`, `value`) frame, one
+        row per observation, with no alignment property at all: rows may be freely dropped.
+        A raster chain reaches it two ways, both of which are `project` raster-to-vector in
+        `ops.LOWERING_TABLE`'s terms -- a summarizing `ProjectOp` at its own declared
+        position, or an `InputSelection.grid_cell` pointwise sample applied up front (see
+        below). Once there, every non-`project` op is lowered by the SAME
+        `vector.apply_long_op` the vector interpreter calls, with the same arguments.
+
+        - `Shape.band_wide`: `self.lf` is band metadata -- one
           row per selected band, or (once at least one `group` has run) one row per
           surviving group; no pixel data either way.
 
@@ -929,8 +1105,8 @@ class RasterGridAnalysis(BaseAnalysis):
           op, and which one is the pushdown rule:
 
             Before the first `group` (`self._raw_band_frame is None`), it is applied
-            straight to `self.lf` (`apply_dimension_filter`, the same call
-            `_apply_filter_params` makes). `self.lf` is still the table `_band_frame`
+            straight to `self.lf` (`band_metadata_scan_filter`, the same `lf.sql()` path
+            `apply_dimension_filter` uses). `self.lf` is still the table `_band_frame`
             hands a pixel-read consumer to build its scan from, so narrowing it here means
             the dropped bands are never opened at all -- real projection pushdown, not a
             column drop after the fact. This is legal only because every op that can
@@ -978,86 +1154,113 @@ class RasterGridAnalysis(BaseAnalysis):
           here instead would let a value `where` conjunct declared by a LATER `FilterOp`
           step slip past the "standalone value filter needs summarize_by/summarize_aggregate"
           rejection entirely (nothing would ever re-check it) -- so this branch is a plain
-          `continue`, and the trailing `if current_grid == self.grid.name: await
+          `continue`, and the trailing `if shape is Shape.band_wide: await
           self._apply_transform_params_impl()` after the whole loop (see below) reproduces
           that always-runs-last check for this shape instead.
-        - POST-project (`current_grid != self.grid.name`, i.e. after a summarizing `project`
-          ran): `self.lf` is now an ordinary long-shape (grid_cell/value/dimensions) tabular
-          frame -- structurally identical to vector's own `self.lf` at the same point -- so a
-          `FilterOp` here is lowered EXACTLY the way `vector.VectorGridAnalysis.apply_steps`
-          lowers one: `apply_dimension_filter` then `apply_value_filter(..., mask=False)`, an
-          unconditional row drop (see that method's docstring for why a drop, not a
-          conditional mask-vs-drop, is the only coherent choice once the aggregate already
-          ran at its own declared position). The planner never admits a
-          `CalculateOp`/`GroupOp`/second `ProjectOp` once a `project` has summarized, so
-          `FilterOp` is the only op this branch needs to handle. A post-project literal
-          `grid_cell = N` filter is treated here as an ordinary long-shape row filter -- one
-          zone's own aggregate does not depend on which OTHER zones were also requested, so
-          post-hoc filtering the summarize's OUTPUT rows by `grid_cell` gives a numerically
-          identical answer to narrowing the crosswalk's `zone_ids` before the summarize runs.
+        - `Shape.long`: `self.lf` is an ordinary long (grid_cell/value/dimensions) tabular
+          frame -- structurally identical to vector's own `self.lf` -- so every
+          `FilterOp`/`CalculateOp`/`GroupOp` is handed straight to `vector.apply_long_op`,
+          the single shared implementation of `ops.LOWERING_TABLE`'s long row. A value
+          conjunct is an unconditional ROW DROP there (nothing downstream is aligned to a
+          raster any more), which is also why the band-wide branch cannot reuse it.
+
+          A post-project literal `grid_cell = N` filter is an ordinary long-shape row filter
+          here -- one zone's own aggregate does not depend on which OTHER zones were also
+          requested, so post-hoc filtering the summarize's OUTPUT rows by `grid_cell` gives
+          a numerically identical answer to narrowing the crosswalk's `zone_ids` before the
+          summarize runs.
+
+          A further `ProjectOp` from this shape is REJECTED rather than lowered. It is
+          reachable only from the `grid_cell` entry into this shape (after a summarizing
+          project the planner admits no second one), and a `grid_cell` sample's `grid_cell`
+          values are `"lng,lat"` coordinate labels for arbitrary points, not cells of any
+          grid -- there is no crosswalk keyed by them and no meaningful zone to
+          re-aggregate them onto. That combination previously reached
+          `_apply_transform_params_impl` with an already-reshaped `self.lf` and died on a
+          raw `ColumnNotFoundError` for the missing `path` column; it is an explicit 400
+          now.
 
         `self.options.grid_cell` (`InputSelection.grid_cell`, an INPUT-level sampling filter,
-        never a pipeline step) is deliberately EXCLUDED from the raster fast path by
-        `planner._compile_single_input_chain` (this method is simply never reached with it
-        set) rather than handled here: `_apply_grid_cell` reshapes `self.lf` from the
-        metadata table straight into a long (grid_cell/value) frame via `.unpivot(...)`
-        BEFORE any op could run, a shape change this method's PRE-project mode does not
-        accommodate. The `if self.options.grid_cell:` guard below is kept anyway, purely for
-        parity with `VectorGridAnalysis.apply_steps`'s own unconditional inclusion of the
-        identical line -- it is dead code for every raster instance that actually reaches
-        this method in practice (the planner gate guarantees `grid_cell is None` here), but
-        costs nothing to leave in should that gate ever change.
+        never a pipeline step, so it never appears in `ordered_ops`) is applied once, up
+        front, via the existing `_apply_grid_cell` hook -- the same relative timing
+        `BaseAnalysis.apply_params`'s stage 1 gives it and the same spot
+        `VectorGridAnalysis.apply_steps` applies its own. For a raster it is not a row
+        filter but a resample: it samples each selected band at the requested coordinates
+        and rebuilds `self.lf` as a long (grid_cell/value) frame via `.unpivot(...)`, i.e.
+        `project` raster-to-vector, so `shape` starts at `Shape.long` whenever it is set and
+        the whole walk takes the long lowerings.
+
+        Known cost of applying it up front: a dimension filter declared as a leading step no
+        longer narrows the set of bands that get SAMPLED, the way the band-wide pushdown
+        prefix narrows the set that gets read. Every selected band is sampled at the
+        requested points and the filter then drops rows from the long result. The answer is
+        identical; the work is not, for a request that selects many bands and filters to few.
 
         `rename_map`/`value_names`: identical construction to `VectorGridAnalysis.
         apply_steps` -- see that method's docstring for why a synthetic digit-string default
         output name (`ops._default_output_name`) is deliberately excluded.
+
+        Errors: as in the vector interpreter, every lowering is a plain library function
+        raising `ExpressionError`/`FoldError`, translated once by `base.op_error_boundary`
+        around the whole walk. A rejection this method makes ITSELF (`self._error`) raises
+        `AnalysisError`, which that boundary deliberately passes through untouched.
         """
+        shape = Shape.band_wide
         if self.options.grid_cell:
             await self._apply_grid_cell()
+            shape = Shape.long
 
         current_grid = self.grid.name
         value_names = {ordered_ops[0].input}
         value_names.update(op.output for op in ordered_ops if not op.output[0].isdigit())
         rename_map = {name: "value" for name in value_names}
 
-        for op in ordered_ops:
-            if isinstance(op, ProjectOp):
-                if op.to == current_grid:
-                    continue
-                await self._apply_transform_params_impl()
-                current_grid = op.to
-            elif isinstance(op, FilterOp):
-                rewritten = rewrite_named_columns(op.where, rename_map)
-                if current_grid != self.grid.name:
-                    # Post-project: self.lf is long-shape now -- see the docstring above.
-                    try:
-                        self.lf, value_where, has_dimension_conjunct = apply_dimension_filter(self.lf, rewritten)
-                        self.lf = apply_value_filter(self.lf, value_where, mask=False)
-                    except ExpressionError as exc:
-                        self._error(str(exc))
-                else:
-                    try:
-                        dimension_conjuncts, value_conjuncts = classify_where(rewritten)
-                    except ExpressionError as exc:
-                        self._error(str(exc))
+        with op_error_boundary():
+            for op in ordered_ops:
+                if isinstance(op, ProjectOp):
+                    if op.to == current_grid:
+                        continue
+                    if shape is Shape.long:
+                        self._error(
+                            f"not supported: a `project` to {op.to!r} in a raster-input pipeline that also "
+                            "selects a `grid_cell` -- a grid_cell selection samples the raster at arbitrary "
+                            "coordinates, so its rows are labeled by coordinate rather than by cells of any "
+                            "grid, and there is no crosswalk that can re-aggregate them onto another grid. "
+                            "Drop the `grid_cell` selection to summarize, or drop the project step to sample."
+                        )
+                    await self._apply_transform_params_impl()
+                    shape = Shape.long
+                    current_grid = op.to
+                elif shape is Shape.long:
+                    if isinstance(op, GroupOp) and op.aggregate == "count":
+                        # Same rejection `_collapse_group` makes for the band-wide shape, kept
+                        # here so the answer to "is group_aggregate='count' legal on a raster
+                        # selection" does not depend on which shape the frame happens to be in.
+                        self._error("group_aggregate 'count' is not supported for raster grids")
+                    self.lf, has_dimension_conjunct = apply_long_op(
+                        self.lf,
+                        op,
+                        rename_map=rename_map,
+                        has_selective_filter=self._has_selective_dimension_filter(),
+                    )
+                    self._where_has_dimension_conjunct = (
+                        self._where_has_dimension_conjunct or has_dimension_conjunct
+                    )
+                elif isinstance(op, FilterOp):
+                    rewritten = rewrite_named_columns(op.where, rename_map)
+                    dimension_conjuncts, value_conjuncts = classify_where(rewritten)
                     has_dimension_conjunct = bool(dimension_conjuncts)
                     if has_dimension_conjunct:
                         dimension_where = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
                         if self._raw_band_frame is None:
                             # Pushdown prefix: narrow the scan itself.
-                            try:
-                                self.lf = self.lf.sql(f"select * from self where {dimension_where}")
-                            except Exception as exc:
-                                self._error(str(exc))
+                            self.lf = band_metadata_scan_filter(self.lf, dimension_where)
                         else:
                             # A `group` already ran, so this filter has to run at its own
                             # position instead -- against the grouped bands it names.
                             self._flush_calculate_plans_to_band_ops()
                             self._band_ops.append(("filter", dimension_where))
-                            try:
-                                self.lf = band_metadata_filter(self.lf.collect(), dimension_where)[0].lazy()
-                            except ExpressionError as exc:
-                                self._error(str(exc))
+                            self.lf = band_metadata_filter(self.lf.collect(), dimension_where)[0].lazy()
                     if value_conjuncts:
                         value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
                         self._flush_calculate_plans_to_band_ops()
@@ -1065,22 +1268,19 @@ class RasterGridAnalysis(BaseAnalysis):
                         self._value_where = (
                             value_where if self._value_where is None else f"({self._value_where}) and ({value_where})"
                         )
-                self._where_has_dimension_conjunct = self._where_has_dimension_conjunct or has_dimension_conjunct
-            elif isinstance(op, CalculateOp):
-                expression = rewrite_named_columns(op.expression, rename_map)
-                where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
-                try:
+                    self._where_has_dimension_conjunct = self._where_has_dimension_conjunct or has_dimension_conjunct
+                elif isinstance(op, CalculateOp):
+                    expression = rewrite_named_columns(op.expression, rename_map)
+                    where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
                     self._calculate_plans.extend(
                         compile_calculate_entries([(f"step.{op.step_no}", expression, where)])
                     )
-                except ExpressionError as exc:
-                    self._error(str(exc))
-            elif isinstance(op, GroupOp):
-                self._collapse_group(list(op.by), op.aggregate)
-            else:  # pragma: no cover -- a `JoinOp` never reaches a single-input chain
-                self._error(f"unsupported op in the raster interpreter: {op.op!r}")
+                elif isinstance(op, GroupOp):
+                    self._collapse_group(list(op.by), op.aggregate)
+                else:  # pragma: no cover -- a `JoinOp` never reaches a single-input chain
+                    self._error(f"unsupported op in the raster interpreter: {op.op!r}")
 
-        if current_grid == self.grid.name:
+        if shape is Shape.band_wide:
             # No `ProjectOp` in this chain ever actually summarized (an identity project,
             # possibly followed by filter/calculate/group steps that ran against the
             # still-metadata-shaped `self.lf` above) -- `_apply_transform_params_impl` still
@@ -1093,8 +1293,18 @@ class RasterGridAnalysis(BaseAnalysis):
             # interpreter alike -- must keep rejecting that shape, not just the ones where a
             # value filter happens to be declared before the (identity) project. A genuinely
             # summarizing `ProjectOp` above already called this once, at its own declared
-            # position, and updated `current_grid` away from `self.grid.name` when it did --
-            # so this is a plain no-op for that case, never a second summarize.
+            # position, and moved `shape` to `Shape.long` when it did -- so this is skipped
+            # for that case, never a second summarize.
+            #
+            # Skipped for a `grid_cell` selection too, which also leaves `shape` at
+            # `Shape.long` (before the walk even starts). That is a deliberate admission,
+            # not an oversight: the rejection this call carries exists because a plain
+            # raster selection has no per-pixel frame for a value predicate to test, and a
+            # `grid_cell` selection is precisely the case that DOES -- `_apply_grid_cell`
+            # has already resolved every selected band to a real sampled `value` at each
+            # requested coordinate, so `apply_long_op` applies the predicate to it directly,
+            # as an ordinary row drop, instead of stashing it on `self._value_where` for a
+            # zonal summarize that is never coming.
             await self._apply_transform_params_impl()
 
     def _collapse_tile_bands(self, df, data, nodata):

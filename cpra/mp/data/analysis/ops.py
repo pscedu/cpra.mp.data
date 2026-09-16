@@ -74,7 +74,7 @@ class JoinOp(BaseModel):
     """Combine `inputs` (always exactly the names `JoinStep.inputs` gave, in that order --
     `join` is the one op with no implicit-chain default; see `pipeline.py`'s chaining rule)
     on shared dimensions plus `grid_cell`. `long` lowers this onto an ordinary Polars join
-    keyed on `grid_cell` plus every shared dimension (`sources.scan_paired`'s own
+    keyed on `grid_cell` plus every shared dimension (`sources.scan_rasters`' crosswalk
     docstring); band-wide onto an O(1) dense lookup array over a zone-ID raster
     (`sources._dense_lookup_array`) rather than a generic join, since that array beats a
     hash join for a small, dense key range and is worth preserving as-is -- see

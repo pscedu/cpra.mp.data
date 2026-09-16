@@ -79,6 +79,7 @@ subclass `self` is.
 """
 
 import re
+from contextlib import contextmanager
 
 import polars as pl
 from polars.exceptions import ColumnNotFoundError
@@ -91,6 +92,7 @@ from cpra.mp.data.analysis.expressions import (
     parse_value_expr,
     value_predicate_mask,
 )
+from cpra.mp.data.analysis.fold import FoldError
 from cpra.mp.data.analysis.types import DataFormat, OutputType
 from cpra.mp.data.analysis.utils import get_lazy_frame, timing, unpack_values
 from cpra.mp.data.dimensions import DIMENSIONS
@@ -108,8 +110,9 @@ SORT_CHOICES = DIMENSION_CHOICES + [f"-{dim_name}" for dim_name in DIMENSION_CHO
 # Each function below is the same Polars logic `_apply_filter_params`/`_apply_calculate_
 # params` used to run only against `self.lf`/`self.options`, pulled out to take its own
 # arguments and return a new `lf` instead of mutating an instance -- so a caller walking a
-# `list[ops.Op]` in DECLARED order (`vector.VectorGridAnalysis.apply_steps`, the ops
-# interpreter) can invoke exactly the same stage logic once per op, in whatever order the
+# `list[ops.Op]` in DECLARED order (either interpreter's `apply_steps`, via the shared
+# long lowering `vector.apply_long_op`) can invoke exactly the same stage logic once per
+# op, in whatever order the
 # pipeline actually declared, rather than the fixed five-stage order `apply_params` always
 # runs in. Each one raises the plain `ExpressionError`/`FoldError` its Polars-adjacent
 # helpers already raise -- never `AnalysisError` -- since these are library functions with
@@ -149,12 +152,14 @@ def apply_value_filter(lf, value_where, *, mask):
     (`mask=True`, `pl.when(...).then(value).otherwise(None)` -- nulls a non-matching value
     rather than dropping its row, composing with a downstream aggregate's own null-
     skipping behavior) or a row DROP (`mask=False`, `lf.filter(...)`). `_apply_filter_
-    params`'s docstring explains exactly when the OLD (fixed five-stage) engine picks
+    params`'s docstring explains exactly when the OLD (fixed five-stage) flow picks
     which: mask for an aggregating request (`_is_aggregating()`), drop otherwise. The
-    ops interpreter (`vector.apply_steps`) always passes `mask=False` -- see that
-    method's own docstring for why a straight drop, not that conditional, is the only
-    semantically coherent choice once filter/group/project run in their own declared
-    positions instead of a fixed order.
+    LONG-shape op lowering (`vector.apply_long_op`, shared by both interpreters) always
+    passes `mask=False` -- see that function's own docstring for why a straight drop, not
+    that conditional, is the only semantically coherent choice once filter/group/project
+    run in their own declared positions instead of a fixed order. (The BAND-WIDE lowering
+    does not reach this function at all: it must stay positionally aligned to the raster,
+    so its value filter is always a per-cell mask -- `raster.apply_value_filter_band_wide`.)
 
     A `None` `value_where` (no value conjunct) is a no-op: returns `lf` unchanged.
     """
@@ -209,6 +214,37 @@ class AnalysisError(Exception):
         self.detail = detail
         self.status_code = status_code
         super().__init__(detail)
+
+
+@contextmanager
+def op_error_boundary():
+    """The single translation point between the op ALGEBRA and the request LIFECYCLE.
+
+    Every re-entrant op core in this package (`apply_dimension_filter`/`apply_value_filter`/
+    `apply_calculate_plans` above, `vector.apply_group_by`/`apply_project`/`apply_long_op`,
+    `raster.band_metadata_scan_filter` and the `apply_*_band_wide` family) is a plain
+    library function: it has no `self`, no `status_code`, and no opinion about HTTP, so it
+    signals failure with the typed library exceptions its Polars-adjacent helpers already
+    raise -- `ExpressionError` for anything the expression layer refuses to parse or
+    whitelist, `FoldError` for a chunked collapse that cannot proceed. Wrapping an
+    interpreter's whole op walk in this boundary converts either one, once, into the
+    `AnalysisError` the API layer already knows how to render, with the message text
+    unchanged.
+
+    This replaces a per-op `try/except ...: self._error(str(exc))` around nearly every
+    lowering call in `vector.VectorGridAnalysis.apply_steps`/`raster.RasterGridAnalysis.
+    apply_steps`, which made the mapping "typed library error -> 400" a thing each call
+    site had to remember rather than a property of the interpreter.
+
+    Deliberately does NOT catch `AnalysisError`: an op core that already knows the
+    request-level answer (a missing crosswalk file, a rejected aggregate) raises that
+    directly, including its own `status_code`, and re-wrapping it here would flatten a 404
+    into a 400.
+    """
+    try:
+        yield
+    except (ExpressionError, FoldError) as exc:
+        raise AnalysisError(str(exc)) from exc
 
 
 class BaseAnalysis:
@@ -269,13 +305,14 @@ class BaseAnalysis:
         # which used to just check `options.where is not None` and is now wrong to,
         # since `where` may hold only a value conjunct (a mask, not a row filter).
         self._where_has_dimension_conjunct = False
-        # Set by `planner._compile_single_input_chain`'s vector fast path to
+        # Set by `planner._compile_single_input_chain`'s fast path to
         # `ops.compile_ops(pipeline)`'s
         # `list[Op]` -- never by this constructor itself, and never by anything on the
         # flat (non-pipeline) request surface. `None` (the default here) means "no op IR
-        # was attached", the signal `VectorGridAnalysis.apply_params`'s override reads to
-        # decide between the interpreter (`apply_steps`) and this class's own fixed
-        # five-stage flow -- see that override's docstring.
+        # was attached", the signal both `apply_params` overrides (`VectorGridAnalysis`'
+        # and `RasterGridAnalysis`') read to decide between their own interpreter
+        # (`apply_steps`) and this class's fixed five-stage flow -- see those overrides'
+        # docstrings.
         self._pipeline_ops = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
@@ -457,13 +494,12 @@ class BaseAnalysis:
 
         A thin caller over `apply_dimension_filter`/`apply_value_filter`: the logic
         itself now lives in
-        those two re-entrant, `self`-free functions so `vector.VectorGridAnalysis.
-        apply_steps` (the ops interpreter) can invoke the identical Polars behavior once
-        per `FilterOp`, in declared order, instead of once for the whole combined `where`
-        string here. This method's OWN behavior is unchanged by that split -- it still
-        runs once, against `self.options.where` as a whole, for every non-interpreter
-        request (every flat request, and any pipeline the vector fast path doesn't
-        select).
+        those two re-entrant, `self`-free functions so the long-shape op lowering
+        (`vector.apply_long_op`, called by both interpreters) can invoke the identical
+        Polars behavior once per `FilterOp`, in declared order, instead of once for the
+        whole combined `where` string here. This method's OWN behavior is unchanged by that
+        split -- it still runs once, against `self.options.where` as a whole, for every
+        non-interpreter request, which now means every FLAT (non-pipeline) request.
         """
         if self.options.where:
             try:

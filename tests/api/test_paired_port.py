@@ -1,12 +1,13 @@
-"""Tests for `_write_paired_notebook_raster`'s port onto `scan_paired` +
-`collect_batches` (see `cpra/mp/data/analysis/paired.py`'s module docstring for the
-port's motivation and scope).
+"""Tests for `_write_paired_notebook_raster`'s construction from the general
+`pivot_vector_to_band_wide` + `scan_rasters` pair (see `cpra/mp/data/analysis/paired.py`'s
+module docstring for the motivation and scope).
 
 Two things this file exists to prove, neither covered elsewhere:
 
-* The ported write path actually EXECUTES `scan_paired` -- not merely that its output
-  happens to look right, which a bug that silently fell back to some other code path
-  could also produce (`TestPortUsesScanPaired`).
+* The write path actually EXECUTES both of those operations, and the bespoke paired source
+  it replaced is gone rather than merely bypassed -- not merely that its output happens to
+  look right, which a bug that silently fell back to some other code path could also
+  produce (`TestWritePathUsesTheGeneralOps`).
 * The ported path's actual pixel output is IDENTICAL, byte-for-byte, to the pre-port
   hand-rolled collapse (`_accumulate_paired_window`/`_collapse_paired_window_wide`, both
   retained unmodified in `paired.py` specifically to serve as this differential test's
@@ -50,7 +51,7 @@ from tests.factories import write_raster_crosswalk
 # byte-for-byte (this is the one combination `tests/factories.py` has no ready-made
 # builder for and the spec's own exit-criterion example uses) -- reproduced here rather
 # than imported, see the module docstring.
-FINE_KWARGS = dict(
+RASTER_INPUT_KWARGS = dict(
     variable="ffibs_coverage_ratio",
     grid="veg_grid_cell_v001",
     time_unit="annual",
@@ -60,7 +61,7 @@ FINE_KWARGS = dict(
     model="icm_v2023.0.0",
 )
 
-COARSE_KWARGS = dict(
+VECTOR_INPUT_KWARGS = dict(
     variable="sal",
     grid="hydro_compartment_v001",
     time_unit="annual",
@@ -82,9 +83,9 @@ def _pipeline_query(aggregate):
         group_step["of"] = "calendar_year"
     return {
         "inputs": {
-            "marsh": {k: FINE_KWARGS[k] for k in ("variable", "grid", "time_unit", "model_group_id", "scenario_id", "ffibs_type")},
+            "marsh": {k: RASTER_INPUT_KWARGS[k] for k in ("variable", "grid", "time_unit", "model_group_id", "scenario_id", "ffibs_type")},
             "salinity": {
-                k: COARSE_KWARGS[k]
+                k: VECTOR_INPUT_KWARGS[k]
                 for k in ("variable", "grid", "time_unit", "model_group_id", "scenario_id", "aggregate_type")
             },
         },
@@ -100,17 +101,17 @@ def _pipeline_query(aggregate):
 
 @pytest.fixture
 def paired_port_data(base_path, crosswalk_path, monkeypatch):
-    """Real fine (raster)/coarse (vector) datasets with five equal row bands, each
+    """Real raster-grid/vector-grid datasets with five equal row bands, each
     isolating one thing that matters to at least one aggregate -- `sal` (zone 1) is a
     uniform 6.0 in both years (always satisfies the query's `sal > 5.5`), so every
-    band's outcome below is driven purely by `marsh`/fine-nodata/pairing, mirroring
+    band's outcome below is driven purely by `marsh`/raster-nodata/pairing, mirroring
     `test_pipeline_exec.py`'s `accumulator_edge_case_data`/`count_edge_case_data`
     fixtures (reproduced here, not imported -- see the module docstring):
 
     * rows [0, h/5): `marsh` is 0.3 in both years -- never satisfies `marsh > 0.5`, in
       the pairing crosswalk's domain, zero contributing bands.
-    * rows [h/5, 2h/5): `marsh` is `write_cog`'s own fine-nodata sentinel (-9999) in
-      both years -- in-domain, zero contributing bands via fine nodata rather than a
+    * rows [h/5, 2h/5): `marsh` is `write_cog`'s own raster-nodata sentinel (-9999) in
+      both years -- in-domain, zero contributing bands via raster nodata rather than a
       failed `where`.
     * rows [2h/5, 3h/5): `marsh` satisfies `where` in 2030 only (0.7 vs 0.2) -- exactly
       one contributing band.
@@ -138,19 +139,19 @@ def paired_port_data(base_path, crosswalk_path, monkeypatch):
     marsh_2040[4 * fifth :, :] = 0.6
 
     for year, data in ((2030, marsh_2030), (2040, marsh_2040)):
-        write_cog(data.astype("float32"), base_path=base_path, calendar_year=year, **FINE_KWARGS)
+        write_cog(data.astype("float32"), base_path=base_path, calendar_year=year, **RASTER_INPUT_KWARGS)
 
     years = (2030, 2040)
     df = pl.DataFrame(
         {
-            "variable": pl.Series([COARSE_KWARGS["variable"]] * len(years), dtype=pl.String),
-            "grid": pl.Series([COARSE_KWARGS["grid"]] * len(years), dtype=pl.String),
-            "time_unit": pl.Series([COARSE_KWARGS["time_unit"]] * len(years), dtype=pl.String),
-            "model_group_id": pl.Series([COARSE_KWARGS["model_group_id"]] * len(years), dtype=pl.Int32),
-            "scenario_id": pl.Series([COARSE_KWARGS["scenario_id"]] * len(years), dtype=pl.Int32),
-            "aggregate_type": pl.Series([COARSE_KWARGS["aggregate_type"]] * len(years), dtype=pl.String),
+            "variable": pl.Series([VECTOR_INPUT_KWARGS["variable"]] * len(years), dtype=pl.String),
+            "grid": pl.Series([VECTOR_INPUT_KWARGS["grid"]] * len(years), dtype=pl.String),
+            "time_unit": pl.Series([VECTOR_INPUT_KWARGS["time_unit"]] * len(years), dtype=pl.String),
+            "model_group_id": pl.Series([VECTOR_INPUT_KWARGS["model_group_id"]] * len(years), dtype=pl.Int32),
+            "scenario_id": pl.Series([VECTOR_INPUT_KWARGS["scenario_id"]] * len(years), dtype=pl.Int32),
+            "aggregate_type": pl.Series([VECTOR_INPUT_KWARGS["aggregate_type"]] * len(years), dtype=pl.String),
             "calendar_year": pl.Series(list(years), dtype=pl.Int32),
-            "model": pl.Series([COARSE_KWARGS["model"]] * len(years), dtype=pl.String),
+            "model": pl.Series([VECTOR_INPUT_KWARGS["model"]] * len(years), dtype=pl.String),
             "1": pl.Series([6.0, 6.0], dtype=pl.Float32),
         }
     )
@@ -164,12 +165,12 @@ def paired_port_data(base_path, crosswalk_path, monkeypatch):
 
 
 def _reference_write_paired_raster(plan, out_path):
-    """A verbatim copy of `_write_paired_notebook_raster`'s pre-Phase-4-step-5 body:
-    the hand-rolled rasterio block-window loop dispatching directly onto
-    `_accumulate_paired_window`/`_collapse_paired_window_wide` (both retained,
-    unmodified, in `paired.py` for exactly this purpose), reading `fine_srcs`/
-    `pairing_src` itself rather than through `scan_paired`. This is the "old" side of
-    this file's differential test -- see the module docstring. Looks up
+    """A verbatim copy of the body `_write_paired_notebook_raster` had before it was
+    rebuilt onto the shared ops: the hand-rolled rasterio block-window loop dispatching
+    directly onto `_accumulate_paired_window`/`_collapse_paired_window_wide` (both
+    retained, unmodified, in `paired.py` for exactly this purpose), reading
+    `raster_srcs`/`pairing_src` itself rather than through a Polars source. This is the
+    "old" side of this file's differential test -- see the module docstring. Looks up
     `paired_module._STREAMING_AGGREGATES` (not a locally-bound copy) on every call so a
     test can monkeypatch it to force the wide-frame fallback, exactly as
     `test_pipeline_exec.py::TestPairedAnalysisCountConsistency.
@@ -185,7 +186,7 @@ def _reference_write_paired_raster(plan, out_path):
         blocks_per_batch = raster_blocks_per_batch(n_units, block_height, block_width, itemsize)
         window_list = list(_batched_windows(ref_src, blocks_per_batch))
 
-        fine_srcs = {path: stack.enter_context(rio.open(path)) for path in {p for p, _ in plan.band_sources}}
+        raster_srcs = {path: stack.enter_context(rio.open(path)) for path in {p for p, _ in plan.band_sources}}
         pairing_src = stack.enter_context(rio.open(str(plan.pairing_crosswalk_path)))
 
         profile.update(count=1, dtype=plan.out_dtype, nodata=plan.nodata_value, compress="deflate")
@@ -205,67 +206,124 @@ def _reference_write_paired_raster(plan, out_path):
                 pairing_valid = np.ones(pairing_ids.shape, dtype=bool)
 
             if streaming:
-                values = _accumulate_paired_window(plan, fine_srcs, window, pairing_ids, pairing_valid, shape)
+                values = _accumulate_paired_window(plan, raster_srcs, window, pairing_ids, pairing_valid, shape)
             else:
                 values = _collapse_paired_window_wide(
-                    plan, fine_srcs, window, pairing_ids, pairing_valid, shape, collapse_expr
+                    plan, raster_srcs, window, pairing_ids, pairing_valid, shape, collapse_expr
                 )
             dst.write(values.astype(plan.out_dtype), 1, window=window)
 
 
-class TestPortUsesScanPaired:
-    """Proves the ported write path actually drives `scan_paired`, not merely that its
-    output happens to be correct (which a bug that silently kept the old code path
-    alive alongside the new one could also produce).
+def _spy(monkeypatch, attr):
+    """Record every call to `paired_module.<attr>` while still running the real thing."""
+    calls = []
+    real = getattr(paired_module, attr)
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(paired_module, attr, spy)
+    return calls
+
+
+class TestWritePathUsesTheGeneralOps:
+    """Proves the write path actually drives the two general operations it is documented
+    to be built from -- `pivot_vector_to_band_wide` and `scan_rasters` -- not merely that
+    its output happens to be correct, which a bug that silently kept some other code path
+    alive alongside them could also produce.
     """
 
-    async def test_write_raster_calls_scan_paired(self, paired_port_data, monkeypatch, tmp_path):
+    async def test_write_raster_calls_pivot_and_scan_rasters(self, paired_port_data, monkeypatch, tmp_path):
         base_path, _fifth = paired_port_data
         pipeline = parse_pipeline(_pipeline_query("sum"))
         plan = compile_pipeline(pipeline, base_path=base_path)
 
-        calls = []
-        real_scan_paired = paired_module.scan_paired
-
-        def spy(*args, **kwargs):
-            calls.append((args, kwargs))
-            return real_scan_paired(*args, **kwargs)
-
-        monkeypatch.setattr(paired_module, "scan_paired", spy)
+        pivot_calls = _spy(monkeypatch, "pivot_vector_to_band_wide")
+        scan_calls = _spy(monkeypatch, "scan_rasters")
 
         out_path = tmp_path / "ported.tif"
         result = await plan.write_raster(str(out_path))
         assert result is True
-        assert len(calls) == 1, "the ported write path must call scan_paired exactly once per write"
+        assert len(pivot_calls) == 1, "the write path must pivot the vector frame exactly once per write"
+        assert len(scan_calls) == 1, "the write path must call scan_rasters exactly once per write"
+
+        # The scan is the GENERAL one, carrying the pairing crosswalk as an ordinary
+        # `GridCrosswalk` with the pivoted table attached -- not a paired-specific source.
+        (crosswalk,) = scan_calls[0][1]["crosswalks"]
+        assert crosswalk.name == paired_module.PAIRED_CROSSWALK_NAME
+        assert crosswalk.values is not None, "the pivoted table must reach the scan"
+        assert crosswalk.values.columns == [paired_module.PAIRED_CROSSWALK_NAME, *plan.paired_cols]
 
         grid = GRIDS["veg_grid_cell_v001"]
         with rio.open(out_path) as src:
             data = src.read(1)
         assert data.shape == (grid.height, grid.width)
 
-    async def test_get_tile_does_not_call_scan_paired(self, paired_port_data, monkeypatch):
-        """The tile path is explicitly NOT ported (blocked on `WarpedVRT` reprojection
-        -- see the module docstring and `_paired_notebook_tile`'s own) -- confirm it
-        stays that way: rendering a tile must never reach `scan_paired` either.
+    def test_no_bespoke_paired_source_survives(self):
+        """Complementary to the spy above: the old paired-specific source is GONE, not
+        merely bypassed. A module-level rename that left the old function importable would
+        let a stale caller keep working and silently diverge.
+        """
+        from cpra.mp.data.analysis import sources as sources_module
+
+        assert not hasattr(sources_module, "scan_paired")
+        assert not hasattr(sources_module, "PairedCrosswalk")
+        assert not hasattr(paired_module, "scan_paired")
+
+    async def test_count_reads_the_pairing_crosswalk_once_per_window(
+        self, paired_port_data, monkeypatch, tmp_path
+    ):
+        """`count` needs the pairing crosswalk TWICE conceptually -- once for each band's
+        paired value, once for `_count_zone_gate`'s in-domain test -- and the pre-unification
+        shape paid for both, opening the crosswalk a second time in the scan's separate
+        attach-only zone mode. Under one `GridCrosswalk` the zone column and the value
+        columns come out of the SAME read, so the file is opened exactly as many times as a
+        non-`count` write opens it.
+        """
+        base_path, _fifth = paired_port_data
+
+        opens = []
+        real_open = rio.open
+
+        def counting_open(path, *args, **kwargs):
+            opens.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(rio, "open", counting_open)
+
+        counts = {}
+        for aggregate in ("sum", "count"):
+            plan = compile_pipeline(parse_pipeline(_pipeline_query(aggregate)), base_path=base_path)
+            opens.clear()
+            assert await plan.write_raster(str(tmp_path / f"{aggregate}.tif")) is True
+            counts[aggregate] = sum(1 for p in opens if p.endswith("veg_grid_cell_v001__hydro_compartment_v001.tif"))
+
+        assert counts["sum"] > 0, "the pairing crosswalk must actually be read"
+        assert counts["count"] == counts["sum"], (
+            f"count opened the pairing crosswalk {counts['count']} times vs "
+            f"{counts['sum']} for sum -- the zone gate must reuse the crosswalk read the "
+            "value columns already did, not add one of its own"
+        )
+
+    async def test_get_tile_does_not_call_the_write_path_ops(self, paired_port_data, monkeypatch):
+        """The tile path is explicitly NOT built from these ops (blocked on `WarpedVRT`
+        reprojection -- see the module docstring and `_paired_notebook_tile`'s own) --
+        confirm it stays that way: rendering a tile must reach neither of them.
         """
         base_path, _fifth = paired_port_data
         pipeline = parse_pipeline(_pipeline_query("sum"))
         plan = compile_pipeline(pipeline, base_path=base_path)
 
-        calls = []
-        real_scan_paired = paired_module.scan_paired
-
-        def spy(*args, **kwargs):
-            calls.append((args, kwargs))
-            return real_scan_paired(*args, **kwargs)
-
-        monkeypatch.setattr(paired_module, "scan_paired", spy)
+        pivot_calls = _spy(monkeypatch, "pivot_vector_to_band_wide")
+        scan_calls = _spy(monkeypatch, "scan_rasters")
 
         # A tile over the grid's own bounds -- z=0 always covers the whole world, so it
         # always overlaps a real dataset regardless of grid location.
         image = await plan.get_tile(0, 0, 0, "png", tile_size=256)
         assert image is not None
-        assert calls == []
+        assert pivot_calls == []
+        assert scan_calls == []
 
 
 class TestPortMatchesReferenceImplementation:

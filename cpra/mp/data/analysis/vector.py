@@ -24,6 +24,7 @@ from cpra.mp.data.analysis.base import (
     apply_calculate_plans,
     apply_dimension_filter,
     apply_value_filter,
+    op_error_boundary,
 )
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
@@ -194,6 +195,56 @@ def apply_project(lf, from_grid, to_grid, aggregate, *, has_selective_filter):
     return joined.group_by(*dim_cols, pl.col("dst_id").alias("grid_cell")).agg(getattr(pl.col("value"), aggregate)())
 
 
+def apply_long_op(lf, op, *, rename_map, has_selective_filter):
+    """The LONG-shape lowering of one `filter`/`calculate`/`group` op: `lf` in, `lf` out,
+    with no instance state read or written.
+
+    `ops.LOWERING_TABLE` gives each op two rows -- one for a long frame (dimension columns,
+    `grid_cell`, `value`; one row per observation) and one for a band-wide frame (one row
+    per pixel, one column per band). This function is the long row for the three ops whose
+    lowering depends only on the SHAPE, never on which grid the shape came from, so both
+    interpreters can share one implementation instead of keeping two copies in step.
+    `project` is deliberately not handled here: it is the one op that CHANGES shape, so its
+    lowering differs per direction (see `apply_project` for vector-to-vector, and
+    `raster.RasterGridAnalysis.apply_steps` for the raster-to-vector pair), and each
+    interpreter applies its own.
+
+    Returns `(lf, has_dimension_conjunct)` -- the second value is the signal
+    `BaseAnalysis._has_selective_dimension_filter` needs from a `FilterOp` (see
+    `apply_dimension_filter`); it is `False` for the ops that cannot produce one.
+
+    Raises only `ExpressionError`/`FoldError`; callers translate at
+    `base.op_error_boundary`.
+
+    Filter semantics: a `FilterOp`'s value conjunct is always a ROW DROP here
+    (`apply_value_filter(..., mask=False)`), never `_apply_filter_params`'s conditional
+    mask-vs-drop (`_is_aggregating()`). `ops.LOWERING_TABLE` states the long-shape filter
+    lowering as a literal, unconditional "row filter" (see `ops.FilterOp`'s docstring), and
+    under TRUE declared-order execution a drop is the only semantically coherent choice: a
+    mask exists solely to compose with a downstream aggregate's own null-skipping behavior
+    when the filter and the aggregate are applied out of their declared order (the old
+    engine's Filter-always-before-Group/Transform flow) -- here the aggregate already runs
+    in its own declared position, so there is no "downstream" null left to skip around.
+    (The band-wide lowering is the opposite: a mask, never a drop, because that shape must
+    stay positionally aligned to the raster -- see `apply_value_filter_band_wide`.)
+    """
+    if isinstance(op, FilterOp):
+        rewritten = rewrite_named_columns(op.where, rename_map)
+        lf, value_where, has_dimension_conjunct = apply_dimension_filter(lf, rewritten)
+        return apply_value_filter(lf, value_where, mask=False), has_dimension_conjunct
+    if isinstance(op, CalculateOp):
+        expression = rewrite_named_columns(op.expression, rename_map)
+        where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
+        plans = compile_calculate_entries([(f"step.{op.step_no}", expression, where)])
+        return apply_calculate_plans(lf, plans), False
+    if isinstance(op, GroupOp):
+        return (
+            apply_group_by(lf, op.by, op.aggregate, of=op.of, has_selective_filter=has_selective_filter),
+            False,
+        )
+    raise ExpressionError(f"{op.op!r} has no long-shape lowering")  # pragma: no cover
+
+
 class VectorGridAnalysis(BaseAnalysis):
     async def _apply_grid_cell(self):
         """Apply the grid_cell filter to a vector-grid dataset.
@@ -361,17 +412,16 @@ class VectorGridAnalysis(BaseAnalysis):
 
     async def apply_params(self):
         """Dispatch to the ops interpreter (`apply_steps`) when `self._pipeline_ops` was
-        attached -- `planner._compile_single_input_chain`'s vector fast path, taken for a
-        pipeline whose INPUT is on a vector grid (see that function's trailing wiring for
-        exactly why input, not output, grid type decides this) -- else fall through to
-        `BaseAnalysis.apply_params`'s fixed five-stage flow unchanged. Every flat
-        (non-pipeline) request reaches this dataset with `self._pipeline_ops` still at its
-        `None` default (only `_compile_single_input_chain` ever sets it), so this override
-        changes nothing for the entire existing flat surface -- only a pipeline request
-        that both (a) has a single vector input and no `join` and (b) actually compiled
-        (passed every existing check in `_compile_single_input_chain`, the SUMMARIZING-
-        PROJECT ORDER GUARD included -- this override runs strictly after that function
-        returns) takes the new path.
+        attached -- `planner._compile_single_input_chain`'s fast path, which attaches it
+        unconditionally -- else fall through to `BaseAnalysis.apply_params`'s fixed
+        five-stage flow unchanged. Every flat (non-pipeline) request reaches this dataset
+        with `self._pipeline_ops` still at its `None` default (only
+        `_compile_single_input_chain` ever sets it), so this override changes nothing for
+        the entire existing flat surface -- only a pipeline request that both (a) has a
+        single vector input and no `join` and (b) actually compiled (passed every existing
+        check in `_compile_single_input_chain`, the SUMMARIZING-PROJECT ORDER GUARD
+        included -- this override runs strictly after that function returns) takes the new
+        path.
         """
         if self._pipeline_ops is not None:
             await self.apply_steps(self._pipeline_ops)
@@ -427,6 +477,18 @@ class VectorGridAnalysis(BaseAnalysis):
         lowercase letter or underscore, so `op.output[0].isdigit()` is `True` if and only
         if `output` is synthetic.
 
+        Every op other than `project` is lowered by the shared `apply_long_op` above (the
+        long row of `ops.LOWERING_TABLE` for `filter`/`calculate`/`group`), which
+        `raster.RasterGridAnalysis.apply_steps` calls with the identical arguments once its
+        own frame has reached the long shape -- one implementation of the long lowering
+        rather than two that have to be kept in agreement. `project` stays here because it
+        is the op that CHANGES shape, so its lowering differs per direction.
+
+        Errors: every lowering called below is a plain library function raising
+        `ExpressionError`/`FoldError`, translated into an `AnalysisError` exactly once by
+        `base.op_error_boundary` around the whole walk rather than by a `try/except` at each
+        call site -- see that context manager's docstring.
+
         `ordered_ops[0].input` is always the pipeline's own (single, since this method is
         only ever reached for a single-input, no-`join` chain) input name -- `compile_ops`
         resolves every implicit chain, and a chain's first step always names its input
@@ -453,16 +515,8 @@ class VectorGridAnalysis(BaseAnalysis):
         rather than re-deriving it from `ordered_ops`, since `Options.calculate` is already
         the exact signal that method's caller (`_apply_transform_params_impl`) checks.
 
-        Filter semantics: a `FilterOp`'s value conjunct is always a ROW DROP here
-        (`apply_value_filter(..., mask=False)`), never `_apply_filter_params`'s
-        conditional mask-vs-drop (`_is_aggregating()`). `ops.LOWERING_TABLE` states the
-        long-shape filter lowering as a literal, unconditional "row filter" (see
-        `ops.FilterOp`'s docstring), and under TRUE declared-order execution a drop is the
-        only semantically coherent choice: a mask exists solely to compose with a
-        downstream aggregate's own null-skipping behavior when the filter and the
-        aggregate are applied out of their declared order (the old engine's Filter-always-
-        before-Group/Transform flow) -- here the aggregate already runs in its own
-        declared position, so there is no "downstream" null left to skip around.
+        Filter semantics (a value conjunct is a row DROP, never a mask): see
+        `apply_long_op`'s docstring, which now owns that lowering.
         """
         if self.options.grid_cell:
             await self._apply_grid_cell()
@@ -473,13 +527,13 @@ class VectorGridAnalysis(BaseAnalysis):
         value_names.update(op.output for op in ordered_ops if not op.output[0].isdigit())
         rename_map = {name: "value" for name in value_names}
 
-        for op in ordered_ops:
-            if isinstance(op, ProjectOp):
-                if op.to == current_grid:
-                    continue
-                if op.aggregate == "count_by_value":
-                    self._reject_calculate_with_count_by_value()
-                try:
+        with op_error_boundary():
+            for op in ordered_ops:
+                if isinstance(op, ProjectOp):
+                    if op.to == current_grid:
+                        continue
+                    if op.aggregate == "count_by_value":
+                        self._reject_calculate_with_count_by_value()
                     lf = apply_project(
                         lf,
                         current_grid,
@@ -487,40 +541,17 @@ class VectorGridAnalysis(BaseAnalysis):
                         op.aggregate,
                         has_selective_filter=self._has_selective_dimension_filter(),
                     )
-                except (ExpressionError, FoldError) as exc:
-                    self._error(str(exc))
-                current_grid = op.to
-            elif isinstance(op, FilterOp):
-                rewritten = rewrite_named_columns(op.where, rename_map)
-                try:
-                    lf, value_where, has_dimension_conjunct = apply_dimension_filter(lf, rewritten)
-                    lf = apply_value_filter(lf, value_where, mask=False)
-                except ExpressionError as exc:
-                    self._error(str(exc))
-                self._where_has_dimension_conjunct = (
-                    self._where_has_dimension_conjunct or has_dimension_conjunct
-                )
-            elif isinstance(op, CalculateOp):
-                expression = rewrite_named_columns(op.expression, rename_map)
-                where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
-                try:
-                    plans = compile_calculate_entries([(f"step.{op.step_no}", expression, where)])
-                    lf = apply_calculate_plans(lf, plans)
-                except ExpressionError as exc:
-                    self._error(str(exc))
-            elif isinstance(op, GroupOp):
-                try:
-                    lf = apply_group_by(
+                    current_grid = op.to
+                else:
+                    lf, has_dimension_conjunct = apply_long_op(
                         lf,
-                        op.by,
-                        op.aggregate,
-                        of=op.of,
+                        op,
+                        rename_map=rename_map,
                         has_selective_filter=self._has_selective_dimension_filter(),
                     )
-                except FoldError as exc:
-                    self._error(str(exc))
-            else:  # pragma: no cover -- a `JoinOp` never reaches a single-input chain
-                self._error(f"unsupported op in the vector interpreter: {op.op!r}")
+                    self._where_has_dimension_conjunct = (
+                        self._where_has_dimension_conjunct or has_dimension_conjunct
+                    )
 
         if current_grid != self.grid.name:
             lf = lf.with_columns(geographic_unit=pl.lit(current_grid))

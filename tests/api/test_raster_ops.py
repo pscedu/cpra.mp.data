@@ -31,7 +31,10 @@ from cpra.mp.data.analysis.raster import (
     band_group_row_idxs,
     band_metadata_filter,
     band_metadata_group,
+    band_metadata_scan_filter,
     band_ops_for_pixel_read,
+    crosswalk_value_column_names,
+    pivot_vector_to_band_wide,
 )
 from cpra.mp.data.analysis.sources import scan_rasters
 from cpra.mp.data.grids import GRIDS
@@ -186,6 +189,48 @@ class TestBandMetadataFilter:
         assert out["calendar_year"].to_list() == [2040, 2050]
         # The surviving bands are renamed by their NEW positions, not their old ones.
         assert band_column_names(out) == ["b0", "b1"]
+
+
+class TestBandMetadataScanFilter:
+    """The other metadata-side lowering of a dimension filter: push the predicate into the
+    SCAN, so the rejected bands are never opened. Legal only over a chain prefix where
+    every preceding op preserves band identity; `band_metadata_filter` above takes over
+    once a `group` has run."""
+
+    def test_narrows_the_scan_lazily(self):
+        lf = pl.LazyFrame({"calendar_year": [2030, 2040, 2050], "band": [1, 2, 3]})
+
+        out = band_metadata_scan_filter(lf, "calendar_year >= 2040")
+
+        assert out.collect()["band"].to_list() == [2, 3]
+
+    def test_a_malformed_predicate_raises_expression_error(self):
+        """Polars' SQL parser rejects a syntactically invalid `where` at `lf.sql()` itself,
+        eagerly. That is retyped here so `RasterGridAnalysis.apply_steps`' single error
+        boundary sees the same exception every other lowering raises, rather than a raw
+        `SQLInterfaceError` escaping as a 500."""
+        lf = pl.LazyFrame({"calendar_year": [2030]})
+
+        with pytest.raises(ExpressionError):
+            band_metadata_scan_filter(lf, "calendar_year >=")
+
+    def test_an_unknown_column_is_deferred_to_collect_not_caught_here(self):
+        """The limit of the retyping above, asserted rather than left to be discovered.
+        `lf.sql()` only PLANS, so name resolution happens at `collect()` -- which is where
+        `BaseAnalysis.materialize`'s own `ColumnNotFoundError` handler already turns it into
+        the same 400, so nothing is lost by this function not catching it.
+
+        That path is genuinely used: `planner._validate_filter_where` deliberately does not
+        namespace-restrict a dimension conjunct at plan time (matching the flat `where=`
+        surface, which has no such check either), so an unknown dimension name in a `filter`
+        step is EXPECTED to reach execution rather than being rejected at compile time.
+        """
+        lf = pl.LazyFrame({"calendar_year": [2030]})
+
+        out = band_metadata_scan_filter(lf, "not_a_real_column == 1")  # no raise here
+
+        with pytest.raises(pl.exceptions.ColumnNotFoundError):
+            out.collect()
 
 
 class TestApplyDimensionFilterBandWide:
@@ -416,6 +461,152 @@ class TestApplyGroupBandWide:
             apply_group_band_wide(lf, metadata, [], "count")
 
 
+class TestBandWideRowAlignment:
+    """The property that makes `ops.Shape.band_wide` a sufficient type on its own.
+
+    A band-wide frame is not merely "one column per band" -- it is POSITIONALLY ALIGNED to
+    the raster: row `i` is pixel `i` of the window being read, in the dense row-major order
+    `sources.scan_rasters` produces. `RasterGridAnalysis`'s pixel-read path depends on that
+    directly (`_take_window_rows` raises on a short read rather than silently writing a
+    misaligned band), and so does every window-at-a-time write.
+
+    Rather than carry alignment as a second type field beside the shape -- a field whose
+    only reachable value would be `True`, since every band-wide frame in this codebase
+    originates from that same dense scan -- it is an invariant of the lowerings themselves:
+    no band-wide lowering may add, drop, or reorder rows. This class is what pins that.
+    Each lowering gets the same 5-row frame and must hand back 5 rows in the same order,
+    including the cases where the op's LONG-shape counterpart would legitimately drop rows.
+
+    There is exactly one exception, and it gets its own test below rather than being left
+    implicit: a dimension filter that matches no band at all takes the height to 0 with the
+    columns, because a Polars frame with no columns has no height to keep.
+    """
+
+    @staticmethod
+    def _frame():
+        # Five pixels, three bands. Row order is the alignment being asserted, so the
+        # values are distinct per row and deliberately not sorted.
+        return (
+            pl.LazyFrame(
+                {
+                    "b0": [50, 10, 40, 20, 30],
+                    "b1": [1, 2, 3, 4, 5],
+                    "b2": [9, 8, 7, 6, 5],
+                }
+            ),
+            pl.DataFrame({"calendar_year": [2030, 2040, 2050]}),
+        )
+
+    def test_a_value_filter_masks_rather_than_dropping(self):
+        """The load-bearing case. In the long shape the same conjunct is a row drop; here
+        a drop would shift every later pixel up by one and misplace the whole raster."""
+        lf, metadata = self._frame()
+
+        out, out_metadata = apply_value_filter_band_wide(lf, metadata, "value > 25")
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert collected["b0"].to_list() == [50, None, 40, None, 30]
+        assert out_metadata.height == 3
+
+    def test_a_value_filter_that_nothing_passes_still_returns_every_row(self):
+        """The degenerate end of the same rule: an all-reject predicate yields five
+        all-null pixels, not an empty frame. `apply_band_ops` refills those with the
+        band's nodata at the very end; a zero-row frame would have nothing to refill."""
+        lf, metadata = self._frame()
+
+        out, _ = apply_value_filter_band_wide(lf, metadata, "value > 1000")
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert collected["b0"].to_list() == [None] * 5
+
+    def test_a_dimension_filter_drops_columns_not_rows(self):
+        lf, metadata = self._frame()
+
+        out, out_metadata = apply_dimension_filter_band_wide(lf, metadata, "calendar_year == 2040")
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert band_column_names(out_metadata) == ["b0"]
+        assert collected["b0"].to_list() == [1, 2, 3, 4, 5]  # the old b1, renumbered
+
+    def test_the_one_exception_is_a_filter_that_leaves_no_bands_at_all(self):
+        """The single documented exception to the invariant above, asserted so it stays
+        documented. A dimension filter matching NO band leaves a frame with no band
+        columns, and Polars cannot represent "zero columns, five rows" -- the height goes
+        to 0 with them. (`BAND_INDEX` solves exactly this for the METADATA frame, where
+        `band_metadata_group` needs a zero-dimension group to still count rows; there is no
+        equivalent placeholder on the pixel side, and adding one would change the column
+        dictionary every downstream read is written against.)
+
+        It is harmless because it is unreachable as a write: a band-wide chain narrows its
+        band metadata by the same predicate, and `_apply_transform_params_impl` rejects an
+        empty band frame with a 404 before any pixel is read. So there is no surviving
+        raster whose rows could be misaligned -- there is no raster at all.
+        """
+        lf, metadata = self._frame()
+
+        out, out_metadata = apply_dimension_filter_band_wide(lf, metadata, "calendar_year == 1999")
+
+        assert out_metadata.height == 0, "the 404-triggering condition"
+        assert out.collect().height == 0
+
+    def test_an_extra_column_holds_the_rows_even_with_no_bands(self):
+        """And where a non-band column IS present -- the `extra_columns` metadata contract,
+        e.g. a `grid_cell` attached by a zoned scan -- even the zero-band case keeps its
+        rows, because the frame still has a column to have a height."""
+        lf, metadata = self._frame()
+        lf = lf.with_columns(pl.Series("grid_cell", [1, 1, 2, 2, 2]))
+
+        out, _ = apply_dimension_filter_band_wide(
+            lf, metadata, "calendar_year == 1999", extra_columns=["grid_cell"]
+        )
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert collected.columns == ["grid_cell"]
+
+    def test_a_calculate_rewrites_in_place(self):
+        lf, metadata = self._frame()
+        plans = compile_calculate_entries([("calculate.1", "value * 2", None)])
+
+        out, _ = apply_calculate_band_wide(lf, metadata, plans)
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert collected["b0"].to_list() == [100, 20, 80, 40, 60]
+
+    def test_a_group_reduces_across_columns_not_down_rows(self):
+        """The op whose long-shape counterpart collapses rows outright. Horizontally it
+        collapses the band AXIS instead: three columns become one, five pixels stay five.
+        """
+        lf, metadata = self._frame()
+
+        out, out_metadata = apply_group_band_wide(lf, metadata, [], "sum")
+
+        collected = out.collect()
+        assert collected.height == 5
+        assert band_column_names(out_metadata) == ["b0"]
+        assert collected["b0"].to_list() == [60, 20, 50, 30, 40]
+
+    def test_a_full_replay_of_all_four_preserves_the_rows(self):
+        """End to end through `apply_band_ops`, the path an actual pixel read takes: the
+        invariant has to hold for the composition, not just op by op."""
+        lf, metadata = self._frame()
+        band_ops = [
+            ("calculate", compile_calculate_entries([("calculate.1", "value + 1", None)])),
+            ("filter_value", "value > 25"),
+            ("filter", "calendar_year <= 2040"),
+            ("group", [], "mean"),
+        ]
+
+        out, out_metadata = apply_band_ops(lf.collect(), metadata, band_ops)
+
+        assert out.height == 5
+        assert band_column_names(out_metadata) == ["b0"]
+
+
 class TestBandOpsForPixelRead:
     """How a standalone value `where` -- one with no declared position, because the flat
     request surface has no positions -- is folded into a recorded op list."""
@@ -567,3 +758,121 @@ class TestApplyBandOps:
 # `_summarize_zone_stats_plugin` (the zoned/filtered `scan_rasters` mode) instead. The
 # zone-attach-only scan mode it would have consumed is untouched and still exercised
 # directly by `TestScanRastersAttachWithoutFilter`, above.
+
+
+class TestPivotVectorToBandWide:
+    """`pivot_vector_to_band_wide`: the long-to-band-wide half of projecting a vector
+    dataset onto a raster grid.
+
+    The vector dataset arrives LONG -- one row per `(zone, calendar step)`. Turning that
+    into one column per band is the whole job, and the reason it cannot be skipped is a
+    CORRECTNESS one, not a speed one: keyed by zone alone, a long frame has no single value
+    to give a pixel, and any spelling that tried would either multiply a frame's height by
+    the number of steps (a join) or pick an arbitrary step (a lookup). A raster-output write
+    reads rows back BY POSITION, so a height change there is a wrong answer, not a slow one.
+    """
+
+    @staticmethod
+    def _metadata(n):
+        return pl.DataFrame({BAND_INDEX: pl.Series(range(n), dtype=pl.UInt32)})
+
+    @staticmethod
+    def _long(rows):
+        return pl.DataFrame(
+            rows,
+            schema={"grid_cell": pl.Int32, "_step": pl.Int32, "value": pl.Float64},
+            orient="row",
+        )
+
+    def test_one_row_per_zone_not_one_per_zone_and_step(self):
+        """THE gate this function exists for. Two zones x two calendar steps is FOUR long
+        rows; the pivoted table must be TWO rows (one per zone) with two value columns, not
+        four. Consumed positionally by a raster scan, a four-row table would pair each
+        pixel with whichever step happened to be found first -- and expressed as a join
+        instead, it would double the pixel count outright.
+        """
+        metadata_df = self._metadata(2)
+        long = self._long([(1, 2020, 10.0), (1, 2050, 11.0), (2, 2020, 20.0), (2, 2050, 21.0)])
+        assert long.height == 4
+
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020, 2050], step_column="_step", prefix="v")
+
+        assert wide.height == 2, "one row per ZONE -- not one per (zone, step)"
+        assert wide.columns == ["v", "v0", "v1"]
+        assert wide.sort("v").rows() == [(1, 10.0, 11.0), (2, 20.0, 21.0)]
+
+    def test_column_names_match_the_shared_invariant(self):
+        metadata_df = self._metadata(3)
+        long = self._long([(1, 2020, 1.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020, 2030, 2040], step_column="_step", prefix="p")
+        assert wide.columns[1:] == crosswalk_value_column_names(metadata_df, "p")
+
+    def test_two_bands_sharing_a_step_both_get_that_steps_value(self):
+        """Band identity, not step identity, decides how many value columns there are: two
+        bands at the same calendar step each get their own column holding the same value,
+        so the scan can look each band up by its own row position with no step bookkeeping.
+        """
+        metadata_df = self._metadata(3)
+        long = self._long([(1, 2020, 5.0), (1, 2050, 9.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020, 2020, 2050], step_column="_step", prefix="v")
+        assert wide.rows() == [(1, 5.0, 5.0, 9.0)]
+
+    def test_step_with_no_vector_rows_yields_an_all_null_column(self):
+        """A band whose calendar step is absent from the vector frame entirely gets a
+        column of nulls -- the same outcome as a zone with no row, so a downstream miss
+        needs no branch of its own."""
+        metadata_df = self._metadata(2)
+        long = self._long([(1, 2020, 5.0), (2, 2020, 6.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020, 2050], step_column="_step", prefix="v")
+        assert wide.sort("v").rows() == [(1, 5.0, None), (2, 6.0, None)]
+
+    def test_zone_missing_from_one_step_is_null_in_that_column_alone(self):
+        metadata_df = self._metadata(2)
+        long = self._long([(1, 2020, 5.0), (1, 2050, 7.0), (2, 2020, 6.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020, 2050], step_column="_step", prefix="v")
+        assert wide.sort("v").rows() == [(1, 5.0, 7.0), (2, 6.0, None)]
+
+    def test_duplicate_zone_ids_resolve_last_wins(self):
+        """Matched to NumPy's own rule for the fancy-index assignment in
+        `sources._dense_lookup_array`, which consumes this table -- deliberately identical
+        so the two cannot disagree about a duplicate."""
+        metadata_df = self._metadata(1)
+        long = self._long([(1, 2020, 5.0), (1, 2020, 99.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020], step_column="_step", prefix="v")
+        assert wide.rows() == [(1, 99.0)]
+
+    def test_rows_with_a_null_zone_or_an_unused_step_are_dropped(self):
+        """Neither can ever be selected by any band, and `_dense_lookup_array` cannot index
+        a null -- so they are dropped here rather than carried as unreachable rows."""
+        metadata_df = self._metadata(1)
+        long = self._long([(1, 2020, 5.0), (None, 2020, 6.0), (2, 1999, 7.0)])
+        wide = pivot_vector_to_band_wide(metadata_df, long, [2020], step_column="_step", prefix="v")
+        assert wide.rows() == [(1, 5.0)]
+
+    def test_empty_vector_frame_yields_an_empty_but_correctly_shaped_table(self):
+        """`DataFrame.pivot` on an empty frame produces no value columns at all, so the
+        shape has to be built directly. An empty table is a complete answer -- every lookup
+        misses and every band's column is null."""
+        metadata_df = self._metadata(2)
+        wide = pivot_vector_to_band_wide(metadata_df, self._long([]), [2020, 2050], step_column="_step", prefix="v")
+        assert wide.height == 0
+        assert wide.columns == ["v", "v0", "v1"]
+        assert wide.schema["v0"] == pl.Float64
+
+    def test_step_count_must_match_band_count(self):
+        metadata_df = self._metadata(2)
+        long = self._long([(1, 2020, 5.0)])
+        with pytest.raises(ValueError, match="one step per band column"):
+            pivot_vector_to_band_wide(metadata_df, long, [2020], step_column="_step", prefix="v")
+
+    def test_non_numeric_step_values_work(self):
+        """Steps are numbered internally and the pivot keys on that numbering, never on the
+        step value itself -- so a string or date step needs no round-trippable spelling."""
+        metadata_df = self._metadata(2)
+        long = pl.DataFrame(
+            [("a", 1, 5.0), ("b", 1, 7.0)],
+            schema={"_step": pl.String, "grid_cell": pl.Int32, "value": pl.Float64},
+            orient="row",
+        )
+        wide = pivot_vector_to_band_wide(metadata_df, long, ["a", "b"], step_column="_step", prefix="v")
+        assert wide.rows() == [(1, 5.0, 7.0)]
