@@ -40,7 +40,7 @@ class CalculateEntry(BaseModel):
     """One generic calculate entry: `expression` (arithmetic over the placeholder column
     `value` and numeric literals -- see `expressions.parse_calculate_expression` for the
     exact grammar/whitelist) applied to the rows/bands/pixels matching `where` (the same
-    dimension-and/or-value-condition grammar as the Filter stage's `where`; omitted means
+    dimension-and/or-value-condition grammar as `where` itself; omitted means
     the expression applies to everything). Rows not matching `where` pass through the
     calculate stage unchanged -- calculate never drops or masks data.
 

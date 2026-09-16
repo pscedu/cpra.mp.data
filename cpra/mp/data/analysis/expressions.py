@@ -254,7 +254,7 @@ def classify_where(where_str):
     into a DIMENSION conjunct (references no `value` column) or a VALUE conjunct
     (references `value`, and nothing outside `value` plus literals/whitelisted
     functions) -- the seam this module's two existing surfaces are unified across: a
-    dimension conjunct is recombined by the caller (`Dataset._apply_filter_params`) into
+    dimension conjunct is recombined by the caller (`base.apply_dimension_filter`) into
     the existing unrestricted `lf.sql()` path, and a value conjunct is recombined and
     handed to `parse_value_expr`'s restricted whitelist, exactly the two mechanisms that
     already existed for `where` and the former `value_where` respectively.
@@ -427,7 +427,7 @@ def compile_calculate_entries(entries):
     order -- into `CalculatePlan`s, before any file is opened.
 
     `expression` goes through `parse_calculate_expression` against the `value`-only
-    namespace. `where` (optional) gets exactly the Filter stage's treatment: split and
+    namespace. `where` (optional) gets exactly a `FilterOp`'s treatment: split and
     classified by `classify_where` (so a conjunct mixing a dimension column and `value`,
     an aggregate call, or a subquery is rejected with the same messages `where` gives),
     dimension conjuncts recombined into `dimension_where` -- their column NAMES are
@@ -537,7 +537,7 @@ def count_by_value_frame(lf, group_cols, value_col, max_distinct):
     with the count of rows sharing that value -- a fundamentally different OUTPUT SHAPE
     from every other aggregate in this package (which collapse a group to one row), so it
     is never reachable through `group_aggregate` (see the `AggregateFunction.count_by_value`
-    comment in types.py and `Dataset._apply_group_params`'s rejection of it there); only
+    comment in types.py and `stages.reject_count_by_value_group`'s rejection); only
     `summarize_aggregate` can express it.
 
     `group_by(*group_cols, value_col).agg(pl.len())` is itself an ordinary streaming-closed

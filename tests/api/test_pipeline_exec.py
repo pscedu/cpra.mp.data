@@ -51,7 +51,6 @@ import rasterio as rio
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
-from cpra.mp.data.analysis import paired as paired_module
 from cpra.mp.data.analysis.base import AnalysisError, BaseAnalysis
 from cpra.mp.data.analysis.paired import (
     PairedAnalysis,
@@ -146,10 +145,9 @@ def _write_ffibs_raster(base_path, values_by_year):
 
 def _write_ffibs_raster_arrays(base_path, arrays_by_year):
     """Like `_write_ffibs_raster`, but each year gets an arbitrary per-pixel array
-    rather than a uniform fill -- needed to exercise `_write_paired_notebook_raster`'s
-    streaming accumulator (`_accumulate_paired_window`) across pixels that differ in how
-    many bands validate the `where` clause (all of them, some of them, or none), which a
-    uniform raster can never produce.
+    rather than a uniform fill -- needed to exercise the paired per-pixel band collapse
+    across pixels that differ in how many bands validate the `where` clause (all of them,
+    some of them, or none), which a uniform raster can never produce.
     """
     for year, data in arrays_by_year.items():
         write_cog(
@@ -408,7 +406,7 @@ class TestCompileChecks:
         # G8: a conjunct that does not reference the `value` placeholder is a DIMENSION
         # conjunct under `classify_where`'s split (see that function's docstring), and a
         # dimension conjunct is no longer namespace-restricted here -- exactly like the
-        # flat `where=` parameter (`Dataset._apply_filter_params`), which has no
+        # flat `where=` parameter (`base.apply_dimension_filter`), which has no
         # compile-time namespace check for a dimension conjunct either; an unrecognized
         # name fails at EXECUTION (`lf.sql()`), not at pipeline-compile time. This
         # replaces a prior version of this test (`test_validate_filter_where_rejects_
@@ -486,10 +484,10 @@ class TestCompileChecks:
         pipeline = parse_pipeline(NOTEBOOK_QUERY)
         _validate_output_columns(pipeline)
 
-    def test_validate_paired_group_aggregate_accepts_every_streaming_aggregate(self):
+    def test_validate_paired_group_aggregate_accepts_every_supported_aggregate(self):
         # Duck-typed, not a real `GroupStep` -- this check only ever reads `.aggregate`,
         # and (per its own docstring) is unreachable through `parse_pipeline` today since
-        # `_STREAMING_AGGREGATES` is exactly `fold.DECOMPOSABLE_AGGREGATES`; exercised
+        # `_SUPPORTED_PAIRED_AGGREGATES` is exactly `fold.DECOMPOSABLE_AGGREGATES`; exercised
         # directly here the way `TestCompileChecks`'s other members are.
         for aggregate in ("min", "max", "sum", "mean", "count"):
             _validate_paired_group_aggregate(types.SimpleNamespace(aggregate=aggregate))
@@ -1343,7 +1341,7 @@ class TestPostProjectOrderingGuard:
         # DECLARED (sum, then keep value > 2): {100: 3.0, 200: 7.0} (1.0+2.0=3.0 kept
         # since 3.0>2; 3.0+4.0=7.0 kept since 7.0>2).
         # ACTUAL, absent this rejection: the
-        # flat machinery runs its whole Filter stage before the project's Transform-stage
+        # flat machinery applies the whole `where` before the project's summarize
         # crosswalk join, so the filter drops ecoregion 1 and 2's SOURCE rows (1.0 and
         # 2.0 both fail `> 2`) before the join ever sees them -- compartment 100 then
         # sums an EMPTY set to 0.0: {100: 0.0, 200: 7.0}. No error raised; a
@@ -1357,8 +1355,8 @@ class TestPostProjectOrderingGuard:
     def test_rejects_calculate_after_summarizing_project(self, base_path, crosswalk_path):
         # DECLARED (sum, then square): {100: 9.0, 200: 49.0} (3.0**2, 7.0**2).
         # ACTUAL, absent this rejection:
-        # `calculate` lowers onto the Calculate stage (2nd), before the project's
-        # Transform-stage (4th) aggregation, so each SOURCE cell is squared before
+        # `calculate` lowers to a `CalculateOp`, emitted before the project's summarize
+        # aggregation runs, so each SOURCE cell is squared before
         # summing: {100: 1.0+4.0=5.0, 200: 9.0+16.0=25.0}. Silently wrong, no error.
         self._write_fixture(base_path, crosswalk_path)
         pipeline = self._pipeline([{"op": "calculate", "expression": "eco * eco"}])
@@ -1368,8 +1366,8 @@ class TestPostProjectOrderingGuard:
     def test_rejects_group_after_summarizing_project(self, base_path, crosswalk_path):
         # This test doesn't work out numbers the way the filter/calculate tests above
         # do, but the mechanism pinning this rejection is identical: `group` lowers onto
-        # `Options.group_by`/`group_aggregate`, applied in the Group stage (3rd),
-        # still strictly before the project's Transform-stage (4th) aggregation
+        # `Options.group_by`/`group_aggregate`, lowered to a `GroupOp`,
+        # still strictly before the project's own summarize aggregation
         # regardless of declared order, so it would collapse pre-project source rows
         # rather than the declared post-project zones.
         self._write_fixture(base_path, crosswalk_path)
@@ -1407,8 +1405,8 @@ class TestPostProjectOrderingGuard:
         spelling `test_rejects_value_filter_after_summarizing_project`'s rejection
         message above points authors at ("move a value condition before the project
         step"). Declared and executed order now agree by construction: the filter
-        lowers onto `Options.where`, applied in the Filter stage (stage 1), strictly
-        before the project's Transform-stage aggregation (stage 4) -- there is no
+        lowers onto `Options.where`, which the lowering emits first, strictly
+        before the project's own summarize aggregation -- there is no
         reordering left to verify against, unlike the post-project case above.
 
         DECLARED (and, since the filter genuinely runs first, ACTUAL): keep eco >= 2
@@ -1499,7 +1497,7 @@ class TestPostProjectOrderingGuard:
         the already-projected `grid_cell` column, in declared order, same as any other
         filter (see `TestVectorInterpreterDifferential
         .test_summarizing_project_then_grid_cell_filter`, which already pins the single-
-        filter case frame-for-frame against the legacy engine).
+        filter case frame-for-frame against the `Options` lowering of the same request).
 
         DECLARED (and, since the interpreter runs ops in declared order, ACTUAL):
         `project(sum)` gives {100: 3.0 (1.0+2.0), 200: 7.0 (3.0+4.0)} -- the FIRST filter
@@ -1571,9 +1569,9 @@ class TestPostProjectOrderingGuard:
         `AND` (the old `" AND ".join(f"({w})" for w in rewritten_filters)`). A single
         filter step mixing a dimension conjunct and a value conjunct in one `where` --
         e.g. `"model_group_id = 500 AND eco > 2"` -- used to combine to
-        `Options.where = "(model_group_id = 500 AND eco > 2)"`. At EXECUTION time,
-        `BaseAnalysis._apply_filter_params` re-runs `classify_where` on that combined
-        string (base.py:329), and the outer paren keeps the inner `AND` at paren-depth 1
+        `Options.where = "(model_group_id = 500 AND eco > 2)"`. At EXECUTION time, the
+        `FilterOp` lowering re-runs `classify_where` on that combined string
+        (`base.apply_dimension_filter`), and the outer paren keeps the inner `AND` at paren-depth 1
         the whole way through, so `split_top_level_and` returns ONE conjunct spanning
         both columns -- which `classify_where` then rejects outright ("references both a
         dimension column and `value`"), a false rejection of a perfectly legal filter at
@@ -1612,8 +1610,8 @@ class TestLeadingCalculateInputExtension:
     Unlike the vector-only ordering relaxations above (`TestPostProjectOrderingGuard`'s
     grid_cell/group/calculate/filter classes), this extension is NOT vector-only:
     `Options.calculate` is a list that already accumulates leading and post-project
-    entries side by side without collision, and the Calculate stage (stage 2) runs
-    unconditionally before the Transform stage (stage 4) a `project`'s aggregation lowers
+    entries side by side without collision, and every `CalculateOp` runs
+    unconditionally before the summarize a `project`'s aggregation lowers
     onto, for BOTH engines -- see `CalculateStep`'s docstring in pipeline.py. `GroupStep`
     deliberately did NOT gain the same field (see `GroupStep`'s docstring for why --
     `Options.group_by`/`group_aggregate` are scalar, not list, buckets); this class also
@@ -1712,7 +1710,7 @@ class TestLeadingCalculateInputExtension:
         self, base_path, client, monkeypatch
     ):
         """The raster side of the same claim: a leading `calculate` lowers onto
-        `Options.calculate` (Calculate stage 2) exactly as a post-project one does --
+        `Options.calculate` exactly as a post-project one does --
         this is the point of `CalculateStep`'s docstring's claim that the extension is
         NOT vector-only, unlike the vector-only ordering relaxations above. Mirrors
         `TestCalculateStepEndToEnd.test_weighted_band_sum_on_the_data_route`'s weighted
@@ -1786,12 +1784,12 @@ class TestLeadingCalculateInputExtension:
         self, base_path
     ):
         """The `grid_cell`-bearing raster selection was the last shape for which
-        `leading_after_calculate` could still reject: it stayed on the fixed-stage engine,
-        whose `Options.where` is applied in the Filter stage strictly before the Calculate
-        stage regardless of whether the calculate/filter pair was declared leading or
-        post-project. It now reaches `RasterGridAnalysis.apply_steps` like every other
-        shape, so the LEADING arrangement executes in declared order too -- asserted on the
-        answer, not just on compiling.
+        `leading_after_calculate` could still reject: it was the last one whose
+        `Options.where` was applied strictly before its `Options.calculate`, regardless of
+        whether the calculate/filter pair was declared leading or post-project. It now
+        reaches `RasterGridAnalysis.apply_steps` like every other shape, so the LEADING
+        arrangement executes in declared order too -- asserted on the answer, not just on
+        compiling.
 
         Sampled bands 2030 -> 80 and 2040 -> 200. DECLARED: `calculate(vct * 0.6)` (-> 48,
         120) then `filter(vct > 60)`, which keeps only the 2040 sample. The fixed
@@ -1827,15 +1825,15 @@ class TestLeadingCalculateInputExtension:
 class TestVectorInterpreterLoadBearing:
     """The ops interpreter
     (`vector.VectorGridAnalysis.apply_steps`) is wired into `_compile_single_input_chain`
-    unconditionally (planner.py's "OPS-INTERPRETER FAST PATH" comment) -- `dataset
+    unconditionally (planner.py's "OPS-INTERPRETER WIRING" comment) -- `dataset
     ._pipeline_ops` is attached to `ops.compile_ops(pipeline)` for every shape that function
-    compiles, and `apply_params` dispatches to `apply_steps` instead of `BaseAnalysis`'s
-    fixed five-stage flow whenever that attribute is set. A wiring mistake here would be
+    compiles, and `apply_params` hands exactly that list to `apply_steps` whenever the
+    attribute is set, rather than lowering `Options` itself. A wiring mistake here would be
     invisible to every OTHER test in this module: they all assert on `materialize()`'s
-    output, which stays correct even if `_pipeline_ops` were attached but silently ignored,
-    as long as the old flow still runs underneath. This class exists solely to rule that
-    out -- confirming the attribute really is set and `apply_steps` really is the method
-    invoked. `TestRasterInterpreterLoadBearing` does the same for the raster shapes.
+    output, which can stay correct even if `_pipeline_ops` were attached but silently
+    ignored, since the `Options` lowering of the same request often produces the same
+    answer. This class exists solely to rule that out -- confirming the attribute really is
+    set and that it is what `apply_steps` receives. `TestRasterInterpreterLoadBearing` does the same for the raster shapes.
     """
 
     async def test_interpreter_actually_runs_for_a_vector_pipeline(self, base_path, monkeypatch):
@@ -1852,7 +1850,7 @@ class TestVectorInterpreterLoadBearing:
             }
         )
         compiled = compile_pipeline(pipeline, base_path=base_path)
-        # The fast path's own precondition: an ops list was actually attached, not left
+        # The wiring's own precondition: an ops list was actually attached, not left
         # `None` (which would silently fall through to the old engine regardless of the
         # spy below -- this assertion is what makes the spy's count below meaningful).
         assert compiled._pipeline_ops is not None
@@ -1866,9 +1864,9 @@ class TestVectorInterpreterLoadBearing:
 
         monkeypatch.setattr(VectorGridAnalysis, "apply_steps", _spy)
         await compiled.apply_params()
-        # Proves `apply_steps` is load-bearing, not dead code that happens to pass because
-        # the legacy flow still runs underneath: it was invoked exactly once, with exactly
-        # the ops list the planner attached.
+        # Proves the DECLARED ops are load-bearing, not silently ignored in favor of a
+        # lowering of the same `Options`: `apply_steps` was invoked exactly once, with
+        # exactly the ops list the planner attached.
         assert calls == [compiled._pipeline_ops]
         df = compiled.materialize()
         assert sorted(df["grid_cell"].to_list()) == [1, 2, 3, 4]
@@ -1876,13 +1874,12 @@ class TestVectorInterpreterLoadBearing:
     async def test_raster_input_summarizing_onto_a_vector_grid_now_takes_the_raster_interpreter(
         self, base_path, crosswalk_path
     ):
-        """The fast
-        path admits a raster input too, so a chain that starts on a raster grid and
-        summarizes onto a vector one takes `RasterGridAnalysis.apply_steps`, not the
-        fixed-stage flow. See `TestRasterInterpreterLoadBearing` below for the raster
+        """The wiring admits a raster input too, so a chain that starts on a raster grid
+        and summarizes onto a vector one takes `RasterGridAnalysis.apply_steps` with its own
+        declared ops. See `TestRasterInterpreterLoadBearing` below for the raster
         counterpart of this whole class (a load-bearing spy per shape), and
-        `TestRasterInterpreterDifferential` for the comparisons against the legacy
-        `Options`-lowering engine.
+        `TestRasterInterpreterDifferential` for the comparisons against the same request
+        lowered from `Options`.
         """
         grid = GRIDS[RASTER_KWARGS["grid"]]
         zones = np.zeros((grid.height, grid.width), dtype="int32")
@@ -1902,28 +1899,26 @@ class TestVectorInterpreterLoadBearing:
 
 
 class TestVectorInterpreterDifferential:
-    """The ops interpreter
-    (`vector.VectorGridAnalysis.apply_steps`) must compute EXACTLY what the legacy
-    `Options`-lowering engine (`BaseAnalysis.apply_params`'s fixed five-stage flow)
-    computes, for every declared-order shape `planner._compile_single_input_chain`
-    accepts -- the fast path added to planner.py is only supposed to change WHICH ENGINE
-    runs a pipeline, never WHAT a pipeline computes.
+    """A pipeline's DECLARED op list and the op list `stages.lower_flat_options` derives
+    from the same request's flat `Options` must compute EXACTLY the same answer, for every
+    shape `planner._compile_single_input_chain` accepts -- the planner's `_pipeline_ops`
+    wiring is only supposed to change WHERE the op list comes from, never WHAT the request
+    computes.
 
     Each test compiles the SAME pipeline via TWO independent `compile_pipeline` calls
-    against the same fixture data: one left exactly as the planner produces it (takes the
-    interpreter, since its input grid is vector), and one with `_pipeline_ops` forced back
-    to `None` immediately after compiling -- which reroutes `VectorGridAnalysis
-    .apply_params` onto `super().apply_params()`, i.e. the untouched legacy flow, per its
-    own `if self._pipeline_ops is not None: ... else: await super().apply_params()`
-    dispatch. Both are then materialized and compared with `_assert_frames_equal
-    _ignoring_order` -- sorted by every column, so row order (which the two engines are
-    not obliged to agree on) doesn't cause a false mismatch.
+    against the same fixture data: one left exactly as the planner produces it (walks
+    `compile_ops(pipeline)`), and one with `_pipeline_ops` forced back to `None`
+    immediately after compiling -- which makes `BaseAnalysis.apply_params` lower the
+    `Options` fields the planner populated alongside the ops, and walk THAT list instead.
+    Both are then materialized and compared with `_assert_frames_equal_ignoring_order` --
+    sorted by every column, so row order (which the two lowerings are not obliged to agree
+    on) doesn't cause a false mismatch.
 
     Pipelines below are deliberately drawn from shapes already pinned END-TO-END elsewhere
     in this module (`TestPostProjectOrderingGuard`, `TestProjectAggregateCountByValue
     EndToEnd`) -- reusing a shape whose CORRECT answer is independently known lets each
-    test check two things at once: the interpreter's answer is right, AND it agrees with
-    the legacy engine.
+    test check two things at once: the declared-ops answer is right, AND it agrees with
+    the flat lowering of the same request.
     """
 
     @staticmethod
@@ -2031,9 +2026,10 @@ class TestVectorInterpreterDifferential:
     async def test_summarizing_project_then_grid_cell_filter(self, base_path, crosswalk_path):
         """The post-project `grid_cell` filter shape
         (`_extract_post_project_grid_cell_filter`/`Options.summarize_grid_cell`) lowers
-        onto a genuinely different MECHANISM in each engine: the legacy engine narrows the
-        crosswalk join itself (`Options.summarize_grid_cell`, applied inside the Transform
-        stage), while the interpreter runs an ordinary post-`ProjectOp` `FilterOp` on the
+        onto a genuinely different MECHANISM on each side: the flat lowering narrows the
+        crosswalk join itself (`Options.summarize_grid_cell`, read by
+        `_apply_transform_params_impl`), while the declared ops run an ordinary
+        post-`ProjectOp` `FilterOp` on the
         already-projected `grid_cell` column, dropped in plain declared order like any
         other filter (`apply_steps`'s `FilterOp` branch). This is the one shape in this
         class where the two engines' internals genuinely diverge rather than merely their
@@ -2108,14 +2104,14 @@ class TestRasterInterpreterLoadBearing:
     """The raster counterpart
     of `TestVectorInterpreterLoadBearing` -- proves `RasterGridAnalysis.apply_steps` is
     really invoked for every raster shape, rather than dead code that happens to pass
-    because the old fixed-stage flow still runs underneath.
+    because a lowering of the same `Options` happens to agree.
 
     Two tests, one per SHAPE that `apply_steps` dispatches on, since they are different
     lowerings and a spy on one proves nothing about the other: a plain raster selection
     walks `Shape.band_wide`, and a selection carrying an `InputSelection.grid_cell` walks
-    `Shape.long` (the grid_cell sample is itself `project` raster-to-vector). There is no
-    longer any raster shape left on the fixed-stage flow, which is the complementary half
-    each test asserts in its own terms.
+    `Shape.long` (the grid_cell sample is itself `project` raster-to-vector). Each test
+    also asserts the DECLARED op list is what `apply_steps` received, which is the
+    complementary half.
     """
 
     async def test_interpreter_actually_runs_for_a_raster_pipeline(self, base_path, monkeypatch):
@@ -2131,7 +2127,7 @@ class TestRasterInterpreterLoadBearing:
             }
         )
         compiled = compile_pipeline(pipeline, base_path=base_path)
-        # The fast path's own precondition, mirroring the vector test above.
+        # The wiring's own precondition, mirroring the vector test above.
         assert compiled._pipeline_ops is not None
 
         calls = []
@@ -2145,7 +2141,7 @@ class TestRasterInterpreterLoadBearing:
         await compiled.apply_params()
         assert calls == [compiled._pipeline_ops]
         # Both raw bands (2030, 2040) collapsed into a single group (`group by=[]`) --
-        # proof `_collapse_group` really ran from inside `apply_steps`, not skipped.
+        # proof `collapse_band_group` really ran from inside `apply_steps`, not skipped.
         assert compiled._band_ops == [("group", [], "max")]
         assert compiled._band_frame().height == 2
         assert compiled.materialize().height == 1
@@ -2198,19 +2194,73 @@ class TestRasterInterpreterLoadBearing:
         assert compiled._raw_band_frame is None
         assert compiled.materialize()["value"].to_list() == [40]
 
+    async def test_band_wide_ops_run_from_the_free_function(self, base_path, tmp_path, monkeypatch):
+        """The band-wide row of the lowering table lives in `raster.apply_band_wide_op`, a
+        free function taking every piece of state it needs as an argument -- not in a
+        branch of `apply_steps` reading `self`. Spied here because the answer alone would
+        not distinguish the two: `apply_steps` could have kept its own inlined copy and
+        still produced 80.
+
+        The spy is a pass-through, so what the free function RETURNS is what the rest of
+        the run uses -- the one-band `_band_frame()` (the dimension filter's pushdown), the
+        `_band_ops` recording (the deferred calculate, then the group), and the written
+        pixels (2040's fill of 40, doubled, collapsed by `max`) are all downstream of its
+        return values rather than of anything `apply_steps` computed itself.
+
+        `_flush_calculate_plans_to_band_ops` was the method that used to do the
+        band_ops-recording half; `flush_calculate_plans` replaced it, and the old name
+        being gone is the complementary half of this proof.
+        """
+        assert not hasattr(RasterGridAnalysis, "_flush_calculate_plans_to_band_ops")
+
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "filter", "where": "calendar_year = 2040"},
+                    {"op": "calculate", "expression": "vct * 2"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        compiled = compile_pipeline(pipeline, base_path=base_path)
+        assert compiled._pipeline_ops is not None
+
+        seen = []
+        original = raster_module.apply_band_wide_op
+
+        def _spy(op, metadata_lf, **kwargs):
+            seen.append(op.op)
+            return original(op, metadata_lf, **kwargs)
+
+        monkeypatch.setattr(raster_module, "apply_band_wide_op", _spy)
+        await compiled.apply_params()
+
+        assert seen == ["filter", "calculate", "group"], "declared order, identity project aside"
+        assert compiled._band_frame().height == 1, "the dimension filter narrowed the scan"
+        assert [entry[0] for entry in compiled._band_ops] == ["calculate", "group"]
+        assert compiled._band_ops[-1] == ("group", [], "max")
+
+        out_path = tmp_path / "out.tif"
+        await compiled.write_raster(out_path)
+        with rio.open(out_path) as src:
+            data = src.read()
+        assert (data == 80).all(), "2040's fill of 40, doubled, then collapsed by `max`"
+
 
 class TestRasterInterpreterDifferential:
     """The raster counterpart
-    of `TestVectorInterpreterDifferential` -- the ops interpreter
-    (`RasterGridAnalysis.apply_steps`) must compute EXACTLY what the legacy
-    `Options`-lowering engine (`BaseAnalysis.apply_params`'s fixed five-stage flow)
-    computes, for every declared-order raster shape `planner._compile_single_input_chain`
-    now admits to the fast path.
+    of `TestVectorInterpreterDifferential` -- a raster request's DECLARED op list and the
+    list `stages.lower_flat_options` derives from the same request's flat `Options` must
+    compute EXACTLY the same answer, for every raster shape
+    `planner._compile_single_input_chain` admits.
 
     Same two-compile pattern as the vector class: one `compile_pipeline` call left as the
-    planner produces it (takes the interpreter), one with `_pipeline_ops` forced back to
-    `None` (reroutes `RasterGridAnalysis.apply_params` onto `super().apply_params()`, the
-    untouched legacy flow).
+    planner produces it (walks the declared ops), one with `_pipeline_ops` forced back to
+    `None` (makes `apply_params` lower `Options` into its own list instead).
     """
 
     async def _run_both_engines(self, pipeline, base_path):
@@ -2262,7 +2312,7 @@ class TestRasterInterpreterDifferential:
         """The pushdown prefix: a dimension filter declared before any `group` is applied
         straight to the band-metadata frame `_band_frame` hands the pixel reader, so the
         dropped year's file is never opened at all -- and the answer still matches the
-        legacy engine's own `Options.where` dimension conjunct, band for band.
+        flat lowering's own `Options.where` dimension conjunct, band for band.
         """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         pipeline = parse_pipeline(
@@ -2324,8 +2374,8 @@ class TestRasterInterpreterDifferential:
         """Exercises the pushdown gate (`_write_raster_windowed`'s
         `apply_value_filter_band_wide` call): a pre-project value `FilterOp` stashes onto
         `self._value_where` (this method's PRE-project branch) rather than dropping rows,
-        and `_summarize_zone_stats_plugin` masks each band's raw pixel value against it
-        before the `mean` collapse -- exactly like the legacy engine's own `where=`
+        and `summarize_zone_stats` masks each band's raw pixel value against it
+        before the `mean` collapse -- exactly like the flat lowering's own `where=`
         value-conjunct handling for a summarizing raster request.
         """
         grid = GRIDS[RASTER_KWARGS["grid"]]
@@ -2357,9 +2407,9 @@ class TestRasterInterpreterDifferential:
     ):
         # Same fixture/pipeline as
         # TestPostProjectGridCellFilterEndToEnd.test_grid_cell_eq_lowers_onto_summarize_grid_cell,
-        # but exercised as a differential: the legacy engine narrows the crosswalk's
+        # but exercised as a differential: the flat lowering narrows the crosswalk's
         # `zone_ids` via `Options.summarize_grid_cell` (`_extract_post_project_grid_cell_
-        # filter`), while the interpreter runs an ordinary post-`ProjectOp` `FilterOp` on
+        # filter`), while the declared ops run an ordinary post-`ProjectOp` `FilterOp` on
         # the already-projected `grid_cell` column instead (see `apply_steps`' own
         # docstring for why those are numerically equivalent) -- so this is the one shape
         # where the two engines' internal MECHANISM genuinely diverges, worth checking
@@ -2393,10 +2443,9 @@ class TestRasterInterpreterDifferential:
     async def test_standalone_value_filter_without_summarize_still_rejected_by_both_engines(
         self, base_path
     ):
-        """The trickiest ordering edge case this step had to get right: `project`
-        (identity) declared BEFORE a value `FilterOp`, with no `summarize_by`/
-        `summarize_aggregate` anywhere. The legacy engine's stage 4
-        (`_apply_transform_params_impl`) always runs LAST, regardless of declared order,
+        """The trickiest ordering edge case here: `project` (identity) declared BEFORE a
+        value `FilterOp`, with no `summarize_by`/`summarize_aggregate` anywhere.
+        `_apply_transform_params_impl` always runs LAST, regardless of declared order,
         and is what raises this rejection -- so `apply_steps` must reproduce that exact
         "runs last" positioning for an identity project (see its own docstring), rather
         than resolving the project immediately at its declared (earlier) position and
@@ -2432,11 +2481,11 @@ class TestRasterInterpreterDeclaredOrder:
     """The four raster shapes `planner._compile_single_input_chain` used to reject
     outright, one test each, every answer hand-computed.
 
-    A differential against the legacy engine (`TestRasterInterpreterDifferential`, above)
-    is the wrong instrument here: these are precisely the shapes the legacy engine gets
-    WRONG -- it would agree with the interpreter only if the interpreter reproduced the
-    bug. So each test states the declared meaning, states the number the old fixed stage
-    order would have produced instead, and asserts the declared one.
+    A differential against the `Options` lowering (`TestRasterInterpreterDifferential`,
+    above) is the wrong instrument here: these are precisely the shapes an orderless flat
+    request cannot express, so the two lowerings are SUPPOSED to disagree. Each test
+    instead states the declared meaning, states the number the flat lowering's fixed
+    filter/calculate/group order would have produced, and asserts the declared one.
     """
 
     @staticmethod
@@ -2560,7 +2609,7 @@ class TestRasterInterpreterDeclaredOrder:
         """DECLARED: `calculate(vct * 0.6)` then `filter(vct > 60)` -- the predicate tests
         the POST-calculate value, so the surviving pixels are those whose RAW value exceeds
         100, and the zone mean is taken over `raw * 0.6` for exactly those. The fixed
-        Filter-before-Calculate stage order this rejection existed for would instead test
+        fixed filter-before-calculate order this rejection existed for would instead test
         the raw value against 60, keeping every pixel above 60 -- a strictly larger, and
         differently-valued, population.
 
@@ -2602,8 +2651,8 @@ class TestRasterInterpreterDeclaredOrder:
 class TestRasterGridCellDeclaredOrder:
     """`TestRasterInterpreterDeclaredOrder`'s four shapes again, this time for a raster
     selection that also carries a `grid_cell` -- the shape that was the last one still
-    executing `BaseAnalysis.apply_params`'s fixed five-stage flow, and for which all four
-    were therefore still rejected at compile time.
+    executing an `Options`-derived fixed order, and for which all four were therefore still
+    rejected at compile time.
 
     It is a genuinely different execution path, not a rerun: `_apply_grid_cell` samples the
     selected bands at the requested coordinates and rebuilds `self.lf` as a LONG frame
@@ -2612,9 +2661,10 @@ class TestRasterGridCellDeclaredOrder:
     rather than a written raster.
 
     Every answer is hand-computed, for the same reason the band-wide class gives: these are
-    exactly the shapes the fixed-stage flow gets wrong, so a differential against it would
-    only prove the bug was reproduced. Each test states the declared meaning, states the
-    number the fixed stage order would have produced, and asserts the declared one.
+    exactly the shapes an orderless flat request cannot express, so a differential against
+    its lowering is not the right instrument. Each test states the declared meaning, states
+    the number the flat lowering's fixed filter/calculate/group order would have produced,
+    and asserts the declared one.
     """
 
     @staticmethod
@@ -2755,7 +2805,7 @@ class TestRasterGridCellDeclaredOrder:
 
     async def test_group_aggregate_count_stays_rejected(self, base_path):
         """`group_aggregate='count'` is refused for a raster selection regardless of which
-        shape the frame is in. `RasterGridAnalysis._collapse_group` makes that call for the
+        shape the frame is in. `raster.collapse_band_group` makes that call for the
         band-wide shape; `apply_steps` repeats it for the long shape rather than letting
         the answer to "is this legal on a raster" depend on whether a `grid_cell` happens
         to be set.
@@ -2773,10 +2823,11 @@ class TestRasterGridCellDeclaredOrder:
             await compiled.apply_params()
 
     async def test_a_plain_grid_cell_sample_is_unchanged_by_the_engine_switch(self, base_path):
-        """The differential half: for a shape the fixed-stage flow got RIGHT (a plain
-        sample with no ordering hazard at all), the interpreter must produce the identical
-        frame. Run through the interpreter, then again with `_pipeline_ops` cleared to
-        force `BaseAnalysis.apply_params`, and compare the materialized frames.
+        """The differential half: for a shape the flat `Options` lowering expresses
+        faithfully (a plain sample with no ordering hazard at all), the two op lists must
+        produce the identical frame. Run through the declared ops, then again with
+        `_pipeline_ops` cleared so `apply_params` lowers `Options` instead, and compare the
+        materialized frames.
         """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: 2 if y == 2030 else 4)
         steps = [
@@ -2837,7 +2888,7 @@ class TestRasterBandOpsReplayIsLoadBearing:
 
         assert seen, "the write path never reached apply_band_ops"
         kinds = [entry[0] for entry in seen[0]]
-        assert kinds == ["group", "filter", "calculate"], "declared order, not a fixed stage order"
+        assert kinds == ["group", "filter", "calculate"], "declared order, not a fixed order"
         assert seen[0][0][:2] == ("group", ["calendar_year"])
         assert seen[0][1] == ("filter", "(calendar_year = 2040)")
         with rio.open(out_path) as src:
@@ -3078,8 +3129,7 @@ class TestNotebookQueryEndToEnd:
 
 
 class TestPairedAccumulatorEdgeCases:
-    """`_write_paired_notebook_raster`'s streaming per-band accumulator
-    (`_accumulate_paired_window`) covers `sum`/`mean`/`min`/`max` -- `min` is already
+    """The paired per-pixel band collapse over `sum`/`mean`/`min`/`max` -- `min` is already
     exercised byte-exact by `TestNotebookQueryEndToEnd` (via a uniform raster), but a
     uniform raster can't distinguish "zero bands validate" from "all bands validate" or
     exercise `mean`'s divide-by-VALID-count (not divide-by-total-bands) semantics. These
@@ -3139,15 +3189,16 @@ class TestPairedAccumulatorEdgeCases:
 
 class TestPairedAnalysisCountConsistency:
     """`count` on a paired pipeline: the zero-vs-nodata fixture scenarios (`count_edge_
-    case_data`'s five row bands), the accumulator/wide-fallback consistency proof, and
-    an ASGI tile test. `count` is in `_STREAMING_AGGREGATES` now, so a real request takes
-    the streaming accumulator (`_accumulate_paired_window`), but `_collapse_paired_
-    window_wide` -- also what `_paired_notebook_tile` always uses, and what any FUTURE
-    non-streaming aggregate would fall back to -- must produce IDENTICAL output; the
-    second test below proves that directly by forcing the wide path via the same
-    `_STREAMING_AGGREGATES`-monkeypatch trick `/tmp/pipetest/scale_probe.py` uses to
-    measure it at scale, applied here to prove the two paths AGREE rather than just to
-    measure one of them.
+    case_data`'s five row bands) and an ASGI tile test.
+
+    This class used to also hold `test_accumulator_matches_wide_fallback`, which forced the
+    write path onto a second collapse implementation by monkeypatching a module-level
+    frozenset and checked the two agreed. Both the dispatch and the second implementation are
+    gone from production (one scan-and-collapse serves every aggregate), so the patch had
+    become a no-op and the test compared a request against itself. The agreement it was after
+    is pinned where the other implementation now lives, against the real ASGI output:
+    `tests/api/test_paired_port.py::TestPortMatchesReferenceImplementation`, parametrized over
+    both of the old implementation's branches, `count` included.
     """
 
     def _pipeline(self):
@@ -3169,22 +3220,6 @@ class TestPairedAnalysisCountConsistency:
         assert (data[2 * fifth : 3 * fifth, :] == 0).all()  # pairing-miss-all-bands -> real 0
         assert (data[3 * fifth : 4 * fifth, :] == -1).all()  # outside-zone -> nodata
         assert (data[4 * fifth :, :] == 1).all()  # mixed pixel -> exact count
-
-    def test_accumulator_matches_wide_fallback(self, client, count_edge_case_data, monkeypatch):
-        # The streaming path (default -- `count` is in `_STREAMING_AGGREGATES`).
-        streaming_response = client.post("/v1/analysis.tif", json=self._pipeline())
-        assert streaming_response.status_code == 200, streaming_response.text
-        with rio.open(io.BytesIO(streaming_response.content)) as src:
-            streaming_data = src.read(1)
-
-        # Force every aggregate, `count` included, onto `_collapse_paired_window_wide`.
-        monkeypatch.setattr(paired_module, "_STREAMING_AGGREGATES", frozenset())
-        wide_response = client.post("/v1/analysis.tif", json=self._pipeline())
-        assert wide_response.status_code == 200, wide_response.text
-        with rio.open(io.BytesIO(wide_response.content)) as src:
-            wide_data = src.read(1)
-
-        assert np.array_equal(streaming_data, wide_data)
 
     def test_get_png_tile(self, client, count_edge_case_data):
         base_path, _fifth = count_edge_case_data
@@ -3606,14 +3641,15 @@ class TestPostProjectGridCellFilterRejections:
         execution time even though it is still the (single, last-write-wins) bucket used
         to narrow the initial crosswalk scan.
 
-        This is a HAND-COMPUTED correctness check, not a legacy-engine differential: the
-        OLD fixed-stage engine cannot compute the right answer for this shape at all --
+        This is a HAND-COMPUTED correctness check, not a differential against the flat
+        `Options` lowering: that lowering cannot express this shape at all --
         `_extract_post_project_grid_cell_filter` absorbs BOTH `grid_cell` filters into the
-        same single `Options.summarize_grid_cell` bucket (last-write-wins), so the legacy
-        engine would narrow the crosswalk scan to only the SECOND filter's zones ({2, 3})
-        and never intersect it with the first ({1, 2}) at all -- it would wrongly keep
+        same single `Options.summarize_grid_cell` bucket (last-write-wins), so a request
+        built from `Options` alone would narrow the crosswalk scan to only the SECOND
+        filter's zones ({2, 3}) and never intersect it with the first ({1, 2}) at all -- it
+        would wrongly keep
         zone 3. Only the interpreter's real sequential `FilterOp` application computes the
-        declared intersection correctly, so comparing against the legacy engine here would
+        declared intersection correctly, so comparing against the flat lowering here would
         be comparing against a wrong answer, not a matching one.
         """
         grid = GRIDS[RASTER_KWARGS["grid"]]

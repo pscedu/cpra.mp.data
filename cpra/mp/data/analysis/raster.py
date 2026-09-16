@@ -1,6 +1,6 @@
 """`RasterGridAnalysis`: the raster half of the former `api/dataset.py`'s `Dataset` class.
 
-See `analysis/base.py`'s module docstring for the staged `apply_params` flow and the hook
+See `analysis/base.py`'s module docstring for the `apply_params` flow and the hook
 contract every method here fills in; see `analysis/vector.py` for the vector half.
 """
 
@@ -20,15 +20,12 @@ import rasterio as rio
 from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
-from rasterio.enums import Resampling
 from rasterio.shutil import copy as rio_copy
-from rasterio.transform import from_bounds
-from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis import stages
-from cpra.mp.data.analysis.base import BaseAnalysis, op_error_boundary
+from cpra.mp.data.analysis.base import AnalysisError, BaseAnalysis, op_error_boundary
 from cpra.mp.data.analysis.expressions import (
     ExpressionError,
     classify_where,
@@ -37,7 +34,7 @@ from cpra.mp.data.analysis.expressions import (
     rewrite_named_columns,
 )
 from cpra.mp.data.analysis.geography import parse_coordinate_pairs, project_coordinates
-from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, Shape
+from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, Shape, calculate_label
 from cpra.mp.data.analysis.sources import (
     NUMPY_TO_POLARS,
     band_calculate_passes,
@@ -57,7 +54,9 @@ from cpra.mp.data.analysis.utils import (
     raster_blocks_per_batch,
     raster_copy_gdal_env,
     raster_gdal_env,
+    tile_source_window,
     unpack_values,
+    warp_window_to_tile,
 )
 # The LONG-shape lowering of `filter`/`calculate`/`group`, shared with the vector
 # interpreter rather than reimplemented here: a raster chain reaches that shape after a
@@ -89,10 +88,10 @@ OUTPUT_INTERLEAVE = "PIXEL"
 #
 # Re-entrant functions -- each takes its own arguments and returns new ones instead of
 # reading `self.lf`/`self.options` -- that `RasterGridAnalysis.apply_steps`'s interpreter
-# and its three pixel-read consumers (`_summarize_zone_stats_plugin`,
+# and its three pixel-read consumers (`summarize_zone_stats`,
 # `_collapse_tile_bands`, `_write_raster_windowed`) use to apply a request's
 # filter/calculate/group steps IN DECLARED ORDER against a real, per-op band-wide frame,
-# rather than the position a fixed five-stage engine would always run them at.
+# rather than at one position fixed by the engine.
 #
 # Every op here has the SAME signature: `(band_wide_lf, metadata_df) -> (band_wide_lf,
 # metadata_df)`. The band-wide frame is one row per pixel, one column per currently-live
@@ -117,7 +116,7 @@ OUTPUT_INTERLEAVE = "PIXEL"
 #   `apply_dimension_filter_band_wide`  column drop     metadata narrowed (rows dropped)
 #   `apply_group_band_wide`         horizontal reduce   metadata REPLACED (one row/group)
 #
-# That column is also the pushdown rule `RasterGridAnalysis.apply_steps` follows: a
+# That column is also the pushdown rule `apply_band_wide_op` follows: a
 # dimension filter may be applied to the band-metadata scan up front (narrowing what is
 # ever opened) only over a PREFIX of the chain in which every preceding op preserves band
 # identity. `filter` and `calculate` do; `group` does not, so the first `group` ends the
@@ -183,7 +182,7 @@ def band_metadata_filter(metadata_df, dimension_where):
     rows plus the per-row boolean that says which ones they were.
 
     Split out from `apply_dimension_filter_band_wide` (below) because
-    `RasterGridAnalysis.apply_steps` needs exactly this half on its own, with no band-wide
+    `apply_band_wide_op` needs exactly this half on its own, with no band-wide
     frame in sight: a dimension filter declared after a `group` has to narrow the running
     band metadata at its declared position, hours before any pixel is read. Sharing this
     function is what keeps that in-flight narrowing and the eventual pixel-read replay from
@@ -199,7 +198,7 @@ def band_metadata_scan_filter(lf, dimension_where):
 
     Legal only over the prefix of a chain in which every preceding op preserves band
     identity (`filter`/`calculate` do, `group` does not) -- see
-    `RasterGridAnalysis.apply_steps`' pushdown rule for the full argument. Once a `group`
+    `apply_band_wide_op`'s pushdown rule for the full argument. Once a `group`
     has run, `band_metadata_filter` above is the lowering instead.
 
     `lf.sql` rejects a SYNTACTICALLY malformed predicate eagerly, raising out of Polars'
@@ -246,11 +245,11 @@ def band_metadata_group(metadata_df, by):
     The new metadata frame is `BAND_INDEX` (see that constant for why it has to be there at
     all) hstacked with the `by` columns, taken from the FIRST input row of each group so
     the two stay aligned by construction rather than via a second, independently-ordered
-    `group_by`. Every dimension column NOT in `by` is dropped, mirroring
-    `VectorGridAnalysis._collapse_group`'s own drop: a dimension the caller collapsed
-    across has no single value left to report.
+    `group_by`. Every dimension column NOT in `by` is dropped, mirroring the long-shape
+    lowering's own drop (`vector.apply_group_by`): a dimension the caller collapsed across
+    has no single value left to report.
 
-    Shared by `apply_group_band_wide` and by `RasterGridAnalysis._collapse_group`, for the
+    Shared by `apply_group_band_wide` and by `collapse_band_group`, for the
     same reason `band_metadata_filter` is shared -- the metadata a group leaves behind must
     be identical whether it is being computed in flight or replayed at pixel-read time.
     """
@@ -380,9 +379,9 @@ def apply_group_band_wide(lf, metadata_df, by, aggregate, extra_columns=()):
     `count` entry, since "how many of these bands contributed to this pixel" has no natural
     per-pixel scalar meaning the way max/mean/min/sum do (see the `AggregateFunction.count`
     comment in types.py). Raised as an `ExpressionError` rather than left to surface as a
-    bare `KeyError` from inside the aggregate lookup. `RasterGridAnalysis._collapse_group`
-    rejects the same value independently and earlier, with the identical message, on every
-    live request path, so this is a second guard for a direct caller, not a new behavior.
+    bare `KeyError` from inside the aggregate lookup. `collapse_band_group` rejects the same
+    value independently and earlier, with the identical message, on every live request
+    path, so this is a second guard for a direct caller, not a new behavior.
     """
     if aggregate == "count":
         raise ExpressionError("group_aggregate 'count' is not supported for raster grids")
@@ -504,6 +503,45 @@ def pivot_vector_to_band_wide(
     )
 
 
+async def sample_bands_to_long(metadata_df, grid_cell):
+    """`project` raster-to-vector at arbitrary points: sample every band in `metadata_df`
+    at each "lng,lat" pair in `grid_cell` and return a LONG LazyFrame (dimension columns,
+    `grid_cell`, `value`) -- the other direction from `pivot_vector_to_band_wide` above,
+    and the reason a raster selection carrying a `grid_cell` walks the long lowering from
+    its first op onward (see `RasterGridAnalysis.apply_steps`).
+
+    `metadata_df` is the full per-band metadata table (`path`/`band` plus dimension
+    columns); no pixels have been read yet, so this is where the band-wide frame that
+    would otherwise be produced is bypassed entirely.
+    """
+    lngs, lats = parse_coordinate_pairs(unpack_values(grid_cell, "grid_cell"))
+
+    # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
+    # Rows sharing the same path (bands of the same multiband COG) are grouped so each
+    # file is opened and sampled once, requesting all of its needed bands together.
+    unique_paths, row_indices, bands = group_rows_by_path(metadata_df)
+    with ExitStack() as stack:
+        datasets = [stack.enter_context(rio.open(path)) for path in unique_paths]
+        projected_pairs = list(zip(*project_coordinates(lngs, lats, datasets[0].crs)))
+        group_samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
+        dtype = datasets[0].dtypes[0]
+
+    # Add the resulting values to the LazyFrame as one column per sampled coordinate,
+    # then unpivot into long format (grid_cell/value) to match the long-format contract
+    # used everywhere else in the API. Each grid_cell here is a "lng,lat" coordinate
+    # pair label rather than an integer grid ID, since these are arbitrary sample points.
+    columns = [np.empty(len(metadata_df), dtype=dtype) for _ in lngs]
+    for path_row_indices, path_samples in zip(row_indices, group_samples):
+        for column, values in zip(columns, path_samples):
+            column[path_row_indices] = values
+    column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
+    wide_df = metadata_df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band"))
+    index_cols = [col for col in wide_df.columns if col not in column_labels]
+    return wide_df.unpivot(
+        index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
+    ).lazy()
+
+
 def band_ops_for_pixel_read(band_ops, value_where):
     """`band_ops` as a pixel-read consumer should replay them, with a standalone value
     `where` folded in.
@@ -586,6 +624,441 @@ def apply_band_ops(lf, metadata_df, band_ops, *, extra_columns=(), dtype=None, n
     return lf, metadata_df
 
 
+# -- band-wide op units (plan time) ---------------------------------------------------
+#
+# `ops.LOWERING_TABLE`'s BAND-WIDE row for `filter`/`calculate`/`group`, as standalone
+# functions rather than as branches of an interpreter method -- the band-wide counterpart
+# of `vector.apply_long_op`, which is the long row of the same table. Neither reads or
+# writes an instance attribute; every piece of state either arrives as an argument or
+# leaves as a return value.
+#
+# The band-wide op's declared type is `(band-wide LF, metadata DF) -> (band-wide LF,
+# metadata DF)`, and the `apply_*_band_wide` family above is exactly that. These three
+# functions are the same ops at PLAN time, where no pixel has been read yet: the band-wide
+# LF does not exist, so the op's effect on it is RECORDED as a `band_ops` entry for
+# `apply_band_ops` to replay against the real frame later, while its effect on the METADATA
+# half is applied immediately (the metadata frame is tens to low hundreds of rows, and
+# every later op needs it to be correct). The recorded entry and the in-flight metadata
+# narrowing go through the same primitives -- `band_metadata_filter`, `band_metadata_group`
+# -- so the two halves cannot disagree about what a band is.
+
+
+def flush_calculate_plans(band_ops, calculate_plans):
+    """Move whatever `calculate_plans` has accumulated since the last flush into `band_ops`
+    as a single `("calculate", plans)` entry, emptying `calculate_plans` IN PLACE (so a
+    caller holding the same list object sees the drain).
+
+    Called by `apply_band_wide_op`/`collapse_band_group` before either appends an entry of
+    its own, and once more by each pixel-read consumer for a trailing calculate declared
+    after the last filter/group with nothing following it -- so a calculate always lands at
+    its declared position relative to the ops around it.
+
+    The entry carries the plans alone. Which BANDS each plan applies to is not decided here:
+    `apply_calculate_band_wide` answers that against whatever metadata the replay has
+    reached by the time this entry runs, which is the only frame the plan's own dimension
+    `where` is meaningful against.
+
+    A no-op once `calculate_plans` is empty (already flushed, or never populated), so it is
+    safe to call more than once for the same pending batch.
+    """
+    if not calculate_plans:
+        return
+    band_ops.append(("calculate", list(calculate_plans)))
+    calculate_plans.clear()
+
+
+def collapse_band_group(metadata_lf, by, aggregate, *, raw_band_frame, band_ops, calculate_plans):
+    """The band-wide lowering of a `group`: collapse the CURRENT band metadata
+    (`metadata_lf`: either the untouched raw per-band frame, on this chain's first `group`,
+    or an earlier `group`/post-group dimension `filter`'s own output) into one row per `by`
+    combination, and record the group as a band op for a pixel-read consumer to replay at
+    this position.
+
+    Returns `(metadata_lf, raw_band_frame)`. On the FIRST call `raw_band_frame` comes back
+    as a snapshot of `metadata_lf` taken before anything was touched -- every pixel-read
+    consumer needs the original (path, band) rows to build its scan, even once the running
+    metadata has moved on to dimension-only rows. That snapshot doubles as the "a group has
+    run" flag the pushdown rule tests (`apply_band_wide_op`) and `RasterGridAnalysis.
+    _band_frame` returns. `band_ops`/`calculate_plans` are appended/drained in place.
+
+    The recorded entry is `("group", by, aggregate)` -- the DECLARED key, not the row
+    positions it happens to resolve to against today's metadata. `band_metadata_group`
+    resolves those positions here, for the running metadata, and resolves them again at
+    pixel-read time against the metadata a replay has reached by then; a stored index could
+    not survive a second group or a post-group filter narrowing what it indexed into.
+
+    `aggregate` is always explicit -- a pipeline may declare two group steps with different
+    aggregates, and `Options.group_aggregate` holds only the last one, so `ops.GroupOp`
+    carries its own and `apply_band_wide_op` passes that, rather than leaving this function
+    to read an option that may not describe the step at hand.
+    """
+    if aggregate == "count":
+        # group_aggregate is the raster band-COLLAPSE step
+        # (`sources.HORIZONTAL_RASTER_AGGREGATES`), reducing ACROSS one pixel's selected
+        # bands -- unlike the zonal summarize aggregate this option shares its name and
+        # values with, "how many of these bands contributed to this pixel" has no natural
+        # per-pixel scalar meaning the way max/mean/min/sum do (see the
+        # `AggregateFunction.count` comment in types.py). Rejected explicitly here rather
+        # than left to fail as a raw `KeyError` out of `HORIZONTAL_RASTER_AGGREGATES` deep
+        # in a later stage.
+        raise AnalysisError("group_aggregate 'count' is not supported for raster grids")
+
+    metadata_df = metadata_lf.collect()
+    if raw_band_frame is None:
+        raw_band_frame = metadata_df
+
+    flush_calculate_plans(band_ops, calculate_plans)
+    band_ops.append(("group", list(by), aggregate))
+    return band_metadata_group(metadata_df, by)[0].lazy(), raw_band_frame
+
+
+def apply_band_wide_op(op, metadata_lf, *, raw_band_frame, band_ops, calculate_plans, value_where, rename_map):
+    """The BAND-WIDE lowering of one `filter`/`calculate`/`group` op, at plan time.
+
+    `ops.LOWERING_TABLE` gives each op two rows; this function is the band-wide row for the
+    three ops whose lowering depends only on the SHAPE, exactly as `vector.apply_long_op` is
+    the long row for the same three. Which of the two runs for a given declared op is the
+    SHAPE dispatch in `RasterGridAnalysis.apply_steps` -- shape picks the implementation,
+    never the order.
+
+    Returns `(metadata_lf, raw_band_frame, value_where, has_dimension_conjunct)`;
+    `band_ops` and `calculate_plans` are mutated in place. `has_dimension_conjunct` is the
+    signal `BaseAnalysis._has_selective_dimension_filter` needs from a `FilterOp`, `False`
+    for the ops that cannot produce one -- the same second return value `apply_long_op`
+    gives, so an interpreter threads it identically whichever lowering ran.
+
+    A `FilterOp`'s DIMENSION half either NARROWS THE SCAN or becomes a recorded band op, and
+    which one is the pushdown rule:
+
+        Before the first `group` (`raw_band_frame is None`), it is applied straight to
+        `metadata_lf` (`band_metadata_scan_filter`, the same `lf.sql()` path
+        `base.apply_dimension_filter` uses). That frame is still the table `_band_frame`
+        hands a pixel-read consumer to build its scan from, so narrowing it here means the
+        dropped bands are never opened at all -- real projection pushdown, not a column drop
+        after the fact. This is legal only because every op that can precede it in that
+        prefix (another dimension filter, a value filter, a calculate) PRESERVES BAND
+        IDENTITY: none of them changes which band is which, so evaluating the predicate
+        against the scan's metadata gives the same answer as evaluating it in place. The
+        moment a `group` runs, that stops being true.
+
+        After a `group`, it is recorded as `("filter", dimension_where)` at its own position
+        and applied to the running metadata via `band_metadata_filter` -- the same primitive
+        `apply_dimension_filter_band_wide` uses at replay time, so the in-flight narrowing
+        and the eventual column drop cannot disagree. Pushing it back to the scan instead
+        would be a REORDERING of the chain, not an optimization of a prefix: the predicate
+        names the group's output dimensions, and "which raw bands would have satisfied it"
+        is a different question with a different answer.
+
+    A `FilterOp`'s VALUE half cannot run in either mode -- there is no pixel column yet --
+    so it is recorded as `("filter_value", value_where)` at its declared position, for
+    `apply_value_filter_band_wide` to mask once pixels are read, AND-combined onto the
+    running `value_where` that comes back (which is what `RasterGridAnalysis.
+    _apply_transform_params_impl` validates, and what it rejects a STANDALONE value filter
+    from). Recording it at a position is what makes a value filter declared AFTER a
+    calculate mask the REWRITTEN value, as declared, instead of the stored one.
+
+    A `CalculateOp` is validated and appended to `calculate_plans`, which the next
+    `group`/`filter`/pixel-read consumer flushes into `band_ops` at its own position
+    (`flush_calculate_plans`) -- not applied immediately.
+
+    Raises `ExpressionError` (from `band_metadata_scan_filter`/`compile_calculate_entries`)
+    or `AnalysisError` (the `count` rejection in `collapse_band_group`); callers translate
+    the former at `base.op_error_boundary`, which deliberately passes the latter through.
+    """
+    if isinstance(op, FilterOp):
+        rewritten = rewrite_named_columns(op.where, rename_map)
+        dimension_conjuncts, value_conjuncts = classify_where(rewritten)
+        has_dimension_conjunct = bool(dimension_conjuncts)
+        if has_dimension_conjunct:
+            dimension_where = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
+            if raw_band_frame is None:
+                # Pushdown prefix: narrow the scan itself.
+                metadata_lf = band_metadata_scan_filter(metadata_lf, dimension_where)
+            else:
+                # A `group` already ran, so this filter has to run at its own position
+                # instead -- against the grouped bands it names.
+                flush_calculate_plans(band_ops, calculate_plans)
+                band_ops.append(("filter", dimension_where))
+                metadata_lf = band_metadata_filter(metadata_lf.collect(), dimension_where)[0].lazy()
+        if value_conjuncts:
+            conjunct_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
+            flush_calculate_plans(band_ops, calculate_plans)
+            band_ops.append(("filter_value", conjunct_where))
+            value_where = (
+                conjunct_where if value_where is None else f"({value_where}) and ({conjunct_where})"
+            )
+        return metadata_lf, raw_band_frame, value_where, has_dimension_conjunct
+
+    if isinstance(op, CalculateOp):
+        expression = rewrite_named_columns(op.expression, rename_map)
+        where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
+        calculate_plans.extend(compile_calculate_entries([(calculate_label(op), expression, where)]))
+        return metadata_lf, raw_band_frame, value_where, False
+
+    if isinstance(op, GroupOp):
+        metadata_lf, raw_band_frame = collapse_band_group(
+            metadata_lf,
+            list(op.by),
+            op.aggregate,
+            raw_band_frame=raw_band_frame,
+            band_ops=band_ops,
+            calculate_plans=calculate_plans,
+        )
+        return metadata_lf, raw_band_frame, value_where, False
+
+    # pragma: no cover -- a `JoinOp` never reaches a single-input chain
+    raise AnalysisError(f"unsupported op in the raster interpreter: {op.op!r}")  # pragma: no cover
+
+
+# -- the `project` band-wide -> long lowering (zonal summarize) -----------------------
+#
+# `ops.LOWERING_TABLE`'s `project` raster-to-vector row, split into the validation half
+# (`validate_raster_summarize`, which must run before a crosswalk or a pixel is touched),
+# the reduction itself (`apply_zonal_summarize`), and the two synchronous workers each
+# aggregate kind hands to `asyncio.to_thread`. None of them reads or writes an instance
+# attribute; `RasterGridAnalysis._apply_transform_params_impl` is three lines of option-
+# reading over them, and `apply_steps` reaches them through that method for a `ProjectOp`.
+
+
+def validate_raster_summarize(value_where, *, grid_name, summarize_by, summarize_aggregate, summarize_grid_cell):
+    """Everything a zonal summarize can reject before opening a file, returning
+    `(has_summarize, summarize_grid_cell_ids, crosswalk_path)` -- `crosswalk_path` is
+    `None` when the request declares no summarize at all.
+
+    A `where` VALUE conjunct (a per-pixel value predicate -- see `base.apply_value_filter`
+    and `apply_band_wide_op`'s `FilterOp` branch, which records it as a `("filter_value",
+    ...)` band op) is only meaningful at the summarize stage: it is
+    what `summarize_zone_stats` masks each band's raw pixel value against, before the
+    multiplier/group_aggregate collapse, so "count pixels above X" and "sum of pixels
+    above X" both fall out of the existing null-skipping zonal aggregates for free. A
+    plain, non-summarized raster selection has no zonal aggregate to feed a mask into and
+    no per-pixel frame the API exposes to a caller at all (a raster `self.lf` is the
+    band-metadata table until the summarize builds one) -- so a `where` value conjunct
+    given without `summarize_by`/`summarize_aggregate` is rejected outright here, rather
+    than silently ignored.
+    """
+    if value_where is not None:
+        # Parsed here, against the placeholder namespace every value conjunct
+        # writes against (`value`, `grid_cell`), before touching the crosswalk file,
+        # the band metadata, or any pixel data -- an aggregate-inside-predicate or
+        # a whitelist violation is rejected before a single file is opened, not
+        # discovered partway through a streaming collect. `summarize_zone_stats`
+        # re-parses the same string per selected band (each band's own namespace is
+        # exactly {that band, grid_cell} -- see `masked_value_predicate_exprs`), so this
+        # call is a validation pass, not the one whose result gets used.
+        try:
+            parse_value_expr(value_where, ["value", "grid_cell"])
+        except ExpressionError as exc:
+            raise AnalysisError(str(exc))
+
+    has_summarize, summarize_grid_cell_ids = stages.validate_summarize_options(
+        summarize_by, summarize_aggregate, summarize_grid_cell
+    )
+    if not has_summarize:
+        if value_where is not None:
+            raise AnalysisError(
+                "where's value condition(s) require summarize_by and summarize_aggregate for raster grids"
+            )
+        return False, summarize_grid_cell_ids, None
+
+    crosswalk_path = config.CROSSWALKS_PATH / f"{grid_name}__{summarize_by}.tif"
+    if not crosswalk_path.exists():
+        raise AnalysisError(f"No crosswalk from {grid_name} to {summarize_by}")
+    return True, summarize_grid_cell_ids, crosswalk_path
+
+
+async def apply_zonal_summarize(
+    df,
+    dim_df,
+    n_bands,
+    *,
+    crosswalk_path,
+    summarize_by,
+    summarize_aggregate,
+    summarize_grid_cell_ids,
+    calculate,
+    value_where,
+    band_ops,
+):
+    """Summarize raster pixels by geographic unit (e.g. hydro compartment) using a
+    pre-generated zone-ID crosswalk raster (see `python -m cpra.mp.data.cli crosswalk`),
+    returning a LONG LazyFrame in the same shape `vector.apply_summarize` produces
+    (dimension columns, a `grid_cell` column holding the destination grid_cell ID, a
+    `value` column, and a `geographic_unit` column).
+
+    `df` is the full per-band metadata frame the read scans from; `dim_df`/`n_bands` come
+    from `RasterGridAnalysis._get_raster_dimension_frame` and describe the OUTPUT bands,
+    aligned row-for-row with the `(n_bands, zone_ids.size)` array `summarize_zone_stats`
+    returns. The actual per-zone reduction is that worker's; this function resolves the
+    zone list, routes to the right worker, and reshapes the result.
+    """
+    unique_paths, row_indices, bands = group_rows_by_path(df)
+
+    with rio.open(crosswalk_path) as crosswalk:
+        if summarize_grid_cell_ids:
+            zone_ids = np.array(sorted(summarize_grid_cell_ids), dtype="int64")
+        else:
+            dst_ids = crosswalk.tags()["dst_ids"].split(",")
+            zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
+
+    if summarize_aggregate == "count_by_value":
+        # Single RAW band only: a request selecting more than one raw pixel band (e.g.
+        # every calendar_year in a range, or several bands pre-collapsed by
+        # group_by/group_aggregate into one group) has no single natural (zone, value)
+        # shape to count into -- see raster_source.count_by_value's docstring for why
+        # this is refused rather than guessed at. Checked against the raw band count
+        # from `row_indices` (not `n_bands`, which reflects the post-group_aggregate
+        # collapsed count and would wrongly admit a group_by that collapses several raw
+        # bands down to one group) -- `group_by`/`group_aggregate`'s own collapse logic
+        # is never applied by `raster_source.count_by_value`, so a caller combining it
+        # with count_by_value must be rejected outright rather than have it silently
+        # ignore every raw band but one. `row_indices` comes from `group_rows_by_path`
+        # on the band-metadata frame, which only reads path/band/dimension columns,
+        # never pixel data -- so this check is still "before any file [of pixel data] is
+        # read", not merely before the summarize starts.
+        raw_band_count = sum(len(indices) for indices in row_indices)
+        if raw_band_count != 1:
+            raise AnalysisError(
+                f"count_by_value is only supported for a single raster band per request, got {raw_band_count} -- "
+                "narrow the request (e.g. to one calendar_year) and don't combine it with group_by/group_aggregate"
+            )
+        stages.reject_calculate_with_count_by_value(calculate)
+
+        try:
+            result_df = await asyncio.to_thread(
+                summarize_count_by_value,
+                unique_paths,
+                row_indices,
+                bands,
+                crosswalk_path,
+                zone_ids,
+                value_where=value_where,
+            )
+        except ExpressionError as exc:
+            raise AnalysisError(str(exc))
+
+        # `dim_df` can legitimately have zero columns (every dimension collapsed
+        # away by group_aggregate with no group_by) -- `.row(0)` on a zero-width
+        # frame raises, so there is nothing to read off it in that case.
+        dim_row = dim_df.row(0, named=True) if dim_df.width else {}
+        return (
+            result_df.lazy()
+            .with_columns(**{col: pl.lit(val) for col, val in dim_row.items()})
+            .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(summarize_by))
+        )
+
+    # The plugin path (`scan_rasters`) applies the calculate/group-aggregate
+    # pre-collapse via the shared `band_calculate_passes`/
+    # `horizontal_aggregate_expr` vocabulary in raster_source.py -- see
+    # `summarize_zone_stats` -- so every summarize request, regardless of
+    # which parameters are in play, reaches the same single implementation.
+    result = await asyncio.to_thread(
+        summarize_zone_stats,
+        df,
+        unique_paths,
+        row_indices,
+        bands,
+        crosswalk_path,
+        zone_ids,
+        n_bands,
+        band_ops=band_ops,
+        aggregate=summarize_aggregate,
+    )
+
+    # Assemble in wide format (one column per zone) to line up with `result`'s shape,
+    # then unpivot to the long-format grid_cell/value contract used everywhere else --
+    # matching `vector.apply_summarize`'s join-based output shape.
+    dim_cols = dim_df.columns
+    result_frame = pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row")
+    # `dim_df` can legitimately have zero columns (every dimension collapsed away by
+    # group_aggregate with no group_by) -- `result_frame` already has the right
+    # height (`n_bands` rows) on its own in that case, so there is nothing to
+    # hstack onto it, and `hstack` would fail on the height mismatch a zero-column
+    # `dim_df` reports (see `_get_raster_dimension_frame`'s docstring).
+    wide = dim_df.hstack(result_frame) if dim_cols else result_frame
+    return (
+        wide.unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
+        .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(summarize_by))
+        .lazy()
+    )
+
+
+def summarize_zone_stats(
+    df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands, *, band_ops, aggregate
+):
+    """Zonal aggregate via the Polars IO plugin (`sources.scan_rasters`), returning a
+    `(n_bands, zone_ids.size)` array.
+
+    The single implementation of the zonal summarize step (see `apply_zonal_summarize`):
+    every filter/calculate/group step this request declared arrives as `band_ops` (from
+    `RasterGridAnalysis._pixel_read_band_ops`) and is replayed here in DECLARED order by
+    `apply_band_ops`, against the scan's own band-wide frame, whatever shape the chain has.
+
+    `scan_rasters` masks nodata to null against each band's own raw pixel value before
+    any op sees it (`mask_nodata=True`), so a masked band's null survives a calculate
+    pass untouched (its `is_not_null()` guard -- NoData in, NoData out) and drops out of
+    a horizontal collapse and the final vertical `guarded_aggregate` alike, with no
+    separate accumulation pass needed here. `apply_band_ops` is therefore called with
+    `dtype=None`: nodata is already handled, and a "no contributor" group here should
+    stay NULL forever (feeding `guarded_aggregate`'s own NaN handling), never be filled
+    to a sentinel the way a tile/write output needs.
+
+    A value `where` conjunct is replayed at its own declared position like any other op
+    (`_pixel_read_band_ops`), as a per-cell mask. On the flat request surface that
+    position is first -- before any calculate entry -- which is what a FILTER value
+    predicate means there: it is written against the stored pixel value, not one a
+    calculate entry already rewrote. A pixel the predicate rejects then behaves exactly
+    like a nodata pixel for everything downstream -- it drops out of the collapse, and
+    out of `guarded_aggregate`'s denominator -- which is what turns "count contributing
+    pixels" into "count pixels where value > x" with no separate code path. (A CALCULATE
+    entry's own value condition, by contrast, tests the running value at that entry's
+    position in the sequence, per the sequential contract -- that's
+    `band_calculate_passes`' job, not this mask's.)
+
+    Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
+    long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
+    blocking the event loop for the whole summarize, matching how the numpy path's
+    blocking `rio_copy` call is offloaded elsewhere (`_write_raster_vrt`).
+    """
+    lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
+    try:
+        lf, out_metadata_df = apply_band_ops(lf, df, band_ops, extra_columns=("grid_cell",))
+    except ExpressionError as exc:
+        raise AnalysisError(str(exc))
+    out_names = band_column_names(out_metadata_df)
+
+    grouped = (
+        lf.group_by("grid_cell")
+        .agg([guarded_aggregate(aggregate, name) for name in out_names])
+        .collect(engine="streaming")
+    )
+
+    result = np.full((n_bands, zone_ids.size), np.nan)
+    if grouped.height:
+        positions = np.searchsorted(zone_ids, grouped["grid_cell"].to_numpy().astype("int64"))
+        for i, name in enumerate(out_names):
+            result[i, positions] = grouped[name].to_numpy()
+    return result
+
+
+def summarize_count_by_value(unique_paths, row_indices, bands, crosswalk_path, zone_ids, *, value_where):
+    """count_by_value's raster-side worker: delegates to `raster_source.count_by_value`
+    (the single-band scan + per-zone categorical count), on a worker thread the same
+    way `summarize_zone_stats` is -- see that function's docstring for why (the
+    streaming `collect()` underneath is long-running and CPU/IO-bound, so it must not
+    block the event loop for the whole summarize).
+    """
+    return raster_count_by_value(
+        unique_paths,
+        row_indices,
+        bands,
+        crosswalk_path,
+        zone_ids,
+        value_where=value_where,
+        max_distinct=COUNT_BY_VALUE_MAX_DISTINCT,
+    )
+
+
 def _batched_block_windows(block_windows, blocks_per_batch):
     """Yield window unions over `block_windows`, chunked to at most `blocks_per_batch`
     blocks each rather than a whole block row at a time.
@@ -648,115 +1121,24 @@ def _take_window_rows(batch_iter, buffer, needed):
 
 class RasterGridAnalysis(BaseAnalysis):
     async def _apply_grid_cell(self):
-        """Apply the grid_cell filter to a raster-grid dataset."""
-        lngs, lats = parse_coordinate_pairs(unpack_values(self.options.grid_cell, "grid_cell"))
-
-        # Transform the coordinates to the correct CRS, and sample the rasters in parallel.
-        # Rows sharing the same path (bands of the same multiband COG) are grouped so each
-        # file is opened and sampled once, requesting all of its needed bands together.
-        df = self.materialize()
-        unique_paths, row_indices, bands = group_rows_by_path(df)
-        with ExitStack() as stack:
-            datasets = [stack.enter_context(rio.open(path)) for path in unique_paths]
-            projected_pairs = list(zip(*project_coordinates(lngs, lats, datasets[0].crs)))
-            group_samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
-            dtype = datasets[0].dtypes[0]
-
-        # Add the resulting values to the LazyFrame as one column per sampled coordinate,
-        # then unpivot into long format (grid_cell/value) to match the long-format contract
-        # used everywhere else in the API. Each grid_cell here is a "lng,lat" coordinate
-        # pair label rather than an integer grid ID, since these are arbitrary sample points.
-        columns = [np.empty(len(df), dtype=dtype) for _ in lngs]
-        for path_row_indices, path_samples in zip(row_indices, group_samples):
-            for column, values in zip(columns, path_samples):
-                column[path_row_indices] = values
-        column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-        wide_df = df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band"))
-        index_cols = [col for col in wide_df.columns if col not in column_labels]
-        self.lf = wide_df.unpivot(
-            index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
-        ).lazy()
-
-    def _collapse_group(self, group_by_cols, aggregate=None):
-        """Collapse the CURRENT band metadata (`self.lf`: either the untouched raw per-band
-        frame, on this request's first `group`, or an earlier `group`/post-group dimension
-        `filter`'s own output) into one row per `group_by_cols` combination, and record the
-        group as a band op for a pixel-read consumer to replay at this position.
-
-        On the FIRST call, snapshots `self.lf` into `self._raw_band_frame` before touching
-        anything -- every pixel-read consumer needs the original (path, band) rows to build
-        its scan, even once `self.lf` itself has moved on to dimension-only metadata. That
-        snapshot doubles as the "a group has run" flag every other method here tests.
-
-        Any calculate entries accumulated so far (`self._calculate_plans`) are flushed into
-        `self._band_ops` BEFORE this group's own entry is appended, so a replay applies them
-        at the position they were declared at rather than always before every group.
-
-        The recorded entry is `("group", by, aggregate)` -- the DECLARED key, not the row
-        positions it happens to resolve to against today's metadata. `band_metadata_group`
-        resolves those positions here, for `self.lf`, and resolves them again at pixel-read
-        time against the metadata a replay has reached by then; a stored index could not
-        survive a second group or a post-group filter narrowing what it indexed into.
-
-        `aggregate` defaults to `self.options.group_aggregate` -- the single scalar option
-        the old fixed-stage caller (`_apply_group_params`) has to offer. `apply_steps`
-        passes the `GroupOp`'s OWN aggregate instead (exactly as
-        `vector.VectorGridAnalysis.apply_steps` passes `op.aggregate` to `apply_group_by`),
-        because a pipeline may declare two group steps with different aggregates and
-        `Options.group_aggregate` holds only the last one.
+        """The `_apply_grid_cell` hook for a raster frame -- a thin caller over the free
+        function `sample_bands_to_long`, which holds the whole lowering (see its
+        docstring). What stays here is what touches `self`: materializing the band
+        metadata (through `materialize`, so a missing dataset still surfaces as a 404),
+        reading the option, and storing the reshaped frame back.
         """
-        if aggregate is None:
-            aggregate = self.options.group_aggregate
-        if aggregate == "count":
-            # group_aggregate is the raster band-COLLAPSE step
-            # (`sources.HORIZONTAL_RASTER_AGGREGATES`), reducing ACROSS one pixel's
-            # selected bands -- unlike the zonal summarize aggregate this option shares
-            # its name and values with, "how many of these bands contributed to this
-            # pixel" has no natural per-pixel scalar meaning the way max/mean/min/sum do
-            # (see the `AggregateFunction.count` comment in types.py). Rejected explicitly
-            # here rather than left to fail as a raw `KeyError` out of
-            # `HORIZONTAL_RASTER_AGGREGATES` deep in a later stage.
-            self._error("group_aggregate 'count' is not supported for raster grids")
-
-        metadata_df = self.lf.collect()
-        if self._raw_band_frame is None:
-            self._raw_band_frame = metadata_df
-
-        self._flush_calculate_plans_to_band_ops()
-        self._band_ops.append(("group", list(group_by_cols), aggregate))
-        self.lf = band_metadata_group(metadata_df, group_by_cols)[0].lazy()
-
-    def _flush_calculate_plans_to_band_ops(self):
-        """Move whatever `self._calculate_plans` has accumulated since the last flush into
-        `self._band_ops` as a single `("calculate", plans)` entry.
-
-        Called by `_collapse_group` and by a `FilterOp` (`apply_steps`) before each appends
-        its own entry, and once more by each pixel-read consumer for a trailing calculate
-        declared after the last filter/group with nothing following it -- so a calculate
-        always lands at its declared position relative to the ops around it.
-
-        The entry carries the plans alone. Which BANDS each plan applies to is not decided
-        here: `apply_calculate_band_wide` answers that against whatever metadata the replay
-        has reached by the time this entry runs, which is the only frame the plan's own
-        dimension `where` is meaningful against.
-
-        A no-op once `self._calculate_plans` is empty (already flushed, or never populated),
-        so it is safe to call more than once for the same pending batch.
-        """
-        if not self._calculate_plans:
-            return
-        self._band_ops.append(("calculate", list(self._calculate_plans)))
-        self._calculate_plans = []
+        self.lf = await sample_bands_to_long(self.materialize(), self.options.grid_cell)
 
     def _band_frame(self):
         """The full per-band metadata (`path`/`band`/dimension columns) a pixel-read
         consumer needs to build its raw scan, and the metadata frame its replay starts from:
         `self.materialize()` if no `group` has run yet (in which case `self.lf` still IS
-        that table), else `self._raw_band_frame` -- the snapshot `_collapse_group` took
-        before `self.lf` moved on to collapsed, dimension-only metadata.
+        that table), else `self._raw_band_frame` -- the snapshot the first `GroupOp`
+        (`collapse_band_group`) took before `self.lf` moved on to collapsed,
+        dimension-only metadata.
 
         Dimension filters declared BEFORE the first group are already baked into this frame
-        (they narrowed the scan itself -- see `apply_steps`' pushdown rule), which is why a
+        (they narrowed the scan itself -- see `apply_band_wide_op`'s pushdown rule), which is why a
         replay starting here and `self.lf`'s own running state stay in agreement: both are
         the same raw frame carried through the same ops.
         """
@@ -764,27 +1146,28 @@ class RasterGridAnalysis(BaseAnalysis):
 
     def _pixel_read_band_ops(self):
         """`self._band_ops` as a pixel-read consumer should replay them: any trailing
-        calculate batch flushed into place first (`_flush_calculate_plans_to_band_ops`),
-        then a standalone value `where` folded in (`band_ops_for_pixel_read`).
+        calculate batch flushed into place first (`flush_calculate_plans`), then a
+        standalone value `where` folded in (`band_ops_for_pixel_read`).
 
-        Each of the three consumers (`_summarize_zone_stats_plugin`,
-        `_collapse_tile_bands`, `_write_raster_windowed`) calls exactly this and nothing
-        else, so they cannot drift apart on which ops a request actually has. The flush is
-        repeated per consumer because a tile is served without a preceding `group` just as
-        often as with one; it is a no-op once the pending batch has already moved.
+        Each of the three pixel reads gets its ops from exactly this and nothing else --
+        `_collapse_tile_bands` and `_write_raster_windowed` call it themselves, and
+        `_apply_transform_params_impl` calls it to hand `apply_zonal_summarize` the
+        `band_ops` it forwards to `summarize_zone_stats` -- so they cannot drift apart on
+        which ops a request actually has. The flush is repeated per consumer because a
+        tile is served without a preceding `group` just as often as with one; it is a
+        no-op once the pending batch has already moved.
         """
-        self._flush_calculate_plans_to_band_ops()
+        flush_calculate_plans(self._band_ops, self._calculate_plans)
         return band_ops_for_pixel_read(self._band_ops, self._value_where)
 
     def _get_raster_dimension_frame(self, df):
         """Get `(dim_df, n_bands)`: a DataFrame with one row per output raster band, aligned
-        by row order with the `(n_bands, zone_ids.size)` array `_summarize_zone_stats_plugin`
+        by row order with the `(n_bands, zone_ids.size)` array `summarize_zone_stats`
         returns for the same `df`, and that band count as a separate value.
 
         A dimension column left out of the group by clause is simply absent from `dim_df` --
-        mirroring `VectorGridAnalysis._collapse_group`'s drop (see its comment for the full
-        rationale: the old behavior null-filled every collapsed dimension back in, which is
-        the artifact this drops).
+        mirroring the long-shape group lowering's drop (see `vector.apply_group_by`'s
+        docstring for the full rationale).
 
         `n_bands` is read off the metadata frame's own height BEFORE `BAND_INDEX` is
         dropped, never off `len(dim_df)`: a group_aggregate with no group_by at all
@@ -798,218 +1181,44 @@ class RasterGridAnalysis(BaseAnalysis):
         return metadata_df.drop(BAND_INDEX), metadata_df.height
 
     async def _apply_transform_params_impl(self):
-        """Apply transform and extract parameters to the image.
+        """The transform hook for a raster frame -- a thin caller over the free functions
+        `validate_raster_summarize` and `apply_zonal_summarize`, which hold the whole
+        `project` band-wide -> long lowering (see their docstrings). What stays here is
+        what touches `self`: reading the options, taking the band-metadata frame
+        (`_band_frame`) and its output-band description (`_get_raster_dimension_frame`),
+        collecting the replay recipe (`_pixel_read_band_ops`), and storing the two results
+        back.
 
-        Summarizes raster pixels by geographic unit (e.g. hydro compartment) using a
-        pre-generated zone-ID crosswalk raster (see
-        `python -m cpra.mp.data.cli crosswalk`), converting the result into a tabular
-        LazyFrame in the same shape produced by `VectorGridAnalysis`'s transform hook
-        (dimension columns, a `grid_cell` column holding the destination grid_cell ID, a
-        `value` column, and a `geographic_unit` column).
-
-        The actual per-zone reduction is computed by `_summarize_zone_stats_plugin`,
-        returning a `(n_bands, zone_ids.size)` array.
-
-        A `where` VALUE conjunct (a per-pixel value predicate -- see
-        `_apply_filter_params`/`self._value_where`) is only meaningful here, at the
-        summarize stage: it is what `_summarize_zone_stats_plugin` masks each band's raw
-        pixel value against, before the multiplier/group_aggregate collapse, so "count
-        pixels above X" and "sum of pixels above X" both fall out of the existing
-        null-skipping zonal aggregates for free. A plain, non-summarized raster
-        selection has no zonal aggregate to feed a mask into and no per-pixel frame the
-        API exposes to a caller at all (`self.lf` is the band-metadata table until this
-        method builds one) -- so a `where` value conjunct given without `summarize_by`/
-        `summarize_aggregate` is rejected outright below, rather than silently ignored.
+        The empty-frame 404 stays here too, between the two calls, because it is about
+        this dataset's own selection rather than about the summarize: it fires exactly
+        where it used to, after the crosswalk check and before any pixel is read.
         """
-        if self._value_where is not None:
-            # Parsed here, against the placeholder namespace every value conjunct
-            # writes against (`value`, `grid_cell`), before touching the crosswalk file,
-            # `self.materialize()`, or any pixel data -- an aggregate-inside-predicate or
-            # a whitelist violation is rejected before a single file is opened, not
-            # discovered partway through a streaming collect. `_summarize_zone_stats_plugin`
-            # re-parses the same string per selected band (each band's own namespace is
-            # exactly {that band, grid_cell} -- see `masked_value_predicate_exprs`), so this
-            # call is a validation pass, not the one whose result gets used.
-            try:
-                parse_value_expr(self._value_where, ["value", "grid_cell"])
-            except ExpressionError as exc:
-                self._error(str(exc))
-
-        has_summarize, self.summarize_grid_cell_ids = stages.validate_summarize_options(
-            self.options.summarize_by, self.options.summarize_aggregate, self.options.summarize_grid_cell
+        has_summarize, self.summarize_grid_cell_ids, crosswalk_path = validate_raster_summarize(
+            self._value_where,
+            grid_name=self.grid.name,
+            summarize_by=self.options.summarize_by,
+            summarize_aggregate=self.options.summarize_aggregate,
+            summarize_grid_cell=self.options.summarize_grid_cell,
         )
         if not has_summarize:
-            if self._value_where is not None:
-                self._error("where's value condition(s) require summarize_by and summarize_aggregate for raster grids")
             return
-
-        crosswalk_name = f"{self.grid.name}__{self.options.summarize_by}.tif"
-        crosswalk_path = config.CROSSWALKS_PATH / crosswalk_name
-        if not crosswalk_path.exists():
-            msg = f"No crosswalk from {self.grid.name} to {self.options.summarize_by}"
-            self._error(msg)
 
         df = self._band_frame()
         if df.is_empty():
             self._error("Dataset does not exist", status_code=404)
 
         dim_df, n_bands = self._get_raster_dimension_frame(df)
-        unique_paths, row_indices, bands = group_rows_by_path(df)
-
-        with rio.open(crosswalk_path) as crosswalk:
-            if self.summarize_grid_cell_ids:
-                zone_ids = np.array(sorted(self.summarize_grid_cell_ids), dtype="int64")
-            else:
-                dst_ids = crosswalk.tags()["dst_ids"].split(",")
-                zone_ids = np.array(sorted(int(dst_id) for dst_id in dst_ids), dtype="int64")
-
-        if self.options.summarize_aggregate == "count_by_value":
-            # Single RAW band only: a request selecting more than one raw pixel band (e.g.
-            # every calendar_year in a range, or several bands pre-collapsed by
-            # group_by/group_aggregate into one group) has no single natural (zone, value)
-            # shape to count into -- see raster_source.count_by_value's docstring for why
-            # this is refused rather than guessed at. Checked against the raw band count
-            # from `row_indices` (not `n_bands`, which reflects the post-group_aggregate
-            # collapsed count and would wrongly admit a group_by that collapses several raw
-            # bands down to one group) -- `group_by`/`group_aggregate`'s own collapse logic
-            # is never applied by `raster_source.count_by_value`, so a caller combining it
-            # with count_by_value must be rejected outright rather than have it silently
-            # ignore every raw band but one. `row_indices` comes from `group_rows_by_path`
-            # on `self._band_frame()`, which only reads the band-metadata table (path/
-            # band/dimensions), never pixel data -- so this check is still "before any
-            # file [of pixel data] is read", not merely before the summarize starts.
-            raw_band_count = sum(len(indices) for indices in row_indices)
-            if raw_band_count != 1:
-                self._error(
-                    f"count_by_value is only supported for a single raster band per request, got {raw_band_count} -- "
-                    "narrow the request (e.g. to one calendar_year) and don't combine it with group_by/group_aggregate"
-                )
-            stages.reject_calculate_with_count_by_value(self.options.calculate)
-
-            try:
-                result_df = await asyncio.to_thread(
-                    self._summarize_count_by_value_plugin, unique_paths, row_indices, bands, crosswalk_path, zone_ids
-                )
-            except ExpressionError as exc:
-                self._error(str(exc))
-
-            # `dim_df` can legitimately have zero columns (every dimension collapsed
-            # away by group_aggregate with no group_by) -- `.row(0)` on a zero-width
-            # frame raises, so there is nothing to read off it in that case.
-            dim_row = dim_df.row(0, named=True) if dim_df.width else {}
-            self.lf = (
-                result_df.lazy()
-                .with_columns(**{col: pl.lit(val) for col, val in dim_row.items()})
-                .with_columns(
-                    pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by)
-                )
-            )
-            return
-
-        # The plugin path (`scan_rasters`) applies the calculate/group-aggregate
-        # pre-collapse via the shared `band_calculate_passes`/
-        # `horizontal_aggregate_expr` vocabulary in raster_source.py -- see
-        # `_summarize_zone_stats_plugin` -- so every summarize request, regardless of
-        # which parameters are in play, reaches the same single implementation.
-        result = await asyncio.to_thread(
-            self._summarize_zone_stats_plugin,
+        self.lf = await apply_zonal_summarize(
             df,
-            unique_paths,
-            row_indices,
-            bands,
-            crosswalk_path,
-            zone_ids,
+            dim_df,
             n_bands,
-        )
-
-        # Assemble in wide format (one column per zone) to line up with `result`'s shape,
-        # then unpivot to the long-format grid_cell/value contract used everywhere else --
-        # matching VectorGridAnalysis's join-based output shape.
-        dim_cols = dim_df.columns
-        result_frame = pl.from_numpy(result, schema=[str(zone_id) for zone_id in zone_ids], orient="row")
-        # `dim_df` can legitimately have zero columns (every dimension collapsed away by
-        # group_aggregate with no group_by) -- `result_frame` already has the right
-        # height (`n_bands` rows) on its own in that case, so there is nothing to
-        # hstack onto it, and `hstack` would fail on the height mismatch a zero-column
-        # `dim_df` reports (see `_get_raster_dimension_frame`'s docstring).
-        wide = dim_df.hstack(result_frame) if dim_cols else result_frame
-        self.lf = (
-            wide.unpivot(index=dim_cols, variable_name="grid_cell", value_name="value")
-            .with_columns(pl.col("grid_cell").cast(pl.Int32), geographic_unit=pl.lit(self.options.summarize_by))
-            .lazy()
-        )
-
-    def _summarize_zone_stats_plugin(self, df, unique_paths, row_indices, bands, crosswalk_path, zone_ids, n_bands):
-        """Zonal aggregate via the Polars IO plugin (`sources.scan_rasters`).
-
-        The single implementation of the zonal summarize step (see
-        `_apply_transform_params_impl`): every filter/calculate/group step this request
-        declared is replayed here in DECLARED order by `apply_band_ops`, against the scan's
-        own band-wide frame, whatever shape the chain has.
-
-        `scan_rasters` masks nodata to null against each band's own raw pixel value before
-        any op sees it (`mask_nodata=True`), so a masked band's null survives a calculate
-        pass untouched (its `is_not_null()` guard -- NoData in, NoData out) and drops out of
-        a horizontal collapse and the final vertical `guarded_aggregate` alike, with no
-        separate accumulation pass needed here. `apply_band_ops` is therefore called with
-        `dtype=None`: nodata is already handled, and a "no contributor" group here should
-        stay NULL forever (feeding `guarded_aggregate`'s own NaN handling), never be filled
-        to a sentinel the way a tile/write output needs.
-
-        A value `where` conjunct is replayed at its own declared position like any other op
-        (`_pixel_read_band_ops`), as a per-cell mask. On the flat request surface that
-        position is first -- before any calculate entry -- which is what a FILTER value
-        predicate means there: it is written against the stored pixel value, not one a
-        calculate entry already rewrote. A pixel the predicate rejects then behaves exactly
-        like a nodata pixel for everything downstream -- it drops out of the collapse, and
-        out of `guarded_aggregate`'s denominator -- which is what turns "count contributing
-        pixels" into "count pixels where value > x" with no separate code path. (A CALCULATE
-        entry's own value condition, by contrast, tests the running value at that entry's
-        position in the sequence, per the sequential contract -- that's
-        `band_calculate_passes`' job, not this mask's.)
-
-        Synchronous (called via `asyncio.to_thread`): the streaming `collect()` below is a
-        long-running, CPU/IO-bound call, so it's offloaded to a worker thread rather than
-        blocking the event loop for the whole summarize, matching how the numpy path's
-        blocking `rio_copy` call is offloaded elsewhere (`_write_raster_vrt`).
-        """
-        lf = scan_rasters(unique_paths, row_indices, bands, crosswalk_path, zone_ids, mask_nodata=True)
-        try:
-            lf, out_metadata_df = apply_band_ops(
-                lf, df, self._pixel_read_band_ops(), extra_columns=("grid_cell",)
-            )
-        except ExpressionError as exc:
-            self._error(str(exc))
-        out_names = band_column_names(out_metadata_df)
-
-        grouped = (
-            lf.group_by("grid_cell")
-            .agg([guarded_aggregate(self.options.summarize_aggregate, name) for name in out_names])
-            .collect(engine="streaming")
-        )
-
-        result = np.full((n_bands, zone_ids.size), np.nan)
-        if grouped.height:
-            positions = np.searchsorted(zone_ids, grouped["grid_cell"].to_numpy().astype("int64"))
-            for i, name in enumerate(out_names):
-                result[i, positions] = grouped[name].to_numpy()
-        return result
-
-    def _summarize_count_by_value_plugin(self, unique_paths, row_indices, bands, crosswalk_path, zone_ids):
-        """count_by_value's raster-side worker: delegates to `raster_source.count_by_value`
-        (the single-band scan + per-zone categorical count), on a worker thread the same
-        way `_summarize_zone_stats_plugin` is -- see that method's docstring for why (the
-        streaming `collect()` underneath is long-running and CPU/IO-bound, so it must not
-        block the event loop for the whole summarize).
-        """
-        return raster_count_by_value(
-            unique_paths,
-            row_indices,
-            bands,
-            crosswalk_path,
-            zone_ids,
+            crosswalk_path=crosswalk_path,
+            summarize_by=self.options.summarize_by,
+            summarize_aggregate=self.options.summarize_aggregate,
+            summarize_grid_cell_ids=self.summarize_grid_cell_ids,
+            calculate=self.options.calculate,
             value_where=self._value_where,
-            max_distinct=COUNT_BY_VALUE_MAX_DISTINCT,
+            band_ops=self._pixel_read_band_ops(),
         )
 
     async def _read_raster_bands(self, df, rasters, row_indices, bands, window, out_shape=None, use_gdal_env=False):
@@ -1035,22 +1244,6 @@ class RasterGridAnalysis(BaseAnalysis):
         return data
 
     # -- ops interpreter ----------------------------------------------------------------
-
-    async def apply_params(self):
-        """Dispatch to the ops interpreter (`apply_steps`) when `self._pipeline_ops` was
-        attached -- mirrors `VectorGridAnalysis.apply_params` exactly; see that method's
-        docstring for the shared reasoning (this override changes nothing for the flat,
-        non-pipeline request surface, which never sets `_pipeline_ops`). `planner.
-        _compile_single_input_chain`'s fast path attaches `_pipeline_ops` for every raster
-        input shape, `selection.grid_cell` included -- `apply_steps` handles that one by
-        tracking the frame's SHAPE explicitly (see its docstring), rather than by being kept
-        away from it.
-        """
-        if self._pipeline_ops is not None:
-            await self.apply_steps(self._pipeline_ops)
-            self._apply_sort_params()
-            return
-        await super().apply_params()
 
     async def apply_steps(self, ordered_ops: list[Op]):
         """The raster interpreter: walk `ordered_ops` and apply each op IN DECLARED
@@ -1105,46 +1298,12 @@ class RasterGridAnalysis(BaseAnalysis):
           row per selected band, or (once at least one `group` has run) one row per
           surviving group; no pixel data either way.
 
-          A `FilterOp`'s DIMENSION half either NARROWS THE SCAN or becomes a recorded band
-          op, and which one is the pushdown rule:
-
-            Before the first `group` (`self._raw_band_frame is None`), it is applied
-            straight to `self.lf` (`band_metadata_scan_filter`, the same `lf.sql()` path
-            `apply_dimension_filter` uses). `self.lf` is still the table `_band_frame`
-            hands a pixel-read consumer to build its scan from, so narrowing it here means
-            the dropped bands are never opened at all -- real projection pushdown, not a
-            column drop after the fact. This is legal only because every op that can
-            precede it in that prefix (another dimension filter, a value filter, a
-            calculate) PRESERVES BAND IDENTITY: none of them changes which band is which,
-            so evaluating the predicate against the scan's metadata gives the same answer
-            as evaluating it in place. The moment a `group` runs, that stops being true.
-
-            After a `group`, it is recorded as `("filter", dimension_where)` at its own
-            position and applied to the running metadata via `band_metadata_filter` -- the
-            same primitive `apply_dimension_filter_band_wide` uses at replay time, so the
-            in-flight narrowing and the eventual column drop cannot disagree. Pushing it
-            back to the scan instead would be a REORDERING of the chain, not an
-            optimization of a prefix: the predicate names the group's output dimensions,
-            and "which raw bands would have satisfied it" is a different question with a
-            different answer.
-
-          A `FilterOp`'s VALUE half cannot run in either mode -- there is no pixel column
-          yet -- so it is recorded as `("filter_value", value_where)` at its declared
-          position, for `apply_value_filter_band_wide` to mask once pixels are read, AND
-          AND-combined onto `self._value_where`, which is what
-          `_apply_transform_params_impl` validates and rejects a standalone value filter
-          from. Recording it at a position is what makes a value filter declared AFTER a
-          calculate mask the REWRITTEN value, as declared, instead of the stored one.
-
-          A `CalculateOp` is validated and appended to `self._calculate_plans`, which the
-          next `group`/`filter`/pixel-read consumer flushes into `self._band_ops` at its own
-          position (`_flush_calculate_plans_to_band_ops`) -- not applied immediately.
-
-          A `GroupOp` calls `self._collapse_group(op.by, op.aggregate)` directly -- the exact
-          hook `_apply_group_params` calls, at this op's own declared position instead of
-          always third, and with THIS op's aggregate rather than the single scalar
-          `Options.group_aggregate` (which holds only the last group step's, once a pipeline
-          declares more than one).
+          Every `FilterOp`/`CalculateOp`/`GroupOp` is handed straight to the free function
+          `apply_band_wide_op`, the single implementation of `ops.LOWERING_TABLE`'s
+          band-wide row -- see its docstring for the pushdown rule, for why a value conjunct
+          is recorded at a position rather than applied, and for what a `group` snapshots.
+          Nothing about that lowering is a method: this loop reads the four pieces of
+          running state off `self`, hands them over, and stores the results back.
 
           A `ProjectOp` that summarizes (`op.to != current_grid`) calls
           `self._apply_transform_params_impl()` unchanged, which both performs the transform
@@ -1186,8 +1345,7 @@ class RasterGridAnalysis(BaseAnalysis):
 
         `self.options.grid_cell` (`InputSelection.grid_cell`, an INPUT-level sampling filter,
         never a pipeline step, so it never appears in `ordered_ops`) is applied once, up
-        front, via the existing `_apply_grid_cell` hook -- the same relative timing
-        `BaseAnalysis.apply_params`'s stage 1 gives it and the same spot
+        front, via the `_apply_grid_cell` hook -- the same spot
         `VectorGridAnalysis.apply_steps` applies its own. For a raster it is not a row
         filter but a resample: it samples each selected band at the requested coordinates
         and rebuilds `self.lf` as a long (grid_cell/value) frame via `.unpivot(...)`, i.e.
@@ -1215,7 +1373,10 @@ class RasterGridAnalysis(BaseAnalysis):
             shape = Shape.long
 
         current_grid = self.grid.name
-        value_names = {ordered_ops[0].input}
+        # Empty `ordered_ops` (a selection that declared no `where`/`calculate`/`group` at
+        # all) walks nothing and renames nothing -- see `VectorGridAnalysis.apply_steps`'
+        # own comment on the same line.
+        value_names = {op.input for op in ordered_ops[:1]}
         value_names.update(op.output for op in ordered_ops if not op.output[0].isdigit())
         rename_map = {name: "value" for name in value_names}
 
@@ -1237,8 +1398,8 @@ class RasterGridAnalysis(BaseAnalysis):
                     current_grid = op.to
                 elif shape is Shape.long:
                     if isinstance(op, GroupOp) and op.aggregate == "count":
-                        # Same rejection `_collapse_group` makes for the band-wide shape, kept
-                        # here so the answer to "is group_aggregate='count' legal on a raster
+                        # Same rejection `collapse_band_group` makes for the band-wide shape,
+                        # kept here so the answer to "is group_aggregate='count' legal on a raster
                         # selection" does not depend on which shape the frame happens to be in.
                         self._error("group_aggregate 'count' is not supported for raster grids")
                     self.lf, has_dimension_conjunct = apply_long_op(
@@ -1250,39 +1411,22 @@ class RasterGridAnalysis(BaseAnalysis):
                     self._where_has_dimension_conjunct = (
                         self._where_has_dimension_conjunct or has_dimension_conjunct
                     )
-                elif isinstance(op, FilterOp):
-                    rewritten = rewrite_named_columns(op.where, rename_map)
-                    dimension_conjuncts, value_conjuncts = classify_where(rewritten)
-                    has_dimension_conjunct = bool(dimension_conjuncts)
-                    if has_dimension_conjunct:
-                        dimension_where = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
-                        if self._raw_band_frame is None:
-                            # Pushdown prefix: narrow the scan itself.
-                            self.lf = band_metadata_scan_filter(self.lf, dimension_where)
-                        else:
-                            # A `group` already ran, so this filter has to run at its own
-                            # position instead -- against the grouped bands it names.
-                            self._flush_calculate_plans_to_band_ops()
-                            self._band_ops.append(("filter", dimension_where))
-                            self.lf = band_metadata_filter(self.lf.collect(), dimension_where)[0].lazy()
-                    if value_conjuncts:
-                        value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
-                        self._flush_calculate_plans_to_band_ops()
-                        self._band_ops.append(("filter_value", value_where))
-                        self._value_where = (
-                            value_where if self._value_where is None else f"({self._value_where}) and ({value_where})"
-                        )
-                    self._where_has_dimension_conjunct = self._where_has_dimension_conjunct or has_dimension_conjunct
-                elif isinstance(op, CalculateOp):
-                    expression = rewrite_named_columns(op.expression, rename_map)
-                    where = rewrite_named_columns(op.where, rename_map) if op.where is not None else None
-                    self._calculate_plans.extend(
-                        compile_calculate_entries([(f"step.{op.step_no}", expression, where)])
+                else:
+                    (
+                        self.lf,
+                        self._raw_band_frame,
+                        self._value_where,
+                        has_dimension_conjunct,
+                    ) = apply_band_wide_op(
+                        op,
+                        self.lf,
+                        raw_band_frame=self._raw_band_frame,
+                        band_ops=self._band_ops,
+                        calculate_plans=self._calculate_plans,
+                        value_where=self._value_where,
+                        rename_map=rename_map,
                     )
-                elif isinstance(op, GroupOp):
-                    self._collapse_group(list(op.by), op.aggregate)
-                else:  # pragma: no cover -- a `JoinOp` never reaches a single-input chain
-                    self._error(f"unsupported op in the raster interpreter: {op.op!r}")
+                    self._where_has_dimension_conjunct = self._where_has_dimension_conjunct or has_dimension_conjunct
 
         if shape is Shape.band_wide:
             # No `ProjectOp` in this chain ever actually summarized (an identity project,
@@ -1376,32 +1520,41 @@ class RasterGridAnalysis(BaseAnalysis):
             # sentinel.)
             nodata = inputs[0].nodata if inputs[0].nodata is not None else -9999
 
-            # Warp each source directly onto the tile's Web Mercator pixel grid so
-            # the output registers exactly with the tile, with no intermediate grid
-            # or window rounding to shift pixels off their true location.
-            tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
-            vrts = [
-                WarpedVRT(
-                    dataset,
-                    crs="EPSG:3857",
-                    transform=tile_transform,
-                    width=tile_size,
-                    height=tile_size,
+            # Read the tile's footprint out of the sources in their OWN CRS, collapse the
+            # request's bands over those pixels, and warp the collapsed result onto the
+            # tile grid -- rather than warping each source first and collapsing on the tile.
+            # Reprojection is a rendering step, not something the per-pixel band algebra
+            # needs to know about, and keeping it last is what lets that algebra be the
+            # same `apply_band_ops` call the write and summarize paths make.
+            #
+            # `Resampling.nearest` is what makes the two orders equivalent: every tile pixel
+            # takes one whole source pixel's value, and the collapse is per-pixel across
+            # bands, so collapsing before or after the warp reads the same numbers.
+            # `tests/api/test_tile_warp.py` measures that equivalence against the warp-first
+            # order directly, pixel by pixel.
+            #
+            # One window serves every input: all the files backing one request are the same
+            # variable on the same grid, written by the same conversion pipeline, so they
+            # are co-registered -- the same assumption `_write_raster_windowed` already
+            # makes when it derives its block windows from one reference source.
+            window = tile_source_window(inputs[0], tile_bounds)
+            if window is None:
+                # The tile's footprint misses the source's pixels entirely, even though it
+                # overlapped the (rectangular, reprojected) dataset bounds tested above.
+                # That is a rendered tile of nothing, not a missing tile.
+                tile_data = np.full((1, tile_size, tile_size), nodata, dtype=inputs[0].dtypes[0])
+            else:
+                data = await self._read_raster_bands(df, inputs, row_indices, bands, window)
+                tile_data = warp_window_to_tile(
+                    self._collapse_tile_bands(df, data, nodata),
+                    window=window,
+                    src_transform=inputs[0].transform,
+                    src_crs=inputs[0].crs,
+                    tile_bounds=tile_bounds,
+                    tile_size=tile_size,
                     nodata=nodata,
-                    add_alpha=False,
-                    src_nodata=nodata,
-                    dtype=dataset.dtypes[0],
-                    resampling=Resampling.nearest,
                 )
-                for dataset in inputs
-            ]
-
-            # Each VRT above is already warped directly onto the tile's own pixel grid
-            # (tile_transform/tile_size), so no separate intersection window or output
-            # shape needs to be computed here -- reading the whole VRT reads exactly the
-            # tile, and GDAL fills anything outside the source's extent with nodata.
-            data = await self._read_raster_bands(df, vrts, row_indices, bands, None)
-            color = self.legend.colorize_pixels(self._collapse_tile_bands(df, data, nodata))
+            color = self.legend.colorize_pixels(tile_data)
             # JPEG has no alpha channel, so drop it. fromarray infers RGB vs RGBA from the
             # array's shape, and passing mode= explicitly is deprecated as of Pillow 11.
             image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)

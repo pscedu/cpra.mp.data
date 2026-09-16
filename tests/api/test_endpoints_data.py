@@ -526,9 +526,9 @@ class TestRasterData:
 
         The filter is now declared exactly where it executes: both steps lower onto
         `Options` (`where`, and `summarize_by`/`summarize_aggregate` respectively), and
-        the flat engine always applies the Filter stage (stage 1 of
-        `BaseAnalysis.apply_params`) before the Transform stage's zonal aggregation
-        (stage 4) -- so declaring the filter first is what makes "pixel-level threshold,
+        the flat lowering always emits the `where` filter before the zonal aggregation
+        the summarize applies -- so declaring the filter first is what makes
+        "pixel-level threshold,
         not a post-count one" the TRUTH of the declared order, not a fact the reader has
         to already know about the underlying engine to get the right answer.
 

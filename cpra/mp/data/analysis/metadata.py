@@ -53,7 +53,7 @@ def estimate_data_size(dataset_dimensions, filter_dimensions, grid, group_by_col
 
     `group_by_cols` and `has_group_by` come from the caller rather than from `Options`
     directly: resolving `group_by` into column names is validated op-side
-    (`BaseAnalysis._get_group_by_columns`, which rejects `group_by` without
+    (`stages.resolve_group_by_columns`, which rejects `group_by` without
     `group_aggregate`), and this function must not re-run that validation as a side effect
     of an estimate.
     """

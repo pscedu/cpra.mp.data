@@ -37,15 +37,18 @@ for this shape; a tabular paired output is deliberately left unsupported (see
 `planner._compile_paired_notebook_shape`'s rejection) rather than materializing the full
 joined frame, which is exactly the memory cliff this whole design avoids.
 
-`_paired_notebook_tile` is NOT built that way -- it reprojects every raster band and the
-pairing crosswalk through `WarpedVRT` onto the requested tile's CRS/transform, and no
-source here has reprojection to offer it (the same blocker the single-input tile port hit
-in `raster.py` for the identical reason). It keeps the hand-rolled block loop over
-`sources._dense_lookup_array`/`_crosswalk_lookup_values`, so `PairedAnalysis._prepare` still
-builds the dense lookup arrays that path reads. Retiring this class as a whole is not done
-here -- `PairedAnalysis` keeps both the op-built write path and the old hand-written tile
-loop, side by side, until the tile path either grows reprojection support or the paired
-shape's tile route is redesigned around it.
+`_paired_notebook_tile` is built the same way, from the same `_paired_scan`. The two differ
+only in which pixels they read and what they do with the collapsed rows: the write path
+walks the whole raster in batched block windows and writes each one; the tile path restricts
+the scan to the ONE window the tile's footprint covers (`utils.tile_source_window`), then
+warps the collapsed result onto the tile grid (`utils.warp_window_to_tile`).
+
+That reordering -- reproject LAST, not first -- is what made the tile path expressible as
+the same scan at all. It used to warp every raster band AND the pairing crosswalk through a
+`WarpedVRT` before collapsing anything, and no source has reprojection to offer, so it had
+to hand-roll a parallel collapse over `sources._dense_lookup_array`/
+`_crosswalk_lookup_values`. Reprojection is a rendering step; the per-pixel band algebra
+never needed to know about it.
 """
 from contextlib import ExitStack
 from io import BytesIO
@@ -56,8 +59,6 @@ import polars as pl
 import rasterio as rio
 from PIL import Image
 from rasterio.coords import BoundingBox, disjoint_bounds
-from rasterio.transform import from_bounds
-from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
@@ -77,8 +78,6 @@ from cpra.mp.data.analysis.raster import (
 from cpra.mp.data.analysis.sources import (
     GridCrosswalk,
     _batched_windows,
-    _crosswalk_lookup_values,
-    _dense_lookup_array,
     horizontal_aggregate_expr,
     scan_rasters,
 )
@@ -87,6 +86,8 @@ from cpra.mp.data.analysis.utils import (
     group_rows_by_path,
     raster_blocks_per_batch,
     raster_gdal_env,
+    tile_source_window,
+    warp_window_to_tile,
 )
 from cpra.mp.data.legends import LEGENDS, Legend
 
@@ -136,16 +137,15 @@ class PairedAnalysis:
     standing in for a `BaseAnalysis` instance (which has no "join two datasets" concept).
 
     Deliberately a SIBLING of `BaseAnalysis`, not a subclass: `BaseAnalysis`'s entire
-    reason to exist is the staged `self.lf` mutation pipeline (filter/calculate/group/
-    transform/sort-select -- see that class's docstring) that `apply_params` runs in
-    order. `PairedAnalysis` has no `self.lf` at all and no equivalent of that pipeline --
+    reason to exist is the `self.lf` mutation walk (an ordered op list -- see that
+    class's docstring) that `apply_params` runs. `PairedAnalysis` has no `self.lf` at all and no equivalent of that pipeline --
     its own `apply_params` is a single `_prepare()` call that builds numpy lookup arrays
     from two ALREADY-`apply_params`'d `raster_dataset`/`vector_dataset` instances (each a
     real `BaseAnalysis` subclass), and every other method it exposes
     (`get_tile`/`write_raster`/`validate_tile`/`estimate_data_size`/`output_type`) is a
     same-named, same-shaped, but independently-implemented method, not an override of
     one `BaseAnalysis` provides. Subclassing here would buy nothing but a shared base
-    whose actual behavior (the staged flow) `PairedAnalysis` doesn't use and can't
+    whose actual behavior (the op walk) `PairedAnalysis` doesn't use and can't
     honestly claim to specialize -- the honest relationship is "implements the same
     duck-typed surface", which is exactly what this class already documented itself as
     before the split, one paragraph up.
@@ -283,49 +283,35 @@ class PairedAnalysis:
             (c for c in ("calendar_year", "calendar_day") if c in raster_df.columns and c in vector_df.columns),
             None,
         )
-        # Two forms of the same vector-grid selection, for the shape's two output paths:
-        #
-        # `self.lookup_arrays` (dense arrays, `_dense_lookup_array`'s own output, keyed by
-        # calendar step) feeds the TILE path (`_paired_notebook_tile`, which cannot be
-        # built from the ordinary ops -- see the module docstring's `WarpedVRT` note) via
-        # `_crosswalk_lookup_values`.
+        # ONE form of the vector-grid selection, serving both output paths (they run the
+        # same `_paired_scan`; there used to be a second, dense-array form here that only
+        # the tile path read).
         #
         # `self._vector_long` is the LONG frame -- `grid_cell | _step | value`, one row per
-        # (zone, step) -- that the WRITE path pivots with `pivot_vector_to_band_wide`.
+        # (zone, step) -- that `_paired_scan` pivots with `pivot_vector_to_band_wide`.
         # It is deliberately NOT pre-pivoted here, because which steps the pivot needs is a
-        # property of the BANDS being written, which is the pivot's own input, not this
+        # property of the BANDS being read, which is the pivot's own input, not this
         # dataset's.
         #
         # `self._vector_band_steps` is one step per band, positionally aligned with
         # `band_sources`, in the same vocabulary `_vector_long._step` uses. With no shared
         # calendar dimension at all, both sides collapse onto the single sentinel step `0`
         # -- "one value per zone, the same for every band" -- rather than onto `None`, so
-        # the pivot never has to key on a null. `self.calendar_values` keeps the `None`
-        # spelling because that is what the tile path's `lookup_arrays.get(...)` keys on.
-        self.lookup_arrays = {}
+        # the pivot never has to key on a null.
         if calendar_col is not None:
-            self.calendar_values = raster_df[calendar_col].to_list()
-            self._vector_band_steps = list(self.calendar_values)
+            self._vector_band_steps = raster_df[calendar_col].to_list()
             self._vector_long = vector_df.select(
                 pl.col("grid_cell"),
                 pl.col(calendar_col).alias("_step"),
                 pl.col("value"),
             )
-            for key, group in vector_df.group_by(calendar_col):
-                ids = group["grid_cell"].to_numpy()
-                values = group["value"].to_numpy().astype("float64")
-                self.lookup_arrays[key[0]] = _dense_lookup_array(ids, values)
         else:
-            self.calendar_values = [None] * len(self.band_sources)
             self._vector_band_steps = [0] * len(self.band_sources)
             self._vector_long = vector_df.select(
                 pl.col("grid_cell"),
                 pl.lit(0, dtype=pl.Int32).alias("_step"),
                 pl.col("value"),
             )
-            ids = vector_df["grid_cell"].to_numpy()
-            values = vector_df["value"].to_numpy().astype("float64")
-            self.lookup_arrays[None] = _dense_lookup_array(ids, values)
 
         self._prepared = True
 
@@ -334,12 +320,12 @@ class PairedAnalysis:
     def _band_value_expr(self, i):
         """Band `i`'s own contribution to the collapse -- its `of` value, `None`
         wherever `where` (rewritten onto this band's synthetic `raster_cols[i]`/
-        `paired_cols[i]` names) doesn't hold. Factored out of `_collapse_expr` so
-        `_band_masked_value` (the per-band streaming accumulator's evaluator -- see
-        `_accumulate_paired_window`) can reuse the IDENTICAL expression over a
-        standalone one-band frame, rather than re-deriving the where-clause/nodata
-        semantics for that path in numpy and risking drift from what this method
-        produces as `where` grows more expressive than any one fixture.
+        `paired_cols[i]` names) doesn't hold. Factored out of `_collapse_expr` so that
+        anything wanting ONE band's contribution -- `tests/api/test_paired_port.py`'s
+        pre-port oracles evaluate it a band at a time over a standalone two-column frame --
+        reuses the IDENTICAL expression rather than re-deriving the where-clause/nodata
+        semantics in NumPy and risking drift from what this method produces as `where`
+        grows more expressive than any one fixture.
         """
         if self.of_kind == "dimension":
             value_expr = pl.lit(self.of_values[i])
@@ -377,14 +363,14 @@ class PairedAnalysis:
     def _collapse_expr(self):
         n = len(self.band_sources)
         if self.group_step.aggregate == "count":
-            # `count`'s own LOCAL collapse form -- see `_STREAMING_AGGREGATES`'s
-            # docstring for why this is deliberately NOT a `HORIZONTAL_RASTER_AGGREGATES`
-            # entry: a plain horizontal sum of each band's boolean validity indicator,
-            # never null (every summand is a concrete True/False, never a Polars null),
-            # so "zero contributing bands" surfaces as a real 0 here -- the "outside the
-            # pairing crosswalk's domain" nodata case is NOT decided by this expression
-            # at all; it needs `pairing_valid`, which only the per-window callers have
-            # (see `_count_zone_gate`, applied by every caller of this method).
+            # `count`'s own LOCAL collapse form, deliberately NOT a
+            # `HORIZONTAL_RASTER_AGGREGATES` entry: a plain horizontal sum of each band's
+            # boolean validity indicator, never null (every summand is a concrete
+            # True/False, never a Polars null), so "zero contributing bands" surfaces as a
+            # real 0 here -- the "outside the pairing crosswalk's domain" nodata case is
+            # NOT decided by this expression at all; it needs `pairing_valid`, which only
+            # a caller holding the zone column has (see `_count_zone_gate`, applied by
+            # `_collapse_paired_frame` after every use of this method).
             if n == 0:
                 return pl.lit(0, dtype=pl.Int32).alias("value")
             valid_exprs = [self._band_valid_expr(i).cast(pl.Int32) for i in range(n)]
@@ -394,57 +380,12 @@ class PairedAnalysis:
         collapsed = horizontal_aggregate_expr(self.group_step.aggregate, value_exprs, None)
         return collapsed.fill_null(self.nodata_value).alias("value")
 
-    def _band_valid_mask(self, i, raster_flat, paired_flat):
-        """Band `i`'s boolean valid mask, as a flat NumPy array -- the numpy-accumulator
-        counterpart to `_band_valid_expr` (mirrors `_band_masked_value`'s own relationship
-        to `_band_value_expr`: evaluated over a throwaway two-column frame instead of the
-        full wide one, so `_accumulate_paired_window` never holds more than one band's
-        arrays alive at once). See `_band_masked_value`'s docstring for why `fill_nan(None)`
-        is needed before evaluating either expression over `raster_flat`/`paired_flat`.
-        """
-        raster_col, paired_col = self.raster_cols[i], self.paired_cols[i]
-        df = pl.DataFrame({raster_col: raster_flat, paired_col: paired_flat})
-        df = df.with_columns([pl.col(c).fill_nan(None) for c in (raster_col, paired_col)])
-        result = df.select(self._band_valid_expr(i).alias("v"))
-        return result["v"].to_numpy()
 
-    def _band_masked_value(self, i, raster_flat, paired_flat):
-        """Band `i`'s masked collapse value ALONE, as a flat float64 NumPy array (`NaN`
-        standing in for Polars null -- the same substitution `fill_nan(None)` undoes on
-        the way in and `to_numpy()` reintroduces on the way out). This is exactly what
-        band `i` contributes to `_collapse_expr`'s wide `horizontal_aggregate_expr` call,
-        evaluated over a throwaway two-column, single-band frame instead of the full
-        `2 * len(band_sources)`-column one, so `_accumulate_paired_window` never holds
-        more than one band's worth of source arrays alive at once. `raster_flat`/
-        `paired_flat` carry `NaN` for nodata/pairing-miss on entry (the same convention
-        `_write_paired_notebook_raster`'s window loop already reads them in); converting
-        those to true Polars nulls with `fill_nan(None)` before evaluating the expression
-        matters because Polars does NOT treat float `NaN` as null on its own (`NaN > x`
-        is `True`, `NaN.is_null()` is `False`) -- skipping this step would silently change
-        which pixels the where-clause and the nodata-mask treat as missing.
-        """
-        raster_col, paired_col = self.raster_cols[i], self.paired_cols[i]
-        df = pl.DataFrame({raster_col: raster_flat, paired_col: paired_flat})
-        df = df.with_columns([pl.col(c).fill_nan(None) for c in (raster_col, paired_col)])
-        result = df.select(self._band_value_expr(i).alias("v"))
-        return result["v"].to_numpy().astype("float64")
-
-
-# `_validate_paired_group_aggregate`'s own docstring for the defense-in-depth check that
-# used to be missing here -- `group_step.aggregate == "count"` used to reach the wide
-# path today only because nothing rejected it for this shape, and `horizontal_aggregate_
-# expr` raised a bare `KeyError` for it; that gap is what this whole change closes).
-#
-# Deliberately a SEPARATE frozenset from `_STREAMING_AGGREGATES` just below, even though
-# the two happen to hold identical values today -- they answer different questions.
-# `_SUPPORTED_PAIRED_AGGREGATES` is the durable "does `PairedAnalysis` implement this
-# aggregate AT ALL" invariant `_validate_paired_group_aggregate` enforces; `_STREAMING_
-# AGGREGATES` is a dispatch knob a caller (or a test) can legitimately flip per-run to
-# force everything onto `_collapse_paired_window_wide` (see that set's own docstring and
-# `TestPairedAnalysisCountConsistency.test_accumulator_matches_wide_fallback`). Validating
-# against `_STREAMING_AGGREGATES` directly would make that monkeypatch ALSO disable
-# support for every aggregate for the duration of the patch, rather than merely routing
-# it onto the wide path -- exactly the trap that test hit during development.
+#: Which `group` aggregates `PairedAnalysis` implements at all -- see
+#: `_validate_paired_group_aggregate` for the defense-in-depth check that used to be
+#: missing here (`aggregate == "count"` used to reach the collapse only because nothing
+#: rejected it for this shape, and `horizontal_aggregate_expr` raised a bare `KeyError`
+#: for it).
 _SUPPORTED_PAIRED_AGGREGATES = frozenset({"min", "max", "sum", "mean", "count"})
 
 
@@ -463,11 +404,11 @@ def _validate_paired_group_aggregate(group_step):
     (see `pipeline.py`'s own "Why business validation is NOT wired into pydantic
     validators" section), and -- more importantly -- any FUTURE aggregate added to
     `fold.DECOMPOSABLE_AGGREGATES` without matching support added here: without this
-    check, that aggregate would compile clean and fall through to
-    `_collapse_paired_window_wide`, whose `horizontal_aggregate_expr` call raises a bare
-    `KeyError` for anything `HORIZONTAL_RASTER_AGGREGATES` doesn't know -- exactly the
-    latent defect `count` itself used to hit before this change. Converts that failure
-    mode into a plan-time `PipelineError` (a 400) for anything that reaches it.
+    check, that aggregate would compile clean and fall through to `_collapse_expr`, whose
+    `horizontal_aggregate_expr` call raises a bare `KeyError` for anything
+    `HORIZONTAL_RASTER_AGGREGATES` doesn't know -- exactly the latent defect `count` itself
+    used to hit before this change. Converts that failure mode into a plan-time
+    `PipelineError` (a 400) for anything that reaches it.
     """
     if group_step.aggregate not in _SUPPORTED_PAIRED_AGGREGATES:
         raise PipelineError(
@@ -478,33 +419,10 @@ def _validate_paired_group_aggregate(group_step):
         )
 
 
-# Formerly the dispatch knob `_write_paired_notebook_raster` read to pick
-# `_accumulate_paired_window` (streaming) vs. `_collapse_paired_window_wide` (wide-frame)
-# for a given `group_step.aggregate`. Now that the write path is built from
-# `scan_rasters`, it no longer dispatches on this at all -- it runs one scan +
-# `collect_batches`
-# pipeline for every supported aggregate (see that function's own docstring) -- so this frozenset is
-# now VESTIGIAL for that caller specifically. It stays defined, unchanged, purely because
-# `tests/api/test_pipeline_exec.py::TestPairedAnalysisCountConsistency.
-# test_accumulator_matches_wide_fallback` monkeypatches it
-# (`monkeypatch.setattr(paired_module, "_STREAMING_AGGREGATES", frozenset())`, which
-# requires the attribute to already exist) -- deleting it would break that test's ability
-# to patch it at all, even though the patch itself is now a no-op against the ported
-# write path (both of that test's two requests now run identical code regardless of this
-# value, which is why it still passes). `_accumulate_paired_window`/
-# `_collapse_paired_window_wide` themselves are ALSO no longer called by the write path --
-# see their own docstrings for why they're still here.
-
-_STREAMING_AGGREGATES = _SUPPORTED_PAIRED_AGGREGATES
-
-
 def _count_zone_gate(plan, flat_values, pairing_valid):
-    """`count`'s zero-vs-nodata split, applied identically after ANY of this module's
-    collapse paths (`_write_paired_notebook_raster`'s `scan_rasters`-driven
-    `.select()`, `_paired_notebook_tile`'s inline collapse, or the two retained
-    reference implementations `_accumulate_paired_window`/`_collapse_paired_window_wide`
-    -- see their own docstrings) computes a flat per-pixel band tally -- a no-op for
-    every other aggregate.
+    """`count`'s zero-vs-nodata split, applied by `_collapse_paired_frame` after either
+    output path's collapse computes a flat per-pixel band tally -- a no-op for every other
+    aggregate.
 
     `pairing_valid` (this pixel's own membership in the pairing crosswalk -- the only
     "is this pixel even in this plan's output domain at all" signal a `PairedAnalysis` has;
@@ -525,135 +443,6 @@ def _count_zone_gate(plan, flat_values, pairing_valid):
     return np.where(pairing_valid, flat_values, plan.nodata_value)
 
 
-def _collapse_paired_window_wide(plan, raster_srcs, window, pairing_ids, pairing_valid, shape, collapse_expr):
-    """The pre-port per-window collapse: every raster band and its paired lookup
-    read into one `2 * len(band_sources)`-column frame, then `plan._collapse_expr()`
-    evaluated once across all of it. `_write_paired_notebook_raster` no longer calls
-    this (it now runs `plan._collapse_expr()` against a `scan_rasters`-produced LazyFrame
-    instead -- see that function's own docstring) -- kept, unmodified, as a pinned
-    reference implementation: `tests/api/test_paired_port.py`'s differential test calls
-    this function directly and diffs its output against the ported write path's actual
-    COG output (`np.array_equal` on real pixel arrays), which is what proves the port
-    didn't silently change any of the four aggregates' math.
-    `TestPairedAnalysisCountConsistency.test_accumulator_matches_wide_fallback`'s
-    `_STREAMING_AGGREGATES` monkeypatch no longer reaches this function at all through
-    the ASGI write path it drives -- see that frozenset's own comment for why the test
-    still passes anyway (both of its requests now run the identical ported code
-    regardless of the patched value).
-    """
-    cols = {}
-    for i, (path, band) in enumerate(plan.band_sources):
-        src = raster_srcs[path]
-        band_data = src.read(band, window=window)
-        flat = band_data.ravel().astype("float64")
-        nodata = src.nodata
-        if nodata is not None:
-            flat = np.where(flat == nodata, np.nan, flat)
-        cols[plan.raster_cols[i]] = flat
-
-        lookup = plan.lookup_arrays.get(plan.calendar_values[i], plan.lookup_arrays.get(None))
-        cols[plan.paired_cols[i]] = _crosswalk_lookup_values(lookup, pairing_ids, pairing_valid)
-
-    df = pl.DataFrame(cols)
-    df = df.with_columns([pl.col(c).fill_nan(None) for c in plan.raster_cols + plan.paired_cols])
-    result = df.select(collapse_expr)
-    values = _count_zone_gate(plan, result["value"].to_numpy(), pairing_valid)
-    return values.reshape(shape)
-
-
-def _accumulate_paired_window(plan, raster_srcs, window, pairing_ids, pairing_valid, shape):
-    """Per-band streaming counterpart to `_collapse_paired_window_wide`, from before
-    the write path's rebuild onto `scan_rasters`: folds one band's masked value
-    (`plan._band_masked_value` -- the exact per-band piece `_collapse_expr` itself would
-    compute) into a running accumulator, so at most one band's raster/paired arrays are ever
-    alive at once instead of all `len(band_sources)` of them plus the wide Polars frame
-    built from them. Like `_collapse_paired_window_wide`, no longer called by
-    `_write_paired_notebook_raster` (which now streams via `scan_rasters` + `collect_batches`
-    instead of this hand-rolled accumulator -- see that function's own docstring) -- kept,
-    unmodified, as `tests/api/test_paired_port.py`'s differential-test oracle alongside its
-    wide-frame sibling. Bit-identical to `horizontal_aggregate_expr`'s own null-skipping
-    reduction (see sources.py): `min`/`max` seed their running accumulator at +-inf so a pixel no
-    band ever validates for never updates it; `sum` seeds at 0 and only adds a band's
-    value where that band is valid (Polars' own `sum_horizontal` treats a null band the
-    same way -- as a zero contribution, not as excluding the row); `mean` accumulates a
-    running sum and a running per-pixel valid-band COUNT and divides at the end, which is
-    what makes it differ from `sum` (dividing by contributor count, not by
-    `len(band_sources)`). `any_valid` -- OR'd across every band -- is this function's
-    counterpart to `horizontal_aggregate_expr`'s `no_contributor_at` (`all_horizontal`
-    over the per-band null masks): wherever no band ever validated, the pixel gets the
-    plan's own `nodata_value` instead of whatever the (otherwise untouched, +-inf/0)
-    accumulator seed happens to hold.
-
-    `count` is handled separately from the `any_valid`-gated aggregates above: it folds
-    `plan._band_valid_mask` (the exact per-band piece `_collapse_expr`'s `count` branch
-    itself would compute, mirroring how `masked`/`_band_masked_value` works for the other
-    four) into a plain running integer tally rather than a `min`/`max`/`sum`-style
-    accumulator, and is gated by `_count_zone_gate`'s `pairing_valid` check, NOT by
-    `any_valid` -- see that function's own docstring for why those two gates disagree on
-    purpose (a real 0 tally is `count`'s correct answer for an in-domain pixel; the
-    `any_valid`-gated aggregates have no equivalent "real 0" to protect).
-    """
-    aggregate = plan.group_step.aggregate
-    flat_shape = pairing_ids.shape
-
-    if aggregate == "count":
-        tally = np.zeros(flat_shape, dtype="int64")
-        for i, (path, band) in enumerate(plan.band_sources):
-            src = raster_srcs[path]
-            band_data = src.read(band, window=window)
-            raster_flat = band_data.ravel().astype("float64")
-            nodata = src.nodata
-            if nodata is not None:
-                raster_flat = np.where(raster_flat == nodata, np.nan, raster_flat)
-
-            lookup = plan.lookup_arrays.get(plan.calendar_values[i], plan.lookup_arrays.get(None))
-            paired_flat = _crosswalk_lookup_values(lookup, pairing_ids, pairing_valid)
-
-            tally += plan._band_valid_mask(i, raster_flat, paired_flat).astype("int64")
-
-        return _count_zone_gate(plan, tally, pairing_valid).reshape(shape)
-
-    if aggregate == "min":
-        acc = np.full(flat_shape, np.inf, dtype="float64")
-    elif aggregate == "max":
-        acc = np.full(flat_shape, -np.inf, dtype="float64")
-    else:  # sum / mean
-        acc = np.zeros(flat_shape, dtype="float64")
-    count = np.zeros(flat_shape, dtype="int64") if aggregate == "mean" else None
-    any_valid = np.zeros(flat_shape, dtype=bool)
-
-    for i, (path, band) in enumerate(plan.band_sources):
-        src = raster_srcs[path]
-        band_data = src.read(band, window=window)
-        raster_flat = band_data.ravel().astype("float64")
-        nodata = src.nodata
-        if nodata is not None:
-            raster_flat = np.where(raster_flat == nodata, np.nan, raster_flat)
-
-        lookup = plan.lookup_arrays.get(plan.calendar_values[i], plan.lookup_arrays.get(None))
-        paired_flat = _crosswalk_lookup_values(lookup, pairing_ids, pairing_valid)
-
-        masked = plan._band_masked_value(i, raster_flat, paired_flat)
-        valid = ~np.isnan(masked)
-        any_valid |= valid
-
-        if aggregate == "min":
-            acc = np.minimum(acc, np.where(valid, masked, np.inf))
-        elif aggregate == "max":
-            acc = np.maximum(acc, np.where(valid, masked, -np.inf))
-        else:
-            acc = acc + np.where(valid, masked, 0.0)
-            if aggregate == "mean":
-                count += valid
-
-    if aggregate == "mean":
-        safe_count = np.where(count == 0, 1, count)
-        acc = acc / safe_count
-
-    result = np.where(any_valid, acc, plan.nodata_value)
-    return result.reshape(shape)
-
-
 #: The pairing `GridCrosswalk`'s name: both the zone-id column it emits and the prefix of
 #: the per-band value columns `p0..pN`. `"p"` because `PairedAnalysis.paired_cols` -- which
 #: `_collapse_expr` and both retained reference implementations all write expressions
@@ -665,45 +454,29 @@ PAIRED_CROSSWALK_NAME = "p"
 
 
 def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwargs):
-    """`pivot_vector_to_band_wide` + `scan_rasters` + `collect_batches`, driven exactly like
-    `raster._write_raster_windowed`.
+    """`_paired_scan` + `collect_batches`, driven exactly like `raster._write_raster_windowed`.
 
-    The pivot turns the vector dataset's long `(zone, step)` values into one row per zone
-    and one column per band; the scan reads the pairing crosswalk once per window and uses
-    it to look that table up per pixel, producing one `p<i>` beside each `b<i>` plus the
-    raw zone column `p`. `plan._collapse_expr()` -- the SAME expression the retained wide
-    reference (`_collapse_paired_window_wide`) and the unported tile path
-    (`_paired_notebook_tile`) both evaluate -- then collapses each row through one
-    `.select()`, and `_take_window_rows` pulls the result back out window-at-a-time to be
-    written once per window. Nothing GDAL-related crosses a `yield`; that constraint lives
-    inside `scan_rasters`, not here.
+    The scan (shared with `_paired_notebook_tile`, whose only difference is that it restricts
+    it to one window) reads the pairing crosswalk once per window and looks the pivoted vector
+    table up per pixel, producing one `p<i>` beside each `b<i>` plus the raw zone column `p`.
+    `plan._collapse_expr()` collapses each row through one `.select()`, and `_take_window_rows`
+    pulls the result back out window-at-a-time to be written once per window. Nothing
+    GDAL-related crosses a `yield`; that constraint lives inside `scan_rasters`, not here.
 
-    `count`'s own zero-vs-nodata split (`_count_zone_gate`) needs `pairing_valid` -- whether
-    each pixel is even inside the pairing crosswalk's domain, independent of any band's own
-    lookup miss. That is the SAME crosswalk read the value columns come from, so `count`
-    just keeps the zone column in the `.select()` and tests it for nullity; no second read
-    of the crosswalk, and no second mode of the scan, is involved. (`scan_rasters` masks a
-    crosswalk zone column's nodata sentinel to null unconditionally -- see its `crosswalks`
-    parameter -- which is what makes `is_not_null()` the whole of the domain test here.)
+    `count`'s own zero-vs-nodata split (`_count_zone_gate`, applied by `_collapse_paired_frame`)
+    needs `pairing_valid` -- whether each pixel is even inside the pairing crosswalk's domain,
+    independent of any band's own lookup miss. That is the SAME crosswalk read the value
+    columns come from, so `count` just keeps the zone column in the `.select()` and tests it
+    for nullity; no second read of the crosswalk, and no second mode of the scan, is involved.
+    (`scan_rasters` masks a crosswalk zone column's nodata sentinel to null unconditionally --
+    see its `crosswalks` parameter -- which is what makes `is_not_null()` the whole of the
+    domain test here.)
 
-    `_STREAMING_AGGREGATES`'s wide-vs-streaming dispatch has no counterpart here: one
-    pipeline serves every supported aggregate. Both old collapse functions are superseded on
-    this path, kept unmodified as this path's differential-test oracles and (for
-    `_crosswalk_lookup_values`) the tile path's continued dependency -- see
-    `tests/api/test_paired_port.py`.
+    One pipeline serves every supported aggregate: there is no wide-vs-streaming dispatch on
+    this path, and none on the tile path either.
     """
     if not plan.band_sources:
         return False
-
-    band_df = pl.DataFrame(
-        {
-            "path": [path for path, _ in plan.band_sources],
-            "band": [band for _, band in plan.band_sources],
-        }
-    )
-    paths, row_indices, bands = group_rows_by_path(band_df)
-    pairing_path = str(plan.pairing_crosswalk_path)
-    is_count = plan.group_step.aggregate == "count"
 
     with ExitStack() as stack:
         with raster_gdal_env():
@@ -720,36 +493,8 @@ def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwar
             profile.update(profile_kwargs)
             output = stack.enter_context(rio.open(str(out_path), "w", **profile))
 
-        collapse_expr = plan._collapse_expr()
-
-        # One row per band, in `band_sources` order -- the band-wide metadata frame's only
-        # load-bearing property here is its HEIGHT, which is what `band_column_names`/
-        # `crosswalk_value_column_names` count `b<i>`/`p<i>` off. `PairedAnalysis` has no
-        # dimension frame of its own to hand over (that is the two-shape dispatch this class
-        # still predates), so the minimal frame carrying that height is built here.
-        metadata_df = pl.DataFrame({"_band": pl.Series(range(len(plan.band_sources)), dtype=pl.UInt32)})
-
-        vector_wide = pivot_vector_to_band_wide(
-            metadata_df,
-            plan._vector_long,
-            plan._vector_band_steps,
-            step_column="_step",
-            prefix=PAIRED_CROSSWALK_NAME,
-        )
-        assert crosswalk_value_column_names(metadata_df, PAIRED_CROSSWALK_NAME) == plan.paired_cols
-
-        lf = scan_rasters(
-            paths,
-            row_indices,
-            bands,
-            crosswalks=[GridCrosswalk(name=PAIRED_CROSSWALK_NAME, path=pairing_path, values=vector_wide)],
-        )
-
-        # Never `.filter()` this lf: `_take_window_rows` requires strict, gapless
-        # raster-pixel order (see its own docstring) -- `count`'s zone column is carried
-        # along for `_count_zone_gate` to MASK afterward, never to drop rows.
-        select_cols = [pl.col(PAIRED_CROSSWALK_NAME), collapse_expr] if is_count else [collapse_expr]
-        lf = lf.select(select_cols)
+        lf, _metadata_df = _paired_scan(plan)
+        lf = lf.select(_paired_select_columns(plan, plan._collapse_expr()))
 
         chunk_size = blocks_per_batch * block_height * block_width
         batch_iter = iter(lf.collect_batches(chunk_size=chunk_size, maintain_order=True))
@@ -759,11 +504,7 @@ def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwar
             needed = window.height * window.width
             result, buffer = _take_window_rows(batch_iter, buffer, needed)
 
-            values = result["value"].to_numpy()
-            if is_count:
-                pairing_valid = result[PAIRED_CROSSWALK_NAME].is_not_null().to_numpy()
-                values = _count_zone_gate(plan, values, pairing_valid)
-
+            values = _collapse_paired_frame(plan, result)
             block = values.astype(plan.out_dtype, copy=False).reshape((1, window.height, window.width))
             output.write(block, window=window)
             del result, block
@@ -771,73 +512,134 @@ def _write_paired_notebook_raster(plan: PairedAnalysis, out_path, **profile_kwar
     return True
 
 
+def _paired_scan(plan, read_windows=None):
+    """The scan both output paths share: every raster band, plus the pivoted vector table
+    looked up per pixel through the pairing crosswalk.
+
+    A free function taking `plan` rather than a method, because what it builds belongs to
+    the REQUEST (these bands, this pairing crosswalk, this pivot) and not to the plan
+    object, and because having the write path and the tile path call one function is the
+    whole point -- the two differ only in `read_windows` (the whole raster, batched, versus
+    one tile's source footprint) and in what they do with the collapsed rows.
+
+    Returns `(lf, metadata_df)`; the caller selects `plan._collapse_expr()` off `lf` and,
+    for `count`, keeps `PAIRED_CROSSWALK_NAME` beside it for `_count_zone_gate`.
+    """
+    band_df = pl.DataFrame(
+        {
+            "path": [path for path, _ in plan.band_sources],
+            "band": [band for _, band in plan.band_sources],
+        }
+    )
+    paths, row_indices, bands = group_rows_by_path(band_df)
+
+    # One row per band, in `band_sources` order -- the band-wide metadata frame's only
+    # load-bearing property here is its HEIGHT, which is what `band_column_names`/
+    # `crosswalk_value_column_names` count `b<i>`/`p<i>` off. `PairedAnalysis` has no
+    # dimension frame of its own to hand over (that is the two-shape dispatch this class
+    # still predates), so the minimal frame carrying that height is built here.
+    metadata_df = pl.DataFrame({"_band": pl.Series(range(len(plan.band_sources)), dtype=pl.UInt32)})
+
+    vector_wide = pivot_vector_to_band_wide(
+        metadata_df,
+        plan._vector_long,
+        plan._vector_band_steps,
+        step_column="_step",
+        prefix=PAIRED_CROSSWALK_NAME,
+    )
+    assert crosswalk_value_column_names(metadata_df, PAIRED_CROSSWALK_NAME) == plan.paired_cols
+
+    lf = scan_rasters(
+        paths,
+        row_indices,
+        bands,
+        crosswalks=[
+            GridCrosswalk(
+                name=PAIRED_CROSSWALK_NAME,
+                path=str(plan.pairing_crosswalk_path),
+                values=vector_wide,
+            )
+        ],
+        read_windows=read_windows,
+    )
+    return lf, metadata_df
+
+
+def _collapse_paired_frame(plan, frame):
+    """`plan._collapse_expr()`'s result as a flat NumPy array, with `count`'s zone gate
+    already applied -- the two steps that always go together, wherever the rows came from.
+
+    `frame` is the already-collected result of selecting `_paired_scan`'s collapse columns
+    (the zone column first, for `count`).
+    """
+    values = frame["value"].to_numpy()
+    if plan.group_step.aggregate == "count":
+        pairing_valid = frame[PAIRED_CROSSWALK_NAME].is_not_null().to_numpy()
+        values = _count_zone_gate(plan, values, pairing_valid)
+    return values
+
+
+def _paired_select_columns(plan, collapse_expr):
+    """Never `.filter()` a paired scan: `_take_window_rows` requires strict, gapless
+    raster-pixel order (see its own docstring), and the tile path reshapes the rows into a
+    window just as positionally. `count`'s zone column is carried along for
+    `_count_zone_gate` to MASK afterward, never to drop rows.
+    """
+    if plan.group_step.aggregate == "count":
+        return [pl.col(PAIRED_CROSSWALK_NAME), collapse_expr]
+    return [collapse_expr]
+
+
 async def _paired_notebook_tile(plan: PairedAnalysis, x, y, z, format, tile_size=256):
-    """Mirrors `RasterGridAnalysis.get_tile`'s `WarpedVRT`-based shape, over every raster band plus
-    the pairing crosswalk warped onto the requested tile grid, then the same per-pixel
-    collapse `_write_paired_notebook_raster` uses.
+    """The same `_paired_scan` the write path runs, restricted to the one source window the
+    tile's footprint covers, collapsed the same way, and warped onto the tile grid LAST.
+
+    The tile is rendered in the sources' OWN CRS and reprojected only once the per-pixel
+    band algebra is done, which is what lets that algebra be the identical scan-and-collapse
+    `_write_paired_notebook_raster` runs. Warping first -- one `WarpedVRT` per raster band
+    plus one for the pairing crosswalk, which is what this did -- forced a hand-rolled
+    parallel collapse instead, because no source has reprojection to offer.
+
+    Reprojecting the PAIRING CROSSWALK is the part that most needed to stop: its pixels are
+    zone IDs, and a zone ID resampled onto a foreign grid is only meaningful under nearest
+    neighbour. Here it is never resampled at all -- it is read on its own grid, positionally
+    beside the band pixels, and only the collapsed RESULT crosses CRSs.
+    `tests/api/test_paired_port.py` pins that the ported tile and the warp-first one agree
+    pixel for pixel, and `tests/api/test_tile_warp.py` pins the warp geometry itself.
     """
     if not plan.band_sources:
         return None
 
     tile_bounds = BoundingBox(*mercantile.xy_bounds(x, y, z))
 
-    with ExitStack() as stack:
-        raster_srcs = [stack.enter_context(rio.open(path)) for path, _ in plan.band_sources]
-        pairing_src = stack.enter_context(rio.open(str(plan.pairing_crosswalk_path)))
-
-        ref = raster_srcs[0] if raster_srcs else pairing_src
+    with raster_gdal_env(), rio.open(plan.band_sources[0][0]) as ref:
         dataset_bounds = BoundingBox(*transform_bounds(ref.crs, "EPSG:3857", *ref.bounds))
         if disjoint_bounds(dataset_bounds, tile_bounds):
             return None
+        window = tile_source_window(ref, tile_bounds)
+        src_transform, src_crs = ref.transform, ref.crs
 
-        tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
-
-        cols = {}
-        for i, ((path, band), src) in enumerate(zip(plan.band_sources, raster_srcs)):
-            raster_nodata = src.nodata if src.nodata is not None else -9999
-            vrt = stack.enter_context(
-                WarpedVRT(
-                    src,
-                    crs="EPSG:3857",
-                    transform=tile_transform,
-                    width=tile_size,
-                    height=tile_size,
-                    nodata=raster_nodata,
-                    add_alpha=False,
-                )
-            )
-            data = vrt.read(band).ravel().astype("float64")
-            data = np.where(data == raster_nodata, np.nan, data)
-            cols[plan.raster_cols[i]] = data
-
-        pairing_nodata = pairing_src.nodata if pairing_src.nodata is not None else -1
-        pairing_vrt = stack.enter_context(
-            WarpedVRT(
-                pairing_src,
-                crs="EPSG:3857",
-                transform=tile_transform,
-                width=tile_size,
-                height=tile_size,
-                nodata=pairing_nodata,
-                add_alpha=False,
-            )
+    if window is None:
+        # The tile's footprint misses the source's pixels entirely, even though it
+        # overlapped the (rectangular, reprojected) dataset bounds tested above. That is a
+        # rendered tile of nothing, not a missing tile.
+        tile_values = np.full((1, tile_size, tile_size), plan.nodata_value, dtype=plan.out_dtype)
+    else:
+        lf, _metadata_df = _paired_scan(plan, read_windows=[window])
+        frame = lf.select(_paired_select_columns(plan, plan._collapse_expr())).collect()
+        values = _collapse_paired_frame(plan, frame)
+        tile_values = warp_window_to_tile(
+            values.astype(plan.out_dtype, copy=False).reshape((1, window.height, window.width)),
+            window=window,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            tile_bounds=tile_bounds,
+            tile_size=tile_size,
+            nodata=plan.nodata_value,
         )
-        pairing_raw = pairing_vrt.read(1)
-        pairing_ids = pairing_raw.ravel().astype("int64")
-        pairing_valid = pairing_ids != int(pairing_nodata)
-
-        for i in range(len(plan.band_sources)):
-            lookup = plan.lookup_arrays.get(plan.calendar_values[i], plan.lookup_arrays.get(None))
-            cols[plan.paired_cols[i]] = _crosswalk_lookup_values(lookup, pairing_ids, pairing_valid)
-
-    df = pl.DataFrame(cols)
-    df = df.with_columns([pl.col(c).fill_nan(None) for c in plan.raster_cols + plan.paired_cols])
-    result = df.select(plan._collapse_expr())
-    values = _count_zone_gate(plan, result["value"].to_numpy(), pairing_valid)
-    values = values.reshape(tile_size, tile_size)
 
     legend = _legend_for(plan.color_map)
-    color = legend.colorize_pixels(values[np.newaxis, :, :])
+    color = legend.colorize_pixels(tile_values)
     image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
     with BytesIO() as memfile:
         image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))

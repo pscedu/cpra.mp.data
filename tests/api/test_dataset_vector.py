@@ -1,7 +1,8 @@
 """Tests for the Dataset query pipeline on vector (Parquet) grids.
 
-The five stages run in the order documented in docs/data-analysis-api.md:
-filter -> calculate -> group and aggregate -> transform and extract -> sort.
+A flat `Options` request lowers (in `stages.lower_flat_options`) to the op list
+`apply_params` walks: filter -> calculate -> group, then the summarize/extract hook
+and the sort.
 """
 
 import polars as pl
@@ -179,9 +180,9 @@ class TestValueWhereStage:
     ):
         """PLAIN (non-aggregating: no group_aggregate/summarize_aggregate) is the one
         case where a `where` value conjunct behaves differently from the retired
-        `value_where`, which always masked -- see `Dataset._apply_filter_params`'s
-        docstring: there is no aggregate downstream here for a masked null to fall into
-        unnoticed, so a failing row is dropped outright instead."""
+        `value_where`, which always masked -- see `ops.FilterOp.mask_value`: there is no
+        aggregate downstream here for a masked null to fall into unnoticed, so a failing
+        row is dropped outright instead."""
         dataset = dataset_factory(DIMENSIONS, where="value > 2035")
         await dataset.apply_params()
         df = dataset.materialize()
@@ -410,7 +411,7 @@ class TestCalculateStage:
     `calculate` entries (`value * -1`/`* 10`/`* 100`); the fields
     themselves have since been deleted from `Options` (not just their HTTP spelling), along with the
     sugar-expansion and legacy-vs-generic mixing-rejection logic that used to sit beside
-    what is now `stages.resolve_calculate_entries` -- so what these tests pin is now expressed directly
+    the `calculate` option handling -- so what these tests pin is now expressed directly
     as the generic `calculate` entry each legacy parameter used to expand into.
     """
 
@@ -549,7 +550,7 @@ class TestGenericCalculate:
     # see `TestCalculateStage.test_negate_flips_matching_rows` above, which pins that
     # entry's behavior directly since there is no more legacy field to compare it
     # against -- and the latter exercised the legacy/generic mixing-rejection branch of
-    # what is now `stages.resolve_calculate_entries`, deleted along with the fields that could
+    # the old `calculate` option handling, deleted along with the fields that could
     # ever be mixed. Neither has anything left to test.
 
     async def test_invalid_expression_is_a_400_naming_the_entry(
@@ -608,7 +609,7 @@ class TestGroupStage:
         `group_by="scenario_id"` key) is absent from the result entirely -- it used to
         come back as an all-null, Null-dtype placeholder column, which was a meaningless
         artifact every caller of `analyze_data`/the tabular API saw for every such
-        dimension (see `VectorGridAnalysis._collapse_group`'s comment)."""
+        dimension (see `vector.apply_group_by`'s docstring)."""
         dataset = dataset_factory(DIMENSIONS, group_by="scenario_id", group_aggregate="max")
         await dataset.apply_params()
         df = dataset.materialize()
@@ -776,8 +777,9 @@ class TestFoldRouting:
     """Dataset-level check that the two vector group_by sites actually call the fold
     (api/fold.py) exactly when `api.fold.should_fold_group_by`'s rule says they should.
     `test_fold.py::TestShouldFoldGroupBy` pins the rule itself as a pure function; this
-    pins that `_apply_group_params` and `_apply_transform_params_vector` feed it the
-    arguments the rule needs and honor its answer.
+    pins that the `GroupOp` lowering (`vector.apply_group_by`) and
+    `VectorGridAnalysis._apply_transform_params_impl` feed it the arguments the rule needs
+    and honor its answer.
     """
 
     @pytest.fixture
@@ -839,8 +841,9 @@ class TestFoldRouting:
     async def test_crosswalk_reaggregation_routes_through_the_fold_when_unfiltered(
         self, dataset_factory, annual_data, crosswalk, spy_fold
     ):
-        """No `group_by`/`group_aggregate` here, so `_apply_group_params` returns before
-        ever considering a fold -- only `_apply_transform_params_vector`'s crosswalk
+        """No `group_by`/`group_aggregate` here, so no `GroupOp` is lowered at all and
+        `vector.apply_group_by` never runs -- only
+        `VectorGridAnalysis._apply_transform_params_impl`'s crosswalk
         reaggregation site is reachable, and it fires because the request is unfiltered."""
         dataset = dataset_factory(
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="sum"
@@ -869,9 +872,9 @@ class TestFoldRouting:
     ):
         """With both `group_aggregate` and `summarize_by` set and nothing filtering the
         request, both fold-eligible sites are reachable and both fire: the group_by
-        collapse in `_apply_group_params` (always keyed on grid_cell in long format,
+        collapse in `vector.apply_group_by` (always keyed on grid_cell in long format,
         which runs first) and the crosswalk reaggregation in
-        `_apply_transform_params_vector` (some crosswalks land on a finer destination
+        `VectorGridAnalysis._apply_transform_params_impl` (some crosswalks land on a finer destination
         than the source grid; see that method's docstring), operating on the
         already-collapsed result of the first."""
         dataset = dataset_factory(
@@ -890,7 +893,7 @@ class TestCountByValue:
     with the count of source grid cells sharing that value -- a categorical count, a
     genuinely different output SHAPE from every other summarize_aggregate (which collapse
     a zone to one row). See `expressions.count_by_value_frame` for the cardinality bound
-    and `Dataset._apply_transform_params_vector`'s count_by_value branch for the
+    and `VectorGridAnalysis._apply_transform_params_impl`'s count_by_value branch for the
     vector-side wiring: no `scale_factor` multiply (unlike every other summarize_aggregate
     here), since rescaling a categorical code before counting it would change which raw
     values collapse into "the same" category.
@@ -950,8 +953,8 @@ class TestCountByValue:
     async def test_composes_with_where_value_conjunct_mask_then_count(
         self, dataset_factory, categorical_annual_data, crosswalk
     ):
-        """A `where` value conjunct masks a non-matching source cell's value to null in
-        `_apply_filter_params` -- upstream of this stage -- so it is excluded here the
+        """A `where` value conjunct masks a non-matching source cell's value to null when
+        its `FilterOp` is lowered -- upstream of the summarize -- so it is excluded here the
         same way `count_by_value_frame` excludes any other null: not a category, and not
         counted under any value."""
         expected = self._expected_counts()

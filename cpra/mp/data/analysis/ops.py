@@ -100,6 +100,25 @@ class FilterOp(BaseModel):
     `LOWERING_TABLE`, keyed by predicate kind, not by a field here -- `expressions.
     classify_where` is what tells the two apart, and it needs no new field on this op to
     keep doing that.
+
+    `mask_value` is the ONE thing this op records that a pipeline step never declares: for
+    a LONG-shape value conjunct, whether a non-matching row is masked to null
+    (`mask_value=True`) or dropped outright (`False`, the default and the only value
+    `compile_ops` ever emits). It exists because the flat request surface has no declared
+    order at all -- `stages.lower_flat_options` emits its single `where` FIRST,
+    unconditionally, ahead of whatever `group_by`/`summarize_by` the same request asked
+    for -- so a flat `where` on an AGGREGATING request is by construction hoisted above the
+    aggregate it was written against, and masking is what lets it compose with that
+    aggregate's own null-skipping behavior instead of changing the aggregate's denominator
+    or erasing a group entirely (see `stages.lower_flat_options`, which sets it, and
+    `vector.apply_long_op`, which reads it). A pipeline `filter` step runs at its own
+    declared position, so there is no downstream null for an aggregate to skip and a drop
+    is the only coherent lowering -- hence the default.
+
+    The band-wide lowering ignores this field: a value conjunct there is ALWAYS a per-cell
+    mask, because that shape must stay positionally aligned to the raster (see
+    `raster.apply_value_filter_band_wide`), which is a property of the shape rather than of
+    the request.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -109,6 +128,7 @@ class FilterOp(BaseModel):
     input: str
     where: str
     output: str
+    mask_value: bool = False
 
 
 class CalculateOp(BaseModel):
@@ -116,6 +136,15 @@ class CalculateOp(BaseModel):
     `long` lowers this onto `with_columns` over the `value` column; band-wide onto
     `with_columns` across every band column (reusing `sources.band_calculate_passes`'s
     existing vocabulary, not a second implementation) -- see `LOWERING_TABLE`.
+
+    `label` is what a 400 out of `expressions.compile_calculate_entries` calls this entry.
+    It is diagnostic only -- nothing dispatches on it -- and defaults to `None`, meaning
+    "name me after my step", which is what a pipeline step wants (`step.3`). The flat
+    request surface sets it explicitly to `calculate.N`, the name its own `calculate.N.
+    expression=`/`calculate.N.where=` query parameters already use (`api/__init__.py`
+    parses exactly those keys), so a caller's error message names the parameter they
+    actually wrote. `calculate_label` below is the one place the two spellings are
+    resolved.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -126,6 +155,7 @@ class CalculateOp(BaseModel):
     expression: str
     where: str | None = None
     output: str
+    label: str | None = None
 
 
 class GroupOp(BaseModel):
@@ -151,6 +181,20 @@ Op = Annotated[
     Union[ProjectOp, JoinOp, FilterOp, CalculateOp, GroupOp],
     Field(discriminator="op"),
 ]
+
+
+def calculate_label(op: CalculateOp) -> str:
+    """What a 400 raised while compiling `op`'s expression should call it: the explicit
+    `CalculateOp.label` a flat request set (`calculate.1`, `calculate.2`, ... -- the query
+    parameter the caller actually wrote), else `step.<step_no>`, the pipeline step's own
+    position.
+
+    One function rather than the same `or` twice, because both lowerings of `calculate`
+    need it -- `vector.apply_long_op` and `raster.apply_band_wide_op` -- and a label that
+    disagreed between the two would make the SAME request name its offending entry
+    differently depending on which shape it happened to run against.
+    """
+    return op.label if op.label is not None else f"step.{op.step_no}"
 
 
 class Shape(str, Enum):

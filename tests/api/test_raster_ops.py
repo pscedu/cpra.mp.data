@@ -8,7 +8,7 @@ dictionary the NEXT step reads its band names out of. `RasterGridAnalysis` wires
 them through `apply_band_ops`, which the request-level tests in `test_dataset_raster.py`,
 `test_write_raster.py`, and `test_pipeline_exec.py` cover end to end; this file is the
 per-primitive layer underneath, the same way `sources.scan_rasters` is exercised directly
-in `test_raster_source.py` rather than only through `_summarize_zone_stats_plugin`.
+in `test_raster_source.py` rather than only through `summarize_zone_stats`.
 
 A sixth function, `apply_project_band_wide`, used to be tested here too; it was deleted
 unused -- see the comment at the end of this file.
@@ -98,6 +98,57 @@ class TestScanRastersAttachWithoutFilter:
         out = lf.collect()
 
         assert np.array_equal(out["grid_cell"].to_numpy(), expected_zones)
+
+    def test_read_windows_restricts_the_scan_to_those_pixels(self, base_path, zone_crosswalk_path):
+        """`read_windows` is a SPATIAL restriction: the rows out are exactly the named
+        windows' pixels, and every column still says what it would have said in a full scan
+        of the same pixels.
+
+        This is what lets a map tile run the same scan a full-raster write runs
+        (`paired._paired_notebook_tile` hands over the one window covering the tile's
+        footprint), so the property that matters is not just "fewer rows" but "the SAME rows
+        the full scan would have produced at those positions".
+        """
+        from rasterio.windows import Window
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _: _gradient())
+        paths = list(base_path.rglob("*.tif"))
+        window = Window(col_off=3, row_off=5, width=11, height=7)
+
+        full = scan_rasters(paths, [[0]], [None], zones_path=zone_crosswalk_path, with_px=True).collect()
+        restricted = scan_rasters(
+            paths, [[0]], [None], zones_path=zone_crosswalk_path, with_px=True, read_windows=[window]
+        ).collect()
+
+        assert restricted.height == window.width * window.height
+        assert restricted.height < full.height
+
+        # `_px` is indexed over the FULL raster, not the window, so it is the join key
+        # between the two scans -- and the whole row must match, not just the band value.
+        assert restricted.equals(full.filter(pl.col("_px").is_in(restricted["_px"])))
+
+        expected_px = [
+            row * GRID.width + col
+            for row in range(window.row_off, window.row_off + window.height)
+            for col in range(window.col_off, window.col_off + window.width)
+        ]
+        assert restricted["_px"].to_list() == expected_px
+
+    def test_several_read_windows_are_concatenated_in_order(self, base_path):
+        """Windows are emitted in the order given and are not re-chunked to the batch budget
+        -- a caller specific enough to name its own windows has already decided how much it
+        wants in memory at once."""
+        from rasterio.windows import Window
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _: _gradient())
+        paths = list(base_path.rglob("*.tif"))
+        windows = [Window(0, 20, 4, 2), Window(0, 0, 4, 2)]
+
+        out = scan_rasters(paths, [[0]], [None], with_px=True, read_windows=windows).collect()
+
+        assert out.height == 16
+        assert out["_px"].to_list()[:4] == [20 * GRID.width + c for c in range(4)]
+        assert out["_px"].to_list()[8:12] == [0, 1, 2, 3]
 
     def test_zone_ids_without_zones_path_is_rejected(self, base_path):
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _: 1)
@@ -371,8 +422,8 @@ class TestBandGroupRowIdxs:
 
 
 class TestBandMetadataGroup:
-    """The metadata half of a group, shared by `RasterGridAnalysis._collapse_group` and
-    the `apply_band_ops` replay."""
+    """The metadata half of a group, shared by `collapse_band_group` and the
+    `apply_band_ops` replay."""
 
     def test_keeps_one_row_per_group_and_drops_collapsed_dimensions(self):
         metadata = pl.DataFrame({"calendar_year": [2030, 2030, 2040], "model_group_id": [500, 600, 500]})
@@ -448,12 +499,12 @@ class TestApplyGroupBandWide:
         assert out.collect().columns == ["grid_cell", "b0"]
 
     def test_count_aggregate_is_rejected(self):
-        """`RasterGridAnalysis._collapse_group` rejects `group_aggregate="count"` with
-        this exact message before any pixel-read stage runs -- this function has no
-        `self` to raise an `AnalysisError` off of, so it raises `ExpressionError`
-        instead, with the identical text, rather than letting a bare `KeyError` out of
+        """`collapse_band_group` rejects `group_aggregate="count"` with this exact
+        message before any pixel is read -- this function has no `self` to raise an
+        `AnalysisError` off of, so it raises `ExpressionError` instead, with the identical
+        text, rather than letting a bare `KeyError` out of
         `HORIZONTAL_RASTER_AGGREGATES` reach a caller that got here without going through
-        `_collapse_group` first."""
+        `collapse_band_group` first."""
         lf = pl.LazyFrame({"b0": [10, 20], "b1": [30, 40]})
         metadata = pl.DataFrame({"calendar_year": [2030, 2040]})
 
@@ -755,7 +806,7 @@ class TestApplyBandOps:
 # DELETED. The other band-wide ops in `raster.py` are each wired into `apply_band_ops`,
 # which every pixel-read path replays; a band-wide `project` never joined them, because a
 # summarizing `project` reaches the crosswalk through `_apply_transform_params_impl` ->
-# `_summarize_zone_stats_plugin` (the zoned/filtered `scan_rasters` mode) instead. The
+# `summarize_zone_stats` (the zoned/filtered `scan_rasters` mode) instead. The
 # zone-attach-only scan mode it would have consumed is untouched and still exercised
 # directly by `TestScanRastersAttachWithoutFilter`, above.
 

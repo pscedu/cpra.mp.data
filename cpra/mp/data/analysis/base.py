@@ -13,51 +13,37 @@ FastAPI's own exception handling) reads `.status_code`/`.detail` off the caught 
 directly, which is why `AnalysisError` carries them as plain attributes rather than
 relying on the translation point.
 
-**The staged `apply_params` flow.** A `BaseAnalysis` instance mutates `self.lf` (a Polars
-LazyFrame) through five ordered stages, run once by `apply_params`:
+**The `apply_params` flow.** A `BaseAnalysis` instance mutates `self.lf` (a Polars
+LazyFrame) by walking ONE ordered list of ops, run once by `apply_params`. There is no
+second execution path: a request compiled from a declared pipeline arrives with its op
+list already attached as `self._pipeline_ops`, and a flat request (`where`, `calculate`,
+`group_by`/`group_aggregate`) is LOWERED into the equivalent list by
+`stages.lower_flat_options` at the top of `apply_params`. Both then go to `apply_steps`,
+the per-shape interpreter each subclass implements (`vector.VectorGridAnalysis.apply_steps`
+for long frames, `raster.RasterGridAnalysis.apply_steps` for band-wide ones).
 
-1. **filter** (`_apply_filter_params`) -- `where`'s dimension conjuncts become a
-   `.sql()`/`.filter()` on `self.lf`; its value conjunct is stashed on
-   `self._value_where` for later stages to apply (vector: immediately, as a mask or a
-   filter; raster: per band, once pixels are read). `options.grid_cell`, if given, is
-   applied here too, via the `_apply_grid_cell` hook.
-2. **calculate** (`_apply_calculate_params`) -- the generic `calculate` entries
-   (expression/where pairs) conditionally rewrite `value` in place (vector), or
-   are validated and stashed on `self._calculate_plans` for the pixel-read paths to
-   apply per band (raster, whose `self.lf` at this point is still the band-metadata
-   table, not pixels -- see `raster.apply_calculate_band_wide`).
-3. **group** (`_apply_group_params`) -- `group_by`/`group_aggregate` collapse rows via the
-   `_collapse_group` hook (vector: dimension-collapse across rows per grid_cell, folding
-   through `analysis.fold` when the collapse is cliff-shaped; raster: collapses the band
-   METADATA and records the group as a `self._band_ops` entry, for a later stage to
-   replay against actual pixels).
-4. **transform** (`_apply_transform_params`) -- `summarize_by`/`summarize_aggregate`
-   convert to another grid's cells via the `_apply_transform_params_impl` hook (vector: a
-   crosswalk-table join; raster: a zonal reduction against a crosswalk raster, which is
-   also where a raster's `self.lf` first becomes a real per-pixel-derived tabular frame).
-5. **sort/select** (`_apply_sort_params`) -- `sort`/`select` order and narrow the final
-   columns.
+Two options have no op form and so run around the walk rather than inside it:
+
+- `options.grid_cell` selects the INPUT, before any op sees it, via the `_apply_grid_cell`
+  hook -- it is not a step in the chain, it is which cells the chain starts from.
+- `sort`/`select` (`_apply_sort_params`) order and narrow the FINAL columns, after the
+  walk, since they describe the response rather than the data.
+
+`summarize_by`/`summarize_aggregate` sit between the two: they are a `project` in op form,
+but the flat surface deliberately does not lower them, because the flat surface has no
+declared order and a summarize is always last. Each interpreter calls
+`_apply_transform_params_impl` at the end of its walk instead (see
+`stages.lower_flat_options`).
 
 **Hook contract.** Each hook below is declared abstract here (raising
-`NotImplementedError`) and overridden once per subclass; every override must leave
-`self.lf` in the same SHAPE the base flow expects next (long format: dimension columns,
-`grid_cell`, `value`), since the following stage runs unconditionally regardless of which
-subclass produced it.
+`NotImplementedError`) and overridden once per subclass.
 
 - `async _apply_grid_cell(self)` -- apply `options.grid_cell` (IDs or coordinates) to
   `self.lf`. Vector: filters to matching `grid_cell` IDs, resolving coordinates to IDs
   first if needed, and records them on `self.grid_cell_ids`. Raster: samples the raster at
   each coordinate and rebuilds `self.lf` as a long-format (grid_cell/value) frame labeled
-  by coordinate, since a raster has no cell IDs of its own.
-- `_collapse_group(self, group_by_cols)` -- apply `group_by`/`group_aggregate` (already
-  validated not to be `count_by_value`, and, on input, `group_by_cols` is a list of
-  dimension names, empty meaning "aggregate with no grouping" -- see
-  `_get_group_by_columns`). Vector: a real `group_by(...).agg(...)` (or
-  `analysis.fold.fold_group_by` when cliff-shaped), DROPPING dimension columns left out
-  of the group (they no longer have a value, so they no longer have a column -- see the
-  method's own comment). Raster: no pixels are read here -- it collapses the band
-  metadata and appends a `self._band_ops` entry that a later stage (transform, tile, or
-  write) replays against actual band data.
+  by coordinate, since a raster has no cell IDs of its own -- which is also why this hook
+  is the one place a raster chain can CHANGE SHAPE before its walk begins.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
   converting to another grid's cells. Each implementation starts by calling
   `stages.validate_summarize_options`, which confirms both parameters (or neither) were
@@ -87,16 +73,16 @@ members named above are delegations to them, kept on the class only because
 algebra, and none of it depends on which ops ran. The catalog and frame-shape lookups
 (`variable`, `estimate_data_size`) are the same story, in `analysis/metadata.py`.
 
-**Where the LOGIC of the five stages lives.** Two layers, split by what they depend on.
-The ALGEBRA -- `apply_dimension_filter`/`apply_value_filter`/`apply_calculate_plans`
-below, plus `vector.apply_group_by`/`apply_project`/`apply_long_op` and `raster`'s
+**Where the LOGIC of an op lives.** Two layers, split by what they depend on. The ALGEBRA
+-- `apply_dimension_filter`/`apply_value_filter`/`apply_calculate_plans` below, plus
+`vector.apply_group_by`/`apply_project`/`apply_long_op` and `raster`'s
 `apply_*_band_wide` family -- is re-entrant and op-shaped: each takes an `lf` and returns
 one, so an interpreter walking a `list[ops.Op]` can invoke it once per op in whatever
-order the request declared. The OPTION HANDLING that reads `Options` and decides what to
-hand the algebra is `analysis/stages.py`, another module of plain free functions. The four
-`_apply_*_params` methods below are what is left once both layers are factored out: they
-read `self.options`, store results back on `self`, dispatch the subclass hook, and convert
-a typed library error to a 400 via `op_error_boundary` -- and nothing else.
+order the request declared. The OPTION HANDLING that reads `Options`, lowers it into that
+list, and makes the validations the list cannot express is `analysis/stages.py`, another
+module of plain free functions. What is left on this class once both layers are factored
+out is `apply_params` (five lines of "get the op list, walk it, sort"), the two hooks, and
+`op_error_boundary`, the single point where a typed library error becomes a 400.
 """
 
 from contextlib import contextmanager
@@ -113,31 +99,22 @@ from cpra.mp.data.analysis.expressions import (
 )
 from cpra.mp.data.analysis.fold import FoldError
 from cpra.mp.data.analysis.types import OutputType
-from cpra.mp.data.analysis.utils import get_lazy_frame, unpack_values
-from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.analysis.utils import get_lazy_frame
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import Legend
 from cpra.mp.data.variables import Variable
 
-# The accepted `group_by` values. (`sort`'s own choice list is `stages.SORT_CHOICES`,
-# next to the sort/select stage logic that validates against it.)
-DIMENSION_CHOICES = list(DIMENSIONS.keys())
 
-
-# -- re-entrant stage cores ---------------------------------------------------------
+# -- re-entrant op cores -------------------------------------------------------------
 #
-# Each function below is the same Polars logic `_apply_filter_params`/`_apply_calculate_
-# params` used to run only against `self.lf`/`self.options`, pulled out to take its own
-# arguments and return a new `lf` instead of mutating an instance -- so a caller walking a
-# `list[ops.Op]` in DECLARED order (either interpreter's `apply_steps`, via the shared
-# long lowering `vector.apply_long_op`) can invoke exactly the same stage logic once per
-# op, in whatever order the
-# pipeline actually declared, rather than the fixed five-stage order `apply_params` always
-# runs in. Each one raises the plain `ExpressionError`/`FoldError` its Polars-adjacent
-# helpers already raise -- never `AnalysisError` -- since these are library functions with
-# no `self._error` to call; every caller (a `BaseAnalysis` stage method, or the
-# interpreter) catches and converts at its own boundary, exactly like `_apply_filter_
-# params`/`_apply_calculate_params` already did for the logic now living here.
+# Each function below is Polars logic that once ran only against `self.lf`/`self.options`,
+# taking its own arguments and returning a new `lf` instead of mutating an instance -- so a
+# caller walking a `list[ops.Op]` in DECLARED order (either interpreter's `apply_steps`,
+# via the shared long lowering `vector.apply_long_op`) can invoke it once per op, in
+# whatever order the request actually declared. Each one raises the plain
+# `ExpressionError`/`FoldError` its Polars-adjacent helpers already raise -- never
+# `AnalysisError` -- since these are library functions with no `self._error` to call; the
+# interpreter catches and converts at its own boundary (`op_error_boundary`, below).
 def apply_dimension_filter(lf, where):
     """Split `where` into DIMENSION and VALUE conjuncts (`expressions.classify_where`) and
     apply the dimension half to `lf` via the same unrestricted `lf.sql()` path `where` has
@@ -149,8 +126,10 @@ def apply_dimension_filter(lf, where):
     dimension_filter` needs to decide whether a downstream `group_by`/`project` is
     cliff-shaped (see that method's docstring).
 
-    A falsy `where` (`None` or `""`) is a no-op: returns `(lf, None, False)` unchanged,
-    matching `_apply_filter_params`'s own `if self.options.where:` guard.
+    A falsy `where` (`None` or `""`) is a no-op: returns `(lf, None, False)` unchanged.
+    (`stages.lower_flat_options` emits no `FilterOp` at all for a request with no `where`,
+    and `ops.FilterOp.where` is required, so this guard is defensive rather than a path
+    any request surface reaches.)
     """
     if not where:
         return lf, None, False
@@ -170,13 +149,13 @@ def apply_value_filter(lf, value_where, *, mask):
     string by `apply_dimension_filter` or an equivalent split) to `lf`: as a MASK
     (`mask=True`, `pl.when(...).then(value).otherwise(None)` -- nulls a non-matching value
     rather than dropping its row, composing with a downstream aggregate's own null-
-    skipping behavior) or a row DROP (`mask=False`, `lf.filter(...)`). `_apply_filter_
-    params`'s docstring explains exactly when the OLD (fixed five-stage) flow picks
-    which: mask for an aggregating request (`_is_aggregating()`), drop otherwise. The
-    LONG-shape op lowering (`vector.apply_long_op`, shared by both interpreters) always
-    passes `mask=False` -- see that function's own docstring for why a straight drop, not
-    that conditional, is the only semantically coherent choice once filter/group/project
-    run in their own declared positions instead of a fixed order. (The BAND-WIDE lowering
+    skipping behavior) or a row DROP (`mask=False`, `lf.filter(...)`). The LONG-shape op
+    lowering (`vector.apply_long_op`, shared by both interpreters) passes
+    `ops.FilterOp.mask_value`, which is `True` only for the filter
+    `stages.lower_flat_options` emits for an AGGREGATING flat request -- see
+    `FilterOp.mask_value`'s docstring for why a straight drop is the only semantically
+    coherent choice once filter/group/project run in their own declared positions, and why
+    the orderless flat surface is the one case that needs the mask. (The BAND-WIDE lowering
     does not reach this function at all: it must stay positionally aligned to the raster,
     so its value filter is always a per-cell mask -- `raster.apply_value_filter_band_wide`.)
 
@@ -192,14 +171,14 @@ def apply_value_filter(lf, value_where, *, mask):
 
 def apply_calculate_plans(lf, calculate_plans):
     """Apply already-validated `expressions.CalculatePlan`s to a vector/tabular `lf`,
-    sequentially in list order (entry N+1 sees entry N's output) -- the re-entrant core of
-    `_apply_calculate_params`'s vector-side rewrite (the raster band-metadata early return
-    there has no equivalent here: this function always assumes `lf` already carries a real
-    `value` column, which is exactly what `_apply_calculate_params` checks with `_is_
-    raster_metadata_table()` before ever calling the logic now living here). A missing
-    value stays missing (`is_not_null()` guards every rewrite) and a row not matching a
-    plan's own `where` passes through unchanged, for the same reasons `_apply_calculate_
-    params`'s docstring gives.
+    sequentially in list order (entry N+1 sees entry N's output) -- the LONG-shape half of
+    `calculate`'s lowering, reached from `vector.apply_long_op`. It assumes `lf` already
+    carries a real `value` column; a band-wide frame is band METADATA and has none, so the
+    band-wide half (`raster.apply_band_wide_op`) records the compiled plan for the pixel
+    read instead of calling this. A missing value stays missing (`is_not_null()` guards
+    every rewrite) and a row not matching a plan's own `where` passes through unchanged, so
+    a conditional `calculate` rewrites only where it applies and leaves the rest of the
+    column alone.
 
     An empty `calculate_plans` is a no-op: returns `lf` unchanged.
     """
@@ -281,19 +260,20 @@ class BaseAnalysis:
         self.grid_cell_ids = None
         self.summarize_grid_cell_ids = None
         # `RasterGridAnalysis`-only band bookkeeping (a vector frame never sets either
-        # -- its own `_collapse_group` just reassigns `self.lf` directly, since a
+        # -- its interpreter just reassigns `self.lf` directly, since a
         # row-per-grid_cell frame has no band columns to keep a dictionary for).
         #
         # `self.lf` for a raster analysis starts as the per-band metadata table (one row
         # per selected (path, band)) and stays band metadata until a summarize converts
         # it to a tabular frame: it is the COLUMN DICTIONARY for the band-wide frame a
         # pixel read will produce, narrowed and collapsed in step with the ops declared
-        # against it. `_raw_band_frame` is the snapshot the FIRST `_collapse_group` call
-        # takes before `self.lf` moves on to collapsed (dimension-only) metadata, since
+        # against it. `_raw_band_frame` is the snapshot the FIRST `GroupOp`
+        # (`raster.collapse_band_group`) takes before `self.lf` moves on to collapsed
+        # (dimension-only) metadata, since
         # every pixel read still needs the original (path, band) rows to build its scan;
         # it is also the "a group has run" flag, which is what
         # `RasterGridAnalysis._band_frame` and the dimension-filter pushdown rule in
-        # `RasterGridAnalysis.apply_steps` both test.
+        # `raster.apply_band_wide_op` both test.
         #
         # `_band_ops` is the ordered replay recipe: one entry per filter/calculate/group
         # step actually declared, in declared order, each carrying only what the caller
@@ -303,35 +283,34 @@ class BaseAnalysis:
         # that function and `RasterGridAnalysis`'s three pixel-read methods.
         self._raw_band_frame = None
         self._band_ops = []
-        # Set by `_apply_filter_params`, the first step `apply_params` runs, from
-        # `where`'s value conjuncts (see `expressions.classify_where`) -- the internal
-        # successor to the retired `Options.value_where` field. `None` means `where`
-        # contained no value conjunct; every other consumer of the old `value_where`
-        # field (`RasterGridAnalysis._apply_transform_params_impl`,
-        # `_summarize_zone_stats_plugin`, `_summarize_count_by_value_plugin`) reads this
-        # attribute instead now.
+        # Set by whichever `apply_steps` ran, from each `FilterOp`'s value conjuncts (see
+        # `expressions.classify_where`) -- the internal successor to the retired
+        # `Options.value_where` field. `None` means no filter contributed a value
+        # conjunct; every other consumer of the old `value_where` field
+        # (`RasterGridAnalysis._apply_transform_params_impl`, `summarize_zone_stats`,
+        # `summarize_count_by_value`) reads this attribute instead now.
         self._value_where = None
-        # Set by `_apply_calculate_params`: the validated `CalculatePlan`s for this
-        # request (the generic `calculate` entries), in application order. Empty when
-        # the request has no calculate parameters at all. A vector frame consumes them
-        # immediately inside `_apply_calculate_params`; the raster pixel-read paths
-        # (tile/write/summarize) flush it into `_band_ops` (as a `("calculate", plans)`
-        # entry) and apply it per band via `raster.apply_calculate_band_wide`.
+        # Set by whichever `apply_steps` ran: the validated `CalculatePlan`s for this
+        # request, in application order. Empty when the request declared no `calculate`
+        # at all. A long frame consumes them immediately (`apply_calculate_plans`, from
+        # `vector.apply_long_op`); a band-wide one accumulates them here and the raster
+        # pixel-read paths (tile/write/summarize) flush them into `_band_ops` (as a
+        # `("calculate", plans)` entry) to apply per band via
+        # `raster.apply_calculate_band_wide`.
         self._calculate_plans = []
-        # Also set by `_apply_filter_params`: whether `where` produced at least one
-        # DIMENSION conjunct, i.e. whether it actually did anything that could shrink
-        # the row count reaching a group_by -- see `_has_selective_dimension_filter`,
-        # which used to just check `options.where is not None` and is now wrong to,
-        # since `where` may hold only a value conjunct (a mask, not a row filter).
+        # Also set by whichever `apply_steps` ran: whether any `FilterOp` produced at
+        # least one DIMENSION conjunct, i.e. whether the request actually did anything
+        # that could shrink the row count reaching a group -- see
+        # `_has_selective_dimension_filter`, which cannot just check
+        # `options.where is not None`, since a `where` may hold only a value conjunct
+        # (a mask, not a row filter).
         self._where_has_dimension_conjunct = False
-        # Set by `planner._compile_single_input_chain`'s fast path to
-        # `ops.compile_ops(pipeline)`'s
+        # Set by `planner._compile_single_input_chain` to `ops.compile_ops(pipeline)`'s
         # `list[Op]` -- never by this constructor itself, and never by anything on the
         # flat (non-pipeline) request surface. `None` (the default here) means "no op IR
-        # was attached", the signal both `apply_params` overrides (`VectorGridAnalysis`'
-        # and `RasterGridAnalysis`') read to decide between their own interpreter
-        # (`apply_steps`) and this class's fixed five-stage flow -- see those overrides'
-        # docstrings.
+        # was attached", the signal `apply_params` reads to lower `self.options` into the
+        # equivalent list itself (`stages.lower_flat_options`). Either way exactly one
+        # list reaches `apply_steps`; this attribute only says who built it.
         self._pipeline_ops = None
 
         self.lf = get_lazy_frame(self.dataset_dimensions, self.filter_dimensions, base_path)
@@ -392,10 +371,12 @@ class BaseAnalysis:
         """Whether this request collapses rows via an aggregate -- `group_aggregate`
         (vector row-collapse) or `summarize_aggregate` (raster zonal / vector
         cross-grid summarize) -- as opposed to a PLAIN, non-aggregating tabular/tile
-        response. Used by `_apply_filter_params` to decide whether a `where` value
-        conjunct masks a non-matching value to null (composing with an aggregate's own
-        null-skipping behavior) or drops the row outright (the only sensible behavior
-        once there is no aggregate downstream to skip a null for -- see that method).
+        response. Read by `apply_params` and passed to `stages.lower_flat_options` as
+        `is_aggregating`, which is what decides whether the `FilterOp` lowered from a flat
+        `where` masks a non-matching value to null (composing with the aggregate's own
+        null-skipping behavior) or drops the row outright (the only sensible behavior when
+        there is no aggregate downstream to skip a null for). See
+        `ops.FilterOp.mask_value`.
         """
         return self.options.group_aggregate is not None or self.options.summarize_aggregate is not None
 
@@ -411,35 +392,7 @@ class BaseAnalysis:
         """
         tiles.validate_vector_tile(self.output_type, self.options.summarize_by or self.grid.name)
 
-    # -- stage 1: filter ------------------------------------------------------------------
-
-    async def _apply_filter_params(self):
-        """Apply filter parameters to the LazyFrame.
-
-        The `where` half is `stages.apply_filter_options`, which reads the option, splits
-        it into dimension and value conjuncts, and decides mask-vs-drop -- see that
-        function for the whole contract. What stays here is what touches `self`: storing
-        its three results (`self.lf`, `self._value_where` -- the internal successor to the
-        retired `Options.value_where` field, which every raster-side consumer reads -- and
-        `self._where_has_dimension_conjunct`), converting its typed `ExpressionError` into
-        a 400 at this stage's own boundary, and dispatching the `_apply_grid_cell` hook the
-        subclass supplies.
-
-        The option is read as a whole, once, exactly as before: an interpreter walking a
-        `list[ops.Op]` instead calls the underlying re-entrant algebra
-        (`apply_dimension_filter`/`apply_value_filter`) once per `FilterOp` in declared
-        order, via `vector.apply_long_op`, and never reaches this method at all.
-        """
-        with op_error_boundary():
-            self.lf, self._value_where, self._where_has_dimension_conjunct = stages.apply_filter_options(
-                self.lf,
-                self.options.where,
-                grid_type=self.grid.grid_type,
-                is_aggregating=self._is_aggregating(),
-            )
-
-        if self.options.grid_cell:
-            await self._apply_grid_cell()
+    # -- the `grid_cell` input selection ---------------------------------------------------
 
     async def _apply_grid_cell(self):
         """Apply the `grid_cell` filter to `self.lf`. See the module/class docstring's
@@ -447,64 +400,19 @@ class BaseAnalysis:
         """
         raise NotImplementedError
 
-    # -- stage 2: calculate -----------------------------------------------------------------
-
-    def _apply_calculate_params(self):
-        """Apply the calculate stage: expression/where entries that rewrite `value` for
-        the rows/bands/pixels matching each entry's `where`, sequentially in entry order.
-
-        Validation and application are `stages.resolve_calculate_plans` and
-        `stages.apply_calculate_options` -- see those two for what each entry means and
-        why a raster's band-metadata table is left for the pixel-read paths to rewrite.
-        What stays here is what touches `self`: stashing the validated plans on
-        `self._calculate_plans` (which every raster read path replays per band), storing
-        the rewritten frame back on `self.lf`, and converting the typed `ExpressionError`
-        either one raises into a 400 at this stage's own boundary.
-
-        The option list is read as a whole, once, exactly as before: an interpreter
-        instead calls the underlying re-entrant algebra (`apply_calculate_plans`) once per
-        `CalculateOp`, in declared order, and never reaches this method at all.
-        """
-        with op_error_boundary():
-            self._calculate_plans = stages.resolve_calculate_plans(self.options.calculate)
-            self.lf = stages.apply_calculate_options(self.lf, self._calculate_plans, self.grid.grid_type)
-
-    # -- stage 5: sort/select ---------------------------------------------------------------
+    # -- sort/select: the two options with no op form ---------------------------------------
 
     def _apply_sort_params(self):
         """Apply sort and select parameters to the LazyFrame -- see
         `stages.apply_sort_options`.
 
-        Both interpreters call this at the end of their own op walk (see their
-        `apply_params` overrides), because `sort`/`select` are response SHAPING options
-        that have no op form and so always run last, whatever order the ops themselves
-        declared.
+        Called by `apply_params` once, after the op walk, because `sort`/`select` are
+        response SHAPING options that have no op form and so always run last, whatever
+        order the ops themselves declared.
         """
         self.lf = stages.apply_sort_options(
             self.lf, self.options.sort, self.options.select, self.dataset_dimensions
         )
-
-    # -- stage 3: group ---------------------------------------------------------------------
-
-    def _get_group_by_columns(self):
-        """Get a list of group_by column names.
-
-        Empty, not a `[True]` literal sentinel (its pre-cleanup shape): a caller
-        grouping by `True` gets a column literally named "literal" back from Polars
-        (`df.group_by(True)` -- see `fold.py`'s `fold_group_by` docstring for the same
-        naming quirk), which leaked into every collapse-to-cell/collapse-everything
-        response as a meaningless `literal` boolean column. An empty list needs no such
-        placeholder: `VectorGridAnalysis._collapse_group` always appends "grid_cell"
-        itself before grouping, so `[]` still collapses to one row per grid_cell, and
-        `RasterGridAnalysis._collapse_group`'s `group_by()` with no columns collapses
-        to a single overall group -- both without inventing a key column.
-        """
-        if self.options.group_by is not None and self.options.group_aggregate is None:
-            self._error("group_aggregate must be specified when group_by is used")
-
-        if self.options.group_by is None:
-            return []
-        return unpack_values(self.options.group_by, "group_by", DIMENSION_CHOICES)
 
     def _has_selective_dimension_filter(self):
         """Whether this request already carries something that shrinks the row count
@@ -516,22 +424,21 @@ class BaseAnalysis:
         `get_lazy_frame`/`read_parquet`, before `self.lf` exists at all -- the measured
         case where a `grid_cell` group-by drops from 9.8 GB to 285 MB. `options.grid_cell`
         (a real `.filter()` on specific cell IDs) and a `where` DIMENSION conjunct (an
-        arbitrary SQL `.filter()`, applied to `self.lf` itself in `_apply_filter_params`)
-        are the same kind of row-dropping filter, so they count too --
-        `self._where_has_dimension_conjunct` (set by `_apply_filter_params`) is checked
-        here rather than `self.options.where is not None`, since `where` may now hold
-        only a VALUE conjunct, which never reaches this method as a row filter at all
-        (see the next paragraph).
+        arbitrary SQL `.filter()`, applied by `apply_dimension_filter` when the
+        interpreter lowers a `FilterOp`) are the same kind of row-dropping filter, so they
+        count too -- `self._where_has_dimension_conjunct` (set by whichever `apply_steps`
+        ran, from the second value each lowering returns) is checked here rather than
+        `self.options.where is not None`, since a `where` may hold only a VALUE conjunct,
+        which never reaches this method as a row filter at all (see the next paragraph).
 
         A `where` VALUE conjunct and the `calculate` parameters are deliberately NOT
-        included: wherever this method's caller
-        (`_apply_group_params`, gating a vector `group_by`) applies, a value conjunct is
-        always a `with_columns` mask, never a row-dropping `.filter()` -- masking is
-        exactly what lets it compose with the group_by's own aggregate instead of
-        changing its denominator (see `_apply_filter_params`) -- so it never changes how
-        many rows reach the group-by, doesn't affect whether it's cliff-shaped, and
-        (unlike a `.filter()`) doesn't block the fold's `.slice()` from reaching the scan
-        either.
+        included: wherever this method's callers (the two interpreters, gating a vector
+        `GroupOp`) apply, a value conjunct is a `with_columns` mask rather than a
+        row-dropping `.filter()` whenever it could change a group's denominator at all --
+        masking is exactly what lets a flat `where` compose with the group_by's own
+        aggregate (see `ops.FilterOp.mask_value`) -- so it never changes how many rows
+        reach the group-by, doesn't affect whether it's cliff-shaped, and (unlike a
+        `.filter()`) doesn't block the fold's `.slice()` from reaching the scan either.
         """
         return (
             self.options.grid_cell is not None
@@ -539,35 +446,7 @@ class BaseAnalysis:
             or any(v is not None for v in dict(self.filter_dimensions).values())
         )
 
-    def _apply_group_params(self):
-        """Apply group and aggregate parameters to the LazyFrame or image.
-
-        The shared preamble (the `count_by_value` rejection, which differs by neither grid
-        type nor instance and so lives in `stages.reject_count_by_value_group`, and
-        `group_by_cols` resolution) runs here; the actual collapse is the
-        `_collapse_group` hook -- see the module/class docstring.
-        """
-        if self.options.group_by is None and self.options.group_aggregate is None:
-            return
-
-        stages.reject_count_by_value_group(self.options.group_aggregate)
-
-        group_by_cols = self._get_group_by_columns()
-        self._collapse_group(group_by_cols)
-
-    def _collapse_group(self, group_by_cols):
-        """Collapse `self.lf` (a vector frame) or `self.lf`/`self._band_ops` (a raster
-        frame) per `group_by_cols`. See the module/class
-        docstring's hook contract -- overridden per subclass; there is no grid-agnostic
-        default.
-        """
-        raise NotImplementedError
-
-    # -- stage 4: transform -----------------------------------------------------------------
-
-    async def _apply_transform_params(self):
-        """Apply transform and extract parameters to the LazyFrame or image."""
-        await self._apply_transform_params_impl()
+    # -- the summarize hook -----------------------------------------------------------------
 
     async def _apply_transform_params_impl(self):
         """Apply `summarize_by`/`summarize_aggregate`. See the module/class docstring's
@@ -578,19 +457,48 @@ class BaseAnalysis:
     # -- orchestration ----------------------------------------------------------------------
 
     async def apply_params(self):
-        """Apply the query parameters to the LazyFrame, in the fixed five-stage order.
+        """Apply the query parameters to the LazyFrame: hand an op list to the interpreter
+        (`apply_steps`), then apply `sort`/`select`.
 
-        The one member of this flow that is still a method rather than a free function in
-        `analysis/stages.py`, and deliberately so: every call below reaches a subclass
-        hook (`_apply_filter_params` -> `_apply_grid_cell`, `_apply_group_params` ->
-        `_collapse_group`, `_apply_transform_params` -> `_apply_transform_params_impl`),
-        so a free-function version would take the instance under another name and gain
-        nothing. It becomes extractable when those hooks stop being hooks, not before.
+        **There is one execution engine.** Every request -- flat or piped -- runs through
+        `apply_steps`. The only difference is where its `list[ops.Op]` came from:
+
+        - A PIPELINE request arrives with `self._pipeline_ops` already attached, by
+          `planner._compile_single_input_chain` (the only thing that ever sets
+          it), holding `ops.compile_ops(pipeline)` -- the steps the caller declared, in
+          DECLARED order.
+        - A FLAT request still has `_pipeline_ops` at its `__init__` default of `None`, and
+          is lowered here, by `stages.lower_flat_options`, into the same IR: `filter` from
+          `where`, `calculate` from each `calculate` entry, `group` from
+          `group_by`/`group_aggregate`, emitted in exactly one fixed order: filter, then
+          calculate, then group. `Options` has no declared order of its own, so that
+          lowering is order-preserving by construction -- see that function's docstring,
+          including why `summarize_by`/`summarize_aggregate` and `sort`/`select` are
+          deliberately not lowered.
+
+        Lowered HERE, not in `__init__` or in `factory.create_analysis`. Construction stays
+        free of validation and of `Options` interpretation: `lower_flat_options` raises
+        `AnalysisError` for `group_by` without `group_aggregate` and for
+        `group_aggregate='count_by_value'`, and those rejections belong where they have
+        always fired -- inside the call that executes the request, not at the point an
+        analysis object is built. This is also the ONE place every consumer passes through
+        (`api/tabular.py`, `api/vector.py`, the tile routes, `visualizations/map.py`,
+        `analysis.analyze_data`), whereas the construction paths are several.
+
+        `apply_steps` is per-grid-type (`vector.VectorGridAnalysis.apply_steps` for the long
+        shape, `raster.RasterGridAnalysis.apply_steps` for the band-wide/long pair), so this
+        method is only ever reached on an instance that defines one -- `factory.
+        create_analysis` returns one of those two subclasses and nothing else.
+
+        `sort`/`select` run after the walk because they are response SHAPING options with no
+        op form at all -- see `_apply_sort_params`.
         """
-        await self._apply_filter_params()
-        self._apply_calculate_params()
-        self._apply_group_params()
-        await self._apply_transform_params()
+        ordered_ops = self._pipeline_ops
+        if ordered_ops is None:
+            ordered_ops = stages.lower_flat_options(
+                self.options, is_aggregating=self._is_aggregating()
+            )
+        await self.apply_steps(ordered_ops)
         self._apply_sort_params()
 
     def estimate_data_size(self):
@@ -598,12 +506,17 @@ class BaseAnalysis:
 
         `self.grid` is `GRIDS[self.dataset_dimensions.grid]` (set in `__init__` and never
         reassigned), which is the single grid object the estimate needs.
+
+        The group-by columns come from `stages.resolve_group_by_columns` -- the same
+        function `stages.lower_flat_options` builds `GroupOp.by` with -- rather than from
+        the op list, because this method is routinely called WITHOUT `apply_params` having
+        run (`api/__init__.py`'s size pre-check answers before any frame is walked).
         """
         return metadata.estimate_data_size(
             self.dataset_dimensions,
             self.filter_dimensions,
             self.grid,
-            self._get_group_by_columns(),
+            stages.resolve_group_by_columns(self.options.group_by, self.options.group_aggregate),
             has_group_by=self.options.group_aggregate is not None,
             grid_cell_ids=self.grid_cell_ids,
         )

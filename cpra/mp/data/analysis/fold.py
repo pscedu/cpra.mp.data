@@ -149,7 +149,7 @@ def should_fold_group_by(
     defeating the point of a cheap plan-time check) or account for every way a filter
     might shrink row count (e.g. `where`'s value conjunct, which MASKS values to null
     rather than dropping rows when the request is aggregating -- see
-    `Dataset._apply_filter_params` -- is deliberately not treated as selective here -- it
+    `ops.FilterOp.mask_value` -- is deliberately not treated as selective here -- it
     doesn't change how many rows reach the group-by at all).
     """
     if has_selective_filter:
@@ -202,7 +202,7 @@ def fold_group_by(
     value/accumulator columns) -- this sidesteps needing to know how a non-string key or
     an aliased expression resolves to a concrete column name (a bare Polars literal key,
     though this package's own callers no longer produce one -- see
-    `BaseAnalysis._get_group_by_columns` -- would resolve to a column literally named
+    `stages.resolve_group_by_columns` -- would resolve to a column literally named
     "literal"), since after one `.collect()` there is no more ambiguity to resolve.
 
     Decomposable aggregates only -- `validate_decomposable` raises `FoldError` (an

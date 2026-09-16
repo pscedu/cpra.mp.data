@@ -201,7 +201,7 @@ def _validate_filter_where(step_no, where, extra_allowed_columns, op="filter"):
     that function's docstring for the full split/classify/reject contract) -- a
     dimension conjunct gets only the subquery/aggregate safety check
     (`_check_no_dimension_subquery_or_aggregate`), otherwise unrestricted (the same
-    treatment `Dataset._apply_filter_params` gives it, via an unrestricted `lf.sql()`
+    treatment `base.apply_dimension_filter` gives it, via an unrestricted `lf.sql()`
     call); a value conjunct (referencing the running-value placeholder -- already
     rewritten to the literal column `value` by the caller, see `rewrite_named_columns`)
     gets the full `parse_value_expr` whitelist against `extra_allowed_columns` (always
@@ -317,11 +317,11 @@ def _extract_post_project_grid_cell_filter(step_no, where):
     post-project filter, untouched by this rule, still folded into `Options.where` by the
     caller exactly as before).
 
-    Why this exists: the executor's Filter stage (which `Options.where` feeds) runs
-    against the SOURCE (pre-summarize) rows, before the Transform/summarize stage that a
-    many-to-one `project` compiles onto ever narrows anything to the summarized grid --
-    so a `filter` naming `grid_cell` after such a `project` would, if simply folded into
-    `Options.where` like any other post-project filter, silently test the WRONG grid's
+    Why this exists: `Options.where` is applied against the SOURCE (pre-summarize) rows,
+    before the summarize a many-to-one `project` compiles onto ever narrows anything to
+    the summarized grid -- so a `filter` naming `grid_cell` after such a `project` would,
+    if simply folded into `Options.where` like any other post-project filter, silently
+    test the WRONG grid's
     cell IDs (the source dataset's, not the summarized zones'). `summarize_grid_cell` is
     the correct target (`stages.validate_summarize_options` parses it, and both
     `_apply_transform_params_impl` implementations apply it against the
@@ -390,18 +390,18 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     ((input_name, selection),) = pipeline.inputs.items()
     _check_input_dimensions(input_name, selection)
 
-    # EVERY single-input chain now executes through an ops interpreter (`VectorGridAnalysis.
+    # EVERY single-input chain executes through an ops interpreter (`VectorGridAnalysis.
     # apply_steps` / `RasterGridAnalysis.apply_steps`), over `ops.compile_ops(pipeline)`'s
-    # raw, declared-order IR, rather than through `BaseAnalysis.apply_params`'s fixed
-    # five-stage flow -- see the fast-path wiring at the bottom of this function, which
-    # attaches `_pipeline_ops` unconditionally.
+    # raw, declared-order IR -- see the interpreter wiring at the bottom of this function,
+    # which attaches `_pipeline_ops` unconditionally.
     #
     # That is why four ordering rejections this function used to make are simply gone
     # rather than narrowed: a dimension filter after a group, a calculate after a group, a
     # second group, and a value filter after a calculate. All four existed ONLY because the
-    # old fixed-stage flow ran one bucket per stage (one `Options.group_by`, one combined
-    # `Options.where`, ...) in a fixed order, and so could not represent those shapes at
-    # all, regardless of whether the shape is meaningful. An interpreter has no buckets: it
+    # engine that once executed a compiled chain ran one bucket per fixed stage (one
+    # `Options.group_by`, one combined `Options.where`, ...) in an order the request could
+    # not choose, and so could not represent those shapes at all, regardless of whether the
+    # shape is meaningful. An interpreter has no buckets: it
     # walks the ops list in declared order and applies each one as an ordinary re-entrant
     # transform. On the raster side no positions are carried across a metadata change
     # either -- an op is recorded with the caller's OWN predicate/plans/group key
@@ -437,11 +437,10 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # index 0.
     #
     # `calculate` joins `filter` in the leading run for exactly the same reason `filter`
-    # is let in -- `Options.calculate` lowers onto
-    # `BaseAnalysis.apply_params`'s Calculate stage (stage 2), which runs unconditionally
-    # before the Transform stage (stage 4) a `project`'s aggregation lowers onto, for
-    # BOTH the raster and vector-interpreter engines (see `CalculateStep`'s own
-    # docstring for the full argument). A leading `calculate` therefore executes in
+    # is let in -- `Options.calculate` lowers to a `CalculateOp` ahead of the summarize a
+    # `project`'s aggregation lowers onto, which `_apply_transform_params_impl` always runs
+    # last, on both grid types (see `CalculateStep`'s own docstring for the full
+    # argument). A leading `calculate` therefore executes in
     # exactly its declared position regardless of grid type, with no ordering question
     # the way a POST-project `calculate` has (still rejected a few lines below, after a
     # many-to-one `project` -- see the SUMMARIZING-PROJECT ORDER GUARD comment). `group` was deliberately
@@ -512,9 +511,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # (`first`, found above -- possibly after a run of leading `filter` steps, not
     # necessarily `steps[0]` itself) is many-to-one (summarizing) is exactly whether it
     # set `summarize_by` above -- and it is exactly this case where an ordering bug is
-    # live. `summarize_by`/`summarize_aggregate` only take effect in `BaseAnalysis
-    # .apply_params`'s TRANSFORM stage (stage 4), which runs after Filter (stage 1),
-    # Calculate (stage 2), and Group (stage 3) UNCONDITIONALLY -- regardless of where in
+    # live. `summarize_by`/`summarize_aggregate` only take effect in
+    # `_apply_transform_params_impl`, which each interpreter runs LAST, after every
+    # filter/calculate/group op -- regardless of where in
     # the DECLARED pipeline a filter/calculate/group step sits relative to `project`. A
     # step declared after a many-to-one `project` therefore actually runs against the
     # PRE-project source rows, not the declared post-project result. That is verified
@@ -527,8 +526,8 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # summed-then-squared).
     #
     # An IDENTITY project (`to` equal to the input's own grid, the `if` branch above)
-    # sets no `summarize_by` at all -- stage 4 is then a no-op, so there is nothing for
-    # a later step to run "before", and no order to invert. That is why every registered
+    # sets no `summarize_by` at all -- the summarize is then a no-op, so there is nothing
+    # for a later step to run "before", and no order to invert. That is why every registered
     # analysis (`difference`/`concatenate`/`exit_criterion`, all of which project to
     # their own dataset's grid) is unaffected by this guard: it only ever fires for a
     # `project` that actually changes grid, which none of them do.
@@ -543,8 +542,8 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # below, unchanged by this guard.
     #
     # A `filter` in `leading_filters` (found above, BEFORE `first`) never needs any of
-    # this reasoning at all: it is declared and executes in the same place -- the Filter
-    # stage (stage 1), strictly before the project's Transform-stage (stage 4)
+    # this reasoning at all: it is declared and executes in the same place -- ahead of
+    # every other op, strictly before the project's own summarize
     # aggregation, by construction, regardless of whether that aggregation is
     # many-to-one. That is precisely why leading filters are the remediation this guard's
     # own error messages point authors at, below.
@@ -554,9 +553,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # enforcement sites below (the calculate-, group-, and
     # value-filter-after-a-summarizing-`project` rejections) -- is NOT relaxed for
     # either grid type, unlike the rejections deleted elsewhere in this function. This
-    # guard is not a bucket-collision artifact of the old fixed-stage engine: it
+    # guard is not a bucket-collision artifact of the retired fixed-stage engine: it
     # protects against a genuine ORDERING question that is just as real for the
-    # interpreter as for `BaseAnalysis.apply_params` -- whether a value-testing step
+    # interpreter -- whether a value-testing step
     # declared after a many-to-one `project` runs against the declared post-project
     # (aggregated) rows or the pre-project source rows. The interpreter answers this
     # correctly BY CONSTRUCTION (it applies `compile_ops`'s `ProjectOp` in declared
@@ -578,17 +577,24 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # `filter` declared AFTER a leading `calculate` (e.g.
     # `calculate, filter, project`) needs the identical after-`calculate` commutativity
     # check a POST-project filter-after-calculate gets in the main loop below -- both
-    # ultimately combine into the same flat `Options.calculate` (a list, applied as ONE
-    # Calculate stage, stage 2) and `Options.where` (a single combined string, applied as
-    # ONE Filter stage, stage 1) regardless of whether their source step was leading or
-    # post-project, so the OLD fixed-stage engine runs every filter (stage 1) before
-    # every calculate (stage 2) either way -- a value-testing leading filter declared
-    # after a leading calculate would, for a RASTER input, silently test the
-    # PRE-calculate value despite being declared after the calculate that rewrites it,
-    # exactly the same failure mode `after_calculate`'s existing check (below) already
-    # guards against for the post-project case. Tracked here as `leading_after_calculate`,
-    # flipped `True` the moment a leading `calculate` is seen, mirroring `bool
-    # (calculate_steps)` in the main post-project loop below.
+    # ultimately combine into the same flat `Options.calculate` (a list, lowered to one
+    # run of `CalculateOp`s) and `Options.where` (a single combined string, lowered to ONE
+    # `FilterOp`) regardless of whether their source step was leading or
+    # post-project, so the RETIRED fixed-stage engine ran every filter before every
+    # calculate either way -- a value-testing leading filter declared after a leading
+    # calculate would, for a RASTER input, silently have tested the PRE-calculate value
+    # despite being declared after the calculate that rewrites it, exactly the same failure
+    # mode `after_calculate`'s existing check (below) guards against for the post-project
+    # case. Tracked here as `leading_after_calculate`, flipped `True` the moment a leading
+    # `calculate` is seen, mirroring `bool(calculate_steps)` in the main post-project loop
+    # below.
+    #
+    # This rejection is now CONSERVATIVE rather than necessary: the wiring at the bottom
+    # of this function attaches `_pipeline_ops` unconditionally, so a leading filter really
+    # does execute in its declared position on both grid types, and the misordering it
+    # guards against can no longer occur. Lifting it needs the same hand-verified
+    # differential test every other lifted rejection here got, so it stays in force until
+    # that exists.
     filters = []
     calculate_steps = []
     leading_after_calculate = False
@@ -609,16 +615,16 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     summarize_grid_cell = None
     for i, step in enumerate(steps[project_idx + 1 :], start=project_step_no + 1):
         if isinstance(step, FilterStep):
-            # A filter declared after a group step used to be rejected outright: the old
-            # fixed-stage engine has exactly one Filter stage (stage 1), running strictly
-            # before its Group stage (3), so a filter ordered after a `group` step could
+            # A filter declared after a group step used to be rejected outright: the
+            # retired fixed-stage engine had exactly one Filter stage, running strictly
+            # before its Group stage, so a filter ordered after a `group` step could
             # only ever silently apply to the PRE-group rows, never the declared post-group
             # result -- "keep only groups whose collapsed value passes some test" is a
             # legitimate, common query, not a meaningless shape, so that was a real engine
             # limitation. `vector.VectorGridAnalysis.apply_steps` walks `ops.compile_ops
             # (pipeline)` in DECLARED order and applies each op as an ordinary re-entrant
             # transform: a `FilterOp` declared after a `GroupOp` runs against whatever the
-            # group already produced, because there is no separate fixed "Filter stage"
+            # group already produced, because there is no separate fixed filter position
             # for it to have instead landed in. So this is lifted for vector.
             #
             # Lifted for raster too, for every raster shape. On a band-wide frame
@@ -641,8 +647,8 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                 grid_cell_ids = _extract_post_project_grid_cell_filter(i, step.where)
             if grid_cell_ids is not None:
                 # `Options.summarize_grid_cell` is a single scalar field --
-                # the old fixed-stage engine has exactly one slot to narrow the crosswalk
-                # join by, so a SECOND post-project `grid_cell` filter had nowhere to go
+                # exactly one slot to narrow the crosswalk join by, so a SECOND
+                # post-project `grid_cell` filter had nowhere to go
                 # but to silently overwrite (or be rejected ahead of overwriting, which is
                 # what this did) the first one's value. This extraction still runs
                 # (unchanged, both grid types -- it is what keeps a literal
@@ -681,8 +687,8 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                 value_names.add(step.as_)
         elif isinstance(step, CalculateStep):
             # A calculate declared after a group step used to be rejected outright, for
-            # the same reason as the filter-after-group case above: the old fixed-stage
-            # engine's Calculate stage (2) always ran before its Group stage (3), so a
+            # the same reason as the filter-after-group case above: the retired fixed-stage
+            # engine's Calculate stage always ran before its Group stage, so a
             # `calculate` ordered after a `group` step could only ever silently rewrite
             # the PRE-group rows, never the declared post-group (collapsed) result.
             # `VectorGridAnalysis.apply_steps` applies each op in declared order, so a
@@ -709,10 +715,10 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                     f"not yet supported in analysis pipelines: step {i} (calculate) "
                     "comes after a many-to-one (summarizing) `project` step in a "
                     "single-input pipeline -- `project`'s aggregation lowers onto "
-                    "`Options.summarize_by`/`summarize_aggregate`, applied in "
-                    "`BaseAnalysis.apply_params`'s Transform stage (stage 4), while "
-                    "`calculate` lowers onto `Options.calculate`, applied in the "
-                    "Calculate stage (stage 2) -- which runs BEFORE stage 4 "
+                    "`Options.summarize_by`/`summarize_aggregate`, which "
+                    "`BaseAnalysis.apply_params` applies LAST, while `calculate` "
+                    "lowers onto `Options.calculate`, which is applied BEFORE that "
+                    "summarize "
                     "unconditionally, regardless of how the steps are declared. A "
                     "calculate step ordered after the project would therefore rewrite "
                     "the PRE-project source values, not the declared post-project "
@@ -741,7 +747,7 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             # which the vector interpreter's execution path does not consult).
             #
             # Lifted for raster too, for every raster shape. On a band-wide frame
-            # `RasterGridAnalysis._collapse_group` APPLIES each group to the running band
+            # `raster.collapse_band_group` APPLIES each group to the running band
             # metadata (`band_metadata_group`) and appends its own
             # `("group", by, aggregate)` entry, so a second group resolves against the first
             # one's collapsed output on both halves -- the metadata here and the pixels at
@@ -753,9 +759,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
             if is_summarizing_project:
                 # SUMMARIZING-PROJECT ORDER GUARD -- see the long comment above `is_summarizing_project`'s
                 # assignment. Same reasoning as the `calculate` guard immediately above:
-                # `group` lowers onto `Options.group_by`/`group_aggregate`, applied in
-                # the Group stage (stage 3 of `apply_params`), which also runs before
-                # the project's own Transform-stage aggregation (stage 4) regardless of
+                # `group` lowers onto `Options.group_by`/`group_aggregate`, which the
+                # flat lowering emits ahead of everything, and which in any case runs
+                # before the project's own summarize aggregation regardless of
                 # declared order -- so a group step ordered after the project would
                 # collapse the PRE-project source rows into groups, not the declared
                 # post-project zones, and a collapse does not commute with a subsequent
@@ -765,8 +771,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                     f"not yet supported in analysis pipelines: step {i} (group) comes "
                     "after a many-to-one (summarizing) `project` step in a single-input "
                     "pipeline -- `project`'s aggregation only takes effect in the "
-                    "Transform stage (stage 4 of `BaseAnalysis.apply_params`), while "
-                    "`group` runs in the Group stage (stage 3), unconditionally before "
+                    "summarize `BaseAnalysis.apply_params` applies LAST, while "
+                    "`group` lowers onto `Options.group_by`/`group_aggregate`, "
+                    "applied unconditionally before "
                     "it -- a group declared after the project would collapse the "
                     "pre-project rows instead of the declared post-project zones. Move "
                     "this group step before the project step."
@@ -809,8 +816,8 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
         except ExpressionError as exc:
             raise PipelineError(f"step {i} (filter) where={where!r} is invalid: {exc}") from exc
         # A value-testing filter declared after a calculate step used to be rejected:
-        # `Options.calculate`/`Options.where` are each combinable buckets, but the flat
-        # machinery's fixed stage order (Filter stage before Calculate stage) could only
+        # `Options.calculate`/`Options.where` are each combinable buckets, but the retired
+        # fixed stage order (Filter stage before Calculate stage) could only
         # honor a filter declared after a calculate if the two commuted, and a value
         # condition doesn't (it would test the pre-calculate value instead of the
         # post-calculate one the declared order promises). A dimension conjunct always
@@ -837,9 +844,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
                 f"not yet supported in analysis pipelines: step {i} (filter) "
                 f"where={where!r} tests the running value after a many-to-one "
                 "(summarizing) `project` step -- the flat machinery this single-input "
-                "pipeline compiles onto applies every filter's `where` in the Filter "
-                "stage (stage 1 of `BaseAnalysis.apply_params`), which runs BEFORE the "
-                "project's own crosswalk aggregation (stage 4, via "
+                "pipeline compiles onto applies every filter's `where` ahead of every "
+                "other op, so it runs BEFORE the "
+                "project's own crosswalk aggregation (applied last, via "
                 "`Options.summarize_by`/`summarize_aggregate`) regardless of where the "
                 "filter is declared -- so a value condition ordered after the project "
                 "would drop SOURCE rows before the crosswalk join ever sees them, not "
@@ -870,9 +877,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
         # re-splits the combined string later, the same way `split_top_level_and`
         # itself would be hidden by any other unrelated parens. Concretely: a single
         # filter step `where="model_group_id = 500 AND value > 5"` used to combine to
-        # `Options.where = "(model_group_id = 500 AND value > 5)"` -- and
-        # `BaseAnalysis._apply_filter_params` re-runs `classify_where` on
-        # `self.options.where` at EXECUTION time (base.py:311-327+), where the outer
+        # `Options.where = "(model_group_id = 500 AND value > 5)"` -- and the `FilterOp`
+        # lowering re-runs `classify_where` on that string at EXECUTION time
+        # (`base.apply_dimension_filter`, `raster.apply_band_wide_op`), where the outer
         # parens keep the inner `AND` at paren-depth 1 the whole way through, so
         # `split_top_level_and` returns ONE conjunct spanning both columns --
         # and `classify_where` then rejects it outright ("references both a dimension
@@ -915,11 +922,11 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     if group_step is not None:
         # `by=[]` means "collapse to one row per grid_cell" (see `GroupStep`'s
         # docstring) -- that is `Options`' OWN "group_aggregate with no group_by"
-        # shape (`BaseAnalysis._get_group_by_columns`'s `group_by is None` branch,
+        # shape (`stages.resolve_group_by_columns`'s `group_by is None` branch,
         # returning `[]`), not "group_by the empty string". Passing `group_by=""`
         # through instead would hit `unpack_values("", ...)`, which 400s ("Invalid
         # values for group_by: ")
-        # since "" is never a member of `DIMENSION_CHOICES` -- so the empty-list
+        # since "" is never a member of `stages.GROUP_BY_CHOICES` -- so the empty-list
         # case must omit `group_by` entirely rather than joining it into "".
         if group_step.by:
             option_kwargs["group_by"] = ",".join(group_step.by)
@@ -955,27 +962,27 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
 
     dataset = _dataset_for(input_name, selection, base_path, **option_kwargs)
 
-    # OPS-INTERPRETER FAST PATH: attach the op IR so `apply_params` (see
-    # `VectorGridAnalysis.apply_params`/`RasterGridAnalysis.apply_params`'s own docstrings)
-    # executes this pipeline through the ops interpreter (`apply_steps`) IN DECLARED
-    # ORDER, instead of `BaseAnalysis`'s fixed five-stage flow that the SUMMARIZING-PROJECT ORDER GUARD
-    # above exists BECAUSE that fixed order and a pipeline's declared order can disagree.
-    # `dataset` is built via the exact same `_dataset_for` call as before this change --
-    # every `Options` field above is populated identically regardless of which engine
-    # ends up executing it (`estimate_data_size`, `legend`, `output_type`, ... all still
-    # read `Options` directly and are unaffected) -- so attaching `_pipeline_ops`
-    # afterward changes nothing except what `apply_params()` (called by every consumer:
-    # `api/tabular.py`, `api/vector.py`, tile routes, ...) does internally.
+    # OPS-INTERPRETER WIRING: attach the op IR so `apply_params` (see
+    # `BaseAnalysis.apply_params`'s own docstring) executes this pipeline through
+    # `apply_steps` in the order the caller DECLARED, rather than lowering `Options` into
+    # one fixed order of its own (`stages.lower_flat_options`, which is what a FLAT request
+    # gets instead -- nothing but this line ever sets `_pipeline_ops`). The
+    # SUMMARIZING-PROJECT ORDER GUARD above exists precisely because those two orders can
+    # disagree.
+    #
+    # `dataset` is built via the exact same `_dataset_for` call either way -- every
+    # `Options` field above is populated identically (`estimate_data_size`, `legend`,
+    # `output_type`, ... all still read `Options` directly and are unaffected) -- so
+    # attaching `_pipeline_ops` afterward changes nothing except which op list
+    # `apply_params()` (called by every consumer: `api/tabular.py`, `api/vector.py`, tile
+    # routes, ...) hands to the interpreter.
     #
     # Unconditional: every shape this function compiles reaches an interpreter that walks
     # the ops in declared order, on either grid type, with or without a `grid_cell`
-    # selection. The last shape that did not -- a `grid_cell`-bearing raster input -- is
-    # covered by `RasterGridAnalysis.apply_steps`' explicit shape tracking (see the comment
-    # near the top of this function, and that method's own docstring).
-    #
-    # `BaseAnalysis.apply_params`'s fixed five-stage flow is still what every FLAT
-    # (non-pipeline) request runs: nothing but this line ever sets `_pipeline_ops`, and both
-    # `apply_params` overrides fall through to it whenever the attribute is still `None`.
+    # selection. A `grid_cell`-bearing raster input -- the one shape that starts the walk in
+    # a different frame shape -- is covered by `RasterGridAnalysis.apply_steps`' explicit
+    # shape tracking (see the comment near the top of this function, and that method's own
+    # docstring).
     dataset._pipeline_ops = compile_ops(pipeline)
 
     return dataset
@@ -1015,8 +1022,8 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
         raise PipelineError(
             "not yet supported in analysis pipelines: `output.sort`/`output.select` in "
             "the paired (spatially-joined) pipeline shape -- both lower onto "
-            "`Options.sort`/`.select`, which only take effect through "
-            "`BaseAnalysis.apply_params()`'s sort/select stage, but this shape's "
+            "`Options.sort`/`.select`, which only take effect through the "
+            "sort/select `BaseAnalysis.apply_params()` runs last, but this shape's "
             "`raster_dataset`/`vector_dataset` never call `apply_params()` at all "
             "(`PairedAnalysis._prepare()` calls `.materialize()` on them directly) -- "
             "setting either here would silently no-op rather than sort/narrow anything"
@@ -1174,19 +1181,17 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
     return plan
 
 
-# `group_step.aggregate` values `_accumulate_paired_window` (the streaming per-band
-# accumulator) covers. Four of these (`min`/`max`/`sum`/`mean`) are exactly
-# `HORIZONTAL_RASTER_AGGREGATES`'s keys -- the aggregates `horizontal_aggregate_expr`
-# (what the wide-frame path ultimately calls, via `PairedAnalysis._collapse_expr`) knows how
-# to reduce across bands. `count` is the fifth and is handled entirely differently: it
-# is deliberately NOT a `HORIZONTAL_RASTER_AGGREGATES` key (see that dict's own docstring
-# and `types.AggregateFunction.count`'s comment -- a flat-API raster `group_aggregate` has
-# no per-pixel meaning for "how many bands contributed"), but a PAIRED pipeline's `where`
-# clause gives that same tally a real, user-authored meaning ("how many calendar steps
-# satisfied the condition"), so `PairedAnalysis` implements it LOCALLY (`_band_valid_expr`/
-# `_band_valid_mask`, and the `count` branches of `_collapse_expr`/
-# `_accumulate_paired_window` below) rather than teaching the shared vocabulary a second,
-# incompatible meaning for the same name. Do not "unify" the two by adding `count` to
+# `group_step.aggregate` values `PairedAnalysis` implements. Four of these
+# (`min`/`max`/`sum`/`mean`) are exactly `HORIZONTAL_RASTER_AGGREGATES`'s keys -- the
+# aggregates `horizontal_aggregate_expr` (what `PairedAnalysis._collapse_expr` ultimately
+# calls) knows how to reduce across bands. `count` is the fifth and is handled entirely
+# differently: it is deliberately NOT a `HORIZONTAL_RASTER_AGGREGATES` key (see that dict's
+# own docstring and `types.AggregateFunction.count`'s comment -- a flat-API raster
+# `group_aggregate` has no per-pixel meaning for "how many bands contributed"), but a PAIRED
+# pipeline's `where` clause gives that same tally a real, user-authored meaning ("how many
+# calendar steps satisfied the condition"), so `PairedAnalysis` implements it LOCALLY
+# (`_band_valid_expr` and `_collapse_expr`'s own `count` branch) rather than teaching the
+# shared vocabulary a second, incompatible meaning for the same name. Do not "unify" the two by adding `count` to
 # `HORIZONTAL_RASTER_AGGREGATES` -- they answer different questions for different callers.
 # `count_by_value` is excluded even earlier, by `fold.DECOMPOSABLE_AGGREGATES`, and never
 # reaches this shape at all through the sanctioned `parse_pipeline` entry point (see

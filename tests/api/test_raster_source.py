@@ -1,6 +1,6 @@
 """Tests for the Polars IO-plugin raster source (api.raster_source.scan_rasters).
 
-`scan_rasters` backs `Dataset._summarize_zone_stats_plugin` -- see
+`scan_rasters` backs `raster.summarize_zone_stats` -- see
 `test_dataset_raster.py`'s `TestSummarizeCalculateAndGroupAggregate` and
 `TestGroupAggregateNodataExclusion` for value-level coverage of that path -- but is
 exercised directly here for mechanics only a hand-built LazyFrame source has: dense
@@ -257,7 +257,7 @@ class TestPredicatePushdownReachesTheSource:
     -- so it was unverified whether Polars ever pushes a filter down into this particular
     IO plugin at all, as opposed to always collecting everything and filtering
     afterwards. Both engines are checked because of exactly this kind of divergence:
-    the production summarize path (`_summarize_zone_stats_plugin`) collects
+    the production summarize path (`summarize_zone_stats`) collects
     under ``engine="streaming"``, and pushdown behaviour is not guaranteed to be the same
     between engines.
     """
@@ -372,7 +372,7 @@ class TestValueFilterPixelCountPreservation:
     pixel shape a raster/tile OUTPUT needs -- row order is raster-raveled pixel order, so
     a caller writing those rows back into a grid depends on every pixel still being
     present. Its zoned mode (`zone_ids` given) is the TABULAR/zonal shape production
-    already uses (`Dataset._summarize_zone_stats_plugin`): one row per (pixel,
+    already uses (`raster.summarize_zone_stats`): one row per (pixel,
     destination zone), immediately collapsed by a `group_by`, where a dropped row only
     means one fewer contributor to its zone's aggregate -- nothing downstream depends on
     row COUNT, only on which zone each surviving row belongs to.
@@ -384,14 +384,14 @@ class TestValueFilterPixelCountPreservation:
     with no awareness of which shape its caller intends: the plugin cannot know which
     it is in, so the compiler must. `masked_value_predicate_exprs` is the
     mask lowering that already exists and is already used correctly, but only by the
-    zonal path (`raster.py`'s `_summarize_zone_stats_plugin`, against zoned mode, where
+    zonal path (`raster.py`'s `summarize_zone_stats`, against zoned mode, where
     masking and dropping are equally valid -- it happens to use the mask form because
     it's shared with nodata handling, not because dropping would be wrong there). Nothing
     today applies that same mask lowering to the DENSE shape, and nothing stops a caller
     from reaching for `.filter()` on a dense-mode scan instead and getting a silently
     misaligned pixel grid out the other end. Gating that choice is the value-filter
     gate's job, and no production caller does this today (`scan_rasters`
-    has exactly two real call sites, `raster.py`'s `_summarize_zone_stats_plugin` and
+    has exactly two real call sites, `raster.py`'s `summarize_zone_stats` and
     `sources.py`'s `count_by_value`, both always zoned) -- so these tests characterize the
     primitive's mechanics as they exist now, not an aspiration wired through a compiler.
     """
@@ -399,7 +399,7 @@ class TestValueFilterPixelCountPreservation:
     def test_mask_preserves_pixel_count_across_a_value_filter(self, varied_raster_data):
         """The correct raster/tile-output lowering: `masked_value_predicate_exprs` via
         `.with_columns()`, applied against dense mode instead of the zoned mode
-        `_summarize_zone_stats_plugin` uses it against -- a raster/tile write has no
+        `summarize_zone_stats` uses it against -- a raster/tile write has no
         destination zone to group by, but the same mask expression works unchanged
         against `b0` either way. Pixel count survives the filter completely; only the
         failing pixels' values change, to null: the pixel survives, its value becomes

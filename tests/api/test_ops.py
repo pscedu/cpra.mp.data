@@ -255,8 +255,8 @@ class TestDeclaredOrderSurvives:
         FILTER-THEN-PROJECT as declared -- the `project` op's `input` is the filter op's
         own `output`, not the original `eco` input, matching what
         `planner._compile_single_input_chain` also does for this shape today (a leading
-        filter lowers onto `Options.where`, stage 1, strictly before the project's
-        stage-4 aggregation -- see
+        filter lowers onto `Options.where`, emitted first, strictly before the project's
+        own summarize aggregation -- see
         `test_pipeline_exec.py::TestPostProjectOrderingGuard::
         test_leading_filter_before_project_compiles_and_executes_declared_order`) -- this
         is the one shape where the IR and the flat lowering already agree, included here

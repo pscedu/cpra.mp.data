@@ -170,7 +170,7 @@ class TestShouldFoldGroupBy:
         assert should_fold_group_by(["calendar_year"], has_selective_filter=True) is False
 
     def test_a_non_string_key_is_harmless_alongside_grid_cell(self):
-        """`BaseAnalysis._get_group_by_columns` no longer produces a non-string key --
+        """`stages.resolve_group_by_columns` no longer produces a non-string key --
         the group_aggregate-without-group_by case is an empty list now, not a `[True]`
         literal sentinel (see its docstring for why: grouping by `True` leaked a
         meaningless "literal" column into every such response) -- but `group_by_keys`

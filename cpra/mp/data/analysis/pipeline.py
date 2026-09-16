@@ -275,10 +275,9 @@ class CalculateStep(BaseModel):
     optional -- an omitted `input` chains from the previous step's output, mirroring
     `FilterStep.input` exactly and for the identical reason: a `calculate` declared as a
     leading step, ahead of the `project` it precedes, executes in exactly the position it
-    is declared in on every engine -- the interpreters run it there because they run every
-    op in declared order, and the fixed-stage flow runs it there because its Calculate
-    stage (2) precedes the Transform stage (4) a `project`'s aggregation lowers onto
-    anyway. There is no ordering question here the way there is for a POST-project
+    is declared in: the interpreters run every op in declared order, so a leading
+    `calculate` runs ahead of the `project` it precedes.
+    There is no ordering question here the way there is for a POST-project
     `calculate`, which `planner._compile_single_input_chain` still rejects after a
     many-to-one `project` (the same unestablished-commutativity risk `FilterStep`'s
     docstring describes for a post-project value filter). `group` still has no `input` field (see `GroupStep`'s
@@ -309,17 +308,15 @@ class GroupStep(BaseModel):
     and `calculate`, `group` deliberately did NOT gain an `input` field alongside them.
     `Options.group_by`/`Options.group_aggregate` are scalar fields, not a list like
     `Options.calculate` -- a leading (pre-project) `group` and a post-project `group`
-    (still legal today, subject to `planner._compile_single_input_chain`'s "only one"
-    limit, which now applies only to the one shape that still executes the fixed-stage
-    flow: a `grid_cell`-bearing raster selection) would have to share that one bucket. `calculate`'s equivalent bucket is a LIST that already accumulates
-    leading and trailing entries side by side without collision (see `CalculateStep`'s
-    docstring); `group`'s does not, so allowing a leading `group` would need either a
-    second `Options` field (a real schema change beyond this step's scope) or a new
-    compile-time rejection of "leading group + trailing group in the same pipeline" to
-    keep that single bucket from being silently overwritten for the shapes that still read
-    it -- genuinely separate design work, not a mechanical extension of the
-    `filter`/`calculate` pattern. Left
-    alone; a `group` step still cannot lead a pipeline.
+    would have to share that one bucket. `calculate`'s equivalent bucket is a LIST that
+    already accumulates leading and trailing entries side by side without collision (see
+    `CalculateStep`'s docstring); `group`'s does not, so allowing a leading `group` would
+    need either a second `Options` field (a real schema change) or a new compile-time
+    rejection of "leading group + trailing group in the same pipeline" to keep that single
+    bucket from being silently overwritten for the consumers that still read it
+    (`estimate_data_size`, `legend`, `output_type`) -- genuinely separate design work, not a
+    mechanical extension of the `filter`/`calculate` pattern. Left alone; a `group` step
+    still cannot lead a pipeline.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True, use_enum_values=True)

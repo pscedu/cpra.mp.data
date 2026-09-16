@@ -21,7 +21,11 @@ import rasterio
 from rasterio.shutil import copy as rio_copy
 
 from cpra.mp.data.analysis.expressions import compile_calculate_entries
-from cpra.mp.data.analysis.raster import RasterGridAnalysis, band_column_names
+from cpra.mp.data.analysis.raster import (
+    RasterGridAnalysis,
+    band_column_names,
+    flush_calculate_plans,
+)
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import (
     DECADE_GROUP_YEARS,
@@ -82,8 +86,8 @@ def _index_frame(cog_path, bands):
 
 def _scale_plans(factor, where=None):
     """Calculate plans multiplying every (or the `where`-selected) band by `factor` --
-    the validated form `BaseAnalysis._apply_calculate_params` would record for the
-    equivalent request."""
+    the validated form a `calculate` op's lowering records for the equivalent
+    request."""
 
     return compile_calculate_entries([("calculate.1", f"value * {factor}", where)])
 
@@ -99,10 +103,10 @@ def _dataset(df, group_by=None, group_aggregate=None, calculate_plans=None, valu
 
     ``group_by`` is a ``GroupOp``'s own key -- a list of ``df`` column names, empty for
     "collapse every band into one", or ``None`` for an ungrouped request. When it is given,
-    ``_band_ops`` is built the way ``_collapse_group`` builds it -- any ``calculate_plans``
-    flushed in first, then the group -- since that ordered list is what the write path
-    replays. Ungrouped, the plans stay pending and the write path's own flush positions
-    them.
+    ``_band_ops`` is built the way ``collapse_band_group`` builds it -- any
+    ``calculate_plans`` flushed in first, then the group -- since that ordered list is what
+    the write path replays. Ungrouped, the plans stay pending and the write path's own flush
+    positions them.
     """
 
     dataset = object.__new__(RasterGridAnalysis)
@@ -114,7 +118,7 @@ def _dataset(df, group_by=None, group_aggregate=None, calculate_plans=None, valu
     dataset._calculate_plans = calculate_plans or []
     dataset._value_where = value_where
     if group_by is not None:
-        dataset._flush_calculate_plans_to_band_ops()
+        flush_calculate_plans(dataset._band_ops, dataset._calculate_plans)
         dataset._band_ops.append(("group", list(group_by), group_aggregate))
     return dataset
 

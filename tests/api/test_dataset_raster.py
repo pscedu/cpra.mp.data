@@ -154,7 +154,7 @@ class TestCalculateStage:
         """A raster's calculate stage never touches the band-metadata table itself -- it
         records validated plans for the pixel-read paths to apply per band."""
         dataset = dataset_factory(DIMENSIONS)
-        dataset._apply_calculate_params()
+        await dataset.apply_params()
         assert dataset._calculate_plans == []
         assert "multiplier" not in dataset.materialize().columns
 
@@ -165,7 +165,7 @@ class TestCalculateStage:
         dataset = dataset_factory(
             DIMENSIONS, calculate=[{"expression": "value * -1", "where": "calendar_year = 2030"}]
         )
-        dataset._apply_calculate_params()
+        await dataset.apply_params()
         (plan,) = dataset._calculate_plans
         assert plan.label == "calculate.1"
         assert plan.expression == "value * -1"
@@ -177,7 +177,7 @@ class TestCalculateStage:
         dataset = dataset_factory(
             DIMENSIONS, calculate=[{"expression": "value * 10", "where": "calendar_year = 2040"}]
         )
-        dataset._apply_calculate_params()
+        await dataset.apply_params()
         df = dataset.materialize().sort("calendar_year")
         (plan,) = dataset._calculate_plans
         assert band_dimension_keep(df, plan.dimension_where) == [False, True]
@@ -834,10 +834,10 @@ class TestTileBandCollapse:
 
 
 class TestSummarizeCalculateAndGroupAggregate:
-    """The zonal summarize (`_summarize_zone_stats_plugin`) applies a calculate
+    """The zonal summarize (`summarize_zone_stats`) applies a calculate
     (multiplier) parameter and a group_aggregate band collapse before the zonal reduce
     itself, via the shared `horizontal_aggregate_expr`/`HORIZONTAL_RASTER_AGGREGATES`
-    vocabulary (see `_apply_transform_params_raster`'s docstring) -- these pin that
+    vocabulary (see `RasterGridAnalysis._apply_transform_params_impl`'s docstring) -- these pin that
     composition with hand-computed values, since `TestSummarizeStage`'s plain-selection
     coverage doesn't exercise either parameter.
     """
@@ -891,7 +891,7 @@ class TestSummarizeCalculateAndGroupAggregate:
         self, dataset_factory, raster_data, zone_crosswalk
     ):
         """Both parameters compose: multiply then collapse (see
-        `_summarize_zone_stats_plugin`'s docstring) -- sum(-30, 40) = 10, uniform across
+        `summarize_zone_stats`'s docstring) -- sum(-30, 40) = 10, uniform across
         the grid, so the zonal mean is also 10."""
         dataset = dataset_factory(
             DIMENSIONS,
@@ -1017,18 +1017,18 @@ class TestGroupAggregateNodataExclusion:
 
 class TestSummarizeRoutesThroughThePlugin:
     """Every summarize request, regardless of which query parameters are in play, reaches
-    `_summarize_zone_stats_plugin` (see `_apply_transform_params_raster`'s docstring) --
+    `summarize_zone_stats` (see `RasterGridAnalysis._apply_transform_params_impl`'s docstring) --
     there is only the one implementation to route to."""
 
     async def _plugin_was_called(self, dataset, monkeypatch):
         called = []
-        original = dataset._summarize_zone_stats_plugin
+        original = dataset_module.summarize_zone_stats
 
         def spy(*args, **kwargs):
             called.append(True)
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(dataset, "_summarize_zone_stats_plugin", spy)
+        monkeypatch.setattr(dataset_module, "summarize_zone_stats", spy)
         await dataset.apply_params()
         return bool(called)
 
@@ -1067,8 +1067,8 @@ class TestValueWherePixelPredicate:
     """A `where` VALUE conjunct -- a predicate over pixel VALUES, not dimensions,
     written against the placeholder column `value` (see `expressions.classify_where`)
     -- is only meaningful once pixels are actually being summarized (see
-    `_apply_transform_params_raster`'s docstring): it is masked in per band, before the
-    multiplier/group_aggregate collapse (`_summarize_zone_stats_plugin`), so
+    `RasterGridAnalysis._apply_transform_params_impl`'s docstring): it is masked in per band, before the
+    multiplier/group_aggregate collapse (`summarize_zone_stats`), so
     `summarize_aggregate=count` together with it is exactly "count pixels per zone where
     value > X" -- and any other summarize_aggregate becomes its conditional counterpart
     ("sum of pixels where...", etc.) for free via the same null-skipping mechanism nodata
@@ -1137,7 +1137,7 @@ class TestValueWherePixelPredicate:
 
     async def test_where_value_conjunct_without_summarize_is_rejected(self, dataset_factory, raster_data):
         """A raster grid has no per-pixel frame at all for a plain (non-summarized)
-        response -- see `_apply_transform_params_raster`'s docstring -- so a `where`
+        response -- see `RasterGridAnalysis._apply_transform_params_impl`'s docstring -- so a `where`
         value conjunct given without summarize_by/summarize_aggregate is rejected
         outright, with an error that says so."""
         dataset = dataset_factory(DIMENSIONS, where="value > 3")
@@ -1156,13 +1156,13 @@ class TestValueWherePixelPredicate:
             where="value > 100000",
         )
         called = []
-        original = dataset._summarize_zone_stats_plugin
+        original = dataset_module.summarize_zone_stats
 
         def spy(*args, **kwargs):
             called.append(True)
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(dataset, "_summarize_zone_stats_plugin", spy)
+        monkeypatch.setattr(dataset_module, "summarize_zone_stats", spy)
         await dataset.apply_params()
         assert called
 
@@ -1173,13 +1173,13 @@ class TestValueWherePixelPredicate:
             DIMENSIONS, summarize_by="hydro_compartment_v001", summarize_aggregate="count"
         )
         called = []
-        original = dataset._summarize_zone_stats_plugin
+        original = dataset_module.summarize_zone_stats
 
         def spy(*args, **kwargs):
             called.append(True)
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(dataset, "_summarize_zone_stats_plugin", spy)
+        monkeypatch.setattr(dataset_module, "summarize_zone_stats", spy)
         await dataset.apply_params()
         assert called
 
@@ -1198,9 +1198,9 @@ class TestValueWherePixelPredicate:
         self, dataset_factory, gradient_raster_data, zone_crosswalk, monkeypatch
     ):
         """A single AND-term referencing both `value` and some other column has no
-        ambiguity-free classification (`expressions.classify_where`) and is rejected at
-        `_apply_filter_params` time -- before `_apply_transform_params_raster` even
-        starts, so before `scan_rasters`, any COG, or the crosswalk file is touched.
+        ambiguity-free classification (`expressions.classify_where`) and is rejected when
+        the `FilterOp` is lowered -- before `RasterGridAnalysis._apply_transform_params_impl`
+        even starts, so before `scan_rasters`, any COG, or the crosswalk file is touched.
         Substituted here for the retired value_where's own "unknown column" rejection,
         since a bare dimension-only conjunct (no `value` reference at all) is no longer
         eagerly namespace-checked -- it goes to the same unrestricted `lf.sql()` path any

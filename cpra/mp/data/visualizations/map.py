@@ -49,8 +49,8 @@ class Map(DatasetVisualization):
         the named-analysis HTTP routes use (see `api.__init__`'s `_compile_analysis_
         pipeline`) -- falling back to a plain `create_analysis` + the same
         `apply_params()` orchestration otherwise, so a plain (unanalyzed) map still
-        honors `grid_cell`/`where` -- calling only `_apply_calculate_params`/
-        `_apply_group_params` here used to silently skip them.
+        honors `grid_cell`/`where` -- reaching past `apply_params` to apply only some of
+        the options by hand, as this used to, silently skipped them.
 
         Bug this replaces: the storage format is long (one row per grid cell, after
         grouping/aggregation collapses every other dimension), not the wide,

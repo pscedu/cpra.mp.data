@@ -1,12 +1,18 @@
 """Analysis-layer helpers (the former api/utils.py, HTTP-free half). Nothing here may import FastAPI."""
 import asyncio
+import math
 from enum import Enum
 from functools import wraps
 from time import time
 
 import rasterio as rio
 from cachetools import TTLCache, cached
+from rasterio import windows
 from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
+from rasterio.transform import from_bounds
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import transform_bounds
 
 from cpra.mp.data import read_data
 from cpra.mp.data.analysis.types import CompressionAlgorithm
@@ -203,7 +209,7 @@ def raster_copy_gdal_env():
 def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):
     """Number of adjacent raster blocks to union into one summarize-loop batch.
 
-    ``Dataset._apply_transform_params_raster`` used to union a whole block row per
+    ``RasterGridAnalysis._apply_transform_params_impl`` used to union a whole block row per
     iteration regardless of how many blocks that row contained, so one iteration's read
     buffer (``n_bands`` bands x ``block_height`` x the row's full width) grew with the
     raster's width and the request's band count alike -- 20674 px wide block rows meant
@@ -259,6 +265,128 @@ def group_rows_by_path(df):
     row_indices = [row_indices_by_path[path] for path in order]
     bands = [bands_by_path[path] if has_bands else None for path in order]
     return order, row_indices, bands
+
+
+#: The CRS every map tile is rendered in.
+TILE_CRS = "EPSG:3857"
+
+#: Whole source pixels read around a tile's own footprint, so the warp onto the tile grid
+#: has neighbouring pixels to sample at the tile's edge rather than running off the end of
+#: the buffer it was handed. Four is what `tile_source_window`'s callers were measured
+#: against; with `Resampling.nearest` (the only resampling either tile path uses) a single
+#: pixel would do, and a larger margin costs only the extra pixels read.
+TILE_READ_BUFFER_PX = 4
+
+
+def tile_source_window(src, tile_bounds, buffer_px=TILE_READ_BUFFER_PX):
+    """The window of `src` (in its OWN CRS) covering the Web Mercator `tile_bounds`, as
+    whole source pixels clipped to the source's extent -- or `None` when the tile's
+    footprint lands entirely outside the source.
+
+    Two properties of the returned window are what let a caller read it, run per-pixel work
+    over the result in the SOURCE CRS, and only then warp onto the tile grid (see
+    `warp_window_to_tile`):
+
+    * It is a whole-pixel window: every offset and extent is an integer, so
+      `rasterio.windows.transform(window, src.transform)` describes the returned buffer
+      exactly -- same resolution and same grid phase as `src` itself, offset by an integer
+      number of pixels.
+    * It is INTERSECTED with the source extent rather than read `boundless=True` with
+      nodata padding. GDAL treats "outside the source extent" and "inside it but nodata"
+      differently when it snaps the warp at the data boundary, and padding measured one
+      pixel of erosion along that boundary on tiles that straddle it. Clipping instead
+      measured none. `tests/api/test_tile_warp.py` pins both halves of that.
+
+    `transform_bounds` densifies the tile's edges before reprojecting (a straight
+    Web-Mercator edge is curved in a projected source CRS, so its corners alone understate
+    the footprint). A tile large enough that its reprojection is not finite at all -- a
+    whole-world tile at low zoom, say -- falls back to the source's full extent, which is
+    the smallest window that certainly contains the footprint.
+    """
+    src_bounds = transform_bounds(TILE_CRS, src.crs, *tile_bounds, densify_pts=21)
+    if not all(math.isfinite(value) for value in src_bounds):
+        return windows.Window(0, 0, src.width, src.height)
+
+    window = windows.from_bounds(*src_bounds, transform=src.transform)
+    col_off = max(0, math.floor(window.col_off) - buffer_px)
+    row_off = max(0, math.floor(window.row_off) - buffer_px)
+    col_end = min(src.width, math.ceil(window.col_off + window.width) + buffer_px)
+    row_end = min(src.height, math.ceil(window.row_off + window.height) + buffer_px)
+    if col_end <= col_off or row_end <= row_off:
+        return None
+    return windows.Window(col_off, row_off, col_end - col_off, row_end - row_off)
+
+
+def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata):
+    """Warp `data` (a ``(bands, height, width)`` array georeferenced by `array_transform`
+    in `src_crs`) onto a tile's own Web Mercator pixel grid, through an in-memory dataset.
+
+    `array_transform` must describe the array PASSED IN. `warp_window_to_tile` is the entry
+    point that guarantees that; this function takes the transform as a bare argument so a
+    test can hand it a deliberately wrong one and measure what that costs
+    (`tests/api/test_tile_warp.py`'s control).
+
+    The warp targets the tile grid directly -- explicit `transform`/`width`/`height`, no
+    intermediate output grid -- and `Resampling.nearest` keeps every rendered pixel a real
+    source pixel value rather than a blend of several.
+    """
+    tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
+    count, height, width = data.shape
+    dtype = data.dtype.name
+    with MemoryFile() as memfile:
+        with memfile.open(
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=count,
+            dtype=dtype,
+            crs=src_crs,
+            transform=array_transform,
+            nodata=nodata,
+        ) as mem:
+            mem.write(data)
+        # Reopened read-only: rasterio deprecates warping a dataset that is still open for
+        # writing, and the written bytes are already complete once the block above exits.
+        with memfile.open() as mem:
+            with WarpedVRT(
+                mem,
+                crs=TILE_CRS,
+                transform=tile_transform,
+                width=tile_size,
+                height=tile_size,
+                nodata=nodata,
+                src_nodata=nodata,
+                add_alpha=False,
+                dtype=dtype,
+                resampling=Resampling.nearest,
+            ) as vrt:
+                return vrt.read()
+
+
+def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, tile_size, nodata):
+    """Warp one window's worth of per-pixel results onto a tile's pixel grid.
+
+    `data` is ``(bands, window.height, window.width)`` -- whatever a caller computed over
+    the pixels of `window`, still in the source CRS and still on the source's own grid --
+    and `window`/`src_transform` are the window that was READ and the transform of the
+    dataset it was read from. The georeferencing handed to the warp is derived here, from
+    those two, rather than accepted from the caller: a transform built from anything other
+    than the window actually read is a sub-pixel origin error that displaces every rendered
+    pixel, with no symptom short of a differential against another implementation (see
+    `tests/api/test_tile_warp.py`, which measures exactly that).
+
+    The shape check below is the mechanical half of the same guarantee -- a `window` that
+    does not describe `data` cannot reach the warp at all.
+    """
+    if tuple(data.shape[-2:]) != (window.height, window.width):
+        raise ValueError(
+            f"warp_window_to_tile: data is {data.shape[-2:]} but window is "
+            f"({window.height}, {window.width}) -- the array must be exactly the window "
+            "that was read, or its georeferencing is wrong"
+        )
+    return _warp_array_to_tile(
+        data, windows.transform(window, src_transform), src_crs, tile_bounds, tile_size, nodata
+    )
 
 
 def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None, use_gdal_env=False):

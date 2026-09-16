@@ -128,7 +128,7 @@ def _apply_read_data_selection(lf, grid, options):
     instead, rather than silently doing nothing or reinterpreting the request.
 
     `sort`/`select` are validated against `lf`'s own live schema (not the analysis
-    engine's `DIMENSION_CHOICES`/`required_columns`-derived whitelists) -- those
+    engine's `stages.SORT_CHOICES`/`required_columns`-derived whitelists) -- those
     whitelists assume `BaseAnalysis`'s own narrowed-tabular-output shape (vector
     dimension columns plus `grid_cell`/`value`), which is a genuinely different, and for
     a raster grid strictly smaller, set of columns than what `read_data` actually

@@ -160,7 +160,7 @@ def write_vector_crosswalk(crosswalk_path, src_grid, dst_grid, mapping):
     """Write a src->dst crosswalk Parquet.
 
     ``mapping`` is an iterable of ``(src_id, dst_id, scale_factor)`` triples, matching the
-    schema ``_apply_transform_params_vector`` expects.
+    schema ``VectorGridAnalysis._apply_transform_params_impl`` expects.
     """
     path = crosswalk_path / f"{src_grid}__{dst_grid}.parquet"
     pl.DataFrame(

@@ -66,7 +66,7 @@ POLARS_RASTER_AGGREGATES = {
 # DOWN a `group_by`'s rows the way the zonal summarize aggregates above do -- band-collapse and
 # zonal summarize are different axes of the same per-band pipeline and are kept in a
 # separate dict so the two are never reached for each other by mistake. Shared by
-# `Dataset._summarize_zone_stats_plugin` (pre-collapsing a group before the vertical zonal
+# `raster.summarize_zone_stats` (pre-collapsing a group before the vertical zonal
 # `guarded_aggregate`) and `Dataset._write_raster_windowed` (collapsing a group into one
 # output band) -- the one shared expression vocabulary both paths use for group_aggregate.
 #
@@ -167,7 +167,7 @@ def guarded_aggregate(aggregate, name):
 
     Bare Polars returns `null` for `min`/`max`/`mean` on an all-null group, and `0` (the
     additive identity) for `sum` -- neither is a meaningful answer for a (band, zone) with
-    no contributing pixel at all, which `_apply_transform_params_raster` needs reported as
+    no contributing pixel at all, which `RasterGridAnalysis._apply_transform_params_impl` needs reported as
     `NaN` instead. `count()` already skips nulls, so it is exactly the contributing-pixel
     count on its own, but the guard below is still needed for all four aggregates, not
     just `sum`, to turn "no contributing pixel" into `NaN` consistently.
@@ -226,7 +226,7 @@ def count_by_value(paths, row_indices, bands, crosswalk_path, zone_ids, value_wh
     value), via `scan_rasters` + `expressions.count_by_value_frame`.
 
     Single-band only. `paths`/`row_indices`/`bands` must together describe exactly one
-    selected band -- `Dataset._apply_transform_params_raster` enforces this before ever
+    selected band -- `RasterGridAnalysis._apply_transform_params_impl` enforces this before ever
     calling in (via its already-computed `n_bands`), since a multi-band request has no
     single natural (zone, value) shape: counting each band's values into the same `value`
     column would silently conflate unrelated variables/years, and counting them into
@@ -234,7 +234,7 @@ def count_by_value(paths, row_indices, bands, crosswalk_path, zone_ids, value_wh
     multi-band result is not acceptable, so this is refused rather than guessed at --
     re-asserted here defensively rather than only trusted from the caller.
 
-    `value_where`, when given, is applied the same way `_summarize_zone_stats_plugin` (the
+    `value_where`, when given, is applied the same way `summarize_zone_stats` (the
     other summarize_aggregate path) applies it: masked to null against the (single) band's
     own raw pixel value, before counting -- so a pixel the predicate rejects is excluded
     from the category counts exactly like a masked nodata pixel already is (mask first,
@@ -381,6 +381,7 @@ def scan_rasters(
     mask_nodata=True,
     crosswalks=(),
     with_px=False,
+    read_windows=None,
 ):
     """Return a LazyFrame of (grid_cell, <crosswalk columns>, <band columns>) over one or
     more multiband COGs.
@@ -409,13 +410,13 @@ def scan_rasters(
       position a pipeline declares it, rather than always being folded into the initial
       scan. (`raster.apply_project_band_wide` used to be that downstream consumer; it was
       deleted as unused -- the raster interpreter reaches a summarizing `project` through
-      `_apply_transform_params_impl`/`_summarize_zone_stats_plugin` instead, which use the
+      `_apply_transform_params_impl`/`summarize_zone_stats` instead, which use the
       zoned/filtered mode below. This attach-only mode is still exercised directly by
       `tests/api/test_raster_ops.py::TestScanRastersAttachWithoutFilter`.)
     - ``zones_path`` and ``zone_ids`` both given: the original zoned/TABULAR shape --
       a `grid_cell` column holds the destination zone ID, and pixels whose zone is not
       in `zone_ids` (including crosswalk nodata) are DROPPED in the source. Unchanged:
-      this is still what `Dataset._summarize_zone_stats_plugin`/`count_by_value` use,
+      this is still what `raster.summarize_zone_stats`/`count_by_value` use,
       and dropping here (rather than in a downstream `filter`) remains correct for them
       specifically because their output is immediately `group_by`'d -- row COUNT was
       never part of their contract, only group membership -- unlike a raster-output
@@ -471,6 +472,22 @@ def scan_rasters(
     (``row * width + col``, not window-relative and not renumbered by a zone filter). It
     costs one `arange`-and-broadcast per window -- no file read -- so, like `grid_cell`, it
     is computed wholesale rather than gated on projection pushdown once requested.
+
+    ``read_windows`` restricts the scan to a caller-supplied list of `rasterio.windows.
+    Window`, in the order given, instead of tiling the whole raster into batched blocks.
+    It is a SPATIAL restriction, not a row limit (`n_rows` is that): the rows emitted are
+    exactly the pixels of those windows, concatenated, and every column still means what it
+    means everywhere else -- ``_px`` in particular stays an index over the FULL raster
+    extent, so a restricted scan's pixel indices line up with an unrestricted one's.
+
+    This is what lets a MAP TILE be read through the same scan a full-raster write uses
+    (`paired._paired_notebook_tile` passes the one window `utils.tile_source_window`
+    computed for the tile's footprint) rather than through a parallel implementation.
+    Windows are NOT re-chunked to the batch budget -- a caller that hands over a window
+    bigger than one batch's worth of pixels gets it in one batch -- because a caller
+    specific enough to name its own windows has already decided how much it wants in
+    memory at once, and splitting them would break the "row `k` of the stream is pixel `k`
+    of window `w`" correspondence that a positional consumer reassembles from.
 
     ``value_dtype=None`` infers the schema from `paths[0]` -- see `_raster_dtype`.
 
@@ -626,12 +643,18 @@ def scan_rasters(
         with raster_gdal_env(), rio.open(ref_path) as first_src:
             block_height, block_width = first_src.block_shapes[0]
             raster_width = first_src.width
-            itemsize = np.dtype(first_src.dtypes[0]).itemsize
-            if n_selected_values:
-                itemsize = max(itemsize, 8)
-            n_units = n_selected_bands + 2 * n_selected_values
-            blocks_per_batch = raster_blocks_per_batch(max(n_units, 1), block_height, block_width, itemsize)
-            window_list = list(_batched_windows(first_src, blocks_per_batch))
+            if read_windows is not None:
+                # The caller named its own windows; the block/batch budget below has
+                # nothing left to decide. `raster_width` above is still the FULL raster's,
+                # which is what `_px` is indexed against.
+                window_list = list(read_windows)
+            else:
+                itemsize = np.dtype(first_src.dtypes[0]).itemsize
+                if n_selected_values:
+                    itemsize = max(itemsize, 8)
+                n_units = n_selected_bands + 2 * n_selected_values
+                blocks_per_batch = raster_blocks_per_batch(max(n_units, 1), block_height, block_width, itemsize)
+                window_list = list(_batched_windows(first_src, blocks_per_batch))
 
         for window in window_list:
             if remaining is not None and remaining <= 0:
