@@ -27,7 +27,7 @@ os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 import pytest  # noqa: E402
 
 from cpra.mp.data import config as cpra_config  # noqa: E402
-from cpra.mp.data.analysis.utils import _read_data_cached  # noqa: E402
+from cpra.mp.data.analysis.io.raster_io import _read_data_cached  # noqa: E402
 
 
 def pytest_configure(config):

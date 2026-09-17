@@ -57,7 +57,7 @@ from cpra.mp.data.analysis.sources import (
     _crosswalk_lookup_values,
     _dense_lookup_array,
 )
-from cpra.mp.data.analysis.utils import raster_blocks_per_batch, raster_gdal_env
+from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch, raster_gdal_env
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
 from cpra.mp.data.tabular import write_parquet

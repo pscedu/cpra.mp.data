@@ -15,7 +15,8 @@ import rasterio as rio
 from polars.io.plugins import register_io_source
 
 from cpra.mp.data.analysis import sources as raster_source
-from cpra.mp.data.analysis import utils as api_utils
+from cpra.mp.data.analysis.io import raster_io as api_utils
+from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch
 from cpra.mp.data.analysis.sources import (
     GridCrosswalk,
     _batched_windows,
@@ -24,7 +25,6 @@ from cpra.mp.data.analysis.sources import (
     scan_broadcast,
     scan_rasters,
 )
-from cpra.mp.data.analysis.utils import raster_blocks_per_batch
 from cpra.mp.data.grids import GRIDS
 from tests.factories import RASTER_KWARGS, write_raster_crosswalk, write_raster_dataset
 

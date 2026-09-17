@@ -15,12 +15,12 @@ import numpy as np
 import polars as pl
 import pytest
 
-from cpra.mp.data.analysis.fold import (
-    DECOMPOSABLE_AGGREGATES,
+from cpra.mp.data.analysis.execution.fold import (
     FoldError,
     fold_group_by,
     should_fold_group_by,
 )
+from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES
 
 AGGREGATES = sorted(DECOMPOSABLE_AGGREGATES)
 
@@ -199,7 +199,7 @@ import sys
 
 import polars as pl
 
-from cpra.mp.data.analysis.fold import fold_group_by
+from cpra.mp.data.analysis.execution.fold import fold_group_by
 
 mode, path, step = sys.argv[1], sys.argv[2], int(sys.argv[3])
 if mode == "folded":

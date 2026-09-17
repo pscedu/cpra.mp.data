@@ -21,13 +21,13 @@ import rasterio as rio
 from polars.io.plugins import register_io_source
 from rasterio import windows
 
-from cpra.mp.data.analysis.expressions import (
+from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch, raster_gdal_env
+from cpra.mp.data.analysis.request.expressions import (
     count_by_value_frame,
     parse_value_expr,
     rewrite_value_column,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.utils import raster_blocks_per_batch, raster_gdal_env
 
 NUMPY_TO_POLARS = {
     "int8": pl.Int8,

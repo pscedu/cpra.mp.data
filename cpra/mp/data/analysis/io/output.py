@@ -15,14 +15,14 @@ compiled object by duck typing (`PairedAnalysis` answers the same surface withou
 inheriting it), so the METHODS have to stay even though the LOGIC does not.
 
 `AnalysisError` is imported inside the one function that raises it, the same local-import
-idiom `analysis/utils.py` already uses: it is defined in `analysis/base.py`, which imports
+idiom `io/raster_io.py` already uses: it is defined in `analysis/base.py`, which imports
 this module at module scope, so a module-scope import back would be a cycle.
 """
 
 import polars as pl
 
+from cpra.mp.data.analysis.io.raster_io import timing
 from cpra.mp.data.analysis.types import DataFormat, OutputType
-from cpra.mp.data.analysis.utils import timing
 from cpra.mp.data.legends import LEGENDS, Legend
 
 # Polars' two spellings of each tabular writer: the lazy sink (streams, never materializes

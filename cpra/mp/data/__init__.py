@@ -89,7 +89,7 @@ def read_data(*, variable=None, time_unit=None, grid=None, base_path=None, **sel
         return _apply_read_data_selection(lf, grid_obj, options)
     except Exception as exc:  # AnalysisError or ExpressionError -- see the helper's docstring
         from cpra.mp.data.analysis.base import AnalysisError
-        from cpra.mp.data.analysis.expressions import ExpressionError
+        from cpra.mp.data.analysis.request.expressions import ExpressionError
 
         if isinstance(exc, (AnalysisError, ExpressionError)):
             raise ValidationError(str(exc)) from exc
@@ -137,9 +137,9 @@ def _apply_read_data_selection(lf, grid, options):
     `select`/`sort` by here even though `BaseAnalysis` never exposes them to `Options`).
     """
     from cpra.mp.data.analysis.base import AnalysisError
-    from cpra.mp.data.analysis.expressions import classify_where, value_predicate_mask
-    from cpra.mp.data.analysis.geography import parse_coordinate_pairs, resolve_vector_grid_cell_sync
-    from cpra.mp.data.analysis.utils import unpack_values
+    from cpra.mp.data.analysis.io.geography import parse_coordinate_pairs, resolve_vector_grid_cell_sync
+    from cpra.mp.data.analysis.io.raster_io import unpack_values
+    from cpra.mp.data.analysis.request.expressions import classify_where, value_predicate_mask
 
     schema_names = set(lf.collect_schema().names())
     has_value_column = "value" in schema_names

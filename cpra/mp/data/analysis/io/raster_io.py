@@ -50,10 +50,10 @@ def unpack_values(values_str, param_name, choices=None, separator=","):
     if choices:
         invalid_values = [val for val in values if val not in choices]
         if invalid_values:
-            # Local import: avoids a cpra.mp.data.analysis.base <-> .utils import cycle
-            # (base.py imports get_lazy_frame/unpack_values/timing from this module at
-            # module scope; AnalysisError itself is defined in base.py per that module's
-            # docstring).
+            # Local import: avoids a cpra.mp.data.analysis.base <-> .io.raster_io import
+            # cycle (base.py imports get_lazy_frame/unpack_values/timing from this module
+            # at module scope; AnalysisError itself is defined in base.py per that
+            # module's docstring).
             from cpra.mp.data.analysis.base import AnalysisError
 
             msg = f"Invalid values for {param_name}: {', '.join(invalid_values)}"
@@ -136,8 +136,8 @@ def raster_gdal_env():
     this machine: 1.22s for 2 bands vs 2.42s for 11 from one file; 1.11s for 2 bands vs
     4.81s for 21 of 52 from two files -- a large fixed per-read overhead means it isn't
     perfectly linear, but a narrow band selection is genuinely cheaper, not merely
-    memory-light). ``Dataset._windowed_read_is_lighter``'s routing already keys on the
-    windowed path's buffer *size* (bands x block height x width) rather than a time
+    memory-light). ``RasterGridAnalysis._windowed_read_is_lighter``'s routing already keys
+    on the windowed path's buffer *size* (bands x block height x width) rather than a time
     assumption, so it needed no change once this claim was checked -- confirmed by reading
     it, not merely assumed.
 
@@ -539,5 +539,3 @@ async def parallel_sample_rasters(datasets, coordinates, bands=None):
             for dataset, band in zip(datasets, bands)
         ]
     )
-
-

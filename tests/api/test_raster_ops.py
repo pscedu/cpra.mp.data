@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from cpra.mp.data.analysis.expressions import ExpressionError, compile_calculate_entries
+from cpra.mp.data.analysis.request.expressions import ExpressionError, compile_calculate_entries
 from cpra.mp.data.analysis.raster import (
     BAND_INDEX,
     apply_band_ops,

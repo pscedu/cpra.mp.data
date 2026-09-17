@@ -41,8 +41,8 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data.analysis import raster as raster_module
-from cpra.mp.data.analysis import utils as utils_module
-from cpra.mp.data.analysis.utils import (
+from cpra.mp.data.analysis.io import raster_io as utils_module
+from cpra.mp.data.analysis.io.raster_io import (
     TILE_CRS,
     TILE_READ_BUFFER_PX,
     TILE_READ_OVERSAMPLE,

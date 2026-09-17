@@ -26,27 +26,8 @@ from rasterio.warp import transform_bounds
 from cpra.mp.data import config
 from cpra.mp.data.analysis import stages
 from cpra.mp.data.analysis.base import AnalysisError, BaseAnalysis, op_error_boundary
-from cpra.mp.data.analysis.expressions import (
-    ExpressionError,
-    classify_where,
-    compile_calculate_entries,
-    parse_value_expr,
-    rewrite_named_columns,
-)
-from cpra.mp.data.analysis.geography import parse_coordinate_pairs, project_coordinates
-from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, Shape, calculate_label
-from cpra.mp.data.analysis.sources import (
-    NUMPY_TO_POLARS,
-    band_calculate_passes,
-    guarded_aggregate,
-    horizontal_aggregate_expr,
-    masked_value_predicate_exprs,
-    scan_rasters,
-)
-from cpra.mp.data.analysis.sources import (
-    count_by_value as raster_count_by_value,
-)
-from cpra.mp.data.analysis.utils import (
+from cpra.mp.data.analysis.io.geography import parse_coordinate_pairs, project_coordinates
+from cpra.mp.data.analysis.io.raster_io import (
     asynctiming,
     group_rows_by_path,
     parallel_read_rasters,
@@ -58,6 +39,25 @@ from cpra.mp.data.analysis.utils import (
     tile_source_window,
     unpack_values,
     warp_window_to_tile,
+)
+from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, Shape, calculate_label
+from cpra.mp.data.analysis.request.expressions import (
+    ExpressionError,
+    classify_where,
+    compile_calculate_entries,
+    parse_value_expr,
+    rewrite_named_columns,
+)
+from cpra.mp.data.analysis.sources import (
+    NUMPY_TO_POLARS,
+    band_calculate_passes,
+    guarded_aggregate,
+    horizontal_aggregate_expr,
+    masked_value_predicate_exprs,
+    scan_rasters,
+)
+from cpra.mp.data.analysis.sources import (
+    count_by_value as raster_count_by_value,
 )
 # The LONG-shape lowering of `filter`/`calculate`/`group`, shared with the vector
 # interpreter rather than reimplemented here: a raster chain reaches that shape after a

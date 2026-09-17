@@ -367,7 +367,7 @@ class TestSummarizeStage:
         column blocks (512, 512, 28 px wide), so 1 vs. 1000 genuinely exercises chunked
         vs. whole-row batching, not just a no-op override.
         """
-        from cpra.mp.data.analysis import utils as api_utils
+        from cpra.mp.data.analysis.io import raster_io as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 1)
         chunked_dataset = dataset_factory(

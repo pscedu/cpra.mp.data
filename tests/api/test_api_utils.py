@@ -13,7 +13,7 @@ from fastapi import HTTPException
 
 from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
-from cpra.mp.data.analysis.utils import (
+from cpra.mp.data.analysis.io.raster_io import (
     enum_value,
     get_lazy_frame,
     parallel_read_rasters,
@@ -409,13 +409,13 @@ class TestRasterBlocksPerBatch:
         assert raster_blocks_per_batch(10_000, 512, 512, 8) >= 1
 
     def test_explicit_override_takes_precedence(self, monkeypatch):
-        import cpra.mp.data.analysis.utils as api_utils
+        import cpra.mp.data.analysis.io.raster_io as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", 3)
         assert raster_blocks_per_batch(52, 512, 512, 4) == 3
 
     def test_derives_from_the_configured_buffer_budget(self, monkeypatch):
-        import cpra.mp.data.analysis.utils as api_utils
+        import cpra.mp.data.analysis.io.raster_io as api_utils
 
         monkeypatch.setattr(api_utils, "RASTER_BLOCKS_PER_BATCH", None)
         monkeypatch.setattr(api_utils, "RASTER_BATCH_BUFFER_MB", 8)

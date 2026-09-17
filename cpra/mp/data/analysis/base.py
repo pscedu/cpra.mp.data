@@ -90,16 +90,17 @@ from contextlib import contextmanager
 import polars as pl
 from polars.exceptions import ColumnNotFoundError
 
-from cpra.mp.data.analysis import metadata, output, stages, tiles
-from cpra.mp.data.analysis.expressions import (
+from cpra.mp.data.analysis import metadata, stages, tiles
+from cpra.mp.data.analysis.execution.fold import FoldError
+from cpra.mp.data.analysis.io import output
+from cpra.mp.data.analysis.io.raster_io import get_lazy_frame
+from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
     classify_where,
     parse_value_expr,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.fold import FoldError
 from cpra.mp.data.analysis.types import OutputType
-from cpra.mp.data.analysis.utils import get_lazy_frame
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import Legend
 from cpra.mp.data.variables import Variable

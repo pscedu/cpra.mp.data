@@ -45,12 +45,12 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from cpra.mp.data.analysis.expressions import (
+from cpra.mp.data.analysis.execution.fold import FoldError, validate_decomposable
+from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
     classify_where,
     parse_calculate_expression,
 )
-from cpra.mp.data.analysis.fold import FoldError, validate_decomposable
 from cpra.mp.data.analysis.types import (
     AggregateFunction,
     DataFormat,

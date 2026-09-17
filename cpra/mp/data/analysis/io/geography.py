@@ -1,11 +1,11 @@
 """Convert between vector grid cell IDs and lat/lng coordinates using grid geometry.
 
 Formerly `api/geography.py`; moved here because `vector.apply_grid_cell_selection`
-(called by `VectorGridAnalysis.apply_steps`'s terminal `grid_cell` filter, the vector
-half of the old `Dataset._apply_grid_cell_vector`) resolves `grid_cell` coordinates
-through this module directly, and `cpra.mp.data.analysis` may not import FastAPI (see
-this package's other modules, and `tests/api/test_analysis_boundary.py`) -- so every
-`HTTPException` this module used to raise is an `AnalysisError` instead.
+(called by `VectorGridAnalysis.apply_steps`'s terminal `grid_cell` filter) resolves
+`grid_cell` coordinates through this module directly, and `cpra.mp.data.analysis` may not
+import FastAPI (see this package's other modules, and
+`tests/api/test_analysis_boundary.py`) -- so every `HTTPException` this module used to
+raise is an `AnalysisError` instead.
 """
 
 import asyncio

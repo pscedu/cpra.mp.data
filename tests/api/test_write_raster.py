@@ -20,7 +20,7 @@ import pytest
 import rasterio
 from rasterio.shutil import copy as rio_copy
 
-from cpra.mp.data.analysis.expressions import compile_calculate_entries
+from cpra.mp.data.analysis.request.expressions import compile_calculate_entries
 from cpra.mp.data.analysis.raster import (
     RasterGridAnalysis,
     band_column_names,

@@ -25,13 +25,13 @@ import pytest
 from cpra.mp.data.analysis import base as base_module
 from cpra.mp.data.analysis import metadata as metadata_module
 from cpra.mp.data.analysis import ops as ops_module
-from cpra.mp.data.analysis import output as output_module
 from cpra.mp.data.analysis import raster as raster_module
 from cpra.mp.data.analysis import stages as stages_module
 from cpra.mp.data.analysis import tiles as tiles_module
 from cpra.mp.data.analysis import vector as vector_module
-from cpra.mp.data.analysis.expressions import ExpressionError
+from cpra.mp.data.analysis.io import output as output_module
 from cpra.mp.data.analysis.ops import CalculateOp, FilterOp
+from cpra.mp.data.analysis.request.expressions import ExpressionError
 from cpra.mp.data.analysis.parameters import CalculateEntry, Options
 from cpra.mp.data.analysis.types import DataFormat, OutputType
 from cpra.mp.data.tabular import write_parquet

@@ -28,8 +28,8 @@ the same local-import idiom `analysis/utils.py` already uses: they are defined i
 back would be a cycle.
 """
 
+from cpra.mp.data.analysis.io.raster_io import unpack_values
 from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, _default_output_name
-from cpra.mp.data.analysis.utils import unpack_values
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 

@@ -63,9 +63,13 @@ from rasterio.warp import transform_bounds
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.base import AnalysisError
-from cpra.mp.data.analysis.expressions import (
-    parse_value_expr,
-    rewrite_named_columns,
+from cpra.mp.data.analysis.io.raster_io import (
+    group_rows_by_path,
+    raster_blocks_per_batch,
+    raster_gdal_env,
+    tile_read_shape,
+    tile_source_window,
+    warp_window_to_tile,
 )
 from cpra.mp.data.analysis.pipeline import (
     PipelineError,
@@ -75,6 +79,10 @@ from cpra.mp.data.analysis.raster import (
     crosswalk_value_column_names,
     pivot_vector_to_band_wide,
 )
+from cpra.mp.data.analysis.request.expressions import (
+    parse_value_expr,
+    rewrite_named_columns,
+)
 from cpra.mp.data.analysis.sources import (
     GridCrosswalk,
     _batched_windows,
@@ -82,14 +90,6 @@ from cpra.mp.data.analysis.sources import (
     scan_rasters,
 )
 from cpra.mp.data.analysis.types import OutputType
-from cpra.mp.data.analysis.utils import (
-    group_rows_by_path,
-    raster_blocks_per_batch,
-    raster_gdal_env,
-    tile_read_shape,
-    tile_source_window,
-    warp_window_to_tile,
-)
 from cpra.mp.data.legends import LEGENDS, Legend
 
 # The column namespace a single-input pipeline's `filter.where` may reference once its own

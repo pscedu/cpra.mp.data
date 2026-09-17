@@ -31,7 +31,7 @@ import polars as pl
 from pydantic import ValidationError
 
 from cpra.mp.data import config
-from cpra.mp.data.analysis.expressions import (
+from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
     _check_no_dimension_subquery_or_aggregate,
     classify_where,

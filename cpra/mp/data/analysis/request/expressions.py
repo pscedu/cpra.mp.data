@@ -26,9 +26,9 @@ whitelist that is honest about what it doesn't yet support.
 
 Every function here takes and returns plain values (strings, sets, `polars.Expr`) and
 raises `ExpressionError`, an ordinary `ValueError` subclass -- never `HTTPException` and
-never a FastAPI import. `Dataset` (`api/dataset.py`) is the only place that translates an
-`ExpressionError` into a 400 response; that split is what lets this module be reused
-outside the API later (the `read_data()` entry point in `cpra/mp/data/__init__.py`).
+never a FastAPI import. `op_error_boundary` (`analysis/base.py`) is the only place that
+translates an `ExpressionError` into a 400 response; that split is what lets this module be
+reused outside the API later (the `read_data()` entry point in `cpra/mp/data/__init__.py`).
 """
 
 import re
@@ -486,8 +486,8 @@ def rewrite_named_columns(expr_str, column_map):
     """Generalization of `rewrite_value_column` to more than one placeholder, rewritten
     simultaneously rather than one at a time.
 
-    `api/pipeline.py`'s analysis pipelines don't write their `filter.where` against the
-    single `value` placeholder -- a step downstream of a spatial `join` (`api/raster_source
+    `pipeline.py`'s analysis pipelines don't write their `filter.where` against the
+    single `value` placeholder -- a step downstream of a spatial `join` (`paired
     ._write_paired_notebook_raster`) names each side by its own input/step name (e.g. `marsh > 0.5 AND sal >
     5.5`), and that same expression has to be re-evaluated once per selected calendar band,
     against that band's own synthetic columns (`scan_rasters`' `b<i>`/`p<i>` convention).
@@ -515,13 +515,13 @@ def rewrite_named_columns(expr_str, column_map):
 def value_predicate_mask(expr_str, allowed_columns):
     """Parse a value predicate and return it as a mask with `null` coerced to `False`.
 
-    The shape every "value_where" call site in `dataset.py` wants: a boolean expression
-    suitable for `pl.when(mask).then(pl.col(...)).otherwise(None)`, which nulls out a
-    non-matching value rather than dropping its row. That is what lets a masked-out value
-    fall into every aggregate's EXISTING null-skipping behaviour (`guarded_aggregate`'s
-    `count()`-based denominator, `POLARS_RASTER_AGGREGATES`, the vector
-    `getattr(pl.col("value"), aggregate)()` call sites) exactly like a nodata pixel does,
-    with no separate "predicate failed" code path anywhere downstream.
+    The shape every "value_where" call site in `base.py`/`sources.py` wants: a boolean
+    expression suitable for `pl.when(mask).then(pl.col(...)).otherwise(None)`, which nulls
+    out a non-matching value rather than dropping its row. That is what lets a masked-out
+    value fall into every aggregate's EXISTING null-skipping behaviour
+    (`guarded_aggregate`'s `count()`-based denominator, `POLARS_RASTER_AGGREGATES`, the
+    vector `getattr(pl.col("value"), aggregate)()` call sites) exactly like a nodata pixel
+    does, with no separate "predicate failed" code path anywhere downstream.
 
     `fill_null(False)`: a predicate over an already-null (nodata) value evaluates to
     null, not `False` (`null > x` is `null`, matching SQL three-valued logic) -- coercing

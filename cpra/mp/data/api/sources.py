@@ -1,7 +1,7 @@
 from fastapi import HTTPException
 from polars.exceptions import ColumnNotFoundError
 
-from cpra.mp.data.analysis.utils import timing
+from cpra.mp.data.analysis.io.raster_io import timing
 
 
 class LazyFrameSource:

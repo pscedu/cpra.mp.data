@@ -27,19 +27,19 @@ from cpra.mp.data.analysis.base import (
     apply_value_filter,
     op_error_boundary,
 )
-from cpra.mp.data.analysis.expressions import (
+from cpra.mp.data.analysis.execution.fold import FoldError, fold_group_by, should_fold_group_by
+from cpra.mp.data.analysis.io.geography import (
+    parse_coordinate_pairs,
+    resolve_vector_grid_cell,
+)
+from cpra.mp.data.analysis.io.raster_io import asynctiming, unpack_values
+from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, calculate_label
+from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
     compile_calculate_entries,
     count_by_value_frame,
     rewrite_named_columns,
 )
-from cpra.mp.data.analysis.fold import FoldError, fold_group_by, should_fold_group_by
-from cpra.mp.data.analysis.geography import (
-    parse_coordinate_pairs,
-    resolve_vector_grid_cell,
-)
-from cpra.mp.data.analysis.ops import CalculateOp, FilterOp, GroupOp, Op, ProjectOp, calculate_label
-from cpra.mp.data.analysis.utils import asynctiming, unpack_values
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 
 DIMENSION_COLUMNS = cs.matches(r"^[a-z]") - cs.by_name("grid_cell", "value")

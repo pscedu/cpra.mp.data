@@ -6,7 +6,7 @@ from rasterio.warp import transform
 from shapely.geometry import box
 
 from cpra.mp.data.analysis import AnalysisError
-from cpra.mp.data.analysis.geography import (
+from cpra.mp.data.analysis.io.geography import (
     parse_coordinate_pairs,
     project_coordinates,
     representative_points,
