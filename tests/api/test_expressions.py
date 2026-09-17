@@ -11,7 +11,10 @@ import pytest
 
 from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
+    PredicateKind,
+    classify_predicate_kind,
     classify_where,
+    classify_where_kinds,
     compile_calculate_entries,
     count_by_value_frame,
     parse_calculate_expression,
@@ -318,6 +321,78 @@ class TestClassifyWhere:
         dimension, value = classify_where("value = min(value)")
         assert dimension == []
         assert value == ["value = min(value)"]
+
+
+class TestClassifyPredicateKind:
+    def test_dimension_conjunct(self):
+        assert classify_predicate_kind("calendar_year > 2040") is PredicateKind.dimension
+
+    def test_value_conjunct(self):
+        assert classify_predicate_kind("value > 3") is PredicateKind.value
+
+    def test_spatial_conjunct(self):
+        assert classify_predicate_kind("grid_cell = 'abc'") is PredicateKind.spatial
+
+    def test_conjunct_referencing_both_grid_cell_and_value_is_rejected(self):
+        """A single AND-term can only be one predicate kind -- exactly the same
+        ambiguity `classify_where` rejects for a value/dimension mix (see
+        `TestClassifyWhere.test_mixed_conjunct_is_rejected`), extended to the third
+        kind."""
+        with pytest.raises(ExpressionError, match="grid_cell"):
+            classify_predicate_kind("grid_cell = 'abc' and value > 3")
+
+    def test_unparseable_conjunct_is_rejected(self):
+        with pytest.raises(ExpressionError):
+            classify_predicate_kind("value >>> 3")
+
+
+class TestClassifyWhereKinds:
+    def test_single_dimension_conjunct(self):
+        kinds = classify_where_kinds("calendar_year > 2040")
+        assert kinds[PredicateKind.dimension] == ["calendar_year > 2040"]
+        assert kinds[PredicateKind.value] == []
+        assert kinds[PredicateKind.spatial] == []
+
+    def test_single_value_conjunct(self):
+        kinds = classify_where_kinds("value > 3")
+        assert kinds[PredicateKind.value] == ["value > 3"]
+        assert kinds[PredicateKind.dimension] == []
+        assert kinds[PredicateKind.spatial] == []
+
+    def test_single_spatial_conjunct(self):
+        kinds = classify_where_kinds("grid_cell = 'abc'")
+        assert kinds[PredicateKind.spatial] == ["grid_cell = 'abc'"]
+        assert kinds[PredicateKind.value] == []
+        assert kinds[PredicateKind.dimension] == []
+
+    def test_all_three_kinds_together_are_sorted_and_kept_separate(self):
+        kinds = classify_where_kinds("calendar_year > 2040 and value > 3 and grid_cell = 'abc'")
+        assert kinds[PredicateKind.dimension] == ["calendar_year > 2040"]
+        assert kinds[PredicateKind.value] == ["value > 3"]
+        assert kinds[PredicateKind.spatial] == ["grid_cell = 'abc'"]
+
+    def test_every_predicate_kind_is_always_a_key_even_when_empty(self):
+        kinds = classify_where_kinds("value > 3")
+        assert set(kinds) == set(PredicateKind)
+
+    def test_empty_conjunct_is_rejected(self):
+        with pytest.raises(ExpressionError, match="empty"):
+            classify_where_kinds("calendar_year > 2040 and")
+
+    def test_spatial_conjunct_with_aggregate_call_is_rejected(self):
+        """Spatial conjuncts get the same structural (no aggregate, no subquery) check
+        as dimension conjuncts do in `classify_where` -- only a VALUE conjunct is exempt,
+        since the value-expression whitelist itself catches aggregates downstream."""
+        with pytest.raises(ExpressionError, match="aggregate"):
+            classify_where_kinds("grid_cell = min(grid_cell)")
+
+    def test_spatial_conjunct_with_subquery_is_rejected(self):
+        with pytest.raises(ExpressionError, match="subquery"):
+            classify_where_kinds("grid_cell in (select 1)")
+
+    def test_value_conjunct_with_aggregate_call_is_not_rejected_at_classification(self):
+        kinds = classify_where_kinds("value = min(value)")
+        assert kinds[PredicateKind.value] == ["value = min(value)"]
 
 
 class TestCountByValueFrame:

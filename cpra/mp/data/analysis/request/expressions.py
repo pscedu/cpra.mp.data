@@ -32,6 +32,7 @@ reused outside the API later (the `read_data()` entry point in `cpra/mp/data/__i
 """
 
 import re
+from enum import Enum
 from typing import NamedTuple
 
 import polars as pl
@@ -530,6 +531,85 @@ def value_predicate_mask(expr_str, allowed_columns):
     neither branch condition technically matched `False`.
     """
     return parse_value_expr(expr_str, allowed_columns).fill_null(False)
+
+
+class PredicateKind(str, Enum):
+    """The three kinds a pipeline `filter`/`calculate.where` conjunct can be, by which
+    reserved column it references: `value` (the measured quantity), `grid_cell` (a
+    spatial predicate -- the one kind `classify_where` above does not distinguish, since
+    it predates the pipeline request layer and only ever needed the dimension/value
+    split), or neither (an ordinary dimension conjunct). Which kind a conjunct is decides
+    its lowering: a dimension conjunct is a column selection in band-wide shape and a row
+    filter in long shape either way; a value conjunct is a row filter in long shape and
+    always a per-cell mask in band-wide shape (never a row drop, since dropping a pixel's
+    row would drop it from every band); a spatial conjunct is a row filter in long shape,
+    and a point sample in band-wide shape -- the one case that changes the frame's shape,
+    from band-wide to long, rather than preserving it.
+    """
+
+    value = "value"
+    dimension = "dimension"
+    spatial = "spatial"
+
+
+def classify_predicate_kind(conjunct: str) -> PredicateKind:
+    """Classify one top-level AND conjunct (as `split_top_level_and` produces) into a
+    `PredicateKind`, by whether it references the reserved `grid_cell` column, the
+    reserved `value` column, or neither. A conjunct naming both is rejected outright, the
+    same rule `classify_where` already applies to a conjunct naming both `value` and a
+    dimension: there is no lowering for a single comparison that tests two kinds at once.
+    """
+    try:
+        expr = pl.sql_expr(conjunct)
+    except Exception as exc:  # pl.sql_expr's own exception types are not part of its stable API
+        raise ExpressionError(f"invalid where conjunct {conjunct!r}: {exc}") from exc
+
+    referenced = set(expr.meta.root_names())
+    is_spatial = "grid_cell" in referenced
+    is_value = "value" in referenced
+    if is_spatial and is_value:
+        raise ExpressionError(
+            f"where conjunct {conjunct!r} references both `grid_cell` and `value` -- a "
+            "single AND-term can only be one predicate kind; write them as separate "
+            "AND-ed conjuncts"
+        )
+    if is_spatial:
+        return PredicateKind.spatial
+    if is_value:
+        return PredicateKind.value
+    return PredicateKind.dimension
+
+
+def classify_where_kinds(where_str: str) -> dict[PredicateKind, list[str]]:
+    """The three-way counterpart of `classify_where`: split `where_str` into its
+    top-level AND conjuncts (`split_top_level_and`) and sort each into one of the three
+    `PredicateKind`s (`classify_predicate_kind`), rather than the dimension/value split
+    `classify_where` performs -- added alongside it, for the pipeline request layer's own
+    shape-typing needs, without changing `classify_where` or anything that already calls
+    it.
+
+    Every dimension and spatial conjunct additionally gets the same structural safety
+    check a dimension conjunct already gets from `classify_where`
+    (`_check_no_dimension_subquery_or_aggregate`): neither is a value expression bound
+    for `parse_value_expr`'s own whitelist, so without this check an aggregate call or a
+    subquery inside either one would otherwise force the same pushdown-defeating full
+    pass the module docstring describes. A value conjunct gets no additional check here,
+    matching `classify_where`'s own behavior -- its caller re-parses and whitelists it
+    with `parse_value_expr` when it actually needs to.
+
+    Returns a dict with all three `PredicateKind` members always present (even when a
+    kind's conjunct list is empty), each mapped to a list of the original conjunct
+    strings in the order they appeared.
+    """
+    result: dict[PredicateKind, list[str]] = {kind: [] for kind in PredicateKind}
+    for conjunct in split_top_level_and(where_str):
+        if not conjunct:
+            raise ExpressionError(f"empty conjunct in where={where_str!r}")
+        kind = classify_predicate_kind(conjunct)
+        if kind is not PredicateKind.value:
+            _check_no_dimension_subquery_or_aggregate(conjunct)
+        result[kind].append(conjunct)
+    return result
 
 
 def count_by_value_frame(lf, group_cols, value_col, max_distinct):
