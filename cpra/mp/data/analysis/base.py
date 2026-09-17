@@ -24,8 +24,14 @@ for long frames, `raster.RasterGridAnalysis.apply_steps` for band-wide ones).
 
 Two options have no op form and so run around the walk rather than inside it:
 
-- `options.grid_cell` selects the INPUT, before any op sees it, via the `_apply_grid_cell`
-  hook -- it is not a step in the chain, it is which cells the chain starts from.
+- `options.grid_cell` narrows the OUTPUT, after every op has run -- it is not a step in
+  the chain, it is which cells the chain's result is narrowed to. A caller who wants an
+  INPUT-side cell filter instead can express one directly as a leading `filter` step. Each
+  `apply_steps` applies it itself, terminally, as a direct call to a free function
+  (`vector.apply_grid_cell_selection`; `raster`'s own terminal lowering) -- there is no
+  shared hook for it, since what "narrow the output to these cells" means depends on the
+  OUTPUT's shape (a vector grid's real cell IDs vs. a raster's point samples), not just on
+  grid type at the start.
 - `sort`/`select` (`_apply_sort_params`) order and narrow the FINAL columns, after the
   walk, since they describe the response rather than the data.
 
@@ -35,15 +41,9 @@ declared order and a summarize is always last. Each interpreter calls
 `_apply_transform_params_impl` at the end of its walk instead (see
 `stages.lower_flat_options`).
 
-**Hook contract.** Each hook below is declared abstract here (raising
-`NotImplementedError`) and overridden once per subclass.
+**Hook contract.** The hook below is declared abstract here (raising `NotImplementedError`)
+and overridden once per subclass.
 
-- `async _apply_grid_cell(self)` -- apply `options.grid_cell` (IDs or coordinates) to
-  `self.lf`. Vector: filters to matching `grid_cell` IDs, resolving coordinates to IDs
-  first if needed, and records them on `self.grid_cell_ids`. Raster: samples the raster at
-  each coordinate and rebuilds `self.lf` as a long-format (grid_cell/value) frame labeled
-  by coordinate, since a raster has no cell IDs of its own -- which is also why this hook
-  is the one place a raster chain can CHANGE SHAPE before its walk begins.
 - `async _apply_transform_params_impl(self)` -- apply `summarize_by`/`summarize_aggregate`,
   converting to another grid's cells. Each implementation starts by calling
   `stages.validate_summarize_options`, which confirms both parameters (or neither) were
@@ -392,14 +392,6 @@ class BaseAnalysis:
         """
         tiles.validate_vector_tile(self.output_type, self.options.summarize_by or self.grid.name)
 
-    # -- the `grid_cell` input selection ---------------------------------------------------
-
-    async def _apply_grid_cell(self):
-        """Apply the `grid_cell` filter to `self.lf`. See the module/class docstring's
-        hook contract -- overridden per subclass; there is no grid-agnostic default.
-        """
-        raise NotImplementedError
-
     # -- sort/select: the two options with no op form ---------------------------------------
 
     def _apply_sort_params(self):
@@ -422,14 +414,21 @@ class BaseAnalysis:
 
         `filter_dimensions` values are pushed down as Hive-partition filters inside
         `get_lazy_frame`/`read_parquet`, before `self.lf` exists at all -- the measured
-        case where a `grid_cell` group-by drops from 9.8 GB to 285 MB. `options.grid_cell`
-        (a real `.filter()` on specific cell IDs) and a `where` DIMENSION conjunct (an
-        arbitrary SQL `.filter()`, applied by `apply_dimension_filter` when the
-        interpreter lowers a `FilterOp`) are the same kind of row-dropping filter, so they
-        count too -- `self._where_has_dimension_conjunct` (set by whichever `apply_steps`
-        ran, from the second value each lowering returns) is checked here rather than
-        `self.options.where is not None`, since a `where` may hold only a VALUE conjunct,
-        which never reaches this method as a row filter at all (see the next paragraph).
+        case where a partition filter drops a scan from 9.8 GB to 285 MB. A `where`
+        DIMENSION conjunct (an arbitrary SQL `.filter()`, applied by
+        `apply_dimension_filter` when the interpreter lowers a `FilterOp`) is the same kind
+        of row-dropping filter, so it counts too -- `self._where_has_dimension_conjunct`
+        (set by whichever `apply_steps` ran, from the second value each lowering returns)
+        is checked here rather than `self.options.where is not None`, since a `where` may
+        hold only a VALUE conjunct, which never reaches this method as a row filter at all
+        (see the next paragraph).
+
+        `options.grid_cell` is deliberately NOT included: it narrows the OUTPUT, applied
+        once, terminally, after every op in the walk (including any `GroupOp`) has already
+        run -- see `analysis/base.py`'s module docstring. By the time a `GroupOp` reaches
+        this method, `grid_cell` has not yet dropped a single row, so it is not a selective
+        filter for a `GroupOp`'s purposes, whatever it is eventually going to narrow at the
+        end.
 
         A `where` VALUE conjunct and the `calculate` parameters are deliberately NOT
         included: wherever this method's callers (the two interpreters, gating a vector
@@ -441,8 +440,7 @@ class BaseAnalysis:
         `.filter()`) doesn't block the fold's `.slice()` from reaching the scan either.
         """
         return (
-            self.options.grid_cell is not None
-            or self._where_has_dimension_conjunct
+            self._where_has_dimension_conjunct
             or any(v is not None for v in dict(self.filter_dimensions).values())
         )
 

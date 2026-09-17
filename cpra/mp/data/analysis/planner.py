@@ -410,11 +410,15 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     # at every step.
     #
     # A `grid_cell`-bearing RASTER selection was the last shape held back, because
-    # `RasterGridAnalysis._apply_grid_cell` reshapes `self.lf` from the band-metadata table
-    # to a long frame before any op could run. That reshape is now named for what it is --
-    # `project` raster-to-vector -- and the raster interpreter tracks the frame's SHAPE
-    # explicitly, taking the long lowerings from that point on, so the shape executes in
-    # declared order like every other.
+    # `RasterGridAnalysis._apply_grid_cell` used to reshape `self.lf` from the band-metadata
+    # table to a long frame before any op could run -- a `grid_cell`-bearing pipeline could
+    # not represent declared order either, for the same class of reason the other four
+    # shapes couldn't. `_apply_grid_cell` is gone now, on both grids: `grid_cell` is not an
+    # input-side reshape at all any more, it is a terminal, OUTPUT-side filter applied once
+    # at the very end of `apply_steps` (`vector.apply_grid_cell_selection` for a vector
+    # destination, `raster.sample_band_ops_to_long` when a raster chain never reaches one),
+    # so the interpreter's walk sees a `grid_cell`-bearing selection exactly the same as one
+    # without, and it executes in declared order like every other shape.
     #
     # The SUMMARIZING-PROJECT ORDER GUARD below is a different question and stays armed for
     # both grid types: it is about whether an op COMMUTES with a many-to-one re-aggregation,
@@ -979,10 +983,9 @@ def _compile_single_input_chain(pipeline: Pipeline, base_path):
     #
     # Unconditional: every shape this function compiles reaches an interpreter that walks
     # the ops in declared order, on either grid type, with or without a `grid_cell`
-    # selection. A `grid_cell`-bearing raster input -- the one shape that starts the walk in
-    # a different frame shape -- is covered by `RasterGridAnalysis.apply_steps`' explicit
-    # shape tracking (see the comment near the top of this function, and that method's own
-    # docstring).
+    # selection -- `grid_cell` is a terminal, OUTPUT-side filter now, so it never changes
+    # what frame shape the walk starts in or moves through (see the comment near the top
+    # of this function, and `RasterGridAnalysis.apply_steps`'s own docstring).
     dataset._pipeline_ops = compile_ops(pipeline)
 
     return dataset
@@ -1070,12 +1073,12 @@ def _compile_paired_notebook_shape(pipeline: Pipeline, base_path):
         raise PipelineError(
             "not yet supported in analysis pipelines: an input `grid_cell` filter in "
             "the paired (spatially-joined) pipeline shape -- it lowers onto "
-            "`Options.grid_cell`, which only takes effect via "
-            "`BaseAnalysis._apply_grid_cell()`, itself only invoked from "
-            "`apply_params()`; this shape's `raster_dataset`/`vector_dataset` never call "
-            "`apply_params()` (`PairedAnalysis._prepare()` calls `.materialize()` on "
-            "them directly), so setting it here would silently no-op rather than "
-            "filter anything"
+            "`Options.grid_cell`, a terminal, OUTPUT-side filter only ever applied from "
+            "inside `apply_steps` (`vector.apply_grid_cell_selection`/`raster."
+            "sample_band_ops_to_long`), itself only invoked from `apply_params()`; this "
+            "shape's `raster_dataset`/`vector_dataset` never call `apply_params()` "
+            "(`PairedAnalysis._prepare()` calls `.materialize()` on them directly), so "
+            "setting it here would silently no-op rather than filter anything"
         )
 
     if GRIDS[raster_selection.grid].grid_type != "raster":

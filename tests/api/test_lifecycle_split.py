@@ -625,10 +625,15 @@ class TestOptionsHandlingRunsFromItsNewHome:
         (`vector.apply_group_by`, `raster.collapse_band_group`). `_get_group_by_columns`
         moved out whole, to `stages.resolve_group_by_columns`.
 
-        `_apply_grid_cell` and `_apply_transform_params_impl` deliberately SURVIVE: both
-        interpreters call them (`grid_cell` is an input selection with no op form, and
-        `summarize_by`/`summarize_aggregate` have no `ProjectOp` spelling that carries
-        `summarize_grid_cell` -- see `stages.lower_flat_options`).
+        `_apply_transform_params_impl` deliberately SURVIVES on all three: both
+        interpreters call it (`summarize_by`/`summarize_aggregate` have no `ProjectOp`
+        spelling that carries `summarize_grid_cell` -- see `stages.lower_flat_options`).
+
+        `_apply_grid_cell` is gone from the base class and from BOTH subclasses:
+        `grid_cell` is not an input selection any more, it narrows the OUTPUT, so vector's
+        `apply_steps` calls `vector.apply_grid_cell_selection` directly and terminally
+        (see that method's docstring), and raster's calls `raster.sample_band_ops_to_long`
+        the same way, instead of either going through a per-instance hook.
         """
         for cls in (
             base_module.BaseAnalysis,
@@ -644,8 +649,11 @@ class TestOptionsHandlingRunsFromItsNewHome:
                 "_get_group_by_columns",
             ):
                 assert not hasattr(cls, name), f"{cls.__name__}.{name} survived"
-            assert hasattr(cls, "_apply_grid_cell")
             assert hasattr(cls, "_apply_transform_params_impl")
+
+        assert not hasattr(base_module.BaseAnalysis, "_apply_grid_cell")
+        assert not hasattr(vector_module.VectorGridAnalysis, "_apply_grid_cell")
+        assert not hasattr(raster_module.RasterGridAnalysis, "_apply_grid_cell")
 
         for name in (
             "apply_filter_options",
@@ -657,18 +665,24 @@ class TestOptionsHandlingRunsFromItsNewHome:
 
 
 class TestHookLoweringsRunFromTheirNewHomes:
-    """Gate 1 for the hook extraction: `_apply_grid_cell` and `_apply_transform_params_impl`
-    no longer HOLD a lowering, they call one.
+    """Gate 1 for the hook extraction, plus (for vector's `grid_cell`) the later move of
+    that filter from an INPUT-side hook to a terminal, OUTPUT-side call.
 
-    Each of the four was a subclass-specific body reading and writing `self`; each is now a
-    free function in `analysis/vector.py` or `analysis/raster.py` taking what it needs as
-    arguments, with the method reduced to option-reading plus storing the results. Spied
-    rather than merely answer-checked, because an inlined second copy would produce the same
-    answer -- every spy returns a marker no real implementation could produce, so the marker
-    reaching `self` is what proves nothing recomputed it.
+    `_apply_transform_params_impl` was a subclass-specific body reading and writing
+    `self`; it is now a free function in `analysis/vector.py`/`analysis/raster.py` taking
+    what it needs as arguments, with the method reduced to option-reading plus storing the
+    results. `_apply_grid_cell` went further: on BOTH sides there is no hook method left AT
+    ALL -- `VectorGridAnalysis.apply_steps` calls `apply_grid_cell_selection` directly,
+    terminally, against whichever grid the walk actually ended on, and
+    `RasterGridAnalysis.apply_steps` calls `sample_band_ops_to_long` the same way when no
+    `summarize_by` gave it a destination grid to filter instead (see that method's
+    docstring, in each module). Spied rather than merely answer-checked, because an
+    inlined second copy would produce the same answer -- every spy returns a marker no
+    real implementation could produce, so the marker reaching `self` is what proves
+    nothing recomputed it.
     """
 
-    async def test_vector_grid_cell_runs_apply_grid_cell_selection(
+    async def test_vector_grid_cell_runs_apply_grid_cell_selection_terminally(
         self, dataset_factory, annual_data, monkeypatch
     ):
         seen = []
@@ -680,11 +694,17 @@ class TestHookLoweringsRunFromTheirNewHomes:
 
         monkeypatch.setattr(vector_module, "apply_grid_cell_selection", spy)
         dataset = dataset_factory(DIMENSIONS, grid_cell="1,2")
-        await dataset._apply_grid_cell()
+        # No hook left to call in isolation -- `apply_steps` IS where the terminal call
+        # lives now, so drive it directly (with no ops to walk) rather than through the
+        # full `apply_params` (which would also run `_apply_sort_params`, irrelevant here).
+        await dataset.apply_steps([])
 
         assert seen == [("ecoregion_v001", "1,2")]
         assert dataset.lf is marker
         assert dataset.grid_cell_ids == ["id-marker"]
+        assert not hasattr(dataset, "_apply_grid_cell"), (
+            "the old per-instance hook must be gone, not merely unused"
+        )
 
     async def test_vector_transform_runs_apply_summarize(
         self, dataset_factory, annual_data, monkeypatch
@@ -707,24 +727,31 @@ class TestHookLoweringsRunFromTheirNewHomes:
         assert dataset.lf is marker
         assert dataset.summarize_grid_cell_ids == [77]
 
-    async def test_raster_grid_cell_runs_sample_bands_to_long(
+    async def test_raster_grid_cell_runs_sample_band_ops_to_long(
         self, dataset_factory, raster_data, monkeypatch
     ):
         seen = []
         marker = pl.LazyFrame({"marker": [1]})
 
-        async def spy(metadata_df, grid_cell):
-            seen.append((metadata_df.height, grid_cell))
+        async def spy(metadata_df, band_ops, grid_cell):
+            seen.append((metadata_df.height, band_ops, grid_cell))
             return marker
 
-        monkeypatch.setattr(raster_module, "sample_bands_to_long", spy)
+        monkeypatch.setattr(raster_module, "sample_band_ops_to_long", spy)
         dataset = dataset_factory(RASTER_DIMENSIONS, grid_cell="-91.0,29.5")
-        await dataset._apply_grid_cell()
+        # No hook left to call in isolation -- `apply_steps` IS where the terminal call
+        # lives now (sub-case B: no `summarize_by`, so no destination grid), so drive it
+        # directly (with no ops to walk) rather than through the full `apply_params`.
+        await dataset.apply_steps([])
 
         # Two bands of metadata reached the sampler, not a frame of pixels: the band-wide
-        # shape is bypassed entirely, which is the whole point of this lowering.
-        assert seen == [(2, "-91.0,29.5")]
+        # shape is bypassed entirely (no op ran to narrow or collapse it), which is the
+        # whole point of this lowering.
+        assert seen == [(2, [], "-91.0,29.5")]
         assert dataset.lf is marker
+        assert not hasattr(dataset, "_apply_grid_cell"), (
+            "the old per-instance hook must be gone, not merely unused"
+        )
 
     async def test_raster_transform_runs_both_zonal_free_functions(
         self, dataset_factory, raster_data, monkeypatch

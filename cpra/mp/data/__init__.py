@@ -108,11 +108,12 @@ def _apply_read_data_selection(lf, grid, options):
        code path from here into `create_analysis` risks calling back into `read_data`.
     2. **Sync/async mismatch** -- `read_data` is, and must stay, a plain synchronous
        function (this module's whole `read_data`/`write_data`/`compact_data` family is
-       sync). `BaseAnalysis.apply_params()` is `async def`, and its vector
-       `_apply_grid_cell` `await`s coordinate resolution -- there is no way to route
-       through it without either making `read_data` async (breaking its signature) or
-       driving an event loop from inside a sync call (fragile, and surprising for a
-       caller already inside one, e.g. a notebook cell).
+       sync). `BaseAnalysis.apply_params()` is `async def`, and `VectorGridAnalysis.
+       apply_steps`' terminal `grid_cell` filter (`vector.apply_grid_cell_selection`)
+       `await`s coordinate resolution -- there is no way to route through it without
+       either making `read_data` async (breaking its signature) or driving an event loop
+       from inside a sync call (fragile, and surprising for a caller already inside one,
+       e.g. a notebook cell).
 
     Instead, this reuses the same underlying, grid-engine-independent building blocks
     `BaseAnalysis` itself is built from: `analysis.expressions.classify_where`/

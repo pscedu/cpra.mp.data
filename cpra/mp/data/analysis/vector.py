@@ -112,11 +112,14 @@ def inject_and_serialize(vt: VectorTile, id_values: dict[int, float]) -> bytes:
 # `analysis/base.py` establishes for filter/calculate; see that module's docstring for why
 # each one raises a plain `FoldError`/`AnalysisError` rather than calling `self._error`.
 #
-# `apply_grid_cell_selection` and `apply_summarize` hold what the `_apply_grid_cell` and
-# `_apply_transform_params_impl` hooks used to run inline, so those methods are now three
-# lines of option-reading each. `apply_group_by` and `apply_project` are reached only from
-# `apply_steps` (this module, below), per `GroupOp`/`ProjectOp` -- a flat request's
-# `group_by`/`group_aggregate` gets there too, as the `GroupOp`
+# `apply_summarize` holds what the `_apply_transform_params_impl` hook used to run
+# inline, so that method is now three lines of option-reading. `apply_grid_cell_selection`
+# is called directly by `apply_steps` itself, terminally (see that method's docstring) --
+# there is no per-instance hook for `grid_cell` at all, since narrowing the OUTPUT is not a
+# per-subclass concept the way the summarize transform is. `apply_group_by` and
+# `apply_project` are reached only from `apply_steps` (this module, below), per
+# `GroupOp`/`ProjectOp` -- a flat request's `group_by`/`group_aggregate` gets there too, as
+# the `GroupOp`
 # `stages.lower_flat_options` emits for it.
 def apply_group_by(lf, by, aggregate, *, of="value", has_selective_filter):
     """Collapse `lf` by `[*by, "grid_cell"]`, aggregating `of` with `aggregate` -- the
@@ -168,8 +171,16 @@ async def apply_grid_cell_selection(lf, grid_name, grid_cell):
     Either way the result is reported under grid cell IDs, never the coordinates that
     selected them: a vector grid_cell *is* its ID. Several coordinates landing in one
     cell therefore select it once, which is what the de-duplication is for -- and why the
-    surviving IDs come back to the caller rather than staying local: they go on to narrow
-    the crosswalk in `apply_summarize` too.
+    surviving IDs come back to the caller rather than staying local: `VectorGridAnalysis.
+    apply_steps` stores them on `self.grid_cell_ids`, which nothing downstream of this
+    call reads any more (it is applied last, so there is no "downstream" left in the walk)
+    but is still surfaced for callers outside the walk that inspect it after the fact (see
+    `get_vector_tile`).
+
+    `grid_name` is whichever grid `lf`'s `grid_cell` column actually indexes AT THE POINT
+    THIS RUNS -- not necessarily the analysis's own input grid -- since this is called
+    terminally, against the pipeline's OUTPUT, by `VectorGridAnalysis.apply_steps` (see
+    that method's docstring for how it resolves `final_grid`).
     """
     values = unpack_values(grid_cell, "grid_cell")
 
@@ -192,17 +203,18 @@ def apply_project(lf, from_grid, to_grid, aggregate, *, has_selective_filter):
     of `summarize_by`/`summarize_aggregate`, for `apply_steps` (below) to call directly
     against a `ProjectOp`.
 
-    Deliberately does NOT pre-filter the crosswalk by `grid_cell_ids`/
-    `summarize_grid_cell_ids` the way `apply_summarize` does -- those are a
-    performance narrowing specific to the OLD engine's `Options.grid_cell`/
-    `summarize_grid_cell`, not a correctness requirement: a post-project `grid_cell`
-    filter reaches this interpreter as an ordinary `FilterOp` on the joined result's own
-    `grid_cell` column (compile_ops copies the raw `Pipeline`'s steps verbatim -- it has
-    no notion of `_extract_post_project_grid_cell_filter`'s Options-only special case),
-    and filtering the DESTINATION rows after the join is mathematically identical to
-    filtering the crosswalk's `dst_id` before it, just less optimized. Also, unlike
-    `apply_summarize`, never appends `geographic_unit` itself -- a pipeline's
-    `ProjectOp` may not be the request's LAST grid change (though a single-input chain
+    Deliberately does NOT pre-filter the crosswalk by `summarize_grid_cell_ids` the way
+    `apply_summarize` does -- that is a performance narrowing specific to
+    `Options.summarize_grid_cell`, not a correctness requirement: a post-project literal
+    `grid_cell = N` filter reaches this interpreter as an ordinary `FilterOp` on the joined
+    result's own `grid_cell` column (compile_ops copies the raw `Pipeline`'s steps
+    verbatim), and filtering the DESTINATION rows after the join is mathematically
+    identical to filtering the crosswalk's `dst_id` before it, just less optimized.
+    `Options.grid_cell` itself never reaches this function at all any more -- it is
+    applied once, terminally, by `apply_steps` after this function (and everything else in
+    the walk) has already run -- so there is nothing of ITS to pre-narrow the crosswalk by
+    here either. Also, unlike `apply_summarize`, never appends `geographic_unit` itself -- a
+    pipeline's `ProjectOp` may not be the request's LAST grid change (though a single-input chain
     without a `join` step can contain at most one -- see `apply_steps`'s docstring), so
     `apply_steps` adds that column once, itself, from the final grid.
 
@@ -253,7 +265,6 @@ def apply_summarize(
     summarize_aggregate,
     summarize_grid_cell,
     calculate,
-    grid_cell_ids,
     has_selective_filter,
 ):
     """The `summarize_by`/`summarize_aggregate` cross-grid reaggregation for a long frame,
@@ -264,9 +275,13 @@ def apply_summarize(
     This is the OLD, `Options`-shaped entry point; `apply_project` above is the op-shaped
     one, and the two differ in three ways that are all `Options`-only:
 
-    - the crosswalk is pre-narrowed by `grid_cell_ids` (sources) and
-      `summarize_grid_cell_ids` (destinations), a performance narrowing with no op
-      equivalent -- see `apply_project`'s docstring for why the op form does not need it;
+    - the crosswalk is pre-narrowed by `summarize_grid_cell_ids` (destinations), a
+      performance narrowing with no op equivalent -- see `apply_project`'s docstring for
+      why the op form does not need it. There is no analogous SOURCE-side narrowing:
+      `grid_cell` no longer selects source cells at all (it is applied terminally, against
+      this function's OUTPUT, by `VectorGridAnalysis.apply_steps` -- see that method's
+      docstring), so this function has nothing of the caller's to pre-narrow the crosswalk
+      by on that side;
     - `geographic_unit` is appended here, because `summarize_by` is by construction the
       request's last grid change, whereas `apply_steps` adds that column once from the
       final grid instead;
@@ -292,9 +307,6 @@ def apply_summarize(
         raise AnalysisError(f"No crosswalk from {grid_name} to {summarize_by}")
 
     crosswalk_lf = pl.scan_parquet(str(crosswalk_path))
-
-    if grid_cell_ids:
-        crosswalk_lf = crosswalk_lf.filter(pl.col("src_id").is_in([int(g) for g in grid_cell_ids]))
 
     if summarize_grid_cell_ids:
         crosswalk_lf = crosswalk_lf.filter(pl.col("dst_id").is_in(summarize_grid_cell_ids))
@@ -333,8 +345,9 @@ def apply_summarize(
     # hydro_compartment_v001 -> clara_grid_cell_v001, 109,854 distinct destination
     # cells), so this reaggregation is not uniformly safe just because most
     # `summarize_by` targets (ecoregion, parish, hydro_compartment, ...) are small.
-    # `summarize_grid_cell` narrows destinations the same way `grid_cell` narrows
-    # sources, so it's added to the same selective-filter signal here.
+    # `summarize_grid_cell` narrows destinations the same way a `WHERE grid_cell IN
+    # (...)` would narrow a plain group's key, so it's added to the same
+    # selective-filter signal here.
     key_names = [*dim_cols, "grid_cell"]
     has_selective_filter = has_selective_filter or summarize_grid_cell is not None
     if should_fold_group_by(key_names, has_selective_filter=has_selective_filter):
@@ -411,20 +424,10 @@ def apply_long_op(lf, op, *, rename_map, has_selective_filter):
 
 
 class VectorGridAnalysis(BaseAnalysis):
-    async def _apply_grid_cell(self):
-        """The `_apply_grid_cell` hook for a vector frame -- a thin caller over the free
-        function `apply_grid_cell_selection`, which holds the whole lowering (see its
-        docstring). What stays here is what touches `self`: reading the option and storing
-        the two results back.
-        """
-        self.lf, self.grid_cell_ids = await apply_grid_cell_selection(
-            self.lf, self.grid.name, self.options.grid_cell
-        )
-
     async def _apply_transform_params_impl(self):
         """The transform hook for a vector frame -- a thin caller over the free function
         `apply_summarize`, which holds the whole lowering (see its docstring). What stays
-        here is what touches `self`: reading the five options it needs and storing the two
+        here is what touches `self`: reading the four options it needs and storing the two
         results back.
 
         Declared `async` (with no internal `await`) purely to match the one hook name
@@ -438,7 +441,6 @@ class VectorGridAnalysis(BaseAnalysis):
             summarize_aggregate=self.options.summarize_aggregate,
             summarize_grid_cell=self.options.summarize_grid_cell,
             calculate=self.options.calculate,
-            grid_cell_ids=self.grid_cell_ids,
             has_selective_filter=self._has_selective_dimension_filter(),
         )
 
@@ -459,11 +461,17 @@ class VectorGridAnalysis(BaseAnalysis):
         above) is a plain free function, called once per op rather than once per
         whole-request option.
 
-        `self.options.grid_cell` (an INPUT-level filter -- `InputSelection.grid_cell`,
-        never a pipeline step, so it never appears in `ordered_ops` at all) is applied
-        once, up front, via the `_apply_grid_cell` hook -- the only sensible spot, since it
-        is a SOURCE-grid cell filter and must run before a `ProjectOp` ever changes what
-        `grid_cell` means.
+        `self.options.grid_cell` (never a pipeline step, so it never appears in
+        `ordered_ops` at all) is applied once, terminally, AFTER the whole walk below --
+        it narrows what comes OUT of this pipeline, not what goes in. A caller who wants
+        an INPUT-side cell filter can express it directly as a leading `filter` step
+        instead. Applied against `final_grid` (see the bottom of this method): whichever
+        grid `self.lf`'s `grid_cell` column actually indexes by the time the walk (and any
+        flat `summarize_by`) has finished, so a coordinate in `grid_cell` resolves against
+        the OUTPUT grid, not necessarily `self.grid.name`. `apply_group_by`/`apply_project`/
+        `apply_summarize` all keep `grid_cell` (or the destination zone aliased to it) as
+        an implicit group key, so it is always present in `self.lf` by the time this runs,
+        whatever ops the pipeline declared.
 
         `rename_map`: every name a `FilterOp.where`/`CalculateOp.expression` may reference
         the running value BY -- the pipeline's own input name, plus every step's own
@@ -532,9 +540,6 @@ class VectorGridAnalysis(BaseAnalysis):
         Filter semantics (a value conjunct is a row DROP, never a mask): see
         `apply_long_op`'s docstring, which now owns that lowering.
         """
-        if self.options.grid_cell:
-            await self._apply_grid_cell()
-
         lf = self.lf
         current_grid = self.grid.name
         # `ordered_ops` is empty for a request that declared nothing this interpreter can
@@ -595,6 +600,20 @@ class VectorGridAnalysis(BaseAnalysis):
             # branch for one is a no-op: `stages.validate_summarize_options` returns
             # "no summarize requested" and `apply_summarize` returns the frame untouched.
             await self._apply_transform_params_impl()
+
+        if self.options.grid_cell:
+            # Terminal `grid_cell`: filter the OUTPUT, on whichever grid it actually ended
+            # up on. `current_grid` moves off `self.grid.name` only for a summarizing
+            # `ProjectOp` (see the comment above); a flat `summarize_by` moves the grid
+            # too, but through the OTHER branch, so `current_grid` alone would miss it --
+            # the two are mutually exclusive (the same comment explains why), so checking
+            # both covers every way `self.lf` can end up on a grid other than its own.
+            final_grid = current_grid if current_grid != self.grid.name else (
+                self.options.summarize_by or self.grid.name
+            )
+            self.lf, self.grid_cell_ids = await apply_grid_cell_selection(
+                self.lf, final_grid, self.options.grid_cell
+            )
 
     @asynctiming
     async def get_vector_tile(self, x: int, y: int, z: int) -> bytes | None:

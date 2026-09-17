@@ -716,37 +716,53 @@ class TestSummarizeStage:
         df = dataset.materialize()
         assert df["grid_cell"].unique().to_list() == [200]
 
-    async def test_grid_cell_filter_narrows_sources(self, dataset_factory, annual_data, crosswalk):
-        """A source-side grid_cell filter removes its contribution from the summary.
+    async def test_grid_cell_no_longer_narrows_summarize_sources(
+        self, dataset_factory, annual_data, crosswalk
+    ):
+        """`grid_cell` used to name SOURCE (ecoregion) cells and pre-narrow the crosswalk
+        before the join -- this test used to request `"1,3"` and check that ecoregions 2
+        and 4 dropped out of each destination's sum. Now `grid_cell` narrows the OUTPUT,
+        resolved against the summarize's DESTINATION grid (`hydro_compartment_v001`, whose
+        real IDs are 100/200 -- see `crosswalk` above), so requesting source-space IDs
+        `"1,3"` selects no destination row at all: neither 100 nor 200 is in {1, 3}. This
+        is the direct, hand-computable evidence that the source-side narrowing is gone,
+        not merely a shape/count check.
+        """
+        dataset = dataset_factory(
+            DIMENSIONS,
+            grid_cell="1,3",
+            summarize_by="hydro_compartment_v001",
+            summarize_aggregate="sum",
+        )
+        await dataset.apply_params()
+        df = dataset.materialize()
+        assert df.height == 0
 
-        Regression: `grid_cell_ids` stay strings because they were originally column
-        names, and were fed straight into `is_in` against the crosswalk's integer `src_id`.
+    async def test_grid_cell_narrows_summarize_destinations(
+        self, dataset_factory, annual_data, crosswalk
+    ):
+        """Gate 2: the same `grid_cell` option, on a summarizing chain, now means something
+        genuinely different from before -- requesting destination compartment `"100"`
+        keeps that one destination row, and its value is the FULL sum of BOTH its source
+        ecoregions (1 and 2), not narrowed to either. Under the old (input) semantics this
+        exact request would have matched no source cell at all (source IDs are 1-4, not
+        100) and returned nothing; under the new (output) semantics it returns exactly one
+        row, with the same value `test_scale_factors_are_applied` computes for compartment
+        100 with no `grid_cell` filter at all -- proof the summarize itself is unaffected
+        and only the terminal narrowing changed.
         """
         source = annual_frame(years=(2030,))
         dataset = dataset_factory(
             DIMENSIONS,
-            grid_cell="1,3",
+            grid_cell="100",
             summarize_by="hydro_compartment_v001",
             summarize_aggregate="sum",
         )
         await dataset.apply_params()
-        df = dataset.materialize().filter(pl.col("grid_cell") == 100).sort("calendar_year")
-        assert df["value"][0] == pytest.approx(source["1"][0] * 0.5, rel=1e-5)
-
-    async def test_grid_cell_filter_drops_excluded_sources_entirely(
-        self, dataset_factory, annual_data, crosswalk
-    ):
-        """Source cells 2 and 4 are excluded, so each destination has one contributor."""
-        source = annual_frame(years=(2030,))
-        dataset = dataset_factory(
-            DIMENSIONS,
-            grid_cell="1,3",
-            summarize_by="hydro_compartment_v001",
-            summarize_aggregate="sum",
-        )
-        await dataset.apply_params()
-        df = dataset.materialize().filter(pl.col("grid_cell") == 200).sort("calendar_year")
-        assert df["value"][0] == pytest.approx(source["3"][0] * 0.5, rel=1e-5)
+        df = dataset.materialize().sort("calendar_year")
+        assert df["grid_cell"].unique().to_list() == [100]
+        expected = (source["1"][0] + source["2"][0]) * 0.5
+        assert df["value"][0] == pytest.approx(expected, rel=1e-5)
 
     async def test_summarize_grid_cell_ids_are_cast_to_int(self, dataset_factory, annual_data):
         """The parse itself. That the parsed IDs then actually narrow the crosswalk's
@@ -816,11 +832,18 @@ class TestFoldRouting:
         dataset.materialize()
         assert len(spy_fold) == 1
 
-    async def test_a_grid_cell_filter_skips_the_fold(self, dataset_factory, annual_data, spy_fold):
+    async def test_a_grid_cell_filter_no_longer_skips_the_fold(
+        self, dataset_factory, annual_data, spy_fold
+    ):
+        """`grid_cell` used to narrow the INPUT before the group_by ran, which was a
+        selective-filter signal (see the name this test used to have). Now it narrows the
+        OUTPUT, terminally, after the group_by -- by the time `vector.apply_group_by` runs
+        it has not dropped a single row, so this is exactly as cliff-shaped as the
+        unfiltered case above and folds too."""
         dataset = dataset_factory(DIMENSIONS, group_aggregate="sum", grid_cell="1")
         await dataset.apply_params()
         dataset.materialize()
-        assert spy_fold == []
+        assert len(spy_fold) == 1
 
     async def test_a_dimension_filter_skips_the_fold(self, dataset_factory, annual_data, spy_fold):
         dataset = dataset_factory(

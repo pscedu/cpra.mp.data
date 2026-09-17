@@ -66,7 +66,7 @@ from cpra.mp.data.analysis.utils import (
 # `analysis/vector.py` because `apply_group_by`/`apply_project`, the two lowerings it calls
 # that are not already in `analysis/base.py`, live there; `analysis/vector.py` imports
 # nothing from this module, so this direction is the acyclic one.
-from cpra.mp.data.analysis.vector import apply_long_op
+from cpra.mp.data.analysis.vector import apply_grid_cell_selection, apply_long_op
 from cpra.mp.data.config import (
     COUNT_BY_VALUE_MAX_DISTINCT,
     RASTER_NUM_THREADS,
@@ -504,16 +504,44 @@ def pivot_vector_to_band_wide(
     )
 
 
-async def sample_bands_to_long(metadata_df, grid_cell):
-    """`project` raster-to-vector at arbitrary points: sample every band in `metadata_df`
-    at each "lng,lat" pair in `grid_cell` and return a LONG LazyFrame (dimension columns,
-    `grid_cell`, `value`) -- the other direction from `pivot_vector_to_band_wide` above,
-    and the reason a raster selection carrying a `grid_cell` walks the long lowering from
-    its first op onward (see `RasterGridAnalysis.apply_steps`).
+async def sample_band_ops_to_long(metadata_df, band_ops, grid_cell):
+    """`project` raster-to-vector at arbitrary points, TERMINALLY: sample every band in
+    `metadata_df` at each `"lng,lat"` pair in `grid_cell`, replay `band_ops` (`RasterGridAnalysis.
+    _pixel_read_band_ops()` -- the same declared filter/calculate/group recipe every other
+    pixel-read consumer replays) against the sampled points via `apply_band_ops`, then
+    unpivot the surviving bands into a LONG LazyFrame (dimension columns, `grid_cell`,
+    `value`) -- the other direction from `pivot_vector_to_band_wide` above.
 
-    `metadata_df` is the full per-band metadata table (`path`/`band` plus dimension
-    columns); no pixels have been read yet, so this is where the band-wide frame that
-    would otherwise be produced is bypassed entirely.
+    `metadata_df` is `RasterGridAnalysis._band_frame()`: the RAW per-band frame (`path`/
+    `band` plus dimension columns), from before any `group` collapsed it -- a pixel-read
+    consumer always starts there, since a collapsed metadata frame no longer names real
+    files to sample. A `grid_cell` sample is a FOURTH pixel-read consumer here, alongside
+    tile/write/summarize, not a separate code path with its own copy of filter/calculate/
+    group -- see `RasterGridAnalysis.apply_steps`'s docstring for why the walk still
+    records `band_ops` even when no `summarize_by` will ever consume them directly.
+
+    The points sampled here are built as a genuine BAND-WIDE frame first (one row per
+    requested point, standing in for "one row per pixel"; one column per band, named
+    `band_column_names(metadata_df)`) -- exactly the shape `apply_band_ops` expects --
+    and only unpivoted to long AFTER the replay, not before. Replaying against the raw
+    per-point samples directly (rather than resampling from an already-long frame) is
+    what lets a `group`'s horizontal collapse, or a post-group dimension filter's column
+    drop, see the same band identity the band-wide walk itself tracked; unpivoting first
+    would have already discarded it. `nodata=None` matches the summarize path's own
+    choice: a value filter's mask (or an all-null `group`) propagates a genuine null into
+    `value` rather than a fabricated sentinel, since this produces tabular output, not a
+    rendered image.
+
+    A declared value-`filter` conjunct is a ROW DROP once replayed here, matching the
+    long-shape lowering's own contract (`vector.apply_long_op`'s docstring: "a `FilterOp`'s
+    value conjunct is a ROW DROP unless the op itself asks for a mask") -- `apply_band_ops`
+    itself cannot drop a row (band-wide shape must preserve every pixel's row identity, see
+    `apply_value_filter_band_wide`), so the drop happens here instead, once, after the
+    replay: any row a `("filter_value", ...)` entry masked to null is dropped. A null a
+    `calculate`/`group` produces with NO value filter declared is left in place as an
+    ordinary null `value`, the same as any other long-shape frame -- this only reaches for
+    the row-drop the value-filter contract actually requires, not every null this replay
+    could in principle produce.
     """
     lngs, lats = parse_coordinate_pairs(unpack_values(grid_cell, "grid_cell"))
 
@@ -527,20 +555,38 @@ async def sample_bands_to_long(metadata_df, grid_cell):
         group_samples = await parallel_sample_rasters(datasets, projected_pairs, bands=bands)
         dtype = datasets[0].dtypes[0]
 
-    # Add the resulting values to the LazyFrame as one column per sampled coordinate,
-    # then unpivot into long format (grid_cell/value) to match the long-format contract
-    # used everywhere else in the API. Each grid_cell here is a "lng,lat" coordinate
-    # pair label rather than an integer grid ID, since these are arbitrary sample points.
+    # `columns[p]` is one point's value across every band (length `len(metadata_df)`);
+    # stacking them turns "one array per point" into a `(n_points, n_bands)` matrix, so
+    # transposing column-vs-row gives the points-as-rows, bands-as-columns frame
+    # `apply_band_ops` expects.
     columns = [np.empty(len(metadata_df), dtype=dtype) for _ in lngs]
     for path_row_indices, path_samples in zip(row_indices, group_samples):
         for column, values in zip(columns, path_samples):
             column[path_row_indices] = values
+    band_names = band_column_names(metadata_df)
+    points_arr = np.stack(columns, axis=0) if columns else np.empty((0, len(metadata_df)), dtype=dtype)
+    points_df = pl.DataFrame({name: points_arr[:, i] for i, name in enumerate(band_names)})
+
+    lf, out_metadata_df = apply_band_ops(points_df.lazy(), metadata_df, band_ops, nodata=None)
     column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]
-    wide_df = metadata_df.with_columns(**dict(zip(column_labels, columns))).select(cs.exclude("path", "band"))
-    index_cols = [col for col in wide_df.columns if col not in column_labels]
-    return wide_df.unpivot(
-        index=index_cols, on=column_labels, variable_name="grid_cell", value_name="value"
-    ).lazy()
+    df = lf.collect().with_columns(pl.Series("grid_cell", column_labels))
+
+    # Melt the surviving `b<i>` columns to long, then rejoin each row's dimension columns
+    # off `out_metadata_df` by parsing `i` back out of the melted column's own name --
+    # `out_metadata_df` row `i` is exactly what `b<i>` means, post-replay, by the same
+    # `band_column_names` invariant every band-wide op preserves.
+    value_cols = band_column_names(out_metadata_df)
+    dim_df = out_metadata_df.select(cs.exclude("path", "band")).with_row_index("_sampled_band_idx")
+    melted = df.unpivot(index=["grid_cell"], on=value_cols, variable_name="_band_col", value_name="value")
+    melted = melted.with_columns(
+        pl.col("_band_col").str.slice(1).cast(pl.UInt32).alias("_sampled_band_idx")
+    )
+    long_df = melted.join(dim_df, on="_sampled_band_idx", how="left").drop(["_sampled_band_idx", "_band_col"])
+
+    if any(kind == "filter_value" for kind, *_ in band_ops):
+        long_df = long_df.filter(pl.col("value").is_not_null())
+
+    return long_df.lazy()
 
 
 def band_ops_for_pixel_read(band_ops, value_where):
@@ -1121,15 +1167,6 @@ def _take_window_rows(batch_iter, buffer, needed):
 
 
 class RasterGridAnalysis(BaseAnalysis):
-    async def _apply_grid_cell(self):
-        """The `_apply_grid_cell` hook for a raster frame -- a thin caller over the free
-        function `sample_bands_to_long`, which holds the whole lowering (see its
-        docstring). What stays here is what touches `self`: materializing the band
-        metadata (through `materialize`, so a missing dataset still surfaces as a 404),
-        reading the option, and storing the reshaped frame back.
-        """
-        self.lf = await sample_bands_to_long(self.materialize(), self.options.grid_cell)
-
     def _band_frame(self):
         """The full per-band metadata (`path`/`band`/dimension columns) a pixel-read
         consumer needs to build its raw scan, and the metadata frame its replay starts from:
@@ -1270,10 +1307,12 @@ class RasterGridAnalysis(BaseAnalysis):
         which of the two frame shapes `self.lf` currently holds. `shape` is what picks the
         IMPLEMENTATION of each declared op; it never picks the ORDER, which comes from
         `ordered_ops` alone. It replaces an earlier `current_grid != self.grid.name` test
-        that stood in for the same question -- a proxy that happened to agree with the shape
-        only because a summarizing `project` was the one thing that could reshape the frame.
-        It no longer is: a `grid_cell` selection reshapes it too, before the walk even
-        starts, which is exactly the case the proxy could not express.
+        that stood in for the same question -- a proxy that agrees with the shape because a
+        summarizing `project` is the only thing in this walk that can reshape the frame:
+        `shape` starts at `Shape.band_wide` unconditionally and the walk never leaves it any
+        other way (`self.options.grid_cell` is a strictly TERMINAL filter now, applied only
+        after this whole method's walk has finished -- see below -- so it never reshapes
+        anything the walk itself sees).
 
         `Shape.band_wide` means one row per pixel and one column per band (`b0..bN`), with
         `self.lf` holding that frame's band METADATA -- and it additionally means the frame
@@ -1295,11 +1334,10 @@ class RasterGridAnalysis(BaseAnalysis):
 
         `Shape.long` means the ordinary (dimension columns, `grid_cell`, `value`) frame, one
         row per observation, with no alignment property at all: rows may be freely dropped.
-        A raster chain reaches it two ways, both of which are `project` raster-to-vector in
-        `ops.LOWERING_TABLE`'s terms -- a summarizing `ProjectOp` at its own declared
-        position, or an `InputSelection.grid_cell` pointwise sample applied up front (see
-        below). Once there, every non-`project` op is lowered by the SAME
-        `vector.apply_long_op` the vector interpreter calls, with the same arguments.
+        A raster chain reaches it exactly one way -- a summarizing `ProjectOp` at its own
+        declared position, `project` raster-to-vector in `ops.LOWERING_TABLE`'s terms. Once
+        there, every non-`project` op is lowered by the SAME `vector.apply_long_op` the
+        vector interpreter calls, with the same arguments.
 
         - `Shape.band_wide`: `self.lf` is band metadata -- one
           row per selected band, or (once at least one `group` has run) one row per
@@ -1340,30 +1378,45 @@ class RasterGridAnalysis(BaseAnalysis):
           a numerically identical answer to narrowing the crosswalk's `zone_ids` before the
           summarize runs.
 
-          A further `ProjectOp` from this shape is REJECTED rather than lowered. It is
-          reachable only from the `grid_cell` entry into this shape (after a summarizing
-          project the planner admits no second one), and a `grid_cell` sample's `grid_cell`
-          values are `"lng,lat"` coordinate labels for arbitrary points, not cells of any
-          grid -- there is no crosswalk keyed by them and no meaningful zone to
-          re-aggregate them onto. That combination previously reached
-          `_apply_transform_params_impl` with an already-reshaped `self.lf` and died on a
-          raw `ColumnNotFoundError` for the missing `path` column; it is an explicit 400
-          now.
+          A further `ProjectOp` from this shape can never be reached: the planner admits at
+          most one `ProjectOp` per single-input chain, and `Shape.long` is entered ONLY by
+          that loop's own (unique) `ProjectOp` branch above (there is no other entry any
+          more -- see `self.options.grid_cell` below), so a second one to reject here is not
+          a case this method's own loop can ever actually see.
 
         `self.options.grid_cell` (`InputSelection.grid_cell`, an INPUT-level sampling filter,
-        never a pipeline step, so it never appears in `ordered_ops`) is applied once, up
-        front, via the `_apply_grid_cell` hook -- the same spot
-        `VectorGridAnalysis.apply_steps` applies its own. For a raster it is not a row
-        filter but a resample: it samples each selected band at the requested coordinates
-        and rebuilds `self.lf` as a long (grid_cell/value) frame via `.unpivot(...)`, i.e.
-        `project` raster-to-vector, so `shape` starts at `Shape.long` whenever it is set and
-        the whole walk takes the long lowerings.
+        never a pipeline step, so it never appears in `ordered_ops`) is a terminal, OUTPUT-side
+        filter, applied once at the very end of this method against whichever grid `self.lf`
+        ends up on -- see the block after the walk, below. It never reshapes anything the
+        WALK above sees: `shape` starts and, absent a summarizing `project`, stays
+        `Shape.band_wide` for the whole loop regardless of whether `grid_cell` is set, so a
+        leading dimension filter still narrows the SCAN via the ordinary band-wide pushdown
+        prefix (`apply_band_wide_op`'s pushdown rule) exactly as it would for a plain raster
+        selection -- unlike the old up-front resample this replaced, which sampled every
+        selected band before any filter could narrow that set. Getting `grid_cell` applied
+        needs two different routes depending on whether the chain also summarizes:
 
-        Known cost of applying it up front: a dimension filter declared as a leading step no
-        longer narrows the set of bands that get SAMPLED, the way the band-wide pushdown
-        prefix narrows the set that gets read. Every selected band is sampled at the
-        requested points and the filter then drops rows from the long result. The answer is
-        identical; the work is not, for a request that selects many bands and filters to few.
+        - `self.options.summarize_by` set: the chain's destination IS a real vector grid
+          (`self.options.summarize_by` itself), and `self.lf` reaches `Shape.long` through
+          the ordinary summarize -- the loop's `ProjectOp` branch for a pipeline, or the
+          trailing `if shape is Shape.band_wide` block below for a flat `summarize_by=`
+          request. Once there, `grid_cell` is applied terminally, reusing `vector.
+          apply_grid_cell_selection` unchanged -- see the block immediately after the walk
+          for why that reuse is exact, not just similar.
+
+        - No `self.options.summarize_by`: there is no destination grid for `grid_cell` to
+          resolve against other than the raster's own pixels, so `shape` never leaves
+          `Shape.band_wide` and the walk above records `self._band_ops`/narrows
+          `self.lf`'s band metadata exactly as it would for a plain (no `grid_cell`) raster
+          selection -- no pixel read yet, same as always. The terminal block below is what
+          finally reads pixels: it samples every SURVIVING band at the requested
+          coordinates and replays `self._band_ops` (via `self._pixel_read_band_ops()`)
+          against those samples with `apply_band_ops`, the identical replay recipe
+          `_collapse_tile_bands`/`_write_raster_windowed`/`apply_zonal_summarize` each use
+          for their own pixel reads -- see `sample_band_ops_to_long`'s own docstring.
+          `self.grid_cell_ids` is not set by this route (unlike the terminal one above) --
+          a sampled coordinate's label is not a cell ID of any grid, so there is nothing to
+          report there.
 
         `rename_map`/`value_names`: identical construction to `VectorGridAnalysis.
         apply_steps` -- see that method's docstring for why a synthetic digit-string default
@@ -1375,9 +1428,12 @@ class RasterGridAnalysis(BaseAnalysis):
         `AnalysisError`, which that boundary deliberately passes through untouched.
         """
         shape = Shape.band_wide
-        if self.options.grid_cell:
-            await self._apply_grid_cell()
-            shape = Shape.long
+        # A `grid_cell` selection with no `summarize_by` (sub-case B, see above) has no
+        # destination grid to reach `Shape.long` through, so the walk below never sees it
+        # either -- it takes the ordinary band-wide lowerings throughout, exactly like a
+        # plain (no `grid_cell`) raster selection, and the terminal block near the end of
+        # this method is the only place that condition is ever checked directly.
+        grid_cell_without_summarize = bool(self.options.grid_cell) and not self.options.summarize_by
 
         current_grid = self.grid.name
         # Empty `ordered_ops` (a selection that declared no `where`/`calculate`/`group` at
@@ -1392,14 +1448,6 @@ class RasterGridAnalysis(BaseAnalysis):
                 if isinstance(op, ProjectOp):
                     if op.to == current_grid:
                         continue
-                    if shape is Shape.long:
-                        self._error(
-                            f"not supported: a `project` to {op.to!r} in a raster-input pipeline that also "
-                            "selects a `grid_cell` -- a grid_cell selection samples the raster at arbitrary "
-                            "coordinates, so its rows are labeled by coordinate rather than by cells of any "
-                            "grid, and there is no crosswalk that can re-aggregate them onto another grid. "
-                            "Drop the `grid_cell` selection to summarize, or drop the project step to sample."
-                        )
                     await self._apply_transform_params_impl()
                     shape = Shape.long
                     current_grid = op.to
@@ -1435,7 +1483,7 @@ class RasterGridAnalysis(BaseAnalysis):
                     )
                     self._where_has_dimension_conjunct = self._where_has_dimension_conjunct or has_dimension_conjunct
 
-        if shape is Shape.band_wide:
+        if shape is Shape.band_wide and not grid_cell_without_summarize:
             # No `ProjectOp` in this chain ever actually summarized (an identity project,
             # possibly followed by filter/calculate/group steps that ran against the
             # still-metadata-shaped `self.lf` above) -- `_apply_transform_params_impl` still
@@ -1451,16 +1499,42 @@ class RasterGridAnalysis(BaseAnalysis):
             # position, and moved `shape` to `Shape.long` when it did -- so this is skipped
             # for that case, never a second summarize.
             #
-            # Skipped for a `grid_cell` selection too, which also leaves `shape` at
-            # `Shape.long` (before the walk even starts). That is a deliberate admission,
-            # not an oversight: the rejection this call carries exists because a plain
-            # raster selection has no per-pixel frame for a value predicate to test, and a
-            # `grid_cell` selection is precisely the case that DOES -- `_apply_grid_cell`
-            # has already resolved every selected band to a real sampled `value` at each
-            # requested coordinate, so `apply_long_op` applies the predicate to it directly,
-            # as an ordinary row drop, instead of stashing it on `self._value_where` for a
-            # zonal summarize that is never coming.
+            # Also skipped for `grid_cell_without_summarize` (sub-case B): that is a
+            # deliberate admission, not an oversight, of the exact same shape this call
+            # would otherwise reject -- a standalone value `where` with no `summarize_by`/
+            # `summarize_aggregate`. The rejection exists because a plain raster selection
+            # exposes no per-pixel frame for a value predicate to test; a `grid_cell`
+            # selection is precisely the case that DOES, once the terminal block below
+            # samples it, so a value filter recorded into `self._band_ops` here is replayed
+            # against real samples there instead of being rejected as premature.
             await self._apply_transform_params_impl()
+
+        if self.options.grid_cell and self.options.summarize_by:
+            # Terminal `grid_cell`, for a chain whose destination grid is a summarized
+            # vector zone (a summarizing `ProjectOp` above, or the flat `summarize_by`
+            # spelling of the same thing -- either way `self.options.summarize_by` names
+            # it). By this point `self.lf` is a genuine long (dimension columns,
+            # `grid_cell`, `value`) frame on that destination grid -- structurally
+            # identical to vector's own long frame at the same point -- so this reuses
+            # `VectorGridAnalysis.apply_steps`' own terminal lowering unchanged:
+            # `apply_grid_cell_selection` already accepts both a destination cell ID and a
+            # lat/lng pair resolved via point-in-polygon against whichever grid it's given.
+            self.lf, self.grid_cell_ids = await apply_grid_cell_selection(
+                self.lf, self.options.summarize_by, self.options.grid_cell
+            )
+        elif grid_cell_without_summarize:
+            # Terminal `grid_cell`, sub-case B: no destination vector grid, so this is a
+            # genuine raster-to-vector point sample instead of a filter. `self.lf` is still
+            # the band metadata the walk above narrowed/collapsed (never a real pixel read
+            # yet); `sample_band_ops_to_long` is the pixel-read consumer that finally reads
+            # one, replaying `self._band_ops` (via `self._pixel_read_band_ops()`) against
+            # samples taken at the requested coordinates rather than against a raster
+            # window -- see that function's own docstring for the replay/row-drop
+            # contract. `self.grid_cell_ids` is deliberately left unset (see this method's
+            # own docstring, in the `self.options.grid_cell` section above).
+            self.lf = await sample_band_ops_to_long(
+                self._band_frame(), self._pixel_read_band_ops(), self.options.grid_cell
+            )
 
     def _collapse_tile_bands(self, df, data, nodata):
         """Apply a tile's declared filter/calculate/group steps with Polars expressions.

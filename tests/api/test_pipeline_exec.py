@@ -754,10 +754,11 @@ class TestCompileSingleInputChain:
 
     def test_accepts_filter_after_group_for_a_grid_cell_raster_input(self, base_path):
         """A `grid_cell`-bearing raster selection was the last shape held back from the ops
-        interpreter, because `_apply_grid_cell` reshapes `self.lf` to a long frame before
-        any op could run. `RasterGridAnalysis.apply_steps` now tracks that reshape as the
-        shape change it is and takes the long lowerings from there, so this compiles like
-        every other shape. The answer is pinned by
+        interpreter, because `_apply_grid_cell` used to reshape `self.lf` to a long frame
+        before any op could run. `grid_cell` is a terminal, OUTPUT-side filter now (see
+        `RasterGridAnalysis.apply_steps`'s own docstring), so a `grid_cell`-bearing chain
+        takes the same band-wide lowerings as one without and compiles like every other
+        shape. The answer is pinned by
         `TestRasterGridCellDeclaredOrder::test_dimension_filter_after_group_selects_from_the_grouped_rows`.
         """
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
@@ -2146,18 +2147,25 @@ class TestRasterInterpreterLoadBearing:
         assert compiled._band_frame().height == 2
         assert compiled.materialize().height == 1
 
-    async def test_raster_input_with_grid_cell_runs_the_long_lowering(self, base_path, monkeypatch):
-        """`RasterGridAnalysis._apply_grid_cell` reshapes `self.lf` straight to a long
-        (grid_cell/value) frame via `.unpivot(...)` before any pipeline op could run. That
-        is `project` raster-to-vector, and `apply_steps` now says so: it starts the walk at
-        `Shape.long` and routes every op through `vector.apply_long_op`, the same
-        implementation the vector interpreter uses.
+    async def test_raster_input_with_grid_cell_runs_the_band_wide_lowering_terminally(
+        self, base_path, monkeypatch
+    ):
+        """A terminal `grid_cell` with no `summarize_by` (sub-case B) has no destination
+        grid for `self.lf` to land on up front, so `apply_steps` never reshapes it to long
+        at all here -- the walk takes the ordinary BAND-WIDE lowering
+        (`raster.apply_band_wide_op`) throughout, exactly as a plain (no `grid_cell`)
+        raster selection would (compare `test_band_wide_ops_run_from_the_free_function`
+        above, same pipeline shape, no `grid_cell`). Only at the very end does
+        `sample_band_ops_to_long` (covered separately in
+        `TestRasterBandOpsReplayIsLoadBearing`) read real pixels at the requested
+        coordinate and replay `self._band_ops`.
 
-        Proved two ways, because the answer alone would not distinguish them: the shared
-        long lowering is spied on and must actually be called with each declared op, AND
-        the band-wide recording machinery (`self._band_ops`, `self._raw_band_frame`) must
-        be untouched -- a band op recorded here would mean the band-wide branch had run
-        against a frame that is no longer band-wide.
+        Proved two ways: the band-wide lowering is spied on and must actually be called
+        with each declared op (the identity `project` aside), AND the recording it leaves
+        behind (`self._band_ops`, `self._raw_band_frame`) must match a plain band-wide run
+        -- the dimension filter here runs BEFORE the `group`, so it narrows the scan
+        itself (pushdown) rather than being recorded, and only the `group` shows up as a
+        replayable op.
         """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         pipeline = parse_pipeline(
@@ -2180,18 +2188,22 @@ class TestRasterInterpreterLoadBearing:
         assert compiled._pipeline_ops is not None
 
         seen = []
-        original = raster_module.apply_long_op
+        original = raster_module.apply_band_wide_op
 
-        def _spy(lf, op, **kwargs):
+        def _spy(op, metadata_lf, **kwargs):
             seen.append(op.op)
-            return original(lf, op, **kwargs)
+            return original(op, metadata_lf, **kwargs)
 
-        monkeypatch.setattr(raster_module, "apply_long_op", _spy)
+        monkeypatch.setattr(raster_module, "apply_band_wide_op", _spy)
         await compiled.apply_params()
 
         assert seen == ["filter", "group"], "the identity project is a no-op, not a lowering"
-        assert compiled._band_ops == []
-        assert compiled._raw_band_frame is None
+        # The dimension filter ran BEFORE the group, so it narrowed the scan directly
+        # instead of being recorded -- only the group is a replayable band op.
+        assert compiled._band_ops == [("group", [], "max")]
+        # The group's own pre-collapse snapshot, taken AFTER the pushdown filter already
+        # narrowed the scan to the single 2040 band.
+        assert compiled._band_frame().height == 1
         assert compiled.materialize()["value"].to_list() == [40]
 
     async def test_band_wide_ops_run_from_the_free_function(self, base_path, tmp_path, monkeypatch):
@@ -2654,11 +2666,17 @@ class TestRasterGridCellDeclaredOrder:
     executing an `Options`-derived fixed order, and for which all four were therefore still
     rejected at compile time.
 
-    It is a genuinely different execution path, not a rerun: `_apply_grid_cell` samples the
-    selected bands at the requested coordinates and rebuilds `self.lf` as a LONG frame
-    before the walk starts, so every op below takes the long lowering (`vector.
-    apply_long_op`) rather than the band-wide one, and the result is a tabular response
-    rather than a written raster.
+    It is a genuinely different execution path, not a rerun -- but not because the walk
+    itself takes a different lowering: a `grid_cell` with no `summarize_by` (sub-case B)
+    has no destination grid, so the walk below takes the ordinary BAND-WIDE lowering
+    (`raster.apply_band_wide_op`) throughout, recording `self._band_ops` exactly as a
+    plain (no `grid_cell`) raster selection would. What is different is what finally reads
+    pixels: instead of a raster window, `sample_band_ops_to_long` samples the requested
+    coordinates and replays `self._band_ops` (via `self._pixel_read_band_ops()`) against
+    those samples with `apply_band_ops` -- the same replay recipe the write and summarize
+    paths use, just against sampled points instead of a window -- so declared order is
+    preserved by the recording, not by a different per-op implementation, and the result
+    is a tabular response rather than a written raster.
 
     Every answer is hand-computed, for the same reason the band-wide class gives: these are
     exactly the shapes an orderless flat request cannot express, so a differential against
@@ -2782,26 +2800,58 @@ class TestRasterGridCellDeclaredOrder:
         assert df["value"].to_list() == pytest.approx([120.0]), "not [48.0, 120.0]"
         assert df["calendar_year"].to_list() == [2040]
 
-    async def test_a_summarizing_project_is_a_400_not_a_crash(self, base_path, crosswalk_path):
-        """The one shape this path refuses. A `grid_cell` selection labels its rows by
-        `"lng,lat"` coordinate, not by cells of any grid, so no crosswalk can re-aggregate
-        them onto another grid. Previously this reached `_apply_transform_params_impl` with
-        an already-reshaped `self.lf` and died on a raw `ColumnNotFoundError` for the
-        missing `path` column -- a 500. It is an explicit 400 now, and the crosswalk raster
-        is written here to show the refusal is about the shape, not about a missing file.
+    async def test_a_summarizing_project_admits_a_terminal_grid_cell_filter(
+        self, base_path, crosswalk_path
+    ):
+        """This shape used to be a flat 400 ("... also selects a `grid_cell`"): a
+        `grid_cell` sample labels its rows by `"lng,lat"` coordinate, not by cells of any
+        grid, so a crosswalk keyed by cell ID could never re-aggregate them. That refusal
+        assumed `grid_cell` always resamples up front, before any `project` could run --
+        which is no longer true. Since a summarizing `project` sets
+        `self.options.summarize_by`, `RasterGridAnalysis.apply_steps` now skips the
+        up-front sample entirely for this shape and applies `grid_cell` TERMINALLY
+        against the destination grid instead, reusing `vector.apply_grid_cell_selection`
+        unchanged -- the same lowering `VectorGridAnalysis.apply_steps` uses for its own
+        terminal filter (both are now genuinely INPUT-selection-labels-a-destination-cell
+        filters, not a pre-project resample).
+
+        Two zones with different fills (top half 5, bottom half 15) make the answer
+        discriminating: selecting zone 1 alone must return exactly zone 1's own hand-
+        computed mean (5), not zone 2's (15), and no other zone's row.
         """
         grid = GRIDS[RASTER_KWARGS["grid"]]
-        zones = np.ones((grid.height, grid.width), dtype="int32")
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[: grid.height // 2, :] = 1
+        zones[grid.height // 2 :, :] = 2
         write_raster_crosswalk(crosswalk_path, RASTER_KWARGS["grid"], "hydro_compartment_v001", zones)
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 5)
-        pipeline = self._pipeline(
-            [{"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}]
+
+        def data_fn(_year):
+            data = np.zeros((grid.height, grid.width), dtype="int32")
+            data[: grid.height // 2, :] = 5
+            data[grid.height // 2 :, :] = 15
+            return data
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=data_fn)
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": "1",
+                    }
+                },
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
         )
         compiled = compile_pipeline(pipeline, base_path=base_path)
+        await compiled.apply_params()
 
-        with pytest.raises(AnalysisError, match="also selects a `grid_cell`") as excinfo:
-            await compiled.apply_params()
-        assert excinfo.value.status_code == 400
+        df = compiled.materialize()
+        assert df["grid_cell"].to_list() == [1]
+        assert df["value"].to_list() == pytest.approx([5.0])
 
     async def test_group_aggregate_count_stays_rejected(self, base_path):
         """`group_aggregate='count'` is refused for a raster selection regardless of which
@@ -2843,6 +2893,70 @@ class TestRasterGridCellDeclaredOrder:
         await legacy.apply_params()
 
         assert new.materialize().equals(legacy.materialize())
+
+    async def test_multi_point_sample_replays_filter_calculate_group_per_point(self, base_path):
+        """Insurance for `sample_band_ops_to_long`'s replay, the way the other tests in
+        this class insure single-op-pair orderings: TWO points, landing in different
+        halves of the grid, sampled through a chain declaring all three replayable band
+        ops PLUS a value filter -- the case a single-point test cannot distinguish from
+        "the terminal sample just forgot to replay anything," since a single point has
+        no "did the OTHER point's row leak into mine" failure mode to catch.
+
+        Fills (top-half / bottom-half) per band: 2020 -> 100/200, 2030 -> 2/8,
+        2040 -> 4/16. DECLARED: `filter(calendar_year > 2020)` drops the 2020 band
+        entirely (its huge 100/200 fill must never reach either answer) -> `group(by=[],
+        max)` over the surviving {2030, 2040} bands -> top: max(2, 4) = 4, bottom:
+        max(8, 16) = 16 -> `calculate(vct * 10)` -> top: 40, bottom: 160 -> `filter(vct >
+        50)`, now a VALUE conjunct (`vct` no longer names a dimension once the group has
+        collapsed it away) -- true for bottom's 160, false for top's 40, so only the top
+        point's row drops.
+
+        This is what `sample_band_ops_to_long`'s own docstring means by "a declared
+        value-`filter` conjunct is a ROW DROP ... replayed here": the replay runs once per
+        sampled point, off the SAME `self._band_ops` list, and only the point whose own
+        sampled-and-recomputed value fails the predicate is the one that disappears.
+        """
+        grid = GRIDS[RASTER_KWARGS["grid"]]
+        half = grid.height // 2
+        fills = {2020: (100, 200), 2030: (2, 8), 2040: (4, 16)}
+
+        def data_fn(year):
+            top, bottom = fills[year]
+            arr = np.empty((grid.height, grid.width), dtype="int32")
+            arr[:half, :] = top
+            arr[half:, :] = bottom
+            return arr
+
+        write_raster_dataset(base_path, years=(2020, 2030, 2040), data_fn=data_fn)
+
+        # "-91.0,30.3" projects to row ~43 (top half); "-91.0,29.5" (the class's own
+        # single-point fixture, reused here) projects to row ~228 (bottom half) --
+        # confirmed by projecting both through `geography.project_coordinates` against
+        # this grid's own CRS/bounds before writing this test, not assumed.
+        top_point, bottom_point = "-91.0,30.3", "-91.0,29.5"
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "vct": {
+                        **{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")},
+                        "grid_cell": f"{top_point},{bottom_point}",
+                    }
+                },
+                "steps": [
+                    {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                    {"op": "filter", "where": "calendar_year > 2020"},
+                    {"op": "group", "by": [], "aggregate": "max"},
+                    {"op": "calculate", "expression": "vct * 10"},
+                    {"op": "filter", "where": "vct > 50"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        df = await self._run(pipeline, base_path)
+
+        assert df.height == 1, "the top point's row must drop, the bottom point's must survive"
+        assert df["grid_cell"].to_list() == [bottom_point]
+        assert df["value"].to_list() == pytest.approx([160.0])
 
 
 class TestRasterBandOpsReplayIsLoadBearing:
@@ -3020,9 +3134,9 @@ class TestCompilePairedNotebookShape:
 
     def test_rejects_grid_cell_on_the_raster_input(self, notebook_query_data):
         # `PairedAnalysis`'s `raster_dataset`/`vector_dataset` never call `apply_params()`
-        # (see `_dataset_for`'s own docstring) -- only `_apply_grid_cell()` (a stage hook
-        # of `apply_params()`) reads `Options.grid_cell`, so blindly forwarding it here
-        # would silently no-op rather than filter anything.
+        # (see `_dataset_for`'s own docstring) -- only `apply_steps` (only ever invoked
+        # from `apply_params()`) reads `Options.grid_cell`, terminally, so blindly
+        # forwarding it here would silently no-op rather than filter anything.
         bad = copy.deepcopy(NOTEBOOK_QUERY)
         bad["inputs"]["marsh"]["grid_cell"] = "1"
         with pytest.raises(PipelineError, match="grid_cell"):
