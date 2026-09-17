@@ -33,3 +33,4 @@ coverage.xml
 /tiles/
 /.*-scratch/
 /.verify-scratch/
+/.claude/
