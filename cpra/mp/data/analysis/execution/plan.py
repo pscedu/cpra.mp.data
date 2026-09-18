@@ -265,7 +265,11 @@ from cpra.mp.data.analysis.request.pipeline import InputSelection, Pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
 from cpra.mp.data.grids import GRIDS
 
-__all__ = ["ExecutionPlan", "ResolvedInput", "TileRequest", "compile_plan"]
+__all__ = ["DEFAULT_TILE_SIZE", "ExecutionPlan", "ResolvedInput", "TileRequest", "compile_plan"]
+
+#: Pixels across for a map tile whose caller did not say. The web-map convention, and what
+#: `visualizations/map.py` already declares as its layer's `tileSize`.
+DEFAULT_TILE_SIZE = 256
 
 
 @dataclasses.dataclass(frozen=True)
@@ -287,7 +291,7 @@ class TileRequest:
     x: int
     y: int
     z: int
-    tile_size: int = 256
+    tile_size: int = DEFAULT_TILE_SIZE
     resampling: Resampling = Resampling.nearest
 
     @property

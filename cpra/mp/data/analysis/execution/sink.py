@@ -18,6 +18,9 @@ reference to anything but the arguments they were called with:
   `legends.Legend.colorize_pixels` for the color. It runs no ops and opens no raster --
   the tile's read window is a compile-time decision (`execution.plan.TileRequest`) and the
   walk that honors it is `execute`'s, the same one every other destination is fed by.
+- `empty_tile` -- the image bytes a caller sends when `render_tile` had nothing to render.
+  A blank tile of the requested format and size, encoded through the same path a real one
+  is, so a client that asked for an image always gets a decodable image back.
 - `sink_vector_tile` -- `pbf`, a single map tile, over a `LongFrame`. Injects a `value`
   property into a pre-generated PMTiles boundary layer; a from-scratch rewrite of the old
   engine's tile-injection code (protobuf-level, not spatial), not a port of it.
@@ -55,7 +58,7 @@ from cpra.mp.data.analysis.execution.frame import (
     has_no_bands,
     row_major_grid_cell,
 )
-from cpra.mp.data.analysis.execution.plan import TileRequest
+from cpra.mp.data.analysis.execution.plan import DEFAULT_TILE_SIZE, TileRequest
 from cpra.mp.data.analysis.io.output import resolve_legend, stream_tabular, tabular_kwargs, write_tabular
 from cpra.mp.data.analysis.io.raster import NUMPY_TO_POLARS
 from cpra.mp.data.analysis.io.raster_io import warp_array_to_tile
@@ -66,6 +69,7 @@ __all__ = [
     "sink_tabular",
     "write_raster",
     "render_tile",
+    "empty_tile",
     "sink_vector_tile",
 ]
 
@@ -269,6 +273,46 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
 # png / jpg: a single map tile
 # ----------------------------------------------------------------------------------------
 
+
+def _encode_tile_image(color: np.ndarray, format) -> bytes:
+    """Encode one `(tile_size, tile_size, 4)` RGBA array as `png`/`jpg` bytes.
+
+    Shared by `render_tile` and `empty_tile` so the blank tile a caller sends for a miss is
+    produced by the same encoder as a real one -- a blank tile that a client's decoder
+    choked on would defeat the entire point of sending one.
+
+    JPEG carries no alpha channel, so the alpha column is dropped rather than flattened
+    against a background: a fully transparent RGBA pixel therefore encodes as whatever RGB
+    it was carrying, which for `empty_tile`'s blank array is black. There is no transparent
+    JPEG to fall back on, so any blank `jpg` tile is a solid color and this picks the one
+    that makes the two formats the same array with and without its fourth channel.
+    (`Image.fromarray` infers RGB vs RGBA from the array's own shape; passing `mode=`
+    explicitly is deprecated as of Pillow 11.)
+    """
+    image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
+    with BytesIO() as memfile:
+        image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))
+        return memfile.getvalue()
+
+
+def empty_tile(format, tile_size: int = DEFAULT_TILE_SIZE) -> bytes:
+    """A blank `tile_size`-square tile of `format` -- the body a caller pairs with the 404
+    it sends when `render_tile` returned `None`.
+
+    The status code is the route's decision, not this module's; what this exists for is that
+    a 404 on an image URL should still carry a decodable image. A client that requested
+    `.png` and got a JSON error document instead logs a decode failure per missing tile,
+    and a map panned past the edge of the data requests a great many of them. The tile is
+    transparent (`png`) rather than a rendered nodata tile, because nothing here knows the
+    request's legend and a legend's own lowest break is not transparent -- see
+    `render_tile`'s note on what a real all-nodata tile actually colors as.
+
+    A caller sending this for a MISSING tile and a caller rendering a real one both go
+    through `_encode_tile_image`, so the two cannot drift in format or in size.
+    """
+    return _encode_tile_image(np.zeros((tile_size, tile_size, 4), dtype="uint8"), format)
+
+
 def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_map=None, variable_legend=None, nodata=DEFAULT_NODATA) -> bytes | None:
     """Render one `png`/`jpg` map tile from an already-executed band-wide result.
 
@@ -286,11 +330,12 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     opened the raster itself could only ever support the ops that keep a frame band-wide,
     which excludes that `project` exactly.
 
-    Returns `None` -- a 404, not a raise -- when the result carries no bands. That covers
-    both "the tile's footprint misses this raster entirely" (`plan.ResolvedInput.
-    tile_disjoint`, which `execute` turns into the same empty frame) and "a dimension
-    predicate narrowed this request to nothing", because they are the same answer to a
-    caller: this tile has nothing to show.
+    Returns `None` -- not a raise -- when the result carries no bands. That covers both
+    "the tile's footprint misses this raster entirely" (`plan.ResolvedInput.tile_disjoint`,
+    which `execute` turns into the same empty frame) and "a dimension predicate narrowed
+    this request to nothing", because they are the same answer to a caller: this tile has
+    nothing to show. A route turns that into a 404 whose body is `empty_tile(format)`, so
+    the response is still a decodable image of the format the URL asked for.
 
     The surviving frame must carry EXACTLY one band. `Legend.colorize_pixels` colors one
     2-D array of pixel values, and nothing upstream guarantees a band-wide result narrows
@@ -301,12 +346,19 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     length-1 leading axis; this raises instead of guessing which band the caller meant,
     which is a gap in the OLD code worth naming rather than one to reproduce.
 
-    `nodata` is the value null pixels are filled with before the warp -- the sentinel the
-    legend's lowest break maps to transparent, not a property of any source file. The scan
-    has already masked each band's declared nodata to null (`io.raster.scan_raster`'s
-    `mask_nodata`), so by here there is nothing left to read off a file even if this
-    function still opened one. `color_map`/`variable_legend` are forwarded to
-    `io.output.resolve_legend` unchanged.
+    `nodata` is the value null pixels are filled with before the warp, and the value the
+    warp itself fills the tile's own out-of-source corners with -- a sentinel this function
+    is told, not a property of any source file. The scan has already masked each band's
+    declared nodata to null (`io.raster.scan_raster`'s `mask_nodata`), so by here there is
+    nothing left to read off a file even if this function still opened one.
+    `color_map`/`variable_legend` are forwarded to `io.output.resolve_legend` unchanged.
+
+    Note that a nodata pixel is NOT rendered transparent: `Legend.colorize_pixels`
+    digitizes against the legend's break points, and a value below the lowest break --
+    which `DEFAULT_NODATA` always is -- lands in the first bucket, whose color is an opaque
+    one (no `LEGENDS` entry declares a transparent under-color). That is the old engine's
+    behavior too, reproduced here rather than changed, and it is why `empty_tile` builds
+    its blank tile directly instead of colorizing an all-nodata array.
     """
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
@@ -349,13 +401,7 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     )
 
     legend = resolve_legend(color_map, variable_legend)
-    color = legend.colorize_pixels(tile_data)
-    # JPEG carries no alpha channel; `Image.fromarray` infers RGB vs RGBA from the array's
-    # own shape, and passing `mode=` explicitly is deprecated as of Pillow 11.
-    image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
-    with BytesIO() as memfile:
-        image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))
-        return memfile.getvalue()
+    return _encode_tile_image(legend.colorize_pixels(tile_data), format)
 
 
 # ----------------------------------------------------------------------------------------
@@ -376,10 +422,11 @@ def sink_vector_tile(lf: LongFrame, grid_name: str, tile, *, grid_cell_ids=None,
     Returns `None` -- not a raise -- for every "nothing to render" outcome: no PMTiles
     archive for `grid_name`, no tile at these `x`/`y`/`z` in that archive, no boundary
     layer in the parsed tile, no feature surviving `grid_cell_ids` (when given), or no
-    row of `lf` landing on a surviving feature with a non-null `value`. A route mapping
-    this to a 404 does not need to distinguish which -- they are all "this tile has
-    nothing to show" the same way `write_raster`'s `False` is "this dataset has nothing
-    to write".
+    row of `lf` landing on a surviving feature with a non-null `value`. A route does not
+    need to distinguish which -- they are all "this tile has nothing to show" the same way
+    `write_raster`'s `False` is "this dataset has nothing to write" -- and sends a bodiless
+    204 for all of them. There is no vector-tile counterpart to `empty_tile`: an MVT client
+    treats a 204 as an empty tile natively, so there is nothing to encode.
 
     `grid_cell_ids`, when given, narrows which of the tile's own feature ids are eligible
     at all, BEFORE `lf` is even queried -- the same role the old engine's
