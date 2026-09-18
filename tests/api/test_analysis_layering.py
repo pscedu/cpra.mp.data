@@ -33,7 +33,7 @@ ANALYSIS_PACKAGE_DIR = Path(cpra.mp.data.analysis.__file__).parent
 ANALYSIS_PACKAGE_NAME = "cpra.mp.data.analysis"
 
 # The three new subpackages this test polices, and what each may import from the other
-# two (by subpackage name, not by module -- deliberately coarse-grained for Stage 1: `io`
+# two (by subpackage name, not by module -- deliberately coarse-grained for now: `io`
 # importing `request` at all, whatever it imports, is treated as satisfying "request
 # types/errors only" for now, because nothing under `io/` today imports from `request/`
 # at all. The FINER rule -- that it may only reach for a type or an error class, not

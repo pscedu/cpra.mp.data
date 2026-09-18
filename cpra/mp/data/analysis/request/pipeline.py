@@ -69,7 +69,11 @@ RESERVED_NAMES = frozenset({"value", "grid_cell", "value_category"})
 # The positional band-name pattern (`b0`, `b1`, ...) and the reserved band-wide index
 # column: both are recomputed at execution time and never stored, so a user-chosen name
 # that merely matches one of these shapes would be silently shadowed by it later.
-_BAND_NAME_RE = re.compile(r"^b[0-9]+$")
+# Public (not underscore-prefixed) because `execution/frame.py` reuses both as the single
+# source of truth for what counts as a positional name -- copying the pattern there would
+# let the two definitions drift.
+BAND_NAME_RE = re.compile(r"^b[0-9]+$")
+RESERVED_BAND_INDEX_COLUMN = "_band"
 
 # Output formats that render to a single raster/image surface (a GeoTIFF band or a map
 # tile pixel) rather than a table -- these need a band-wide (not long) final frame; see
@@ -89,7 +93,7 @@ def _validate_name(name: str, kind: str) -> None:
         raise RequestError(
             f"{kind} name {name!r} collides with a reserved column name {sorted(RESERVED_NAMES)}"
         )
-    if name == "_band" or _BAND_NAME_RE.match(name):
+    if name == RESERVED_BAND_INDEX_COLUMN or BAND_NAME_RE.match(name):
         raise RequestError(
             f"{kind} name {name!r} matches the positional band-name pattern (b0, b1, ...) "
             "or the reserved _band index column, and would be shadowed by it"
