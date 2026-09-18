@@ -1,7 +1,14 @@
-"""`project_vector_to_vector`: the one lowering this vertical slice gives `project`, for
-the direction with no raster on either side of it -- a long frame's rows, re-addressed
-from `op.input`'s grid onto `op.to` via a crosswalk join, then re-collapsed one row per
-(dimensions, destination cell) with `op.aggregate`.
+"""The three lowerings `project` can dispatch to once its two operand grids are both
+known: `project_vector_to_vector`, `project_raster_to_vector`, and
+`project_vector_to_raster` -- keyed by `(from kind, to kind)` in `execute.py`'s registry
+rather than by the incoming frame's shape, since `project` is the one op a shape alone
+cannot route (see that module's docstring). Raster-to-raster is deliberately absent:
+`request.ops.PROJECT_LOWERING_TABLE` does not name it, so no lowering for it exists here
+either.
+
+`project_vector_to_vector`, first: the direction with no raster on either side of it -- a
+long frame's rows, re-addressed from `op.input`'s grid onto `op.to` via a crosswalk join,
+then re-collapsed one row per (dimensions, destination cell) with `op.aggregate`.
 
 **Why the join mechanics below read like `analysis/vector.py::apply_project`.** They are
 the same join, deliberately: `lf.join(crosswalk_lf, left_on="grid_cell",
@@ -116,6 +123,20 @@ shared by construction and no assertion is needed; `execution/frame.py`'s
 `assert_same_pixel_grid` compares `batch_layout` precisely so that a future caller tempted
 back into the two-read shape fails loudly instead of silently.
 
+**Where that one read now happens: at open time, in `execute.py`, not in this module.**
+`project_raster_to_vector` below does not call `scan_raster` itself and does not resolve a
+crosswalk path -- `execute.py`'s own input-opening step does both, for any raster origin
+`execution.plan.ResolvedInput.straddling_vector_grid` names, before the walk ever reaches a
+`filter`/`calculate`/`group`/`join` between that origin and this lowering. That is what
+makes this lowering safe to call on the SAME already-open, already-processed frame every
+other band-wide lowering reads and writes: whatever a `calculate` rewrote or a `filter`
+masked upstream is already sitting in `frames[op.input]`'s own `lf` by the time this
+function runs, because it is the identical `lf` the rest of the walk has been threading
+along -- there is no second, independent read left to silently discard that work. `
+ZONE_COLUMN` (below) is the column that read's zone ids come back in, attached once, at the
+origin, exactly like a `variable`/`time_unit` dimension column would be if this were a
+vector scan.
+
 **`count_by_value` is the one aggregate that unpivots per pixel.** See
 `_zonal_count_by_value` below: its accumulator is per (zone, distinct value), not the single
 scalar per (zone, band) the other five collapse to while the frame is still wide, so the
@@ -154,36 +175,29 @@ it comes back null on every band with no separate nodata branch needed.
 
 --------------------------------------------------------------------------------------
 
-**Two deliberate gaps, recorded here so a later reader does not mistake either for an
-oversight.**
+**All three `project` lowerings share the one uniform registry shape,
+`(frames, op, frame_types) -> <output frame>`, with no SIGNATURE adapter at the registry
+boundary.** `project_raster_to_vector` takes `frames: dict[str, BandWideFrame]` exactly
+like `project_vector_to_vector`/`project_vector_to_raster` do, and reads
+`frames[op.input]` -- the SAME already-open, already-processed band-wide frame the walk
+has been threading through every upstream `filter`/`calculate`/`group`/`join` -- rather
+than raw, unopened band metadata. It does not call `scan_raster` and does not resolve a
+crosswalk path itself; see "where that one read now happens" above for why that work
+belongs to `execute.py`'s input-opening step instead, and what guarantees it gives this
+function in return (the zone column, under `ZONE_COLUMN`, already sitting on
+`frames[op.input]`'s own `lf`, attached at open time and carried through untouched by
+every band-wide lowering in between). `execute.py` still wraps this one entry in a small
+GUARD (not a signature adapter -- it calls this function with the identical arguments,
+unmodified) for the one case below that is a dispatch-key ambiguity rather than an
+argument-shape mismatch.
 
-*Wiring.* Neither direction is wired into `execution/execute.py`'s `_LOWERINGS`; both stay
-in its `NOT_YET_IMPLEMENTED["project"]` set, matching `tests/api/test_execute.py`'s own
-`TestLoweringTableAgreement` (a pre-existing, already-committed pin on that exact set) and
-its `TestLoweringNotImplemented` (asserting both directions still raise
-`LoweringNotImplementedError` through a real pipeline). The reason is structural, not just
-that pinned test: `execute()`'s own frame-opening loop only ever populates `frames: dict[
-str, LongFrame]` for `Shape.long`-typed inputs -- there is no existing mechanism in that
-walk to open a band-wide input (a raster scan, or this module's own raster-touching
-`project` output) into anything at all. Building that -- deciding when a raster is scanned,
-what window it is scanned over, whether/how a chain of band-wide ops composes before
-anything is materialized -- is a scan-policy decision that belongs to `execute()`, made
-once at the point where frames are opened and shared by every band-wide lowering. Wiring
-either direction from here would mean inventing that policy ad hoc, one lowering at a
-time, rather than once, coherently, where it belongs.
-
-*Signatures.* `project_vector_to_raster(frames, op, frame_types) -> BandWideFrame` takes
-the identical input shape `project_vector_to_vector` already does (its input is a long
-vector frame either way; only the OUTPUT shape differs by direction).
-`project_raster_to_vector(metadata_df, op, frame_types) -> LongFrame` cannot take a
-`frames` dict the same way -- nothing upstream of this module builds a dict of
-already-opened band-wide inputs (see "wiring" above), so it takes the raw resolved raster
-band metadata directly, the same input `io.raster.scan_raster` itself takes. This is a real
-asymmetry, and whoever wires band-wide inputs into `execute()` has to reconcile it: that
-work will need to decide how `execute()` obtains a `metadata_df` for a raster `op.input`
-(presumably `io.catalog.resolve_raster_bands` against that input's own `InputSelection`)
-and thread it to this function in place of a `frames[op.input]` lookup. Giving this
-function the other shape now would only mean rewriting it once that policy exists.
+The one sub-case this function still cannot serve: a raster origin an earlier spatial
+filter already sampled down to a long frame no longer has a band-wide `frames[op.input]`
+to read at all (`ResolvedInput.band_metadata` describes the ORIGIN's own bands, not
+whatever a later op did to them). `execute.py`'s dispatch keys on `frame_types[op.input].
+shape` before ever reaching this function, and raises `LoweringNotImplementedError` for
+that narrower case itself, rather than this function receiving a long frame with no zone
+column to aggregate by and failing on a missing-column error instead.
 """
 
 import polars as pl
@@ -194,6 +208,8 @@ from cpra.mp.data.analysis.execution.frame import (
     LongFrame,
     add_reserved_band_index,
     band_column_names,
+    drop_reserved_band_index,
+    has_no_bands,
 )
 from cpra.mp.data.analysis.io.crosswalk_read import read_vector_crosswalk, resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
@@ -202,7 +218,12 @@ from cpra.mp.data.analysis.request.ops import FrameType, ProjectOp
 from cpra.mp.data.analysis.request.pipeline import DATASET_SELECTION_COLUMNS
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 
-__all__ = ["project_vector_to_vector", "project_raster_to_vector", "project_vector_to_raster"]
+__all__ = [
+    "ZONE_COLUMN",
+    "project_vector_to_vector",
+    "project_raster_to_vector",
+    "project_vector_to_raster",
+]
 
 # Aggregates that read a `scale_factor`-weighted `value` -- see the module docstring for
 # why the other three (`min`, `max`, `count`) do not, and `count_by_value` is handled
@@ -419,9 +440,12 @@ def project_vector_to_vector(
 
 #: The column the raster-to-vector crosswalk's zone ids come back in, named for
 #: `scan_raster`'s `crosswalks=` parameter (which requires a name that is neither a `b<i>`
-#: band name nor the reserved band-index column). Double-underscored so it cannot collide
-#: with a dataset dimension riding along on `metadata_df`.
-_ZONE_COLUMN = "__zone__"
+#: band name nor the reserved band-index column). Public (unlike `_BAND_IDENTITY_COLUMN`
+#: below, which stays purely internal to this module's own reshape): `execute.py` attaches
+#: this column at open time, on a raster origin `ResolvedInput.straddling_vector_grid`
+#: names, so it needs the same name this module reads by. Double-underscored regardless,
+#: so it still cannot collide with a dataset dimension riding along on `metadata_df`.
+ZONE_COLUMN = "__zone__"
 
 #: The column an unpivot puts a band's own `b<i>` name in, and the key the per-band
 #: dimension values are then joined back on. Internal to the reshape: dropped before the
@@ -456,7 +480,7 @@ def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str], max_distinct:
     request that passes here would pass a per-band probe too, never the reverse.
     """
     per_pixel = in_zone.unpivot(
-        index=[_ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value"
+        index=[ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value"
     )
     n_unique = per_pixel.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
     if n_unique > max_distinct:
@@ -467,7 +491,7 @@ def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str], max_distinct:
         )
     return per_pixel.group_by(
         _BAND_IDENTITY_COLUMN,
-        pl.col(_ZONE_COLUMN).alias("grid_cell"),
+        pl.col(ZONE_COLUMN).alias("grid_cell"),
         pl.col("value").alias("value_category"),
     ).agg(pl.len().alias("value"))
 
@@ -494,63 +518,74 @@ def _zonal_aggregate_expr(aggregate: str, name: str) -> pl.Expr:
     return getattr(col, aggregate)().alias(name)
 
 
-def project_raster_to_vector(metadata_df: pl.DataFrame, op: ProjectOp, frame_types: dict[str, FrameType]) -> LongFrame:
+def project_raster_to_vector(
+    frames: dict[str, BandWideFrame], op: ProjectOp, frame_types: dict[str, FrameType]
+) -> LongFrame:
     """The `("project", ("raster", "vector"))` lowering: zonal-aggregate a raster's own
     bands onto `op.to`'s cells via the raster-to-vector crosswalk between
     `frame_types[op.input].grid` (the raster grid) and `op.to`, with `op.aggregate` (never
     `None` here, for the same reason `project_vector_to_vector` names: `request.aggregates.
     validate_project_aggregate` requires one for every direction but vector-to-raster).
 
-    `metadata_df` is the raster's already-resolved band list (`io.catalog.
-    resolve_raster_bands`'s own return shape: one row per (file, band), `path`/`band` plus
-    whatever dataset dimensions -- `variable`, `calendar_year`, `scenario_id`, ... -- ride
-    along beside them) rather than an already-opened frame; see the module docstring's
-    "signatures" note for why this direction's input cannot match the other three
-    lowerings' `frames: dict[str, LongFrame]` shape.
+    `frames[op.input]` is the already-open `BandWideFrame` every upstream band-wide
+    lowering has been reading and writing -- its `lf` already carries `ZONE_COLUMN`,
+    attached once at open time by `execute.py` (see the module docstring's "where that one
+    read now happens" note), and already reflects whatever `filter`/`calculate` ran
+    upstream of this `project`. This function does not scan anything itself.
 
-    Every one of `metadata_df`'s columns besides `path`/`band` is carried onto the output
-    long frame's dimension columns, attached per band via a join on band identity -- this
-    is what keeps two bands differing only by, say, `calendar_year` from silently merging
-    into one destination-cell group; see the module docstring's "group-then-unpivot" note
+    Every one of `metadata_df`'s columns besides `path`/`band` and the reserved band-index
+    column is carried onto the output long frame's dimension columns, attached per band via
+    a join on band identity -- this is what keeps two bands differing only by, say,
+    `calendar_year` from silently merging into one destination-cell group; the reserved
+    index is excluded because it is a POSITION, not a dimension, and this is the last point
+    it can be told apart from one (see `drop_reserved_band_index` at the call site below).
+    See the module docstring's "group-then-unpivot" note
     for exactly how. `grid`, if present, is rewritten to `op.to` on the way out via the
     same `_readdress` the vector-to-vector direction uses -- true for the same reason: every
     `grid_cell` in the result addresses a destination (vector) cell now, and `variable`/
     `time_unit` remain true unchanged (still the same measurement, same time unit).
 
-    Pixels whose crosswalk entry is nodata (masked by `scan_raster` itself, unconditionally
-    -- see that function's own module docstring) belong to no destination cell and are
-    excluded before the zonal `group_by` runs, never grouped under a spurious null-zone key.
+    Pixels whose crosswalk entry is nodata (masked at open time, the same unconditional
+    masking `scan_raster`'s own module docstring describes) belong to no destination cell
+    and are excluded before the zonal `group_by` runs, never grouped under a spurious
+    null-zone key.
 
-    The crosswalk is read on the data bands' OWN read, as `scan_raster`'s `crosswalks=`
-    parameter appends it -- one VRT, one chunking, so a pixel's zone and its values arrive
-    on the same row by construction. Reading it with a second `scan_raster` call and
-    combining the two positionally would be silently wrong for any raster big enough to
-    batch; the module docstring gives the mechanism and the measurement.
+    A zero-band `metadata_df` (`has_no_bands`) returns an empty `pl.LazyFrame()` rather
+    than running a `group_by`/`unpivot` over a frame with no band columns to reduce --
+    the same "nothing left to describe" precedent `execution.frame.empty_band_wide` sets
+    for the band-wide shape this input came from, carried over to this direction's own,
+    differently-shaped (long) output.
 
-    Raises `request.errors.NotFoundError` (via `io.crosswalk_read.
-    resolve_raster_crosswalk_path`) if no raster-to-vector crosswalk artifact exists for
-    this raster grid and `op.to`, and `request.errors.AggregateError` if
-    `op.aggregate == "count_by_value"` and the data has more distinct values than
-    `config.COUNT_BY_VALUE_MAX_DISTINCT` allows (the same rule, and the same error, the
-    vector-to-vector direction applies).
+    Raises `request.errors.AggregateError` if `op.aggregate == "count_by_value"` and the
+    data has more distinct values than `config.COUNT_BY_VALUE_MAX_DISTINCT` allows (the
+    same rule, and the same error, the vector-to-vector direction applies).
     """
-    current = frame_types[op.input]
-    crosswalk_path = resolve_raster_crosswalk_path(current.grid, op.to)
-    lf, out_metadata_df, _window = scan_raster(metadata_df, crosswalks=[(_ZONE_COLUMN, str(crosswalk_path))])
-    names = band_column_names(out_metadata_df)
-    in_zone = lf.filter(pl.col(_ZONE_COLUMN).is_not_null())
+    lf, metadata_df, _window = frames[op.input]
+    if has_no_bands(metadata_df):
+        return pl.LazyFrame()
+
+    names = band_column_names(metadata_df)
+    in_zone = lf.filter(pl.col(ZONE_COLUMN).is_not_null())
 
     if op.aggregate == "count_by_value":
         long_lf = _zonal_count_by_value(in_zone, names, COUNT_BY_VALUE_MAX_DISTINCT)
     else:
-        zonal = in_zone.group_by(pl.col(_ZONE_COLUMN).alias("grid_cell")).agg(
+        zonal = in_zone.group_by(pl.col(ZONE_COLUMN).alias("grid_cell")).agg(
             [_zonal_aggregate_expr(op.aggregate, name) for name in names]
         )
         long_lf = zonal.unpivot(index=["grid_cell"], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value")
 
-    dim_columns = [name for name in out_metadata_df.columns if name not in ("path", "band")]
+    # `drop_reserved_band_index` first: an upstream `group` with `by=[]` leaves the
+    # reserved band-index column standing on `metadata_df` (that lowering's own docstring
+    # says so), and every remaining column here becomes a DIMENSION column on the long
+    # frame this function returns -- so without the drop, an internal positional index
+    # rides out of the walk looking exactly like a dataset dimension a caller asked for.
+    # `execute` cannot catch it afterward the way it does for a band-wide result: by then
+    # the index is an ordinary column of a long frame, indistinguishable from a real one.
+    carried = drop_reserved_band_index(metadata_df)
+    dim_columns = [name for name in carried.columns if name not in ("path", "band")]
     band_identity = pl.DataFrame({_BAND_IDENTITY_COLUMN: pl.Series(names, dtype=pl.String)}).hstack(
-        out_metadata_df.select(dim_columns)
+        carried.select(dim_columns)
     )
     with_metadata = long_lf.join(band_identity.lazy(), on=_BAND_IDENTITY_COLUMN, how="left").drop(
         _BAND_IDENTITY_COLUMN

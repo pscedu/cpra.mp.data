@@ -19,7 +19,7 @@ import pytest
 
 from cpra.mp.data.analysis.execution import plan as plan_module
 from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, compile_plan
-from cpra.mp.data.analysis.request.errors import BandLimitError
+from cpra.mp.data.analysis.request.errors import BandLimitError, ShapeError
 from cpra.mp.data.analysis.request.ops import Shape, validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
@@ -849,6 +849,33 @@ class TestOverviewEligibility:
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.straddling_vector_grid == VECTOR_GRID
         assert resolved.overview_permitted is False
+
+    def test_two_conflicting_project_targets_off_one_raster_origin_raises(self, monkeypatch):
+        # The rejected counterpart to the fan-out test above: here BOTH branches off "a"
+        # reach a raster-to-vector `project`, targeting two DIFFERENT destination grids
+        # (`VECTOR_GRID` and `ecoregion_v001`). A raster origin's full-resolution pixels
+        # can only be read once per compiled plan (one `scan_raster` call, one crosswalk
+        # attached to it), so this has no single answer for "which crosswalk does 'a'
+        # open with" -- `compile_plan` rejects it outright, at compile time, rather than
+        # picking one target arbitrarily (`setdefault`-style) and silently ignoring the
+        # other `project`'s destination.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [
+                    {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c1"},
+                    {"op": "calculate", "input": "a", "expression": "value * 3", "as": "c2"},
+                    {"op": "project", "input": "c1", "to": VECTOR_GRID, "aggregate": "sum", "as": "p1"},
+                    {"op": "project", "input": "c2", "to": "ecoregion_v001", "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="straddles two different destination grids"):
+            compile_plan(pipeline)
 
     def test_a_point_sample_forbids_the_overview(self, monkeypatch):
         # An overview pixel is a real value, but not necessarily the one under the sampled

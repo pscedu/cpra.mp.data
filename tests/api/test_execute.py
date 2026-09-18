@@ -1,32 +1,40 @@
 """Tests for `cpra.mp.data.analysis.execution.execute` -- the walk.
 
-Three concerns, in three test classes:
+Four concerns, in four test classes:
 
 - `TestLoweringTableAgreement`: the bidirectional coverage check the module docstring
   promises -- every `(op, shape)` combination `request.ops`'s lowering tables (or, for
   `calculate`/`group`, `Shape` itself) declare legal is covered by EXACTLY one of
   `execute.py`'s registered executors or its `NOT_YET_IMPLEMENTED` set, never both, never
   neither.
-- `TestLoweringNotImplemented`: the walk's failure path for a combination
-  `NOT_YET_IMPLEMENTED` names -- band-wide anything, and `project` in the two directions
-  that touch a raster grid (`("vector", "vector")` now has a real lowering; see
-  `tests/api/test_project.py` for its own coverage).
+- `TestLoweringNotImplemented`: the exception hierarchy `LoweringNotImplementedError`
+  itself must hold, plus the one dispatch key that still raises it on purpose -- see that
+  class's own docstring for why a raster-to-vector `project` reached through an earlier
+  spatial filter is not the same combination `("raster", "vector")` names.
 - `TestEndToEnd`: the resume contract itself -- a JSON pipeline over a real fixture
   dataset, taken through `parse_pipeline` -> `validate_shapes` -> `compile_plan` ->
   `execute` -> `.collect()`, including a declared-order test proving that reordering two
   steps changes the answer, and a `project` step carried all the way through a real
   crosswalk file.
+- `TestBandWideEndToEnd`: the same resume contract for a raster input -- opening a
+  band-wide frame, running `filter`/`calculate`/`group`/`join`/`project` against it, and
+  the mid-walk transition to long shape a spatial filter causes.
 """
 
+import numpy as np
 import polars as pl
 import pytest
+from rasterio.crs import CRS
+from rasterio.transform import from_bounds
 
+from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.execute import (
     NOT_YET_IMPLEMENTED,
     LoweringNotImplementedError,
     _LOWERINGS,
     execute,
 )
+from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN
 from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
@@ -38,7 +46,16 @@ from cpra.mp.data.analysis.request.ops import (
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.grids import GRIDS
-from tests.factories import ANNUAL_KWARGS, write_annual_dataset, write_omar_dataset, write_vector_crosswalk
+from tests.factories import (
+    ANNUAL_KWARGS,
+    RASTER_KWARGS,
+    raster_array,
+    write_annual_dataset,
+    write_omar_dataset,
+    write_raster_crosswalk,
+    write_raster_dataset,
+    write_vector_crosswalk,
+)
 
 VECTOR_GRID = "hydro_compartment_v001"
 RASTER_GRID = "veg_grid_cell_v001"
@@ -150,110 +167,52 @@ class TestLoweringTableAgreement:
             assert kind in domains, f"{kind!r} is not an op the request layer types"
             assert key in domains[kind], f"{kind!r} has no declared lowering for {key!r}"
 
-    def test_named_not_yet_implemented_set_is_exactly_band_wide_plus_project(self):
-        # A concrete pin on the "deliberate, named" set the brief asks for -- this test
-        # fails the moment a later stage adds a real band-wide or project lowering,
-        # forcing that stage to shrink this dict rather than leaving it stale.
-        assert NOT_YET_IMPLEMENTED["filter"] == frozenset({Shape.band_wide})
-        assert NOT_YET_IMPLEMENTED["calculate"] == frozenset({Shape.band_wide})
-        assert NOT_YET_IMPLEMENTED["group"] == frozenset({Shape.band_wide})
-        assert NOT_YET_IMPLEMENTED["join"] == frozenset({Shape.band_wide})
-        assert NOT_YET_IMPLEMENTED["project"] == frozenset(
-            {("raster", "vector"), ("vector", "raster")}
-        )
+    def test_not_yet_implemented_set_is_empty_for_every_op(self):
+        # A concrete pin on "this stage wires everything the lowering tables declare
+        # legal" -- this test fails the moment a later stage grows a lowering table (a new
+        # grid kind, a new predicate combination) without also wiring the executor,
+        # forcing that stage to either add the lowering or come back and name the gap here
+        # rather than leaving `NOT_YET_IMPLEMENTED` stale.
+        assert NOT_YET_IMPLEMENTED["filter"] == frozenset()
+        assert NOT_YET_IMPLEMENTED["calculate"] == frozenset()
+        assert NOT_YET_IMPLEMENTED["group"] == frozenset()
+        assert NOT_YET_IMPLEMENTED["join"] == frozenset()
+        assert NOT_YET_IMPLEMENTED["project"] == frozenset()
 
 
 class TestLoweringNotImplemented:
-    """The walk's failure path: an `(op, shape)` combination `request/ops.py`'s shape
-    typing already accepts (so the pipeline validates fine) but for which no executor
-    exists yet. None of these need real raster data on disk -- shape typing runs from grid
-    KIND alone (`GRIDS[name].grid_type`), and the walk raises before ever needing to open
-    the band-wide input's frame (see `execute`'s own docstring: a band-wide input is never
-    scanned up front).
+    """`LoweringNotImplementedError`'s own contract, plus the one dispatch key that still
+    raises it on purpose even though every `(op, key)` combination `NOT_YET_IMPLEMENTED`
+    used to name now has a real lowering.
+
+    `project_direction` keys a `project` off the incoming frame's DECLARED grid
+    (`frame_types[op.input].grid`), not its current actual shape -- so a raster-origin
+    frame an earlier spatial filter already turned long still dispatches to the
+    `("raster", "vector")` entry, which is real and expects a band-wide frame to zonal-
+    aggregate. It cannot do that to a frame that is already one row per sampled pixel --
+    that data has already been through a different reduction (point sampling, not zonal
+    aggregation), and reusing the raster-to-vector lowering on it would silently answer a
+    different question than the one it exists to answer -- so the registered lowering
+    itself raises `LoweringNotImplementedError` for exactly that narrower case, rather than
+    the coarse `(op, direction)` keying in `NOT_YET_IMPLEMENTED` (which cannot express a
+    shape-dependent sub-case) claiming the whole direction is unimplemented when the
+    ordinary case works fine (see `TestBandWideEndToEnd`'s own raster-to-vector `project`
+    test).
     """
 
-    def test_band_wide_filter_raises(self):
+    def test_raster_to_vector_project_after_a_spatial_filter_raises(self):
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
-                "steps": [{"op": "filter", "input": "a", "where": "value > 1"}],
-                "output": {"format": "tif"},
-            }
-        )
-        plan = compile_plan(pipeline)
-        with pytest.raises(LoweringNotImplementedError):
-            execute(plan)
-
-    def test_band_wide_calculate_raises(self):
-        pipeline = _pipeline(
-            {
-                "inputs": {"a": raster_input()},
-                "steps": [{"op": "calculate", "input": "a", "expression": "value * 2"}],
-                "output": {"format": "tif"},
-            }
-        )
-        plan = compile_plan(pipeline)
-        with pytest.raises(LoweringNotImplementedError):
-            execute(plan)
-
-    def test_band_wide_group_raises(self):
-        # `group` never has an explicit `input` field (it always chains from a preceding
-        # step -- `GroupStep`'s own docstring: "can never be a pipeline's first step"),
-        # and every OTHER op is equally unimplemented for band-wide, so there is no legal
-        # pipeline JSON that reaches a bare band-wide `group` first. Building the
-        # `ExecutionPlan` directly isolates exactly the one thing this test checks --
-        # `group`'s own not-yet-implemented gate -- from that chaining requirement.
-        from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput
-        from cpra.mp.data.analysis.request.ops import GroupOp
-        from cpra.mp.data.analysis.request.pipeline import InputSelection
-
-        selection = InputSelection(**raster_input())
-        plan = ExecutionPlan(
-            inputs={"a": ResolvedInput(selection=selection)},
-            ops=[GroupOp(step_no=1, input="a", by=[], aggregate="sum", output="g")],
-            frame_types=frame_types(RASTER_GRID, a=Shape.band_wide, g=Shape.band_wide),
-        )
-        with pytest.raises(LoweringNotImplementedError):
-            execute(plan)
-
-    def test_band_wide_join_raises(self):
-        from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput
-        from cpra.mp.data.analysis.request.ops import JoinOp
-        from cpra.mp.data.analysis.request.pipeline import InputSelection
-
-        selection_a = InputSelection(**raster_input())
-        selection_b = InputSelection(**raster_input(grid=RASTER_GRID, variable="veg_area"))
-        plan = ExecutionPlan(
-            inputs={"a": ResolvedInput(selection=selection_a), "b": ResolvedInput(selection=selection_b)},
-            ops=[JoinOp(step_no=1, type="attribute", inputs=["a", "b"], output="j")],
-            frame_types=frame_types(RASTER_GRID, a=Shape.band_wide, b=Shape.band_wide, j=Shape.band_wide),
-        )
-        with pytest.raises(LoweringNotImplementedError):
-            execute(plan)
-
-    def test_raster_to_vector_project_raises(self):
-        # `("raster", "vector")` is still not-yet-implemented -- only `("vector",
-        # "vector")` has a real lowering (`execution/project.py`).
-        pipeline = _pipeline(
-            {
-                "inputs": {"a": raster_input()},
-                "steps": [{"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum"}],
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "grid_cell == 0", "as": "sampled"},
+                    {"op": "project", "input": "sampled", "to": VECTOR_GRID, "aggregate": "sum"},
+                ],
                 "output": {"format": "csv"},
             }
         )
         plan = compile_plan(pipeline)
-        with pytest.raises(LoweringNotImplementedError):
-            execute(plan)
-
-    def test_vector_to_raster_project_raises(self):
-        pipeline = _pipeline(
-            {
-                "inputs": {"a": vector_input()},
-                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID}],
-                "output": {"format": "tif"},
-            }
-        )
-        plan = compile_plan(pipeline)
+        assert plan.frame_types["sampled"].shape is Shape.long
         with pytest.raises(LoweringNotImplementedError):
             execute(plan)
 
@@ -512,3 +471,609 @@ class TestEndToEnd:
         # the whole chain runs, so it is the one place the column reaching a writer can be
         # checked against the cell ids sitting next to it.
         assert set(df["grid"].to_list()) == {"parish_v2020"}
+
+
+class TestBandWideEndToEnd:
+    """The resume contract for a raster input: opening a band-wide frame through
+    `execute()`, running `filter`/`calculate`/`group`/`join`/`project` against it, and the
+    mid-walk transition to long shape a spatial filter causes -- each covered end to end
+    rather than only through the lowering's own unit tests
+    (`test_band_ops.py`/`test_project_raster.py`/`test_raster_scan.py`).
+
+    Fixture: `write_raster_dataset` with `RASTER_KWARGS`'s defaults -- `vct` on
+    `RASTER_GRID`, one band per `calendar_year`, ordered ascending (`cpra.mp.data.
+    raster.read_cog`'s own sort order, `path_cols` then the calendar column) -- so a
+    two-year dataset always resolves `b0` to the earlier year and `b1` to the later one.
+    """
+
+    def test_filter_calculate_group_runs_through_execute(self, base_path):
+        # b0 (2030) fills 30, b1 (2040) fills 40. `value > 35` masks b0 to null (30 is not
+        # > 35) and keeps b1; `value * 2` then only touches the surviving band (b0 stays
+        # null -- `calculate` never revives a masked pixel, it only rewrites one that is
+        # still there); `group by=[] aggregate="sum"` reduces the two bands to one, and
+        # `sum_horizontal` skips the null contributor, so the answer is 80.0 (0 + 40*2)
+        # everywhere, not (30*2 + 40*2) and not null. A version that ran `calculate` before
+        # `filter`, or that summed before doubling, would both land on a different number.
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "value > 35", "as": "f"},
+                    {"op": "calculate", "expression": "value * 2", "as": "c"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        final = plan.ops[-1].output
+        assert plan.frame_types[final].shape is Shape.band_wide
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert df.columns == ["b0"]
+        stats = df.select(
+            pl.col("b0").min().alias("min"),
+            pl.col("b0").max().alias("max"),
+            pl.col("b0").null_count().alias("nulls"),
+        ).row(0, named=True)
+        assert stats["min"] == pytest.approx(80)
+        assert stats["max"] == pytest.approx(80)
+        assert stats["nulls"] == 0
+        # `group_band_wide(by=[])` leaves the reserved band-index column standing (see
+        # that function's own docstring); this is the one place that proves `execute()`'s
+        # own cleanup actually removes it before the walk's result reaches a caller.
+        assert RESERVED_BAND_INDEX_COLUMN not in metadata_df.columns
+
+    def test_spatial_filter_turns_the_frame_long_mid_walk(self, base_path):
+        # Same two-band fixture as above. `grid_cell == 0` is a SPATIAL conjunct, so
+        # `band_ops.filter_band_wide` dispatches to `sample_grid_cells_band_wide`, which
+        # unpivots every pixel of every band into one long row per (pixel, band) and then
+        # applies the whole `where` -- turning the frame long, with exactly one row per
+        # band at pixel 0 (2030: 30.0, 2040: 40.0). The `calculate` after it must then run
+        # `calculate_long`, not `calculate_band_wide` -- asserted below via `frame_types`,
+        # not merely inferred from the answer being right, since a walk that accidentally
+        # kept dispatching to the band-wide lowering on an already-long frame would fail
+        # with a schema error, not silently produce a plausible-looking wrong number.
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "grid_cell == 0", "as": "sampled"},
+                    {"op": "calculate", "expression": "value * 2", "as": "doubled"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.frame_types["sampled"].shape is Shape.long
+        assert plan.frame_types["doubled"].shape is Shape.long
+
+        df = execute(plan, base_path=base_path).collect()
+
+        assert df["grid_cell"].to_list() == [0, 0]
+        assert sorted(df["calendar_year"].to_list()) == [2030, 2040]
+        assert sorted(df["value"].to_list()) == pytest.approx([60.0, 80.0])
+
+    def test_band_wide_join_reads_operands_from_one_shared_scan(self, base_path, monkeypatch):
+        # Two DIFFERENT raster variables on `RASTER_GRID` -- `vct` fills 10 everywhere,
+        # `ffibs_score` fills 5.0 everywhere -- joined spatially into one band-wide frame,
+        # then a trailing `calculate expression="value"` (identity, per band) to collapse
+        # back to the single-value-column sink rule (`_type_join` types a join's output as
+        # carrying `value_columns={*op.inputs}`, which `_type_calculate` then always
+        # collapses to `{"value"}`, exactly like `TestEndToEnd`'s own long-shape join
+        # tests). `plan.band_wide_join_scans` should record this join's two operands as one
+        # shared-scan group; `scan_raster` is monkeypatched to a call-counting wrapper
+        # around the real function so this is checked at the IO level -- if the walk
+        # opened each operand with its own `scan_raster` call instead of the one shared
+        # scan `_open_band_wide_join_group` performs, this would still likely produce the
+        # right VALUES (both files cover the identical window) but would call `scan_raster`
+        # twice, which inspecting only the answer could never catch.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="ffibs_score",
+            data_fn=lambda year: raster_array(fill=5, grid_name=RASTER_GRID, dtype="float32"),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.frame_types["j"].shape is Shape.band_wide
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+        from cpra.mp.data.analysis.io.raster import scan_raster as real_scan_raster
+
+        calls = []
+
+        def counting_scan_raster(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_scan_raster(*args, **kwargs)
+
+        monkeypatch.setattr(execute_module, "scan_raster", counting_scan_raster)
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert len(calls) == 1
+        assert df.columns == ["b0", "b1"]
+        assert df["b0"].unique().to_list() == pytest.approx([10.0])
+        assert df["b1"].unique().to_list() == pytest.approx([5.0])
+
+    def test_raster_to_vector_project_runs_through_execute(self, base_path, crosswalk_path):
+        # A constant-fill (10) raster and a crosswalk with ONE zone covering the whole
+        # grid: mean-of-a-constant is invariant to how many pixels contributed, which
+        # sidesteps hand-counting `veg_grid_cell_v001`'s ~384k pixels while still proving
+        # `project_raster_to_vector` is reachable from `execute()`'s own
+        # `("raster", "vector")` registry entry -- with a real crosswalk file and a real
+        # catalog-resolved band list, not the hand-built `metadata_df` `test_project_
+        # raster.py` uses for its own, narrower unit tests.
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda year: 10)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [{"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "mean"}],
+                "output": {"format": "csv"},
+            }
+        )
+        df = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path).collect()
+
+        assert df["grid_cell"].to_list() == [900]
+        assert df["value"].to_list() == pytest.approx([10.0])
+
+    def test_a_join_group_whose_operands_all_resolve_to_zero_bands_opens_nothing(
+        self, base_path, monkeypatch
+    ):
+        # The all-zero counterpart to the partial-mismatch case: when EVERY operand of a
+        # shared-scan group is narrowed to zero bands by pushdown there is nothing to read
+        # and nothing to mismatch, so the group is built from the grid's own geometry with
+        # no scan at all. Covered here because the branch fabricates a result rather than
+        # raising -- an untested branch that invents an answer looks, from the outside,
+        # exactly like one that works. The `calculate` between the filters and the join is
+        # deliberate: it walks the zero-band frame through one more lowering, which is the
+        # shape that used to crash on metadata with no dimension columns left to read.
+        write_raster_dataset(base_path, years=(2030,), variable="vct")
+        write_raster_dataset(base_path, years=(2030,), variable="ffibs_score")
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "fa"},
+                    {"op": "calculate", "input": "fa", "expression": "value * 2", "as": "ca"},
+                    {"op": "filter", "input": "b", "where": "calendar_year == 2099", "as": "fb"},
+                    {"op": "join", "type": "spatial", "inputs": ["ca", "fb"], "as": "j"},
+                    {"op": "calculate", "expression": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+        assert plan.inputs["a"].band_metadata.height == 0
+        assert plan.inputs["b"].band_metadata.height == 0
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("scan_raster must not be called when every operand is zero-band")
+
+        monkeypatch.setattr(execute_module, "scan_raster", _fail_if_called)
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+
+        assert metadata_df.is_empty()
+        assert window.source == ()
+        assert window.width == GRIDS[RASTER_GRID].width
+
+    def test_a_project_off_a_shared_scan_join_reads_the_crosswalk_from_that_same_scan(
+        self, base_path, crosswalk_path
+    ):
+        # The one pipeline shape where the crosswalk attachment and the shared-scan
+        # prelude have to cooperate: two raster origins joined band-wide, then projected
+        # onto a vector grid. Both origins are reachable from the `project`, so BOTH carry
+        # a `straddling_vector_grid`, and the crosswalk has to ride on the one combined
+        # read rather than on either operand's own -- which is why the shared scan gives
+        # each origin its own internal zone column and re-aliases it back to the canonical
+        # name, instead of attaching one crosswalk the way a single origin's read does.
+        # Without a test at this shape the whole per-origin naming path runs in production
+        # having never run here: a single-origin `project` never reaches it, and the join
+        # test above never projects.
+        #
+        # `vct` fills 10, `ffibs_score` fills 5, so the joined frame's two bands are 10 and
+        # 5; one zone covers the grid, so a zonal mean of each constant band is that band,
+        # and the two bands come back as two long rows distinguished by their operand
+        # column. A crosswalk lost or mispaired in the combined read would surface as a
+        # missing column or an empty result, not as a plausible wrong number.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="ffibs_score",
+            data_fn=lambda year: raster_array(fill=5, grid_name=RASTER_GRID, dtype="float32"),
+        )
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "project", "to": "ecoregion_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+        assert plan.inputs["a"].straddling_vector_grid == "ecoregion_v001"
+        assert plan.inputs["b"].straddling_vector_grid == "ecoregion_v001"
+
+        df = execute(plan, base_path=base_path).collect()
+
+        assert set(df["grid_cell"].to_list()) == {900}
+        assert sorted(df["value"].to_list()) == pytest.approx([5.0, 10.0])
+        # Neither the canonical zone column nor either origin's internal, per-origin one
+        # may survive into the long result -- the whole point of re-aliasing them inside
+        # the shared scan is that they stay internal to it.
+        assert not [name for name in df.columns if "zone" in name]
+
+    def test_a_project_after_a_by_nothing_group_does_not_leak_the_band_index_column(
+        self, base_path, crosswalk_path
+    ):
+        # `group by=[]` collapses both bands to one and leaves the reserved band-index
+        # column standing on the metadata (that lowering's own docstring says so). A
+        # raster-to-vector `project` then turns every remaining metadata column into a
+        # DIMENSION column on its long output, so the index would ride out of the walk
+        # looking exactly like a dimension the caller asked for -- and `execute`'s own
+        # end-of-walk cleanup cannot catch it, because that cleanup only runs for a
+        # band-wide result, and by this point the index is an ordinary column of a long
+        # one. The value is checked alongside it so this stays a test of the whole chain
+        # rather than only of the column list: 30 and 40 summed horizontally is 70, and a
+        # `project` that re-read raw pixels instead of the grouped frame would report the
+        # two original bands separately rather than one row of 70.
+        write_raster_dataset(
+            base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40
+        )
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "calculate", "input": "a", "expression": "value", "as": "c"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                    {"op": "project", "to": "ecoregion_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        df = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path).collect()
+
+        assert RESERVED_BAND_INDEX_COLUMN not in df.columns
+        assert df.height == 1
+        assert df["grid_cell"].to_list() == [900]
+        assert df["value"].to_list() == pytest.approx([70.0])
+
+    def test_vector_to_raster_project_runs_through_execute(self, base_path, crosswalk_path):
+        # The reverse direction, over the same crosswalk artifact (one raster<->vector
+        # grid pair serves both directions -- see `test_project_raster.py`'s own
+        # docstring): every pixel is tagged zone 1, so every pixel's broadcast value is
+        # unambiguously ecoregion cell 1's `ssf` value at year 2030 (`year + geo_id / 100`
+        # = 2030.01). Runs through `execute()`'s `("vector", "raster")` entry, which is
+        # `project_vector_to_raster` registered directly (its signature already matches
+        # the uniform registry shape -- see `execute.py`'s own comments for why only the
+        # raster-to-vector direction needs an adapter).
+        write_annual_dataset(base_path, years=(2030,))
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 1, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {
+                    "a": {"variable": ANNUAL_KWARGS["variable"], "time_unit": "annual", "grid": ANNUAL_KWARGS["grid"]}
+                },
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID}],
+                "output": {"format": "csv"},
+            }
+        )
+        lf, metadata_df, window = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
+        df = lf.collect()
+
+        assert metadata_df["calendar_year"].to_list() == [2030]
+        assert df["b0"].unique().to_list() == pytest.approx([2030.01])
+        # `project_vector_to_raster`'s zero-pivot-dimension case does not apply here (there
+        # IS a pivot dimension, `calendar_year`), but the cleanup at the end of `execute()`
+        # must be unconditional regardless -- this pins that it does not misfire and drop
+        # a real dimension column by mistake.
+        assert RESERVED_BAND_INDEX_COLUMN not in metadata_df.columns
+
+    def test_zero_band_selection_builds_an_empty_frame_without_opening_a_file(self, base_path, monkeypatch):
+        # A dimension filter (`calendar_year == 2099`) that matches no band on-disk narrows
+        # `ResolvedInput.band_metadata` to zero rows entirely at COMPILE time (pushdown --
+        # see `execution/plan.py`'s module docstring), before `execute()` ever runs.
+        # `scan_raster` is monkeypatched to fail loudly if called at all -- a stronger check
+        # than merely getting the right (empty) answer, since a version that fell through to
+        # a real scan over zero metadata would raise `ValueError` from deep inside
+        # `io.raster.scan_raster` instead of ever reaching this assertion, which would look
+        # like a passing test failing for an unrelated reason rather than pinning the actual
+        # behaviour under test.
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [{"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "f"}],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata.height == 0
+        assert plan.frame_types["f"].shape is Shape.band_wide
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("scan_raster must not be called for a zero-band selection")
+
+        monkeypatch.setattr(execute_module, "scan_raster", _fail_if_called)
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+
+        assert lf.collect().is_empty()
+        assert metadata_df.is_empty()
+        # The window is taken from the raster GRID's own geometry, not derived from any
+        # file (none was opened) -- `source=()` names none, and the extent/transform match
+        # a full, undecimated read of the same grid computed independently here rather than
+        # by calling the production helper that built it, so a bug in that helper would not
+        # be masked by comparing its output to itself.
+        grid = GRIDS[RASTER_GRID]
+        assert window.source == ()
+        assert window.width == grid.width
+        assert window.height == grid.height
+        assert window.transform == from_bounds(*grid.bounds, width=grid.width, height=grid.height)
+        assert window.crs == CRS.from_user_input(grid.crs)
+        assert window.batch_layout == ()
+
+    def test_project_reads_upstream_calculate_work_not_a_raw_rescan(self, base_path, crosswalk_path):
+        # Regression test: `project_raster_to_vector` used to perform its OWN independent
+        # `scan_raster` call, silently discarding whatever an upstream `calculate` had
+        # already done to `frames[op.input]`'s `lf` -- it read only the metadata half of
+        # that frame and re-scanned raw pixels from disk for the data half. A single
+        # constant-fill (10) raster, doubled by `calculate` before the `project`, with a
+        # crosswalk whose one zone covers the whole grid (mean-of-a-constant is invariant
+        # to pixel count, so this doesn't need to hand-count the grid): the answer is 20.0
+        # if the doubling was honored, 10.0 -- the raw on-disk value -- if `project`
+        # re-read the file itself instead of the already-open, already-processed frame.
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda year: 10)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"},
+                    {"op": "project", "input": "c", "to": "ecoregion_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        df = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path).collect()
+
+        assert df["grid_cell"].to_list() == [900]
+        assert df["value"].to_list() == pytest.approx([20.0])
+
+    def test_project_reads_upstream_filter_masking_not_a_raw_rescan(self, base_path, crosswalk_path):
+        # Same regression as above, for `filter` instead of `calculate`. `value > 35`
+        # masks the 2030 band (fill 30, not > 35) to null and leaves 2040 (fill 40)
+        # unmasked. A `project` reading the SAME already-filtered frame sees an all-null
+        # 2030 contribution (mean of nothing -> null) and 40.0 for 2040; a `project` that
+        # re-scanned raw pixels on its own would see the filter's masking never happened
+        # at all and report 30.0 for 2030 instead of null.
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "value > 35", "as": "f"},
+                    {"op": "project", "input": "f", "to": "ecoregion_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        df = (
+            execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
+            .collect()
+            .sort("calendar_year")
+        )
+
+        assert df["calendar_year"].to_list() == [2030, 2040]
+        values = df["value"].to_list()
+        assert values[0] is None
+        assert values[1] == pytest.approx(40.0)
+
+    def test_zero_band_project_returns_empty_without_opening_a_file(self, base_path, crosswalk_path, monkeypatch):
+        # Corner case: a dimension filter (`calendar_year == 2099`) narrows a raster
+        # origin to zero bands at compile time, upstream of a raster-to-vector `project`.
+        # `_open_band_wide_input`'s zero-band branch never calls `scan_raster` (pinned by
+        # monkeypatching it to fail loudly), and `project.project_raster_to_vector`'s own
+        # `has_no_bands` guard returns an empty frame rather than grouping by a
+        # `ZONE_COLUMN` that was never attached (`extra_columns=()` for this case -- see
+        # `_open_band_wide_input`'s own docstring).
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda year: 10)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "f"},
+                    {"op": "project", "input": "f", "to": "ecoregion_v001", "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata.height == 0
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("scan_raster must not be called for a zero-band selection")
+
+        monkeypatch.setattr(execute_module, "scan_raster", _fail_if_called)
+
+        result = execute(plan, base_path=base_path)
+
+        assert result.collect().is_empty()
+
+    def test_spatial_filter_downstream_of_a_fanned_out_origin_does_not_leak_the_crosswalk_column(
+        self, base_path, crosswalk_path
+    ):
+        # Corner case: "a" is read by two steps -- a `project` to a vector grid (which
+        # makes `_open_band_wide_input` attach a crosswalk column under `project.
+        # ZONE_COLUMN` to "a"'s own open frame) and, separately, a spatial `filter` that
+        # turns "a" long. The spatial filter's own `extra_columns` handling
+        # (`_run_filter_band_wide`) must strip that crosswalk column before the frame goes
+        # long -- it names no destination cell of its own once the frame stops being the
+        # raster origin, and a later `group`/`join` could silently key on it as if it were
+        # a real dimension otherwise.
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda year: 10)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "mean", "as": "p"},
+                    {"op": "filter", "input": "a", "where": "grid_cell == 0", "as": "sampled"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].straddling_vector_grid == "ecoregion_v001"
+        assert plan.frame_types["sampled"].shape is Shape.long
+
+        df = execute(plan, base_path=base_path).collect()
+
+        assert project.ZONE_COLUMN not in df.columns
+        assert df["grid_cell"].to_list() == [0]
+        assert df["value"].to_list() == pytest.approx([10.0])
+
+    def test_final_defensive_strip_removes_the_crosswalk_column_from_a_band_wide_result(
+        self, base_path, crosswalk_path
+    ):
+        # A different fan-out shape than the spatial-filter case above: "a" feeds a
+        # `project` on one branch (attaching `project.ZONE_COLUMN` to "a"'s own open
+        # frame) and an ordinary `calculate` on another, which stays BAND-WIDE and becomes
+        # the pipeline's actual last declared step -- so the mid-walk strip inside
+        # `_run_filter_band_wide` never runs at all (no filter is involved), and only
+        # `execute()`'s own final, defensive strip (see the module docstring's closing
+        # paragraph) is what keeps the crosswalk column from leaking into the returned
+        # frame's `lf`.
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda year: 10)
+        grid = GRIDS[RASTER_GRID]
+        zones = np.full((grid.height, grid.width), 900, dtype="int32")
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "mean", "as": "p"},
+                    {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].straddling_vector_grid == "ecoregion_v001"
+        assert plan.frame_types["c"].shape is Shape.band_wide
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert project.ZONE_COLUMN not in df.columns
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == pytest.approx([20.0])
+
+    def test_a_partial_zero_band_join_operand_raises(self, base_path):
+        # `plan.band_wide_join_scans` groups both operands of a band-wide `join` for one
+        # shared scan whenever every origin in the group is raster -- including when a
+        # dimension filter has already narrowed ONE operand to zero bands via pushdown
+        # (`origin_sets` is provenance, not pushdown validity -- see `plan.py`'s own
+        # module docstring). `_open_band_wide_join_group` cannot silently slice a
+        # zero-band operand out of the shared scan (that slice would collapse to height 0
+        # while its sibling keeps the scan's real row count -- a shape mismatch
+        # `join_band_wide`'s own precondition would also catch, but only after producing a
+        # confusing error with no indication which operand was actually empty), so it
+        # raises `ValueError` naming the mismatched origin instead.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="ffibs_score",
+            data_fn=lambda year: raster_array(fill=5, grid_name=RASTER_GRID, dtype="float32"),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "fa"},
+                    {"op": "join", "type": "spatial", "inputs": ["fa", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata.height == 0
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+
+        with pytest.raises(ValueError, match="partial zero-band mismatch"):
+            execute(plan, base_path=base_path)

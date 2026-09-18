@@ -262,9 +262,21 @@ def select_dimension_band_wide(
     Returns `empty_band_wide(window)` when no band survives -- the one lowering this
     module's height-preservation invariant does not cover, named as the exception rather
     than special-cased inside `assert_height_preserved` (see that function's docstring).
+
+    Also returns `empty_band_wide(window)` immediately, without evaluating
+    `dimension_where` at all, when `band_wide` is ALREADY the empty triple: this is the
+    walk's own redundant re-application of the predicate that caused an input to be
+    opened empty in the first place (`ExecutionPlan`'s compile-time band-metadata pushdown
+    narrows a raster origin before `execute()` ever runs, but the filter step that named
+    the predicate still executes normally afterward, same as every other step). Zero bands
+    means `metadata_df` carries none of its usual dimension columns either -- see
+    `empty_band_wide`'s own docstring -- so attempting the SQL filter against it would fail
+    on a missing column rather than correctly reporting "still nothing survives".
     """
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
+    if has_no_bands(metadata_df):
+        return empty_band_wide(window)
     names = band_column_names(metadata_df)
     indexed = metadata_df.with_row_index("__pos")
     kept = indexed.filter(pl.sql_expr(dimension_where).fill_null(False))
@@ -348,9 +360,17 @@ def calculate_band_wide(band_wide: BandWideFrame, op: CalculateOp, extra_columns
     entry (a `CalculateOp` is always one, never that function's multi-entry list -- see the
     module docstring), including its `is_not_null()` guard (nodata in, nodata out, as a
     structural property rather than a per-expression obligation).
+
+    Returns `band_wide` unchanged, without evaluating `op.where`'s dimension half at all,
+    when it is ALREADY the empty triple -- same redundant-re-application situation
+    `select_dimension_band_wide` documents: zero bands means no dimension columns to
+    evaluate a `where` against, and "nothing happens to zero bands" is already the correct
+    answer without asking.
     """
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
+    if has_no_bands(metadata_df):
+        return band_wide
     names = band_column_names(metadata_df)
     (plan,) = compile_calculate_entries(
         [(calculate_label(op), op.expression, op.where)], allowed_columns=["value", *extra_columns]
@@ -405,7 +425,6 @@ def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequen
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
         return empty_band_wide(window)
-
     names = band_column_names(metadata_df)
     indexed = metadata_df.with_row_index("__pos")
     groups_df = indexed.group_by(op.by, maintain_order=True).agg(pl.col("__pos"))
@@ -475,7 +494,18 @@ def join_band_wide(operands: list[BandWideFrame], names: list[str], extra_column
         if k == 0:
             select_cols += [pl.col(column) for column in extra_columns]
         aligned.append(lf.select(select_cols))
-        renamed_metadatas.append(metadata_df.with_columns(pl.lit(name).alias(JOIN_OPERAND_COLUMN)))
+        # Guarded on height: `with_columns` of a literal against a zero-ROW frame
+        # broadcasts to length ONE rather than staying empty, so a zero-band operand would
+        # otherwise contribute a metadata row describing a band that does not exist -- and
+        # two of them would hand back metadata claiming two bands over a frame carrying
+        # none, the inverse of the "zero columns loses the row count" gap this module's
+        # docstring describes. A zero-band operand contributes zero band rows; that is the
+        # whole of its contribution.
+        renamed_metadatas.append(
+            metadata_df.with_columns(pl.lit(name).alias(JOIN_OPERAND_COLUMN))
+            if metadata_df.height
+            else metadata_df
+        )
 
     combined = pl.concat(aligned, how="horizontal")
     out_lf = combined.select([*(f"b{i}" for i in range(next_position)), *extra_columns])

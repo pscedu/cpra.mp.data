@@ -27,6 +27,8 @@ from rasterio.transform import from_origin
 
 from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.project import project_raster_to_vector, project_vector_to_raster
+from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
+from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.request.aggregates import validate_project_aggregate
 from cpra.mp.data.analysis.request.errors import AggregateError, NotFoundError
 from cpra.mp.data.analysis.request.ops import FrameType, ProjectOp, Shape
@@ -86,6 +88,28 @@ def _metadata(rows, **extra_columns):
     return df
 
 
+def _open_raster_frame(metadata_df, crosswalk_written=True, input_name="r"):
+    """Open `metadata_df` exactly as `execute.py`'s `_open_band_wide_input` would for a
+    raster origin whose pixels straddle a `project` -- data bands plus, when
+    `crosswalk_written` (the crosswalk this module's own `_write_crosswalk` wrote, resolved
+    via the same `resolve_raster_crosswalk_path(RASTER_GRID, VECTOR_GRID)` production
+    calls), the crosswalk attached on the SAME `scan_raster` call under `project.
+    ZONE_COLUMN` -- see `execute.py`'s and `project.py`'s own module docstrings for why the
+    crosswalk always rides on the data bands' own read rather than a second scan.
+
+    Returns the `frames` dict `project_raster_to_vector` itself now reads (its signature
+    changed from `(metadata_df, op, frame_types)` to `(frames, op, frame_types)` -- see
+    `project.py`'s module docstring, "all three project lowerings share the one uniform
+    registry shape").
+    """
+    crosswalks = (
+        [(project.ZONE_COLUMN, str(resolve_raster_crosswalk_path(RASTER_GRID, VECTOR_GRID)))]
+        if crosswalk_written
+        else []
+    )
+    return {input_name: scan_raster(metadata_df, crosswalks=crosswalks)}
+
+
 def _raster_frame_types(input_name="r"):
     return {
         input_name: FrameType(
@@ -139,8 +163,9 @@ class TestRasterToVectorZonalAggregate:
         data_path = _write_tif(tmp_path / "data.tif", self._DATA)
         metadata_df = _metadata([(data_path, 1)])
 
+        frames = _open_raster_frame(metadata_df)
         out = project_raster_to_vector(
-            metadata_df, _raster_op(aggregate=aggregate), _raster_frame_types()
+            frames, _raster_op(aggregate=aggregate), _raster_frame_types()
         ).collect()
 
         got = dict(zip(out["grid_cell"].to_list(), out["value"].to_list()))
@@ -165,7 +190,8 @@ class TestRasterToVectorDimensionCarrying:
         path_2040 = _write_tif(tmp_path / "y2040.tif", np.array([[10, 20], [30, 40]], dtype="float32"))
         metadata_df = _metadata([(path_2030, 1), (path_2040, 1)], calendar_year=[2030, 2040])
 
-        out = project_raster_to_vector(metadata_df, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
+        frames = _open_raster_frame(metadata_df)
+        out = project_raster_to_vector(frames, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
 
         rows = {
             (row["grid_cell"], row["calendar_year"]): row["value"]
@@ -192,7 +218,8 @@ class TestRasterToVectorNodataExclusion:
         data_path = _write_tif(tmp_path / "data.tif", self._DATA)
         metadata_df = _metadata([(data_path, 1)])
 
-        out = project_raster_to_vector(metadata_df, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
+        frames = _open_raster_frame(metadata_df)
+        out = project_raster_to_vector(frames, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
 
         assert out.height == 1
         assert out["grid_cell"].to_list() == [100]
@@ -203,7 +230,8 @@ class TestRasterToVectorNodataExclusion:
         data_path = _write_tif(tmp_path / "data.tif", self._DATA)
         metadata_df = _metadata([(data_path, 1)])
 
-        out = project_raster_to_vector(metadata_df, _raster_op(aggregate="count"), _raster_frame_types()).collect()
+        frames = _open_raster_frame(metadata_df)
+        out = project_raster_to_vector(frames, _raster_op(aggregate="count"), _raster_frame_types()).collect()
 
         assert None not in out["grid_cell"].to_list()
         assert -1 not in out["grid_cell"].to_list()
@@ -227,8 +255,9 @@ class TestRasterToVectorCountByValue:
         _write_crosswalk(crosswalk_path, self._ZONES)
         data_path = _write_tif(tmp_path / "data.tif", self._DATA, nodata=-1)
         metadata_df = _metadata([(data_path, 1)])
+        frames = _open_raster_frame(metadata_df)
         out = project_raster_to_vector(
-            metadata_df, _raster_op(aggregate="count_by_value"), _raster_frame_types()
+            frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
         ).collect()
         return {(row["grid_cell"], row["value_category"]): row["value"] for row in out.iter_rows(named=True)}
 
@@ -261,8 +290,9 @@ class TestRasterToVectorCountByValue:
         path_2040 = _write_tif(tmp_path / "y2040.tif", np.array([[3, 3], [4, 4]], dtype="float32"))
         metadata_df = _metadata([(path_2030, 1), (path_2040, 1)], calendar_year=[2030, 2040])
 
+        frames = _open_raster_frame(metadata_df)
         out = project_raster_to_vector(
-            metadata_df, _raster_op(aggregate="count_by_value"), _raster_frame_types()
+            frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
         ).collect()
 
         rows = {
@@ -281,22 +311,27 @@ class TestRasterToVectorCountByValue:
         data_path = _write_tif(tmp_path / "data.tif", np.array([[1, 2], [3, 4]], dtype="float32"))
         metadata_df = _metadata([(data_path, 1)])
         monkeypatch.setattr(project, "COUNT_BY_VALUE_MAX_DISTINCT", 2)
+        frames = _open_raster_frame(metadata_df)
 
         with pytest.raises(AggregateError, match="count_by_value"):
             project_raster_to_vector(
-                metadata_df, _raster_op(aggregate="count_by_value"), _raster_frame_types()
+                frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
             ).collect()
 
 
 class TestRasterToVectorMissingCrosswalk:
-    def test_raises_not_found_before_any_raster_is_opened(self, tmp_path, crosswalk_path):
-        """No crosswalk written -- `resolve_raster_crosswalk_path` is called before
-        `scan_raster` ever runs, so `metadata_df` need not even name a real file for this
-        to raise `NotFoundError`, not some later `rasterio` error."""
-        metadata_df = _metadata([("/nonexistent/data.tif", 1)])
-
+    def test_resolving_a_missing_crosswalk_raises_not_found(self, crosswalk_path):
+        """`project_raster_to_vector` no longer resolves the crosswalk itself -- opening a
+        raster origin's frame with its crosswalk attached is `execute.py`'s own job now
+        (see that module's docstring, "the raster-to-vector crosswalk is attached here"),
+        performed before `project_raster_to_vector` ever runs. This pins that the
+        resolution `execute.py` (and this file's own `_open_raster_frame` helper) relies on
+        still raises `NotFoundError` for a raster/vector grid pair with no crosswalk
+        artifact written -- no crosswalk written here, so this never even reaches
+        `scan_raster`.
+        """
         with pytest.raises(NotFoundError):
-            project_raster_to_vector(metadata_df, _raster_op(aggregate="sum"), _raster_frame_types())
+            resolve_raster_crosswalk_path(RASTER_GRID, VECTOR_GRID)
 
 
 class TestRasterToVectorReaddressesGrid:
@@ -305,7 +340,8 @@ class TestRasterToVectorReaddressesGrid:
         data_path = _write_tif(tmp_path / "data.tif", np.array([[1, 2], [3, 4]], dtype="float32"))
         metadata_df = _metadata([(data_path, 1)], grid=[RASTER_GRID])
 
-        out = project_raster_to_vector(metadata_df, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
+        frames = _open_raster_frame(metadata_df)
+        out = project_raster_to_vector(frames, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
 
         assert set(out["grid"].to_list()) == {VECTOR_GRID}
 

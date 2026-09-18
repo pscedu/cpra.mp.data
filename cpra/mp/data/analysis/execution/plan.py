@@ -151,7 +151,15 @@ traces to. Two things make that unsafe:
   origin via ANY `ops` entry, not only ones pushdown validity survived to -- see the
   provenance paragraph above on why `origin_sets` rather than `states` is what this reads)
   targets, or `None` if none does; `overview_permitted` is unconditionally `False` whenever
-  it is not `None`.
+  it is not `None`. A raster origin reachable from two raster-to-vector `project` steps
+  that target DIFFERENT grids raises `request.errors.ShapeError` here, at compile time,
+  rather than silently keeping whichever step this loop happened to see first: the crosswalk
+  attached at open time (see `execution.execute`/`execution.project`'s own docstrings) is
+  one artifact, resolved against one destination grid, so one origin cannot straddle two
+  destinations at once the way `origin_sets`' fan-out otherwise freely allows for ops that
+  do not carry that constraint (a fan-out into two `calculate`s, or into a `project` and an
+  ordinary `join`, is unaffected -- only two conflicting `project` destinations off the same
+  raster origin are rejected).
 * A point sample (`point_sample_step`, above) reads exactly the pixel under a coordinate --
   an overview's decimated grid can hand back a neighbouring pixel's value instead of the
   one actually asked for. `overview_permitted` is `False` for any origin with a
@@ -216,7 +224,7 @@ from collections import Counter
 import polars as pl
 
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
-from cpra.mp.data.analysis.request.errors import BandLimitError, RequestError
+from cpra.mp.data.analysis.request.errors import BandLimitError, RequestError, ShapeError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
     CalculateOp,
@@ -490,8 +498,18 @@ def compile_plan(pipeline: Pipeline, *, base_path=None) -> ExecutionPlan:
         if from_kind != "raster" or to_kind != "vector":
             continue
         for origin in origin_sets[op.input]:
-            if origin_kind[origin] == "raster":
-                straddling_vector_grid.setdefault(origin, op.to)
+            if origin_kind[origin] != "raster":
+                continue
+            existing = straddling_vector_grid.get(origin)
+            if existing is not None and existing != op.to:
+                raise ShapeError(
+                    f"raster input {origin!r} straddles two different destination grids "
+                    f"({existing!r} and {op.to!r}) via separate 'project' steps reachable "
+                    "from it -- a raster origin's full-resolution pixels can only be read "
+                    "once per compiled plan, so a fan-out with two raster-to-vector "
+                    "projects targeting different grids is not supported"
+                )
+            straddling_vector_grid[origin] = op.to
 
     inputs: dict[str, ResolvedInput] = {}
     for name, selection in pipeline.inputs.items():
