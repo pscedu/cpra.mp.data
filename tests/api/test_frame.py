@@ -235,6 +235,41 @@ class TestAssertWindowUnchanged:
             frame.assert_window_unchanged(handed, returned)
 
 
+class TestAssertSamePixelGrid:
+    def test_passes_for_two_reads_of_different_sources_over_the_same_grid(self):
+        # The case this function exists for, and the one plain `ReadWindow` equality gets
+        # wrong: two operands of a band-wide join are by definition two different reads.
+        # A `==`-based check would reject this, leaving a join satisfiable only against
+        # itself -- so a wrong implementation must visibly fail here, not merely agree.
+        one = make_window(source="veg_grid_cell_v001/elev.tif")
+        other = make_window(source="veg_grid_cell_v001/salinity.tif")
+        assert one != other
+        frame.assert_same_pixel_grid(one, other)  # must not raise
+
+    def test_passes_when_the_window_is_identical(self):
+        frame.assert_same_pixel_grid(make_window(), make_window())  # must not raise
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"col_off": 5},
+            {"row_off": 5},
+            {"width": 999},
+            {"height": 999},
+            {"decimation": 2},
+            {"crs": CRS.from_epsg(4326)},
+            {"transform": Affine.translation(10, 10)},
+        ],
+    )
+    def test_fires_when_any_geometric_field_differs(self, override):
+        with pytest.raises(AssertionError):
+            frame.assert_same_pixel_grid(make_window(), make_window(**override))
+
+    def test_names_the_fields_that_differ(self):
+        with pytest.raises(AssertionError, match="col_off, width"):
+            frame.assert_same_pixel_grid(make_window(), make_window(col_off=5, width=999))
+
+
 class TestAssertHeightPreserved:
     def test_passes_when_height_is_unchanged_even_if_the_data_is_not(self):
         before = pl.LazyFrame({"b0": [1, 2, 3]})

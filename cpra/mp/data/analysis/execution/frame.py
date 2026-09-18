@@ -90,6 +90,7 @@ __all__ = [
     "add_reserved_band_index",
     "drop_reserved_band_index",
     "assert_window_unchanged",
+    "assert_same_pixel_grid",
     "assert_height_preserved",
 ]
 
@@ -234,6 +235,31 @@ def assert_window_unchanged(handed: ReadWindow, returned: ReadWindow) -> None:
     )
 
 
+def assert_same_pixel_grid(one: ReadWindow, other: ReadWindow) -> None:
+    """Two independently produced `ReadWindow`s address the same pixels in the same
+    order -- the precondition a positional (row *i* is row *i*) combination of two
+    band-wide frames needs before it may line their rows up.
+
+    Every field BUT `source` is compared. `source` is deliberately excluded: the whole
+    point of combining two band-wide frames positionally is that they came from
+    different reads, so requiring identical `source` would reject exactly the case this
+    check exists to admit. What makes row *i* the same pixel in both is the geometry --
+    offsets, extent, transform, CRS, decimation -- not which file it was read out of.
+    Contrast `assert_window_unchanged`, which compares `source` too because there the
+    two windows are the SAME read, before and after one lowering, and a changed `source`
+    there is unambiguously a bug.
+    """
+    differing = [
+        field
+        for field in ("col_off", "row_off", "width", "height", "transform", "crs", "decimation")
+        if getattr(one, field) != getattr(other, field)
+    ]
+    assert not differing, (
+        f"band-wide frames do not share a pixel grid -- {', '.join(differing)} differ "
+        f"({one!r} vs {other!r}); their rows cannot be aligned positionally"
+    )
+
+
 def assert_height_preserved(before: pl.LazyFrame, after: pl.LazyFrame) -> None:
     """Every band-wide lowering preserves row count: a value filter masks instead of
     dropping, a spatial filter changes shape to long instead of dropping band-wide rows,
@@ -243,9 +269,13 @@ def assert_height_preserved(before: pl.LazyFrame, after: pl.LazyFrame) -> None:
     function at all -- it returns `empty_band_wide` directly, named as the exception
     rather than an assertion this call would have to special-case.
 
-    Computes each side's height via `pl.len()` rather than a full materialization --
-    cheap enough that a lowering can call this on every invocation rather than reserving
-    it for tests.
+    **This is a test-time assertion, not one a lowering calls on itself.** Both sides are
+    collected, and a band-wide frame's `before` is typically an unmaterialized raster
+    scan, so each call is a real read of every pixel -- twice per invocation, and a
+    lowering calling it inline would pay that on every op in a walk. The lowerings
+    themselves build `after` with `select`/`with_columns`/a horizontal concat of
+    equal-height frames, none of which can change a row count, so the guarantee is
+    structural there; this function is how the tests check that from the outside.
     """
     before_height = before.select(pl.len()).collect().item()
     after_height = after.select(pl.len()).collect().item()
