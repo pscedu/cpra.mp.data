@@ -7,6 +7,8 @@ second implementation. `_window()` builds a `ReadWindow` with sensible defaults;
 overrides only the field its scenario cares about.
 """
 
+import dataclasses
+
 import polars as pl
 import pytest
 from rasterio.crs import CRS
@@ -22,7 +24,7 @@ from cpra.mp.data.analysis.execution.band_ops import (
     sample_grid_cells_band_wide,
     select_dimension_band_wide,
 )
-from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN, ReadWindow
+from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN, ReadWindow, row_major_grid_cell
 from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp
 
 
@@ -493,3 +495,63 @@ class TestJoinBandWide:
         b = (pl.LazyFrame({"b0": [2]}), pl.DataFrame({"label": ["b"]}), window)
         with pytest.raises(ValueError):
             join_band_wide([a, b], ["a"], extra_columns=[])
+
+
+class TestSpatialFilterCommutesWithCalculateAndGroup:
+    """A spatial (`grid_cell`) conjunct, sitting after a `calculate` and a `group` in the
+    same band-wide chain, is a candidate for a compile-time pushdown marker that names the
+    conjunct's own step rather than one nearer the read -- but only if restricting the
+    frame to one pixel BEFORE running the `calculate`/`group` in front of it would produce
+    the identical answer running them over the whole window and picking that pixel out
+    afterward does. `calculate_band_wide` acts one pixel at a time (nothing about its
+    `pl.when(...).then(...)` reads across rows) and `group_band_wide` reduces HORIZONTALLY
+    across a row's own bands (nothing about `sum_horizontal` reads across rows either) --
+    so neither op has any way to make one pixel's output depend on another pixel's input,
+    which is exactly the property this test checks with concrete, hand-computed numbers
+    rather than assuming it from the two lowerings' docstrings alone.
+
+    2 pixels, 2 bands, no nulls: `b0 = [10, 100]`, `b1 = [1, 5]`. `calculate` adds 1 to
+    every band unconditionally (`value + 1`); `group` collapses both bands into one via an
+    unweighted horizontal sum (`by=[]`, `aggregate="sum"`). Worked by hand for pixel 1
+    (`grid_cell = 1`, the second row): post-calculate `b0 = 101`, `b1 = 6`; post-group
+    `b0 = 101 + 6 = 107`.
+    """
+
+    def _fixture(self):
+        lf = pl.LazyFrame({"b0": [10, 100], "b1": [1, 5]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
+        return lf, metadata_df, _window(height=2)
+
+    def test_full_window_then_pick_one_pixel_matches_hand_computed_value(self):
+        band_wide = self._fixture()
+        calculate_op = CalculateOp(step_no=1, input="x", expression="value + 1", output="c")
+        group_op = GroupOp(step_no=2, input="c", by=[], aggregate="sum", output="g")
+
+        calculated = calculate_band_wide(band_wide, calculate_op, extra_columns=[])
+        grouped = group_band_wide(calculated, group_op, extra_columns=[])
+        long_result = sample_grid_cells_band_wide(grouped, "grid_cell = 1", extra_columns=[]).collect()
+
+        assert long_result.height == 1
+        assert long_result["value"].to_list() == [107]
+
+    def test_picking_the_pixel_first_matches_the_same_hand_computed_value(self):
+        """The pushdown candidate itself: restrict to `grid_cell = 1` FIRST -- as compile-
+        time pushdown would, if it read only that one pixel from disk -- then run the
+        identical `calculate`/`group` over just that one-row frame. No executor wires this
+        up (this module composes the lowerings by hand, exactly as a real one eventually
+        would), but the two results below being equal is the concrete fact that justifies
+        marking the spatial conjunct's own step as pushable rather than forcing the read
+        back to the chain's start.
+        """
+        lf, metadata_df, window = self._fixture()
+        one_pixel_lf = row_major_grid_cell(lf, window).filter(pl.col("grid_cell") == 1).drop("grid_cell")
+        one_pixel = (one_pixel_lf, metadata_df, dataclasses.replace(window, height=1))
+
+        calculate_op = CalculateOp(step_no=1, input="x", expression="value + 1", output="c")
+        group_op = GroupOp(step_no=2, input="c", by=[], aggregate="sum", output="g")
+
+        calculated = calculate_band_wide(one_pixel, calculate_op, extra_columns=[])
+        grouped = group_band_wide(calculated, group_op, extra_columns=[])
+        result = grouped[0].collect()
+
+        assert result["b0"].to_list() == [107]

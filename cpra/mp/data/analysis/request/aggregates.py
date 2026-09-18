@@ -18,8 +18,8 @@ duplicated, once per layer, each raising that layer's own exception type.
 
 SCOPE NOTE: this module does not yet carry the `mean` (sum, count) accumulator pair or
 `count_by_value`'s partial-fold accumulator -- both are execution machinery, not a
-vocabulary fact, and are out of scope until a later stage builds `execution/fold.py`'s
-own aggregate lowering.
+vocabulary fact, and so belong with `execution/fold.py`'s own aggregate lowering rather
+than here.
 """
 
 from cpra.mp.data.analysis.request.errors import AggregateError

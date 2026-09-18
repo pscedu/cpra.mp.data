@@ -130,6 +130,24 @@ COUNT_BY_VALUE_MAX_DISTINCT = int(get_config("COUNT_BY_VALUE_MAX_DISTINCT", "100
 # pipeline's `project`/`join` step at something unbounded.
 ANALYSIS_JOIN_MAX_ROWS = int(get_config("ANALYSIS_JOIN_MAX_ROWS", "200000"))
 
+# Ceiling on the number of bands an analysis pipeline's raster input may resolve to at
+# compile time (cpra.mp.data.analysis.execution.plan.compile_plan, via
+# io.catalog.resolve_raster_bands) -- one band is one (file, band-index) pair, and each
+# survives compile-time band selection independently of the others, so an input whose
+# on-disk layout resolves to an unexpectedly large band count (a bad glob, a variable
+# whose calendar dimension turns out to be finer-grained than expected, a `filter` that
+# fails to narrow anything) would otherwise only surface as a very slow or very large VRT
+# at scan time, with nothing to catch it before then. For a band-wide `join`, both
+# operands are read through ONE shared VRT (positional row alignment requires it -- see
+# `execution/band_ops.py`'s `join_band_wide`), so the ceiling is checked against the
+# UNION of the operands' band counts there, not against each one separately. 1000 is the
+# same order-of-magnitude bound `COUNT_BY_VALUE_MAX_DISTINCT` uses for an unrelated
+# unbounded-cardinality question, comfortably above any real per-input band count in this
+# dataset (a multi-decade annual calendar dimension is on the order of dozens to low
+# hundreds of bands) while still catching a request that would otherwise open a
+# thousand-plus file VRT with no filter that could ever have been declared to prevent it.
+ANALYSIS_BAND_CEILING = int(get_config("ANALYSIS_BAND_CEILING", "1000"))
+
 # Row-offset chunk size for the tabular "fold" (api.fold.fold_group_by), which bounds a
 # high-cardinality `group_by` (e.g. `grid_cell`, 126,174 distinct values in
 # clara_grid_cell_v001) to at most this many input rows per `group_by`/`agg`/`collect`

@@ -30,9 +30,9 @@ directions that touch a raster grid) -- so `tests/api/test_execute.py` can asser
 directions, that the registered lowerings and the not-yet-implemented set together
 partition exactly what the tables declare legal: no orphan executor for a combination no
 table names, and no combination falling through neither set. Shrinking
-`NOT_YET_IMPLEMENTED` is what a later stage adding a real band-wide lowering (or the
-remaining two `project` directions) does, and the test is what forces that stage to come
-back here rather than leaving the new lowering un-wired by omission.
+`NOT_YET_IMPLEMENTED` is what adding a real band-wide lowering (or the remaining two
+`project` directions) does, and the test is what forces whoever adds one to come back here
+rather than leaving the new lowering un-wired by omission.
 
 `calculate` and `group` have no lowering table of their own -- `request/ops.py` types both
 as unconditionally shape-preserving, in code rather than as data -- so their entries below

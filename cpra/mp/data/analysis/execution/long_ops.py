@@ -145,8 +145,8 @@ def group_long(lf: LongFrame, op: GroupOp) -> LongFrame:
     earlier step already shrank this frame enough that the cheap path is safe, and nothing
     on the plan records that yet. `False` takes the conservative side -- folding a frame
     that was already small costs a little redundant overhead, where skipping a fold that
-    was needed costs the memory cliff the fold exists to avoid. A later stage that threads
-    real filter history onto the plan can supply the true signal here.
+    was needed costs the memory cliff the fold exists to avoid. Threading real filter
+    history onto the plan is what would let this carry the true signal.
 
     May raise `fold.FoldError` for a non-decomposable aggregate reaching the fold path --
     unreachable from a validated request, since `request.aggregates` already restricts a

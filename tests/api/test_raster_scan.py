@@ -34,12 +34,14 @@ from cpra.mp.data.analysis.execution.frame import (
     band_column_names,
     row_major_grid_cell,
 )
+from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.io import raster_io
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch
 from cpra.mp.data.analysis.request.errors import NotFoundError
-from cpra.mp.data.analysis.request.pipeline import InputSelection
+from cpra.mp.data.analysis.request.ops import validate_shapes
+from cpra.mp.data.analysis.request.pipeline import InputSelection, parse_pipeline
 from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
 
 # Arbitrary but fixed georeferencing -- every synthetic fixture below shares it, since a
@@ -50,6 +52,13 @@ _TRANSFORM = from_origin(0, 10, 1, 1)
 _CRS = "EPSG:4326"
 
 _SELECTION_FIELDS = ("variable", "time_unit", "grid")
+
+
+def _pipeline(data):
+    """`parse_pipeline` then `validate_shapes` -- `compile_plan`'s own precondition."""
+    pipeline = parse_pipeline(data)
+    validate_shapes(pipeline)
+    return pipeline
 
 
 def _write_tif(path, data, nodata=None):
@@ -388,6 +397,50 @@ class TestResolveRasterBands:
             resolve_raster_bands(bad_selection, base_path=base_path)
 
 
+class TestDroppedBandsAreNeverOpened:
+    """Band selection is a real narrowing of the physical read, not a filter applied to
+    rows that were already read.
+
+    Everything else in this file drives `scan_raster` from a hand-built `metadata_df`,
+    and every raster test in `test_execution_plan.py` monkeypatches the catalog. This
+    one deliberately does neither: it goes through the real `resolve_raster_bands` and
+    the real dimension narrowing, and then proves the narrowing reached the file system
+    by DELETING the dropped year's file. If the scan still returns 2030's pixels, the
+    2040 file was never opened -- which is the only way that can succeed.
+    """
+
+    def _dropped_file(self, base_path, where):
+        write_raster_dataset(base_path, years=(2030, 2040))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": {k: RASTER_KWARGS[k] for k in _SELECTION_FIELDS}},
+                    "steps": [{"op": "filter", "input": "a", "where": where}],
+                    "output": {"format": "csv"},
+                }
+            ),
+            base_path=base_path,
+        )
+        metadata = plan.inputs["a"].band_metadata
+        assert metadata["calendar_year"].to_list() == [2030]
+        return metadata
+
+    def test_the_dropped_years_file_is_never_opened(self, base_path):
+        metadata = self._dropped_file(base_path, "calendar_year == 2030")
+
+        surviving = set(metadata["path"].to_list())
+        removed = [p for p in base_path.rglob("*.tif") if str(p) not in surviving]
+        assert removed, "fixture wrote nothing for the dropped year -- the test would pass vacuously"
+        for path in removed:
+            path.unlink()
+
+        lf, _, _ = scan_raster(metadata)
+        out = lf.collect()
+
+        assert out.height > 0
+        assert [c for c in out.columns if c.startswith("b")] == ["b0"]
+
+
 class TestBatchedReadMatchesUnbatched:
     """Every fixture here writes DISTINGUISHING pixel values (`raster_array()`'s own
     `arange`, through `data_fn`), never the uniform per-year fill `write_raster_dataset`
@@ -528,3 +581,44 @@ class TestPushdownIsHonored:
         lf = self._two_band_scan(tmp_path)
 
         assert lf.filter(pl.col("b0") > 1).head(2).collect()["b0"].to_list() == [2, 3]
+
+
+class TestValuePredicateNeverBelongsAsARowFilter:
+    """This scan honors whatever `.filter()` a caller chains onto it -- that is what
+    `TestPushdownIsHonored` above checks. For a VALUE predicate specifically, honoring it
+    this way is exactly the danger `execution.plan.compile_plan` is built to avoid: a row
+    is one pixel across every band at once, so dropping a row because one band's value
+    failed a predicate throws away every OTHER band's value at that same pixel too, even
+    the ones the predicate holds for.
+
+    Reproduces `tests/api/test_band_ops.py`'s `_two_band_fixture()` disagreement (one
+    pixel where band 0 satisfies a `value` predicate and band 1 does not) against a real
+    two-band GeoTIFF read through this scan, rather than the hand-built frame that
+    fixture uses -- so the corruption below is demonstrated at the actual IO boundary, not
+    just against a synthetic `pl.LazyFrame`. `execution.band_ops.mask_value_band_wide`'s
+    own `test_masks_not_drops_and_bands_disagree` (in `test_band_ops.py`) checks the
+    corresponding CORRECT behavior -- null out the failing band only, keep the row -- on
+    that same hand-built frame; `compile_plan` never gives a raster `ResolvedInput` a
+    `predicate` at all, so a value conjunct against a raster origin has no path to this
+    scan's `filter` argument and can only ever reach `mask_value_band_wide` once a real
+    executor lowers it.
+    """
+
+    def test_a_value_filter_on_a_disagreeing_pixel_drops_the_whole_row(self, tmp_path):
+        # Pixel index 2 (row-major): b0 = 1 fails `value > 4`, b1 = 20 satisfies it on ITS
+        # OWN band -- the same disagreement `_two_band_fixture()` engineers by hand. A
+        # `.filter()` naming one band as a stand-in for "value" has no way to see that: it
+        # can only check the band it names.
+        band0 = np.array([[1, 5], [1, 1]], dtype="int32")
+        band1 = np.array([[2, 1], [20, 1]], dtype="int32")
+        path = _write_tif(tmp_path / "two.tif", np.stack([band0, band1]))
+        lf, _, _ = scan_raster(_metadata([(path, 1), (path, 2)]))
+
+        filtered = lf.filter(pl.col("b0") > 4).collect()
+
+        # The row-drop corruption: pixel index 2 vanishes ENTIRELY -- including band 1's
+        # own value (20), which satisfies the very predicate being applied -- because the
+        # filter only ever consulted band 0's value at that pixel.
+        assert filtered.height == 1
+        assert filtered["b0"].to_list() == [5]
+        assert 20 not in filtered["b1"].to_list()
