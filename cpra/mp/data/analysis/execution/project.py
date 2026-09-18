@@ -6,8 +6,8 @@ from `op.input`'s grid onto `op.to` via a crosswalk join, then re-collapsed one 
 **Why the join mechanics below read like `analysis/vector.py::apply_project`.** They are
 the same join, deliberately: `lf.join(crosswalk_lf, left_on="grid_cell",
 right_on="src_id", how="inner")`, and then `pl.col("dst_id").alias("grid_cell")` to
-re-address the result. That mechanic is not spec'd numeric behavior, just how a crosswalk
-join is expressed in Polars, and carrying it over rather than re-deriving it is the same
+re-address the result. That mechanic carries no numeric decision of its own -- it is just
+how a crosswalk join is expressed in Polars -- and carrying it over rather than re-deriving it is the same
 move `execution/long_ops.py` makes for its own four lowerings.
 
 **What is NOT carried over, on purpose: the per-aggregate weighting.** The old engine

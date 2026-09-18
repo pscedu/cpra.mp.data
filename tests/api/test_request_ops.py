@@ -133,7 +133,7 @@ class TestSpatialFilterKeepsGridKind:
     """
 
     def test_accepts_spatial_filter_then_project_vector_to_raster_to_tif(self):
-        """The deliberate ACCEPT case spec calls out: `filter(grid_cell)` on a vector
+        """The deliberate ACCEPT case: `filter(grid_cell)` on a vector
         input, then `project` vector-to-raster, sinks to `tif` -- must not be caught by
         the sink's long-shape-under-raster-format rule, since the spatial filter turns
         the frame long before the project turns it band-wide again."""
@@ -212,7 +212,7 @@ class TestCountByValue:
 
 
 class TestCountByValueCalculateOrdering:
-    """Spec explicitly calls out that there is NO rejection of `count_by_value` combined
+    """There is deliberately NO rejection of `count_by_value` combined
     with `calculate` in either order -- both orderings must pass full shape typing, not
     merely structural parsing (see `test_request_pipeline.py::TestCalculateStep` for the
     structural-only counterparts of these two)."""

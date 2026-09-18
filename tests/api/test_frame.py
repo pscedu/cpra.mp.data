@@ -64,7 +64,7 @@ class TestBandColumnNames:
 
 
 # ----------------------------------------------------------------------------------
-# extra_columns validation (spec 4.3's positional-name rejection)
+# extra_columns validation (a non-band column may not take a positional band name)
 # ----------------------------------------------------------------------------------
 
 

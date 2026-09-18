@@ -1,6 +1,6 @@
 """The vector scan: `scan_vector`, this module's only export, opens one input's Parquet
 dataset as a long `pl.LazyFrame` -- dimension columns, `grid_cell`, `value`, one row per
-observation (spec's vector row model).
+observation (the long row model -- see `execution/frame.py`).
 
 `request.pipeline.InputSelection` names a dataset (`variable`/`time_unit`/`grid`); it does
 not filter one -- see that model's own docstring. This scan takes exactly that much and

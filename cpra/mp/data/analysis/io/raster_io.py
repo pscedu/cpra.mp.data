@@ -1,5 +1,6 @@
 """Analysis-layer helpers (the former api/utils.py, HTTP-free half). Nothing here may import FastAPI."""
 import asyncio
+import itertools
 import math
 from enum import Enum
 from functools import wraps
@@ -266,6 +267,28 @@ def group_rows_by_path(df):
     row_indices = [row_indices_by_path[path] for path in order]
     bands = [bands_by_path[path] if has_bands else None for path in order]
     return order, row_indices, bands
+
+
+def batched_windows(src, blocks_per_batch):
+    """Window unions over one block row at a time, chunked to `blocks_per_batch` blocks.
+
+    Adapted from `sources.py`'s private `_batched_windows` (the old engine's identical
+    windowing logic, left in place there for the old engine to keep using until it is
+    retired) -- this is the copy the VRT-based raster scan (`io/raster.py`) reads its
+    batch boundaries from, so a request over a large raster still bounds its per-batch
+    buffer the same way rather than unioning a whole block row (tens of thousands of
+    pixels wide regardless of how much data a request needs) into one batch.
+
+    `src.block_windows(1)` reads band 1's own block layout as the batching reference --
+    every band of a co-registered raster covers the same ground, so which band's block
+    grid is walked does not change which pixels a batch covers, only the chunk boundaries
+    it happens to fall on.
+    """
+    groups = itertools.groupby(src.block_windows(1), key=lambda bw: bw[0][0])
+    for _row, group in groups:
+        row_windows = [w for _ji, w in group]
+        for i in range(0, len(row_windows), blocks_per_batch):
+            yield windows.union(*row_windows[i : i + blocks_per_batch])
 
 
 #: The CRS every map tile is rendered in.

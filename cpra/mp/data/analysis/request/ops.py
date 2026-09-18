@@ -2,7 +2,7 @@
 `CalculateOp`/`GroupOp`, exactly the five ops `pipeline.py`'s `Step` union already names
 -- plus `compile_ops`, which turns an already-validated `Pipeline` into `list[Op]` **in
 declared order**, and `validate_shapes`, which types every input/step's shape (`long` or
-`band_wide`) and rejects the combinations spec'd as illegal.
+`band_wide`) and rejects the combinations that have no meaning (enumerated below).
 
 **Shape-agnostic at the interface.** An `Op` carries only what the pipeline DECLARED: a
 `project`'s target grid, a `filter`'s predicate, a `calculate`'s expression, a `group`'s
@@ -22,8 +22,8 @@ column at the sink, a second `count_by_value` in one chain) with no IO at all.
 **Why this lives here, and not in `pipeline.py`.** `compile_ops`/`validate_shapes` both
 need `Pipeline`/`Step` from `pipeline.py`; `pipeline.py` cannot import this module back
 without a cycle. `validate_pipeline` (`pipeline.py`) and `validate_shapes` (here) are
-therefore two functions, in two modules, implementing what spec calls one VALIDATE stage:
-a `Pipeline` needs both calls -- `pipeline.parse_pipeline(data)` then
+therefore two halves of one validation step, split across two modules only to break that
+cycle: a `Pipeline` needs both calls -- `pipeline.parse_pipeline(data)` then
 `ops.validate_shapes(pipeline)` -- before anything executes it.
 
 `validate_shapes` itself runs `compile_ops` first, so that the shape walk sees resolved

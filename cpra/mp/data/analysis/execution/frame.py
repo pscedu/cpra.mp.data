@@ -49,8 +49,9 @@ instead of falling into that hole by accident:
   column reserved for exactly this: it holds each surviving band's position, so the
   metadata frame's height keeps meaning something even when no dimension column does.
   `drop_reserved_band_index` removes it again before metadata reaches anything outside
-  the walk -- it is exactly the same kind of stored positional index invariant 1 forbids
-  everywhere else, tolerated here only as long as it never escapes.
+  the walk -- it is exactly the same kind of stored positional index the no-retained-row-
+  index rule above forbids everywhere else, tolerated here only as long as it never
+  escapes.
 
 Everything in this module is pure Polars: no file is opened, no raster is read, no
 request is parsed. Three names it re-exports are defined elsewhere and imported rather
