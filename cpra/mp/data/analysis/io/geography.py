@@ -9,6 +9,7 @@ raise is an `AnalysisError` instead.
 """
 
 import asyncio
+import math
 
 import pyogrio
 
@@ -16,11 +17,12 @@ import pyogrio
 # the only handle on the failure PROJ reports for an unprojectable point.
 from rasterio._err import CPLE_BaseError
 from rasterio.crs import CRS
-from rasterio.warp import transform
+from rasterio.warp import transform, transform_bounds
 from shapely.geometry import Point
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.base import AnalysisError
+from cpra.mp.data.grids import GRIDS
 
 
 def parse_coordinate_pairs(values):
@@ -103,6 +105,45 @@ def _geometry_path(grid_name: str):
     if not fgb_path.exists():
         raise AnalysisError(f"No geometry file for grid: {grid_name}", status_code=400)
     return fgb_path
+
+
+def straddling_feature_bounds(grid_name: str, tile_bounds, tile_crs) -> tuple[float, float, float, float] | None:
+    """Bounding box, in `grid_name`'s OWN crs (`cpra.mp.data.grids.GRIDS[grid_name].crs`),
+    of every feature in that vector grid's `.fgb` whose bounding box the tile footprint
+    (`tile_bounds`, expressed in `tile_crs` -- Web Mercator for every map tile) overlaps at
+    all, not just the part of each feature that falls inside the tile.
+
+    Called from `io.raster_io.tile_source_window` when `execution.plan.compile_plan` has
+    determined that the raster being read feeds a raster-to-vector `project` step onto
+    `grid_name`: that step joins each raster pixel to whichever polygon it falls inside on
+    the OUTPUT grid, and a polygon can extend past a tile's own edge, so a raster read
+    clipped to the tile's footprint alone would silently drop the pixels on the far side of
+    a straddling polygon before the join ever sees them. Returning the union of every
+    touched feature's own bounding box -- not an exact per-feature geometry test -- is
+    deliberately generous: `tile_source_window` reads a few extra source pixels around a
+    feature whose bounding box merely brushes the tile without the polygon itself doing so,
+    which costs nothing but a slightly larger read, rather than risking the opposite.
+
+    `bbox=` is pyogrio's own R-tree prefilter (the same mechanism `_resolve_point` uses for
+    a single point) -- a bounding-box overlap test, which is exactly the union this function
+    returns, so no further exact-geometry check narrows the candidate set the way
+    `_resolve_point`'s `.contains()` does for a point-in-polygon answer.
+
+    Returns `None` when the tile's footprint does not reproject to a finite bounding box in
+    `grid_name`'s crs, or when no feature's bounding box overlaps it -- the same "nothing to
+    add" convention `tile_source_window` uses for its own window.
+    """
+    fgb_path = _geometry_path(grid_name)
+    grid_crs = GRIDS[grid_name].crs
+    grid_bounds = transform_bounds(tile_crs, grid_crs, *tile_bounds, densify_pts=21)
+    if not all(math.isfinite(value) for value in grid_bounds):
+        return None
+
+    features = pyogrio.read_dataframe(fgb_path, bbox=grid_bounds, columns=["id"])
+    if features.empty:
+        return None
+    minx, miny, maxx, maxy = features.total_bounds
+    return (float(minx), float(miny), float(maxx), float(maxy))
 
 
 def _projected_points(grid_name: str, lngs: list[float], lats: list[float]):

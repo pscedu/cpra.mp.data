@@ -136,6 +136,47 @@ only to WHERE that filter sits in the declared chain and to no longer tracking o
 validity for that origin past it (per the table above, a spatial filter turns a band-wide
 frame long, so anything after it addresses a different, already-materialized frame).
 
+**Overview eligibility is a per-raster-SOURCE property, decided here rather than wherever
+the read happens.** A tile read is free to let GDAL serve a decimated window from a raster's
+own pyramid (`io.raster_io.tile_read_shape`) whenever the read feeds nothing but per-pixel
+operations -- every overview level is a real, precomputed downsample, so which one gets
+picked changes only how coarse the answer is, never which source pixel a per-pixel result
+traces to. Two things make that unsafe:
+
+* A raster-to-vector `project` step redistributes pixels onto polygons that can be smaller
+  than one overview pixel at a coarse level, or straddle a boundary an overview blurs
+  across -- the join has to see the FULL-resolution pixels a polygon actually covers, not
+  whichever overview happened to be near the tile's own resolution. `straddling_vector_grid`
+  records, per raster origin, the OUTPUT vector grid such a step (reachable from that
+  origin via ANY `ops` entry, not only ones pushdown validity survived to -- see the
+  provenance paragraph above on why `origin_sets` rather than `states` is what this reads)
+  targets, or `None` if none does; `overview_permitted` is unconditionally `False` whenever
+  it is not `None`.
+* A point sample (`point_sample_step`, above) reads exactly the pixel under a coordinate --
+  an overview's decimated grid can hand back a neighbouring pixel's value instead of the
+  one actually asked for. `overview_permitted` is `False` for any origin with a
+  `point_sample_step`, for the same reason.
+
+Every other raster origin -- including one whose pixels are later joined (not projected)
+onto a vector chain, e.g. a vector-to-vector crosswalk aggregate joined with a raster for
+display -- keeps `overview_permitted` at its default `True`: a `join` is not a `project`,
+so it never appears in `straddling_vector_grid`, and nothing about attaching a raster's
+already-resolved pixel values to a vector chain's rows demands full resolution the way
+redistributing the pixels themselves onto new polygons does.
+
+Both fields are DECISIONS this module records, and only one of them currently has anywhere
+to go: `straddling_vector_grid` is exactly what `io.raster_io.tile_source_window` takes as
+its own argument of that name, while `overview_permitted` has no reader at all -- the call
+it would gate is `io.raster_io.tile_read_shape`, which neither takes it nor consults it,
+and no tile read in this package passes either field, because no tile route is mounted on
+this package yet. So the rule is computed and asserted (`tests/api/test_execution_plan.py`)
+but not yet ENFORCED anywhere, and an `overview_permitted=False` origin would today be
+decimated like any other. Whoever mounts the tile route owns closing that: pass
+`straddling_vector_grid` through, and skip `tile_read_shape` entirely for an origin whose
+`overview_permitted` is `False`. Recorded here rather than left to be noticed, because a
+field that is written, tested, and never read looks from the outside exactly like a field
+that is working.
+
 **Band enumeration and its ceiling.** Every raster origin gets `io.catalog.
 resolve_raster_bands` called on it exactly once, narrowed by whatever dimension predicates
 survived pushdown, then checked against `cpra.mp.data.config.ANALYSIS_BAND_CEILING`
@@ -204,12 +245,17 @@ class ResolvedInput:
 
     `columns`/`predicate` are what `io.vector.scan_vector` accepts, populated only for an
     input on a vector grid -- see the module docstring for exactly when each is non-`None`.
-    `band_metadata`/`point_sample_step` are the raster-side counterpart, populated only for
-    an input on a raster grid: `band_metadata` is `io.catalog.resolve_raster_bands`'s
-    result, narrowed by every dimension predicate pushdown allowed through, and
-    `point_sample_step` is the step number of the first spatial filter reached while this
-    origin was still band-wide (`None` if none was). An input's grid kind decides which
-    pair of fields is populated; the other pair is left at its default.
+    `band_metadata`/`point_sample_step`/`straddling_vector_grid`/`overview_permitted` are
+    the raster-side counterpart, populated only for an input on a raster grid:
+    `band_metadata` is `io.catalog.resolve_raster_bands`'s result, narrowed by every
+    dimension predicate pushdown allowed through, and `point_sample_step` is the step
+    number of the first spatial filter reached while this origin was still band-wide
+    (`None` if none was). `straddling_vector_grid` is the name of the vector grid this
+    origin's pixels get redistributed onto, if any `ops` entry ever runs a raster-to-vector
+    `project` step reachable from this origin (`None` otherwise) -- see the module
+    docstring's paragraph on overview eligibility for what it and `overview_permitted` are
+    for and how they are derived. An input's grid kind decides which group of fields is
+    populated; the other group is left at its default.
     """
 
     selection: InputSelection
@@ -218,6 +264,8 @@ class ResolvedInput:
     # polars into every reader of this dataclass's annotations.
     band_metadata: object | None = None  # `pl.DataFrame | None`; same reasoning.
     point_sample_step: int | None = None
+    straddling_vector_grid: str | None = None
+    overview_permitted: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -427,13 +475,34 @@ def compile_plan(pipeline: Pipeline, *, base_path=None) -> ExecutionPlan:
                 f"{ANALYSIS_BAND_CEILING} -- see cpra.mp.data.config.ANALYSIS_BAND_CEILING"
             )
 
+    # Overview eligibility (module docstring): which raster origins a `project` step ever
+    # redistributes onto a vector grid. A second, narrower pass over `ops` rather than part
+    # of the walk above -- it only needs `origin_sets`/`frame_types`, both already fully
+    # populated by every op regardless of whether pushdown validity survived to reach it,
+    # which is exactly what this has to ignore (a raster origin that fed a `project` before
+    # its own validity was invalidated by an earlier fan-out still needs full-resolution
+    # reads at that `project`).
+    straddling_vector_grid: dict[str, str] = {}
+    for op in ops:
+        if not isinstance(op, ProjectOp):
+            continue
+        from_kind, to_kind = project_direction(frame_types[op.input], op.to)
+        if from_kind != "raster" or to_kind != "vector":
+            continue
+        for origin in origin_sets[op.input]:
+            if origin_kind[origin] == "raster":
+                straddling_vector_grid.setdefault(origin, op.to)
+
     inputs: dict[str, ResolvedInput] = {}
     for name, selection in pipeline.inputs.items():
         if origin_kind[name] == "raster":
+            target = straddling_vector_grid.get(name)
             inputs[name] = ResolvedInput(
                 selection=selection,
                 band_metadata=raster_band_metadata[name],
                 point_sample_step=point_sample_step.get(name),
+                straddling_vector_grid=target,
+                overview_permitted=target is None and name not in point_sample_step,
             )
         else:
             predicate = None

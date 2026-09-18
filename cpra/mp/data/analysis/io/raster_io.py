@@ -26,6 +26,7 @@ from cpra.mp.data.config import (
     RASTER_SWATH_SIZE_MB,
 )
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.grids import GRIDS
 
 RASTER_COMPRESSION_ALGORITHMS = [
     CompressionAlgorithm.deflate,
@@ -301,8 +302,63 @@ TILE_CRS = "EPSG:3857"
 #: pixel would do, and a larger margin costs only the extra pixels read.
 TILE_READ_BUFFER_PX = 4
 
+#: Half-width, in source pixels, that each resampling kernel actually samples around a
+#: source location -- 0 for nearest (the single pixel the rounded coordinate lands on), 1
+#: for a 2x2 bilinear kernel, 2 for a 4x4 cubic/cubic-spline kernel, 3 for lanczos's
+#: windowed-sinc kernel. These are GDAL's own kernel definitions, not this module's choice.
+_RESAMPLING_KERNEL_RADIUS_PX = {
+    Resampling.nearest: 0,
+    Resampling.bilinear: 1,
+    Resampling.cubic: 2,
+    Resampling.cubic_spline: 2,
+    Resampling.lanczos: 3,
+}
 
-def tile_source_window(src, tile_bounds, buffer_px=TILE_READ_BUFFER_PX):
+
+def resampling_buffer_px(resampling):
+    """Source pixels `tile_source_window` should read around a tile's footprint for
+    `resampling`, so the later warp has whole neighbouring pixels to sample at the tile's
+    edge rather than running off the end of the buffer it was handed.
+
+    `TILE_READ_BUFFER_PX` (4) is this module's original, `Resampling.nearest`-only buffer,
+    measured against `tile_source_window`'s callers before `resampling` existed as a
+    parameter -- nearest only ever needs the single pixel a rounded coordinate lands on, so
+    all 4 of those pixels are rounding margin rather than kernel radius. Every other
+    resampling method needs that same rounding margin PLUS its own kernel's half-width, so
+    this adds the kernel radius on top of the margin instead of replacing it:
+    `resampling_buffer_px(Resampling.nearest) == TILE_READ_BUFFER_PX` exactly, which is what
+    keeps a `tile_source_window` call that never mentions `resampling` at all unchanged from
+    before this function existed.
+
+    **The radius is in SOURCE pixels, so it is only sufficient where the warp does not
+    DOWNSAMPLE**, and that limit is measured rather than assumed -- a 2176x2176 10 m source
+    swept over a 3x3 tile neighbourhood, derived buffer against a generous 20 px one, is
+    byte-identical at a tile resolution of 8.3 m (0.8x, upsampling: 0 of 589,824 pixels
+    differ) and disagrees at essentially every pixel one zoom lower, at 16.6 m (1.7x,
+    downsampling: 583,033 of 589,824) -- while `Resampling.nearest` over those same windows,
+    at that same zoom and decimation factor, disagrees at 0. Only the kernel differs between
+    those two numbers, which is what identifies the cause: a warp that downsamples by `r`
+    draws each destination pixel from roughly `r` source pixels per kernel tap, so the margin
+    an `r`-times-coarser destination needs is about `radius * r` source pixels, not `radius`.
+
+    Nothing corrects for that here, because this function is not given the ratio -- it sees
+    neither the tile's pixel size nor `tile_size`, only `resampling`. Supplying it is what a
+    caller wanting a non-nearest tile would have to add, and the ratio is not incidental:
+    `TILE_READ_OVERSAMPLE` deliberately holds a decimated read about 2x finer than the tile
+    grid, so every decimated tile warps at `r` near 2 by construction. `Resampling.nearest`
+    is unaffected at any ratio (radius 0, nothing to sample around), which is why the tile
+    path is correct today at the one value it actually uses.
+    """
+    try:
+        radius = _RESAMPLING_KERNEL_RADIUS_PX[resampling]
+    except KeyError:
+        raise ValueError(f"resampling_buffer_px: unsupported resampling method {resampling!r}")
+    return TILE_READ_BUFFER_PX + radius
+
+
+def tile_source_window(
+    src, tile_bounds, buffer_px=None, resampling=Resampling.nearest, straddling_vector_grid=None
+):
     """The window of `src` (in its OWN CRS) covering the Web Mercator `tile_bounds`, as
     whole source pixels clipped to the source's extent -- or `None` when the tile's
     footprint lands entirely outside the source.
@@ -326,10 +382,60 @@ def tile_source_window(src, tile_bounds, buffer_px=TILE_READ_BUFFER_PX):
     the footprint). A tile large enough that its reprojection is not finite at all -- a
     whole-world tile at low zoom, say -- falls back to the source's full extent, which is
     the smallest window that certainly contains the footprint.
+
+    `buffer_px`, when not given explicitly, is derived from `resampling`
+    (`resampling_buffer_px`) rather than defaulting to `TILE_READ_BUFFER_PX` outright -- see
+    that function for why the two agree exactly when `resampling` is left at its own
+    `Resampling.nearest` default.
+
+    `straddling_vector_grid`, when given, is the name of a vector grid that `execution.plan.
+    compile_plan` has determined this source feeds a raster-to-vector `project` step onto --
+    this function does not derive that itself, only acts on the answer. When given, the
+    window is widened to also cover every feature of that grid the tile touches at all (not
+    only the part of each feature inside the tile), via `io.geography.
+    straddling_feature_bounds`. Three CRSs are in play for that widening: the tile's own
+    Web Mercator grid (`TILE_CRS`), `straddling_vector_grid`'s OWN crs (what
+    `straddling_feature_bounds` returns its bounds in), and `src.crs` (what this function's
+    return value is ultimately expressed in) -- a raster-to-vector `project` step joins each
+    pixel to whichever polygon it falls inside on the OUTPUT grid, and that polygon can
+    extend past the tile's own edge, so a read clipped to the tile's footprint alone would
+    silently drop the pixels on the far side of a straddling polygon before the join ever
+    sees them.
     """
+    # CRS #1 (this tile's own grid, Web Mercator, `TILE_CRS`) -> CRS #2 (`src`'s own crs):
+    # the tile's pixel-accurate footprint in the source's own georeferencing.
     src_bounds = transform_bounds(TILE_CRS, src.crs, *tile_bounds, densify_pts=21)
     if not all(math.isfinite(value) for value in src_bounds):
         return windows.Window(0, 0, src.width, src.height)
+
+    if straddling_vector_grid is not None:
+        # Local import: avoids the `cpra.mp.data.analysis.base` <-> `.io.raster_io` import
+        # cycle this module's other local imports (`unpack_values`, `get_lazy_frame`) work
+        # around too -- `io.geography` imports `AnalysisError` from `base` at module scope,
+        # and `base` imports this module at module scope, so importing `io.geography` at
+        # THIS module's top level would close the cycle before `AnalysisError` is defined.
+        from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
+
+        # CRS #1 -> CRS #3 (`straddling_vector_grid`'s OWN crs, read inside
+        # `straddling_feature_bounds` itself): the whole footprint of every feature the tile
+        # touches at all, not just the part already inside the tile.
+        feature_bounds = straddling_feature_bounds(straddling_vector_grid, tile_bounds, TILE_CRS)
+        if feature_bounds is not None:
+            # CRS #3 -> CRS #2: reproject that footprint into the same source crs
+            # `src_bounds` above is already expressed in, so the two can be unioned.
+            feature_src_bounds = transform_bounds(
+                GRIDS[straddling_vector_grid].crs, src.crs, *feature_bounds, densify_pts=21
+            )
+            if all(math.isfinite(value) for value in feature_src_bounds):
+                src_bounds = (
+                    min(src_bounds[0], feature_src_bounds[0]),
+                    min(src_bounds[1], feature_src_bounds[1]),
+                    max(src_bounds[2], feature_src_bounds[2]),
+                    max(src_bounds[3], feature_src_bounds[3]),
+                )
+
+    if buffer_px is None:
+        buffer_px = resampling_buffer_px(resampling)
 
     window = windows.from_bounds(*src_bounds, transform=src.transform)
     col_off = max(0, math.floor(window.col_off) - buffer_px)
@@ -418,7 +524,7 @@ def tile_read_shape(window, tile_size, buffer_px=TILE_READ_BUFFER_PX, oversample
     return (max(1, int(window.height) // height_factor), max(1, int(window.width) // width_factor))
 
 
-def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata):
+def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata, resampling=Resampling.nearest):
     """Warp `data` (a ``(bands, height, width)`` array georeferenced by `array_transform`
     in `src_crs`) onto a tile's own Web Mercator pixel grid, through an in-memory dataset.
 
@@ -428,8 +534,10 @@ def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, 
     (`tests/api/test_tile_warp.py`'s control).
 
     The warp targets the tile grid directly -- explicit `transform`/`width`/`height`, no
-    intermediate output grid -- and `Resampling.nearest` keeps every rendered pixel a real
-    source pixel value rather than a blend of several.
+    intermediate output grid. `resampling` defaults to `Resampling.nearest`, which keeps
+    every rendered pixel a real source pixel value rather than a blend of several; a caller
+    that passes anything else is opting into a blend, and is the one responsible for
+    widening the read (`resampling_buffer_px`, via `tile_source_window`) to match.
     """
     tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
     count, height, width = data.shape
@@ -459,12 +567,23 @@ def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, 
                 src_nodata=nodata,
                 add_alpha=False,
                 dtype=dtype,
-                resampling=Resampling.nearest,
+                resampling=resampling,
             ) as vrt:
                 return vrt.read()
 
 
-def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, tile_size, nodata, out_shape=None):
+def warp_window_to_tile(
+    data,
+    *,
+    window,
+    src_transform,
+    src_crs,
+    tile_bounds,
+    tile_size,
+    nodata,
+    out_shape=None,
+    resampling=Resampling.nearest,
+):
     """Warp one window's worth of per-pixel results onto a tile's pixel grid.
 
     `data` is whatever a caller computed over the pixels of `window`, still in the source
@@ -485,6 +604,11 @@ def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, ti
 
     The shape check below is the mechanical half of the same guarantee -- an array that
     matches neither the window nor the shape it was decimated to cannot reach the warp.
+
+    `resampling` defaults to `Resampling.nearest`, forwarded to `_warp_array_to_tile`
+    unchanged -- the buffer `window` was read with has to have been sized for whatever
+    `resampling` is passed here (`resampling_buffer_px`, via `tile_source_window`), which is
+    the caller's responsibility, not this function's; it only carries the choice through.
     """
     expected = tuple(out_shape) if out_shape is not None else (window.height, window.width)
     if tuple(data.shape[-2:]) != expected:
@@ -496,7 +620,7 @@ def warp_window_to_tile(data, *, window, src_transform, src_crs, tile_bounds, ti
     array_transform = windows.transform(window, src_transform)
     if out_shape is not None:
         array_transform *= Affine.scale(window.width / expected[1], window.height / expected[0])
-    return _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata)
+    return _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata, resampling=resampling)
 
 
 def _read_window(dataset, window, out_shape=None, resampling=Resampling.nearest, indexes=None, use_gdal_env=False):

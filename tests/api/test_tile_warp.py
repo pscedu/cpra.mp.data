@@ -26,13 +26,12 @@ present:
 
 import math
 from contextlib import ExitStack
-from io import BytesIO
 
 import mercantile
 import numpy as np
+import polars as pl
 import pytest
 import rasterio as rio
-from PIL import Image
 from rasterio import windows
 from rasterio.coords import BoundingBox
 from rasterio.enums import Resampling
@@ -41,19 +40,27 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data.analysis import raster as raster_module
+from cpra.mp.data.analysis.execution.band_ops import group_band_wide
 from cpra.mp.data.analysis.io import raster_io as utils_module
+from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
+from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
+from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import (
     TILE_CRS,
     TILE_READ_BUFFER_PX,
     TILE_READ_OVERSAMPLE,
+    _axis_decimation_factor,
     _warp_array_to_tile,
-    group_rows_by_path,
+    resampling_buffer_px,
     tile_read_shape,
     tile_source_window,
     warp_window_to_tile,
 )
+from cpra.mp.data.analysis.io.window import ReadWindow
+from cpra.mp.data.analysis.request.ops import GroupOp
+from cpra.mp.data.analysis.request.pipeline import InputSelection
 from cpra.mp.data.grids import GRIDS
-from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
+from tests.factories import RASTER_KWARGS, raster_array, write_grid_geometry, write_raster_dataset
 
 DIMENSIONS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 GRID = GRIDS[RASTER_KWARGS["grid"]]
@@ -232,40 +239,6 @@ def _window_then_warp_padded(src, tile_bounds, buffer_px=TILE_READ_BUFFER_PX):
         tile_size=TILE_SIZE,
         nodata=NODATA,
     )[0]
-
-
-async def _warp_first_then_collapse(dataset, tile_bounds, tile_size):
-    """The pre-port band order: one `WarpedVRT` per source onto the tile's pixel grid, then
-    `_collapse_tile_bands` over the warped TILE pixels.
-
-    The collapse itself is the production method -- only the order changes -- so a
-    difference between this and `get_tile` can only come from where the reprojection sits.
-    """
-    df = dataset._band_frame()
-    unique_paths, row_indices, bands = group_rows_by_path(df)
-    tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
-    with ExitStack() as stack:
-        inputs = [stack.enter_context(rio.open(path)) for path in unique_paths]
-        nodata = inputs[0].nodata if inputs[0].nodata is not None else NODATA
-        vrts = [
-            stack.enter_context(
-                WarpedVRT(
-                    source,
-                    crs=TILE_CRS,
-                    transform=tile_transform,
-                    width=tile_size,
-                    height=tile_size,
-                    nodata=nodata,
-                    add_alpha=False,
-                    src_nodata=nodata,
-                    dtype=source.dtypes[0],
-                    resampling=Resampling.nearest,
-                )
-            )
-            for source in inputs
-        ]
-        data = await dataset._read_raster_bands(df, vrts, row_indices, bands, None)
-        return dataset._collapse_tile_bands(df, data, nodata)
 
 
 def _score(reference, candidate):
@@ -598,6 +571,28 @@ class TestDecimatedTileReads:
 
         assert identical_tiles >= 20, f"only {identical_tiles} tiles read whole -- nothing was compared"
 
+    def test_a_sliver_window_decimates_only_its_long_axis(self):
+        """A hand-computed regression for the property `tile_read_shape`'s own docstring
+        names directly: "a single factor taken from the shorter axis would leave the read
+        unbounded on the longer one". A window thin on one axis and long on the other --
+        exactly what a tile straddling the source's own edge produces, per that same
+        docstring -- must decimate only the long axis; nothing in `wide_unique_pixel_raster`
+        (square, so both axes are always the same length) can exercise that asymmetry at
+        all, which is why this is a direct, fixture-free unit test on the function instead.
+
+        `target = TILE_READ_OVERSAMPLE * (TILE_SIZE + 2 * TILE_READ_BUFFER_PX)` = ``2 * (256
+        + 8)`` = 528 pixels. The short axis (100px) is already under that, so
+        `_axis_decimation_factor` returns 1 (read whole) for it. The long axis (3000px)
+        gives ``ratio = 3000 // 528 = 5``, and the largest power of two at or below 5 is 4
+        (``1 << (5.bit_length() - 1)`` = ``1 << 2``) -- so it decimates by 4, to
+        ``3000 // 4 = 750``.
+        """
+        window = windows.Window(col_off=0, row_off=0, width=3000, height=100)
+
+        assert _axis_decimation_factor(window.height, 528) == 1
+        assert _axis_decimation_factor(window.width, 528) == 4
+        assert tile_read_shape(window, TILE_SIZE) == (100, 750)
+
 
 class TestWarpWindowToTileRejectsAMismatchedWindow:
     """`warp_window_to_tile` derives the warp's georeferencing from the window it is given,
@@ -630,8 +625,19 @@ class TestTileSourceWindow:
             assert tile_source_window(src, _tile_bounds(mercantile.Tile(1, 3, 2))) is None
 
     def test_a_whole_world_tile_falls_back_to_the_full_extent(self, unique_pixel_raster):
-        """z=0 covers the whole planet, most of which has no finite position in a UTM zone.
-        The fallback reads everything rather than failing on an infinite bound."""
+        """z=0 covers the whole planet, and the window still has to come back as the
+        source's own extent rather than something larger or an error.
+
+        It gets there by CLIPPING, not by the non-finite fallback, and the distinction is
+        worth stating because the name suggests otherwise: this PROJ reprojects the whole
+        Web Mercator world into `epsg:26915` as finite (if enormous) bounds -- it clamps
+        out-of-domain coordinates rather than returning an infinity -- so the window is
+        simply bigger than the source on every side and the clip to `src.width`/`src.height`
+        is what produces the assertion below. `tile_source_window`'s `math.isfinite` guard is
+        a belt-and-braces path for a CRS pair or PROJ build where that clamping does not
+        happen; nothing in this suite reaches it, and it is deliberately kept rather than
+        deleted on the strength of one PROJ version's behaviour.
+        """
         with rio.open(unique_pixel_raster) as src:
             window = tile_source_window(src, _tile_bounds(mercantile.Tile(0, 0, 0)))
             assert (window.col_off, window.row_off) == (0, 0)
@@ -647,15 +653,419 @@ class TestTileSourceWindow:
             assert window.row_off + window.height <= src.height
 
 
+class TestStraddlingFeatureWidensTheWindow:
+    """A raster feeding a raster-to-vector `project` has to read past its tile's own
+    footprint when a polygon on the OUTPUT grid straddles the tile edge -- the join needs
+    every pixel under that polygon, including the part on the far side of the tile
+    boundary, or those pixels are silently missing from the aggregate. `compile_plan`
+    decides whether a given raster origin feeds such a project (`TestOverviewEligibility`'s
+    sibling detection pass, in `test_execution_plan.py`, covers that decision); this class
+    covers what `tile_source_window` does once told the answer is yes -- three CRSs
+    involved, named explicitly rather than left implicit: #1 the tile's own bounds, always
+    Web Mercator; #2 the raster source's CRS; #3 the vector grid's own CRS, which is a
+    DIFFERENT grid than the raster source's (`hydro_compartment_v001`, not
+    `veg_grid_cell_v001`) even though the current registry happens to give every grid the
+    same crs (epsg:26915) -- so this test cannot distinguish "reprojected correctly" from
+    "never reprojected at all". `TestTileSourceWindow` and `TestResamplingBufferSizing`
+    above already cover CRS #1 -> #2 on its own; nothing here re-proves that step, only the
+    union straddling adds on top of it.
+    """
+
+    def test_a_feature_extending_past_the_tile_widens_the_window(self, unique_pixel_raster, geometry_path):
+        from shapely.geometry import box
+
+        with rio.open(unique_pixel_raster) as src:
+            bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
+            plain_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
+
+            # Independently re-derive the tile's footprint in the raster's own CRS (CRS #1
+            # -> CRS #2) -- the same reprojection `tile_source_window` itself performs, but
+            # recomputed here directly rather than trusted, so this test's expectation
+            # doesn't depend on that step's own correctness.
+            src_bounds = transform_bounds(TILE_CRS, src.crs, *bounds, densify_pts=21)
+
+            # veg_grid_cell_v001's own pixels are exactly 480m square ((909670-404710) /
+            # 1052 == (3374680-3199480) / 365 == 480), so a feature bounding box built from
+            # a whole multiple of 480m lands on an exact pixel boundary -- the widened
+            # window's edge is then a single, exactly-predictable integer pixel count away
+            # from the plain one, not merely "some amount wider".
+            pixel_size = 480
+            extension_px = 3
+            extension = extension_px * pixel_size
+            feature = box(src_bounds[0] - extension, src_bounds[1], src_bounds[2], src_bounds[3])
+            write_grid_geometry(geometry_path, "hydro_compartment_v001", [(1, feature)])
+
+            widened_window = tile_source_window(
+                src, bounds, resampling=Resampling.nearest, straddling_vector_grid="hydro_compartment_v001"
+            )
+
+            # The feature only extends the WEST edge, so only the column offset/width move;
+            # the east edge and both row bounds are untouched, and move by exactly the
+            # extension in whole pixels -- not "wider", exactly 3 pixels wider.
+            assert widened_window.col_off == plain_window.col_off - extension_px
+            assert widened_window.width == plain_window.width + extension_px
+            assert widened_window.row_off == plain_window.row_off
+            assert widened_window.height == plain_window.height
+
+    def test_a_feature_nowhere_near_the_tile_leaves_the_window_unchanged(self, unique_pixel_raster, geometry_path):
+        """The control: a feature written to the same grid, but far from this tile, must
+        contribute nothing -- without this, a widened-window result above would not
+        distinguish "the union logic works" from "any feature at all widens the window"."""
+        from shapely.geometry import box
+
+        with rio.open(unique_pixel_raster) as src:
+            bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
+            plain_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
+
+            west, south, east, north = GRID.bounds
+            far_feature = box(west, south, west + 480, south + 480)
+            write_grid_geometry(geometry_path, "hydro_compartment_v001", [(1, far_feature)])
+
+            unchanged_window = tile_source_window(
+                src, bounds, resampling=Resampling.nearest, straddling_vector_grid="hydro_compartment_v001"
+            )
+
+            assert unchanged_window == plain_window
+
+    def test_no_grid_given_is_unaffected_by_any_geometry_file_present(self, unique_pixel_raster, geometry_path):
+        """`straddling_vector_grid=None` (the default -- every caller that never mentions
+        it, matching `resampling`'s own default-unchanged property above) must not even
+        look at a geometry file, regardless of what it contains."""
+        from shapely.geometry import box
+
+        with rio.open(unique_pixel_raster) as src:
+            bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
+            src_bounds = transform_bounds(TILE_CRS, src.crs, *bounds, densify_pts=21)
+            feature = box(src_bounds[0] - 1440, src_bounds[1], src_bounds[2], src_bounds[3])
+            write_grid_geometry(geometry_path, "hydro_compartment_v001", [(1, feature)])
+
+            no_grid_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
+            plain_window = tile_source_window(
+                src, bounds, resampling=Resampling.nearest, straddling_vector_grid=None
+            )
+
+            assert no_grid_window == plain_window
+
+
+def _window_then_warp_resampled(src, tile_bounds, resampling, buffer_px=None, decimate=False):
+    """`_window_then_warp`, with `resampling`/`buffer_px` threaded through instead of
+    hardcoding nearest -- the ported geometry as `resampling` becoming a real parameter
+    left it, through the production helpers and nothing else.
+
+    `decimate=True` additionally runs the read through `tile_read_shape` the way
+    `_window_then_warp_decimated` does, which is what a low-zoom tile actually gets; it is
+    off by default so the buffer differentials above stay full-resolution comparisons.
+    """
+    window = tile_source_window(src, tile_bounds, buffer_px=buffer_px, resampling=resampling)
+    if window is None:
+        return np.full((TILE_SIZE, TILE_SIZE), NODATA, dtype=src.dtypes[0])
+    out_shape = tile_read_shape(window, TILE_SIZE) if decimate else None
+    data = src.read(1, window=window, out_shape=out_shape)
+    return warp_window_to_tile(
+        data[np.newaxis, :, :],
+        window=window,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        tile_bounds=tile_bounds,
+        tile_size=TILE_SIZE,
+        nodata=NODATA,
+        resampling=resampling,
+        out_shape=out_shape,
+    )[0]
+
+
+class TestResamplingBufferSizing:
+    """resampling as a parameter, not a hardcoded `Resampling.nearest`: `tile_source_window`
+    has to read a wider buffer around a tile's footprint for a resampling method whose
+    kernel samples more than one pixel, or the warp runs off the edge of the array it was
+    given -- silently, since rasterio simply has no neighbour there to sample and the
+    output is a value, not an error.
+    """
+
+    def test_nearest_reproduces_the_original_buffer_exactly(self):
+        # The property that keeps every caller that never mentions `resampling` at all --
+        # every other test in this file among them -- byte-for-byte unchanged by this
+        # parameter existing.
+        assert resampling_buffer_px(Resampling.nearest) == TILE_READ_BUFFER_PX
+
+    @pytest.mark.parametrize(
+        "resampling,kernel_radius",
+        [
+            (Resampling.bilinear, 1),
+            (Resampling.cubic, 2),
+            (Resampling.cubic_spline, 2),
+            (Resampling.lanczos, 3),
+        ],
+    )
+    def test_every_other_resampling_adds_its_kernel_radius_on_top_of_the_original_margin(
+        self, resampling, kernel_radius
+    ):
+        assert resampling_buffer_px(resampling) == TILE_READ_BUFFER_PX + kernel_radius
+
+    def test_an_unsupported_resampling_method_is_rejected_rather_than_silently_underbuffered(self):
+        with pytest.raises(ValueError, match="unsupported resampling"):
+            resampling_buffer_px(Resampling.average)
+
+    def test_a_wider_kernel_widens_tile_source_windows_own_buffer(self, unique_pixel_raster):
+        """`tile_source_window`'s own contribution, one level below the warp: the window it
+        hands back for `Resampling.cubic` must be exactly `nearest`'s window widened by
+        cubic's own extra kernel radius (2px) on every side -- not merely "some amount
+        wider", which a bug that widened the wrong axis or only one side could still pass.
+        """
+        with rio.open(unique_pixel_raster) as src:
+            bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
+            nearest_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
+            cubic_window = tile_source_window(src, bounds, resampling=Resampling.cubic)
+
+            # Neither window may be touching the source's own extent, or the clip in
+            # `tile_source_window` (rather than the buffer difference under test) could be
+            # what's actually bounding one side -- `test_the_window_is_whole_pixels_inside_
+            # the_source` above already established z=12 at the grid centre is interior;
+            # this re-checks it explicitly rather than assuming it silently carries over.
+            assert nearest_window.col_off > 0 and nearest_window.row_off > 0
+            assert nearest_window.col_off + nearest_window.width < src.width
+            assert nearest_window.row_off + nearest_window.height < src.height
+
+            delta = resampling_buffer_px(Resampling.cubic) - resampling_buffer_px(Resampling.nearest)
+            assert delta == 2
+            assert cubic_window.col_off == nearest_window.col_off - delta
+            assert cubic_window.row_off == nearest_window.row_off - delta
+            assert cubic_window.width == nearest_window.width + 2 * delta
+            assert cubic_window.height == nearest_window.height + 2 * delta
+
+    def test_an_underbuffered_bilinear_read_diverges_from_a_generously_buffered_one_but_the_derived_buffer_does_not(
+        self, unique_pixel_raster
+    ):
+        """The differential proper, on rendered pixel VALUES rather than the window alone --
+        `Resampling.bilinear` blends a tile-edge pixel from its source neighbours, so a read
+        whose buffer is too narrow to contain them samples the wrong (or, at the array's own
+        edge, a nonexistent) neighbour instead, a sub-pixel value error nearest's own
+        differential above (`TestPortedTileGeometryMatchesTheWarpFirstOrder`) cannot see --
+        that one is byte-equality against a NEAREST reference, and bilinear disagrees with
+        nearest everywhere it blends, not just where the buffer runs short.
+
+        Measured empirically before this test was written (a 6-zoom, 3x3-tile sweep of
+        `unique_pixel_raster`, matching `_sweep`'s own footprint): a buffer of 0 disagreed
+        with a generously-buffered (20px) reference at 59,334 pixels; `resampling_buffer_px`'s
+        own derived buffer (5px for bilinear) disagreed at exactly 0.
+
+        SCOPE, and it is narrower than "the derived buffer is sufficient": every zoom
+        `_sweep` covers UPSAMPLES here. `veg_grid_cell_v001` is 480 m, and zooms 9 through 14
+        put a tile pixel at 265.6 m down to 8.3 m, all finer than the source, so this fixture
+        cannot reach the downsampling case at any zoom. The derived buffer is NOT sufficient
+        there -- `test_the_derived_buffer_is_not_sufficient_where_the_warp_downsamples` below
+        measures that boundary on a fixture that does reach it.
+        """
+        generous_disagreement = derived_disagreement = 0
+        with rio.open(unique_pixel_raster) as src:
+            for bounds, _reference in _sweep(src):
+                generous = _window_then_warp_resampled(src, bounds, Resampling.bilinear, buffer_px=20)
+                zero_buffered = _window_then_warp_resampled(src, bounds, Resampling.bilinear, buffer_px=0)
+                derived = _window_then_warp_resampled(src, bounds, Resampling.bilinear)  # buffer_px=None
+
+                both_zero = (generous != NODATA) & (zero_buffered != NODATA)
+                both_derived = (generous != NODATA) & (derived != NODATA)
+                generous_disagreement += int(((generous != zero_buffered) & both_zero).sum())
+                derived_disagreement += int(((generous != derived) & both_derived).sum())
+
+        # The control: without this, a derived_disagreement of 0 would prove nothing -- a
+        # differential that can never disagree with its own reference detects nothing.
+        assert generous_disagreement > 0, (
+            f"the control (buffer_px=0) disagreed with the generous reference at only "
+            f"{generous_disagreement} pixels -- this differential cannot detect an "
+            "under-sized buffer, so the result below is not evidence"
+        )
+        assert derived_disagreement == 0, (
+            f"{derived_disagreement} pixels rendered under resampling_buffer_px's own "
+            "derived buffer still disagree with the generously-buffered reference"
+        )
+
+    def test_the_derived_buffer_is_not_sufficient_where_the_warp_downsamples(
+        self, wide_unique_pixel_raster
+    ):
+        """The boundary of the property above, pinned as a measurement rather than left to
+        be discovered by whoever first renders a non-nearest tile at low zoom.
+
+        `resampling_buffer_px` sizes its kernel radius in SOURCE pixels, so it covers a warp
+        that upsamples and undercounts one that downsamples by `r` -- each destination pixel
+        then draws on roughly `r` source pixels per kernel tap. Two adjacent zooms on either
+        side of that line make the case without any appeal to the mechanism, since the only
+        thing that changes between them is the ratio:
+
+        * z=14 puts a tile pixel at 8.3 m against this fixture's 10 m source (0.8x, still
+          upsampling) -- the derived buffer agrees with a generous one exactly.
+        * z=13 is 16.6 m (1.7x, downsampling) -- essentially every rendered pixel moves.
+
+        `Resampling.nearest` over those same windows, at that same zoom and the same
+        decimation factor, is the control: radius 0 has nothing to sample around, so it must
+        be unaffected. It is, which is what makes the kernel -- rather than the window, the
+        decimation, or the georeferencing, all of which z=13 changes identically for both --
+        the thing being measured. That is also why `Resampling.nearest`, the only value the
+        tile path uses today, is correct at every zoom.
+        """
+        counts = {}
+        with rio.open(wide_unique_pixel_raster) as src:
+            for zoom in (13, 14):
+                for resampling in (Resampling.nearest, Resampling.bilinear):
+                    disagreement = compared = 0
+                    for bounds, _reference in _sweep(
+                        src, zooms=[zoom], centre_lon_lat=_wide_centre(src)
+                    ):
+                        derived = _window_then_warp_resampled(
+                            src, bounds, resampling, decimate=True
+                        )
+                        generous = _window_then_warp_resampled(
+                            src, bounds, resampling, buffer_px=20, decimate=True
+                        )
+                        both = (derived != NODATA) & (generous != NODATA)
+                        disagreement += int(((derived != generous) & both).sum())
+                        compared += int(both.sum())
+                    counts[(zoom, resampling)] = (disagreement, compared)
+
+        for (zoom, resampling), (_disagreement, compared) in counts.items():
+            assert compared > 100_000, (
+                f"z={zoom} {resampling.name} compared only {compared} pixels -- too few for "
+                "the counts below to mean anything"
+            )
+
+        # The control, both sides of the line: nearest has no kernel to run off the end of.
+        assert counts[(13, Resampling.nearest)][0] == 0
+        assert counts[(14, Resampling.nearest)][0] == 0
+
+        # Upsampling: the derived buffer is sufficient, matching the differential above.
+        assert counts[(14, Resampling.bilinear)][0] == 0
+
+        # Downsampling: it is not, and not marginally -- this is the known limitation
+        # `resampling_buffer_px`'s own docstring records, not a tolerance to be widened.
+        downsampled_disagreement, downsampled_compared = counts[(13, Resampling.bilinear)]
+        assert downsampled_disagreement > downsampled_compared // 2, (
+            f"only {downsampled_disagreement} of {downsampled_compared} pixels moved -- if "
+            "the derived buffer has become sufficient under a downsampling warp, this test "
+            "and resampling_buffer_px's docstring both need rewriting, not relaxing"
+        )
+
+
+def _resolve_metadata(dimensions, base_path):
+    """`InputSelection` -> `metadata_df`, the first new-module step any real tile read
+    starts from -- `io.catalog.resolve_raster_bands` against the sandboxed `base_path`,
+    never the real data tree.
+    """
+    return resolve_raster_bands(InputSelection(**dimensions), base_path=base_path)
+
+
+def _render_tile(dimensions, base_path, tile_bounds, *, tile_size=TILE_SIZE, aggregate=None):
+    """The new-module tile path end to end: resolve the dataset's bands, compute the
+    source window (via `utils_module.tile_source_window`, called by attribute so a spy
+    patched onto that module still takes effect here -- see the module-qualified-lookup
+    rule this suite relies on), scan exactly that window, optionally collapse it across
+    bands on SOURCE pixels, then warp the single surviving band onto the tile grid (via
+    `utils_module.warp_window_to_tile`, same reason).
+
+    This replaces the old `dataset_factory`/`RasterGridAnalysis.get_tile` path for this
+    file's tests: that path is delete-tier and must not be exercised here. Composed
+    entirely from `request`/`io`/`execution` primitives instead.
+    """
+    metadata_df = _resolve_metadata(dimensions, base_path)
+    with rio.open(metadata_df["path"][0]) as src:
+        window = utils_module.tile_source_window(src, tile_bounds)
+        if window is None:
+            return np.full((tile_size, tile_size), NODATA, dtype=np.int32)
+        src_transform = src.transform
+        src_crs = src.crs
+
+    band_wide = scan_raster(metadata_df, window=window)
+    if aggregate is not None:
+        band_wide = group_band_wide(
+            band_wide,
+            GroupOp(step_no=1, input="raster", by=[], aggregate=aggregate, output="collapsed"),
+            extra_columns=[],
+        )
+    lf, _metadata_out, read_window = band_wide
+    array = (
+        lf.select("b0")
+        .collect()
+        .get_column("b0")
+        .fill_null(NODATA)
+        .to_numpy()
+        .reshape(read_window.height, read_window.width)
+    )
+    return utils_module.warp_window_to_tile(
+        array[np.newaxis, :, :],
+        window=window,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        tile_bounds=tile_bounds,
+        tile_size=tile_size,
+        nodata=NODATA,
+    )[0]
+
+
+def _warp_first_then_collapse(metadata_df, tile_bounds, tile_size, aggregate):
+    """The OTHER order, as the reference side of the differential: warp every band onto
+    the tile grid FIRST (one `WarpedVRT` per source, `_warp_first`'s single-band shape
+    done once per band), and only then collapse across bands -- on TILE pixels rather than
+    source pixels, through the same `group_band_wide` lowering `_render_tile` uses, so the
+    aggregate itself is not what a mismatch would be measuring.
+    """
+    paths = metadata_df["path"].to_list()
+    tile_transform = from_bounds(*tile_bounds, tile_size, tile_size)
+    arrays = []
+    with ExitStack() as stack:
+        for path in paths:
+            source = stack.enter_context(rio.open(path))
+            vrt = stack.enter_context(
+                WarpedVRT(
+                    source,
+                    crs=TILE_CRS,
+                    transform=tile_transform,
+                    width=tile_size,
+                    height=tile_size,
+                    nodata=NODATA,
+                    src_nodata=NODATA,
+                    add_alpha=False,
+                    dtype=source.dtypes[0],
+                    resampling=Resampling.nearest,
+                )
+            )
+            arrays.append(vrt.read(1))
+
+    columns = {f"b{i}": arr.ravel() for i, arr in enumerate(arrays)}
+    lf = pl.DataFrame(columns).lazy().with_columns(
+        [pl.when(pl.col(name) == NODATA).then(None).otherwise(pl.col(name)).alias(name) for name in columns]
+    )
+    fake_window = ReadWindow(
+        source=tuple(paths),
+        col_off=0,
+        row_off=0,
+        width=tile_size,
+        height=tile_size,
+        transform=tile_transform,
+        crs=TILE_CRS,
+        decimation=1,
+        batch_layout=(),
+    )
+    collapsed_lf, _metadata_out, _window = group_band_wide(
+        (lf, metadata_df, fake_window),
+        GroupOp(step_no=1, input="raster", by=[], aggregate=aggregate, output="collapsed"),
+        extra_columns=[],
+    )
+    return (
+        collapsed_lf.select("b0")
+        .collect()
+        .get_column("b0")
+        .fill_null(NODATA)
+        .to_numpy()
+        .reshape(tile_size, tile_size)
+    )
+
+
 class TestGetTileRunsTheWindowThenWarpPath:
     """Gate: the new path actually executes, and the old one is gone rather than bypassed."""
 
-    async def test_get_tile_calls_the_window_and_warp_helpers(
-        self, dataset_factory, unique_pixel_raster, base_path, monkeypatch
-    ):
+    def test_get_tile_calls_the_window_and_warp_helpers(self, unique_pixel_raster, base_path, monkeypatch):
         calls = []
-        real_window = raster_module.tile_source_window
-        real_warp = raster_module.warp_window_to_tile
+        real_window = utils_module.tile_source_window
+        real_warp = utils_module.warp_window_to_tile
 
         def spy_window(*args, **kwargs):
             calls.append("window")
@@ -665,15 +1075,14 @@ class TestGetTileRunsTheWindowThenWarpPath:
             calls.append("warp")
             return real_warp(*args, **kwargs)
 
-        monkeypatch.setattr(raster_module, "tile_source_window", spy_window)
-        monkeypatch.setattr(raster_module, "warp_window_to_tile", spy_warp)
+        monkeypatch.setattr(utils_module, "tile_source_window", spy_window)
+        monkeypatch.setattr(utils_module, "warp_window_to_tile", spy_warp)
 
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
         tile = mercantile.tile(*_tile_centre(), 11)
-        body = await dataset.get_tile(tile.x, tile.y, tile.z, "png")
+        bounds = _tile_bounds(tile)
+        rendered = _render_tile(DIMENSIONS, base_path, bounds)
 
-        assert body is not None
+        assert rendered is not None
         assert calls == ["window", "warp"]
 
     def test_the_source_warping_import_is_gone_from_the_raster_module(self):
@@ -709,66 +1118,19 @@ class TestCollapseThenWarpMatchesWarpThenCollapse:
         )
         return base_path
 
-    @pytest.fixture
-    def capture_ported_tile(self, monkeypatch):
-        """Hand back the exact array `get_tile` hands the legend.
-
-        Comparing rendered PNGs instead would compare colors, and a legend maps whole
-        ranges of values onto one color -- which is precisely the resolution at which a
-        mis-collapsed pixel disappears. `test_the_rendered_png_is_unchanged` covers the
-        rendering; this covers the numbers.
-        """
-        captured = []
-        real_warp = raster_module.warp_window_to_tile
-
-        def capture(*args, **kwargs):
-            result = real_warp(*args, **kwargs)
-            captured.append(result)
-            return result
-
-        monkeypatch.setattr(raster_module, "warp_window_to_tile", capture)
-        return captured
-
     @pytest.mark.parametrize("aggregate", ["mean", "max", "sum"])
     @pytest.mark.parametrize("zoom", [10, 12, 14])
-    async def test_grouped_tile_pixels_are_identical(
-        self, dataset_factory, two_band_raster_with_nodata, capture_ported_tile, aggregate, zoom
-    ):
+    def test_grouped_tile_pixels_are_identical(self, two_band_raster_with_nodata, aggregate, zoom):
         tile = mercantile.tile(*_tile_centre(), zoom)
         bounds = _tile_bounds(tile)
 
-        dataset = dataset_factory(DIMENSIONS, group_aggregate=aggregate)
-        await dataset.apply_params()
-        assert await dataset.get_tile(tile.x, tile.y, tile.z, "png") is not None
-        (ported,) = capture_ported_tile
+        ported = _render_tile(DIMENSIONS, two_band_raster_with_nodata, bounds, aggregate=aggregate)
+        metadata_df = _resolve_metadata(DIMENSIONS, two_band_raster_with_nodata)
+        reference = _warp_first_then_collapse(metadata_df, bounds, TILE_SIZE, aggregate)
 
-        reference_dataset = dataset_factory(DIMENSIONS, group_aggregate=aggregate)
-        await reference_dataset.apply_params()
-        reference = await _warp_first_then_collapse(reference_dataset, bounds, TILE_SIZE)
-
-        assert reference.shape == (1, TILE_SIZE, TILE_SIZE)
+        assert reference.shape == (TILE_SIZE, TILE_SIZE)
         assert (reference != NODATA).sum() > 1000, "the reference tile is empty -- nothing compared"
         assert np.array_equal(ported, reference), (
             f"aggregate={aggregate} z={zoom}: collapse-then-warp differs from "
             "warp-then-collapse"
         )
-
-    async def test_the_rendered_png_is_unchanged(
-        self, dataset_factory, two_band_raster_with_nodata
-    ):
-        """End to end, on the bytes a client actually receives."""
-        tile = mercantile.tile(*_tile_centre(), 11)
-        bounds = _tile_bounds(tile)
-
-        dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
-        await dataset.apply_params()
-        body = await dataset.get_tile(tile.x, tile.y, tile.z, "png")
-        with Image.open(BytesIO(body)) as image:
-            ported_pixels = np.array(image)
-
-        reference_dataset = dataset_factory(DIMENSIONS, group_aggregate="mean")
-        await reference_dataset.apply_params()
-        collapsed = await _warp_first_then_collapse(reference_dataset, bounds, TILE_SIZE)
-        reference_pixels = reference_dataset.legend.colorize_pixels(collapsed)
-
-        assert np.array_equal(ported_pixels, reference_pixels)

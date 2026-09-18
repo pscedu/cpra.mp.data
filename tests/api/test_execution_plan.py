@@ -796,3 +796,123 @@ class TestBandWideJoinCeiling:
             }
         )
         assert compile_plan(pipeline).band_wide_join_scans == {}
+
+
+class TestOverviewEligibility:
+    """`ResolvedInput.overview_permitted`/`straddling_vector_grid` -- whether a raster
+    origin's tile reads may be served from a decimated overview
+    (`io.raster_io.tile_read_shape`) instead of always the full-resolution pixels.
+    """
+
+    def test_a_raster_to_vector_project_forbids_the_overview(self, monkeypatch):
+        # A raster-to-vector project redistributes pixels onto polygons an overview level
+        # can blur across or shrink below one pixel of, so the origin feeding it must never
+        # be served a decimated read.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [
+                    {"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum", "as": "p"},
+                    {"op": "filter", "input": "p", "where": "value > 1"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.straddling_vector_grid == VECTOR_GRID
+        assert resolved.overview_permitted is False
+
+    def test_the_project_is_still_detected_behind_a_fan_out(self, monkeypatch):
+        # `origin_sets` (unconditional provenance), not `states` (pushdown validity, which
+        # a fan-out clears): "a" is read by two steps here, so its own pushdown state is
+        # gone by the time the project runs, but it still IS the raster that project reads
+        # from -- overview eligibility has to follow provenance, not validity.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [
+                    {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c1"},
+                    {"op": "calculate", "input": "a", "expression": "value * 3", "as": "c2"},
+                    {"op": "project", "input": "c1", "to": VECTOR_GRID, "aggregate": "sum", "as": "p"},
+                    {"op": "filter", "input": "p", "where": "value > 1"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        # "c2" is a dead branch -- only present to make "a" read by two ops (the fan-out).
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.straddling_vector_grid == VECTOR_GRID
+        assert resolved.overview_permitted is False
+
+    def test_a_point_sample_forbids_the_overview(self, monkeypatch):
+        # An overview pixel is a real value, but not necessarily the one under the sampled
+        # coordinate -- a point sample needs the exact pixel, never a decimated stand-in.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "grid_cell = 7"}],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.straddling_vector_grid is None  # a point sample, not a project
+        assert resolved.overview_permitted is False
+
+    def test_a_vector_to_vector_chain_joined_with_a_display_raster_still_permits_it(self, monkeypatch):
+        # The accept case: "a" runs a v->v crosswalk-style project (its own, unrelated
+        # branch -- never touching "b"/"c" at all), while "b" is only ever JOINED (not
+        # projected) with another raster "c" for display. Attaching a raster's own,
+        # already-resolved pixel values to a vector chain's rows via `join` is not the same
+        # as redistributing the raster's pixels onto new polygons via `project`, so neither
+        # "b" nor "c" is forbidden the overview by it.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2035}]),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(),
+                    "b": raster_input(variable="ffibs_coverage_ratio"),
+                    "c": raster_input(variable="vct"),
+                },
+                "steps": [
+                    {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "sum", "as": "zp"},
+                    {"op": "join", "type": "spatial", "inputs": ["b", "c"], "as": "j"},
+                    {"op": "calculate", "input": "j", "expression": "b + c"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline)
+        assert plan.inputs["b"].straddling_vector_grid is None
+        assert plan.inputs["b"].overview_permitted is True
+        assert plan.inputs["c"].straddling_vector_grid is None
+        assert plan.inputs["c"].overview_permitted is True
+
+    def test_no_project_and_no_point_sample_means_the_default_permits_it(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.straddling_vector_grid is None
+        assert resolved.overview_permitted is True
+
+    def test_a_vector_origin_is_unaffected(self):
+        # `overview_permitted`/`straddling_vector_grid` are a raster-only concept; a vector
+        # `ResolvedInput` simply carries the dataclass defaults, which nothing reads.
+        pipeline = _pipeline({"inputs": {"a": vector_input()}, "steps": [], "output": {"format": "csv"}})
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.overview_permitted is True
+        assert resolved.straddling_vector_grid is None
