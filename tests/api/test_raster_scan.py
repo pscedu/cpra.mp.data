@@ -18,6 +18,8 @@ Two fixture styles, deliberately different from each other:
   the same way `test_raster_source.py`'s own batching test does.
 """
 
+import dataclasses
+
 import numpy as np
 import polars as pl
 import pytest
@@ -26,14 +28,19 @@ from rasterio.transform import from_origin
 from rasterio.windows import Window
 from rasterio.windows import transform as window_transform
 
-from cpra.mp.data.analysis.execution.frame import assert_height_preserved, assert_window_unchanged, band_column_names
+from cpra.mp.data.analysis.execution.frame import (
+    assert_height_preserved,
+    assert_window_unchanged,
+    band_column_names,
+    row_major_grid_cell,
+)
 from cpra.mp.data.analysis.io import raster_io
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch
 from cpra.mp.data.analysis.request.errors import NotFoundError
 from cpra.mp.data.analysis.request.pipeline import InputSelection
-from tests.factories import RASTER_KWARGS, write_raster_dataset
+from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
 
 # Arbitrary but fixed georeferencing -- every synthetic fixture below shares it, since a
 # VRT assembled from sources of differing size/origin is not a shape these tests need to
@@ -382,28 +389,142 @@ class TestResolveRasterBands:
 
 
 class TestBatchedReadMatchesUnbatched:
-    def test_forcing_many_small_batches_matches_the_default_batching(self, base_path, monkeypatch):
-        write_raster_dataset(base_path, years=(2030,))
-        metadata_df = resolve_raster_bands(TestResolveRasterBands.SELECTION, base_path=base_path)
-        path = metadata_df["path"][0]
+    """Every fixture here writes DISTINGUISHING pixel values (`raster_array()`'s own
+    `arange`, through `data_fn`), never the uniform per-year fill `write_raster_dataset`
+    defaults to. A uniform raster cannot tell any of these apart: re-chunking a read
+    permutes its rows, and every permutation of a constant array is that same array.
+    """
 
+    @staticmethod
+    def _distinct(base_path):
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda year: raster_array())
+        return resolve_raster_bands(TestResolveRasterBands.SELECTION, base_path=base_path)
+
+    def test_forcing_many_small_batches_reads_every_pixel_the_default_batching_does(self, base_path, monkeypatch):
+        """Two chunkings of one read see the same values at the same CELLS. That is what
+        "batching does not change what was read" means; it is NOT the same claim as "the
+        two frames are equal row for row", which is false -- see the next test.
+        """
+        metadata_df = self._distinct(base_path)
         default_lf, _, default_window = scan_raster(metadata_df)
-        default_out = default_lf.collect()
+        default_cells = row_major_grid_cell(default_lf, default_window).collect().sort("grid_cell")
 
         monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
-
-        # Sanity-check that forcing RASTER_BLOCKS_PER_BATCH=1 really does yield more than
-        # one batch for this grid (mirrors test_raster_source.py's identical check) --
-        # otherwise this test would pass even if batching were silently broken.
-        with rio.open(path) as src:
-            block_height, block_width = src.block_shapes[0]
-            itemsize = np.dtype(src.dtypes[0]).itemsize
-            blocks_per_batch = raster_blocks_per_batch(1, block_height, block_width, itemsize)
-            n_batches = sum(1 for _ in raster_io.batched_windows(src, blocks_per_batch))
-        assert n_batches > 1
-
         forced_lf, _, forced_window = scan_raster(metadata_df)
-        forced_out = forced_lf.collect()
+        forced_cells = row_major_grid_cell(forced_lf, forced_window).collect().sort("grid_cell")
 
-        assert forced_out.equals(default_out)
-        assert_window_unchanged(default_window, forced_window)
+        assert len(forced_window.batch_layout) > 1  # the forcing really did take effect
+        assert forced_cells.equals(default_cells)
+
+    def test_rechunking_permutes_the_frames_own_row_order(self, base_path, monkeypatch):
+        """The fact `row_major_grid_cell` exists for, pinned as a test rather than left as
+        a claim in a docstring: a batch covers a sub-rectangle of a block row, not a
+        full-width strip, so re-chunking a read reorders its rows. Same values, same
+        multiset, different row indices.
+        """
+        metadata_df = self._distinct(base_path)
+        default_out = scan_raster(metadata_df)[0].collect()
+
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        forced_out = scan_raster(metadata_df)[0].collect()
+
+        assert not forced_out.equals(default_out)
+        assert forced_out.sort("b0").equals(default_out.sort("b0"))
+
+    def test_the_window_records_the_batching_and_is_otherwise_unchanged(self, base_path, monkeypatch):
+        """`batch_layout` is the one field two chunkings of the same read differ in, and it
+        has to differ: it is the only record of which pixel a given row index means.
+        """
+        metadata_df = self._distinct(base_path)
+        _, _, default_window = scan_raster(metadata_df)
+
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        _, _, forced_window = scan_raster(metadata_df)
+
+        assert forced_window.batch_layout != default_window.batch_layout
+        assert dataclasses.replace(forced_window, batch_layout=()) == dataclasses.replace(
+            default_window, batch_layout=()
+        )
+
+    def test_batch_layout_covers_the_window_exactly_once(self, base_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        metadata_df = self._distinct(base_path)
+        _, _, window = scan_raster(metadata_df)
+
+        covered = {
+            (row, col)
+            for col_off, row_off, width, height in window.batch_layout
+            for row in range(row_off, row_off + height)
+            for col in range(col_off, col_off + width)
+        }
+        assert sum(width * height for _c, _r, width, height in window.batch_layout) == window.width * window.height
+        assert len(covered) == window.width * window.height
+
+
+class TestBandsOfDifferingDtype:
+    """A `rasterio` read of several bands at once returns ONE array, so every band it reads
+    in that call must share a dtype. The bands of one VRT routinely do not: a crosswalk's
+    dtype follows its zone-id range alone, and two variables read together are two
+    different measurements stored two different ways. `scan_raster` groups its bands by
+    dtype and reads one group per call; asking for all of them at once raises
+    `ValueError: more than one 'dtype' found`.
+    """
+
+    def test_data_bands_of_two_dtypes_scan_together(self, tmp_path):
+        int_path = _write_tif(tmp_path / "ints.tif", np.array([[1, 2], [3, 4]], dtype="int32"))
+        float_path = _write_tif(tmp_path / "floats.tif", np.array([[1.5, 2.5], [3.5, 4.5]], dtype="float32"))
+        metadata_df = pl.DataFrame({"path": [str(int_path), str(float_path)], "band": [1, 1]})
+
+        out = scan_raster(metadata_df)[0].collect()
+
+        assert out.schema["b0"] == pl.Int32
+        assert out.schema["b1"] == pl.Float32
+        assert out["b0"].to_list() == [1, 2, 3, 4]
+        assert out["b1"].to_list() == [1.5, 2.5, 3.5, 4.5]
+
+    def test_an_integer_crosswalk_rides_along_with_float_data(self, tmp_path):
+        """The production shape, and the one the raster-to-vector `project` depends on: a
+        float measurement band and an integer zone crosswalk in a single read.
+        """
+        data_path = _write_tif(tmp_path / "data.tif", np.array([[1.5, 2.5], [3.5, 4.5]], dtype="float32"))
+        zone_path = _write_tif(tmp_path / "zones.tif", np.array([[7, 7], [8, -1]], dtype="int16"), nodata=-1)
+        metadata_df = pl.DataFrame({"path": [str(data_path)], "band": [1]})
+
+        out = scan_raster(metadata_df, crosswalks=[("zone", str(zone_path))])[0].collect()
+
+        assert out.schema["b0"] == pl.Float32
+        assert out.schema["zone"] == pl.Int16
+        assert out["b0"].to_list() == [1.5, 2.5, 3.5, 4.5]
+        assert out["zone"].to_list() == [7, 7, 8, None]
+
+
+class TestPushdownIsHonored:
+    """Polars REMOVES a `.select`/`.filter` from the plan when it pushes it into an IO
+    plugin, and does not re-apply it afterward. A plugin that accepts either and ignores it
+    therefore does not merely miss an optimization -- it returns rows the plan says were
+    already filtered out, and columns the plan says were already projected away.
+    """
+
+    def _two_band_scan(self, tmp_path):
+        path = _write_tif(
+            tmp_path / "two.tif",
+            np.array([[[1, 2], [3, 4]], [[10, 20], [30, 40]]], dtype="int32"),
+        )
+        return scan_raster(pl.DataFrame({"path": [str(path)] * 2, "band": [1, 2]}))[0]
+
+    def test_a_chained_filter_actually_drops_rows(self, tmp_path):
+        lf = self._two_band_scan(tmp_path)
+
+        assert lf.filter(pl.col("b0") > 2).collect()["b0"].to_list() == [3, 4]
+
+    def test_a_chained_select_actually_drops_columns(self, tmp_path):
+        lf = self._two_band_scan(tmp_path)
+
+        assert lf.select("b1").collect().columns == ["b1"]
+
+    def test_a_filter_and_a_head_compose(self, tmp_path):
+        """`n_rows` means "the first n rows of what this source produces", so it applies
+        after the predicate, not before it."""
+        lf = self._two_band_scan(tmp_path)
+
+        assert lf.filter(pl.col("b0") > 1).head(2).collect()["b0"].to_list() == [2, 3]

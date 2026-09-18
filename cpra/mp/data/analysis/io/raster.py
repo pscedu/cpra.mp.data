@@ -13,8 +13,8 @@ from a `(path, band)` list and needs no change for this -- see that function's o
 docstring for why a bare path means band 1 and a `(path, band)` pair selects a specific
 one.
 
-The VRT is assembled fresh on every call (no caching -- deferred, along with
-whatever invalidation a cache would need, to a later stage) and opened straight out of
+The VRT is assembled fresh on every call (no caching -- a cache and the invalidation it
+would need are both deliberately absent) and opened straight out of
 memory via `rasterio.io.MemoryFile`, never written to disk: a VRT's own bytes are pure XML
 referencing the real files by path, so nothing about opening or re-opening one touches a
 temp directory this module would otherwise have to clean up. Confirmed empirically (not
@@ -61,10 +61,10 @@ measurement behind it).
 `window`, when given, restricts the scan to that single `rasterio.windows.Window` read
 whole, in one batch, rather than tiling the full raster -- a caller specific enough to name
 its own window has already decided how much of it to hold in memory at once. This is
-plumbing only: nothing in this module computes a window on its own (that is a pushdown
-decision for a later stage), and no resampling parameter exists yet -- every read is
-`Resampling.nearest`, GDAL's own default for an unspecified resampling method, and the only
-one a decimation-free window read ever needs.
+plumbing only: nothing in this module computes a window on its own (choosing a window is
+the caller's decision, not this scan's), and no resampling parameter exists yet -- every
+read is `Resampling.nearest`, GDAL's own default for an unspecified resampling method,
+and the only one a decimation-free window read ever needs.
 
 `io` may import `request` but never `execution` -- see
 `tests/api/test_analysis_layering.py`. What `scan_raster` takes from `request` is only
@@ -238,19 +238,41 @@ def scan_raster(
         transform=window_transform(read_window, raster_transform),
         crs=raster_crs,
         decimation=1,
+        batch_layout=tuple(
+            (int(w.col_off), int(w.row_off), int(w.width), int(w.height)) for w in window_list
+        ),
     )
 
     schema = pl.Schema({name: NUMPY_TO_POLARS[dt] for name, dt in zip(column_names, dtypes)})
 
+    # Bands grouped by dtype, each group read in one `rasterio` call. A multi-band
+    # `.read()` returns ONE array, so every band it reads at once must share a dtype;
+    # asking for all of them together raises `ValueError: more than one 'dtype' found` the
+    # moment they do not. Bands of one VRT routinely do not: a crosswalk's dtype is chosen
+    # by zone-id range alone, and two variables scanned together are two different
+    # measurements with two different storage types. Grouping (rather than reading every
+    # band separately) keeps the call count at one per distinct dtype -- usually one, at
+    # worst a handful -- and keeps each band's own dtype exactly as `schema` above
+    # declares it, which a single read with a forced common `out_dtype` would not.
+    dtype_groups: dict[str, list[int]] = {}
+    for position, dt in enumerate(dtypes):
+        dtype_groups.setdefault(str(dt), []).append(position)
+    read_groups = [([position + 1 for position in positions], positions) for positions in dtype_groups.values()]
+
     def source(with_columns, predicate, n_rows, batch_size):
-        # No pushdown yet (projection/predicate pushdown is later-stage work):
-        # `with_columns`/`predicate` are accepted (the plugin protocol requires the
-        # signature) but not applied here -- Polars applies any `.select`/`.filter` a
-        # caller chains onto this scan's own LazyFrame afterward, which is correct, just
-        # not optimized. `n_rows` IS honored below: unlike the other two it is not an
-        # optimization a caller could apply just as well downstream (a `.head(n)` needs
-        # the source to actually stop producing rows, not merely trim them after the
-        # fact once memory is already spent).
+        # Every one of the four arguments MUST be honored here. An IO plugin does not
+        # "accept but ignore" a pushed-down projection or predicate: Polars removes the
+        # `.select`/`.filter` from the plan when it hands it over and does NOT re-apply it
+        # afterward, so a plugin that takes one and drops it silently returns unfiltered
+        # rows (and unprojected columns) that the plan says were already dealt with. Both
+        # were confirmed directly: a `.filter()` chained onto this scan returned every row,
+        # and a `.select("b1")` returned `b0` alongside it.
+        #
+        # Honoring them here is not a read-side optimization -- the pixels are read either
+        # way, since a projection arrives as column names and this scan's columns are bands
+        # of one already-assembled VRT. It is what makes the scan CORRECT. `n_rows` is the
+        # one that does cut the read short, and it is applied last, after the predicate,
+        # because it means "the first n rows of what this source produces".
         remaining = n_rows
         for batch_window in window_list:
             if remaining is not None and remaining <= 0:
@@ -258,11 +280,16 @@ def scan_raster(
 
             # Nothing GDAL-related crosses the `yield` below -- see module docstring.
             with raster_gdal_env(), MemoryFile(vrt_bytes, ext=".vrt") as memfile, memfile.open() as src:
-                data = src.read(window=batch_window)
+                by_position = {}
+                for indexes, positions in read_groups:
+                    group_data = src.read(indexes=indexes, window=batch_window)
+                    for i, position in enumerate(positions):
+                        by_position[position] = group_data[i].ravel()
+                    del group_data
 
-            cols = {name: data[i].ravel() for i, name in enumerate(column_names)}
+            cols = {name: by_position[i] for i, name in enumerate(column_names)}
             df = pl.DataFrame(cols, schema=schema)
-            del data, cols
+            del by_position, cols
 
             mask_exprs = [
                 pl.when(pl.col(name) == nd).then(None).otherwise(pl.col(name)).alias(name)
@@ -271,6 +298,13 @@ def scan_raster(
             ]
             if mask_exprs:
                 df = df.with_columns(mask_exprs)
+
+            # After masking, never before: a mask expression reads every column of the
+            # batch, including ones a projection is about to drop.
+            if with_columns is not None:
+                df = df.select(with_columns)
+            if predicate is not None:
+                df = df.filter(predicate)
 
             if remaining is not None and df.height > remaining:
                 df = df.head(remaining)

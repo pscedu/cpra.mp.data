@@ -259,15 +259,91 @@ class TestAssertSamePixelGrid:
             {"decimation": 2},
             {"crs": CRS.from_epsg(4326)},
             {"transform": Affine.translation(10, 10)},
+            {"batch_layout": ((0, 0, 2, 4), (2, 0, 2, 4))},
         ],
     )
     def test_fires_when_any_geometric_field_differs(self, override):
         with pytest.raises(AssertionError):
             frame.assert_same_pixel_grid(make_window(), make_window(**override))
 
+    def test_fires_for_two_reads_that_cover_the_same_ground_in_different_orders(self):
+        """The case that makes `batch_layout` a compared field rather than a bookkeeping
+        one: two reads of the identical window, chunked differently (which is what happens
+        when they have different band counts), agree on every geometric measure and still
+        disagree about which pixel row *i* is.
+        """
+        one = make_window(batch_layout=((0, 0, 4, 4),))
+        other = make_window(batch_layout=((0, 0, 2, 4), (2, 0, 2, 4)))
+
+        with pytest.raises(AssertionError, match="batch_layout"):
+            frame.assert_same_pixel_grid(one, other)
+
     def test_names_the_fields_that_differ(self):
         with pytest.raises(AssertionError, match="col_off, width"):
             frame.assert_same_pixel_grid(make_window(), make_window(col_off=5, width=999))
+
+
+class TestRowMajorGridCell:
+    """`grid_cell` is a pixel's row-major position within the window, which is the frame's
+    own row index only when the read came back in one batch.
+    """
+
+    def test_a_single_batch_read_is_the_plain_row_index(self):
+        window = make_window(width=2, height=3, batch_layout=((0, 0, 2, 3),))
+        lf = pl.LazyFrame({"b0": [10, 11, 12, 13, 14, 15]})
+
+        out = frame.row_major_grid_cell(lf, window).collect()
+
+        assert out["grid_cell"].to_list() == [0, 1, 2, 3, 4, 5]
+        assert out["b0"].to_list() == [10, 11, 12, 13, 14, 15]
+
+    def test_an_empty_batch_layout_is_treated_as_one_batch(self):
+        """A hand-built `ReadWindow` (a test's, or any window not produced by a batched
+        scan) carries no layout; "the whole window, once" is what that means."""
+        window = make_window(width=2, height=2, batch_layout=())
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        assert frame.row_major_grid_cell(lf, window).collect()["grid_cell"].to_list() == [0, 1, 2, 3]
+
+    def test_two_column_strips_are_de_interleaved(self):
+        """A 4x2 window read as two 2-wide strips emits columns 0-1 of both rows, then
+        columns 2-3 of both rows. Row order 0..7 therefore means cells 0,1,4,5,2,3,6,7 --
+        a plain row index would put half the pixels in the wrong place.
+        """
+        window = make_window(width=4, height=2, batch_layout=((0, 0, 2, 2), (2, 0, 2, 2)))
+        lf = pl.LazyFrame({"b0": ["a", "b", "e", "f", "c", "d", "g", "h"]})
+
+        out = frame.row_major_grid_cell(lf, window).collect().sort("grid_cell")
+
+        assert out["grid_cell"].to_list() == [0, 1, 2, 3, 4, 5, 6, 7]
+        assert out["b0"].to_list() == ["a", "b", "c", "d", "e", "f", "g", "h"]
+
+    def test_batches_of_differing_shape_are_decoded_by_their_own_widths(self):
+        """The last batch of a block row is narrower than the rest whenever the width is
+        not a multiple of the batch width, so each batch's offset must be split by ITS own
+        width, not by a single shared one.
+        """
+        window = make_window(width=3, height=2, batch_layout=((0, 0, 2, 2), (2, 0, 1, 2)))
+        lf = pl.LazyFrame({"b0": [0, 1, 3, 4, 2, 5]})
+
+        out = frame.row_major_grid_cell(lf, window).collect()
+
+        assert out["grid_cell"].to_list() == [0, 1, 3, 4, 2, 5]
+        assert out.sort("grid_cell")["b0"].to_list() == [0, 1, 2, 3, 4, 5]
+
+    def test_offsets_are_relative_to_the_window_not_the_raster(self):
+        """A windowed read's batches carry absolute pixel offsets, but cell 0 is the
+        window's own first pixel."""
+        window = make_window(col_off=10, row_off=20, width=2, height=2, batch_layout=((10, 20, 2, 2),))
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        assert frame.row_major_grid_cell(lf, window).collect()["grid_cell"].to_list() == [0, 1, 2, 3]
+
+    def test_leaves_no_working_columns_behind(self):
+        window = make_window(width=2, height=2, batch_layout=((0, 0, 2, 2),))
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        assert frame.row_major_grid_cell(lf, window).collect().columns == ["b0", "grid_cell"]
 
 
 class TestAssertHeightPreserved:

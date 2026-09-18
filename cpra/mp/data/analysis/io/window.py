@@ -43,6 +43,20 @@ class ReadWindow:
     are the read's affine transform and coordinate system; `decimation` is the
     overview/decimation level actually read, `1` meaning full resolution.
 
+    `batch_layout` is the ORDER the read emitted its pixels in: one
+    `(col_off, row_off, width, height)` tuple per batch the scan produced, in the order it
+    produced them, each batch's own pixels then following row-major within it. It is NOT
+    derivable from the four extent fields above. A large read is broken into batches to
+    bound the read buffer, and a batch covers a sub-rectangle of a block row rather than a
+    full-width strip, so "row *i* of the frame" means a different pixel depending on how
+    the read happened to be chunked -- and how it is chunked depends on the BAND COUNT (a
+    wider read gets fewer blocks per batch for the same memory budget), not only on the
+    ground the read covers. Two reads of the same window over the same grid can therefore
+    emit the same pixels in two different orders, which is why this is a field and not a
+    computation: it is the only thing that can tell those two reads apart, and combining
+    them positionally without noticing would silently pair up unrelated pixels. See
+    `execution/frame.py`'s `assert_same_pixel_grid`, which compares it.
+
     Frozen, so `==` comes for free and comparing two windows is a plain comparison rather
     than a field-by-field check. No band-wide lowering may return a window differing from
     the one it was handed -- see `frame.assert_window_unchanged`.
@@ -56,3 +70,4 @@ class ReadWindow:
     transform: Affine
     crs: CRS
     decimation: int = 1
+    batch_layout: tuple[tuple[int, int, int, int], ...] = ()

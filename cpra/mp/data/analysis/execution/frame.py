@@ -9,8 +9,15 @@ what shape it expects without a reader having to already know the convention.
 **Band-wide** is the raster row model: one row per pixel, one column per band, carried as
 the triple `BandWideFrame = (band_wide_lf, metadata_df, window)`:
 
-- `band_wide_lf` -- the pixel data. Row *i* is pixel *i* in row-major order within
-  `window`, in every band column.
+- `band_wide_lf` -- the pixel data. Row *i* is pixel *i* of the read, in every band
+  column, in the order the read produced them -- which is row-major within `window` only
+  when the read came back in ONE batch. A read big enough to be chunked emits each batch's
+  own sub-rectangle row-major, batch after batch, so its rows are a permutation of the
+  row-major order and not that order itself. `window.batch_layout` is what names the
+  permutation; `row_major_grid_cell` below is what converts a row index back into a
+  row-major cell id, and is what any lowering that needs a pixel's POSITION (rather than
+  merely its identity with the same pixel in another frame from the same read) has to go
+  through.
 - `metadata_df` -- the COLUMN dictionary: one row per band column, holding that band's
   dimension values (and, after a `group`, its group identity). `band_column_names` below
   is what ties a metadata row to the pixel column it describes; it is the only thing that
@@ -64,6 +71,7 @@ return a complete band-wide triple without importing this module, which sits a l
 above it.
 """
 
+import itertools
 from collections.abc import Iterable
 
 import polars as pl
@@ -92,6 +100,7 @@ __all__ = [
     "assert_window_unchanged",
     "assert_same_pixel_grid",
     "assert_height_preserved",
+    "row_major_grid_cell",
 ]
 
 
@@ -248,15 +257,93 @@ def assert_same_pixel_grid(one: ReadWindow, other: ReadWindow) -> None:
     Contrast `assert_window_unchanged`, which compares `source` too because there the
     two windows are the SAME read, before and after one lowering, and a changed `source`
     there is unambiguously a bug.
+
+    **`batch_layout` is compared, and is the field that most often differs.** Sharing a
+    patch of ground is necessary but NOT sufficient: two reads of the identical window
+    over the identical grid still emit their pixels in different ORDERS when they were
+    chunked differently, and they are chunked differently whenever their band counts
+    differ, since a fixed read-buffer budget buys fewer blocks per batch the more bands
+    each block carries (`io/window.py`'s `batch_layout`, `io/raster_io.py`'s
+    `raster_blocks_per_batch`). A batch covers a sub-rectangle of a block row, not a
+    full-width strip, so two different chunkings are two different permutations of the
+    same pixels -- every one present in both frames, at mismatched row indices. Without
+    this field the two frames look interchangeable on every geometric measure and
+    combining them yields a frame whose shape, extent and row count are all exactly right
+    and whose values are paired with the wrong pixels: measured on a 1024x1024 four-band
+    read against a co-registered one-band read, 1044480 of 1048576 rows landed on the
+    wrong pixel, with nothing in the result to say so. A caller that trips this does not
+    want the check relaxed; it wants ONE read (a single `scan_raster` over all the bands
+    it needs, crosswalks included -- which is what that function's `crosswalks=` parameter
+    is for), whose pixel order is then shared by construction rather than by assertion.
     """
     differing = [
         field
-        for field in ("col_off", "row_off", "width", "height", "transform", "crs", "decimation")
+        for field in ("col_off", "row_off", "width", "height", "transform", "crs", "decimation", "batch_layout")
         if getattr(one, field) != getattr(other, field)
     ]
     assert not differing, (
         f"band-wide frames do not share a pixel grid -- {', '.join(differing)} differ "
         f"({one!r} vs {other!r}); their rows cannot be aligned positionally"
+    )
+
+
+def row_major_grid_cell(lf: pl.LazyFrame, window: ReadWindow, name: str = "grid_cell") -> pl.LazyFrame:
+    """`lf` with a `name` column holding each row's ROW-MAJOR pixel position within
+    `window` -- the cell id a raster grid addresses that pixel by, recovered from the row
+    index the frame actually carries.
+
+    A plain `with_row_index` is not that id. It is only that id when `window.batch_layout`
+    describes a single batch covering the whole window, which is the case for a small read
+    and for a windowed one, and NOT the case for a full read of a real grid: there the read
+    is chunked to bound its buffer, each batch covers a sub-rectangle of a block row, and
+    the frame's rows run row-major WITHIN each batch, batch after batch. Row 1 of such a
+    frame is the pixel one column to the right, but row `batch_width` is the pixel at the
+    start of the batch's second line -- not the pixel at the start of the raster's second
+    line, which lives thousands of rows further on in another batch entirely. How many
+    batches a read is cut into depends on its band count, so this is not even a fixed
+    property of a grid: the same pixel sits at two different row indices in a one-band and
+    a four-band read of the same window.
+
+    Decoded with a backward `join_asof` on each batch's starting row index -- the frame's
+    row index is ascending by construction, which is exactly what `join_asof` needs, and it
+    keeps the whole decode lazy rather than materializing a per-pixel lookup table. The
+    arithmetic per row is then the obvious one: which batch the row falls in, its offset
+    within that batch, that offset split into a line and a column by the BATCH's width, and
+    those placed back inside `window` by the batch's own offsets.
+
+    `window.batch_layout` is empty for a `ReadWindow` not built by a batched scan (a
+    hand-constructed one in a test, say). That is treated as the single-batch case -- the
+    whole window, one batch -- so the id reduces to the plain row-major index, which is
+    what such a window means.
+    """
+    layout = window.batch_layout or ((window.col_off, window.row_off, window.width, window.height),)
+    starts = list(itertools.accumulate((w * h for _c, _r, w, h in layout), initial=0))[:-1]
+    batches = pl.DataFrame(
+        {
+            "__batch_start": starts,
+            "__batch_col": [col for col, _r, _w, _h in layout],
+            "__batch_row": [row for _c, row, _w, _h in layout],
+            "__batch_width": [width for _c, _r, width, _h in layout],
+        },
+        schema={
+            "__batch_start": pl.Int64,
+            "__batch_col": pl.Int64,
+            "__batch_row": pl.Int64,
+            "__batch_width": pl.Int64,
+        },
+    )
+    offset = pl.col("__row_index") - pl.col("__batch_start")
+    return (
+        lf.with_row_index("__row_index")
+        .with_columns(pl.col("__row_index").cast(pl.Int64))
+        .join_asof(batches.lazy(), left_on="__row_index", right_on="__batch_start", strategy="backward")
+        .with_columns(
+            (
+                (pl.col("__batch_row") + offset // pl.col("__batch_width") - window.row_off) * window.width
+                + (pl.col("__batch_col") + offset % pl.col("__batch_width") - window.col_off)
+            ).alias(name)
+        )
+        .drop("__row_index", "__batch_start", "__batch_col", "__batch_row", "__batch_width")
     )
 
 

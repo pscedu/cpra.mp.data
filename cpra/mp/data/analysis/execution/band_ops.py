@@ -164,6 +164,7 @@ from cpra.mp.data.analysis.execution.frame import (
     band_column_names,
     empty_band_wide,
     has_no_bands,
+    row_major_grid_cell,
     validate_extra_columns,
 )
 from cpra.mp.data.analysis.request.expressions import (
@@ -284,9 +285,13 @@ def sample_grid_cells_band_wide(band_wide: BandWideFrame, where: str, extra_colu
     means on the band-wide side.
 
     Unconditionally unpivots every pixel into one long row per (pixel, band) observation:
-    `grid_cell` is the pixel's row-major position within `window` (an ordinary
-    `with_row_index`, since row order is the only positional information a band-wide frame
-    keeps -- `execution/frame.py`'s module docstring), and each band's row picks up that
+    `grid_cell` is the pixel's row-major position within `window`, via
+    `frame.row_major_grid_cell` and NOT a plain `with_row_index` -- row order is the only
+    positional information a band-wide frame keeps, but that order is the order the READ
+    produced, which is row-major only for a single-batch read (see that function, and
+    `execution/frame.py`'s module docstring). A raw row index would hand the long frame
+    cell ids that address the right pixels in the wrong places on any raster large enough
+    to have been chunked, which is all of the real ones. Each band's row then picks up that
     band's own dimension values from `metadata_df` via a join on band identity. `where` in
     its ENTIRETY -- every conjunct, of every kind, not just the spatial one(s) -- is then
     applied by `execution.long_ops.filter_long`, which already knows how to run a mixed
@@ -296,7 +301,7 @@ def sample_grid_cells_band_wide(band_wide: BandWideFrame, where: str, extra_colu
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
     names = band_column_names(metadata_df)
-    indexed = lf.with_row_index("grid_cell").with_columns(pl.col("grid_cell").cast(pl.Int64))
+    indexed = row_major_grid_cell(lf, window)
     long_lf = indexed.unpivot(index=["grid_cell", *extra_columns], on=names, variable_name="__band", value_name="value")
     band_identity = pl.DataFrame({"__band": pl.Series(names, dtype=pl.String)}).hstack(metadata_df)
     with_metadata = long_lf.join(band_identity.lazy(), on="__band", how="left").drop("__band")
