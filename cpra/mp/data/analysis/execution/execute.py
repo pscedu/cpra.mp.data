@@ -25,13 +25,14 @@ uses, via the shared `request.ops.project_direction`.
 every combination the request layer will type successfully. Until this module existed
 nothing checked whether an executor exists for each of them. `NOT_YET_IMPLEMENTED` below
 is the missing other half -- a named, deliberate record of exactly which combinations this
-vertical slice does not execute yet (band-wide anything, and `project` in every direction)
--- so `tests/api/test_execute.py` can assert, in both directions, that the registered
-lowerings and the not-yet-implemented set together partition exactly what the tables
-declare legal: no orphan executor for a combination no table names, and no combination
-falling through neither set. Shrinking `NOT_YET_IMPLEMENTED` is what a later stage adding
-a real band-wide or `project` lowering does, and the test is what forces that stage to
-come back here rather than leaving the new lowering un-wired by omission.
+vertical slice does not execute yet (band-wide anything, and `project` in the two
+directions that touch a raster grid) -- so `tests/api/test_execute.py` can assert, in both
+directions, that the registered lowerings and the not-yet-implemented set together
+partition exactly what the tables declare legal: no orphan executor for a combination no
+table names, and no combination falling through neither set. Shrinking
+`NOT_YET_IMPLEMENTED` is what a later stage adding a real band-wide lowering (or the
+remaining two `project` directions) does, and the test is what forces that stage to come
+back here rather than leaving the new lowering un-wired by omission.
 
 `calculate` and `group` have no lowering table of their own -- `request/ops.py` types both
 as unconditionally shape-preserving, in code rather than as data -- so their entries below
@@ -39,7 +40,7 @@ are declared directly against `Shape`'s two members. There is no table for them 
 from.
 """
 
-from cpra.mp.data.analysis.execution import long_ops
+from cpra.mp.data.analysis.execution import long_ops, project
 from cpra.mp.data.analysis.execution.frame import LongFrame
 from cpra.mp.data.analysis.execution.plan import ExecutionPlan
 from cpra.mp.data.analysis.io.vector import scan_vector
@@ -73,13 +74,15 @@ class LoweringNotImplementedError(NotImplementedError):
 # stages -- see the module docstring. Each value holds the dispatch keys for which the
 # walk raises `LoweringNotImplementedError` instead of dispatching: shapes for the four
 # shape-keyed ops, and for `project` the `(from kind, to kind)` pairs
-# `PROJECT_LOWERING_TABLE` itself declares.
+# `PROJECT_LOWERING_TABLE` declares MINUS `("vector", "vector")`, which has a real
+# lowering below -- the one direction with no raster grid on either side of it, and so the
+# one direction this vertical slice can execute without a raster scan.
 NOT_YET_IMPLEMENTED: dict[str, frozenset] = {
     "filter": frozenset({Shape.band_wide}),
     "calculate": frozenset({Shape.band_wide}),
     "group": frozenset({Shape.band_wide}),
     "join": frozenset({Shape.band_wide}),
-    "project": frozenset(PROJECT_LOWERING_TABLE),
+    "project": frozenset(PROJECT_LOWERING_TABLE) - {("vector", "vector")},
 }
 
 
@@ -99,6 +102,10 @@ def _run_join(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
     return long_ops.join_long([frames[name] for name in op.inputs], op)
 
 
+def _run_project(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
+    return project.project_vector_to_vector(frames, op, frame_types)
+
+
 # The registry the walk dispatches through. One uniform signature per entry --
 # `(frames, op, frame_types) -> LongFrame` -- so the loop below never has to know which op
 # it is running. A filter's three predicate kinds share one entry because all three lower
@@ -108,15 +115,19 @@ def _run_join(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
 #
 # `frame_types` is the plan's whole name -> `FrameType` map rather than just the incoming
 # operand's, so that the signature stays the same for `join` (several operands) as for the
-# rest. Only `_run_calculate` reads it today -- it needs the incoming frame's value
-# columns, which a long frame's schema cannot reveal on its own -- but handing it to every
-# entry is what keeps this a registry rather than four differently-shaped callables the
-# loop would have to tell apart.
+# rest. `_run_calculate` reads it for the incoming frame's value columns, which a long
+# frame's schema cannot reveal on its own; `_run_project` reads it for the incoming
+# frame's CURRENT grid (`current.grid`, not the pipeline input's own declared grid --
+# `request.ops.FrameType`'s own docstring is where that distinction is spelled out), which
+# is the other half of which crosswalk to open. Handing `frame_types` to every entry is
+# what keeps this a registry rather than five differently-shaped callables the loop would
+# have to tell apart.
 _LOWERINGS: dict[tuple[str, object], object] = {
     ("filter", Shape.long): _run_filter,
     ("calculate", Shape.long): _run_calculate,
     ("group", Shape.long): _run_group,
     ("join", Shape.long): _run_join,
+    ("project", ("vector", "vector")): _run_project,
 }
 
 

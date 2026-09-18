@@ -17,10 +17,12 @@ import pytest
 
 from cpra.mp.data.analysis.execution.fold import (
     FoldError,
+    fold_count_by_value,
     fold_group_by,
     should_fold_group_by,
 )
 from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES
+from cpra.mp.data.analysis.request.errors import AggregateError
 
 AGGREGATES = sorted(DECOMPOSABLE_AGGREGATES)
 
@@ -128,6 +130,136 @@ class TestMeanOfMeansTrap:
         result = fold_group_by(lambda: df.lazy(), ["key"], "mean", step=9)
         assert result["value"].item() == pytest.approx(19.0)
         assert result["value"].item() != pytest.approx(55.0)
+
+
+class TestFoldGroupByWeightColumn:
+    """`weight_column` -- the area-weighted mean a vector-to-vector `project` needs
+    (`execution/project.py`) -- rides through the same fold as the plain mean, carrying a
+    different (numerator, denominator) pair. See `_weighted_mean_exprs` in
+    `execution/project.py` for the same rule stated once for the unfolded path."""
+
+    @pytest.fixture
+    def weighted_frame(self):
+        """Two destinations, unequal weights, and one null-valued contributor to "x" --
+        an all-1.0-weight fixture can't distinguish a weighted mean from a plain one, and
+        an all-non-null fixture can't catch the denominator restriction below."""
+        return pl.DataFrame(
+            {
+                "dst": ["x", "x", "x", "y", "y"],
+                "value": [10.0, None, 20.0, 5.0, 15.0],
+                "weight": [0.75, 1.0, 0.25, 0.5, 0.5],
+            }
+        )
+
+    @pytest.mark.parametrize("step", [1, 2, 100])
+    def test_weighted_mean_matches_hand_computation(self, weighted_frame, step):
+        # dst "x": numerator = 10*0.75 + 20*0.25 = 12.5; denominator is sum(weight)
+        # restricted to non-null-value rows = 0.75 + 0.25 = 1.0 -- the null row's own
+        # weight (1.0) is excluded, not folded into the denominator -> mean = 12.5.
+        # dst "y": numerator = 5*0.5 + 15*0.5 = 10.0; denominator = 0.5 + 0.5 = 1.0.
+        actual = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=step
+        ).sort("dst")
+        assert actual["dst"].to_list() == ["x", "y"]
+        assert actual["value"].to_list() == pytest.approx([12.5, 10.0])
+
+    def test_batched_matches_unbatched(self, weighted_frame):
+        """step=1 (five single-row chunks, the maximum number of merges this fixture can
+        force) and step=100 (one chunk -- the direct, unfolded answer) must agree exactly:
+        the resume contract's batched-vs-unbatched equality requirement for `mean`."""
+        batched = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=1
+        ).sort("dst")
+        unbatched = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=100
+        ).sort("dst")
+        assert batched.to_dict(as_series=False) == unbatched.to_dict(as_series=False)
+
+    def test_a_group_with_every_value_null_folds_to_null_not_nan(self):
+        """Both halves of the pair sum to 0.0 for an all-null-valued group (Polars sums
+        an empty/all-null selection to 0.0, not null) -- dividing those directly gives
+        NaN; the finalize step must guard that case to null instead, matching what a
+        "no data reached this destination" answer should report."""
+        df = pl.DataFrame({"dst": ["z", "z"], "value": [None, None], "weight": [0.5, 0.5]})
+        actual = fold_group_by(lambda: df.lazy(), ["dst"], "mean", weight_column="weight", step=1)
+        assert actual["value"].item() is None
+
+    def test_unweighted_mean_is_unaffected_by_the_new_parameter(self, scattered_nulls_frame):
+        """`weight_column` defaults to `None` -- every existing caller that doesn't pass
+        it must see bit-for-bit the same behavior as before this parameter existed."""
+        default = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], "mean").sort("key")
+        explicit_none = fold_group_by(
+            lambda: scattered_nulls_frame.lazy(), ["key"], "mean", weight_column=None
+        ).sort("key")
+        assert default.to_dict(as_series=False) == explicit_none.to_dict(as_series=False)
+
+
+class TestFoldCountByValue:
+    """The `count_by_value` counterpart of `TestFoldGroupByMatchesPlainGroupBy`: a
+    per-chunk `(group, distinct value)` count table, merged by summing matching keys --
+    the same associative-count argument `fold_group_by` makes for plain `count`, with one
+    more column riding along in the key."""
+
+    @pytest.fixture
+    def categorical_frame(self):
+        return pl.DataFrame(
+            {
+                "key": ["a", "a", "a", "a", "b", "b", "b"],
+                "value": ["x", "x", "y", None, "x", "x", None],
+            }
+        )
+
+    @pytest.mark.parametrize("step", [1, 2, 100])
+    def test_matches_plain_group_by(self, categorical_frame, step):
+        expected = (
+            categorical_frame.group_by("key", pl.col("value").alias("value_category"))
+            .agg(pl.len().alias("value"))
+            .sort(["key", "value_category"])
+        )
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=step
+        ).sort(["key", "value_category"])
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
+
+    def test_null_is_kept_as_its_own_category(self, categorical_frame):
+        # Group "a" carries one null-valued row -- it must survive as its own
+        # (key="a", value_category=None) row with count 1, not be dropped.
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=1
+        )
+        null_row = actual.filter(pl.col("key") == "a").filter(pl.col("value_category").is_null())
+        assert null_row["value"].to_list() == [1]
+
+    def test_exceeding_max_distinct_raises(self, categorical_frame):
+        with pytest.raises(AggregateError, match="distinct"):
+            fold_count_by_value(lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=1, step=1)
+
+    def test_non_positive_step_is_rejected(self, categorical_frame):
+        with pytest.raises(FoldError, match="step"):
+            fold_count_by_value(
+                lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=0
+            )
+
+    def test_chunk_transform_is_applied_per_chunk(self, categorical_frame):
+        """Mirrors `TestFoldGroupByEmptyChunk`'s contract for `fold_group_by` -- a
+        `chunk_transform` (the crosswalk join site's use, in real callers) applies to
+        every chunk, and the folded result must still match grouping the transformed
+        frame directly."""
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(),
+            ["key"],
+            "value",
+            max_distinct=10,
+            step=2,
+            chunk_transform=lambda chunk: chunk.filter(pl.col("key") == "a"),
+        ).sort(["key", "value_category"])
+        expected = (
+            categorical_frame.filter(pl.col("key") == "a")
+            .group_by("key", pl.col("value").alias("value_category"))
+            .agg(pl.len().alias("value"))
+            .sort(["key", "value_category"])
+        )
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
 
 
 class TestValidateDecomposableRejection:

@@ -8,11 +8,14 @@ Three concerns, in three test classes:
   `execute.py`'s registered executors or its `NOT_YET_IMPLEMENTED` set, never both, never
   neither.
 - `TestLoweringNotImplemented`: the walk's failure path for a combination
-  `NOT_YET_IMPLEMENTED` names -- band-wide anything, and `project` at every shape.
+  `NOT_YET_IMPLEMENTED` names -- band-wide anything, and `project` in the two directions
+  that touch a raster grid (`("vector", "vector")` now has a real lowering; see
+  `tests/api/test_project.py` for its own coverage).
 - `TestEndToEnd`: the resume contract itself -- a JSON pipeline over a real fixture
   dataset, taken through `parse_pipeline` -> `validate_shapes` -> `compile_plan` ->
   `execute` -> `.collect()`, including a declared-order test proving that reordering two
-  steps changes the answer.
+  steps changes the answer, and a `project` step carried all the way through a real
+  crosswalk file.
 """
 
 import polars as pl
@@ -35,7 +38,7 @@ from cpra.mp.data.analysis.request.ops import (
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.grids import GRIDS
-from tests.factories import ANNUAL_KWARGS, write_annual_dataset, write_omar_dataset
+from tests.factories import ANNUAL_KWARGS, write_annual_dataset, write_omar_dataset, write_vector_crosswalk
 
 VECTOR_GRID = "hydro_compartment_v001"
 RASTER_GRID = "veg_grid_cell_v001"
@@ -156,7 +159,7 @@ class TestLoweringTableAgreement:
         assert NOT_YET_IMPLEMENTED["group"] == frozenset({Shape.band_wide})
         assert NOT_YET_IMPLEMENTED["join"] == frozenset({Shape.band_wide})
         assert NOT_YET_IMPLEMENTED["project"] == frozenset(
-            {("vector", "vector"), ("raster", "vector"), ("vector", "raster")}
+            {("raster", "vector"), ("vector", "raster")}
         )
 
 
@@ -228,12 +231,26 @@ class TestLoweringNotImplemented:
         with pytest.raises(LoweringNotImplementedError):
             execute(plan)
 
-    def test_project_raises_regardless_of_direction(self):
+    def test_raster_to_vector_project_raises(self):
+        # `("raster", "vector")` is still not-yet-implemented -- only `("vector",
+        # "vector")` has a real lowering (`execution/project.py`).
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum"}],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline)
+        with pytest.raises(LoweringNotImplementedError):
+            execute(plan)
+
+    def test_vector_to_raster_project_raises(self):
         pipeline = _pipeline(
             {
                 "inputs": {"a": vector_input()},
-                "steps": [{"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum"}],
-                "output": {"format": "csv"},
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID}],
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline)
@@ -460,3 +477,38 @@ class TestEndToEnd:
             year + geo_id / 100 - geo_id for year in (2030, 2040) for geo_id in range(1, 33)
         )
         assert sorted(df["value"].to_list()) == pytest.approx(expected, abs=1e-3)
+
+    def test_project_runs_as_a_whole_json_pipeline(self, annual_dataset, crosswalk_path):
+        # The resume contract's end-to-end walk: a real fixture dataset, a real crosswalk
+        # file on disk, taken through the whole `parse_pipeline` -> `validate_shapes` ->
+        # `compile_plan` -> `execute` chain, ending in `project`'s own long-shaped
+        # lowering (`execution/project.py`) rather than a hand-built frame the way
+        # `tests/api/test_project.py` exercises it.
+        #
+        # Only cells 1 and 2 are given a crosswalk row (weights 0.5/0.5 into one
+        # destination) -- the other 30 fixture cells have no row at all, so the crosswalk
+        # join drops them, and the resulting frame has exactly one destination cell per
+        # year. `ssf`'s fixture value is `year + geo_id / 100`, so:
+        #   sum = 0.5*(year + 0.01) + 0.5*(year + 0.02) = year + 0.015
+        write_vector_crosswalk(
+            crosswalk_path, "ecoregion_v001", "parish_v2020", [(1, 900, 0.5), (2, 900, 0.5)]
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {
+                    "a": {"variable": ANNUAL_KWARGS["variable"], "time_unit": "annual", "grid": ANNUAL_KWARGS["grid"]}
+                },
+                "steps": [{"op": "project", "input": "a", "to": "parish_v2020", "aggregate": "sum"}],
+                "output": {"format": "csv"},
+            }
+        )
+        df = execute(compile_plan(pipeline), base_path=annual_dataset).collect().sort("calendar_year")
+
+        assert df["grid_cell"].to_list() == [900, 900]
+        assert df["calendar_year"].to_list() == [2030, 2040]
+        assert df["value"].to_list() == pytest.approx([2030.015, 2040.015])
+        # The `grid` column a vector scan materializes names the DESTINATION grid here,
+        # not `a`'s own -- those `grid_cell` values are parish ids. This is the one place
+        # the whole chain runs, so it is the one place the column reaching a writer can be
+        # checked against the cell ids sitting next to it.
+        assert set(df["grid"].to_list()) == {"parish_v2020"}

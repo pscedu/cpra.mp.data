@@ -53,6 +53,7 @@ from typing import Any
 import polars as pl
 
 from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES
+from cpra.mp.data.analysis.request.errors import AggregateError
 from cpra.mp.data.config import TABULAR_FOLD_STEP
 
 # Group-by columns whose presence, on its own, is treated as a high-cardinality signal --
@@ -159,11 +160,30 @@ def fold_group_by(
     keys: Sequence[Any],
     aggregate: str,
     value_column: str = "value",
+    weight_column: str | None = None,
     step: int | None = None,
     chunk_transform: Callable[[pl.LazyFrame], pl.LazyFrame] | None = None,
 ) -> pl.DataFrame:
     """Compute `<lf>.group_by(*keys).agg(<aggregate> of value_column)`, bounding peak
     memory by never handing the underlying `group_by` more than `step` rows at once.
+
+    `weight_column`, when given, only changes what `aggregate == "mean"` carries through
+    the fold: instead of (sum of `value_column`, count of non-null `value_column`) it
+    carries (sum of `value_column * weight_column`, sum of `weight_column` restricted to
+    rows where `value_column` is non-null) -- the area-weighted mean a vector-to-vector
+    `project` needs (`execution/project.py`), where each contributing row's weight is the
+    fraction of its source cell's area landing in this destination. The restriction to
+    non-null-`value_column` rows on the SECOND half of that pair is not optional: a plain
+    `sum(weight_column)` would count the weight of a null-valued row the numerator already
+    skipped, understating the true per-unit-weight average by folding in weight that
+    contributed nothing to the numerator. Both this restriction and the eventual
+    zero-denominator guard below (`otherwise(None)`, not a `NaN` from dividing two zero
+    sums) must hold per CHUNK, not just once at the end, or a chunk boundary landing
+    inside an all-null-valued group would silently reproduce the bug this restriction
+    exists to avoid. Ignored for every other aggregate -- `sum`/`min`/`max`/`count` on a
+    project are unweighted by design (see that module's docstring for why only `sum` and
+    `mean` take a weight), and unused entirely when `weight_column` is `None`, which
+    reproduces this function's exact prior (unweighted-mean) behavior bit for bit.
 
     `lf_source` is called fresh for every chunk (it must return an independent,
     not-yet-collected `LazyFrame` each time -- a plain closure over an already-built
@@ -251,12 +271,20 @@ def fold_group_by(
             chunk = chunk_transform(chunk)
 
         if aggregate == "mean":
+            if weight_column is not None:
+                sum_expr = (pl.col(value_column) * pl.col(weight_column)).sum()
+                denom_expr = (
+                    pl.when(pl.col(value_column).is_not_null())
+                    .then(pl.col(weight_column))
+                    .otherwise(None)
+                    .sum()
+                )
+            else:
+                sum_expr = pl.col(value_column).sum()
+                denom_expr = pl.col(value_column).count()
             part = (
                 chunk.group_by(*keys)
-                .agg(
-                    pl.col(value_column).sum().alias(_SUM_ALIAS),
-                    pl.col(value_column).count().alias(_COUNT_ALIAS),
-                )
+                .agg(sum_expr.alias(_SUM_ALIAS), denom_expr.alias(_COUNT_ALIAS))
                 .collect(engine="streaming")
             )
         else:
@@ -293,5 +321,95 @@ def fold_group_by(
             .otherwise(None)
             .alias(value_column)
         ).drop(_SUM_ALIAS, _COUNT_ALIAS)
+
+    return acc
+
+
+def fold_count_by_value(
+    lf_source: Callable[[], pl.LazyFrame],
+    keys: Sequence[Any],
+    value_column: str,
+    max_distinct: int,
+    step: int | None = None,
+    chunk_transform: Callable[[pl.LazyFrame], pl.LazyFrame] | None = None,
+) -> pl.DataFrame:
+    """The `count_by_value` counterpart of `fold_group_by`, kept as a separate function
+    rather than one more `aggregate` branch there: `count_by_value`'s accumulator is not a
+    scalar (or a scalar pair, like `mean`'s) but a whole COUNT TABLE, one row per (group,
+    distinct value) -- a different accumulator shape, not a bigger one, so folding it does
+    not decompose into `fold_group_by`'s existing merge branches. There is no aggregate in
+    the vocabulary that does not fold; this is what makes that true for the one aggregate
+    whose accumulator does not look like the other five's.
+
+    The partial for one chunk is `chunk.group_by(*keys, value_column).agg(pl.len())`, and
+    the merge for two partials is exactly `count`'s own merge: concatenate, re-group by
+    every key INCLUDING the categorical one, and sum the counts. This is safe -- summing
+    counts of matching (group, category) keys across chunks reproduces the single-pass
+    answer exactly, the same associative-count argument `fold_group_by`'s own docstring
+    makes for plain `count`, just with one more column riding along in the key.
+
+    `value_column`'s null values are kept as their own category (never filtered out here
+    or by a caller's `chunk_transform`) -- the categorical count is over whatever value a
+    row actually carries, and a null measurement is a fact about that row, not the absence
+    of one. Polars' own `group_by` already groups `None` as an ordinary key value, so
+    nothing extra is needed to make that happen; it would take a deliberate filter to lose
+    it, and this function does not add one.
+
+    The cardinality probe (`approx_n_unique`, against `max_distinct`) runs once, up front,
+    against `lf_source()` directly -- the bare, pre-`chunk_transform` source -- rather than
+    per chunk or after transformation. This is deliberately conservative rather than
+    exact for the general case, but for THIS package's one caller it is actually exact:
+    the only `chunk_transform` `execution/project.py` supplies is an inner join to a
+    crosswalk, which can only drop rows whose source cell overlaps no destination -- it
+    can duplicate a row's existing value across several destination rows, but it can never
+    manufacture a value that was not already in `value_column` before the join. A probe
+    against the untransformed source therefore never UNDER-counts the true distinct-value
+    total a caller's transform could produce, which is the direction that matters: this
+    check exists to refuse a continuous column before the unbounded `group_by` it would
+    otherwise cost, not to admit one a moment too early.
+
+    Raises `request.errors.AggregateError` if the probe exceeds `max_distinct` -- the
+    request layer's own "an aggregate can't do what was asked of it" family, since this is
+    exactly that: `count_by_value` is for bounded categorical data, and a column that
+    fails this probe is not that, discovered here because it can only be discovered by
+    reading the data, never at plan time.
+    """
+    if step is None:
+        step = TABULAR_FOLD_STEP
+    if step <= 0:
+        raise FoldError(f"fold step must be positive, got {step}")
+
+    n_unique = lf_source().select(pl.col(value_column).approx_n_unique()).collect(engine="streaming").item()
+    if n_unique > max_distinct:
+        raise AggregateError(
+            f"count_by_value would produce approximately {n_unique} distinct values for "
+            f"'{value_column}', over the limit of {max_distinct} -- count_by_value is meant "
+            "for bounded categorical data (e.g. a land-type code), not continuous data"
+        )
+
+    n_rows = lf_source().select(pl.len()).collect(engine="streaming").item()
+
+    acc = None
+    key_columns = None
+    for offset in range(0, max(n_rows, 1), step):
+        chunk = lf_source().slice(offset, step)
+        if chunk_transform is not None:
+            chunk = chunk_transform(chunk)
+
+        part = (
+            chunk.group_by(*keys, pl.col(value_column).alias("value_category"))
+            .agg(pl.len().alias("value"))
+            .collect(engine="streaming")
+        )
+
+        if key_columns is None:
+            key_columns = [c for c in part.columns if c != "value"]
+
+        if acc is None:
+            acc = part
+            continue
+
+        merged = pl.concat([acc, part])
+        acc = merged.group_by(*key_columns).agg(pl.col("value").sum().alias("value"))
 
     return acc
