@@ -131,6 +131,25 @@ def write_annual_dataset(base_path, years=(2030, 2040), **overrides):
     return {**ANNUAL_KWARGS, **overrides}
 
 
+def write_omar_dataset(base_path, years=(2030, 2040), ffibs_type="pl_bf", value_fn=None, **overrides):
+    """Write an annual omar dataset — the SECOND variable on ``ecoregion_v001``, so a test
+    can put two different variables on one grid without leaving the real structure CSVs.
+
+    Same cells and years as :func:`write_annual_dataset`, so the two line up row for row
+    on ``(calendar_year, grid_cell)``; ``value_fn`` defaults to the same one too, so a
+    test that wants the two variables to hold DIFFERENT numbers passes its own. Two
+    differences from ``ssf`` come from ``variables.csv`` and are deliberately not smoothed
+    over: ``omar`` is ``Float64`` (hence the cast), and it requires ``ffibs_type`` on top
+    of ``percentile``, so its rows carry one dimension column ``ssf``'s do not.
+    """
+    df = annual_frame(years=years, value_fn=value_fn, variable="omar", **overrides).with_columns(
+        pl.lit(ffibs_type).alias("ffibs_type"),
+        *[pl.col(str(geo_id)).cast(pl.Float64) for geo_id in ECOREGION_IDS],
+    )
+    write_parquet(df, base_path=base_path)
+    return {**ANNUAL_KWARGS, "variable": "omar", "ffibs_type": ffibs_type, **overrides}
+
+
 def raster_array(fill=None, grid_name=RASTER_KWARGS["grid"], dtype="int32"):
     """A pixel array matching the shape of a raster grid."""
     grid = GRIDS[grid_name]

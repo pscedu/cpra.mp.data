@@ -125,6 +125,17 @@ class InputSelection(BaseModel):
     grid: Grid
 
 
+# The three columns that identify WHICH DATASET a row came from, rather than describing
+# the observation itself. A vector scan materializes each of them as an ordinary literal
+# column (every row of a `variable=marsh` read carries `variable = "marsh"`), which makes
+# them indistinguishable from real dimension columns by schema alone -- so anything that
+# reasons about "this frame's dimensions" has to name them explicitly to exclude them.
+#
+# Derived from `InputSelection`'s own fields rather than spelled out, so narrowing or
+# widening what an input selects cannot leave a stale second list behind.
+DATASET_SELECTION_COLUMNS = frozenset(InputSelection.model_fields)
+
+
 # --------------------------------------------------------------------------------------
 # Steps
 # --------------------------------------------------------------------------------------

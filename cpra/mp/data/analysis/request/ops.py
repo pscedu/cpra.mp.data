@@ -24,8 +24,12 @@ need `Pipeline`/`Step` from `pipeline.py`; `pipeline.py` cannot import this modu
 without a cycle. `validate_pipeline` (`pipeline.py`) and `validate_shapes` (here) are
 therefore two functions, in two modules, implementing what spec calls one VALIDATE stage:
 a `Pipeline` needs both calls -- `pipeline.parse_pipeline(data)` then
-`ops.validate_shapes(pipeline)` -- before `compile_ops` (which assumes both already ran)
-is safe to call.
+`ops.validate_shapes(pipeline)` -- before anything executes it.
+
+`validate_shapes` itself runs `compile_ops` first, so that the shape walk sees resolved
+operand names rather than re-implementing the "chain from the previous step" default a
+second time. That is not circular: `compile_ops` requires only STRUCTURAL validity (the
+chaining and `as` rules `parse_pipeline` already enforced), never shape validity.
 """
 
 import dataclasses
@@ -204,11 +208,16 @@ def _default_output_name(step_no: int) -> str:
 
 
 def compile_ops(pipeline: Pipeline) -> list[Op]:
-    """Turn an already-validated `Pipeline` -- one that passed
-    `pipeline.parse_pipeline`/`validate_pipeline` AND `validate_shapes`, whose chaining/
-    `as`/shape rules this function assumes rather than re-checks -- into `list[Op]`, one
-    entry per step, **in declared order**. Never opens a dataset and never decides a
-    `project`'s cardinality direction; an `Op` records only what the pipeline DECLARED.
+    """Turn a structurally-valid `Pipeline` -- one that passed `pipeline.parse_pipeline`/
+    `validate_pipeline`, whose chaining and `as` rules this function assumes rather than
+    re-checks -- into `list[Op]`, one entry per step, **in declared order**. Never opens a
+    dataset and never decides a `project`'s cardinality direction; an `Op` records only
+    what the pipeline DECLARED.
+
+    Shape validity is deliberately NOT a precondition: `validate_shapes` calls this first,
+    then types the resulting ops, so requiring it here would be circular. Compiling a
+    shape-invalid pipeline is harmless -- an `Op` list is just the declaration, and
+    nothing executes one that has not been through `validate_shapes`.
 
     Every `Op`'s `input` (or `inputs`, for `join`) is fully resolved here, never left as
     an implicit "chain from the previous step" default.
@@ -267,8 +276,11 @@ def compile_ops(pipeline: Pipeline) -> list[Op]:
 
 
 @dataclasses.dataclass(frozen=True)
-class _FrameState:
-    """What `validate_shapes`'s walk tracks for one named input/step output.
+class FrameType:
+    """Everything the shape-typing walk knows about one named input/step output, and the
+    whole of what a downstream consumer needs in order to pick a lowering for an op
+    reading that frame: `annotate_frame_types` below returns one of these per name, and
+    the execution walk dispatches on them rather than re-deriving any of it.
 
     `shape`/`grid` are what a later `project`/`join` needs to know this frame's own
     legality: `grid` is the grid this frame is CURRENTLY addressed against (an input's
@@ -290,16 +302,34 @@ class _FrameState:
     value_columns: frozenset[str]
 
 
-def _initial_state(selection: InputSelection) -> _FrameState:
+def project_direction(current: FrameType, to_grid: str) -> tuple[str, str]:
+    """The `(from kind, to kind)` pair keying `PROJECT_LOWERING_TABLE` for a project
+    carrying `current` onto `to_grid` -- "raster"/"vector", read off `GRIDS`.
+
+    Public, and the one definition of what a project's DIRECTION is, because two callers
+    need the same answer from opposite ends: `_type_project` below, to decide whether the
+    direction has a lowering at all, and the execution walk, to decide WHICH of the three
+    lowerings to dispatch to. A project is the one op whose lowering is not selected by
+    the incoming shape alone -- a long frame projects to either vector (long out) or
+    raster (band-wide out) -- so a shape-keyed dispatch cannot pick it and the grid kinds
+    have to be consulted directly.
+
+    Note `current.grid`, not the input's declared grid: a spatial filter can turn a
+    band-wide frame long while leaving it addressed against the same raster lattice, and
+    a project from there is still raster-to-something (see `FrameType`).
+    """
+    return GRIDS[current.grid].grid_type, GRIDS[to_grid].grid_type
+
+
+def _initial_state(selection: InputSelection) -> FrameType:
     grid_name = selection.grid
     kind = GRIDS[grid_name].grid_type
     shape = Shape.band_wide if kind == "raster" else Shape.long
-    return _FrameState(shape=shape, grid=grid_name, has_count_by_value=False, value_columns=frozenset({"value"}))
+    return FrameType(shape=shape, grid=grid_name, has_count_by_value=False, value_columns=frozenset({"value"}))
 
 
-def _type_project(step_no: int, step: ProjectStep, current: _FrameState) -> _FrameState:
-    from_kind = GRIDS[current.grid].grid_type
-    to_kind = GRIDS[step.to].grid_type
+def _type_project(step_no: int, step: ProjectStep | ProjectOp, current: FrameType) -> FrameType:
+    from_kind, to_kind = project_direction(current, step.to)
     try:
         out_shape = PROJECT_LOWERING_TABLE[(from_kind, to_kind)]
     except KeyError as exc:
@@ -326,10 +356,10 @@ def _type_project(step_no: int, step: ProjectStep, current: _FrameState) -> _Fra
             )
         has_count_by_value = True
 
-    return _FrameState(shape=out_shape, grid=step.to, has_count_by_value=has_count_by_value, value_columns=frozenset({"value"}))
+    return FrameType(shape=out_shape, grid=step.to, has_count_by_value=has_count_by_value, value_columns=frozenset({"value"}))
 
 
-def _type_filter(step: FilterStep, current: _FrameState) -> _FrameState:
+def _type_filter(step: FilterStep | FilterOp, current: FrameType) -> FrameType:
     kinds = classify_where_kinds(step.where)
     if kinds[PredicateKind.spatial]:
         kind = PredicateKind.spatial
@@ -341,15 +371,29 @@ def _type_filter(step: FilterStep, current: _FrameState) -> _FrameState:
     return dataclasses.replace(current, shape=new_shape)
 
 
-def _type_calculate(current: _FrameState) -> _FrameState:
+def _type_calculate(current: FrameType) -> FrameType:
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
 
-def _type_group(current: _FrameState) -> _FrameState:
+def _type_group(current: FrameType) -> FrameType:
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
 
-def _type_join(step_no: int, step: JoinStep, operand_states: list[_FrameState]) -> _FrameState:
+def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[FrameType]) -> FrameType:
+    """A join's operands must agree on both shape and grid, whatever that shape is.
+
+    The grid requirement holds for a long join for the same reason it holds for a
+    band-wide one: `grid_cell` identifies a cell WITHIN one grid, and nothing about the
+    number 7 says which lattice it indexes. Two frames on different grids have no cell in
+    common, so a join between them is asking for a correspondence that does not exist --
+    and the right way to establish one is a `project` bringing both onto a single grid,
+    which is exactly the op that owns cell-to-cell correspondence.
+
+    Note `FrameType.grid`, not the input's declared grid: a spatial filter turns a
+    band-wide frame long while leaving it addressed against the same raster lattice, so a
+    long frame is not necessarily on a vector grid, and this check is about the lattice
+    either way.
+    """
     shapes = {s.shape for s in operand_states}
     if len(shapes) != 1:
         raise ShapeError(
@@ -359,28 +403,64 @@ def _type_join(step_no: int, step: JoinStep, operand_states: list[_FrameState]) 
     shape = shapes.pop()
     out_shape = JOIN_LOWERING_TABLE[shape]
 
-    if shape == Shape.band_wide:
-        grids = {s.grid for s in operand_states}
-        if len(grids) != 1:
-            raise ShapeError(
-                f"step {step_no} (join): band-wide operands must share one grid, got "
-                f"{sorted(grids)} -- insert a project to bring every operand onto one "
-                "grid first"
-            )
-        grid = next(iter(grids))
-    else:
-        grid = operand_states[0].grid
+    grids = {s.grid for s in operand_states}
+    if len(grids) != 1:
+        raise ShapeError(
+            f"step {step_no} (join): operands must share one grid, got {sorted(grids)} -- "
+            "a `grid_cell` identifies a cell within one grid, so operands on different "
+            "grids have no cell in common; insert a project to bring every operand onto "
+            "one grid first"
+        )
+    grid = next(iter(grids))
 
     has_count_by_value = any(s.has_count_by_value for s in operand_states)
     value_columns = frozenset(step.inputs)
-    return _FrameState(shape=out_shape, grid=grid, has_count_by_value=has_count_by_value, value_columns=value_columns)
+    return FrameType(shape=out_shape, grid=grid, has_count_by_value=has_count_by_value, value_columns=value_columns)
+
+
+def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameType]:
+    """Type every named frame in `pipeline` -- each declared input, and each op's output --
+    returning name -> `FrameType`. `ops` is `compile_ops(pipeline)`'s output, so every
+    operand name is already resolved and this walk never has to re-derive the "chain from
+    the previous step" default.
+
+    This is the ONE place the shape-typing rules run. `validate_shapes` calls it to reach
+    the final frame it checks the sink rules against, and the execution layer's compile
+    step calls it to record what the walk dispatches on -- neither carries its own copy of
+    the rules (e.g. `_type_filter`'s spatial > value > dimension precedence), so the two
+    cannot drift. It is exposed for that second caller: a consumer outside this module
+    needs these answers and must not have to reach past the underscore to get them.
+
+    Raises `ShapeError` for every shape-dependent rejection decidable from the declared
+    ops and each input's grid kind alone; see `validate_shapes` for the list. Opens
+    nothing.
+    """
+    frame_types: dict[str, FrameType] = {
+        name: _initial_state(selection) for name, selection in pipeline.inputs.items()
+    }
+    for op in ops:
+        if isinstance(op, JoinOp):
+            new_type = _type_join(op.step_no, op, [frame_types[name] for name in op.inputs])
+        elif isinstance(op, ProjectOp):
+            new_type = _type_project(op.step_no, op, frame_types[op.input])
+        elif isinstance(op, FilterOp):
+            new_type = _type_filter(op, frame_types[op.input])
+        elif isinstance(op, CalculateOp):
+            new_type = _type_calculate(frame_types[op.input])
+        elif isinstance(op, GroupOp):
+            new_type = _type_group(frame_types[op.input])
+        else:  # pragma: no cover -- exhaustive over the Op union
+            raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")
+        frame_types[op.output] = new_type
+    return frame_types
 
 
 def validate_shapes(pipeline: Pipeline) -> None:
-    """Walk `pipeline` (assumed already structurally valid -- see `pipeline.
-    validate_pipeline`) in declared order, typing each input/step output's shape and
-    raising `ShapeError` for every shape-dependent rejection decidable from the declared
-    ops and each input's grid kind alone:
+    """Type `pipeline` (assumed already structurally valid -- see `pipeline.
+    validate_pipeline`) via `annotate_frame_types`, then check the two rules that belong
+    to the FINAL frame rather than to any one op. Raises `ShapeError` for every
+    shape-dependent rejection decidable from the declared ops and each input's grid kind
+    alone:
 
     - raster-to-raster `project` (`_type_project`, via `PROJECT_LOWERING_TABLE`'s
       absence);
@@ -394,39 +474,9 @@ def validate_shapes(pipeline: Pipeline) -> None:
 
     Nothing here opens a file or knows a crosswalk.
     """
-    states: dict[str, _FrameState] = {
-        name: _initial_state(selection) for name, selection in pipeline.inputs.items()
-    }
-    previous_output: str | None = None
-
-    if not pipeline.steps:
-        final = next(iter(states.values()))
-    else:
-        for step_no, step in enumerate(pipeline.steps, start=1):
-            if isinstance(step, JoinStep):
-                operand_states = [states[name] for name in step.inputs]
-                new_state = _type_join(step_no, step, operand_states)
-            else:
-                explicit = _step_explicit_inputs(step)
-                input_name = explicit[0] if explicit else previous_output
-                current = states[input_name]
-                if isinstance(step, ProjectStep):
-                    new_state = _type_project(step_no, step, current)
-                elif isinstance(step, FilterStep):
-                    new_state = _type_filter(step, current)
-                elif isinstance(step, CalculateStep):
-                    new_state = _type_calculate(current)
-                elif isinstance(step, GroupStep):
-                    new_state = _type_group(current)
-                else:  # pragma: no cover -- exhaustive over the Step union
-                    raise RequestError(f"step {step_no} has unrecognized op {getattr(step, 'op', None)!r}")
-
-            as_name = getattr(step, "as_", None)
-            output_name = as_name if as_name is not None else _default_output_name(step_no)
-            states[output_name] = new_state
-            previous_output = output_name
-
-        final = states[previous_output]
+    ops = compile_ops(pipeline)
+    frame_types = annotate_frame_types(pipeline, ops)
+    final = frame_types[ops[-1].output] if ops else next(iter(frame_types.values()))
 
     if len(final.value_columns) != 1:
         raise ShapeError(

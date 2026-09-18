@@ -423,24 +423,33 @@ class CalculatePlan(NamedTuple):
     value_where: str | None
 
 
-def compile_calculate_entries(entries):
+def compile_calculate_entries(entries, allowed_columns=("value",)):
     """Validate calculate entries -- `(label, expression, where)` triples, in application
     order -- into `CalculatePlan`s, before any file is opened.
 
-    `expression` goes through `parse_calculate_expression` against the `value`-only
-    namespace. `where` (optional) gets exactly a `FilterOp`'s treatment: split and
+    `expression` goes through `parse_calculate_expression` against `allowed_columns`.
+    `where` (optional) gets exactly a `FilterOp`'s treatment: split and
     classified by `classify_where` (so a conjunct mixing a dimension column and `value`,
     an aggregate call, or a subquery is rejected with the same messages `where` gives),
     dimension conjuncts recombined into `dimension_where` -- their column NAMES are
     grid-dependent and are checked where the plan is applied -- and value conjuncts
-    recombined into `value_where` and validated here against the `value` placeholder.
+    recombined into `value_where` and validated here against the same namespace.
+
+    `allowed_columns` defaults to the `value` placeholder alone, which is what every
+    single-value-column caller wants and what this function accepted before the parameter
+    existed. It is a parameter because a frame does not always carry its measurement in a
+    column called `value`: a `join`'s output names each operand's measurement after the
+    operand (`a`, `b`, ...), and the whole point of the `calculate` that follows is to
+    compute one `value` from them, so that caller passes those names instead. Both uses
+    below take the same namespace, since `expression` and `where`'s value conjuncts read
+    the same columns of the same frame.
 
     Every rejection is an `ExpressionError` prefixed with the offending entry's label.
     """
     plans = []
     for label, expression, where in entries:
         try:
-            parse_calculate_expression(expression)
+            parse_calculate_expression(expression, allowed_columns)
         except ExpressionError as exc:
             raise ExpressionError(f"{label}: {exc}") from exc
 
@@ -456,7 +465,7 @@ def compile_calculate_entries(entries):
             if value_conjuncts:
                 value_where = " and ".join(f"({c})" for c in value_conjuncts)
                 try:
-                    parse_value_expr(value_where, ["value"])
+                    parse_value_expr(value_where, allowed_columns)
                 except ExpressionError as exc:
                     raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
 

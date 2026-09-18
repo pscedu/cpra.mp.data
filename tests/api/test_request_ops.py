@@ -280,15 +280,53 @@ class TestJoinShapeRules:
         with pytest.raises(ShapeError, match="value column"):
             validate_shapes(pipeline)
 
-    def test_long_join_on_two_different_grids_accepted(self):
-        """Unlike band-wide, a long join does not require its operands to share a
-        grid -- vector data carries its own `grid_cell` per row regardless of grid."""
+    def test_long_join_across_two_different_grids_rejected(self):
+        """A long join requires a shared grid just as a band-wide one does: `grid_cell`
+        numbers a cell WITHIN a grid, so two vector grids' cell 7 are unrelated and the
+        join has no correspondence to match on."""
         pipeline = parse_pipeline(
             {
                 "inputs": {"a": vector_input(grid=VECTOR_GRID), "b": vector_input(grid=VECTOR_GRID_2)},
                 "steps": [
                     {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
                     {"op": "calculate", "expression": "a + b"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="share one grid"):
+            validate_shapes(pipeline)
+
+    def test_long_join_on_one_grid_accepted(self):
+        """The same two variables brought onto one grid -- the shape the rejection above
+        asks for, and the one a real cross-variable comparison takes."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(grid=VECTOR_GRID),
+                    "b": vector_input(grid=VECTOR_GRID, variable="stg"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "a - b"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        validate_shapes(pipeline)
+
+    def test_long_join_after_a_project_onto_a_common_grid_accepted(self):
+        """The remedy the error message names, end to end: an operand on the wrong grid is
+        brought onto the other's by a `project`, and the join then types cleanly. The
+        check reads `FrameType.grid`, which a `project` updates, not the input's declared
+        grid -- so inserting the project is genuinely what unblocks it."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": vector_input(grid=VECTOR_GRID), "b": vector_input(grid=VECTOR_GRID_2)},
+                "steps": [
+                    {"op": "project", "input": "b", "to": VECTOR_GRID, "aggregate": "mean", "as": "pb"},
+                    {"op": "join", "type": "spatial", "inputs": ["a", "pb"], "as": "j"},
+                    {"op": "calculate", "expression": "a + pb"},
                 ],
                 "output": {"format": "csv"},
             }
