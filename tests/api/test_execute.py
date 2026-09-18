@@ -1,6 +1,6 @@
 """Tests for `cpra.mp.data.analysis.execution.execute` -- the walk.
 
-Four concerns, in four test classes:
+Five concerns, in five test classes:
 
 - `TestLoweringTableAgreement`: the bidirectional coverage check the module docstring
   promises -- every `(op, shape)` combination `request.ops`'s lowering tables (or, for
@@ -19,23 +19,39 @@ Four concerns, in four test classes:
 - `TestBandWideEndToEnd`: the same resume contract for a raster input -- opening a
   band-wide frame, running `filter`/`calculate`/`group`/`join`/`project` against it, and
   the mid-walk transition to long shape a spatial filter causes.
+- `TestTileScopedReads`: the same walk again, over a plan compiled for a map tile --
+  every raster origin read at its own window instead of whole, including the shared
+  window a band-wide join group's single scan uses and the widening an origin feeding a
+  raster-to-vector `project` needs to see whole features across the tile's edge.
 """
 
+import dataclasses
+
+import mercantile
 import numpy as np
 import polars as pl
 import pytest
+import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
+from rasterio.warp import transform_bounds
+from rasterio.windows import Window
 
 from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.execute import (
     NOT_YET_IMPLEMENTED,
     LoweringNotImplementedError,
     _LOWERINGS,
+    _shared_tile_window,
     execute,
 )
-from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN
-from cpra.mp.data.analysis.execution.plan import compile_plan
+from cpra.mp.data.analysis.execution.frame import (
+    RESERVED_BAND_INDEX_COLUMN,
+    band_column_names,
+    has_no_bands,
+)
+from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
+from cpra.mp.data.analysis.io.raster_io import raster_grid_geometry, tile_source_window
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
     FrameType,
@@ -51,6 +67,7 @@ from tests.factories import (
     RASTER_KWARGS,
     raster_array,
     write_annual_dataset,
+    write_grid_geometry,
     write_omar_dataset,
     write_raster_crosswalk,
     write_raster_dataset,
@@ -168,10 +185,10 @@ class TestLoweringTableAgreement:
             assert key in domains[kind], f"{kind!r} has no declared lowering for {key!r}"
 
     def test_not_yet_implemented_set_is_empty_for_every_op(self):
-        # A concrete pin on "this stage wires everything the lowering tables declare
-        # legal" -- this test fails the moment a later stage grows a lowering table (a new
-        # grid kind, a new predicate combination) without also wiring the executor,
-        # forcing that stage to either add the lowering or come back and name the gap here
+        # A concrete pin on "the executor wires everything the lowering tables declare
+        # legal" -- this fails the moment a lowering table grows an entry (a new grid kind,
+        # a new predicate combination) without the executor growing the lowering to match,
+        # forcing whoever widened the table to either implement it or name the gap here
         # rather than leaving `NOT_YET_IMPLEMENTED` stale.
         assert NOT_YET_IMPLEMENTED["filter"] == frozenset()
         assert NOT_YET_IMPLEMENTED["calculate"] == frozenset()
@@ -522,10 +539,17 @@ class TestBandWideEndToEnd:
         assert stats["min"] == pytest.approx(80)
         assert stats["max"] == pytest.approx(80)
         assert stats["nulls"] == 0
-        # `group_band_wide(by=[])` leaves the reserved band-index column standing (see
-        # that function's own docstring); this is the one place that proves `execute()`'s
-        # own cleanup actually removes it before the walk's result reaches a caller.
-        assert RESERVED_BAND_INDEX_COLUMN not in metadata_df.columns
+        # `group_band_wide(by=[])` collapses every dimension column out of `metadata_df`,
+        # leaving the reserved band-index column as the ONLY thing carrying "one band
+        # survived" -- so what `execute()`'s own cleanup must not do here is drop it, which
+        # would take the height with it (Polars cannot hold zero columns and one row) and
+        # report an empty result for a raster that plainly has 383,980 pixels of data in
+        # it. The band count, not the column's absence, is what this asserts: the earlier
+        # spelling (`RESERVED_BAND_INDEX_COLUMN not in metadata_df.columns`) was satisfied
+        # by a metadata frame collapsed to shape (0, 0), which is exactly the bug.
+        assert not has_no_bands(metadata_df)
+        assert metadata_df.height == 1
+        assert band_column_names(metadata_df) == ["b0"]
 
     def test_spatial_filter_turns_the_frame_long_mid_walk(self, base_path):
         # Same two-band fixture as above. `grid_cell == 0` is a SPATIAL conjunct, so
@@ -1077,3 +1101,255 @@ class TestBandWideEndToEnd:
 
         with pytest.raises(ValueError, match="partial zero-band mismatch"):
             execute(plan, base_path=base_path)
+
+
+def _tile_over_the_raster_grid(zoom=12):
+    """A tile covering the middle of `RASTER_GRID`'s extent. At z=12 that is a 27x27-pixel
+    window out of the grid's 1052x365 -- small enough that reading it instead of the whole
+    raster is unmistakable in any count below."""
+    grid = GRIDS[RASTER_GRID]
+    west, south, east, north = transform_bounds(grid.crs, "EPSG:4326", *grid.bounds)
+    return mercantile.tile((west + east) / 2, (south + north) / 2, zoom)
+
+
+class TestTileScopedReads:
+    """A plan compiled for a map tile (`compile_plan(..., tile=...)`) reads each raster
+    origin at that tile's own window instead of whole, and the walk over it is the same walk
+    as any other -- no tile-specific op path, which is what lets a tile request run the ops
+    a band-wide sink could not (`project` onto a vector grid, below).
+
+    Which window a tile needs is `execution.plan`'s decision and is pinned there
+    (`test_execution_plan.py::TestTileReadWindow`); what this class pins is that the decision
+    reaches the reader and moves the actual pixels.
+    """
+
+    def test_a_tile_scoped_read_returns_only_that_window(self, base_path):
+        # A unique value in every pixel (`raster_array`'s `arange`), so this can assert the
+        # read landed on the RIGHT 27x27 block and not merely on a 27x27-shaped one -- a
+        # window whose offset was dropped somewhere between the compiler and `scan_raster`
+        # would still be the right size. The expectation is read straight off the file with
+        # rasterio, which shares no code with the scan under test.
+        write_raster_dataset(base_path, years=(2030,), data_fn=lambda _year: raster_array())
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [],
+                "output": {"format": "csv"},
+            }
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        plan = compile_plan(pipeline, base_path=base_path, tile=tile)
+        compiled = plan.inputs["a"].read_window
+
+        lf, _metadata_df, window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert (window.col_off, window.row_off) == (int(compiled.col_off), int(compiled.row_off))
+        assert (window.width, window.height) == (int(compiled.width), int(compiled.height))
+        assert df.height == window.width * window.height
+
+        path = next(base_path.rglob("*.tif"))
+        with rasterio.open(path) as src:
+            expected = src.read(1, window=compiled)
+        np.testing.assert_array_equal(
+            df["b0"].to_numpy().reshape(window.height, window.width), expected
+        )
+
+    def test_a_tile_that_misses_the_grid_opens_nothing(self, base_path, monkeypatch):
+        # `tile_disjoint` is settled at compile time, so the reader is never reached at all
+        # -- pinned by making `scan_raster` fail loudly rather than by checking only that
+        # the answer came back empty. The window still describes the whole grid, because a
+        # frame has to carry SOME geometry and the grid's is the only one available when
+        # nothing was opened (the same window the zero-band case builds).
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path, tile=TileRequest(1, 1, 1))
+        assert plan.inputs["a"].tile_disjoint is True
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError("scan_raster must not be called for a tile-disjoint origin")
+
+        monkeypatch.setattr(execute_module, "scan_raster", _fail_if_called)
+
+        lf, metadata_df, window = execute(plan, base_path=base_path)
+
+        assert lf.collect().is_empty()
+        assert has_no_bands(metadata_df)
+        assert (window.width, window.height) == (GRIDS[RASTER_GRID].width, GRIDS[RASTER_GRID].height)
+
+    def test_a_band_wide_join_reads_both_operands_from_one_tile_window(self, base_path, monkeypatch):
+        # The shared-scan prelude under a tile: two origins on one grid, one scan, one
+        # window. Both operands want the same window here (neither feeds a project), so what
+        # this pins is that the tile scoping survives the join path at all -- the union logic
+        # that handles operands wanting DIFFERENT windows is pinned directly below.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda _year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="ffibs_score",
+            data_fn=lambda _year: raster_array(fill=5, grid_name=RASTER_GRID, dtype="float32"),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        plan = compile_plan(pipeline, base_path=base_path, tile=tile)
+        compiled = plan.inputs["a"].read_window
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+        from cpra.mp.data.analysis.io.raster import scan_raster as real_scan_raster
+
+        calls = []
+
+        def counting_scan_raster(*args, **kwargs):
+            calls.append(kwargs.get("window"))
+            return real_scan_raster(*args, **kwargs)
+
+        monkeypatch.setattr(execute_module, "scan_raster", counting_scan_raster)
+
+        lf, _metadata_df, window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert len(calls) == 1
+        assert (window.width, window.height) == (int(compiled.width), int(compiled.height))
+        assert df.height == window.width * window.height
+        assert df["b0"].unique().to_list() == pytest.approx([10.0])
+        assert df["b1"].unique().to_list() == pytest.approx([5.0])
+
+    def test_a_join_groups_shared_window_is_the_union_of_its_operands(self, base_path):
+        # `_shared_tile_window` directly, since a pipeline that makes two operands of one
+        # join want different windows takes a fan-out, a project, a geometry file and a
+        # crosswalk to set up -- all of which this would then be testing through rather
+        # than testing. Only an origin feeding a raster-to-vector `project` is widened, so
+        # the mixed case is real; the union is what the one shared scan has to read, since a
+        # window too small for either operand silently drops that operand's pixels.
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline, base_path=base_path).inputs["a"]
+        inputs = {
+            "a": dataclasses.replace(resolved, read_window=Window(10, 20, 30, 40)),
+            "b": dataclasses.replace(resolved, read_window=Window(5, 25, 30, 40)),
+        }
+
+        shared = _shared_tile_window(("a", "b"), inputs)
+
+        # West edge from "b" (5), north edge from "a" (20), east edge from "a" (10+30=40),
+        # south edge from "b" (25+40=65) -- every side taken from whichever operand reaches
+        # furthest, which is the definition of "covers both".
+        assert (int(shared.col_off), int(shared.row_off)) == (5, 20)
+        assert (int(shared.col_off) + int(shared.width)) == 40
+        assert (int(shared.row_off) + int(shared.height)) == 65
+
+    def test_a_join_group_mixing_a_disjoint_operand_with_an_overlapping_one_raises(self, base_path):
+        # Disjointness is a property of the tile and the GRID, and a band-wide join's
+        # operands all sit on one grid -- so operands disagreeing about it means the group
+        # was built wrong upstream, not that one of them happens to be empty. Raising names
+        # that, rather than reading the union of "a window" and "no window at all".
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline, base_path=base_path).inputs["a"]
+        inputs = {
+            "a": dataclasses.replace(resolved, read_window=Window(10, 20, 30, 40)),
+            "b": dataclasses.replace(resolved, read_window=None, tile_disjoint=True),
+        }
+
+        with pytest.raises(ValueError, match="mixes tile-disjoint and overlapping"):
+            _shared_tile_window(("a", "b"), inputs)
+
+    def test_a_tile_scoped_project_reads_whole_features_across_the_tile_edge(
+        self, base_path, crosswalk_path, geometry_path
+    ):
+        # The case that only exists because the window is a compile-time decision: a tile
+        # whose pixels feed a raster-to-vector `project`, where the zone they project onto
+        # extends past the tile's own edge. Half of that zone's pixels lie outside the
+        # tile's window; a read clipped to the tile would drop them and report half the sum,
+        # with nothing anywhere in the chain to indicate it had.
+        #
+        # The zone is a 10x10 block straddling the west edge of the tile's own window -- 5
+        # columns inside it, 5 outside -- planted BOTH in the crosswalk (which decides which
+        # pixels belong to zone 900) and in the vector grid's geometry file (which is what
+        # the widening reads to find out how far past the tile the zone reaches). Every
+        # pixel holds 1, so `sum` counts pixels: 100 when the whole block was read, 50 when
+        # only the part inside the tile was.
+        from shapely.geometry import box
+
+        grid = GRIDS[RASTER_GRID]
+        transform = from_bounds(*grid.bounds, width=grid.width, height=grid.height)
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        plain = tile_source_window(raster_grid_geometry(RASTER_GRID), tile.bounds)
+        col_off, row_off = int(plain.col_off) - 5, int(plain.row_off) + 2
+        inside_the_tile = 5 * 10
+
+        zones = np.zeros((grid.height, grid.width), dtype="int32")
+        zones[row_off : row_off + 10, col_off : col_off + 10] = 900
+        write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            data_fn=lambda _year: raster_array(fill=1, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        west, north = transform * (col_off, row_off)
+        east, south = transform * (col_off + 10, row_off + 10)
+        write_grid_geometry(geometry_path, "ecoregion_v001", [(900, box(west, south, east, north))])
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [{"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "sum"}],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path, tile=tile)
+        widened = plan.inputs["a"].read_window
+
+        assert plan.inputs["a"].straddling_vector_grid == "ecoregion_v001"
+        assert int(widened.col_off) <= col_off  # the block's west edge is inside the read
+        assert int(plain.col_off) > col_off  # ...and was outside the unwidened one
+
+        df = execute(plan, base_path=base_path).collect()
+
+        assert df["grid_cell"].to_list() == [900]
+        assert df["value"].to_list() == pytest.approx([100.0])
+
+        # The same walk over the same files with the widening undone -- the control that
+        # makes the 100 above mean something. It answers 50, a plausible-looking number no
+        # caller could tell apart from a correct one, which is the whole reason the widening
+        # is a compile-time decision rather than something the sink could fix up later.
+        unwidened = dataclasses.replace(
+            plan, inputs={"a": dataclasses.replace(plan.inputs["a"], read_window=plain)}
+        )
+        df_unwidened = execute(unwidened, base_path=base_path).collect()
+
+        assert df_unwidened["value"].to_list() == pytest.approx([float(inside_the_tile)])

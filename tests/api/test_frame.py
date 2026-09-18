@@ -201,6 +201,57 @@ class TestReservedBandIndexDegenerateShape:
         assert RESERVED_BAND_INDEX_COLUMN not in exposed.columns
         assert exposed.equals(metadata_df)
 
+    def test_dropping_a_sole_reserved_index_destroys_the_count_it_was_added_to_carry(self):
+        # The exact hole `released_band_metadata` exists for, pinned on its own so the two
+        # tests below are read against a demonstrated fact rather than an asserted one: a
+        # `by=[]` group leaves the reserved column as the ONLY column, and `drop` of a
+        # frame's last column reports height 0 no matter how many rows went in.
+        collapsed = pl.DataFrame({"scenario": ["a"]}).select([])
+        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(
+            RESERVED_BAND_INDEX_COLUMN
+        )
+
+        assert collapsed.shape == (0, 0)
+        assert sole.height == 1
+        assert frame.drop_reserved_band_index(sole).height == 0
+
+    def test_released_band_metadata_keeps_a_sole_reserved_index_so_the_band_count_survives(self):
+        # One band in, one band out. Dropping here would report zero bands for a result
+        # that has one, which a raster sink reads as "this request matched no data".
+        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(
+            RESERVED_BAND_INDEX_COLUMN
+        )
+
+        released = frame.released_band_metadata(sole)
+
+        assert released.height == 1
+        assert not frame.has_no_bands(released)
+        assert frame.band_column_names(released) == ["b0"]
+
+    def test_released_band_metadata_still_drops_the_index_beside_a_real_column(self):
+        # The ordinary case is unchanged: where a dimension column carries the height, the
+        # position has nothing left to carry and goes, exactly as before.
+        indexed = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a", "b", "c"]}))
+
+        released = frame.released_band_metadata(indexed)
+
+        assert released.columns == ["scenario"]
+        assert released.height == 3
+
+    def test_released_band_metadata_is_a_no_op_when_the_index_is_absent(self):
+        metadata_df = pl.DataFrame({"scenario": ["a", "b"]})
+        assert frame.released_band_metadata(metadata_df).equals(metadata_df)
+
+    def test_released_band_metadata_leaves_a_genuinely_empty_frame_empty(self):
+        # A dimension filter that kept no band is still zero bands after release -- the
+        # sole-column carve-out must not manufacture one out of an empty frame.
+        empty = pl.DataFrame({RESERVED_BAND_INDEX_COLUMN: pl.Series([], dtype=pl.UInt32)})
+
+        released = frame.released_band_metadata(empty)
+
+        assert released.height == 0
+        assert frame.has_no_bands(released)
+
 
 # ----------------------------------------------------------------------------------
 # Cheap invariant assertions

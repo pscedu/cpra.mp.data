@@ -1,5 +1,6 @@
 """Analysis-layer helpers (the former api/utils.py, HTTP-free half). Nothing here may import FastAPI."""
 import asyncio
+import dataclasses
 import itertools
 import math
 from enum import Enum
@@ -9,9 +10,11 @@ from time import time
 import rasterio as rio
 from cachetools import TTLCache, cached
 from rasterio import windows
+from rasterio.coords import BoundingBox, disjoint_bounds
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
-from rasterio.transform import Affine, from_bounds
+from rasterio.transform import Affine, array_bounds, from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
@@ -356,12 +359,78 @@ def resampling_buffer_px(resampling):
     return TILE_READ_BUFFER_PX + radius
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class SourceGeometry:
+    """The four properties `tile_source_window` reads off a raster: where its pixels sit on
+    the ground and how many there are.
+
+    An open `rasterio` dataset already has all four under these names, and is what
+    `tile_source_window` was originally written against. This exists so a caller that must
+    NOT open a file can supply them from somewhere else -- `raster_grid_geometry` builds one
+    from a `cpra.mp.data.grids.RasterGrid`, which is what lets the compiler size a tile's
+    read window (`execution.plan`) while keeping its promise to open no data files.
+
+    That substitution is only sound because a raster dataset on grid *G* is co-registered
+    with *G* exactly: same CRS, same extent, same pixel count, therefore the same transform.
+    `execution.execute._grid_read_window` already rests on the same fact, and says it was
+    confirmed byte-identical against a real scan.
+    """
+
+    crs: CRS
+    transform: Affine
+    width: int
+    height: int
+
+
+def raster_grid_geometry(grid_name: str) -> SourceGeometry:
+    """`grid_name`'s own geometry as a `SourceGeometry`, opening nothing.
+
+    The transform is derived from the grid's bounds and pixel count exactly as
+    `io.raster.scan_raster` derives it for a full-extent read of a real raster on that grid.
+    """
+    grid = GRIDS[grid_name]
+    return SourceGeometry(
+        crs=CRS.from_user_input(grid.crs),
+        transform=from_bounds(*grid.bounds, width=grid.width, height=grid.height),
+        width=grid.width,
+        height=grid.height,
+    )
+
+
+def tile_disjoint_from_source(src, tile_bounds) -> bool:
+    """Whether `tile_bounds` (Web Mercator, `TILE_CRS`) shares no ground at all with `src`'s
+    own extent -- the cheap "this tile is nowhere near this raster" test, answered from the
+    same four properties `tile_source_window` reads (so a `SourceGeometry` serves as well as
+    an open dataset).
+
+    Separate from `tile_source_window` returning `None`, and not redundant with it, because
+    the two reproject in OPPOSITE directions. `tile_source_window` carries the tile's
+    footprint into the source's CRS, where a footprint far enough outside the projection's
+    domain of validity has no finite bounds at all; that function then falls back to the
+    source's full extent, since a window that certainly contains the footprint is the safe
+    answer to "which pixels might this tile need". This one carries the source's extent out
+    to Web Mercator, which is always finite (the source's own pixels are, by construction,
+    inside its projection's domain), and so stays decisive exactly where the other one
+    cannot be. A low-zoom tile covering a whole hemisphere of empty ocean is the case: the
+    inbound reprojection goes non-finite and yields the full raster, while this returns
+    `True` and the caller skips the read entirely.
+    """
+    source_bounds = transform_bounds(
+        src.crs, TILE_CRS, *array_bounds(src.height, src.width, src.transform), densify_pts=21
+    )
+    return disjoint_bounds(BoundingBox(*source_bounds), BoundingBox(*tile_bounds))
+
+
 def tile_source_window(
     src, tile_bounds, buffer_px=None, resampling=Resampling.nearest, straddling_vector_grid=None
 ):
     """The window of `src` (in its OWN CRS) covering the Web Mercator `tile_bounds`, as
     whole source pixels clipped to the source's extent -- or `None` when the tile's
     footprint lands entirely outside the source.
+
+    `src` is anything carrying `crs`/`transform`/`width`/`height`: an open `rasterio`
+    dataset, or a `SourceGeometry` built from a grid by `raster_grid_geometry` when the
+    caller must not open a file. Those four are all this function reads.
 
     Two properties of the returned window are what let a caller read it, run per-pixel work
     over the result in the SOURCE CRS, and only then warp onto the tile grid (see
@@ -620,6 +689,28 @@ def warp_window_to_tile(
     array_transform = windows.transform(window, src_transform)
     if out_shape is not None:
         array_transform *= Affine.scale(window.width / expected[1], window.height / expected[0])
+    return _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata, resampling=resampling)
+
+
+def warp_array_to_tile(
+    data, *, array_transform, src_crs, tile_bounds, tile_size, nodata, resampling=Resampling.nearest
+):
+    """Warp `data` onto a tile's pixel grid when its transform is ALREADY known to describe
+    it -- the sibling of `warp_window_to_tile` for a caller holding a georeferenced array
+    rather than a window and a dataset transform.
+
+    That is the case for anything read through `io.raster.scan_raster`: the `ReadWindow` it
+    returns carries the transform of the window it actually read, so a result computed over
+    those pixels is georeferenced by `ReadWindow.transform` directly, with nothing left to
+    derive. `warp_window_to_tile` exists to compute that transform for a caller who has only
+    the source's own; handing it a window and transform just to have it recompute a value
+    already in hand would be the longer way round, and would need the decimation scaling
+    reapplied by hand on top.
+
+    The sub-pixel warning on `warp_window_to_tile` applies here with nothing between the
+    caller and the mistake: `array_transform` MUST describe `data` itself. Prefer
+    `warp_window_to_tile` where the transform still has to be derived.
+    """
     return _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, nodata, resampling=resampling)
 
 

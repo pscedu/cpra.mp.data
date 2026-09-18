@@ -172,18 +172,33 @@ so it never appears in `straddling_vector_grid`, and nothing about attaching a r
 already-resolved pixel values to a vector chain's rows demands full resolution the way
 redistributing the pixels themselves onto new polygons does.
 
-Both fields are DECISIONS this module records, and only one of them currently has anywhere
-to go: `straddling_vector_grid` is exactly what `io.raster_io.tile_source_window` takes as
-its own argument of that name, while `overview_permitted` has no reader at all -- the call
-it would gate is `io.raster_io.tile_read_shape`, which neither takes it nor consults it,
-and no tile read in this package passes either field, because no tile route is mounted on
-this package yet. So the rule is computed and asserted (`tests/api/test_execution_plan.py`)
-but not yet ENFORCED anywhere, and an `overview_permitted=False` origin would today be
-decimated like any other. Whoever mounts the tile route owns closing that: pass
-`straddling_vector_grid` through, and skip `tile_read_shape` entirely for an origin whose
-`overview_permitted` is `False`. Recorded here rather than left to be noticed, because a
-field that is written, tested, and never read looks from the outside exactly like a field
-that is working.
+`straddling_vector_grid` is read by `_resolve_tile_window` below, which forwards it to
+`io.raster_io.tile_source_window` as that function's own argument of the same name.
+`overview_permitted` still has NO reader: the call it gates is `io.raster_io.
+tile_read_shape`, which neither takes it nor consults it, and no read in this package
+passes a decimated shape at all -- `io.raster.scan_raster` has no parameter for one. So no
+tile read is currently decimated, which is safe (a full-resolution read is never the wrong
+answer, only a slower one) but leaves the rule computed and asserted
+(`tests/api/test_execution_plan.py`) rather than enforced. Recorded here rather than left
+to be noticed, because a field that is written, tested, and never read looks from the
+outside exactly like a field that is working.
+
+**The tile read window is decided here, not at the read.** A tile is a property of the
+REQUEST, and which pixels it needs off each raster origin depends on things only this
+module knows: the grid each origin sits on, and whether any raster-to-vector `project`
+reachable from it widens the window to whole straddling features. So `compile_plan` takes
+an optional `TileRequest` and records one `read_window` per raster origin, which
+`execution.execute` then hands to `io.raster.scan_raster`; the walk itself is identical
+either way, and the sink warps whatever it gets onto the tile grid. The alternative -- a
+sink that opens the raster again and runs its own op walk at a tile window -- was tried and
+removed: it duplicated the walk, and it could only ever support the ops that keep a frame
+band-wide, which excludes the raster-to-vector `project` the straddling-feature widening
+exists for in the first place.
+
+Sizing that window opens no file. `io.raster_io.raster_grid_geometry` builds
+`tile_source_window`'s four inputs (crs, transform, width, height) from the grid, which a
+raster on that grid is co-registered with exactly -- so this module keeps the "it opens no
+data files" property that the rest of it already has, band resolution aside.
 
 **Band enumeration and its ceiling.** Every raster origin gets `io.catalog.
 resolve_raster_bands` called on it exactly once, narrowed by whatever dimension predicates
@@ -221,9 +236,16 @@ unavoidable, since which bands exist can only be answered by looking.
 import dataclasses
 from collections import Counter
 
+import mercantile
 import polars as pl
+from rasterio.enums import Resampling
 
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
+from cpra.mp.data.analysis.io.raster_io import (
+    raster_grid_geometry,
+    tile_disjoint_from_source,
+    tile_source_window,
+)
 from cpra.mp.data.analysis.request.errors import BandLimitError, RequestError, ShapeError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
@@ -243,7 +265,35 @@ from cpra.mp.data.analysis.request.pipeline import InputSelection, Pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
 from cpra.mp.data.grids import GRIDS
 
-__all__ = ["ExecutionPlan", "ResolvedInput", "compile_plan"]
+__all__ = ["ExecutionPlan", "ResolvedInput", "TileRequest", "compile_plan"]
+
+
+@dataclasses.dataclass(frozen=True)
+class TileRequest:
+    """One map tile, as the compiler needs to see it: which tile, how many pixels across,
+    and how its pixels will be resampled onto the tile grid.
+
+    Passed to `compile_plan` by a caller rendering a tile; absent (`None`) for every other
+    request, which reads each raster origin at full extent. It carries no legend and no
+    image format -- those are the sink's, and nothing about the read window depends on
+    them.
+
+    `resampling` is here rather than at the sink because the read is what it changes: the
+    buffer of neighbouring source pixels a window needs is a property of the resampling
+    kernel (`io.raster_io.resampling_buffer_px`), so a window sized for one method is not
+    valid for another.
+    """
+
+    x: int
+    y: int
+    z: int
+    tile_size: int = 256
+    resampling: Resampling = Resampling.nearest
+
+    @property
+    def bounds(self):
+        """This tile's bounds in `io.raster_io.TILE_CRS` (Web Mercator)."""
+        return mercantile.xy_bounds(self.x, self.y, self.z)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -264,6 +314,15 @@ class ResolvedInput:
     docstring's paragraph on overview eligibility for what it and `overview_permitted` are
     for and how they are derived. An input's grid kind decides which group of fields is
     populated; the other group is left at its default.
+
+    `read_window`/`tile_disjoint` are the tile read decision for a raster input, and are the
+    default pair (`None`, `False`) -- meaning "read this origin at full extent" -- unless
+    `compile_plan` was given a `TileRequest`. Under one, `read_window` is the
+    `rasterio.windows.Window` that tile needs off this origin, and `tile_disjoint` is
+    `True` (with `read_window` still `None`) for the separate case where the tile's
+    footprint misses this origin's extent altogether. The two cases are distinct fields
+    rather than one nullable one because `None` already means "full extent" and a disjoint
+    tile is the opposite of that -- see the module docstring's tile paragraph.
     """
 
     selection: InputSelection
@@ -274,6 +333,8 @@ class ResolvedInput:
     point_sample_step: int | None = None
     straddling_vector_grid: str | None = None
     overview_permitted: bool = True
+    read_window: object | None = None  # `rasterio.windows.Window | None`; same reasoning.
+    tile_disjoint: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -283,13 +344,18 @@ class ExecutionPlan:
     name's `request.ops.FrameType`, computed once here so `execute.py`'s walk never
     re-derives one. `band_wide_join_scans`: every band-wide `join` step's output name
     mapped to the origins whose bands were read as one shared union for its ceiling check
-    (see the module docstring) -- empty unless the pipeline has such a join.
+    (see the module docstring) -- empty unless the pipeline has such a join. `tile`: the
+    `TileRequest` this plan was compiled for, or `None` for a full-extent one; the sink
+    needs it to warp the result onto the tile's own grid, and it is recorded here so that
+    it comes from the same place the read windows were derived from rather than being
+    passed to the sink a second time and trusted to match.
     """
 
     inputs: dict[str, ResolvedInput]
     ops: list[Op]
     frame_types: dict[str, FrameType]
     band_wide_join_scans: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    tile: TileRequest | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -317,12 +383,18 @@ def _referenced_names(conjunct: str) -> frozenset[str]:
     return frozenset(pl.sql_expr(conjunct).meta.root_names())
 
 
-def compile_plan(pipeline: Pipeline, *, base_path=None) -> ExecutionPlan:
+def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None = None) -> ExecutionPlan:
     """Compile `pipeline` (already validated -- `parse_pipeline` then `validate_shapes`)
     into the `ExecutionPlan` `execute.execute` consumes, including every pushdown decision
     the module docstring describes. `base_path` is forwarded to `io.catalog.
     resolve_raster_bands` for each raster input; left `None` to use the configured default
     (tests always pass a sandboxed path instead -- see `tests/conftest.py`).
+
+    `tile`, when given, compiles the plan for one map tile: every raster origin gets a
+    `read_window` sized to that tile instead of being read whole, derived here rather than
+    at the read (see the module docstring's tile paragraph, and `_resolve_tile_window`).
+    The ops, the pushdown decisions, and the band resolution are identical either way -- a
+    tile changes how much of each raster is read, not what is computed over it.
     """
     ops = compile_ops(pipeline)
     frame_types = annotate_frame_types(pipeline, ops)
@@ -515,12 +587,15 @@ def compile_plan(pipeline: Pipeline, *, base_path=None) -> ExecutionPlan:
     for name, selection in pipeline.inputs.items():
         if origin_kind[name] == "raster":
             target = straddling_vector_grid.get(name)
+            read_window, tile_disjoint = _resolve_tile_window(tile, selection.grid, target)
             inputs[name] = ResolvedInput(
                 selection=selection,
                 band_metadata=raster_band_metadata[name],
                 point_sample_step=point_sample_step.get(name),
                 straddling_vector_grid=target,
                 overview_permitted=target is None and name not in point_sample_step,
+                read_window=read_window,
+                tile_disjoint=tile_disjoint,
             )
         else:
             predicate = None
@@ -534,4 +609,42 @@ def compile_plan(pipeline: Pipeline, *, base_path=None) -> ExecutionPlan:
         ops=ops,
         frame_types=frame_types,
         band_wide_join_scans=dict(band_wide_join_origin_groups),
+        tile=tile,
     )
+
+
+def _resolve_tile_window(tile: TileRequest | None, grid_name: str, straddling_vector_grid: str | None):
+    """The `(read_window, tile_disjoint)` pair one raster origin gets -- `(None, False)`,
+    "read it whole", whenever there is no tile to scope it to.
+
+    Sized from the GRID's geometry (`io.raster_io.raster_grid_geometry`) rather than from
+    an opened raster, which is what keeps this module's promise to open no data files while
+    still producing the tile's read window here. A raster on grid *G* is co-registered with
+    *G*, so the two answers are the same window; see `SourceGeometry` for why that holds.
+
+    Both of `io.raster_io`'s tile-versus-source tests run, in this order, because neither
+    subsumes the other: `tile_disjoint_from_source` carries the grid's extent out to the
+    tile's CRS and is decisive for a tile far enough away that the inbound reprojection is
+    not finite, while `tile_source_window` carries the tile's footprint inward and is the
+    one that knows about buffering, clipping and widening. See the former for why that
+    asymmetry is not redundancy.
+
+    `straddling_vector_grid` is forwarded to `tile_source_window` unchanged: it is the
+    widening that makes a tile whose pixels feed a raster-to-vector `project` read every
+    pixel of each feature it touches, not just the part inside the tile. Deriving WHICH grid
+    that is belongs here; applying it belongs there.
+    """
+    if tile is None:
+        return None, False
+    geometry = raster_grid_geometry(grid_name)
+    if tile_disjoint_from_source(geometry, tile.bounds):
+        return None, True
+    window = tile_source_window(
+        geometry,
+        tile.bounds,
+        resampling=tile.resampling,
+        straddling_vector_grid=straddling_vector_grid,
+    )
+    if window is None:
+        return None, True
+    return window, False

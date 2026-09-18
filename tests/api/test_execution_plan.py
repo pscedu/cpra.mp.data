@@ -8,22 +8,36 @@ declared pipeline and each input's grid kind (`cpra.mp.data.grids.GRIDS[...].gri
 the same no-IO property `request.ops.validate_shapes` already has. A raster input is the
 one exception -- resolving its band list takes one real call to `io.catalog.
 resolve_raster_bands` -- so the raster-side tests below monkeypatch that function rather
-than touch a filesystem, the same "no IO in this test file" spirit applied to the one
-seam that necessarily has some.
+than touch a filesystem, the same "no IO in this test file" spirit applied to the seam that
+necessarily has some.
+
+`TestTileReadWindow` bends that once more, and only in its straddling-widening test: a
+window widened to cover whole features is a union with real polygon bounds, so a geometry
+file has to exist to read them from. Everything else about a tile-scoped compile -- the
+window itself included -- comes off the grid registry with nothing opened.
 """
 
 import dataclasses
 
+import mercantile
 import polars as pl
 import pytest
+from rasterio.warp import transform_bounds
 
 from cpra.mp.data.analysis.execution import plan as plan_module
-from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, compile_plan
+from cpra.mp.data.analysis.execution.plan import (
+    ExecutionPlan,
+    ResolvedInput,
+    TileRequest,
+    compile_plan,
+)
+from cpra.mp.data.analysis.io.raster_io import TILE_CRS
 from cpra.mp.data.analysis.request.errors import BandLimitError, ShapeError
 from cpra.mp.data.analysis.request.ops import Shape, validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
 from cpra.mp.data.grids import GRIDS
+from tests.factories import write_grid_geometry
 
 VECTOR_GRID = "hydro_compartment_v001"
 RASTER_GRID = "veg_grid_cell_v001"
@@ -943,3 +957,117 @@ class TestOverviewEligibility:
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.overview_permitted is True
         assert resolved.straddling_vector_grid is None
+
+
+def _tile_over_the_raster_grid(zoom=12):
+    """A tile covering the middle of `RASTER_GRID`'s extent, so every window below is a
+    strict sub-rectangle of that grid rather than a clipped whole-extent read."""
+    grid = GRIDS[RASTER_GRID]
+    west, south, east, north = transform_bounds(grid.crs, "EPSG:4326", *grid.bounds)
+    return mercantile.tile((west + east) / 2, (south + north) / 2, zoom)
+
+
+class TestTileReadWindow:
+    """`compile_plan(..., tile=...)` -- which pixels of each raster origin one map tile
+    needs, decided here so the executor's one walk can run against them and the sink is left
+    with nothing to do but warp.
+
+    Sizing a window opens no raster: `io.raster_io.raster_grid_geometry` supplies the four
+    properties off the grid registry instead, and `tests/api/test_tile_warp.py::
+    TestRasterGridGeometryStandsInForAnOpenedRaster` is what pins those to a real file's.
+    The straddling-widening case below is the one place this file's no-filesystem property
+    genuinely bends -- the widened window is a union with real polygon bounds, so there has
+    to be a geometry file to read them from -- and it uses the `geometry_path` fixture's
+    sandbox, not any configured directory.
+    """
+
+    def test_no_tile_means_read_every_origin_whole(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        plan = compile_plan(pipeline)
+        assert plan.tile is None
+        assert plan.inputs["a"].read_window is None
+        assert plan.inputs["a"].tile_disjoint is False
+
+    def test_a_tile_narrows_the_window_to_a_sub_rectangle(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        plan = compile_plan(pipeline, tile=tile)
+
+        grid = GRIDS[RASTER_GRID]
+        window = plan.inputs["a"].read_window
+        assert plan.tile is tile
+        assert plan.inputs["a"].tile_disjoint is False
+        assert int(window.width) < grid.width
+        assert int(window.height) < grid.height
+        assert 0 <= int(window.col_off) and int(window.col_off) + int(window.width) <= grid.width
+        assert 0 <= int(window.row_off) and int(window.row_off) + int(window.height) <= grid.height
+
+    def test_a_tile_that_misses_the_grid_is_recorded_as_disjoint(self, monkeypatch):
+        # The opposite z=1 quadrant -- eastern/southern hemisphere, nowhere near this Gulf
+        # Coast grid. `tile_disjoint` rather than a zero-sized window, because `None` on
+        # `read_window` already means "read it whole" and a miss is the opposite of that.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        plan = compile_plan(pipeline, tile=TileRequest(1, 1, 1))
+        assert plan.inputs["a"].tile_disjoint is True
+        assert plan.inputs["a"].read_window is None
+
+    def test_an_origin_feeding_a_raster_to_vector_project_reads_a_wider_window(
+        self, monkeypatch, geometry_path
+    ):
+        # The decision this whole arrangement exists to make reachable. "a" feeds a project
+        # onto VECTOR_GRID, whose one feature here extends 3 pixels west of the tile's own
+        # footprint; every pixel under that feature has to be read or the aggregate silently
+        # loses the part on the far side of the tile edge. "b" is the control: the same grid,
+        # the same tile, no project, so it gets the unwidened window and the comparison
+        # below distinguishes "the widening ran" from "this tile is just large".
+        from shapely.geometry import box
+
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        grid = GRIDS[RASTER_GRID]
+        # veg_grid_cell_v001's pixels are exactly 480m square, so a feature extended by a
+        # whole multiple of 480m widens the window by an exact, predictable pixel count.
+        src_bounds = transform_bounds(TILE_CRS, grid.crs, *tile.bounds, densify_pts=21)
+        extension_px = 3
+        feature = box(src_bounds[0] - extension_px * 480, src_bounds[1], src_bounds[2], src_bounds[3])
+        write_grid_geometry(geometry_path, VECTOR_GRID, [(1, feature)])
+
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(), "b": raster_input(variable="sal")},
+                "steps": [
+                    {"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum", "as": "p"},
+                    {"op": "calculate", "input": "b", "expression": "value * 2", "as": "c"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, tile=tile)
+        widened = plan.inputs["a"].read_window
+        plain = plan.inputs["b"].read_window
+
+        assert plan.inputs["a"].straddling_vector_grid == VECTOR_GRID
+        assert plan.inputs["b"].straddling_vector_grid is None
+        assert int(widened.col_off) == int(plain.col_off) - extension_px
+        assert int(widened.width) == int(plain.width) + extension_px
+        assert (int(widened.row_off), int(widened.height)) == (int(plain.row_off), int(plain.height))
+
+    def test_a_vector_origin_gets_no_window(self):
+        # Tile scoping is a raster read decision. A vector origin's rows are selected by
+        # `grid_cell`, not by pixel offsets, so it carries the defaults untouched -- which
+        # also means a tile-scoped plan mixing the two does not have to special-case it.
+        pipeline = _pipeline({"inputs": {"a": vector_input()}, "steps": [], "output": {"format": "csv"}})
+        plan = compile_plan(pipeline, tile=TileRequest(*_tile_over_the_raster_grid()))
+        assert plan.inputs["a"].read_window is None
+        assert plan.inputs["a"].tile_disjoint is False

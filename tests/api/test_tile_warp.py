@@ -51,7 +51,9 @@ from cpra.mp.data.analysis.io.raster_io import (
     TILE_READ_OVERSAMPLE,
     _axis_decimation_factor,
     _warp_array_to_tile,
+    raster_grid_geometry,
     resampling_buffer_px,
+    tile_disjoint_from_source,
     tile_read_shape,
     tile_source_window,
     warp_window_to_tile,
@@ -651,6 +653,63 @@ class TestTileSourceWindow:
             assert window.col_off >= 0 and window.row_off >= 0
             assert window.col_off + window.width <= src.width
             assert window.row_off + window.height <= src.height
+
+
+class TestRasterGridGeometryStandsInForAnOpenedRaster:
+    """`raster_grid_geometry` lets `execution.plan.compile_plan` size a tile's read window
+    without opening a raster, which is only sound if the grid's own geometry and a real
+    raster on that grid are the same four numbers. That is an assumption about how this
+    repo's rasters are written, not a law, so it is measured here rather than asserted in a
+    docstring: every window `compile_plan` hands the reader is wrong by however much these
+    two disagree.
+    """
+
+    def test_the_four_properties_match_a_real_raster_on_that_grid(self, unique_pixel_raster):
+        geometry = raster_grid_geometry(RASTER_KWARGS["grid"])
+        with rio.open(unique_pixel_raster) as src:
+            assert geometry.crs == src.crs
+            assert geometry.transform == src.transform
+            assert (geometry.width, geometry.height) == (src.width, src.height)
+
+    def test_it_produces_the_same_window_as_the_opened_raster(self, unique_pixel_raster):
+        # The property the compiler actually depends on, one level up from the four fields:
+        # sizing a window off the grid and sizing it off the file agree exactly -- including
+        # the buffer and clip arithmetic, which is what would amplify a small disagreement
+        # in the transform into a differently-offset read.
+        geometry = raster_grid_geometry(RASTER_KWARGS["grid"])
+        for zoom in (6, 9, 12):
+            bounds = _tile_bounds(mercantile.tile(*_tile_centre(), zoom))
+            with rio.open(unique_pixel_raster) as src:
+                assert tile_source_window(geometry, bounds) == tile_source_window(src, bounds)
+
+
+class TestTileDisjointFromSource:
+    """The cheap "nowhere near" test, which `tile_source_window` cannot make on its own
+    because it reprojects the other way (see `tile_disjoint_from_source`'s docstring)."""
+
+    def test_a_tile_over_the_raster_is_not_disjoint(self, unique_pixel_raster):
+        bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
+        with rio.open(unique_pixel_raster) as src:
+            assert tile_disjoint_from_source(src, bounds) is False
+
+    def test_a_low_zoom_tile_on_the_far_side_of_the_world_is_disjoint(self, unique_pixel_raster):
+        # The case this function exists for, and the one `tile_source_window` gets wrong on
+        # its own: the eastern/southern quadrant of the z=1 split is nowhere near a Gulf
+        # Coast raster, but reprojecting that footprint INTO epsg:26915 does not come back
+        # with usable bounds, so `tile_source_window` falls back to the source's full extent
+        # -- a read of every pixel for a tile that needs none of them.
+        bounds = _tile_bounds(mercantile.Tile(1, 1, 1))
+        with rio.open(unique_pixel_raster) as src:
+            assert tile_disjoint_from_source(src, bounds) is True
+            fallback = tile_source_window(src, bounds)
+            assert (fallback.width, fallback.height) == (src.width, src.height)
+
+    def test_the_grid_geometry_gives_the_same_answer_as_the_file(self, unique_pixel_raster):
+        geometry = raster_grid_geometry(RASTER_KWARGS["grid"])
+        with rio.open(unique_pixel_raster) as src:
+            for tile in (mercantile.tile(*_tile_centre(), 12), mercantile.Tile(1, 1, 1)):
+                bounds = _tile_bounds(tile)
+                assert tile_disjoint_from_source(geometry, bounds) == tile_disjoint_from_source(src, bounds)
 
 
 class TestStraddlingFeatureWidensTheWindow:

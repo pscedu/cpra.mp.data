@@ -125,17 +125,19 @@ crosswalks the underlying shared scan actually combined.
 import polars as pl
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
+from rasterio.windows import Window
+from rasterio.windows import transform as window_transform
 
 from cpra.mp.data.analysis.execution import band_ops, long_ops, project
 from cpra.mp.data.analysis.execution.frame import (
     BandWideFrame,
     LongFrame,
     ReadWindow,
-    drop_reserved_band_index,
     empty_band_wide,
     has_no_bands,
+    released_band_metadata,
 )
-from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput
+from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, compile_plan
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.vector import scan_vector
@@ -149,7 +151,7 @@ from cpra.mp.data.analysis.request.ops import (
 )
 from cpra.mp.data.grids import GRIDS
 
-__all__ = ["LoweringNotImplementedError", "NOT_YET_IMPLEMENTED", "execute"]
+__all__ = ["LoweringNotImplementedError", "NOT_YET_IMPLEMENTED", "execute", "run_to_path"]
 
 
 class LoweringNotImplementedError(NotImplementedError):
@@ -397,27 +399,39 @@ def _lowering_for(kind: str, key: object, registry: dict[tuple[str, object], obj
     return registry[(kind, key)]
 
 
-def _grid_read_window(grid_name: str) -> ReadWindow:
-    """A full-extent, undecimated `ReadWindow` built from `grid_name`'s own geometry, with
-    no file opened -- the window a zero-band raster origin gets, since `io.raster.
-    scan_raster` cannot produce one itself (it raises on empty metadata; see the module
-    docstring). `cpra.mp.data.grids.RasterGrid` already carries everything a full window
-    needs (`bounds`, `height`, `width`, `crs`); the transform follows from
+def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
+    """An undecimated `ReadWindow` built from `grid_name`'s own geometry, with no file
+    opened -- the window a zero-band raster origin gets, since `io.raster.scan_raster`
+    cannot produce one itself (it raises on empty metadata; see the module docstring).
+    `cpra.mp.data.grids.RasterGrid` already carries everything a full window needs
+    (`bounds`, `height`, `width`, `crs`); the transform follows from
     `rasterio.transform.from_bounds`, exactly as `io.raster.scan_raster` derives it for a
     real, full-extent, undecimated read of the same grid (confirmed byte-identical against
     a real scan while building this). `source=()` names no file, matching the fact that
     none was opened; `batch_layout=()` is legitimately empty, meaning "the whole window,
     one batch" -- the same reading `execution.frame.row_major_grid_cell` already gives an
     empty `batch_layout` for a hand-built window.
+
+    `window` (a `rasterio.windows.Window`, from `plan.ResolvedInput.read_window`) narrows
+    it to that sub-window, which is what a zero-band origin under a tile-scoped plan needs:
+    a `join` compares its operands' windows field by field (`frame.assert_same_pixel_grid`)
+    and would reject a zero-band operand still describing the whole grid beside a real one
+    describing the tile's window.
     """
     grid = GRIDS[grid_name]
+    grid_transform = from_bounds(*grid.bounds, width=grid.width, height=grid.height)
+    if window is None:
+        col_off, row_off, width, height = 0, 0, grid.width, grid.height
+    else:
+        col_off, row_off = int(window.col_off), int(window.row_off)
+        width, height = int(window.width), int(window.height)
     return ReadWindow(
         source=(),
-        col_off=0,
-        row_off=0,
-        width=grid.width,
-        height=grid.height,
-        transform=from_bounds(*grid.bounds, width=grid.width, height=grid.height),
+        col_off=col_off,
+        row_off=row_off,
+        width=width,
+        height=height,
+        transform=window_transform(Window(col_off, row_off, width, height), grid_transform),
         crs=CRS.from_user_input(grid.crs),
         decimation=1,
         batch_layout=(),
@@ -439,16 +453,74 @@ def _open_band_wide_input(resolved: ResolvedInput) -> tuple[BandWideFrame, tuple
     see the module docstring's "the raster-to-vector crosswalk is attached here" note for
     why this is where that attachment belongs.
 
+    `resolved.read_window` rides along on every one of those `scan_raster` calls: `None`
+    for an ordinary request (read the origin whole), or the window `compile_plan` sized for
+    a tile. A `tile_disjoint` origin -- the tile's footprint misses this raster's extent
+    entirely -- has no window to read at all and becomes the same zero-band empty frame the
+    first case produces, so "this tile is outside the data" arrives at the sink as the
+    no-bands result every other "nothing to show" already arrives as, rather than as a
+    second, parallel signal the sink would have to check separately.
+
     Not used for an origin `execute`'s band-wide-join prelude already opened as part of a
     shared scan -- see `_open_band_wide_join_group`.
     """
-    if has_no_bands(resolved.band_metadata):
+    if resolved.tile_disjoint:
         return empty_band_wide(_grid_read_window(resolved.selection.grid)), ()
+    window = resolved.read_window
+    if has_no_bands(resolved.band_metadata):
+        return empty_band_wide(_grid_read_window(resolved.selection.grid, window)), ()
     if resolved.straddling_vector_grid is not None:
         crosswalk_path = resolve_raster_crosswalk_path(resolved.selection.grid, resolved.straddling_vector_grid)
-        opened = scan_raster(resolved.band_metadata, crosswalks=[(project.ZONE_COLUMN, str(crosswalk_path))])
+        opened = scan_raster(
+            resolved.band_metadata,
+            crosswalks=[(project.ZONE_COLUMN, str(crosswalk_path))],
+            window=window,
+        )
         return opened, (project.ZONE_COLUMN,)
-    return scan_raster(resolved.band_metadata), ()
+    return scan_raster(resolved.band_metadata, window=window), ()
+
+
+#: `_shared_tile_window`'s answer for a join group whose tile misses the data entirely --
+#: distinct from `None`, which already means "no tile, read whole".
+_DISJOINT = object()
+
+
+def _shared_tile_window(origins: tuple[str, ...], inputs: dict[str, ResolvedInput]):
+    """The ONE window a band-wide join group's shared scan reads: `None` (read whole) when
+    the plan is not tile-scoped, `_DISJOINT` when the tile misses the data, else the
+    smallest window covering every origin's own.
+
+    A union rather than any one origin's window, because two operands of one join can want
+    different windows off the same grid: only an origin feeding a raster-to-vector
+    `project` gets the straddling-feature widening, so a join between one that does and one
+    that does not produces two different windows, and the shared scan has to cover both.
+    Reading the union is always safe -- a wider window is more pixels, never different
+    ones -- and the operands stay positionally aligned precisely BECAUSE they share it.
+
+    Disjointness is a property of the tile and the grid alone, and `request.ops`'
+    `validate_shapes` already requires a band-wide join's operands to share a grid, so the
+    origins of one group are either all disjoint or none are; a mixture would mean that
+    same-grid rule had been broken upstream, and is rejected here rather than silently
+    unioned into a window covering only the operands that happened to overlap.
+    """
+    disjoint = {inputs[name].tile_disjoint for name in origins}
+    if disjoint == {True}:
+        return _DISJOINT
+    if len(disjoint) != 1:
+        raise ValueError(
+            f"band-wide join group {list(origins)!r} mixes tile-disjoint and overlapping "
+            "origins, which operands sharing one grid cannot do -- the group's origins do "
+            "not all sit on the same grid"
+        )
+
+    windows = [inputs[name].read_window for name in origins if inputs[name].read_window is not None]
+    if not windows:
+        return None
+    col_off = min(int(w.col_off) for w in windows)
+    row_off = min(int(w.row_off) for w in windows)
+    col_end = max(int(w.col_off) + int(w.width) for w in windows)
+    row_end = max(int(w.row_off) + int(w.height) for w in windows)
+    return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
 def _open_band_wide_join_group(
@@ -480,7 +552,12 @@ def _open_band_wide_join_group(
     performed (`scan_raster` raises on empty metadata) and none is needed -- one
     grid-derived empty window, shared across every origin in the group, exactly like
     `_open_band_wide_input`'s own zero-band case, `extra_columns=()` throughout for the
-    same reason given there.
+    same reason given there. A tile-disjoint group takes the same exit for the same reason,
+    one step earlier: there are no pixels under the tile to scan even where bands exist.
+
+    Under a tile-scoped plan the shared scan reads ONE window covering every origin's own
+    (`_shared_tile_window`) -- which is not necessarily any single origin's, since only an
+    origin feeding a raster-to-vector `project` gets the straddling-feature widening.
 
     A PARTIAL zero-band mismatch within an otherwise-nonzero group (one operand resolves
     to zero bands, another does not) raises `ValueError` naming the mismatched origins,
@@ -492,10 +569,15 @@ def _open_band_wide_join_group(
     reject that mismatch too, but only after producing a confusing shape-mismatch error
     with no indication which operand was actually the empty one.
     """
+    read_window = _shared_tile_window(origins, inputs)
+    if read_window is _DISJOINT:
+        window = _grid_read_window(inputs[origins[0]].selection.grid)
+        return {name: (empty_band_wide(window), ()) for name in origins}
+
     band_metadata = [inputs[name].band_metadata for name in origins]
     heights = [df.height for df in band_metadata]
     if sum(heights) == 0:
-        window = _grid_read_window(inputs[origins[0]].selection.grid)
+        window = _grid_read_window(inputs[origins[0]].selection.grid, read_window)
         return {name: (empty_band_wide(window), ()) for name in origins}
 
     zero_names = [name for name, height in zip(origins, heights) if height == 0]
@@ -520,7 +602,7 @@ def _open_band_wide_join_group(
         crosswalks.append((column, str(crosswalk_path)))
         zone_columns[name] = column
 
-    lf, out_metadata, window = scan_raster(combined, crosswalks=crosswalks)
+    lf, out_metadata, window = scan_raster(combined, crosswalks=crosswalks, window=read_window)
 
     frames: dict[str, tuple[BandWideFrame, tuple[str, ...]]] = {}
     offset = 0
@@ -566,12 +648,12 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     `filter`'s own `extra_columns` are stripped from the frame itself before this walk even
     gets here (`_run_filter_band_wide`).
 
-    Before returning, drops the reserved band-index column
-    (`execution.frame.drop_reserved_band_index`) from a band-wide result's metadata if
-    present -- unconditionally, since either of two lowerings can leave it standing
-    (`band_ops.group_band_wide`'s `by=[]` case, `project.project_vector_to_raster`'s
-    zero-pivot-dimension case) and both document that whatever finishes the walk owns
-    removing it before metadata reaches anything outside. Also drops whatever
+    Before returning, releases a band-wide result's metadata
+    (`execution.frame.released_band_metadata`), which drops the reserved band-index column
+    either of two lowerings can leave standing (`band_ops.group_band_wide`'s `by=[]` case,
+    `project.project_vector_to_raster`'s zero-pivot-dimension case) -- except where it is
+    the only column left, since dropping it there would take the band count with it and
+    report an empty result for a real single-band one; see that function. Also drops whatever
     `extra_columns` the final band-wide output still carries, defensively -- see the module
     docstring's closing paragraph for why a fan-out can leave a raster origin's crosswalk
     column attached to a frame that never actually ran through the `project` that needed it.
@@ -620,5 +702,61 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
         stray = extra_columns.get(last_output, ())
         if stray:
             lf = lf.drop(list(stray))
-        result = (lf, drop_reserved_band_index(metadata_df), window)
+        result = (lf, released_band_metadata(metadata_df), window)
     return result
+
+
+def run_to_path(pipeline, out_path, *, base_path=None, collect_in_memory=False, dtype=None, nodata=None, **profile_options) -> bool:
+    """Compile, run, and sink `pipeline` to `out_path` in one call -- `compile_plan` then
+    `execute` then whichever of the two "a whole result, at a path" sinks matches the
+    result's own shape (`execution.sink.sink_tabular` for a long frame,
+    `execution.sink.write_raster` for a band-wide one).
+
+    Only those two sinks fit this shape of call. `png`/`jpg`/`pbf` each need per-request
+    parameters (a tile's `x`/`y`/`z`, its pixel size, a legend) that a generic
+    `(pipeline, out_path)` signature has nowhere to put, so a caller producing one of those
+    calls `execution.sink.render_tile`/`execution.sink.sink_vector_tile` directly instead
+    of through this function -- this function is the composition helper for the two output
+    kinds that need nothing beyond the pipeline and a destination.
+
+    `execution.sink`'s `output.sort`/`output.select` shaping is applied to a long result
+    before it is written, matching every other tabular path (`apply_output_shaping`, run
+    once, last).
+
+    Returns `False` when the underlying sink does (a band-wide result with no bands to
+    write -- see `execution.sink.write_raster`); `True` otherwise. A long/tabular write
+    always returns `True` -- an empty long frame is still a well-formed, zero-row CSV/
+    NDJSON/Parquet file, unlike a band-wide result with literally no bands to declare a
+    raster's `count` from, so there is no analogous "nothing to write" case for that
+    branch to report.
+
+    `dtype`/`nodata`/`**profile_options` are forwarded to `write_raster`, left at THIS
+    function's own `None` default when the caller does not set them -- `nodata=None` is
+    not forwarded as a literal `None` (which `write_raster` would take as "declare no
+    nodata at all", a different, real profile choice), it is left OUT of the call
+    entirely so `write_raster`'s own `DEFAULT_NODATA` default takes over. `nodata=0`, a
+    legitimate declared value some datasets use, is forwarded exactly as given -- not
+    treated as "unset" the way a bare `nodata or DEFAULT_NODATA` would wrongly do.
+    Ignored entirely for a long/tabular result, the same way `nodata` has no meaning for
+    a CSV row.
+
+    Deferred, function-body-local import of `execution.sink`: `sink.py` imports
+    `LoweringNotImplementedError` from this module at ITS top level, so importing `sink`
+    back at this module's own top level would close that into a cycle at import time.
+    """
+    from cpra.mp.data.analysis.execution import sink
+
+    plan = compile_plan(pipeline, base_path=base_path)
+    result = execute(plan, base_path=base_path)
+
+    if isinstance(result, tuple):
+        write_kwargs = dict(profile_options)
+        if dtype is not None:
+            write_kwargs["dtype"] = dtype
+        if nodata is not None:
+            write_kwargs["nodata"] = nodata
+        return sink.write_raster(result, out_path, **write_kwargs)
+
+    lf = sink.apply_output_shaping(result, pipeline.output)
+    sink.sink_tabular(lf, out_path, pipeline.output.format, collect_in_memory=collect_in_memory)
+    return True

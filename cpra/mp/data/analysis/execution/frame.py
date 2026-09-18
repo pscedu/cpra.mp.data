@@ -55,10 +55,16 @@ instead of falling into that hole by accident:
   many bands survived. `RESERVED_BAND_INDEX_COLUMN` (`add_reserved_band_index`) is a
   column reserved for exactly this: it holds each surviving band's position, so the
   metadata frame's height keeps meaning something even when no dimension column does.
-  `drop_reserved_band_index` removes it again before metadata reaches anything outside
-  the walk -- it is exactly the same kind of stored positional index the no-retained-row-
-  index rule above forbids everywhere else, tolerated here only as long as it never
-  escapes.
+  It is the same kind of stored positional index the no-retained-row-index rule above
+  forbids everywhere else, tolerated here because nothing else can carry the count.
+
+  `released_band_metadata` removes it on the way out, and the rule it keeps is narrower
+  than "it never escapes" -- that rule cannot be kept, because a metadata frame whose only
+  column is this one loses its height the moment the column is dropped, which is the exact
+  loss the column was added to prevent. What holds instead: the reserved column never
+  reaches anything that would read it as a DIMENSION. `drop_reserved_band_index` is the
+  unconditional drop, for a caller that wants the identity columns and carries its own row
+  count some other way; see both functions.
 
 Everything in this module is pure Polars: no file is opened, no raster is read, no
 request is parsed. Three names it re-exports are defined elsewhere and imported rather
@@ -97,6 +103,7 @@ __all__ = [
     "has_reserved_band_index",
     "add_reserved_band_index",
     "drop_reserved_band_index",
+    "released_band_metadata",
     "assert_window_unchanged",
     "assert_same_pixel_grid",
     "assert_height_preserved",
@@ -219,15 +226,48 @@ def add_reserved_band_index(metadata_df: pl.DataFrame) -> pl.DataFrame:
 def drop_reserved_band_index(metadata_df: pl.DataFrame) -> pl.DataFrame:
     """Remove the reserved band-index column if present; a no-op otherwise.
 
-    Idempotent and safe to call unconditionally at the point metadata is about to be
-    exposed outside the walk (returned to a caller, handed to an API response, or
-    reported as part of a result) -- exactly the property `add_reserved_band_index`'s
-    docstring requires of its matching call, whether or not the frame in hand ever went
-    through a `by=[]` group at all.
+    Idempotent, and safe to call unconditionally wherever what is wanted is the set of
+    columns that describe a band's IDENTITY -- a caller turning metadata columns into a
+    long frame's dimension columns, notably, where a position must not be mistaken for a
+    dimension.
+
+    **Not, on its own, the call that releases metadata from the walk.** When the reserved
+    column is the only column left, dropping it takes the row count with it (Polars cannot
+    represent "zero columns, N rows"; see this module's docstring), which is precisely the
+    loss `add_reserved_band_index` exists to prevent -- so a caller that needs the height
+    to survive wants `released_band_metadata` below, not this. A caller that only reads
+    `.columns` off the result is unaffected either way, because a column list does not
+    carry a row count to lose.
     """
     if has_reserved_band_index(metadata_df):
         return metadata_df.drop(RESERVED_BAND_INDEX_COLUMN)
     return metadata_df
+
+
+def released_band_metadata(metadata_df: pl.DataFrame) -> pl.DataFrame:
+    """`metadata_df` as it should leave the walk: the reserved band-index column dropped,
+    unless dropping it would take the frame's row count along with it.
+
+    The reserved column is a position, not an identity, and everywhere it can be confused
+    for a dimension it has to go. But a `group` with `by=[]` leaves a metadata frame whose
+    ONLY column is that one -- every dimension column collapsed away, nothing else left to
+    say how many bands survived -- and dropping it there reports zero bands for a result
+    that genuinely has one. That is not a cosmetic difference: `has_no_bands` is what a
+    raster sink asks to tell "this request matched no data" from "this request produced a
+    raster", so an unconditional drop turns a correct single-band answer into an empty one.
+
+    So in exactly that case the column stays, as the sole carrier of "there is one band
+    here", and the band-wide contract's promise is the narrower one it can actually keep:
+    the reserved column never reaches anything that would read it as a DIMENSION. Nothing
+    consuming a released band-wide frame does -- a raster sink reads the metadata's height
+    and its band columns, never its column names as dimensions -- and the one consumer that
+    does turn metadata columns into dimensions, a raster-to-vector `project`, carries its
+    own row count separately and so calls `drop_reserved_band_index` unconditionally
+    instead.
+    """
+    if metadata_df.columns == [RESERVED_BAND_INDEX_COLUMN]:
+        return metadata_df
+    return drop_reserved_band_index(metadata_df)
 
 
 def assert_window_unchanged(handed: ReadWindow, returned: ReadWindow) -> None:

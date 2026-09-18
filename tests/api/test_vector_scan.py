@@ -81,10 +81,10 @@ class TestScanDoesNotFilterToOneRun:
 
 
 class TestPushdownSeam:
-    """`columns`/`predicate` are the seam `execution/plan.py`'s `ResolvedInput` will fill
-    with a real pushdown decision once a later stage computes one; nothing in this
-    vertical slice computes one, but the scan already applies whatever it is given, and
-    this exercises that application directly.
+    """`columns`/`predicate` are the seam `execution/plan.py`'s `ResolvedInput` fills with
+    its pushdown decision. Which decision that is belongs to the compiler and is pinned
+    there; what these check is the other half -- that the scan applies whatever it is
+    handed, exercised directly rather than through a compiled plan.
     """
 
     def test_predicate_narrows_rows(self, annual_dataset):
