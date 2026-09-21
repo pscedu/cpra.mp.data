@@ -19,6 +19,7 @@ import pytest
 from cpra.mp.data.analysis.parameters import DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import FilterStep, Pipeline
 from cpra.mp.data.grids import GRIDS
@@ -178,6 +179,48 @@ class TestCallerWhere:
             "csv",
         )
         assert pipeline.steps[0].where == "scenario_id = 7 AND (value > 3 OR value < 0)"
+
+    def test_a_multi_conjunct_where_is_parenthesized_per_conjunct(self):
+        """The other half of the rule, and the one a whole-string wrap would break: the
+        caller's own top-level `AND` seam survives, because `expressions.
+        classify_where_kinds` sorts predicates one top-level conjunct at a time.
+        """
+        pipeline = build_data_query_pipeline(
+            _dataset_dimensions(),
+            FilterDimensions(),
+            DataOptions(where="calendar_year > 2035 AND value > 2040.16"),
+            "csv",
+        )
+        assert pipeline.steps[0].where == "(calendar_year > 2035) AND (value > 2040.16)"
+
+    def test_a_mixed_kind_where_stays_classifiable(self):
+        """What that seam is FOR, asserted against the classifier itself rather than
+        against the string: wrapping the whole `where` in one pair of parens would hand
+        `classify_where_kinds` a single conjunct naming both a dimension and `value`,
+        which it rejects as a mixed-kind predicate -- even though the caller wrote
+        exactly the two separate conjuncts the rule asks for.
+        """
+        pipeline = build_data_query_pipeline(
+            _dataset_dimensions(),
+            FilterDimensions(scenario_id=[7]),
+            DataOptions(where="calendar_year > 2035 AND value > 2040.16"),
+            "csv",
+        )
+        kinds = classify_where_kinds(pipeline.steps[0].where)
+        assert kinds[PredicateKind.value] == ["(value > 2040.16)"]
+        assert kinds[PredicateKind.dimension] == ["scenario_id = 7", "(calendar_year > 2035)"]
+
+    def test_an_or_inside_a_conjunct_still_keeps_its_parentheses(self):
+        """Splitting never reaches inside an `OR`: `split_top_level_and` only finds a seam
+        at paren depth 0, so the second conjunct here stays whole and stays wrapped.
+        """
+        pipeline = build_data_query_pipeline(
+            _dataset_dimensions(),
+            FilterDimensions(),
+            DataOptions(where="calendar_year > 2035 AND (value > 3 OR value < 0)"),
+            "csv",
+        )
+        assert pipeline.steps[0].where == "(calendar_year > 2035) AND ((value > 3 OR value < 0))"
 
 
 class TestGridCell:

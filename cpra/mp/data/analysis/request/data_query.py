@@ -47,6 +47,7 @@ from datetime import date
 
 from cpra.mp.data.analysis.parameters import BaseFilterDimensions, DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.expressions import split_top_level_and
 from cpra.mp.data.analysis.request.pipeline import FilterStep, InputSelection, Output, Pipeline, validate_pipeline
 from cpra.mp.data.analysis.request.types import dimension_type
 
@@ -138,13 +139,24 @@ def build_data_query_pipeline(
     conjuncts on one `filter` step (omitted entirely when there is nothing to filter on),
     and `options.sort`/`options.select`/`options.color_map` plus `format` become `output`.
 
-    `options.where`, when given, is parenthesized before being AND-ed in alongside the
-    dimension/`grid_cell` conjuncts -- so a top-level `OR` inside a caller-supplied `where`
-    stays scoped to what the caller wrote, rather than silently spilling into an AND
-    relationship with the dimension filters this function adds around it (e.g. `where="a
-    OR b"` composed naively with a `scenario_id = 7` conjunct as `scenario_id = 7 AND a OR
-    b` would test `a` unconditionally; `scenario_id = 7 AND (a OR b)` is what the caller
-    meant).
+    `options.where`, when given, is split on its own top-level `AND`s
+    (`expressions.split_top_level_and`) and each resulting conjunct is parenthesized
+    individually before being AND-ed in alongside the dimension/`grid_cell` conjuncts.
+
+    Both halves of that matter, for opposite reasons. Parenthesizing keeps a top-level
+    `OR` scoped to what the caller wrote, rather than letting it spill into an AND
+    relationship with the dimension filters this function adds around it (`where="a OR b"`
+    composed naively with a `scenario_id = 7` conjunct as `scenario_id = 7 AND a OR b`
+    would test `a` unconditionally; `scenario_id = 7 AND (a OR b)` is what the caller
+    meant). Splitting FIRST is what keeps that parenthesizing from destroying the AND seam
+    the rest of the engine classifies against: `expressions.classify_where_kinds` sorts a
+    `where` into dimension/value/spatial predicates one top-level conjunct at a time, so
+    wrapping a whole multi-conjunct `where` in ONE pair of parens (`(calendar_year > 2035
+    AND value > 2040.16)`) hides the seam and hands the engine a single conjunct that
+    references both a dimension and `value` -- rejected as a mixed-kind predicate, even
+    though the caller wrote exactly the two separate conjuncts that rule asks for. Each
+    piece a top-level split produces contains no top-level `AND` by construction, so
+    parenthesizing the pieces protects an `OR` without hiding anything.
 
     `grid_cell_where`, when given, is used as the spatial conjunct verbatim, entirely
     bypassing this function's own digit-ID-only handling of `options.grid_cell` -- see the
@@ -172,7 +184,7 @@ def build_data_query_pipeline(
         conjuncts.append(_grid_cell_conjunct(options.grid_cell))
 
     if options.where:
-        conjuncts.append(f"({options.where})")
+        conjuncts.extend(f"({conjunct})" for conjunct in split_top_level_and(options.where))
 
     steps = []
     if conjuncts:

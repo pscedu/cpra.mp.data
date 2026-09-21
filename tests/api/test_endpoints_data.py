@@ -296,9 +296,13 @@ class TestVectorData:
         assert df.height == 32
 
     def test_tif_is_rejected_for_a_vector_grid(self, client, vector_data):
+        """Still a 400, now phrased in terms of the final frame's shape rather than an
+        "output type": the route types the request's frames and rejects a tabular result
+        under a format that needs a raster surface.
+        """
         response = client.get(f"{VECTOR_URL}/data.tif")
         assert response.status_code == 400
-        assert "must be one of" in response.json()["detail"]
+        assert "needs a raster surface" in response.json()["detail"]
 
     def test_unknown_variable_is_rejected(self, client, vector_data):
         assert client.get("/v1/datasets/nope/ecoregion_v001/annual/data.csv").status_code == 422
@@ -490,9 +494,13 @@ class TestRasterData:
             assert src.read(1)[0, 0] == 30
 
     def test_csv_is_rejected_for_a_raster_grid(self, client, raster_data):
+        """The converse of `test_tif_is_rejected_for_a_vector_grid`, and the same 400:
+        with no `grid_cell` to sample at, a raster grid's result stays band-wide, which
+        has no rows to write as CSV.
+        """
         response = client.get(f"{RASTER_URL}/data.csv")
         assert response.status_code == 400
-        assert "must be tif" in response.json()["detail"]
+        assert "needs a tabular sink" in response.json()["detail"]
 
     def test_geography_makes_csv_valid(self, client, raster_data):
         """Sampling at coordinates converts raster output to tabular."""
@@ -508,6 +516,76 @@ class TestRasterData:
         # A raster grid_cell selection is keyed by the "lng,lat" label itself, not an ID.
         assert df["grid_cell"].to_list() == [f"{lng},{lat}"]
         assert df["value"].to_list() == [30]
+
+    def test_two_points_in_one_pixel_get_a_row_each(self, client, raster_data):
+        """Two coordinates landing on the same pixel are two questions about one pixel, and
+        both get answered: the single sampled row fans back out into one row per
+        coordinate, each labeled with the string the caller sent. Collapsing them to one
+        row would leave a caller who asked about two points unable to tell which one they
+        got back.
+        """
+        with rio.open(next(raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform
+
+            row, col = src.height // 2, src.width // 2
+            x, y = src.xy(row, col)
+            pixel_width = src.transform.a
+            points = [
+                [c[0] for c in transform(src.crs, "EPSG:4326", [x + dx], [y])]
+                for dx in (-pixel_width / 4, pixel_width / 4)
+            ]
+
+        grid_cell = ",".join(f"{lng},{lat}" for lng, lat in points)
+        response = client.get(f"{RASTER_URL}/data.csv", params={"grid_cell": grid_cell})
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["grid_cell"].to_list() == [f"{lng},{lat}" for lng, lat in points]
+        assert df["value"].to_list() == [30, 30]
+
+    def test_a_point_outside_the_raster_is_an_empty_result_not_an_error(self, client, raster_data):
+        """A coordinate that misses the grid's extent contributes no cell, and a query where
+        every coordinate misses answers 200 with no rows -- the same convention a vector
+        grid has always used for a point outside every polygon. Rejecting it instead would
+        make "is there data here?" unanswerable without first knowing the extent.
+        """
+        with rio.open(next(raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform
+
+            minx, miny, maxx, _maxy = src.bounds
+            lng, lat = [
+                c[0] for c in transform(src.crs, "EPSG:4326", [(minx + maxx) / 2], [miny - 10_000])
+            ]
+
+        response = client.get(f"{RASTER_URL}/data.csv", params={"grid_cell": f"{lng},{lat}"})
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.height == 0
+
+    def test_sort_and_select_see_the_relabeled_grid_cell(self, client, raster_data):
+        """`sort`/`select` name `grid_cell` and get the coordinate strings, not the integer
+        IDs the filter ran on: the relabeling happens before output shaping, so what the
+        caller sorts and selects by is what the caller receives. Sorting after relabeling
+        also means the order is the labels' own (lexicographic, since they are strings),
+        not the pixel-ID order the caller never sees.
+        """
+        with rio.open(next(raster_data.rglob("*.tif"))) as src:
+            from rasterio.warp import transform
+
+            points = [
+                [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])]
+                for x, y in (src.xy(10, 20), src.xy(5, 5))
+            ]
+
+        grid_cell = ",".join(f"{lng},{lat}" for lng, lat in points)
+        response = client.get(
+            f"{RASTER_URL}/data.csv",
+            params={"grid_cell": grid_cell, "sort": "grid_cell", "select": "grid_cell,value"},
+        )
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.columns == ["grid_cell", "value"]
+        labels = [f"{lng},{lat}" for lng, lat in points]
+        assert df["grid_cell"].to_list() == sorted(labels)
 
     def test_tabular_compression_is_rejected_for_tif(self, client, raster_data):
         response = client.get(f"{RASTER_URL}/data.tif?compression_algorithm=gzip")
@@ -627,11 +705,19 @@ class TestRasterTiles:
         assert response.status_code == 422
 
     def test_multiband_tile_is_400(self, client, base_path, monkeypatch):
+        """A tile that OVERLAPS the data, deliberately: the band-count rejection now
+        happens at render time (`execution.sink.render_tile`), after the read, rather than
+        as an up-front validation of the band metadata alone. A tile whose footprint
+        misses the raster entirely has no bands to count and answers 404 (nothing to show)
+        before the two-band condition is ever reached -- so asking for a disjoint tile, as
+        this test once did, would no longer exercise the rule it names.
+        """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
-        response = client.get(f"{RASTER_URL}/data/8/0/0.png")
+        tile = self._tile(base_path)
+        response = client.get(f"{RASTER_URL}/data/{tile.z}/{tile.x}/{tile.y}.png")
         assert response.status_code == 400
-        assert "more than one band" in response.json()["detail"]
+        assert "2 bands reached the tile sink" in response.json()["detail"]
 
     def test_color_map_is_accepted(self, client, raster_data):
         tile = self._tile(raster_data)
@@ -742,15 +828,24 @@ class TestVectorTiles:
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
 
-    def test_missing_pmtiles_file_is_404(self, client, vector_data, tiles_path):
+    def test_missing_pmtiles_file_is_204(self, client, vector_data, tiles_path):
+        """A bodiless 204, not the old 404-with-a-JSON-body: an MVT client already reads
+        a 204 as "empty tile", and this route cannot distinguish "this grid has no
+        PMTiles archive" from "this tile has no features" anyway -- both are the same
+        answer to a client. Matches `/v1/analysis/{z}/{x}/{y}.pbf`, which made the same
+        change when it moved onto this engine.
+        """
         response = client.get(f"{VECTOR_URL}/tiles/3/1/2.pbf")
-        assert response.status_code == 404
-        assert "no tile file for grid" in response.json()["detail"]
+        assert response.status_code == 204
+        assert response.content == b""
 
     def test_raster_grid_is_400(self, client, raster_data, tiles_path):
+        """Still a 400: a raster grid with no `grid_cell` leaves a band-wide final frame,
+        which has no rows to inject into a vector tile's features.
+        """
         response = client.get(f"{RASTER_URL}/tiles/3/1/2.pbf")
         assert response.status_code == 400
-        assert "invalid output type for vector tile" in response.json()["detail"]
+        assert "needs a tabular sink" in response.json()["detail"]
 
 
 class TestCatalogEndpoint:

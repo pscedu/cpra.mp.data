@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
-from cpra.mp.data.analysis import AnalysisError, create_analysis
+from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis.pipeline import PipelineError
 from cpra.mp.data.analysis.planner import compile_pipeline
 from cpra.mp.data.analysis.request.ops import validate_shapes
@@ -24,6 +24,7 @@ from cpra.mp.data.analysis.types import (
 )
 from cpra.mp.data.api.boundary import install_analysis_boundary
 from cpra.mp.data.api.crosswalk import Crosswalk
+from cpra.mp.data.api.data_query import build_data_query
 from cpra.mp.data.api.models import (
     Analysis,
     AnalysisDataQuery,
@@ -355,17 +356,32 @@ async def get_model_data(
     dataset_dimensions: DatasetDimensions = Depends(),
     _reject_retired: None = RejectRetiredParams,
 ):
+    # `validate_shapes` replaces the old `validate_format(format, dataset.output_type)`
+    # entirely, and covers strictly more: `output_type` was "vector unless this is a raster
+    # grid with no grid_cell/summarize_by" (`analysis.output.resolve_output_type`), i.e. a
+    # restatement of the final frame's shape derived from the two options that can change
+    # it, where `validate_shapes` types the frame through the ops themselves. Both reject
+    # the same two requests -- a raster grid asked for a tabular format, and a point query
+    # asked for `tif` -- with a different message; nothing that used to pass now fails.
+    #
+    # `estimate_data_size`/`STREAM_THRESHOLD`/`collect_in_memory` have no counterpart here:
+    # `PipelineTabularResponse` always streams (see its docstring), because estimating a
+    # compiled plan's result size ahead of running it is not implemented. The old
+    # size-based collect-in-memory shortcut for a small result is the one thing this
+    # rebind drops outright.
     compression = query.compression
     validate_compression(compression, format)
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
-    validate_format(format, dataset.output_type)
-    await dataset.apply_params()
-    if dataset.output_type == OutputType.raster:
-        return RasterioStreamingResponse(dataset, format, compression)
-
-    data_size = dataset.estimate_data_size()
-    collect_in_memory = data_size is not None and data_size <= (STREAM_THRESHOLD * pow(10, 6))
-    return PolarsStreamingResponse(dataset, format, compression, collect_in_memory)
+    resolved = await build_data_query(
+        dataset_dimensions, query.filter_dimensions, query.options, format.value
+    )
+    validate_shapes(resolved.pipeline)
+    return await respond_to_analysis_pipeline(
+        resolved.pipeline,
+        format.value,
+        compression,
+        relabel=resolved.relabel,
+        float_precision=resolved.float_precision,
+    )
 
 
 @app.get(
@@ -381,10 +397,24 @@ async def get_model_tile(
     dataset_dimensions: DatasetDimensions = Depends(),
     _reject_retired: None = RejectRetiredParams,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
-    await dataset.apply_params()
-    dataset.validate_tile()
-    return RasterioTileResponse(dataset, x, y, z, format)
+    # `dataset.validate_tile()`'s two rules, both preserved but now enforced in two
+    # different places. "Not a tabular result" is `validate_shapes` below: `png`/`jpg` are
+    # `RASTER_OUTPUT_FORMATS` members, so a long final frame -- which a `grid_cell` point
+    # query on a raster grid produces, and which a vector grid produces unconditionally --
+    # is a 400 there, the same rejection `resolve_output_type`-plus-`validate_raster_tile`
+    # made. "Exactly one band" is `execution.sink.render_tile`'s own check, which raises
+    # `ShapeError` (-> 400) at render time rather than at validate time: it needs the band
+    # count, which is only known once the catalog has been read.
+    #
+    # `resolved.relabel` is deliberately not forwarded: a `grid_cell` that resolves to
+    # coordinate labels only arises on a raster grid, and that request cannot reach a
+    # renderer at all (the line above rejects it), so there is never a tile response with
+    # a `grid_cell` column to relabel.
+    resolved = await build_data_query(
+        dataset_dimensions, query.filter_dimensions, query.options, format.value
+    )
+    validate_shapes(resolved.pipeline)
+    return await respond_to_analysis_pipeline_tile(resolved.pipeline, x, y, z, format.value)
 
 
 @app.get(
@@ -399,10 +429,29 @@ async def get_vector_tile(
     dataset_dimensions: DatasetDimensions = Depends(),
     _reject_retired: None = RejectRetiredParams,
 ):
-    dataset = create_analysis(dataset_dimensions, query.filter_dimensions, query.options)
-    await dataset.apply_params()
-    dataset.validate_vector_tile()
-    return VectorTileResponse(dataset, x, y, z)
+    # `output.format` is a stand-in, not a choice with consequences. `pbf` is not a member
+    # of `DataFormat`/`TileFormat` (see `request.pipeline.Output.format`), so a pipeline
+    # cannot spell this route's actual output format at all, and nothing here renders from
+    # `output.format`: `respond_to_analysis_pipeline_vector_tile` reads the PMTiles
+    # boundary layer and injects values into it, never applying `output`'s own shaping
+    # (see its docstring). The one thing `output.format` still decides is which half of
+    # `validate_shapes`'s sink-shape rule applies, and every TABULAR format picks the same
+    # half -- "the final frame must be long" -- which is exactly this route's requirement,
+    # so any of them would behave identically here.
+    #
+    # That check is also what replaces the first half of the old `validate_vector_tile()`:
+    # a raster grid with no `grid_cell` leaves a band-wide final frame and is a 400 there,
+    # as it was before. Its second half -- the final grid must actually BE a vector grid,
+    # which a raster point query's long-on-a-raster-grid frame is not -- is
+    # `api.pipeline._require_vector_final_frame`'s `ShapeError`, also a 400. The old
+    # engine reached that case as a 404 ("no tile file for grid: <raster grid>") only
+    # because it looked for a PMTiles file named after a raster grid and failed to find
+    # one; a request that could never have had one is a client error, not a missing file.
+    resolved = await build_data_query(
+        dataset_dimensions, query.filter_dimensions, query.options, DataFormat.ndjson.value
+    )
+    validate_shapes(resolved.pipeline)
+    return await respond_to_analysis_pipeline_vector_tile(resolved.pipeline, x, y, z)
 
 
 def _check_output_format_agreement(pipeline, url_format):

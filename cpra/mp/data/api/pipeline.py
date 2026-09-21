@@ -52,6 +52,7 @@ from starlette.types import Receive, Scope, Send
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.execution import sink
+from cpra.mp.data.analysis.io import output
 from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.ops import Shape
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
@@ -87,11 +88,22 @@ class PipelineTabularSource:
     never calls the collect-first branch for this source, and there is nothing here to
     satisfy that duck type for.
 
-    `tabular_kwargs` always returns `{}`: `api.sources.LazyFrameSource`'s override of this
-    rounds CSV output to a single `Variable`'s `float_precision`, which has no equivalent
-    here -- a pipeline's final frame can blend more than one input, and `request.pipeline.
-    Output` carries no `float_precision` field of its own, so there is no one value this
-    could resolve.
+    `float_precision` is the one `api.sources.LazyFrameSource` behavior this source can
+    only take on when a caller hands it the value: that class's `tabular_kwargs` rounds CSV
+    output to its single `Variable`'s own `float_precision`, and a pipeline's final frame
+    can blend more than one input, so there is no value this could resolve for itself.
+    `api.data_query.build_data_query` DOES have one -- a flat data query is a single-input
+    pipeline built from one `variable` by construction -- and passes it, which is what
+    keeps `/v1/datasets/{variable}/.../data.csv` rounding exactly as it did before that
+    route was rebound onto this engine. Left at `None` by the `/v1/analysis...` routes,
+    whose pipelines have no single variable to round to: that surface does not round, and
+    this default is what keeps it that way rather than having it silently start.
+
+    `relabel` is forwarded to `run_to_path` (see that function's docstring): the raster
+    point query's absolute-id -> coordinate-string map, or `None` for every request that
+    did not point-sample a raster, which is all of them on the `/v1/analysis...` surface
+    (a pipeline spells a spatial filter in `grid_cell` ids directly, so there are no
+    caller-supplied coordinate strings to relabel back to).
 
     `stream_tabular` forwards its `**kwargs` straight into `run_to_path` -- `compression`/
     `compression_level`, computed by `stream_or_write_to_file` from the request's own
@@ -102,15 +114,17 @@ class PipelineTabularSource:
     may not import from `api/` (see `tests/api/test_analysis_boundary.py`).
     """
 
-    def __init__(self, pipeline, *, base_path=None):
+    def __init__(self, pipeline, *, base_path=None, relabel=None, float_precision=None):
         self.pipeline = pipeline
         self.base_path = base_path
+        self.relabel = relabel
+        self.float_precision = float_precision
 
     def tabular_kwargs(self, format):
-        return {}
+        return output.tabular_kwargs(format, self.float_precision)
 
     def stream_tabular(self, out_path, format, **kwargs):
-        run_to_path(self.pipeline, out_path, base_path=self.base_path, **kwargs)
+        run_to_path(self.pipeline, out_path, base_path=self.base_path, relabel=self.relabel, **kwargs)
 
 
 class PipelineTabularResponse(Response):
@@ -251,16 +265,28 @@ class PipelineRasterResponse(FileResponse):
                 raise HTTPException(status_code=404, detail="source data do not exist")
 
 
-async def respond_to_analysis(pipeline, format: str, compression, *, base_path=None) -> Response:
-    """Build the response for `POST|GET /v1/analysis.{format}`: `tif` gets
+async def respond_to_analysis(
+    pipeline, format: str, compression, *, base_path=None, relabel=None, float_precision=None
+) -> Response:
+    """Build the response for `POST|GET /v1/analysis.{format}` -- and, since it was rebound
+    onto this engine, for `GET /v1/datasets/{variable}/{time_unit}/{grid}/data.{format}`
+    too (`api.__init__.get_model_data`, via `api.data_query.build_data_query`): `tif` gets
     `PipelineRasterResponse`, every other (tabular) format gets `PipelineTabularResponse`.
-    Called only after the route has already run `parse_pipeline`/`validate_shapes`/
-    `_check_output_format_agreement`/`validate_compression` -- this function does none of
-    those checks itself.
+    Called only after the caller has already run its own parse/`validate_shapes`/
+    format-agreement/`validate_compression` checks -- this function does none of them
+    itself.
+
+    `relabel`/`float_precision` are the two flat-data-route-only extras, both forwarded to
+    `PipelineTabularSource` and both meaningless for a `tif` (a raster point query's long
+    result can never reach the raster branch -- `request.ops.validate_shapes` rejects
+    `output.format="tif"` on a long final frame before this function is called -- and a
+    GeoTIFF has no text floats to round). See that class's docstring for each.
     """
     if format == "tif":
         return PipelineRasterResponse(pipeline, compression, base_path=base_path)
-    source = PipelineTabularSource(pipeline, base_path=base_path)
+    source = PipelineTabularSource(
+        pipeline, base_path=base_path, relabel=relabel, float_precision=float_precision
+    )
     return PipelineTabularResponse(source, format, compression)
 
 

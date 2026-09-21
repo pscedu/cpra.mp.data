@@ -883,7 +883,9 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     return result
 
 
-def run_to_path(pipeline, out_path, *, base_path=None, dtype=None, nodata=None, **profile_options) -> bool:
+def run_to_path(
+    pipeline, out_path, *, base_path=None, dtype=None, nodata=None, relabel=None, **profile_options
+) -> bool:
     """Compile, run, and sink `pipeline` to `out_path` in one call -- `compile_plan` then
     `execute` then whichever of the two "a whole result, at a path" sinks matches the
     result's own shape (`execution.sink.sink_tabular` for a long frame,
@@ -899,6 +901,19 @@ def run_to_path(pipeline, out_path, *, base_path=None, dtype=None, nodata=None, 
     `execution.sink`'s `output.sort`/`output.select` shaping is applied to a long result
     before it is written, matching every other tabular path (`apply_output_shaping`, run
     once, last).
+
+    `relabel`, when given, is an `io.geography.resolve_raster_point_labels` map (absolute
+    `grid_cell` id -> the caller's own coordinate-string label(s) for it) applied to a long
+    result by `io.geography.relabel_raster_grid_cell` -- the last thing a raster POINT query
+    needs before its output is written, and the reason that query's `grid_cell` column
+    comes back as `"lng,lat"` strings rather than the integer pixel ids the filter itself
+    ran against. Applied BEFORE `apply_output_shaping`, not after, so `output.sort`/
+    `output.select` see the column a caller actually receives: `sort=grid_cell` orders the
+    label strings (what the caller asked to sort by), and `select=grid_cell` keeps a column
+    that still exists. Ignored for a band-wide result -- a raster point query is long by
+    construction (a spatial `filter` unpivots band-wide to long; see `execution.band_ops.
+    filter_band_wide`), so a band-wide result and a `relabel` map cannot both be present
+    unless a caller built one for a pipeline that never point-sampled at all.
 
     Returns `False` when the underlying sink does (a band-wide result with no bands to
     write -- see `execution.sink.write_raster`); `True` otherwise. A long/tabular write
@@ -923,11 +938,19 @@ def run_to_path(pipeline, out_path, *, base_path=None, dtype=None, nodata=None, 
     is never split or reinterpreted -- whichever caller built it already built it in the
     vocabulary the result's own shape needs.
 
-    Deferred, function-body-local import of `execution.sink`: `sink.py` imports
-    `LoweringNotImplementedError` from this module at ITS top level, so importing `sink`
-    back at this module's own top level would close that into a cycle at import time.
+    Deferred, function-body-local imports of `execution.sink` and `io.geography`, for two
+    different cycles. `sink.py` imports `LoweringNotImplementedError` from this module at
+    ITS top level, so importing `sink` back at this module's own top level would close that
+    into a cycle at import time. `io.geography` is a cycle for a longer, temporary reason:
+    it still imports `AnalysisError` from the legacy `analysis/` root for its OLD-engine-
+    facing functions (see that module's own docstring), and `analysis/base.py` reaches this
+    module through `analysis.pipeline` -> `execution.fold` -> `execution/__init__.py`, so a
+    top-level import here would need `analysis.base` to already be initialized while it is
+    still executing. It resolves itself once `io.geography`'s exceptions are re-pointed off
+    the legacy root.
     """
     from cpra.mp.data.analysis.execution import sink
+    from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 
     plan = compile_plan(pipeline, base_path=base_path)
     result = execute(plan, base_path=base_path)
@@ -939,6 +962,9 @@ def run_to_path(pipeline, out_path, *, base_path=None, dtype=None, nodata=None, 
         if nodata is not None:
             write_kwargs["nodata"] = nodata
         return sink.write_raster(result, out_path, **write_kwargs)
+
+    if relabel is not None:
+        result = relabel_raster_grid_cell(result, relabel)
 
     lf = sink.apply_output_shaping(result, pipeline.output)
     sink.sink_tabular(lf, out_path, pipeline.output.format, **profile_options)
