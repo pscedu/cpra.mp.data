@@ -16,7 +16,7 @@ from datetime import date
 
 import pytest
 
-from cpra.mp.data.analysis.parameters import DataOptions, DatasetDimensions, FilterDimensions
+from cpra.mp.data.analysis.request.parameters import DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
@@ -246,10 +246,10 @@ class TestGridCell:
             )
 
     def test_negative_number_is_rejected_as_non_digit(self):
-        """`str.isdigit()` rejects a leading `-` -- mirrors `analysis.vector.
-        apply_grid_cell_selection`'s own digit-vs-coordinate rule exactly, including this
-        edge case (a negative literal ID is not representable through this parameter,
-        matching the old engine's behavior)."""
+        """`str.isdigit()` rejects a leading `-` -- the digit-vs-coordinate rule a
+        vector grid has always used, including this edge case (a negative literal ID is
+        not representable through this parameter, which is long-standing behavior and
+        not a regression introduced here)."""
         with pytest.raises(RequestError, match="grid_cell"):
             build_data_query_pipeline(_dataset_dimensions(), FilterDimensions(), DataOptions(grid_cell="-1"), "csv")
 

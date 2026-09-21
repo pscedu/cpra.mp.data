@@ -7,19 +7,14 @@ chunk is ready.
 
 import polars as pl
 import pytest
-import rasterio as rio
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from cpra.mp.data.analysis.types import CompressionAlgorithm
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.api.models import Compression
-from cpra.mp.data.api.raster import COMPRESSION_LEVEL_OPTIONS, RasterioStreamingResponse
+from cpra.mp.data.api.pipeline import COMPRESSION_LEVEL_OPTIONS
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
-from cpra.mp.data.api.vector import VectorTileResponse
-from tests.factories import RASTER_KWARGS, write_raster_dataset
-
-DIMENSIONS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 
 
 def serve(response_factory):
@@ -120,7 +115,12 @@ class TestStreamingThread:
         assert out.read_text().startswith("a")
 
 
-class TestRasterioStreamingResponse:
+class TestCompressionLevelOptions:
+    """`api.pipeline.COMPRESSION_LEVEL_OPTIONS` -- the rasterio profile key each
+    compression algorithm spells its level with. Only the three that HAVE a level appear;
+    `.get()` returning nothing is what "this algorithm takes no level" means.
+    """
+
     def test_compression_level_option_mapping(self):
         assert COMPRESSION_LEVEL_OPTIONS[CompressionAlgorithm.deflate] == "zlevel"
         assert COMPRESSION_LEVEL_OPTIONS[CompressionAlgorithm.lzma] == "lzma_preset"
@@ -129,86 +129,3 @@ class TestRasterioStreamingResponse:
     def test_algorithms_without_a_level_option(self):
         assert CompressionAlgorithm.lzw not in COMPRESSION_LEVEL_OPTIONS
         assert CompressionAlgorithm.none not in COMPRESSION_LEVEL_OPTIONS
-
-    async def test_streams_a_geotiff(self, dataset_factory, base_path, tmp_path):
-        import io
-
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", Compression()))
-        response = client.get("/test")
-
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "image/tiff; application=geotiff"
-        with rio.open(io.BytesIO(response.content)) as src:
-            assert src.read(1)[0, 0] == 30
-
-    async def test_compression_reaches_the_output_profile(
-        self, dataset_factory, base_path, tmp_path
-    ):
-        import io
-
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        compression = Compression(
-            compression_algorithm=CompressionAlgorithm.deflate, compression_level=9
-        )
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", compression))
-        response = client.get("/test")
-
-        with rio.open(io.BytesIO(response.content)) as src:
-            assert src.profile["compress"].lower() == "deflate"
-
-    async def test_missing_source_data_raises_404(self, dataset_factory, base_path):
-        """An HTTPException raised inside __call__ is still handled by FastAPI."""
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", Compression()))
-        response = client.get("/test")
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Source data do not exist"
-
-
-class TestVectorTileResponse:
-    async def test_missing_tile_raises(self, dataset_factory, base_path, tiles_path):
-        from cpra.mp.data.tabular import write_parquet
-        from tests.factories import ANNUAL_KWARGS, annual_frame
-
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
-        dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions)
-        await dataset.apply_params()
-
-        client = serve(lambda: VectorTileResponse(dataset, 1, 2, 3))
-        response = client.get("/test")
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Tile does not exist"
-
-    async def test_serves_a_tile(self, dataset_factory, base_path, tiles_path):
-        import mercantile
-        from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
-
-        from cpra.mp.data.tabular import write_parquet
-        from tests.factories import ANNUAL_KWARGS, annual_frame, write_pmtiles
-
-        tile = mercantile.Tile(x=1, y=2, z=3)
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
-        write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
-
-        dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions)
-        await dataset.apply_params()
-
-        client = serve(lambda: VectorTileResponse(dataset, tile.x, tile.y, tile.z))
-        response = client.get("/test")
-
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
-        parsed = VectorTile()
-        parsed.ParseFromString(response.content)
-        assert len(parsed.layers[0].values) == 2

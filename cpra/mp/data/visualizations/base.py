@@ -371,6 +371,15 @@ class DatasetVisualization(BaseVisualization):
         selected, the signal every migrated hook in this module (and in `map.py`/
         `time_series_line.py`/`stacked_bar.py`) falls back to its pre-existing legacy
         behavior on.
+
+        `grid_cell` is resolved against real geometry FIRST and passed separately as
+        `grid_cell_where`, exactly as `api.__init__._resolve_dataset_analysis` does for
+        the HTTP routes and for the same reason: the registry cannot parse a coordinate
+        (doing so needs `io/`), and a visualization's `grid_cell` is a coordinate as often
+        as it is an id -- `_grid_cells` above already resolves the same value the same
+        way. A `None` back from `resolve_grid_cell_sync` means the value was a vector
+        grid's digit-id form (or absent), which `_analysis_filters`'s own raw `grid_cell`
+        key covers.
         """
         name = self._analysis_name
         if name is None:
@@ -381,9 +390,17 @@ class DatasetVisualization(BaseVisualization):
         # level would be a circular import -- see `map.py`'s `feature_colors`, which
         # already does the same thing for its own model imports.
         from cpra.mp.data.analyses import DatasetRef, resolve_analysis
+        from cpra.mp.data.api.data_query import resolve_grid_cell_sync
 
+        grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, self.params.get("grid_cell"))
         dataset = DatasetRef(variable=self.variable.name, time_unit=self.time_unit, grid=self.grid.name)
-        return resolve_analysis(name, dataset=dataset, filters=self._analysis_filters, params=self._analysis_params)
+        return resolve_analysis(
+            name,
+            dataset=dataset,
+            filters=self._analysis_filters,
+            params=self._analysis_params,
+            grid_cell_where=grid_cell_where,
+        )
 
     @cached_property
     def difference_suffix(self):
@@ -475,8 +492,8 @@ class DatasetVisualization(BaseVisualization):
             ]
 
         # Imported lazily: this pulls in the geospatial stack, and a notebook that only
-        # builds specs shouldn't need it. Same reason map.py imports `create_analysis`
-        # where it's used.
+        # builds specs shouldn't need it. Same reason map.py imports the analysis engine
+        # where it's used rather than at module scope.
         from cpra.mp.data.analysis.io.geography import resolve_vector_grid_cell_sync
 
         ids = resolve_vector_grid_cell_sync(self.grid.name, [p[0] for p in pairs], [p[1] for p in pairs])

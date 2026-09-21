@@ -20,8 +20,8 @@ partitioning, dataset-dimension literal columns, required-column projection) -- 
 than re-deriving any of that a second time here.
 
 `columns`/`predicate` are the pushdown seam `execution/plan.py`'s `ResolvedInput` carries:
-nothing in this vertical slice computes a real projection/predicate decision (that is
-later-stage work), but the scan already knows how to use one once a plan supplies it, via
+nothing computes a real projection/predicate decision yet, but the scan already knows
+how to use one once a plan supplies it, via
 an ordinary `.select`/`.filter` Polars can push into partition pruning and row-group
 statistics -- see that module's own docstring for why the decision lives on the plan
 rather than being invented here.

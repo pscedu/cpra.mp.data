@@ -520,10 +520,10 @@ class TestRenderTile:
         # resolved input, an empty band-wide result out of `execute`, and `None` -- a 404
         # -- out of the sink.
         #
-        # The old engine's tile path split this in two, rendering an all-nodata tile when a
-        # footprint overlapped the dataset's reprojected bounds but still resolved to no
-        # source pixels, and 404ing only when the bounds themselves were disjoint. Both are
-        # a miss here. The two differ only across a sliver the width of the disagreement
+        # A tile path could split this in two, rendering an all-nodata tile when a
+        # footprint overlaps the dataset's reprojected bounds but still resolves to no
+        # source pixels, and 404ing only when the bounds themselves are disjoint. Both
+        # are a miss here. The two differ only across a sliver the width of the disagreement
         # between two bbox approximations of the same reprojected (curved) quad, and an
         # empty tile and a missing one render identically on a map.
         write_raster_dataset(base_path, years=(2030,))
@@ -666,8 +666,8 @@ class TestSinkVectorTile:
         assert list(by_id[3].tags) == []
 
     def test_result_is_raw_protobuf_not_gzipped(self, tiles_path):
-        # Matches the old engine's inject_and_serialize contract: the injected tile is
-        # handed back as plain protobuf bytes, not re-gzipped -- a caller's own transport
+        # The injected tile is handed back as plain protobuf bytes, not re-gzipped --
+        # a caller's own transport
         # layer (or none) decides compression, the same way the tile read off disk was
         # decompressed once on the way in and never recompressed.
         write_pmtiles(tiles_path, "ecoregion_v001", self.TILE, [1])

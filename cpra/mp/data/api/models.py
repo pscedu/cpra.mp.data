@@ -4,17 +4,17 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
 
-from cpra.mp.data.analysis.parameters import (  # noqa: F401
+from cpra.mp.data.analysis.request.parameters import (  # noqa: F401
     CalculateEntry,
     DataOptions,
     DatasetDimensions,
     FilterDimensions,
     Options,
 )
-from cpra.mp.data.analysis.types import (
+from cpra.mp.data.analysis.request.types import (
     CompressionAlgorithm,
 )
-from cpra.mp.data.analysis.types import Grid as GridName
+from cpra.mp.data.analysis.request.types import Grid as GridName
 
 
 class Compression(BaseModel):

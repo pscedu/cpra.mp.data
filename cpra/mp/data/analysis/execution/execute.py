@@ -161,6 +161,7 @@ from cpra.mp.data.analysis.execution.frame import (
 )
 from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, compile_plan
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
+from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.vector import scan_vector
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
@@ -435,7 +436,7 @@ def _lowering_for(kind: str, key: object, registry: dict[tuple[str, object], obj
     return registry[(kind, key)]
 
 
-# The two `where` shapes `request.data_query._grid_cell_conjunct` (and any other caller
+# The two `where` shapes `request.data_query.grid_cell_conjunct` (and any other caller
 # resolving a coordinate to a literal id list before compiling a pipeline) ever produces
 # for a raster spatial filter -- unquoted integers only, matching the convention every
 # ABSOLUTE `grid_cell` id in this codebase already uses before any window has narrowed it.
@@ -450,7 +451,7 @@ def _parse_point_sample_ids(where: str) -> list[int] | None:
     opened: exactly one top-level spatial conjunct (`request.expressions.
     classify_where_kinds`), and that one conjunct is exactly `grid_cell = N` or `grid_cell
     IN (N1, N2, ...)` with unquoted integer literals -- the two forms `request.data_query.
-    _grid_cell_conjunct` produces for a raster point query.
+    grid_cell_conjunct` produces for a raster point query.
 
     Returns `None` -- not an error -- for anything else: two or more top-level spatial
     conjuncts, or one spatial conjunct that isn't exactly one of the two recognized forms
@@ -938,19 +939,11 @@ def run_to_path(
     is never split or reinterpreted -- whichever caller built it already built it in the
     vocabulary the result's own shape needs.
 
-    Deferred, function-body-local imports of `execution.sink` and `io.geography`, for two
-    different cycles. `sink.py` imports `LoweringNotImplementedError` from this module at
-    ITS top level, so importing `sink` back at this module's own top level would close that
-    into a cycle at import time. `io.geography` is a cycle for a longer, temporary reason:
-    it still imports `AnalysisError` from the legacy `analysis/` root for its OLD-engine-
-    facing functions (see that module's own docstring), and `analysis/base.py` reaches this
-    module through `analysis.pipeline` -> `execution.fold` -> `execution/__init__.py`, so a
-    top-level import here would need `analysis.base` to already be initialized while it is
-    still executing. It resolves itself once `io.geography`'s exceptions are re-pointed off
-    the legacy root.
+    `execution.sink` is imported inside the function body rather than at this module's top
+    level: `sink.py` imports `LoweringNotImplementedError` from here at ITS top level, so
+    importing it back at the top would close that into a cycle at import time.
     """
     from cpra.mp.data.analysis.execution import sink
-    from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 
     plan = compile_plan(pipeline, base_path=base_path)
     result = execute(plan, base_path=base_path)

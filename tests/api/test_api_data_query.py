@@ -19,9 +19,9 @@ from rasterio.transform import xy as raster_xy
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.analysis import AnalysisError
-from cpra.mp.data.analysis.parameters import DataOptions, DatasetDimensions, FilterDimensions
-from cpra.mp.data.analysis.request.errors import NotFoundError
+from cpra.mp.data.analysis.request.parameters import DataOptions, DatasetDimensions, FilterDimensions
+from cpra.mp.data.analysis.request.errors import NotFoundError, RequestError
+from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.api.data_query import build_data_query, resolve_grid_cell
 from cpra.mp.data.grids import GRIDS
 from tests.factories import write_grid_geometry
@@ -84,7 +84,7 @@ class TestResolveGridCellNoop:
 
     async def test_a_vector_grids_digit_ids_are_left_to_the_builder(self):
         """Digit-only tokens on a vector grid are literal polygon IDs, and the ID ->
-        `where` rendering already exists in `request.data_query._grid_cell_conjunct`. This
+        `where` rendering already exists in `request.data_query.grid_cell_conjunct`. This
         layer deliberately does not duplicate it -- it returns `None` so exactly one
         implementation of "these are literal IDs" runs.
         """
@@ -203,9 +203,9 @@ class TestResolveGridCellRaster:
         point is nowhere near this grid's UTM zone, and the error names it as the
         coordinate pair it was parsed as.
         """
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             await resolve_grid_cell(RASTER_GRID, "1,2")
-        assert "1.0, 2.0" in excinfo.value.detail
+        assert "1.0, 2.0" in str(excinfo.value)
 
     async def test_the_raster_branch_opens_no_geometry_file(self):
         """No `geometry_path` fixture here either: a raster `grid_cell` is resolved from the
@@ -222,14 +222,14 @@ class TestResolveGridCellErrors:
             await resolve_grid_cell("no_such_grid_v001", "1,2")
 
     async def test_an_odd_number_of_coordinates_is_rejected(self, ecoregion_geometry):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             await resolve_grid_cell(VECTOR_GRID, "-91.0,29.5,-91.5")
-        assert excinfo.value.status_code == 400
+        assert resolve_status(excinfo.value) == 400
 
     async def test_a_non_numeric_coordinate_is_rejected(self, ecoregion_geometry):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             await resolve_grid_cell(VECTOR_GRID, "-91.0,north")
-        assert excinfo.value.status_code == 400
+        assert resolve_status(excinfo.value) == 400
 
 
 class TestBuildDataQuery:

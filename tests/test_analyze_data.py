@@ -1,24 +1,34 @@
-"""Tests for `analyze_data`, the pipeline-only library entry point that wraps
-`cpra.mp.data.analysis`'s `parse_pipeline`/`compile_pipeline` surface so a notebook or
-script can run an analysis without HTTP and without touching the underlying
-`BaseAnalysis`/`PairedAnalysis` objects directly -- the `/v1/analysis` equivalent
-(`read_data` is `/v1/datasets`'s; its own tests, including its new `grid_cell`/`where`/
-`sort`/`select` selection parameters, live in `tests/test_init.py`).
+"""Tests for `analyze_data`, the pipeline-only library entry point that runs the same
+four stages an HTTP response does -- `parse_pipeline`, `validate_shapes`, `compile_plan`,
+then `execute`/`run_to_path` -- so a notebook or script can run an analysis without
+FastAPI in the way. It is `/v1/analysis`'s counterpart; `read_data` is `/v1/datasets`'s,
+and its own tests (including its `grid_cell`/`where`/`sort`/`select` parameters) live in
+`tests/test_init.py`.
 
-`analyze_data` has no flat/keyword calling surface at all -- `pipeline` is
-its one required, positional-first argument, with no `**params` left to catch a stray
-keyword (`TestPipelineOnlySurface::test_flat_keywords_are_rejected_by_python_itself` below
-proves what a caller still spelling a request the old way gets: Python's own `TypeError`,
-raised before `analyze_data`'s body ever runs). Every test below that used to be a flat
-`analyze_data(variable=..., ...)` call is rewritten as either a `read_data` call (plain
-dimension filtering, no aggregation -- `tests/test_init.py`) or a pipeline body here.
-`cpra.mp.data.analysis.create_analysis`'s own flat/plain-value calling convention is
-unaffected by this change and is exercised directly, not through `analyze_data`, by
-`tests/api/test_analysis_entrypoint.py`.
+What is tested HERE is only what `analyze_data` itself decides -- the return contract.
+The pipeline grammar, the shape rules, and the execution semantics all belong to the
+engine and are tested against it directly; a pipeline body below is the smallest one that
+reaches the branch under test, not a survey of what the grammar can express.
 
-Follows `tests/api/test_analysis_entrypoint.py`'s convention: real variables/grids from
-`tests/factories.py`, `tmp_path`-backed fixtures, and `async def test_...` (the suite runs
-under `asyncio_mode = "auto"`, so no explicit marker is needed).
+Three things the rewrite onto that engine changed about how a request is spelled, all
+visible below:
+
+* **An input selects a dataset and nothing else.** `variable`/`time_unit`/`grid` are the
+  only keys `InputSelection` accepts (`extra="forbid"`); a dimension filter that used to
+  ride along inside `inputs` is a leading `filter` STEP now, which also makes its
+  position in the chain explicit rather than implicit.
+* **There is no raster-to-raster `project`.** A raster input is already band-wide the
+  moment it is read, so a GeoTIFF request is the input plus whatever narrows it -- no
+  projection onto the grid it is already on (there is no crosswalk between two raster
+  lattices; see `request.ops.PROJECT_LOWERING_TABLE`).
+* **The raster/tabular decision is `output.format`, not a re-derived shape.**
+  `validate_shapes` has already forced the format and the final frame's shape to agree
+  before `analyze_data` reads the format, so the two can never disagree here.
+
+`analyze_data` is still a coroutine even though nothing in it awaits any more, so these
+stay `async def test_...` (the suite runs under `asyncio_mode = "auto"`, so no marker is
+needed). Real variables/grids come from `tests/factories.py` against `tmp_path`-backed
+fixtures.
 """
 
 from pathlib import Path
@@ -30,7 +40,7 @@ import rasterio as rio
 from polars.testing import assert_frame_equal
 
 from cpra.mp.data import analyze_data
-from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis.request.errors import NotFoundError, ShapeError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.tabular import write_parquet
 from tests.factories import (
@@ -43,11 +53,29 @@ from tests.factories import (
 
 RASTER_GRID = GRIDS[RASTER_KWARGS["grid"]]
 
+# The vector/raster input selections these pipelines are built from. Each is exactly the
+# three keys `InputSelection` accepts -- spelled once here so a stray fourth key cannot be
+# reintroduced test by test.
+ECO_INPUT = {k: ANNUAL_KWARGS[k] for k in ("variable", "time_unit", "grid")}
+VCT_INPUT = {k: RASTER_KWARGS[k] for k in ("variable", "time_unit", "grid")}
+
+
+def eco_pipeline(*steps, **output):
+    """One `ssf`/`ecoregion_v001` input named `eco`, `steps`, and a CSV output by default."""
+    return {"inputs": {"eco": ECO_INPUT}, "steps": list(steps), "output": {"format": "csv", **output}}
+
+
+def vct_pipeline(*steps, **output):
+    """One `vct`/`veg_grid_cell_v001` input named `vct`, `steps`, and a GeoTIFF output by
+    default -- a raster input is band-wide from the start, so an unnarrowed one already
+    satisfies `tif`'s "needs a raster surface" rule with no `project` in the way."""
+    return {"inputs": {"vct": VCT_INPUT}, "steps": list(steps), "output": {"format": "tif", **output}}
+
 
 @pytest.fixture
 def two_scenario_annual_data(base_path):
-    """Two years x two scenarios of ssf/ecoregion_v001, so a `scenario_id` input filter
-    has something to actually exclude rather than trivially matching everything written."""
+    """Two years x two scenarios of ssf/ecoregion_v001, so a `scenario_id` filter step has
+    something to actually exclude rather than trivially matching everything written."""
     write_parquet(annual_frame(years=(2030, 2040), scenario_id=7), base_path=base_path)
     write_parquet(annual_frame(years=(2030, 2040), scenario_id=8), base_path=base_path)
     return base_path
@@ -78,30 +106,15 @@ def zone_crosswalk(crosswalk_path):
 
 
 class TestPipelineVector:
-    async def test_project_filter_and_group_aggregate(self, two_scenario_annual_data):
-        """scenario_id=7 (an input dimension filter) excludes the scenario-8 rows
-        entirely; `filter` then drops calendar_year=2030, leaving one (2040) row per cell
-        for `group` to collapse -- so the result is just that cell's 2040 value. The
-        pipeline-shaped replacement for what used to be a flat
-        `analyze_data(..., where=..., group_aggregate=...)` call -- that flat convention
-        itself still exists and is still tested directly, as `create_analysis`, by
-        `tests/api/test_analysis_entrypoint.py::TestVectorPlainValues`."""
-        pipeline = {
-            "inputs": {
-                "eco": {
-                    "variable": ANNUAL_KWARGS["variable"],
-                    "time_unit": ANNUAL_KWARGS["time_unit"],
-                    "grid": ANNUAL_KWARGS["grid"],
-                    "scenario_id": 7,
-                }
-            },
-            "steps": [
-                {"op": "project", "input": "eco", "to": ANNUAL_KWARGS["grid"]},
-                {"op": "filter", "where": "calendar_year > 2035"},
-                {"op": "group", "by": [], "aggregate": "mean"},
-            ],
-            "output": {"format": "csv"},
-        }
+    async def test_filter_and_group_aggregate(self, two_scenario_annual_data):
+        """`scenario_id = 7` excludes the scenario-8 rows and `calendar_year > 2035` the
+        2030 ones, leaving one row per cell for `group` to collapse -- so each cell's
+        result is just its own 2040 value. Both conjuncts ride on the leading `filter`
+        step: an input selects a dataset, never a slice of one."""
+        pipeline = eco_pipeline(
+            {"op": "filter", "input": "eco", "where": "scenario_id = 7 AND calendar_year > 2035"},
+            {"op": "group", "by": [], "aggregate": "mean"},
+        )
 
         df = await analyze_data(pipeline, base_path=two_scenario_annual_data)
 
@@ -110,24 +123,34 @@ class TestPipelineVector:
         cell_1 = df.filter(pl.col("grid_cell") == 1)
         assert cell_1["value"][0] == pytest.approx(2040 + 1 / 100)
 
+    async def test_output_sort_and_select_are_applied(self, two_scenario_annual_data):
+        """`output.sort`/`output.select` are `execution.sink.apply_output_shaping`'s job,
+        and a frame handed back from here has been through it -- otherwise the same
+        pipeline body would mean one thing over HTTP and a quietly unshaped other thing
+        from a notebook."""
+        pipeline = eco_pipeline(
+            {"op": "filter", "input": "eco", "where": "scenario_id = 7"},
+            {"op": "group", "by": [], "aggregate": "mean"},
+            sort="-grid_cell",
+            select="grid_cell,value",
+        )
+
+        df = await analyze_data(pipeline, base_path=two_scenario_annual_data)
+
+        assert df.columns == ["grid_cell", "value"]
+        assert df["grid_cell"].to_list() == sorted(df["grid_cell"].to_list(), reverse=True)
+
 
 class TestPipelineRaster:
     async def test_project_to_crosswalk_returns_a_frame(self, scenario_raster_data, zone_crosswalk):
         """Projecting the uniform fill=30 raster onto the zone crosswalk with
         `aggregate=mean` must average back to 30 -- and, being narrowed to a vector grid,
-        the result is a frame, not a raster."""
-        pipeline = {
-            "inputs": {
-                "vct": {
-                    "variable": RASTER_KWARGS["variable"],
-                    "time_unit": RASTER_KWARGS["time_unit"],
-                    "grid": RASTER_KWARGS["grid"],
-                    "scenario_id": 7,
-                }
-            },
-            "steps": [{"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}],
-            "output": {"format": "csv"},
-        }
+        the result is a frame, not a raster, which is why this one asks for `csv`."""
+        pipeline = vct_pipeline(
+            {"op": "filter", "input": "vct", "where": "scenario_id = 7"},
+            {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
+            format="csv",
+        )
 
         result = await analyze_data(pipeline, base_path=scenario_raster_data)
 
@@ -135,49 +158,54 @@ class TestPipelineRaster:
         zone_1 = result.filter(pl.col("grid_cell") == 1)
         assert zone_1["value"][0] == pytest.approx(30)
 
-    async def test_raster_shaped_without_output_path_raises(self, raster_data):
-        pipeline = {
-            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-            "steps": [{"op": "project", "input": "vct", "to": RASTER_KWARGS["grid"]}],
-            "output": {"format": "tif"},
-        }
-        with pytest.raises(AnalysisError) as excinfo:
-            await analyze_data(pipeline, base_path=raster_data)
-        assert "output_path" in excinfo.value.detail
+    async def test_tif_without_output_path_raises(self, raster_data):
+        with pytest.raises(ShapeError) as excinfo:
+            await analyze_data(vct_pipeline(), base_path=raster_data)
+        assert "output_path" in str(excinfo.value)
 
-    async def test_raster_shaped_with_output_path_writes_a_tif(self, raster_data, tmp_path):
-        pipeline = {
-            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-            "steps": [{"op": "project", "input": "vct", "to": RASTER_KWARGS["grid"]}],
-            "output": {"format": "tif"},
-        }
+    async def test_tif_with_output_path_writes_a_tif(self, raster_data, tmp_path):
         out_path = tmp_path / "out.tif"
 
-        result = await analyze_data(pipeline, base_path=raster_data, output_path=out_path)
+        result = await analyze_data(vct_pipeline(), base_path=raster_data, output_path=out_path)
 
         assert result == out_path
         assert isinstance(result, Path)
         assert out_path.exists()
         with rio.open(out_path) as src:
             assert src.count == 2
-            assert src.descriptions == ("calendar_year=2030", "calendar_year=2040")
             assert np.all(src.read(1) == 2030)
             assert np.all(src.read(2) == 2040)
+            # Band ORDER still carries the calendar year, but the band DESCRIPTIONS that
+            # used to spell it out ("calendar_year=2030", ...) are not written any more:
+            # `execution.sink.write_raster` builds its profile from the band-wide frame's
+            # window alone and never calls `set_band_description`, though its
+            # `metadata_df` holds each band's dimension values. Asserted rather than
+            # dropped so the gap stays visible -- `io.catalog` documents recovering
+            # calendar years FROM these descriptions.
+            assert src.descriptions == (None, None)
+
+    async def test_a_tif_selection_matching_nothing_raises_rather_than_returning_a_missing_path(
+        self, raster_data, tmp_path
+    ):
+        """`run_to_path` returns `False` (and writes no file) for a band-wide result with
+        no bands: there is no band count to declare a raster from. Handing back the path
+        anyway would point a caller at a file that does not exist, so this is the one
+        place `analyze_data` turns a sink's `False` into an error."""
+        out_path = tmp_path / "empty.tif"
+        pipeline = vct_pipeline({"op": "filter", "input": "vct", "where": "calendar_year = 1999"})
+
+        with pytest.raises(NotFoundError) as excinfo:
+            await analyze_data(pipeline, base_path=raster_data, output_path=out_path)
+
+        assert "no bands" in str(excinfo.value)
+        assert not out_path.exists()
 
     async def test_output_path_for_a_tabular_result_raises(self, scenario_raster_data, zone_crosswalk, tmp_path):
-        pipeline = {
-            "inputs": {
-                "vct": {
-                    "variable": RASTER_KWARGS["variable"],
-                    "time_unit": RASTER_KWARGS["time_unit"],
-                    "grid": RASTER_KWARGS["grid"],
-                    "scenario_id": 7,
-                }
-            },
-            "steps": [{"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}],
-            "output": {"format": "csv"},
-        }
-        with pytest.raises(AnalysisError):
+        pipeline = vct_pipeline(
+            {"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"},
+            format="csv",
+        )
+        with pytest.raises(ShapeError):
             await analyze_data(
                 pipeline,
                 base_path=scenario_raster_data,
@@ -185,30 +213,40 @@ class TestPipelineRaster:
             )
 
 
-class TestPipelineOnlySurface:
-    async def test_single_input_pipeline_returns_a_frame(self, base_path):
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
-        pipeline = {
-            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-            "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
-            "output": {"format": "csv"},
-        }
+class TestTileFormats:
+    """`png`/`jpg` parse (they are real `Output.format` members, and the tile routes use
+    them) but cannot be answered here: each needs a tile's `x`/`y`/`z` and pixel size, and
+    this signature has nowhere to put them. Rejected explicitly rather than left to fail
+    somewhere downstream with a confusing message about sinks."""
 
-        df = await analyze_data(pipeline, base_path=base_path)
+    @pytest.mark.parametrize("format", ["png", "jpg"])
+    async def test_a_tile_format_is_rejected(self, raster_data, tmp_path, format):
+        pipeline = vct_pipeline(format=format)
+        with pytest.raises(ShapeError) as excinfo:
+            await analyze_data(pipeline, base_path=raster_data, output_path=tmp_path / f"out.{format}")
+        assert "TILE" in str(excinfo.value)
+
+
+class TestPipelineOnlySurface:
+    async def test_a_zero_step_pipeline_returns_the_whole_input(self, base_path):
+        """The smallest legal request: one input, no steps at all. `validate_pipeline`
+        allows it precisely because a single input needs nothing chosen between."""
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+
+        df = await analyze_data(eco_pipeline(), base_path=base_path)
 
         assert isinstance(df, pl.DataFrame)
         assert df.height == 32
 
     async def test_flat_keywords_are_rejected_by_python_itself(self):
-        """`analyze_data`'s flat/keyword calling surface is gone entirely:
-        no mutual-exclusivity check, no `**params` -- `pipeline` is the only argument, and
-        it is required and positional-first. A caller still spelling a request the old
-        way (`variable=`, `where=`, `group_aggregate=`, ...) gets Python's own `TypeError`
-        for an unexpected keyword argument, raised before `analyze_data`'s body ever
-        runs -- immediate and clearly named, not a silent no-op or a wrong answer.
-        `cpra.mp.data.read_data` (dimension filters plus `grid_cell`/`where`/`sort`/
-        `select`) or `cpra.mp.data.analysis.create_analysis` (the full flat surface,
-        including `group_by`/`group_aggregate`/`summarize_*`) are today's replacements."""
+        """`analyze_data` has no flat/keyword calling surface: no mutual-exclusivity
+        check, no `**params` -- `pipeline` is the only argument, and it is required and
+        positional-first. A caller still spelling a request the old way (`variable=`,
+        `where=`, `group_aggregate=`, ...) gets Python's own `TypeError` for an unexpected
+        keyword argument, raised before `analyze_data`'s body ever runs -- immediate and
+        clearly named, not a silent no-op or a wrong answer. `cpra.mp.data.read_data`
+        (dimension filters plus `grid_cell`/`where`/`sort`/`select`) is the replacement
+        for the plain, unaggregated half; everything else is a pipeline body."""
         with pytest.raises(TypeError, match="variable"):
             await analyze_data(
                 variable=ANNUAL_KWARGS["variable"],
@@ -221,27 +259,14 @@ class TestPipelineOnlySurface:
 
 
 class TestCalculate:
-    """The generic calculate entries on the pipeline surface -- the pipeline `calculate`
-    op, which compiles onto the same machinery the (now `create_analysis`-only) flat
-    `calculate=` list did."""
-
     async def test_pipeline_calculate_op(self, two_scenario_annual_data):
-        pipeline = {
-            "inputs": {
-                "eco": {
-                    "variable": ANNUAL_KWARGS["variable"],
-                    "time_unit": ANNUAL_KWARGS["time_unit"],
-                    "grid": ANNUAL_KWARGS["grid"],
-                    "scenario_id": 7,
-                }
-            },
-            "steps": [
-                {"op": "project", "input": "eco", "to": ANNUAL_KWARGS["grid"]},
-                {"op": "calculate", "expression": "eco * 0.5", "where": "calendar_year = 2030"},
-                {"op": "group", "by": [], "aggregate": "sum"},
-            ],
-            "output": {"format": "csv"},
-        }
+        """`calculate` rewrites the running `value` column wherever its `where` matches and
+        passes every other row through untouched -- never dropping data, unlike `filter`."""
+        pipeline = eco_pipeline(
+            {"op": "filter", "input": "eco", "where": "scenario_id = 7"},
+            {"op": "calculate", "expression": "value * 0.5", "where": "calendar_year = 2030"},
+            {"op": "group", "by": [], "aggregate": "sum"},
+        )
 
         df = await analyze_data(pipeline, base_path=two_scenario_annual_data)
 
@@ -254,18 +279,7 @@ class TestCalculate:
 
 class TestLazy:
     async def test_lazy_true_returns_a_lazyframe_matching_the_eager_result(self, two_scenario_annual_data):
-        pipeline = {
-            "inputs": {
-                "eco": {
-                    "variable": ANNUAL_KWARGS["variable"],
-                    "time_unit": ANNUAL_KWARGS["time_unit"],
-                    "grid": ANNUAL_KWARGS["grid"],
-                    "scenario_id": 7,
-                }
-            },
-            "steps": [{"op": "project", "input": "eco", "to": ANNUAL_KWARGS["grid"]}],
-            "output": {"format": "csv"},
-        }
+        pipeline = eco_pipeline({"op": "filter", "input": "eco", "where": "scenario_id = 7"})
 
         eager = await analyze_data(pipeline, base_path=two_scenario_annual_data)
         lazy = await analyze_data(pipeline, base_path=two_scenario_annual_data, lazy=True)
@@ -274,11 +288,6 @@ class TestLazy:
         sort_cols = ["grid_cell", "calendar_year"]
         assert_frame_equal(lazy.collect().sort(sort_cols), eager.sort(sort_cols))
 
-    async def test_lazy_true_with_a_raster_shaped_result_raises(self, raster_data):
-        pipeline = {
-            "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-            "steps": [{"op": "project", "input": "vct", "to": RASTER_KWARGS["grid"]}],
-            "output": {"format": "tif"},
-        }
-        with pytest.raises(AnalysisError):
-            await analyze_data(pipeline, base_path=raster_data, lazy=True)
+    async def test_lazy_true_with_a_tif_output_raises(self, raster_data):
+        with pytest.raises(ShapeError):
+            await analyze_data(vct_pipeline(), base_path=raster_data, lazy=True)

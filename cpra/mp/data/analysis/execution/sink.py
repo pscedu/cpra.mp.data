@@ -75,8 +75,8 @@ __all__ = [
 
 #: The sentinel a raster sink falls back to when neither an explicit `nodata=` argument
 #: nor the source file's own declared nodata says what one is. Matches `Variable`'s own
-#: default (`variables.py`, `Variable.__init__`) and the old engine's tile-path fallback
-#: (`analysis/raster.py`'s `get_tile`) -- not a new number invented for this module.
+#: default (`variables.py`, `Variable.__init__`) and the long-standing tile-path
+#: fallback -- not a new number invented for this module.
 DEFAULT_NODATA = -9999
 
 # The inverse of `io.raster.scan_raster`'s own `NUMPY_TO_POLARS` -- built here rather than
@@ -141,12 +141,10 @@ def _materialize_closure(lf: LongFrame):
     kwargs) it calls that method on `lf` directly (a `sink_*` method, for the streaming
     path) -- see that function's own docstring.
 
-    The old engine's version of this same closure (`BaseAnalysis.materialize`) also
-    translated `ColumnNotFoundError`/`FileNotFoundError` into `AnalysisError` here; that
-    translation is deliberately not reproduced -- it is a transport-facing concern (the
-    error boundary a route installs), not something this closure should decide on its
-    own, and `AnalysisError`'s own family is explicitly not this module's to raise (see
-    the module docstring).
+    A failed collect is deliberately NOT translated here: `ColumnNotFoundError`/
+    `FileNotFoundError` propagate as themselves, for `api/boundary.py` to map. Which
+    status a read failure deserves is a transport-facing concern (the error boundary a
+    route installs), not something this closure should decide on its own.
     """
 
     def materialize(method_name=None, *args, **kwargs):
@@ -160,10 +158,10 @@ def _materialize_closure(lf: LongFrame):
 def sink_tabular(lf: LongFrame, out_path, format, *, float_precision=None, **profile_options) -> None:
     """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet`/`arrow`), always
     lazily (`io.output.stream_tabular`) -- this sink never materializes the whole frame
-    first, unlike the old engine's `BaseAnalysis`, which still picks between this same
-    lazy write and an eager, collect-first one (`io.output.write_tabular`) depending on
-    an estimated result size. Nothing analogous to that size estimate exists for a
-    compiled `ExecutionPlan`, so there is only the one (safe-default) path here.
+    first. `io.output.write_tabular` is the eager, collect-first alternative, reached
+    only when a caller has already decided the result is small; nothing estimates a
+    compiled `ExecutionPlan`'s result size, so there is only the one (safe-default) path
+    here.
 
     `float_precision` is forwarded to `io.output.tabular_kwargs`, which only ever uses it
     for `format == "csv"` -- see that function's own docstring. `**profile_options` is
@@ -214,10 +212,11 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     """Write `band_wide` to `out_path` as a GeoTIFF, one band per surviving `b<i>` column.
 
     Returns `False`, rather than raising, when `band_wide` carries no bands at all (a
-    dimension filter narrowed the source to nothing) -- the same falsy-not-raised contract
-    the old engine's `write_raster` used, which is what lets `api/raster.py`'s
-    `RasterioStreamingResponse` tell "no source data" (a 404) apart from every other
-    failure. Every other case writes the file and returns `True`.
+    dimension filter narrowed the source to nothing) -- a falsy return rather than an
+    exception because "the selection matched nothing" is not a failure, and every caller
+    has its own answer for it: `api/pipeline.py`'s `PipelineRasterResponse` turns it into
+    a 404, `cpra.mp.data.analyze_data` into a `NotFoundError`. Every other case writes the
+    file and returns `True`.
 
     Row order in `band_wide`'s `LazyFrame` is the READ's emission order, not necessarily
     row-major (see `execution/frame.py`'s band-wide invariants) -- `row_major_grid_cell`
@@ -234,15 +233,13 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     `DEFAULT_NODATA`; `dtype`, left `None`, is inferred (`_resolve_write_dtype`).
     Resolving the request-appropriate values from a `Variable`/route parameter is a
     wiring decision for whichever route eventually calls this, mirroring how `api/
-    raster.py` resolves the request's own compression choice at the route layer today
-    rather than inside the dataset object it calls into.
+    pipeline.py` resolves the request's own compression choice at the route layer rather
+    than down here.
 
     `**profile_options` is forwarded straight into `rasterio.open`'s write profile,
     layered over this function's own defaults (`driver="GTiff"` plus the frame's own
-    geometry) -- the same pass-through shape `api/raster.py`'s `profile_options` already
-    uses against the old engine's `write_raster`, so a caller wanting compression,
-    `COMPRESSION_LEVEL_OPTIONS`-style tuning, or a `driver="COG"` override supplies it the
-    same way.
+    geometry), so a caller wanting compression, `api.pipeline.COMPRESSION_LEVEL_OPTIONS`-
+    style tuning, or a `driver="COG"` override supplies it the same way.
     """
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
@@ -345,11 +342,10 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     The surviving frame must carry EXACTLY one band. `Legend.colorize_pixels` colors one
     2-D array of pixel values, and nothing upstream guarantees a band-wide result narrows
     to one band by the time it reaches a tile -- there is no tile-side analogue of
-    `request.ops.validate_shapes`'s single-value-column rule. The old engine's
-    `_collapse_tile_bands` -> `colorize_pixels` path silently rendered band 0 of however
-    many survived, via `colorize_pixels`'s own `[0]` index into what it assumes is a
-    length-1 leading axis; this raises instead of guessing which band the caller meant,
-    which is a gap in the OLD code worth naming rather than one to reproduce.
+    `request.ops.validate_shapes`'s single-value-column rule. `colorize_pixels`'s own
+    `[0]` index into what it assumes is a length-1 leading axis would silently render
+    band 0 of however many survived; this raises instead of guessing which band the
+    caller meant.
 
     `nodata` is the value null pixels are filled with before the warp, and the value the
     warp itself fills the tile's own out-of-source corners with -- a sentinel this function
@@ -361,9 +357,10 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     Note that a nodata pixel is NOT rendered transparent: `Legend.colorize_pixels`
     digitizes against the legend's break points, and a value below the lowest break --
     which `DEFAULT_NODATA` always is -- lands in the first bucket, whose color is an opaque
-    one (no `LEGENDS` entry declares a transparent under-color). That is the old engine's
-    behavior too, reproduced here rather than changed, and it is why `empty_tile` builds
-    its blank tile directly instead of colorizing an all-nodata array.
+    one (no `LEGENDS` entry declares a transparent under-color). That is the
+    long-standing behavior, reproduced here rather than changed, and it is why
+    `empty_tile` builds its blank tile directly instead of colorizing an all-nodata
+    array.
     """
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
@@ -418,11 +415,9 @@ def sink_vector_tile(lf: LongFrame, grid_name: str, tile, *, grid_cell_ids=None,
     """Render one Mapbox Vector Tile by injecting `lf`'s `value` column into `grid_name`'s
     pre-generated PMTiles boundary layer for `tile` (an `(x, y, z)` tuple).
 
-    A from-scratch rewrite of the old engine's `get_vector_tile` (`analysis/vector.py`),
-    not a port: geometry is never decoded here (only the boundary layer's `keys`/
-    `values`/feature `tags` are touched, which is why this is O(features) protobuf work
-    rather than O(coordinates) geometry work), but every line of the actual injection is
-    rewritten against this module's own `LongFrame` contract rather than carried over.
+    Geometry is never decoded here -- only the boundary layer's `keys`/`values`/feature
+    `tags` are touched, which is why this is O(features) protobuf work rather than
+    O(coordinates) geometry work.
 
     Returns `None` -- not a raise -- for every "nothing to render" outcome: no PMTiles
     archive for `grid_name`, no tile at these `x`/`y`/`z` in that archive, no boundary
@@ -434,9 +429,9 @@ def sink_vector_tile(lf: LongFrame, grid_name: str, tile, *, grid_cell_ids=None,
     treats a 204 as an empty tile natively, so there is nothing to encode.
 
     `grid_cell_ids`, when given, narrows which of the tile's own feature ids are eligible
-    at all, BEFORE `lf` is even queried -- the same role the old engine's
-    `self.summarize_grid_cell_ids`/`self.grid_cell_ids` played, narrowing a summarize or a
-    `grid_cell` selection's answer to a specific id set. Resolving which id set (if any) a
+    at all, BEFORE `lf` is even queried -- how a `grid_cell` selection (or a projection
+    onto a specific destination cell) narrows a tile's answer to a specific id set.
+    Resolving which id set (if any) a
     given request implies is a route/request concern this function does not derive on its
     own; `None` (the default) considers every feature id the tile itself carries, which is
     the common case.

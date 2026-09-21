@@ -2,16 +2,6 @@
 
 Covers what `tests/api/test_analyses_registry.py` and `tests/test_visualizations.py` don't:
 
-* **Named-analysis absolute values** (`TestNamedAnalysisResults`) -- for each of `difference`
-  asc/desc and `concatenate` two-image/three-image, an `analysis=` request materializes the
-  expected `(grid_cell, value)` rows. This class used to instead compare a named
-  analysis's result against the OLD legacy-parameter request's (`negate`/`multiply10`/
-  `multiply100` + `group_by`/`group_aggregate`) as a non-breaking-migration proof; those
-  fields were later deleted from `Options` entirely (not just their HTTP spelling), so there
-  is no more legacy request left to compute the other side of that comparison from -- the
-  absolute values these tests were already separately asserting (`assert
-  set(named["value"].to_list()) == {...}`) are what's left, and are now each test's sole
-  assertion.
 * **The `feature_colors` bug fix** (`TestFeatureColorsBugFix`) -- `Map.feature_colors` used
   to silently return `{}` for EVERY caller (a `cs.matches(r"^[0-9]")` selector that assumed
   a wide, one-column-per-grid-cell shape against data stored long). Proven here by asserting
@@ -37,13 +27,10 @@ migrated call sites care about grid TYPE and pipeline SHAPE, not real-world vari
 semantics.
 """
 
-import asyncio
-
 import pytest
 
 from cpra.mp.data import config
 from cpra.mp.data.analyses import DatasetRef, resolve_analysis
-from cpra.mp.data.analysis.planner import compile_pipeline
 from cpra.mp.data.visualizations.map import Map
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
@@ -60,98 +47,6 @@ COMMON_ANNUAL_FILTERS = {
 # The same filters, but as the single-element LISTS a `Map(**kwargs)`/`FilterDimensions`
 # construction needs (unlike `resolve_analysis`'s `filters=`, which accepts bare scalars).
 COMMON_ANNUAL_FILTER_LISTS = {k: [v] for k, v in COMMON_ANNUAL_FILTERS.items()}
-
-
-async def _materialize_named(name, filters, params, base_path):
-    """Resolve `name` against `SSF_DATASET` and materialize it -- the exact
-    `resolve_analysis` -> `compile_pipeline` -> `apply_params` -> `materialize` chain
-    `Map.feature_colors`'s resolved branch runs.
-    """
-    resolved = resolve_analysis(name, dataset=SSF_DATASET, filters=filters, params=params)
-    compiled = compile_pipeline(resolved.pipeline, base_path=base_path)
-    await compiled.apply_params()
-    return compiled.materialize()
-
-
-# ------------------------------------------------------------------------------------------
-# Named-analysis absolute values
-# ------------------------------------------------------------------------------------------
-
-
-class TestNamedAnalysisResults:
-    """A named analysis must materialize the expected `(grid_cell, value)` rows.
-
-    These tests used to instead prove a legacy-parameter request and the
-    equivalent named analysis materialized IDENTICAL rows -- the non-breaking contract
-    the migration rested on. The legacy fields (`negate`/`multiply10`/
-    `multiply100`) were later deleted from `Options` entirely, so there is no more legacy
-    request to build the other half of that comparison from; each test's absolute-value
-    assertion (already present, as a secondary check) is what's left, and is now the whole
-    test.
-    """
-
-    async def test_difference_asc(self, base_path):
-        # order="asc" negates the LATER value (2040) before summing -- see
-        # test_analyses_registry.py's identically-shaped execution test.
-        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id)
-
-        named = await _materialize_named(
-            "difference",
-            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
-            params={"dimension": "calendar_year", "order": "asc"},
-            base_path=base_path,
-        )
-        assert set(named["value"].to_list()) == {0.0}
-
-    async def test_difference_desc(self, base_path):
-        # order="desc" negates the EARLIER value (2030) instead.
-        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year))
-
-        named = await _materialize_named(
-            "difference",
-            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
-            params={"dimension": "calendar_year", "order": "desc"},
-            base_path=base_path,
-        )
-        assert set(named["value"].to_list()) == {10.0}
-
-    async def test_concatenate_two_image(self, base_path):
-        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 1.0)
-
-        named = await _materialize_named(
-            "concatenate",
-            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
-            params={"dimension": "calendar_year"},
-            base_path=base_path,
-        )
-        assert set(named["value"].to_list()) == {11.0}
-
-    async def test_concatenate_three_image(self, base_path):
-        """Three-image mode's own `filter` step drops the redundant `(model_group_id=520,
-        calendar_year=2030)` corner (see `analyses/concatenate.py` and
-        `test_analyses_registry.py::TestConcatenateExecution.
-        test_three_image_mode_encodes_all_three_corners`) -- that corner is simply never
-        written to disk here, so it contributes nothing to the sum either way. The
-        surviving corners are `(500, 2030) -> *100 -> 100`, `(500, 2040) -> *10 -> 10`,
-        `(520, 2040) -> untouched -> 1`.
-        """
-        write_annual_dataset(
-            base_path, years=(2030, 2040), model_group_id=500, value_fn=lambda year, geo_id: 1.0
-        )
-        write_annual_dataset(
-            base_path, years=(2040,), model_group_id=520, value_fn=lambda year, geo_id: 1.0
-        )
-
-        filters = {
-            "scenario_id": ANNUAL_KWARGS["scenario_id"],
-            "percentile": ANNUAL_KWARGS["percentile"],
-            "calendar_year": [2030, 2040],
-            "model_group_id": [500, 520],
-        }
-        named = await _materialize_named(
-            "concatenate", filters=filters, params={"dimension": "calendar_year"}, base_path=base_path
-        )
-        assert set(named["value"].to_list()) == {111.0}
 
 
 # ------------------------------------------------------------------------------------------
@@ -352,12 +247,3 @@ class TestCompareDimensionsExclusion:
         ]
         assert "calendar_year" not in fields
         assert "model_group_id" in fields
-
-
-class _Unused:
-    """Keeps `asyncio` imported for readability of the `async def` tests above under
-    `asyncio_mode = "auto"` (pytest-asyncio); referenced so linting doesn't flag the import
-    as unused if that mode were ever off.
-    """
-
-    _ = asyncio

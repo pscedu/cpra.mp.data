@@ -2,8 +2,8 @@
 
 Every test here calls the free functions directly with a plain `pl.LazyFrame` and a
 hand-rolled `materialize` callable (the same one-argument-method-name contract
-`BaseAnalysis.materialize` implements) -- no `dataset_factory`, no `BaseAnalysis`
-subclass, no catalog files on disk. `output.py`'s own module docstring is explicit that
+`execution.sink`'s own closure implements) -- no compiled plan, no catalog files on
+disk. `output.py`'s own module docstring is explicit that
 none of this depends on which ops ran or in what order, so a plain frame is enough to
 pin its behavior.
 """
@@ -11,7 +11,6 @@ pin its behavior.
 import polars as pl
 import pytest
 
-from cpra.mp.data.analysis.base import AnalysisError
 from cpra.mp.data.analysis.io.output import (
     SINK_METHODS,
     WRITE_METHODS,
@@ -21,12 +20,14 @@ from cpra.mp.data.analysis.io.output import (
     tabular_kwargs,
     write_tabular,
 )
-from cpra.mp.data.analysis.types import DataFormat, OutputType
+from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.types import DataFormat, OutputType
+from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.legends import LEGENDS, Legend
 
 
 def _materialize(lf):
-    """A minimal stand-in for `BaseAnalysis.materialize`: call a method on `lf` by name,
+    """A minimal stand-in for `execution.sink`'s materialize closure: call a method on `lf` by name,
     defaulting to `collect`, with no error translation -- `output.py`'s functions don't
     depend on the translation, only on the call shape.
     """
@@ -128,20 +129,20 @@ class TestResolveLegend:
         assert legend.break_points["color"].to_list() == ["#ff0000", "#0000ff"]
 
     def test_an_unknown_map_type_is_rejected(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             resolve_legend("sideways:#ff0000,1", None)
-        assert excinfo.value.detail == "invalid color map type: sideways"
-        assert excinfo.value.status_code == 400
+        assert str(excinfo.value) == "invalid color map type: sideways"
+        assert resolve_status(excinfo.value) == 400
 
     def test_a_non_numeric_value_is_rejected(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             resolve_legend("continuous:low,#ff0000", None)
-        assert excinfo.value.detail == "invalid color map values"
+        assert str(excinfo.value) == "invalid color map values"
 
     def test_mismatched_colors_and_values_are_rejected(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             resolve_legend("continuous:0,#ff0000,10", None)
-        assert excinfo.value.detail == "mismatched colors and values in color map"
+        assert str(excinfo.value) == "mismatched colors and values in color map"
 
     def test_a_named_legend_is_looked_up_by_name(self):
         assert resolve_legend("default", None) is LEGENDS["default"]

@@ -5,7 +5,7 @@ from enum import Enum
 
 import pytest
 
-from cpra.mp.data.analysis.types import (
+from cpra.mp.data.analysis.request.types import (
     AggregateFunction,
     CompressionAlgorithm,
     DataFormat,

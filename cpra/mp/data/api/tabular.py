@@ -5,7 +5,7 @@ import anyio
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.sources import LazyFrameSource
 

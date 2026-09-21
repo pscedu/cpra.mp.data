@@ -240,11 +240,11 @@ class TestInstallAnalysisBoundary:
 
     def test_file_not_found_answers_404_without_disclosing_the_path(self, boundary_client):
         """A missing data file is a 404, but the reader's own message names the absolute
-        server path it tried to open, and that must not reach the caller. The old engine's
-        two readers (`api.sources.LazyFrameSource.materialize`, `analysis.base.BaseAnalysis
-        .materialize`) both answer this case with a fixed string for exactly that reason;
-        `_DETAIL_BY_TYPE` is what keeps the new engine from regressing on it while the
-        other registered types keep passing their own (ours to disclose) message through.
+        server path it tried to open, and that must not reach the caller.
+        `api.sources.LazyFrameSource.materialize` answers this case with a fixed string
+        for exactly that reason; `_DETAIL_BY_TYPE` is what does the same for the engine,
+        while the other registered types keep passing their own (ours to disclose)
+        message through.
         """
         response = boundary_client.get("/raise/file-not-found")
         assert response.status_code == 404
@@ -315,7 +315,7 @@ class TestFourRoutesEndToEnd:
         """Same baseline as the csv case above, for `ndjson` -- the format `PipelineTabular
         Response._TABULAR_MIME_TYPES`/`PipelineTabularSource.stream_tabular` also serve
         alongside csv/parquet. (`arrow` is the fourth name in that MIME map, but this
-        route's own `{format}` path segment is bound directly to `analysis.types
+        route's own `{format}` path segment is bound directly to `analysis.request.types
         .DataFormat`, which has no live `arrow` member -- `/v1/analysis.arrow` is rejected
         by FastAPI's own enum path-param validation before any code in this module runs,
         so there is no route-level case to add for it here.)

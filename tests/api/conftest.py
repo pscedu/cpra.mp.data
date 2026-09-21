@@ -4,19 +4,23 @@ The MPD database is stubbed with in-memory SQLite via a dependency override, so 
 PostgreSQL server (and no psycopg2) is needed. Only /v1/dimensions.json touches it.
 """
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
+from cpra.mp.data import config
 from cpra.mp.data.api import app, get_mpd_session
-from cpra.mp.data.api.models import (
-    DatasetDimensions,
-    FilterDimensions,
-    MPDDimensionValue,
-    Options,
+from cpra.mp.data.api.models import MPDDimensionValue
+from cpra.mp.data.grids import GRIDS
+from tests.factories import (
+    ANNUAL_KWARGS,
+    RASTER_KWARGS,
+    write_ffibs_coverage_dataset,
+    write_raster_crosswalk,
+    write_sal_annual_dataset,
 )
-from tests.factories import ANNUAL_KWARGS, RASTER_KWARGS
 
 # Dimension values the real MPD serves but the structure CSVs do not. Described as plain
 # tuples rather than model instances: a SQLModel instance becomes bound to the session
@@ -64,26 +68,6 @@ def client(mpd_engine):
 
 
 @pytest.fixture
-def dataset_factory(base_path):
-    """Build a `BaseAnalysis` subclass against an isolated base_path.
-
-    Mirrors how the route handlers construct one (via `create_analysis`), but with the
-    base path injected so the query never reaches the configured data directory.
-    """
-    from cpra.mp.data.analysis import create_analysis
-
-    def build(dimensions, filters=None, base=None, **options):
-        return create_analysis(
-            DatasetDimensions(**dimensions),
-            FilterDimensions(**(filters or {})),
-            Options(**options),
-            base_path=(base if base is not None else base_path),
-        )
-
-    return build
-
-
-@pytest.fixture
 def annual_dimensions():
     return {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 
@@ -91,3 +75,28 @@ def annual_dimensions():
 @pytest.fixture
 def raster_dimensions():
     return {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
+
+
+@pytest.fixture
+def exit_criterion_data(base_path, crosswalk_path, monkeypatch):
+    """The two hardcoded inputs of the `exit-criterion` named analysis, on disk.
+
+    Marsh (raster) 0.3->2030, 0.7->2040 (crosses `marsh > 0.5` only in 2040); salinity
+    (vector, one zone) 4.0->2030, 6.0->2040 (crosses `sal > 5.5` only in 2040) -- and
+    every `veg_grid_cell_v001` pixel maps to the same single `hydro_compartment_v001`
+    zone, so the analysis's `{"aggregate": "min", "of": "calendar_year"}` yields a uniform
+    2040 raster.
+
+    Lives here rather than in either module because two sibling modules need the same
+    data from opposite ends: `test_analyses_registry.py` drives the analysis through
+    `resolve_analysis`/`run_to_path` directly, `test_analyses_endpoints.py` through the
+    custom-analysis HTTP routes.
+    """
+    write_ffibs_coverage_dataset(base_path, {2030: 0.3, 2040: 0.7})
+    write_sal_annual_dataset(base_path, {2030: 4.0, 2040: 6.0})
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+    grid = GRIDS["veg_grid_cell_v001"]
+    zones = np.ones((grid.height, grid.width), dtype="int32")
+    write_raster_crosswalk(crosswalk_path, "veg_grid_cell_v001", "hydro_compartment_v001", zones)
+    return base_path

@@ -44,13 +44,19 @@ class Map(DatasetVisualization):
         so the map style only needs a single global-state lookup per feature
         rather than a full color expression evaluation per feature per frame.
 
-        Reads the resolved analysis first when `analysis=` is selected -- run through
-        EXACTLY the same `compile_pipeline` -> `apply_params` -> `materialize` machinery
-        the named-analysis HTTP routes use (see `api.__init__`'s `_compile_analysis_
-        pipeline`) -- falling back to a plain `create_analysis` + the same
-        `apply_params()` orchestration otherwise, so a plain (unanalyzed) map still
-        honors `grid_cell`/`where` -- reaching past `apply_params` to apply only some of
-        the options by hand, as this used to, silently skipped them.
+        Reads the resolved analysis's `Pipeline` when `analysis=` is selected, and
+        otherwise lowers this map's own dataset/filters/options onto the same kind of
+        `Pipeline` the flat `/v1/datasets/...` data routes build
+        (`request.data_query.build_data_query_pipeline`), so a plain (unanalyzed) map
+        still honors `grid_cell`/`where`. Either way the result goes through EXACTLY the
+        `validate_shapes` -> `compile_plan` -> `execute` path every HTTP response does --
+        this reads data, so it must not be a second, quieter engine with its own idea of
+        what a filter means.
+
+        Synchronous throughout, unlike the routes: a visualization builds its spec from
+        cached properties with no event loop to await on. `execute` itself is sync (it
+        returns a lazy frame), and `resolved_analysis`/`_data_query_pipeline` resolve
+        `grid_cell` through `api.data_query.resolve_grid_cell_sync`.
 
         Bug this replaces: the storage format is long (one row per grid cell, after
         grouping/aggregation collapses every other dimension), not the wide,
@@ -64,38 +70,18 @@ class Map(DatasetVisualization):
         if self.grid.grid_type != "vector":
             return {}
 
+        from cpra.mp.data.analysis.execution.execute import execute
+        from cpra.mp.data.analysis.execution.plan import compile_plan
+        from cpra.mp.data.analysis.request.ops import validate_shapes
+
         resolved = self.resolved_analysis
-        if resolved is not None:
-            import asyncio
+        pipeline = resolved.pipeline if resolved is not None else self._data_query_pipeline()
 
-            from cpra.mp.data.analysis.planner import compile_pipeline
-
-            compiled = compile_pipeline(resolved.pipeline)
-            asyncio.run(compiled.apply_params())
-            df = compiled.materialize()
-        else:
-            import asyncio
-
-            from cpra.mp.data.analysis import create_analysis
-            from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
-
-            dataset_dimensions = DatasetDimensions(
-                variable=self.variable.name,
-                grid=self.grid.name,
-                time_unit=self.time_unit,
-            )
-
-            filter_fields = set(FilterDimensions.model_fields.keys())
-            filter_dimensions = FilterDimensions(
-                **{k: v for k, v in self.params.items() if k in filter_fields and v is not None}
-            )
-
-            options_fields = set(Options.model_fields.keys())
-            options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
-
-            dataset = create_analysis(dataset_dimensions, filter_dimensions, options)
-            asyncio.run(dataset.apply_params())
-            df = dataset.materialize()
+        # A vector grid's final frame is always long (a `project` INTO a raster grid is
+        # the only way to reach band-wide, and nothing here builds one), so `execute`
+        # returns a `LongFrame` -- a plain `pl.LazyFrame`, not the band-wide 3-tuple.
+        validate_shapes(pipeline)
+        df = execute(compile_plan(pipeline)).collect()
 
         if df.is_empty() or "grid_cell" not in df.columns or "value" not in df.columns:
             return {}
@@ -116,6 +102,37 @@ class Map(DatasetVisualization):
         if legend is None:
             return {}
         return {str(fid): self._classify_step_color(val, legend) for fid, val in values.items()}
+
+    def _data_query_pipeline(self):
+        """This map's own dataset plus its `grid_cell`/`where`/dimension filters, lowered
+        onto a `Pipeline` -- the no-`analysis=` half of `feature_colors` above.
+
+        Built through `request.data_query.build_data_query_pipeline`, the same function
+        the flat `/v1/datasets/{variable}/{time_unit}/{grid}/data.{format}` route uses, so
+        a filter means here exactly what it means there. `format="csv"` only because
+        `Output.format` is required and the frame this ends up collecting is tabular;
+        nothing below reads it.
+        """
+        from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
+        from cpra.mp.data.api.data_query import resolve_grid_cell_sync
+        from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+
+        def bind(model):
+            fields = set(model.model_fields)
+            return model(**{k: v for k, v in self.params.items() if k in fields and v is not None})
+
+        dataset_dimensions = DatasetDimensions(
+            variable=self.variable.name, grid=self.grid.name, time_unit=self.time_unit
+        )
+        options = bind(Options)
+        grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, options.grid_cell)
+        return build_data_query_pipeline(
+            dataset_dimensions,
+            bind(FilterDimensions),
+            options,
+            "csv",
+            grid_cell_where=grid_cell_where,
+        )
 
     def _classify_step_color(self, value: float, legend: Legend) -> str:
         """Classify a value into a color bucket matching the step expression behavior."""

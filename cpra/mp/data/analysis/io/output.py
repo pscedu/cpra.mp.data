@@ -4,25 +4,22 @@ and what the response is declared to be.
 None of this is op algebra. Deciding that a CSV rounds to a variable's `float_precision`,
 that `sink_csv` is the streaming spelling of `write_csv`, that a `color_map=` string parses
 into a `Legend`, or that a `grid_cell` selection turns a raster dataset's response into a
-tabular one -- all of it is request LIFECYCLE, driven by `Options` and the catalog, and
-none of it depends on which ops ran or in what order. It lived on `BaseAnalysis` only
-because that class was also the thing an API route held a reference to.
+tabular one -- all of it is request LIFECYCLE, driven by the request's own options and the
+catalog, and none of it depends on which ops ran or in what order.
 
-Every function here is a plain free function taking exactly what it reads. `BaseAnalysis`
-keeps same-named members, but purely as delegations: `api/tabular.py` and `api/__init__.py`
-reach for `tabular_kwargs`/`stream_tabular`/`write_tabular`/`output_type`/`legend` on the
-compiled object by duck typing (`PairedAnalysis` answers the same surface without
-inheriting it), so the METHODS have to stay even though the LOGIC does not.
+Every function here is a plain free function taking exactly what it reads, so a caller
+holds no compiled object to reach these through.
 
-`AnalysisError` is imported inside the one function that raises it, the same local-import
-idiom `io/raster_io.py` already uses: it is defined in `analysis/base.py`, which imports
-this module at module scope, so a module-scope import back would be a cycle.
+`resolve_legend`'s rejections are `request.errors.RequestError`s, mapped to 400 by
+`api/boundary.py` like every other member of that family; nothing here raises an
+`HTTPException`, since `cpra.mp.data.analysis` may not import FastAPI.
 """
 
 import polars as pl
 
 from cpra.mp.data.analysis.io.raster_io import timing
-from cpra.mp.data.analysis.types import DataFormat, OutputType
+from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.types import DataFormat, OutputType
 from cpra.mp.data.legends import LEGENDS, Legend
 
 # Polars' two spellings of each tabular writer: the lazy sink (streams, never materializes
@@ -64,9 +61,10 @@ def tabular_kwargs(format, float_precision):
 def stream_tabular(materialize, out_path, format, *args, **kwargs):
     """Sink the frame to `out_path` without materializing it.
 
-    `materialize` is the caller's own materialize callable (`BaseAnalysis.materialize`),
-    passed in rather than an `lf` because that method is also where the
-    `ColumnNotFoundError`/`FileNotFoundError` -> `AnalysisError` mapping lives.
+    `materialize` is the caller's own materialize callable, passed in rather than an
+    `lf` so that the caller keeps ownership of how a failed collect is reported (see
+    `execution.sink`'s own materialize closure, which lets `ColumnNotFoundError`/
+    `FileNotFoundError` through to `api/boundary.py` untranslated).
 
     `*args`/`**kwargs` pass straight through to the underlying `sink_*` method -- this is
     how a caller's `compression`/`compression_level` (parquet) reach the Polars writer.
@@ -97,15 +95,13 @@ def resolve_legend(color_map, variable_legend) -> Legend:
     Anything else is a lookup: a named `LEGENDS` entry, else the variable's own declared
     legend (`variable_legend`, `None` when it declares none), else `LEGENDS["default"]`.
     """
-    from cpra.mp.data.analysis.base import AnalysisError
-
     color_map = color_map or ""
 
     if ":" in color_map:
         map_type, color_str = color_map.split(":", 1)
 
         if map_type not in ["continuous", "discrete"]:
-            raise AnalysisError(f"invalid color map type: {map_type}", status_code=400)
+            raise RequestError(f"invalid color map type: {map_type}")
 
         color_strs = color_str.split(",")
         if map_type == "continuous":
@@ -120,14 +116,14 @@ def resolve_legend(color_map, variable_legend) -> Legend:
         try:
             values = [float(val) for val in value_strs]
         except ValueError:
-            raise AnalysisError("invalid color map values", status_code=400)
+            raise RequestError("invalid color map values")
 
         # Add a null upper bound value to discrete color maps.
         if map_type == "discrete":
             values += [None]
 
         if len(values) != len(colors):
-            raise AnalysisError("mismatched colors and values in color map", status_code=400)
+            raise RequestError("mismatched colors and values in color map")
 
         return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
 

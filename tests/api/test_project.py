@@ -95,8 +95,8 @@ class TestPerAggregateSplitCell:
     def test_weighted_aggregates_differ_from_unweighted_ones(self, crosswalk_path):
         """A regression guard on the fixture itself: if `sum`/`mean` (weighted) ever
         collapsed to the same numbers as `min`/`max`/`count` (unweighted), the fixture
-        would not actually be exercising the per-aggregate distinction this stage exists
-        to get right."""
+        would not actually be exercising the per-aggregate distinction
+        `project_vector_to_vector` exists to get right."""
         _crosswalk_frame(crosswalk_path)
         frames = {"a": _source_lf()}
         sums = project_vector_to_vector(frames, _op("sum"), _frame_types()).collect().sort(
@@ -112,7 +112,7 @@ class TestBatchedMatchesUnbatched:
     def test_mean_agrees_at_different_fold_steps(self, crosswalk_path, monkeypatch):
         """`project_vector_to_vector` always routes through the fold in real usage
         (`grid_cell` is unconditionally part of the group key), so the batched-vs-
-        unbatched equality this stage's resume contract asks for is exercised here at the
+        unbatched equality the fold's resume contract demands is exercised here at the
         `TABULAR_FOLD_STEP` level, comparing a step smaller than the fixture's row count
         against one far larger -- both must agree exactly with the hand-computed values
         above."""

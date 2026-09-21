@@ -8,7 +8,6 @@ from functools import wraps
 from time import time
 
 import rasterio as rio
-from cachetools import TTLCache, cached
 from rasterio import windows
 from rasterio.coords import BoundingBox, disjoint_bounds
 from rasterio.crs import CRS
@@ -18,8 +17,9 @@ from rasterio.transform import Affine, array_bounds, from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
-from cpra.mp.data import read_data
-from cpra.mp.data.analysis.types import CompressionAlgorithm
+from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
+from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.config import (
     DEBUG,
     RASTER_BATCH_BUFFER_MB,
@@ -28,7 +28,6 @@ from cpra.mp.data.config import (
     RASTER_NUM_THREADS,
     RASTER_SWATH_SIZE_MB,
 )
-from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 
 RASTER_COMPRESSION_ALGORITHMS = [
@@ -55,56 +54,15 @@ def unpack_values(values_str, param_name, choices=None, separator=","):
     if choices:
         invalid_values = [val for val in values if val not in choices]
         if invalid_values:
-            # Local import: avoids a cpra.mp.data.analysis.base <-> .io.raster_io import
-            # cycle (base.py imports get_lazy_frame/unpack_values/timing from this module
-            # at module scope; AnalysisError itself is defined in base.py per that
-            # module's docstring).
-            from cpra.mp.data.analysis.base import AnalysisError
-
             msg = f"Invalid values for {param_name}: {', '.join(invalid_values)}"
-            raise AnalysisError(msg, status_code=400)
+            raise RequestError(msg)
 
     return values
-
-
-@cached(cache=TTLCache(maxsize=128, ttl=600))
-def _read_data_cached(*args, **kwargs):
-    return read_data(*args, **kwargs)
-
-
-def get_lazy_frame(dataset_dimensions, filter_dimensions, base_path=None):
-    """Get a LazyFrame for the given dimensions with error handling."""
-    try:
-        return _read_data_cached(
-            **({"base_path": base_path} if base_path is not None else {}),
-            **dict(dataset_dimensions),
-            **{k: tuple(v) for (k, v) in dict(filter_dimensions).items() if isinstance(v, list)},
-        )
-    except ValidationError as err:
-        # Local import: see the note in unpack_values above.
-        from cpra.mp.data.analysis.base import AnalysisError
-
-        # TODO: Also handle directory does not exist errors.
-        raise AnalysisError(str(err), status_code=422)
 
 
 def enum_value(inst):
     """Get the value from an enum."""
     return inst.value if isinstance(inst, Enum) else inst
-
-
-def asynctiming(func):
-    """Time an asynchronous function call."""
-
-    @wraps(func)
-    async def wrapped(*args, **kwargs):
-        start = time()
-        result = await func(*args, **kwargs)
-        if DEBUG:
-            print("func:%r args:[%r, %r] took: %2.4f sec" % (func.__name__, args, kwargs, time() - start))
-        return result
-
-    return wrapped
 
 
 def timing(func):
@@ -141,10 +99,10 @@ def raster_gdal_env():
     this machine: 1.22s for 2 bands vs 2.42s for 11 from one file; 1.11s for 2 bands vs
     4.81s for 21 of 52 from two files -- a large fixed per-read overhead means it isn't
     perfectly linear, but a narrow band selection is genuinely cheaper, not merely
-    memory-light). ``RasterGridAnalysis._windowed_read_is_lighter``'s routing already keys
-    on the windowed path's buffer *size* (bands x block height x width) rather than a time
-    assumption, so it needed no change once this claim was checked -- confirmed by reading
-    it, not merely assumed.
+    memory-light). The windowed-vs-whole-raster routing keys on the windowed path's
+    buffer *size* (bands x block height x width) rather than on any such time assumption,
+    so it needed no change once this claim was checked -- confirmed by reading it, not
+    merely assumed.
 
     Capping ``GDAL_CACHEMAX`` is what keeps the windowed path's peak memory down, and unlike
     ``GDAL_NUM_THREADS`` it must be in effect at *read* time to matter, not open time
@@ -215,10 +173,10 @@ def raster_copy_gdal_env():
 def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):
     """Number of adjacent raster blocks to union into one summarize-loop batch.
 
-    ``RasterGridAnalysis._apply_transform_params_impl`` used to union a whole block row per
-    iteration regardless of how many blocks that row contained, so one iteration's read
-    buffer (``n_bands`` bands x ``block_height`` x the row's full width) grew with the
-    raster's width and the request's band count alike -- 20674 px wide block rows meant
+    The summarize loop used to union a whole block row per iteration regardless of how
+    many blocks that row contained, so one iteration's read buffer (``n_bands`` bands x
+    ``block_height`` x the row's full width) grew with the raster's width and the
+    request's band count alike -- 20674 px wide block rows meant
     ~10M pixels x N bands per iteration no matter how small the actual query. Chunking the
     row into groups of ``K`` blocks bounds that buffer directly (measured 4 block rows, 52
     bands: whole row 12.0s/4143MB -> 8 blocks 10.6s/2243MB -> 4 blocks 9.8s/1753MB -> 2
@@ -240,48 +198,13 @@ def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):
     return max(1, budget_bytes // per_block_bytes)
 
 
-def group_rows_by_path(df):
-    """Group a materialized index DataFrame's rows by unique ``path``.
-
-    Multiband COGs mean several df rows (different bands, e.g. different
-    ``calendar_year`` values) can share the same file. Callers use this to open each
-    file once and request all of its needed bands in a single read/sample call, rather
-    than reopening the same file per row.
-
-    Returns ``(paths, row_indices, bands)`` where ``paths`` are the unique paths in
-    first-seen order, ``row_indices[i]`` are the df row positions backed by
-    ``paths[i]``, and ``bands[i]`` are the corresponding band numbers (1-based, in the
-    same order as ``row_indices[i]``), or None if df has no ``band`` column.
-    """
-    paths = df["path"].to_list()
-    has_bands = "band" in df.columns
-    row_bands = df["band"].to_list() if has_bands else [None] * len(paths)
-
-    order = []
-    row_indices_by_path = {}
-    bands_by_path = {}
-    for row_idx, (path, band) in enumerate(zip(paths, row_bands)):
-        if path not in row_indices_by_path:
-            order.append(path)
-            row_indices_by_path[path] = []
-            bands_by_path[path] = []
-        row_indices_by_path[path].append(row_idx)
-        bands_by_path[path].append(band)
-
-    row_indices = [row_indices_by_path[path] for path in order]
-    bands = [bands_by_path[path] if has_bands else None for path in order]
-    return order, row_indices, bands
-
-
 def batched_windows(src, blocks_per_batch):
     """Window unions over one block row at a time, chunked to `blocks_per_batch` blocks.
 
-    Adapted from `sources.py`'s private `_batched_windows` (the old engine's identical
-    windowing logic, left in place there for the old engine to keep using until it is
-    retired) -- this is the copy the VRT-based raster scan (`io/raster.py`) reads its
-    batch boundaries from, so a request over a large raster still bounds its per-batch
-    buffer the same way rather than unioning a whole block row (tens of thousands of
-    pixels wide regardless of how much data a request needs) into one batch.
+    This is where the VRT-based raster scan (`io/raster.py`) reads its batch boundaries
+    from, so a request over a large raster bounds its per-batch buffer rather than
+    unioning a whole block row (tens of thousands of pixels wide regardless of how much
+    data a request needs) into one batch.
 
     `src.block_windows(1)` reads band 1's own block layout as the batching reference --
     every band of a co-registered raster covers the same ground, so which band's block
@@ -478,13 +401,6 @@ def tile_source_window(
         return windows.Window(0, 0, src.width, src.height)
 
     if straddling_vector_grid is not None:
-        # Local import: avoids the `cpra.mp.data.analysis.base` <-> `.io.raster_io` import
-        # cycle this module's other local imports (`unpack_values`, `get_lazy_frame`) work
-        # around too -- `io.geography` imports `AnalysisError` from `base` at module scope,
-        # and `base` imports this module at module scope, so importing `io.geography` at
-        # THIS module's top level would close the cycle before `AnalysisError` is defined.
-        from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
-
         # CRS #1 -> CRS #3 (`straddling_vector_grid`'s OWN crs, read inside
         # `straddling_feature_bounds` itself): the whole footprint of every feature the tile
         # touches at all, not just the part already inside the tile.

@@ -175,11 +175,55 @@ def write_raster_dataset(base_path, years=(2030, 2040), fill_fn=None, data_fn=No
     return kwargs
 
 
+def write_ffibs_coverage_dataset(base_path, values_by_year, **overrides):
+    """``ffibs_coverage_ratio`` / ``veg_grid_cell_v001``, one uniformly-filled COG per
+    ``values_by_year`` entry.
+
+    The raster half of the marsh-coverage-plus-salinity pair: the two variables the
+    ``exit-criterion`` named analysis hardcodes, and the smallest real dataset that puts a
+    raster grid and a vector grid on the same pair of years. ``ffibs_type`` is required by
+    ``variables.csv`` and defaults to the ``pl_fm`` value that analysis selects.
+    """
+    kwargs = {**RASTER_KWARGS, "variable": "ffibs_coverage_ratio", "ffibs_type": "pl_fm", **overrides}
+    for year, value in values_by_year.items():
+        data = raster_array(fill=value, grid_name=kwargs["grid"], dtype="float32")
+        write_cog(data, base_path=base_path, calendar_year=year, **kwargs)
+    return kwargs
+
+
+def write_sal_annual_dataset(base_path, values_by_year, geo_ids=(1,), **overrides):
+    """``sal`` / ``hydro_compartment_v001``, ANNUAL rather than :func:`daily_frame`'s
+    daily, with one value per year per cell.
+
+    The vector half of the pair above. ``hydro_compartment_v001`` has 1,657 columns, so
+    this writes only ``geo_ids`` and passes ``validate=False`` for the same reason
+    :func:`daily_frame` does.
+    """
+    kwargs = {**DAILY_KWARGS, "time_unit": "annual", "aggregate_type": "2_wk_max", **overrides}
+    years = sorted(values_by_year)
+    columns = {
+        "variable": pl.Series([kwargs["variable"]] * len(years), dtype=pl.String),
+        "grid": pl.Series([kwargs["grid"]] * len(years), dtype=pl.String),
+        "time_unit": pl.Series([kwargs["time_unit"]] * len(years), dtype=pl.String),
+        "model_group_id": pl.Series([kwargs["model_group_id"]] * len(years), dtype=pl.Int32),
+        "scenario_id": pl.Series([kwargs["scenario_id"]] * len(years), dtype=pl.Int32),
+        "aggregate_type": pl.Series([kwargs["aggregate_type"]] * len(years), dtype=pl.String),
+        "calendar_year": pl.Series(years, dtype=pl.Int32),
+        "model": pl.Series([kwargs["model"]] * len(years), dtype=pl.String),
+    }
+    for geo_id in geo_ids:
+        columns[str(geo_id)] = pl.Series([values_by_year[y] for y in years], dtype=pl.Float32)
+
+    write_parquet(pl.DataFrame(columns), base_path=base_path, validate=False)
+    return kwargs
+
+
 def write_vector_crosswalk(crosswalk_path, src_grid, dst_grid, mapping):
     """Write a src->dst crosswalk Parquet.
 
-    ``mapping`` is an iterable of ``(src_id, dst_id, scale_factor)`` triples, matching the
-    schema ``VectorGridAnalysis._apply_transform_params_impl`` expects.
+    ``mapping`` is an iterable of ``(src_id, dst_id, scale_factor)`` triples, matching
+    the schema ``analysis.io.crosswalk_read.scan_crosswalk`` returns and
+    ``analysis.execution.project`` joins against.
     """
     path = crosswalk_path / f"{src_grid}__{dst_grid}.parquet"
     pl.DataFrame(

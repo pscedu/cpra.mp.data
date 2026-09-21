@@ -3,22 +3,18 @@ triple the `/v1/datasets/{variable}/{time_unit}/{grid}` routes accept -- into a 
 `request.pipeline.Pipeline`, the one thing `api/pipeline.py`'s `respond_to_analysis*`
 functions know how to answer.
 
-This is deliberately the FIRST piece of the flat-route migration written, and the only one
-tested in isolation before any route is rewired to call it (see this package's own
-migration notes): every flat data/tile route's Pipeline-shaped request is "one input, at
-most one `filter` step, an `Output`" -- there is no grouping, no join, no project, nothing
-`Options` (as opposed to `DataOptions`) would add. Building that one shape correctly, and
-proving it here against `request.pipeline.validate_pipeline`'s own rules, means every route
-this feeds only has to worry about response plumbing, not pipeline construction.
+Every flat data/tile route's Pipeline-shaped request is the same narrow shape: "one input,
+at most one `filter` step, an `Output`" -- there is no grouping, no join, no project,
+nothing `Options` (as opposed to `DataOptions`) would add. Building that one shape
+correctly here, and proving it against `request.pipeline.validate_pipeline`'s own rules,
+means every route this feeds only has to worry about response plumbing, not pipeline
+construction.
 
-**Why `analysis.parameters` (the legacy root) rather than a `request`-namespaced copy.**
-`DatasetDimensions`/`FilterDimensions`/`DataOptions` already exist, are already the models
-the flat routes' query parameters bind to today, and are structurally read off the same
-live `cpra.mp.data.dimensions.DIMENSIONS` table `request.types.dimension_type` is. Building
-a second copy under `request/` would just be the same fields typed out twice. Importing
-from the legacy `analysis/` root is the explicit, temporary coexistence allowance
-`tests/api/test_analysis_layering.py` documents (`_LEGACY_ROOT_IMPORT_ALLOWED`); it is not
-a layering violation.
+The `DatasetDimensions`/`FilterDimensions`/`DataOptions` triple it takes is
+`request/parameters.py`'s -- the same models the flat routes' query parameters bind to,
+read structurally off the same live `cpra.mp.data.dimensions.DIMENSIONS` table
+`request.types.dimension_type` is, so there is exactly one definition of those fields
+rather than a second copy typed out for this module's benefit.
 
 **What this module does NOT do.** It never opens a file, never knows a grid's kind
 (vector/raster), and never resolves a coordinate-valued `grid_cell` to an ID -- all of that
@@ -26,13 +22,11 @@ needs `io/catalog.py`/`io/geography.py`, which is `io/`'s job, and `request/` ma
 `io/` (see the layering test again). Concretely:
 
 - A digit-only `grid_cell` (`"1"`, `"1,2,3"`) is handled directly, the same
-  `str.isdigit()`-per-token rule `analysis.vector.apply_grid_cell_selection` already uses
-  for a vector grid, since deciding "these are literal IDs" needs nothing but the string
-  itself.
-- Anything else -- a coordinate pair, or any `grid_cell` value on a raster dataset (which
-  is *always* coordinates; see `analysis.vector.apply_grid_cell_selection`'s docstring on
-  the raster convention this engine has no equivalent for yet) -- is the caller's problem
-  to resolve first. Pass the already-resolved spatial `where` conjunct as `grid_cell_where`
+  `str.isdigit()`-per-token rule a vector grid has always used, since deciding "these are
+  literal IDs" needs nothing but the string itself.
+- Anything else -- a coordinate pair, or any `grid_cell` value on a raster dataset, which
+  is *always* coordinates (see `api/data_query.py`'s module docstring on why the raster
+  branch never applies the digit rule) -- is the caller's problem to resolve first. Pass the already-resolved spatial `where` conjunct as `grid_cell_where`
   (e.g. `"grid_cell IN (1, 2)"`, or `"grid_cell != grid_cell"` for "matched nothing") and
   this function uses it verbatim instead of trying to parse `options.grid_cell` itself.
   `grid_cell_where`, when given, entirely REPLACES this module's own `options.grid_cell`
@@ -45,7 +39,7 @@ needs `io/catalog.py`/`io/geography.py`, which is `io/`'s job, and `request/` ma
 
 from datetime import date
 
-from cpra.mp.data.analysis.parameters import BaseFilterDimensions, DataOptions, DatasetDimensions, FilterDimensions
+from cpra.mp.data.analysis.request.parameters import BaseFilterDimensions, DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.expressions import split_top_level_and
 from cpra.mp.data.analysis.request.pipeline import FilterStep, InputSelection, Output, Pipeline, validate_pipeline
@@ -100,25 +94,30 @@ def _dimension_conjuncts(filter_dimensions: FilterDimensions) -> list[str]:
     return conjuncts
 
 
-def _grid_cell_conjunct(grid_cell: str) -> str:
+def grid_cell_conjunct(grid_cell: str) -> str:
     """The `where` conjunct for a digit-only `grid_cell` (`"1"` or `"1,2,3"`): `grid_cell
     IN (...)`, unquoted -- `grid_cell` is an ordinary integer column in long shape (see
     `execution.long_ops.filter_long`'s docstring; `tests/api/test_execution_plan.py` pins
     `where: "grid_cell = 7"`, unquoted, as the real usage). Every token must be a plain
-    (unsigned, non-decimal) digit string, the same rule `analysis.vector.
-    apply_grid_cell_selection` uses to tell a literal ID apart from a coordinate --
-    anything else must be resolved by the caller and passed as this function's caller's
+    (unsigned, non-decimal) digit string, the same rule a vector grid uses to tell a
+    literal ID apart from a coordinate -- anything else must be resolved by the caller and passed as this function's caller's
     own `grid_cell_where` instead (see the module docstring); reaching this function with
     a non-digit token is therefore a caller error, not a user-input error, and is reported
     as such.
+
+    Public, rather than private to `build_data_query_pipeline` below, because the named-
+    analysis registry (`cpra/mp/data/analyses/base.py`) composes its own leading `filter`
+    step from the same three ingredients this module does -- dimension filters, a
+    `grid_cell`, and a caller's `where` -- and the digit-ID rule is the one piece of that
+    worth having exactly one definition of.
     """
     tokens = [token.strip() for token in grid_cell.split(",")]
     if not tokens or not all(token.isdigit() for token in tokens):
         raise RequestError(
             f"grid_cell={grid_cell!r} is not a plain comma-separated list of digit IDs -- "
             "a coordinate-valued grid_cell must be resolved to IDs by the caller first "
-            "and passed as build_data_query_pipeline(..., grid_cell_where=...) instead of "
-            "left for this function to parse"
+            "and passed as that caller's own grid_cell_where argument instead of left "
+            "for this function to parse"
         )
     if len(tokens) == 1:
         return f"grid_cell = {tokens[0]}"
@@ -161,7 +160,7 @@ def build_data_query_pipeline(
     `grid_cell_where`, when given, is used as the spatial conjunct verbatim, entirely
     bypassing this function's own digit-ID-only handling of `options.grid_cell` -- see the
     module docstring for why (coordinate resolution needs `io/`, which `request/` may not
-    import) and `_grid_cell_conjunct` for the digit-ID path this replaces.
+    import) and `grid_cell_conjunct` for the digit-ID path this replaces.
 
     Only runs `request.pipeline.validate_pipeline`'s STRUCTURAL checks (via `Pipeline`'s
     own construction, below) -- a caller still needs `request.ops.validate_shapes` (which
@@ -181,7 +180,7 @@ def build_data_query_pipeline(
     if grid_cell_where is not None:
         conjuncts.append(grid_cell_where)
     elif options.grid_cell:
-        conjuncts.append(_grid_cell_conjunct(options.grid_cell))
+        conjuncts.append(grid_cell_conjunct(options.grid_cell))
 
     if options.where:
         conjuncts.extend(f"({conjunct})" for conjunct in split_top_level_and(options.where))

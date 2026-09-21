@@ -1,13 +1,12 @@
 """The tile path's geometry: read the tile's footprint in the source CRS, do the per-pixel
 work there, warp the result onto the tile grid last.
 
-`RasterGridAnalysis.get_tile` and `paired._paired_notebook_tile` used to warp every source
-band onto the tile's pixel grid FIRST (a `WarpedVRT` per source) and collapse the bands
-afterwards, on tile pixels. They now do it the other way round, through
-`utils.tile_source_window` + `utils.warp_window_to_tile`. This file exists to prove that
-change moved no pixel, and it has to do that with a differential rather than an assertion
-about the code, because the failure mode is a fractional-pixel offset that renders as a
-picture that still looks right.
+The tile path used to warp every source band onto the tile's pixel grid FIRST (a
+`WarpedVRT` per source) and collapse the bands afterwards, on tile pixels. It now does it
+the other way round, through `utils.tile_source_window` + `utils.warp_window_to_tile`.
+This file exists to prove that change moved no pixel, and it has to do that with a
+differential rather than an assertion about the code, because the failure mode is a
+fractional-pixel offset that renders as a picture that still looks right.
 
 Three things are measured separately here, and conflating them would hide which defect is
 present:
@@ -39,7 +38,6 @@ from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
-from cpra.mp.data.analysis import raster as raster_module
 from cpra.mp.data.analysis.execution.band_ops import group_band_wide
 from cpra.mp.data.analysis.io import raster_io as utils_module
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
@@ -1020,9 +1018,8 @@ def _render_tile(dimensions, base_path, tile_bounds, *, tile_size=TILE_SIZE, agg
     bands on SOURCE pixels, then warp the single surviving band onto the tile grid (via
     `utils_module.warp_window_to_tile`, same reason).
 
-    This replaces the old `dataset_factory`/`RasterGridAnalysis.get_tile` path for this
-    file's tests: that path is delete-tier and must not be exercised here. Composed
-    entirely from `request`/`io`/`execution` primitives instead.
+    Composed entirely from `request`/`io`/`execution` primitives, so that what this
+    file measures is the engine's own tile geometry and not a route's framing of it.
     """
     metadata_df = _resolve_metadata(dimensions, base_path)
     with rio.open(metadata_df["path"][0]) as src:
@@ -1144,13 +1141,10 @@ class TestGetTileRunsTheWindowThenWarpPath:
         assert rendered is not None
         assert calls == ["window", "warp"]
 
-    def test_the_source_warping_import_is_gone_from_the_raster_module(self):
-        """Complementary to the spy: `raster.py` no longer has `WarpedVRT` bound at all, so
-        no stale caller can still warp a source dataset straight onto a tile grid from
-        there. `utils.py` is the one place that reaches for it now, and only ever against
-        an in-memory dataset it just built.
+    def test_warping_lives_only_in_the_io_layer(self):
+        """Complementary to the spy: `io/raster_io.py` is the one place that reaches for
+        `WarpedVRT`, and only ever against an in-memory dataset it just built.
         """
-        assert not hasattr(raster_module, "WarpedVRT")
         assert hasattr(utils_module, "WarpedVRT")
 
 

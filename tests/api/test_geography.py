@@ -8,7 +8,6 @@ from rasterio.transform import xy as raster_xy
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis.io.geography import (
     grid_cell_id_where,
     parse_coordinate_pairs,
@@ -21,7 +20,8 @@ from cpra.mp.data.analysis.io.geography import (
     resolve_vector_grid_cell,
     resolve_vector_grid_cell_sync,
 )
-from cpra.mp.data.analysis.request.errors import NotFoundError
+from cpra.mp.data.analysis.request.errors import NotFoundError, RequestError
+from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.grids import GRIDS
 from tests.factories import write_grid_geometry
 
@@ -70,10 +70,14 @@ async def test_point_outside_every_polygon_resolves_to_none(ecoregion_geometry):
 
 
 async def test_missing_geometry_file_raises_400(geometry_path):
-    with pytest.raises(AnalysisError) as excinfo:
+    """A plain `RequestError` -- 400 via `api.boundary`, not `NotFoundError`'s 404: the
+    grid itself is real and the request names it correctly; what is absent is a server-side
+    artifact the caller can neither see nor fix by asking for something else.
+    """
+    with pytest.raises(RequestError) as excinfo:
         await resolve_vector_grid_cell("ecoregion_v001", [-91.0], [29.5])
-    assert excinfo.value.status_code == 400
-    assert "No geometry file" in excinfo.value.detail
+    assert resolve_status(excinfo.value) == 400
+    assert "No geometry file" in str(excinfo.value)
 
 
 def test_representative_points_are_inside_their_polygons(ecoregion_geometry):
@@ -104,17 +108,17 @@ class TestProjectCoordinates:
     def test_unprojectable_coordinates_raise_400(self):
         """The grids' UTM zone has no image for the origin, which PROJ reports as an error
         rather than as a coordinate — a request, not a server, problem."""
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             project_coordinates([0.0], [0.0], CRS.from_epsg(26915))
-        assert excinfo.value.status_code == 400
-        assert "outside the grid's projection" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "outside the grid's projection" in str(excinfo.value)
 
     def test_only_the_unprojectable_pairs_are_reported(self):
         """PROJ fails the whole batch, so the pair at fault has to be found afterwards."""
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             project_coordinates([-91.0, 0.0], [30.0, 0.0], CRS.from_epsg(26915))
-        assert "0.0, 0.0" in excinfo.value.detail
-        assert "-91.0" not in excinfo.value.detail
+        assert "0.0, 0.0" in str(excinfo.value)
+        assert "-91.0" not in str(excinfo.value)
 
 
 class TestParseCoordinatePairs:
@@ -127,24 +131,24 @@ class TestParseCoordinatePairs:
     def test_nan_is_an_invalid_coordinate(self):
         """`float` accepts "nan" and every bounds comparison against it is False, so a
         magnitude check would pass it through to project to infinity."""
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             parse_coordinate_pairs(["nan", "nan"])
-        assert excinfo.value.status_code == 400
-        assert "invalid coordinate pair" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "invalid coordinate pair" in str(excinfo.value)
 
     def test_infinity_is_an_invalid_coordinate(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             parse_coordinate_pairs(["inf", "0"])
-        assert excinfo.value.status_code == 400
-        assert "invalid coordinate pair" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "invalid coordinate pair" in str(excinfo.value)
 
 
 async def test_unprojectable_point_raises_400(ecoregion_geometry):
     """The vector lookup projects before it reads, so it fails the same way."""
-    with pytest.raises(AnalysisError) as excinfo:
+    with pytest.raises(RequestError) as excinfo:
         await resolve_vector_grid_cell("ecoregion_v001", [0.0], [0.0])
-    assert excinfo.value.status_code == 400
-    assert "outside the grid's projection" in excinfo.value.detail
+    assert resolve_status(excinfo.value) == 400
+    assert "outside the grid's projection" in str(excinfo.value)
 
 
 def _raster_pixel_lng_lat(row: int, col: int) -> tuple[float, float]:
@@ -220,10 +224,10 @@ class TestResolveRasterPixel:
         """`resolve_raster_pixel` reuses `project_coordinates` directly, so an unprojectable
         point (the UTM zone's own origin) fails identically for either grid kind.
         """
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             resolve_raster_pixel(RASTER_GRID, [0.0], [0.0])
-        assert excinfo.value.status_code == 400
-        assert "outside the grid's projection" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "outside the grid's projection" in str(excinfo.value)
 
     def test_a_vector_grid_name_raises_not_found(self):
         """`resolve_raster_pixel` is raster-only -- a name that resolves to a real grid of
@@ -238,15 +242,15 @@ class TestResolveRasterPixel:
             resolve_raster_pixel("not_a_real_grid_at_all", [-91.0], [29.5])
         assert "is not a raster grid" in str(excinfo.value)
 
-    def test_not_found_is_the_new_engine_error_family_not_analysis_error(self):
-        """The one failure mode `resolve_raster_pixel` invented itself (as opposed to
-        reusing `project_coordinates`'s existing `AnalysisError`) must raise from the NEW
-        engine's error family, per this module's own docstring -- not the old engine's
-        `AnalysisError`, which carries an HTTP `status_code` this exception does not.
+    def test_a_missing_raster_grid_is_a_404_not_a_400(self):
+        """The whole point of this module raising `NotFoundError` here rather than the
+        plain `RequestError` every coordinate rejection uses: naming a grid that does not
+        exist is a different answer from sending a malformed coordinate, and
+        `api.boundary` is where that difference becomes 404 vs 400.
         """
         with pytest.raises(NotFoundError) as excinfo:
             resolve_raster_pixel("not_a_real_grid_at_all", [-91.0], [29.5])
-        assert not isinstance(excinfo.value, AnalysisError)
+        assert resolve_status(excinfo.value) == 404
 
 
 class TestRasterGridCellId:

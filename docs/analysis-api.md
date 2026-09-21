@@ -88,8 +88,8 @@ the tile route), an optional `color_map` for rendered raster output, and optiona
 ## What Compiles Today
 
 Not every step sequence a pipeline could describe is executable yet. Three shapes are
-supported; anything else is rejected with a `PipelineError`-derived 400 naming the
-specific unsupported shape and why, rather than a generic failure.
+supported; anything else is rejected with a 400 naming the specific unsupported shape
+and why, rather than a generic failure.
 
 1. **Single-input chains equivalent to a flat dataset request**: one input, an opening
    `project` (identity, or many-to-one onto a coarser grid with `aggregate`), then
@@ -108,7 +108,7 @@ specific unsupported shape and why, rather than a generic failure.
    output -- no `filter`/`group` needed. `output.sort`/`output.select`/`output.color_map`
    still apply to this degenerate case.
 3. **The paired (spatially-joined) shape** (`calculate` steps are not supported in this
-   shape and are rejected with a `PipelineError`-derived 400 naming it -- apply the
+   shape and are rejected with a 400 naming it -- apply the
    rewrite on the flat endpoint or a single-input pipeline feeding the analysis instead):
    exactly two inputs -- a coarser one broadcast (one-to-many `project`, no `aggregate`)
    onto a finer *raster* grid, immediately `join`ed against that raster input, then any

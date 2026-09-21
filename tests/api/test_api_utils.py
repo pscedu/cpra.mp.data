@@ -1,8 +1,9 @@
-"""Tests for cpra.mp.data.api.utils / cpra.mp.data.analysis.utils and the LazyFrameSource
-base class. `get_lazy_frame`/`unpack_values` moved to `analysis.utils` (and raise
-`AnalysisError`, not `HTTPException`) since the `BaseAnalysis` hierarchy needs them and
-`analysis/` may not import FastAPI; `validate_compression`/`validate_format`/
-`get_visualization_class`/`LazyFrameSource` stayed in `api/` and still raise `HTTPException`.
+"""Tests for cpra.mp.data.api.utils / cpra.mp.data.analysis.io.raster_io and the
+LazyFrameSource base class. `unpack_values` lives under `analysis/`, which may not import
+FastAPI, so it raises a `request.errors.RequestError` that `api/boundary.py` maps to 400
+rather than an `HTTPException` of its own.
+`validate_compression`/`validate_format`/`get_visualization_class`/`LazyFrameSource` stayed
+in `api/` and still raise `HTTPException`.
 """
 
 import numpy as np
@@ -11,16 +12,16 @@ import pytest
 import rasterio as rio
 from fastapi import HTTPException
 
-from cpra.mp.data.analysis import AnalysisError
-from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.analysis.io.raster_io import (
     enum_value,
-    get_lazy_frame,
     parallel_read_rasters,
     parallel_sample_rasters,
     raster_blocks_per_batch,
     unpack_values,
 )
+from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.api.models import Compression, DatasetDimensions, FilterDimensions
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.utils import (
@@ -57,15 +58,15 @@ class TestUnpackValues:
         assert unpack_values("a,b", "param", choices=["a", "b", "c"]) == ["a", "b"]
 
     def test_invalid_choice_raises_400(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             unpack_values("a,zzz", "sort", choices=["a", "b"])
-        assert excinfo.value.status_code == 400
-        assert "Invalid values for sort: zzz" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "Invalid values for sort: zzz" in str(excinfo.value)
 
     def test_all_invalid_choices_are_listed(self):
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             unpack_values("x,y", "sort", choices=["a"])
-        assert "x, y" in excinfo.value.detail
+        assert "x, y" in str(excinfo.value)
 
 
 class TestValidateCompression:
@@ -211,36 +212,6 @@ class TestGetAnalysisClass:
 
     def test_type_is_optional(self):
         assert get_analysis_class("exit-criterion") is not None
-
-
-class TestGetLazyFrame:
-    def test_returns_a_lazy_frame(self, base_path):
-        write_raster_dataset(base_path, years=(2030,))
-        dims = DatasetDimensions(**{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")})
-        lf = get_lazy_frame(dims, FilterDimensions(), base_path=base_path)
-        assert lf.collect().height == 1
-
-    def test_list_filters_are_applied(self, base_path):
-        write_raster_dataset(base_path, years=(2030, 2040))
-        dims = DatasetDimensions(**{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")})
-        lf = get_lazy_frame(dims, FilterDimensions(calendar_year=[2040]), base_path=base_path)
-        assert lf.collect()["calendar_year"].to_list() == [2040]
-
-    def test_validation_errors_become_422(self, base_path):
-        """An omitted grid leaves the field None, which read_data rejects."""
-        dims = DatasetDimensions(variable="sal", time_unit="daily")
-        with pytest.raises(AnalysisError) as excinfo:
-            get_lazy_frame(dims, FilterDimensions(), base_path=base_path)
-        assert excinfo.value.status_code == 422
-        assert "Grid is required" in excinfo.value.detail
-
-    def test_results_are_cached(self, base_path):
-        """Repeated identical queries reuse the cached LazyFrame."""
-        write_raster_dataset(base_path, years=(2030,))
-        dims = DatasetDimensions(**{k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")})
-        first = get_lazy_frame(dims, FilterDimensions(), base_path=base_path)
-        second = get_lazy_frame(dims, FilterDimensions(), base_path=base_path)
-        assert first is second
 
 
 class TestLazyFrameSource:

@@ -1,20 +1,19 @@
 """Named-analysis registry: mirrors `cpra.mp.data.visualizations`'s `VISUALIZATIONS`
 pattern (`ANALYSES = {cls.Meta.name: cls for cls in [...]}`) for the small set of
 multi-step, non-visual analyses a route can resolve by NAME rather than requiring a caller
-to hand-author the equivalent `analysis.pipeline.Pipeline` JSON directly -- replacing the
-portal's own client-side-only `subtract-asc`/`subtract-desc`/`concatenate` derivation logic
-and its un-enforced cardinality rules. This package's own registry-drift test
+to hand-author the equivalent `analysis.request.pipeline.Pipeline` JSON directly --
+replacing the portal's own client-side-only `subtract-asc`/`subtract-desc`/`concatenate`
+derivation logic and its un-enforced cardinality rules. The registry-drift test
 (`tests/test_analyses.py`) enforces the constraint that keeps this honest: every entry's
-`pipeline()` must return a real `Pipeline`, run through the exact same `compile_pipeline`
-any hand-authored pipeline does -- nothing is reachable only through a named analysis.
+`pipeline()` must return a real `Pipeline`, run through the exact same
+`execution.plan.compile_plan` any hand-authored pipeline does -- nothing is reachable only
+through a named analysis.
 
 `ANALYSES`, `DatasetRef`, and `resolve_analysis` are the exact three names
-`cpra/mp/data/api/utils.py` already imports (guarded by `except ModuleNotFoundError`,
-since that module landed concurrently with this package) -- see that module's
-`get_analysis_class`, which resolves `ANALYSES[name].Meta.type` directly for its own
-404/400 (unknown name / wrong route kind) translation, independent of the exceptions
-`resolve_analysis` itself raises below for the parameter-validation/pipeline-construction
-half of the same job.
+`cpra/mp/data/api/utils.py` imports -- see that module's `get_analysis_class`, which
+resolves `ANALYSES[name].Meta.type` directly for its own 404/400 (unknown name / wrong
+route kind) translation, independent of the exceptions `resolve_analysis` itself raises
+below for the parameter-validation/pipeline-construction half of the same job.
 """
 
 from pydantic import ValidationError
@@ -31,7 +30,7 @@ from cpra.mp.data.analyses.base import (
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
 from cpra.mp.data.analyses.exit_criterion import ExitCriterion
-from cpra.mp.data.analysis.pipeline import PipelineError
+from cpra.mp.data.analysis.request.errors import RequestError
 
 # Landed in this order (`exit-criterion` first -- the only entry exercising the
 # `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and the
@@ -58,9 +57,10 @@ def resolve_analysis(
     dataset: DatasetRef | None = None,
     filters: dict | None = None,
     params: dict | None = None,
+    grid_cell_where: str | None = None,
 ) -> ResolvedAnalysis:
-    """Resolve a named analysis into a `ResolvedAnalysis` (a real, `compile_pipeline`-
-    ready `Pipeline` plus presentation metadata): look `name` up in `ANALYSES`, check its
+    """Resolve a named analysis into a `ResolvedAnalysis` (a real, `compile_plan`-ready
+    `Pipeline` plus presentation metadata): look `name` up in `ANALYSES`, check its
     `Meta.type` against whether `dataset` was given (a `type="dataset"` analysis requires
     one; a `type="custom"` analysis requires `dataset=None`), validate `params` against
     its `Parameters` model, run its own `validate_selection` cardinality/consistency rule
@@ -68,19 +68,27 @@ def resolve_analysis(
 
     `dataset` is `None` for a `type="custom"` analysis (its inputs are hardcoded in its
     own `pipeline()` method -- see `exit_criterion.py`); `filters` is the dataset's
-    dimension filters plus an optional reserved `grid_cell` key, exactly as a
-    `type="dataset"` analysis's single pipeline input would take them (`request.sort`/
+    dimension filters plus the two reserved keys `grid_cell` and `where`, which the
+    analysis composes into its pipeline's leading `filter` STEP (see
+    `base.selection_filter_where`) rather than onto its input selection -- an
+    `InputSelection` names a dataset and carries no filtering at all. (`request.sort`/
     `.select`/`.color_map`/compression parameters are NOT part of `filters` -- those apply
     to the RESOLVED `Pipeline`'s `.output`/response at the route layer, after this
-    function returns, the same way they would for a hand-authored pipeline); `params` is
+    function returns, the same way they would for a hand-authored pipeline.) `params` is
     the analysis's own declared parameters (`dimension`/`order` for `difference`,
     `dimension` for `concatenate`, `model_group_id`/`scenario_id`/`marsh_threshold`/
     `salinity_threshold` for `exit-criterion`), raw and unvalidated until this call.
 
+    `grid_cell_where` is an already-resolved spatial conjunct (`"grid_cell IN (1, 2)"`)
+    for a caller that had to turn coordinates into IDs itself -- resolving coordinates
+    needs the catalog, which is `io/`'s job, not this package's. When given it entirely
+    replaces `filters["grid_cell"]`'s own digit-ID handling, exactly as the same-named
+    argument does for `request.data_query.build_data_query_pipeline`.
+
     Raises exactly one of three `AnalysisRegistryError` subclasses -- never a bare
-    `PipelineError`, even though `pipeline()` itself calls `parse_pipeline` and could
-    raise one; any `PipelineError` a pipeline-construction step (from valid-shaped, but
-    together nonsensical, parameters/filters) raises is caught and re-raised as
+    `RequestError`, even though `pipeline()` itself calls `parse_pipeline` and could raise
+    one; any `RequestError` a pipeline-construction step (from valid-shaped, but together
+    nonsensical, parameters/filters) raises is caught and re-raised as
     `InvalidAnalysisParametersError` below, so a caller only ever needs to catch this
     module's three exception types:
 
@@ -113,10 +121,12 @@ def resolve_analysis(
 
     analysis_class.validate_selection(parameters, filters)
 
-    analysis = analysis_class(dataset=dataset, filters=filters, parameters=parameters)
+    analysis = analysis_class(
+        dataset=dataset, filters=filters, parameters=parameters, grid_cell_where=grid_cell_where
+    )
     try:
         pipeline = analysis.pipeline()
-    except PipelineError as exc:
+    except RequestError as exc:
         raise InvalidAnalysisParametersError(
             f"analysis {name!r} could not build a pipeline from the given parameters/"
             f"filters: {exc}"

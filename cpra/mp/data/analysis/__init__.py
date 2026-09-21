@@ -1,55 +1,37 @@
-"""Analysis layer: a `BaseAnalysis` template-method hierarchy for running one data-API
-query against one dataset (the former `api/dataset.py`'s `Dataset` class), plus the
-grid-agnostic helpers it's built from (expressions, fold, sources, types, parameters,
-utils, geography) and the paired-plan execution path (`planner`/`paired`).
+"""Analysis layer: the query engine behind both the HTTP API and `cpra.mp.data.
+analyze_data`, organized as four one-way layers, each of which may import from the ones
+above it and never the other way round:
+
+* `request/` -- what was asked for. Parses and validates a JSON-shaped pipeline body into
+  a `Pipeline` (`request.pipeline`), types its frames and checks the shape rules
+  (`request.ops`), parses `where`/`calculate` expressions (`request.expressions`), and
+  owns the error family every rejection here belongs to (`request.errors`). Opens no
+  file and knows no crosswalk.
+* `io/` -- how bytes are read. Rasters (`io.raster`/`io.raster_io`), vectors
+  (`io.vector`), crosswalks (`io.crosswalk_read`), the dataset catalog (`io.catalog`),
+  grid geometry and coordinate resolution (`io.geography`), and tabular output
+  (`io.output`).
+* `execution/` -- how a `Pipeline` runs. Compiles it to an `ExecutionPlan`
+  (`execution.plan`), walks that plan over long and band-wide frames
+  (`execution.execute`, `execution.long_ops`, `execution.band_ops`,
+  `execution.project`), and writes the result (`execution.sink`).
+* the HTTP binding, which does NOT live here -- see `cpra.mp.data.api`.
 
 Nothing under this package may import FastAPI -- see `tests/api/test_analysis_boundary.py`,
-which walks every module here and asserts it. `analysis.base.AnalysisError` stands in for
-`HTTPException`; `api/__init__.py` registers the one place that translates it back into an
-HTTP response.
+which walks every module here and asserts it, and `tests/api/test_analysis_layering.py`,
+which asserts the layer order above. `request.errors.RequestError` and its subclasses
+stand in for `HTTPException`; `api.boundary` is the one place that translates them back
+into HTTP status codes.
 
-This module is also a supported library entry point for running an analysis without
-FastAPI or its request-model objects -- a notebook or a script that wants the plain-value
-calling convention directly, rather than `cpra.mp.data.analyze_data`'s pipeline-shaped
-wrapper around it (see that function's docstring for the split between it and
-`cpra.mp.data.read_data`). `create_analysis` takes plain values (dimension names, filter
-values, option names under their existing API names) rather than the `DatasetDimensions`/
-`FilterDimensions`/`Options` pydantic models `analysis.parameters` normalizes those values
-into internally -- that split is an implementation detail, not something callers need to
-know about:
+The two supported entry points, neither of which needs FastAPI or a request model:
 
-    from cpra.mp.data.analysis import create_analysis
+    from cpra.mp.data import analyze_data          # a pipeline, run to a frame or a GeoTIFF
+    from cpra.mp.data import read_data             # one dataset, read without analysis
 
-    analysis = create_analysis(
-        variable="ssf", time_unit="annual", grid="ecoregion_v001",
-        scenario_id=7, group_aggregate="mean",
-    )
-    await analysis.apply_params()  # the query stages are async
-    df = analysis.materialize()  # -> a polars DataFrame (or LazyFrame; see `method=`)
-
-`parse_pipeline`/`compile_pipeline` are the equivalent entry point for the multi-input
-pipeline shape (see `analysis.pipeline`'s module docstring for the request representation,
-and `analysis.planner`'s for what compiles): `parse_pipeline` validates a JSON-shaped
-pipeline body into a `Pipeline`, and `compile_pipeline` compiles it into a `BaseAnalysis`
-or `PairedAnalysis`, the same objects `create_analysis` builds directly.
+Below those, `request.pipeline.parse_pipeline` validates a JSON-shaped body into a
+`Pipeline`, `request.ops.validate_shapes` checks it against its inputs' grid kinds, and
+`execution.plan.compile_plan` / `execution.execute.execute` run it -- the same four stages
+`analyze_data` and every HTTP response go through, in that order. Import them from their
+own modules; this package's `__init__` deliberately re-exports nothing, so there is no
+second name for anything here.
 """
-
-from cpra.mp.data.analysis.base import AnalysisError, BaseAnalysis
-from cpra.mp.data.analysis.factory import create_analysis
-from cpra.mp.data.analysis.paired import PairedAnalysis
-from cpra.mp.data.analysis.pipeline import PipelineError, parse_pipeline
-from cpra.mp.data.analysis.planner import compile_pipeline
-from cpra.mp.data.analysis.raster import RasterGridAnalysis
-from cpra.mp.data.analysis.vector import VectorGridAnalysis
-
-__all__ = [
-    "AnalysisError",
-    "BaseAnalysis",
-    "PairedAnalysis",
-    "PipelineError",
-    "RasterGridAnalysis",
-    "VectorGridAnalysis",
-    "compile_pipeline",
-    "create_analysis",
-    "parse_pipeline",
-]

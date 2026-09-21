@@ -1,6 +1,6 @@
 from fastapi import HTTPException
 
-from cpra.mp.data.analysis.types import CompressionAlgorithm, DataFormat, OutputType
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.visualizations import VISUALIZATIONS
 
 # The named-analysis registry lands in a concurrent change

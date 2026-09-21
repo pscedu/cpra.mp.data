@@ -2,20 +2,30 @@
 which marsh coverage (`ffibs_coverage_ratio`/annual/`veg_grid_cell_v001`, `ffibs_type=
 pl_fm`) and paired salinity (`sal`/annual/`hydro_compartment_v001`,
 `aggregate_type=2_wk_max`) both cross their thresholds, at every vegetation-grid pixel --
-the paired (project + spatial join) pipeline shape documented at
-`docs/data-analysis-api.md`'s "The Exit-Criterion Query" example, landed here as a named
-analysis rather than requiring a caller to hand-author that exact JSON.
+the paired (project + spatial join) pipeline shape documented at `docs/analysis-api.md`'s
+"The Exit-Criterion Query" example, landed here as a named analysis rather than requiring
+a caller to hand-author that exact JSON.
 
-Lands FIRST among the three v1 entries: it is the only one exercising the
-`type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and has no
-existing consumer (unlike `difference`/`concatenate`, which replace real portal catalog
-entries).
+The only entry exercising the `type="custom"` path, multiple named inputs, and a
+`project` + spatial `join`, and the only one with no existing consumer (unlike
+`difference`/`concatenate`, which replace real portal catalog entries).
+
+**Why the inputs are named `coverage`/`salinity` and the join operands `marsh`/`sal`.**
+A `join`'s output value columns are named after its OPERANDS (see `ops.validate_shapes`),
+so the trailing `filter`'s `where` -- `marsh > ... AND sal > ...` -- can only work if the
+two frames reaching the join carry exactly those names. An `as` may not collide with an
+input name, so the inputs take the two longer names and the per-input `filter`/`project`
+steps rename their outputs down to the two the threshold test reads.
 """
 
 from pydantic import Field
 
-from cpra.mp.data.analyses.base import Analysis
-from cpra.mp.data.analysis.pipeline import parse_pipeline
+from cpra.mp.data.analyses.base import (
+    Analysis,
+    InvalidAnalysisParametersError,
+    selection_filter_where,
+)
+from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 
 class ExitCriterion(Analysis):
@@ -42,33 +52,78 @@ class ExitCriterion(Analysis):
         marsh_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         salinity_threshold: float = Field(default=5.5, ge=0.0)
 
+    @classmethod
+    def validate_selection(cls, parameters, filters):
+        """Reject a selection outright rather than accepting one `pipeline()` below would
+        silently drop.
+
+        A `type="dataset"` analysis composes `filters` into its leading `filter` step via
+        `selection_filter_where(self.filters)`; this one cannot. It has no dataset, and
+        its two inputs sit on DIFFERENT grids (`veg_grid_cell_v001` pixels and
+        `hydro_compartment_v001` polygons), so neither a `grid_cell` selection nor a bare
+        `where` has one unambiguous frame to apply to -- and the caller-facing dimension
+        values it does accept (`model_group_id`/`scenario_id`) are declared `Parameters`,
+        applied to both inputs by `pipeline()` itself. Silently ignoring a `grid_cell` the
+        caller sent would look like a whole-extent answer to a point query.
+        """
+        if filters:
+            raise InvalidAnalysisParametersError(
+                f"analysis 'exit-criterion' takes no selection, but got: "
+                f"{', '.join(sorted(filters))} -- it names its own two inputs, on two "
+                f"different grids, so there is no single frame for a grid_cell/where to "
+                f"narrow; its dimension values are parameters "
+                f"(model_group_id, scenario_id) instead"
+            )
+
     def pipeline(self):
         assert self.dataset is None, "exit-criterion is a type='custom' analysis"
         p = self.parameters
-        where = f"marsh > {p.marsh_threshold} AND sal > {p.salinity_threshold}"
+        coverage_where = selection_filter_where(
+            {
+                "model_group_id": p.model_group_id,
+                "scenario_id": p.scenario_id,
+                "ffibs_type": "pl_fm",
+            }
+        )
+        salinity_where = selection_filter_where(
+            {
+                "model_group_id": p.model_group_id,
+                "scenario_id": p.scenario_id,
+                "aggregate_type": "2_wk_max",
+            }
+        )
         data = {
             "inputs": {
-                "marsh": {
+                "coverage": {
                     "variable": "ffibs_coverage_ratio",
                     "time_unit": "annual",
                     "grid": "veg_grid_cell_v001",
-                    "model_group_id": p.model_group_id,
-                    "scenario_id": p.scenario_id,
-                    "ffibs_type": "pl_fm",
                 },
                 "salinity": {
                     "variable": "sal",
                     "time_unit": "annual",
                     "grid": "hydro_compartment_v001",
-                    "model_group_id": p.model_group_id,
-                    "scenario_id": p.scenario_id,
-                    "aggregate_type": "2_wk_max",
                 },
             },
             "steps": [
-                {"op": "project", "input": "salinity", "to": "veg_grid_cell_v001", "as": "sal"},
+                {"op": "filter", "input": "coverage", "where": coverage_where, "as": "marsh"},
+                {
+                    "op": "filter",
+                    "input": "salinity",
+                    "where": salinity_where,
+                    "as": "selected_salinity",
+                },
+                {
+                    "op": "project",
+                    "input": "selected_salinity",
+                    "to": "veg_grid_cell_v001",
+                    "as": "sal",
+                },
                 {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
-                {"op": "filter", "where": where},
+                {
+                    "op": "filter",
+                    "where": f"marsh > {p.marsh_threshold} AND sal > {p.salinity_threshold}",
+                },
                 {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
             ],
             "output": {"format": "tif"},

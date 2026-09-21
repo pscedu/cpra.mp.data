@@ -25,20 +25,17 @@ caller for `render_tile`/`sink_vector_tile` directly.
   .StreamingThread` verbatim (the temp-file-plus-background-thread machinery,
   unchanged) but is NOT `api.tabular.PolarsStreamingResponse` itself, despite looking
   almost identical to it. The one load-bearing difference is documented on the class.
-- `tif`: `PipelineRasterResponse` mirrors `api.raster.RasterioStreamingResponse` closely
-  (temp file, `FileResponse` on success, `HTTPException(404)` on `False`) but cannot BE
-  that class -- it takes a `Pipeline`, not a `RasterLike` dataset object, and drives
-  `run_to_path` off the event loop via `anyio.to_thread.run_sync` rather than the old
-  engine's own `await dataset.write_raster(...)` coroutine.
-- `png`/`jpg`: purpose-built (`respond_to_analysis_tile`) -- `api.raster.
-  RasterioTileResponse` raises `HTTPException` on a tile miss, which is exactly the
-  anti-pattern this engine must not repeat (see `execution.sink.render_tile`'s and
-  `empty_tile`'s docstrings): a 404 on an image URL still needs a decodable image body,
-  which `HTTPException` would discard in favor of a JSON error document.
-- `pbf`: purpose-built (`respond_to_analysis_vector_tile`) -- `api.vector.
-  VectorTileResponse` raises `HTTPException(404)` on a miss; the new contract is a
-  bodiless 204 (`execution.sink.sink_vector_tile`'s own docstring), which
-  `HTTPException` cannot express either (it always carries a JSON body).
+- `tif`: `PipelineRasterResponse` below -- a temp file, `FileResponse` on success, and
+  `HTTPException(404)` when `run_to_path` reports no bands. `run_to_path` is synchronous,
+  so it is driven off the event loop via `anyio.to_thread.run_sync`.
+- `png`/`jpg`: purpose-built (`respond_to_analysis_tile`), specifically NOT
+  `HTTPException` on a tile miss -- see `execution.sink.render_tile`'s and `empty_tile`'s
+  docstrings: a 404 on an image URL still needs a decodable image body, which
+  `HTTPException` would discard in favor of a JSON error document.
+- `pbf`: purpose-built (`respond_to_analysis_vector_tile`), and again not
+  `HTTPException` -- a miss here is a bodiless 204 (`execution.sink.sink_vector_tile`'s
+  own docstring), which `HTTPException` cannot express either (it always carries a JSON
+  body).
 """
 
 import tempfile
@@ -55,11 +52,21 @@ from cpra.mp.data.analysis.execution import sink
 from cpra.mp.data.analysis.io import output
 from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.ops import Shape
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
-from cpra.mp.data.api.raster import COMPRESSION_LEVEL_OPTIONS
 from cpra.mp.data.api.tabular import StreamingThread
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
+
+# The rasterio profile key each compression algorithm spells its level with. Only the
+# three that HAVE a level appear -- `lzw`/`none` are absent rather than mapped to `None`,
+# so `.get()` returning nothing is what "this algorithm takes no level" means (see
+# `PipelineRasterResponse.__call__`, the only reader).
+COMPRESSION_LEVEL_OPTIONS = {
+    CompressionAlgorithm.deflate: "zlevel",
+    CompressionAlgorithm.lzma: "lzma_preset",
+    CompressionAlgorithm.zstd: "zstd_level",
+}
 
 # The four tabular formats' MIME types -- copied from `api.tabular.PolarsStreamingResponse
 # .mime_types` rather than imported from it, so this module's own response class does not
@@ -155,13 +162,11 @@ class PipelineTabularResponse(Response):
     boundary's own exception handlers can never disagree about what status a given
     exception type means, without hand-maintaining that mapping a second time here.
 
-    Always streams (`collect_in_memory=False`): the old engine picked between streaming and
-    collecting via `BaseAnalysis.estimate_data_size()` compared against `config.
-    STREAM_THRESHOLD`, and nothing analogous exists for a compiled `ExecutionPlan` --
-    estimating a pipeline's own result size ahead of running it is not implemented here.
-    Streaming is the safe default either way (`sink.sink_tabular`'s lazy branch never
-    materializes the whole frame), just not the size-based optimization the old routes made
-    for a small result.
+    Always streams (`collect_in_memory=False`): there is no size estimate for a compiled
+    `ExecutionPlan` to compare against `config.STREAM_THRESHOLD` -- estimating a
+    pipeline's own result size ahead of running it is not implemented. Streaming is the
+    safe default either way (`sink.sink_tabular`'s lazy branch never materializes the
+    whole frame), just not the size-based optimization a small result could take.
     """
 
     background = None
@@ -221,9 +226,7 @@ class PipelineTabularResponse(Response):
 
 
 def _raster_profile_options(compression) -> dict:
-    """`compression`'s algorithm/level, in `rasterio`'s write-profile spelling -- the same
-    mapping `api.raster.RasterioStreamingResponse` applies.
-    """
+    """`compression`'s algorithm/level, in `rasterio`'s write-profile spelling."""
     profile_options = {"compress": compression.compression_algorithm.value.upper()}
     level_option = COMPRESSION_LEVEL_OPTIONS.get(compression.compression_algorithm)
     if level_option is not None:
@@ -233,11 +236,11 @@ def _raster_profile_options(compression) -> dict:
 
 class PipelineRasterResponse(FileResponse):
     """The `tif` response: `run_to_path` off the event loop (`anyio.to_thread.run_sync`),
-    then `FileResponse` on success. Mirrors `api.raster.RasterioStreamingResponse`'s own
-    temp-file-inside-`__call__` shape (needed so the file is still open when `FileResponse`
-    streams it, rather than closed the moment a `with` block in the route function would
-    have exited) -- but drives `run_to_path`, a plain synchronous function, instead of that
-    class's `await dataset.write_raster(...)` coroutine.
+    then `FileResponse` on success.
+
+    The temp file is opened inside `__call__` rather than in the route function, so that it
+    is still open when `FileResponse` streams it -- a `with` block in the route would have
+    closed it the moment the route returned, before a byte was sent.
     """
 
     background = None
@@ -357,9 +360,8 @@ def _require_vector_final_frame(plan) -> str:
     of `request.types.DataFormat`/`TileFormat` (see `request.pipeline.Output.format`'s
     docstring), so `validate_shapes`'s sink-shape rule -- keyed on `pipeline.output.format`
     -- never sees `pbf` and has nothing to reject a raster-final pipeline against on this
-    route's behalf. This is the route-level equivalent of the old engine's `compiled.
-    validate_vector_tile()`, reimplemented against `ExecutionPlan.frame_types` instead of a
-    `BaseAnalysis`/`PairedAnalysis` object.
+    route's behalf. So this check is performed at the route level instead, against
+    `ExecutionPlan.frame_types`.
 
     Raises `ShapeError` (-> 400 via `api.boundary`) rather than deferring to `sink.
     sink_vector_tile`'s own `None` return: that function cannot tell "this grid genuinely

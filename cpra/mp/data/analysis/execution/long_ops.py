@@ -6,16 +6,10 @@ and returning a new `LongFrame` rather than mutating anything.
 it once per op, in declared order; none of them knows about the walk, the plan, or any
 other op -- see that module's docstring for the dispatch itself.
 
-**Why the Polars here is written out rather than called.** The equivalent logic exists
-today in `analysis/base.py` and `analysis/vector.py`, and calling it from here would be
-the shorter diff. Those two modules are the orchestration this package REPLACES, though --
-they are slated for deletion once the old engine's routes are gone -- so importing them
-would make the replacement depend on the thing it replaces, and the deletion would take
-these lowerings down with it. Carrying the logic over instead is the same move the
-migration makes for every other piece of numerically fussy leaf code: the old copies keep
-serving the old engine until it goes, and this copy is the one that survives. The bodies
-below are deliberately faithful to the originals rather than improved in passing;
-rewriting them would re-derive bugs that were expensive to find the first time.
+**Why the Polars here is written out rather than delegated.** These bodies are
+deliberately faithful carry-overs of numerically fussy leaf logic that predates this
+package, rather than improvements made in passing; rewriting them would re-derive bugs
+that were expensive to find the first time.
 
 `project` has no long-shape entry here on purpose: `project` is the one op that CHANGES
 shape (`request.ops.PROJECT_LOWERING_TABLE`), so it has no single-shape lowering the way

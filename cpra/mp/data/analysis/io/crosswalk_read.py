@@ -56,9 +56,7 @@ def read_vector_crosswalk(src_grid: str, dst_grid: str) -> pl.LazyFrame:
     capture the production default at import time and never see the patch.
 
     Raises `request.errors.NotFoundError` if no artifact exists for this exact pair --
-    the vector-to-vector counterpart of the old flat API's `AnalysisError("No crosswalk
-    from ... to ...")`, in this module's own exception family instead, since nothing under
-    `request/`/`io/`/`execution/` may raise the legacy `analysis.base.AnalysisError`.
+    this package's own exception family, which `api/boundary.py` maps to 404.
     """
     path = config.CROSSWALKS_PATH / f"{src_grid}__{dst_grid}.parquet"
     if not path.exists():

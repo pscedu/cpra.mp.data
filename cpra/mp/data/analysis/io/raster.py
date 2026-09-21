@@ -49,14 +49,13 @@ masked UNCONDITIONALLY, regardless of `mask_nodata`. A band with no declared NoD
 NoData at all, the same convention the old per-file scan used.
 
 **Batching.** Reads are chunked through `io/raster_io.py`'s `batched_windows`/
-`raster_blocks_per_batch`, the same block-row-chunked budget the old scan used, so a
-request over a large raster does not pull the whole window into memory as one array. Each
+`raster_blocks_per_batch`, a block-row-chunked budget, so a request over a large raster
+does not pull the whole window into memory as one array. Each
 batch reopens the VRT from its own in-memory bytes rather than holding a dataset handle
 open across a `yield`: Polars' streaming engine may resume this generator's `source`
 callback from a different thread than the one that entered it, and both `rio.Env` and
 rasterio dataset handles are thread-local, so nothing opened before a `yield` may be
-assumed valid after it (see `sources.py`'s identical discipline and its docstring for the
-measurement behind it).
+assumed valid after it.
 
 `window`, when given, restricts the scan to that single `rasterio.windows.Window` read
 whole, in one batch, rather than tiling the full raster -- a caller specific enough to name
@@ -94,9 +93,7 @@ from cpra.mp.data.raster import vrt
 
 __all__ = ["scan_raster"]
 
-# Mirrors `sources.py`'s identical dict -- duplicated rather than imported because
-# `sources.py` is delete-tier for this scan (it belongs to the old engine, kept in place
-# only until that engine is retired) and this module may not depend on it.
+# numpy dtype name -> the Polars dtype a band of that raster reads back as.
 NUMPY_TO_POLARS = {
     "int8": pl.Int8,
     "uint8": pl.UInt8,

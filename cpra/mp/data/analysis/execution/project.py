@@ -10,23 +10,22 @@ either.
 long frame's rows, re-addressed from `op.input`'s grid onto `op.to` via a crosswalk join,
 then re-collapsed one row per (dimensions, destination cell) with `op.aggregate`.
 
-**Why the join mechanics below read like `analysis/vector.py::apply_project`.** They are
-the same join, deliberately: `lf.join(crosswalk_lf, left_on="grid_cell",
-right_on="src_id", how="inner")`, and then `pl.col("dst_id").alias("grid_cell")` to
-re-address the result. That mechanic carries no numeric decision of its own -- it is just
-how a crosswalk join is expressed in Polars -- and carrying it over rather than re-deriving it is the same
-move `execution/long_ops.py` makes for its own four lowerings.
+**The join mechanic itself is the conventional one**, deliberately:
+`lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")`, and then
+`pl.col("dst_id").alias("grid_cell")` to re-address the result. That mechanic carries no
+numeric decision of its own -- it is just how a crosswalk join is expressed in Polars.
 
-**What is NOT carried over, on purpose: the per-aggregate weighting.** The old engine
-multiplies `value` by `scale_factor` before every aggregate except `count_by_value`, and
-groups afterward -- which is only correct for `sum`. `min`/`max`/`count` do not describe
+**Where this deliberately departs from how the crosswalk join was long done here: the
+per-aggregate weighting.** The long-standing implementation multiplies `value` by
+`scale_factor` before every aggregate except `count_by_value`, and groups afterward --
+which is only correct for `sum`. `min`/`max`/`count` do not describe
 a per-unit-area rate, so scaling the values first changes the ANSWER, not just the
 mechanism: a source cell contributing `scale_factor=0.1` to a destination has one full
 `value` in that destination's group, not `0.1 * value`, and `min`/`max`/`count` should see
 it that way. This is the one place a fresh implementation was required rather than a
-faithful copy, and it does change results relative to the old engine for a project whose
-crosswalk has any row with `scale_factor != 1.0` and an aggregate other than `sum`. The
-five treatments, by aggregate:
+faithful copy, and it does change results for a project whose crosswalk has any row with
+`scale_factor != 1.0` and an aggregate other than `sum`. The five treatments, by
+aggregate:
 
 - **`sum`**: weighted -- `sum(value * scale_factor)`, the allocated total.
 - **`mean`**: weighted, but not the naive `sum(value * scale_factor) / sum(scale_factor)`
@@ -305,14 +304,13 @@ def _finalize_mean(lf: pl.LazyFrame) -> pl.LazyFrame:
 def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list[str], max_distinct: int) -> pl.LazyFrame:
     """The unbatched `count_by_value` lowering: one row per (dimensions, destination
     cell, distinct `value`), with the distinct value in `value_category` and its count in
-    `value` -- a deliberately different schema from the old flat API's
+    `value` -- a deliberately different schema from
     `request.expressions.count_by_value_frame` (which keeps the counted column's own name
     and calls the count `count`), because that schema drops null `value`s before both the
     cardinality probe and the grouped count, where this one keeps null as its own
     category: a destination whose only contributing cells are nodata should say so (one
-    row, `value_category=null`), not vanish from the result. That old function stays
-    exactly as it was -- it still serves the old engine's own `summarize` path, which
-    expects its schema -- and is not reused or modified here.
+    row, `value_category=null`), not vanish from the result. That function is left alone
+    rather than reused or modified here.
 
     The probe runs on `lf`'s OWN `value` column, before the crosswalk join -- the join can
     only drop rows (a source cell overlapping no destination) or duplicate a row's already-

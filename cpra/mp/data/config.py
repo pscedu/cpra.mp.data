@@ -82,10 +82,10 @@ RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_
 RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))
 
 # Target size, in MB, for one summarize-loop batch's read buffer (n_bands x block_height x
-# batch_width x itemsize -- see api.utils.raster_blocks_per_batch and
-# api.sources.scan_rasters, the Polars IO-plugin implementation of the raster zonal
-# summarize path -- RasterGridAnalysis._apply_transform_params_impl is its caller). This is a
-# separate budget from RASTER_CACHE_MAX_MB (GDAL's own block cache): capping only GDAL's
+# batch_width x itemsize -- see analysis.io.raster_io.raster_blocks_per_batch, which turns
+# this budget into a block count, and analysis.io.raster.scan_raster, the Polars IO-plugin
+# raster read that batches by it). This is a separate budget from RASTER_CACHE_MAX_MB
+# (GDAL's own block cache): capping only GDAL's
 # cache still leaves the batch's own NumPy buffer free to grow with a block row's full
 # width regardless of how many bands or blocks are requested, which is exactly the defect
 # this budget fixes.

@@ -1,7 +1,17 @@
+"""The pydantic models a caller's flat parameters arrive as, built structurally off the
+live `cpra.mp.data.dimensions` table rather than typed out by hand: `DatasetDimensions`
+(which dataset), `FilterDimensions` (which slice of it), and `DataOptions`/`Options` (what
+to do with the result). `api/models.py` subclasses these for the HTTP query surface, and
+`request/data_query.py` turns the triple into a `request.pipeline.Pipeline`.
+
+These are a sibling of `request/types.py`, not a layer above it: that module owns the
+closed enum vocabularies (`AggregateFunction`, the grid/variable/time-unit types) and this
+one owns the field sets those vocabularies type.
+"""
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from cpra.mp.data.analysis.types import (
+from cpra.mp.data.analysis.request.types import (
     AggregateFunction,
     VectorGrid,
     dimension_type,
@@ -44,10 +54,7 @@ class CalculateEntry(BaseModel):
     the expression applies to everything). Rows not matching `where` pass through the
     calculate stage unchanged -- calculate never drops or masks data.
 
-    This is the planner's lowering target -- `analyses/*.py` pipelines and the library
-    surface (`create_analysis`/`analyze_data`) build these directly as
-    `calculate=[{"expression": ..., "where": ...}, ...]`. Entries apply sequentially in
-    list order -- entry N+1 sees entry N's output.
+    Entries apply sequentially in list order -- entry N+1 sees entry N's output.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -96,13 +103,10 @@ class DataOptions(BaseModel):
 
 
 class Options(DataOptions):
-    """`DataOptions` plus the fields that describe how a compiled pipeline *executes*:
+    """`DataOptions` plus the fields that describe how a request *executes*:
     `group_by`/`group_aggregate`/`summarize_*` collapse or transform rows, and
-    `calculate` rewrites `value` -- all lowered onto this class by `planner.py` (see
-    `analyses/*.py`) and consumed by `BaseAnalysis`. These are internal to the engine:
-    not reachable as flat HTTP query parameters on the data endpoints (which
-    accept only `DataOptions`'s fields) -- a named analysis's own request parameters are
-    validated separately and lowered into these fields by the planner instead.
+    `calculate` rewrites `value`. These are internal: not reachable as flat HTTP query
+    parameters on the data endpoints, which accept only `DataOptions`'s fields.
     """
 
     group_by: str | None = None
@@ -111,60 +115,3 @@ class Options(DataOptions):
     summarize_aggregate: AggregateFunction | None = None
     summarize_grid_cell: str | None = None
     calculate: list[CalculateEntry] | None = None
-
-
-def normalize_analysis_params(*, variable=None, time_unit=None, grid=None, **params):
-    """Normalize `create_analysis`'s plain-value keyword surface into the validated
-    `DatasetDimensions`/`FilterDimensions`/`Options` triple `BaseAnalysis` subclasses take
-    internally. This split -- plain values in, three pydantic objects out -- is an
-    internal implementation detail; the objects themselves are not the public contract
-    (see `analysis/__init__.py`'s module docstring).
-
-    `variable`/`time_unit`/`grid` select the dataset (all three required, the same as
-    `DatasetDimensions`). Every other keyword in `params` is either a dimension filter
-    (`scenario_id`, `calendar_year`, ...) -- accepted as a scalar (`scenario_id=7`) or a
-    list (`scenario_id=[7, 8]`), a scalar being wrapped into a single-element list since
-    `FilterDimensions` fields are always `list[...] | None` underneath -- or an `Options`
-    field under its existing name (`where=`, `group_by=`, `group_aggregate=`,
-    `grid_cell=`, ...), passed through as-is. An unrecognized keyword, or a missing
-    `variable`/`time_unit`/`grid`, raises `AnalysisError` naming the problem and (for an
-    unrecognized keyword) listing every valid dimension filter and option name, so a typo
-    fails loudly instead of silently doing nothing.
-    """
-    from cpra.mp.data.analysis.base import AnalysisError
-
-    missing = [name for name, value in (("variable", variable), ("time_unit", time_unit), ("grid", grid)) if value is None]
-    if missing:
-        raise AnalysisError(
-            f"create_analysis() missing required argument(s): {', '.join(missing)}", status_code=400
-        )
-
-    filter_names = set(BaseFilterDimensions.model_fields)
-    option_names = set(Options.model_fields)
-
-    filter_kwargs = {}
-    option_kwargs = {}
-    unknown = []
-    for name, value in params.items():
-        if name in filter_names:
-            filter_kwargs[name] = list(value) if isinstance(value, (list, tuple)) else [value]
-        elif name in option_names:
-            option_kwargs[name] = value
-        else:
-            unknown.append(name)
-
-    if unknown:
-        valid = ", ".join(sorted({"variable", "time_unit", "grid"} | filter_names | option_names))
-        raise AnalysisError(
-            f"create_analysis() got unexpected keyword argument(s): {', '.join(sorted(unknown))}. "
-            f"Valid parameters are: {valid}.",
-            status_code=400,
-        )
-
-    return (
-        DatasetDimensions(variable=variable, time_unit=time_unit, grid=grid),
-        FilterDimensions(**filter_kwargs),
-        Options(**option_kwargs),
-    )
-
-

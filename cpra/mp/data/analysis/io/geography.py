@@ -8,19 +8,14 @@ declared extent -- no file is opened to answer a raster coordinate lookup).
 `resolve_raster_point_labels`/`relabel_raster_grid_cell` are the raster-only pair that
 additionally relabels an executed raster point query's output back to the caller's own
 coordinate strings, which a vector `grid_cell` query never needs (it reports the polygon id
-itself -- see `analysis.vector.apply_grid_cell_selection`'s docstring on the asymmetry).
+itself -- see `resolve_raster_point_labels`'s docstring on the asymmetry).
 
-Formerly `api/geography.py`; moved here because `vector.apply_grid_cell_selection`
-(called by `VectorGridAnalysis.apply_steps`'s terminal `grid_cell` filter) resolves
-`grid_cell` coordinates through this module directly, and `cpra.mp.data.analysis` may not
-import FastAPI (see this package's other modules, and
-`tests/api/test_analysis_boundary.py`) -- so every `HTTPException` the OLD-engine-facing
-functions here used to raise is an `AnalysisError` instead. The raster functions are NEW-
-engine code with no old-engine counterpart to match, so they raise from `request.errors`
-instead -- see `resolve_raster_pixel`'s own docstring. Both families of function still
-share `parse_coordinate_pairs`/`project_coordinates` below, which keep raising
-`AnalysisError` for a bad/unprojectable coordinate regardless of which grid kind is asking,
-since that failure is decided before either grid kind's own lookup ever begins.
+Formerly `api/geography.py`; moved here because `cpra.mp.data.analysis` may not import
+FastAPI (see this package's other modules, and `tests/api/test_analysis_boundary.py`), so
+nothing here raises an `HTTPException`. Every rejection is a `request.errors.RequestError`
+member instead, which `api/boundary.py` maps to a status code at exactly one place: a
+malformed or unprojectable coordinate and a missing geometry file are `RequestError`
+itself (400), and a grid name that is not a raster grid is `NotFoundError` (404).
 """
 
 import asyncio
@@ -38,8 +33,7 @@ from rasterio.warp import transform, transform_bounds
 from shapely.geometry import Point
 
 from cpra.mp.data import config
-from cpra.mp.data.analysis.base import AnalysisError
-from cpra.mp.data.analysis.request.errors import NotFoundError
+from cpra.mp.data.analysis.request.errors import NotFoundError, RequestError
 from cpra.mp.data.grids import GRIDS
 
 
@@ -54,10 +48,10 @@ def parse_coordinate_pairs(values):
     try:
         coords = [float(value) for value in values]
     except ValueError:
-        raise AnalysisError("grid_cell contains non-numeric coordinates", status_code=400)
+        raise RequestError("grid_cell contains non-numeric coordinates")
 
     if len(coords) % 2:
-        raise AnalysisError("grid_cell contain an even number of coordinates", status_code=400)
+        raise RequestError("grid_cell contain an even number of coordinates")
 
     lngs = []
     lats = []
@@ -65,7 +59,7 @@ def parse_coordinate_pairs(values):
         lng, lat = coords[start_idx : start_idx + 2]
         if not -180 <= lng <= 180 or not -90 <= lat <= 90:
             msg = f"grid_cell contains invalid coordinate pair: {lng}, {lat}"
-            raise AnalysisError(msg, status_code=400)
+            raise RequestError(msg)
         lngs.append(lng)
         lats.append(lat)
 
@@ -86,7 +80,7 @@ def project_coordinates(lngs: list[float], lats: list[float], dst_crs) -> tuple[
     except CPLE_BaseError:
         pairs = [f"{lng}, {lat}" for lng, lat in zip(lngs, lats) if _is_unprojectable(lng, lat, dst_crs)]
         msg = f"grid_cell contains coordinate pairs outside the grid's projection: {'; '.join(pairs)}"
-        raise AnalysisError(msg, status_code=400)
+        raise RequestError(msg)
 
     return list(xs), list(ys)
 
@@ -121,7 +115,7 @@ def _geometry_path(grid_name: str):
     """Locate a vector grid's geometry file, reporting a missing one as a 400."""
     fgb_path = config.GRIDS_PATH / f"{grid_name}.fgb"
     if not fgb_path.exists():
-        raise AnalysisError(f"No geometry file for grid: {grid_name}", status_code=400)
+        raise RequestError(f"No geometry file for grid: {grid_name}")
     return fgb_path
 
 
@@ -207,10 +201,11 @@ def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -
     lookup needs (`bounds`, `height`, `width`, `crs`) -- the same "the grid's own geometry
     is enough, no raster need be opened" property `io.raster_io.raster_grid_geometry` and
     `execution.plan.compile_plan` already rely on for a raster origin's window/extent (only
-    resolving which BANDS exist touches the catalog). `NotFoundError` (this module's NEW
-    family, not `AnalysisError` -- see the module docstring) is raised for a name that
-    isn't a raster grid at all, the raster-side counterpart of `_geometry_path`'s missing-
-    file 400 for a vector grid.
+    resolving which BANDS exist touches the catalog). `NotFoundError` -- a 404, unlike the
+    plain `RequestError` every other rejection here raises -- is used for a name that isn't
+    a raster grid at all: nothing about the request is malformed, the thing it named simply
+    does not exist. Contrast `_geometry_path`'s missing-file 400 on the vector side, which
+    is a real grid whose geometry artifact has not been built.
     """
     grid = GRIDS.get(grid_name)
     if grid is None or grid.grid_type != "raster":
@@ -283,17 +278,16 @@ def resolve_raster_point_labels(grid_name: str, tokens: list[str]) -> dict[int, 
 
     Each returned map value is that point's own two tokens rejoined with a literal comma --
     `f"{lng_token},{lat_token}"` -- never a value round-tripped through `float()` and back.
-    This is a deliberate departure from the OLD engine's raster point-query convention
-    (`analysis.raster`'s `column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]`,
-    which reformats e.g. `"-90.10"` down to `"-90.1"`): a caller joining the response back
-    to its own request needs the EXACT string it sent, not a value that has been through a
-    float and back. A caller that names the same point twice, or two points that resolve to
+    This is a deliberate departure from the long-standing raster point-query convention
+    of relabeling columns as `f"{x!s},{y!s}"` over the PARSED floats, which reformats e.g.
+    `"-90.10"` down to `"-90.1"`: a caller joining the response back to its own request
+    needs the EXACT string it sent, not a value that has been through a float and back. A caller that names the same point twice, or two points that resolve to
     the same pixel, gets both of their original label strings back in that one id's list --
     `relabel_raster_grid_cell` fans them back out into one row apiece. Nothing here
-    deduplicates by pixel the way `analysis.vector.apply_grid_cell_selection` deliberately
-    does for a vector grid's ID-labeled output (see that function's own docstring): the
-    raster convention this mirrors was never ID-labeled to begin with, so there is no
-    id-level dedup to preserve going into it.
+    deduplicates by pixel the way a vector grid's ID-labeled output does, where two
+    coordinates landing in the same polygon collapse to that one id: the raster
+    convention this mirrors was never ID-labeled to begin with, so there is no id-level
+    dedup to preserve going into it.
 
     A token pair that resolves to no pixel at all (`resolve_raster_pixel`'s own `None`, for
     a point outside `grid_name`'s raster extent) is simply ABSENT from the returned map --

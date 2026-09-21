@@ -5,10 +5,10 @@ and therefore cannot live under `request/` (see that module's docstring, and
 `tests/api/test_analysis_layering.py`).
 
 `build_data_query` is what the three `/v1/datasets/{variable}/{time_unit}/{grid}/...`
-routes call instead of the old engine's `create_analysis`: it resolves `grid_cell`, hands
-the resulting conjunct to `build_data_query_pipeline`, and returns the `Pipeline` together
-with the two extras a route needs to plumb into its response but cannot recover from the
-pipeline alone.
+routes call to turn their flat query parameters into a `Pipeline`: it resolves
+`grid_cell`, hands the resulting conjunct to `build_data_query_pipeline`, and returns the
+`Pipeline` together with the two extras a route needs to plumb into its response but
+cannot recover from the pipeline alone.
 
 **Why `grid_cell` resolution is grid-kind-dependent, and exactly how.** The two grid kinds
 have always disagreed about what a `grid_cell` value MEANS, and this module reproduces that
@@ -17,16 +17,16 @@ select:
 
 - A VECTOR grid accepts either form. Every token a plain (unsigned, non-decimal) digit
   string means literal polygon ids; anything else is parsed as coordinate pairs and
-  resolved by point-in-polygon lookup. That is `analysis.vector.apply_grid_cell_selection`'s
-  own rule, kept token-for-token. The digit case is not resolved here at all -- it is left
-  to `build_data_query_pipeline`'s own `_grid_cell_conjunct`, so "these are literal ids"
-  has exactly one implementation.
-- A RASTER grid accepts ONLY coordinates, with no digit check of any kind:
-  `analysis.raster.sample_band_ops_to_long` calls `parse_coordinate_pairs` on the raw
-  tokens unconditionally, so `grid_cell=1,2` on a raster has always meant the point at
-  lng=1, lat=2 -- a degenerate coordinate pair, not pixel id 1 and pixel id 2. Reading
-  digits as pixel ids here (as a vector grid would) would reinterpret such a URL rather
-  than merely extend it, so the raster branch resolves every value as a coordinate.
+  resolved by point-in-polygon lookup. That rule is kept token-for-token from the flat
+  routes' long-standing behavior. The digit case is not resolved here at all -- it is
+  left to `request.data_query.grid_cell_conjunct`, so "these are literal ids" has exactly
+  one implementation.
+- A RASTER grid accepts ONLY coordinates, with no digit check of any kind: the raw tokens
+  go straight to `parse_coordinate_pairs`, so `grid_cell=1,2` on a raster has always
+  meant the point at lng=1, lat=2 -- a degenerate coordinate pair, not pixel id 1 and
+  pixel id 2. Reading digits as pixel ids here (as a vector grid would) would reinterpret
+  such a URL rather than merely extend it, so the raster branch resolves every value as a
+  coordinate.
 
 A pipeline request (`/v1/analysis...`) is the place to name raster pixel ids directly: a
 `filter` step's `where` takes the absolute `grid_cell` ids `io.geography.
@@ -50,6 +50,7 @@ from cpra.mp.data.analysis.io.geography import (
     parse_coordinate_pairs,
     resolve_raster_point_labels,
     resolve_vector_grid_cell,
+    resolve_vector_grid_cell_sync,
 )
 from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import NotFoundError
@@ -83,19 +84,24 @@ class ResolvedDataQuery(NamedTuple):
     float_precision: int | None
 
 
-async def resolve_grid_cell(grid_name: str, grid_cell: str | None):
-    """Resolve a flat route's raw `grid_cell` query value against `grid_name`'s geometry,
-    returning `(grid_cell_where, relabel)` for `build_data_query_pipeline`/`run_to_path` --
-    see this module's docstring for the per-grid-kind rules this implements.
+class _VectorPoints(NamedTuple):
+    """The one case `_resolve_without_geometry` below cannot finish on its own: WGS84
+    pairs still needing a point-in-polygon lookup, which is the only part of `grid_cell`
+    resolution that differs between the async and sync forms.
+    """
 
-    A `grid_cell_where` of `None` means "this function resolved nothing; leave
-    `options.grid_cell` to `build_data_query_pipeline`" -- returned both when the caller
-    set no `grid_cell` at all and for a vector grid's digit-id form, which that function
-    already handles and which nothing here could improve on.
+    lngs: list[float]
+    lats: list[float]
 
-    Async only for the vector branch: `resolve_vector_grid_cell` runs one windowed
-    FlatGeoBuf read per point in an executor. The raster branch opens no file at all
-    (`io.geography.resolve_raster_pixel`) and is synchronous inside this coroutine.
+
+def _resolve_without_geometry(grid_name: str, grid_cell: str | None):
+    """Everything both `resolve_grid_cell` forms below share: the two "nothing to resolve"
+    early outs, the unknown-grid 404, and the whole raster branch -- which opens no file
+    (`io.geography.resolve_raster_pixel` works off the grid's declared transform alone)
+    and so needs no async form.
+
+    Returns the finished `(grid_cell_where, relabel)` pair, or a `_VectorPoints` when a
+    polygon lookup is still owed.
     """
     if not grid_cell:
         return None, None
@@ -113,9 +119,56 @@ async def resolve_grid_cell(grid_name: str, grid_cell: str | None):
     if all(token.isdigit() for token in tokens):
         return None, None
 
-    lngs, lats = parse_coordinate_pairs(tokens)
-    resolved = await resolve_vector_grid_cell(grid_name, lngs, lats)
+    return _VectorPoints(*parse_coordinate_pairs(tokens))
+
+
+def _vector_point_where(resolved: list[int | None]):
+    """A `(grid_cell_where, relabel)` pair from a vector point lookup's ids. `relabel` is
+    always `None`: a vector result is keyed by polygon id, which is what the caller asked
+    about -- only a raster's synthetic pixel ids need renaming back to coordinates.
+    """
     return grid_cell_id_where([cell_id for cell_id in resolved if cell_id is not None]), None
+
+
+async def resolve_grid_cell(grid_name: str, grid_cell: str | None):
+    """Resolve a flat route's raw `grid_cell` query value against `grid_name`'s geometry,
+    returning `(grid_cell_where, relabel)` for `build_data_query_pipeline`/`run_to_path` --
+    see this module's docstring for the per-grid-kind rules this implements.
+
+    A `grid_cell_where` of `None` means "this function resolved nothing; leave
+    `options.grid_cell` to `build_data_query_pipeline`" -- returned both when the caller
+    set no `grid_cell` at all and for a vector grid's digit-id form, which that function
+    already handles and which nothing here could improve on.
+
+    Async only for the vector branch: `resolve_vector_grid_cell` runs one windowed
+    FlatGeoBuf read per point in an executor.
+    """
+    resolved = _resolve_without_geometry(grid_name, grid_cell)
+    if not isinstance(resolved, _VectorPoints):
+        return resolved
+
+    return _vector_point_where(
+        await resolve_vector_grid_cell(grid_name, resolved.lngs, resolved.lats)
+    )
+
+
+def resolve_grid_cell_sync(grid_name: str, grid_cell: str | None):
+    """Blocking form of `resolve_grid_cell`, for a caller outside the event loop.
+
+    A visualization builds its spec from synchronous cached properties but still has to
+    resolve a coordinate selection before it can hand the result to
+    `analyses.resolve_analysis(grid_cell_where=...)` -- the registry cannot do it itself
+    (resolving a coordinate needs `io/`, which nothing under `request/` or in `analyses/`
+    may import), and there is no event loop to await the form above on. Same trade
+    `io.geography.resolve_vector_grid_cell_sync` exists for, one layer down.
+    """
+    resolved = _resolve_without_geometry(grid_name, grid_cell)
+    if not isinstance(resolved, _VectorPoints):
+        return resolved
+
+    return _vector_point_where(
+        resolve_vector_grid_cell_sync(grid_name, resolved.lngs, resolved.lats)
+    )
 
 
 async def build_data_query(

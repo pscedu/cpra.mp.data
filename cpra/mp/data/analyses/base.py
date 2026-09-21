@@ -10,10 +10,9 @@ Mirrors `cpra.mp.data.visualizations.base`'s conventions where they overlap (a n
 since it is validated directly from raw request-shaped values) -- see that module and
 `cpra/mp/data/visualizations/stacked_bar.py`'s `Meta` for the pattern being followed.
 
-Like `cpra.mp.data.analysis.pipeline`/`planner`, nothing here imports FastAPI: every
-exception is a plain `ValueError` subclass, and the API layer (owned by a different,
-concurrent change -- see `cpra/mp/data/api/utils.py`'s `get_analysis_class`) is
-responsible for translating it to a status code.
+Like `cpra.mp.data.analysis.request`, nothing here imports FastAPI: every exception is a
+plain `ValueError` subclass, and `cpra/mp/data/api/boundary.py` -- which owns the one
+type-to-status table -- is responsible for translating it to a status code.
 """
 
 from __future__ import annotations
@@ -23,18 +22,26 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
-from cpra.mp.data.analysis.pipeline import GroupStep, Pipeline
+from cpra.mp.data.analysis.request.data_query import grid_cell_conjunct
+from cpra.mp.data.analysis.request.expressions import split_top_level_and
+from cpra.mp.data.analysis.request.pipeline import GroupStep, Pipeline
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
+
+# The two keys `resolve_analysis`'s `filters` mapping may carry that are NOT dimension
+# filters: a `grid_cell` selection and a caller-written `where`. Both are spatial/value
+# conditions on the data rather than parts of the dataset selection, so both are composed
+# into the leading `filter` step by `selection_filter_where` below rather than rejected as
+# unrecognized dimension names.
+RESERVED_FILTER_KEYS = frozenset({"grid_cell", "where"})
 
 
 class AnalysisRegistryError(ValueError):
     """Base for every error `cpra.mp.data.analyses.resolve_analysis` raises -- an
-    ordinary `ValueError` subclass, in the same family as `analysis.pipeline.PipelineError`
-    and `analysis.base.AnalysisError`, never `HTTPException`. `resolve_analysis` itself
-    never lets a bare `PipelineError` escape (see its docstring): every rejection reaching
-    a caller is one of this family's three subclasses below, which is also the family the
-    API route layer's `get_analysis_class` (see `api/utils.py`) is written to expect.
+    ordinary `ValueError` subclass, in the same family as
+    `analysis.request.errors.RequestError`, never `HTTPException`. `resolve_analysis`
+    itself never lets a bare `RequestError` escape (see its docstring): every rejection
+    reaching a caller is one of this family's three subclasses below.
     """
 
 
@@ -65,7 +72,7 @@ class AnalysisTypeMismatchError(AnalysisRegistryError):
 class DatasetRef:
     """The three dataset-selection dimensions a `type="dataset"` analysis is resolved
     against -- exactly the `variable`/`time_unit`/`grid` triple every flat data endpoint
-    and every `analysis.pipeline.InputSelection` already takes. `None` for a
+    and every `analysis.request.pipeline.InputSelection` already takes. `None` for a
     `type="custom"` analysis (see `resolve_analysis`), since a custom analysis's inputs
     are hardcoded in its own `pipeline()` method, not supplied by the route.
     """
@@ -81,8 +88,7 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
     and any variable-specific `required_dimensions` (`aggregate_type`, `ffibs_type`, ...).
     Pure/in-memory: `get_input_data_frame` only cross-joins tiny literal `pl.DataFrame`s
     and never reads a file, so this needs no `base_path` -- the same pattern
-    `analysis.planner._check_input_dimensions` and
-    `visualizations.base.get_data_uri` already use. Used to build a `difference`/
+    `visualizations.base.get_data_uri` already uses. Used to build a `difference`/
     `concatenate` pipeline's trailing `group.by` (every required dimension except the one
     the analysis operates over), and by `default_collapsed_dimensions` below.
     """
@@ -94,13 +100,12 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
 
 
 def is_filterable_dimension(name: str) -> bool:
-    """Is `name` a real dimension a pipeline's `InputSelection`/`filter`/`calculate` may
-    reference -- i.e. neither `dataset`-typed (`variable`/`time_unit`/`grid` themselves,
-    which are structural, not filters) nor `metadata`-typed. Mirrors
-    `analysis.planner._check_input_dimensions`'s `FilterDimensions.model_fields` check,
-    but only needs `DIMENSIONS` directly here since there is no per-dataset question yet
-    (a `Parameters.dimension` field is validated before any `DatasetRef` filtering
-    question even applies).
+    """Is `name` a real dimension a pipeline's `filter`/`calculate` `where` may reference
+    -- i.e. neither `dataset`-typed (`variable`/`time_unit`/`grid` themselves, which
+    select the input rather than filter it) nor `metadata`-typed. Mirrors
+    `request.parameters.BaseFilterDimensions`'s own field set, but reads `DIMENSIONS`
+    directly since there is no per-dataset question yet (a `Parameters.dimension` field is
+    validated before any `DatasetRef` filtering question even applies).
     """
     dim = DIMENSIONS.get(name)
     return dim is not None and dim.type not in ("dataset", "metadata")
@@ -109,8 +114,8 @@ def is_filterable_dimension(name: str) -> bool:
 def cast_dimension_value(dimension: str, value: Any) -> Any:
     """Cast `value` to `dimension`'s own storage dtype (`Dimension.cast`), so a raw
     request value -- which may arrive as a string regardless of the dimension's real type
-    (see `analysis.pipeline.pipeline_from_query`'s "a query value is always a string"
-    note) -- compares and sorts correctly (e.g. `calendar_year` values `["2040", "9"]`
+    (see `analysis.request.pipeline.pipeline_from_query`'s "a query value is always a
+    string" note) -- compares and sorts correctly (e.g. `calendar_year` values `["2040", "9"]`
     must sort as the integers `9 < 2040`, not lexically). Falls back to the raw value for
     a name `DIMENSIONS` doesn't recognize (`Parameters` field validation already rejects
     that case before this is ever called on it -- see `is_filterable_dimension`).
@@ -151,20 +156,82 @@ def format_dimension_literal(dimension: str, value: Any) -> str:
     return f"'{escaped}'"
 
 
-def dataset_input_selection(dataset: DatasetRef, filters: dict[str, Any]) -> dict[str, Any]:
-    """Build the `InputSelection`-shaped dict for `dataset`'s single pipeline input,
-    folding `filters` (dimension filters, plus an optional reserved `grid_cell` key -- see
-    the `resolve_analysis` contract) onto it exactly as given. Shared by `difference.py`/
-    `concatenate.py`, the two single-input (`type="dataset"`) entries.
+def dataset_input_selection(dataset: DatasetRef) -> dict[str, Any]:
+    """Build the `InputSelection`-shaped dict for `dataset`'s single pipeline input: the
+    `variable`/`time_unit`/`grid` triple and nothing else. An `InputSelection` selects
+    WHICH dataset to read and carries no filtering of any kind (it is `extra="forbid"`, so
+    a dimension name folded in here is a hard rejection, not a silently-ignored key) --
+    a caller's dimension filters become a `filter` STEP instead, via
+    `selection_filter_where` below. Shared by `difference.py`/`concatenate.py`, the two
+    single-input (`type="dataset"`) entries.
     """
-    selection: dict[str, Any] = {
+    return {
         "variable": dataset.variable,
         "time_unit": dataset.time_unit,
         "grid": dataset.grid,
     }
-    for key, value in filters.items():
-        selection[key] = value
-    return selection
+
+
+def selection_filter_where(
+    filters: dict[str, Any], *, grid_cell_where: str | None = None
+) -> str | None:
+    """Compose `filters` into the single `where` string a leading `filter` step takes, or
+    `None` when there is nothing to filter on. This is the named-analysis counterpart of
+    `request.data_query.build_data_query_pipeline`'s own conjunct assembly, and composes
+    the same three ingredients in the same order:
+
+    1. one conjunct per DIMENSION key -- `dim = lit` for a single selected value,
+       `dim IN (lit, ...)` for several, rendered by `format_dimension_literal` and
+       normalized by `normalized_filter_values` so the two never disagree about how many
+       distinct values were selected. Iterated in SORTED key order, so the composed string
+       does not depend on (or silently change with) the caller's dict ordering;
+    2. the spatial conjunct: `grid_cell_where` verbatim when given (a caller that had to
+       resolve coordinates to IDs, which needs `io/`, passes the resolved conjunct in the
+       same way `build_data_query_pipeline` takes it), otherwise
+       `request.data_query.grid_cell_conjunct(filters["grid_cell"])` for the digit-ID case
+       -- one definition of the digit-ID rule, shared rather than re-spelled here;
+    3. each top-level conjunct of a caller's own `where`, split by
+       `expressions.split_top_level_and` and parenthesized INDIVIDUALLY. Splitting first
+       is what keeps the parens from hiding the top-level `AND` seam the engine classifies
+       each conjunct's kind against -- see `build_data_query_pipeline`'s docstring for the
+       full argument; the reasoning is identical here.
+
+    Any key that is neither a filterable dimension (`is_filterable_dimension`) nor one of
+    `RESERVED_FILTER_KEYS` raises `InvalidAnalysisParametersError` naming it, so a typo
+    fails loudly instead of quietly filtering nothing.
+    """
+    conjuncts: list[str] = []
+
+    unknown = [
+        key
+        for key in filters
+        if key not in RESERVED_FILTER_KEYS and not is_filterable_dimension(key)
+    ]
+    if unknown:
+        raise InvalidAnalysisParametersError(
+            f"unrecognized filter name(s): {', '.join(sorted(unknown))} -- expected a "
+            f"filterable dimension or one of {', '.join(sorted(RESERVED_FILTER_KEYS))}"
+        )
+
+    for name in sorted(key for key in filters if key not in RESERVED_FILTER_KEYS):
+        values = normalized_filter_values(name, filters[name])
+        if not values:
+            continue
+        literals = [format_dimension_literal(name, value) for value in values]
+        if len(literals) == 1:
+            conjuncts.append(f"{name} = {literals[0]}")
+        else:
+            conjuncts.append(f"{name} IN ({', '.join(literals)})")
+
+    if grid_cell_where is not None:
+        conjuncts.append(grid_cell_where)
+    elif filters.get("grid_cell"):
+        conjuncts.append(grid_cell_conjunct(str(filters["grid_cell"])))
+
+    if filters.get("where"):
+        conjuncts.extend(f"({conjunct})" for conjunct in split_top_level_and(filters["where"]))
+
+    return " AND ".join(conjuncts) if conjuncts else None
 
 
 def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
@@ -198,7 +265,7 @@ class AnalysisParameters(BaseModel):
     """Base for every analysis's nested `Parameters` model -- `extra="forbid"` so an
     unrecognized parameter name 400s explicitly rather than being silently ignored,
     matching this codebase's general pydantic convention (see e.g.
-    `analysis.pipeline.InputSelection`/`Pipeline`, though those use `extra="allow"`/
+    `analysis.request.pipeline.InputSelection`/`Pipeline`, though those use `extra="allow"`/
     `"forbid"` for their own, different reasons; a `Parameters` model has no reason to
     accept a name it doesn't declare).
     """
@@ -215,11 +282,11 @@ class Analysis:
       (`"value"`, `"difference"`, or `"category"`);
     - a nested `Parameters` (a pydantic model subclassing `AnalysisParameters`) for its
       own request-specific parameters;
-    - a `pipeline()` method building a real `analysis.pipeline.Pipeline` from
-      `self.dataset`/`self.filters`/`self.parameters` -- the ONLY thing a resolved
-      analysis exposes for actually running it (nothing may be reachable only
-      through a named analysis, so this always funnels through the same
-      `compile_pipeline` any hand-authored pipeline does);
+    - a `pipeline()` method building a real `analysis.request.pipeline.Pipeline` from
+      `self.dataset`/`self.filters`/`self.grid_cell_where`/`self.parameters` -- the ONLY
+      thing a resolved analysis exposes for actually running it (nothing may be reachable
+      only through a named analysis, so this always funnels through the same
+      `execution.plan.compile_plan` any hand-authored pipeline does);
     - optionally, a `validate_selection` classmethod for a cardinality/consistency rule
       that needs `filters` as well as `parameters` (e.g. "exactly 2 selected values of
       `dimension`") -- the default is a no-op.
@@ -241,10 +308,22 @@ class Analysis:
     class Parameters(AnalysisParameters):
         pass
 
-    def __init__(self, *, dataset: DatasetRef | None, filters: dict[str, Any], parameters: "Analysis.Parameters"):
+    def __init__(
+        self,
+        *,
+        dataset: DatasetRef | None,
+        filters: dict[str, Any],
+        parameters: "Analysis.Parameters",
+        grid_cell_where: str | None = None,
+    ):
         self.dataset = dataset
         self.filters = filters
         self.parameters = parameters
+        # An already-resolved spatial conjunct (e.g. `"grid_cell IN (1, 2)"`), for a
+        # caller that had to turn coordinates into IDs itself -- it entirely replaces
+        # `filters["grid_cell"]`'s own digit-ID handling, exactly as the same-named
+        # argument does for `request.data_query.build_data_query_pipeline`.
+        self.grid_cell_where = grid_cell_where
 
     @classmethod
     def validate_selection(cls, parameters: "Analysis.Parameters", filters: dict[str, Any]) -> None:

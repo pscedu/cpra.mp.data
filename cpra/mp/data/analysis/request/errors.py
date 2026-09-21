@@ -10,13 +10,11 @@ request-level meaning (a shape mismatch is always a bad request; a lookup with n
 find is always "not found") expresses that by raising the matching subclass, rather than
 attaching a status code as an afterthought at the point something is raised.
 
-This is a NEW family, unconnected to `cpra.mp.data.analysis.base.AnalysisError` (the
-existing flat-API error, an `Exception` subclass carrying `status_code`/`detail`
-attributes read directly by that API's own response machinery). That class keeps serving
-`io/geography.py` and `io/output.py` -- both still wired into the old code path -- exactly
-as before; nothing here re-points them. The two families are independent by design, not
-by oversight: unifying them is a wiring decision for whenever a route is actually rebound
-to this module, not a fact about the exceptions themselves.
+`cpra/mp/data/api/boundary.py` is that boundary: it owns the one type-to-status table, so
+a member of this family reaching a route becomes a response there and nowhere else. Code
+under `io/` raises out of this family too -- it is the request's failure being reported,
+whichever layer notices it -- which is why a rejection from `io/geography.py` or
+`io/output.py` arrives at a caller shaped exactly like one from `request/pipeline.py`.
 """
 
 

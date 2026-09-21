@@ -8,8 +8,8 @@ conjuncts are handed to `pl.sql_expr` -- or even a full `lf.sql(...)` call -- la
 unrestricted, the same as always. A value conjunct is different in kind, not just in
 which columns it can name: it runs on the hot path Polars can stream, so an expression
 shaped wrong doesn't just give a bad answer -- it can force a full materialization the
-query would otherwise never need. The measured example (see `sources.py`'s module
-docstring): two queries returning the identical
+query would otherwise never need. The measured example: two queries returning the
+identical
 126,174-group result set differ 94x in memory (285 MB vs 26859 MB) purely on whether one
 comparison in the predicate was `pl.col(x) == pl.col(x).min()` instead of a literal. An
 aggregate inside a filter forces Polars to see every row before it can evaluate what was
@@ -26,9 +26,9 @@ whitelist that is honest about what it doesn't yet support.
 
 Every function here takes and returns plain values (strings, sets, `polars.Expr`) and
 raises `ExpressionError`, an ordinary `ValueError` subclass -- never `HTTPException` and
-never a FastAPI import. `op_error_boundary` (`analysis/base.py`) is the only place that
-translates an `ExpressionError` into a 400 response; that split is what lets this module be
-reused outside the API later (the `read_data()` entry point in `cpra/mp/data/__init__.py`).
+never a FastAPI import. `api/boundary.py` is the only place that translates an
+`ExpressionError` into a 400 response; that split is what lets this module be reused
+outside the API (the `read_data()` entry point in `cpra/mp/data/__init__.py` does).
 """
 
 import re
@@ -492,46 +492,16 @@ def rewrite_value_column(expr_str, column_name):
     return _VALUE_TOKEN_RE.sub(column_name, expr_str)
 
 
-def rewrite_named_columns(expr_str, column_map):
-    """Generalization of `rewrite_value_column` to more than one placeholder, rewritten
-    simultaneously rather than one at a time.
-
-    `pipeline.py`'s analysis pipelines don't write their `filter.where` against the
-    single `value` placeholder -- a step downstream of a spatial `join` (`paired
-    ._write_paired_notebook_raster`) names each side by its own input/step name (e.g. `marsh > 0.5 AND sal >
-    5.5`), and that same expression has to be re-evaluated once per selected calendar band,
-    against that band's own synthetic columns (`scan_rasters`' `b<i>`/`p<i>` convention).
-    `column_map` is `{name: replacement}` for every name in scope at that step, e.g.
-    `{"marsh": "b0", "sal": "p0"}`.
-
-    Built as ONE regex with alternation over every key, substituted in a single pass --
-    not `column_map`'s items applied one at a time via repeated `rewrite_value_column`-
-    style calls -- so that a replacement string which happens to collide with another
-    key (or another replacement) is never re-substituted. Longer names are tried first
-    in the alternation so a shorter key that is a prefix of a longer one (unlikely given
-    the word-boundary anchor, but not ruled out) can't shadow it.
-
-    Like `rewrite_value_column`, this performs no validation of its own -- the caller is
-    expected to re-parse and re-whitelist the result with `parse_value_expr` immediately
-    after, against the replacement columns' own namespace.
-    """
-    if not column_map:
-        return expr_str
-    names = sorted(column_map, key=len, reverse=True)
-    pattern = re.compile(r"\b(" + "|".join(re.escape(name) for name in names) + r")\b")
-    return pattern.sub(lambda m: column_map[m.group(1)], expr_str)
-
-
 def value_predicate_mask(expr_str, allowed_columns):
     """Parse a value predicate and return it as a mask with `null` coerced to `False`.
 
-    The shape every "value_where" call site in `base.py`/`sources.py` wants: a boolean
+    The shape every "value_where" call site wants: a boolean
     expression suitable for `pl.when(mask).then(pl.col(...)).otherwise(None)`, which nulls
     out a non-matching value rather than dropping its row. That is what lets a masked-out
     value fall into every aggregate's EXISTING null-skipping behaviour
-    (`guarded_aggregate`'s `count()`-based denominator, `POLARS_RASTER_AGGREGATES`, the
-    vector `getattr(pl.col("value"), aggregate)()` call sites) exactly like a nodata pixel
-    does, with no separate "predicate failed" code path anywhere downstream.
+    (`execution.long_ops.group_long`'s `getattr(pl.col("value"), aggregate)()` call, and
+    `execution.band_ops`' horizontal reduces) exactly like a nodata pixel does, with no
+    separate "predicate failed" code path anywhere downstream.
 
     `fill_null(False)`: a predicate over an already-null (nodata) value evaluates to
     null, not `False` (`null > x` is `null`, matching SQL three-valued logic) -- coercing

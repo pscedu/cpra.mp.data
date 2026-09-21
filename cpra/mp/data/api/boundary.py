@@ -5,12 +5,11 @@ ExpressionError`, `execution.execute.LoweringNotImplementedError`, plus Polars' 
 the `/v1/analysis...` pipeline surface (`api/pipeline.py`) and the four routes in
 `api/__init__.py` that use it.
 
-This is the NEW engine's counterpart to `api/__init__.py`'s three existing handlers
-(`analysis_error_handler`, `analysis_registry_error_handler`, `pipeline_error_handler`),
-which keep translating the OLD, unrelated `analysis.base.AnalysisError`/`analysis.pipeline.
-PipelineError`/`analyses.base.AnalysisRegistryError` families exactly as they already do --
-see `request.errors`'s module docstring for why the two exception worlds are independent
-by design, not by oversight. This module never touches those three.
+It sits alongside `api/__init__.py`'s `analysis_registry_error_handler`, which
+translates the separate, unrelated `analyses.base.AnalysisRegistryError` family (a named
+analysis's own name/type lookup, not a pipeline's shape) -- see `request.errors`'s module
+docstring for why the two exception worlds are independent by design, not by oversight.
+This module never touches that one.
 
 **One handler per exception type, not one dispatcher.** `RequestError` is registered on
 its own: FastAPI/Starlette's `add_exception_handler` looks up the handler for a raised
@@ -48,9 +47,8 @@ ours to disclose.
   (`_validate_output_sort_or_select`) but does not exist on the final frame -- the other
   half of that deliberate split; see `execution.sink.apply_output_shaping`'s docstring.
 - `FileNotFoundError` -> 404. Raised by Polars/rasterio's own readers when a real
-  variable/grid/time_unit combo simply has no file on disk yet -- the NEW engine's
-  counterpart to the OLD engine's `BaseAnalysis.materialize`/`api.sources.LazyFrameSource
-  .materialize`, both of which catch this and re-raise as a 404 for the same reason (see
+  variable/grid/time_unit combo simply has no file on disk yet -- the same answer
+  `api.sources.LazyFrameSource.materialize` gives on the flat dataset routes (see
   `execution.sink`'s `_materialize_closure` docstring, which explicitly leaves this
   translation to "the error boundary a route installs" -- this entry is that boundary).
   Not a member of any `request.errors` family: it is raised by the underlying I/O layer
@@ -60,8 +58,8 @@ ours to disclose.
   (`_DETAIL_BY_TYPE`) rather than passed through: the reader's own message names the
   absolute path it could not open. Note this entry is app-wide, so a missing file that is
   a server MISCONFIGURATION (an absent crosswalk or grid file) also answers 404 rather
-  than 500 -- the same conflation the old engine's two readers make, kept deliberately
-  because narrowing it means catching at each read site, of which the new engine has
+  than 500 -- a deliberate conflation, kept because narrowing it means catching at each
+  read site, of which the engine has
   several (tabular sink, vector tile, raster scan).
 
 **`resolve_status`, and why it exists alongside the registered handlers rather than being
@@ -129,11 +127,10 @@ def resolve_status(exc: Exception) -> int | None:
 # text. `FileNotFoundError`'s is the reader's, and it carries the absolute server path of
 # the file that was missing ("No such file or directory (os error 2): /ocean/projects/
 # .../variable=marsh/....parquet") -- a filesystem layout the caller has no business
-# seeing. The old engine's two readers (`api.sources.LazyFrameSource.materialize` and
-# `analysis.base.BaseAnalysis.materialize`) both answer this exact case with a fixed
+# seeing. `api.sources.LazyFrameSource.materialize` answers this exact case with a fixed
 # string for that reason, while passing `ColumnNotFoundError`'s message straight through;
-# that split is deliberate and is reproduced here so moving a route onto the new engine
-# cannot start disclosing paths the old one withheld.
+# that split is deliberate and is reproduced here so the two reading paths cannot differ
+# in what they disclose.
 _DETAIL_BY_TYPE: dict[type[Exception], str] = {
     FileNotFoundError: "Dataset does not exist",
 }
@@ -157,9 +154,8 @@ def resolve_detail(exc: Exception) -> str:
 
 def install_analysis_boundary(app: FastAPI) -> None:
     """Register one exception handler per `_STATUS_BY_TYPE` entry onto `app`. Called
-    exactly once, from `api/__init__.py`, alongside (not instead of) the three existing
-    `AnalysisError`/`AnalysisRegistryError`/`PipelineError` handlers that keep serving the
-    OLD engine's remaining routes.
+    exactly once, from `api/__init__.py`, alongside (not instead of) the
+    `AnalysisRegistryError` handler that serves the named-analysis registry.
 
     Built from `_STATUS_BY_TYPE` in a loop, rather than one `@app.exception_handler(...)`
     per type written out by hand, so that table is the only place the mapping is

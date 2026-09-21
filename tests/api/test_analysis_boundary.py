@@ -1,9 +1,9 @@
 """Guard tests for the `cpra.mp.data.analysis` package's structural boundaries.
 
 `analysis/__init__.py`'s own module docstring states the FastAPI rule: nothing under this
-package may import FastAPI. `analysis.base.AnalysisError` stands in for `HTTPException`
-throughout the package, and `api/__init__.py` registers the one place
-(`analysis_error_handler`) that translates it back into a real HTTP response. This test
+package may import FastAPI. `request.errors.RequestError` and its subclasses stand in for
+`HTTPException` throughout the package, and `api/boundary.py` is the one place that
+translates them back into a real HTTP response. This test
 is the permanent enforcement of that boundary -- it walks every `.py` module on disk
 under `cpra/mp/data/analysis/` and asserts none of them contains an `import fastapi` /
 `from fastapi import ...` statement.
@@ -14,13 +14,13 @@ importable in this environment, so the presence of `fastapi` in `sys.modules` pr
 nothing about which module pulled it in. Parsing each file's own `import` statements is
 the only way to pin the violation to a specific module.
 
-This module also enforces the package's import-cycle fix: `analysis/__init__.py` <->
-`planner.py` <-> `paired.py` used to manage their cycle by documented import ORDER (a
-mid-module import in `planner.py`, plus an `# isort: split` directive in `__init__.py`
-protecting the order from an alphabetizing lint pass -- which broke it once already, see
-`test_every_module_is_independently_importable_first`'s docstring). The model
-(`pipeline.py`) and the factory (`factory.py`) were split out as leaf modules so nothing
-in the package needs an ordering trick anymore; the test below is the permanent proof.
+This module also enforces that the package is cycle-free: every module under
+`analysis/` must import cleanly as the FIRST thing a fresh interpreter imports, with no
+help from import ORDER (see `test_every_module_is_independently_importable_first`'s
+docstring for why order-dependence is worth a test of its own -- an alphabetizing pass
+over the imports broke exactly that once already). `analysis/__init__.py` re-exports
+nothing, so no module here needs an ordering trick; the test below is the permanent
+proof.
 """
 
 import ast
@@ -62,7 +62,7 @@ def test_no_module_under_analysis_imports_fastapi():
 
 
 def _dotted_module_name(path: Path) -> str:
-    """`cpra/mp/data/analysis/planner.py` -> `cpra.mp.data.analysis.planner`;
+    """`cpra/mp/data/analysis/io/raster_io.py` -> `cpra.mp.data.analysis.io.raster_io`;
     `cpra/mp/data/analysis/__init__.py` -> `cpra.mp.data.analysis` (the package itself).
     """
     relative = path.relative_to(ANALYSIS_PACKAGE_DIR)

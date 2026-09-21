@@ -5,9 +5,14 @@ derivation.
 
 Pure/in-memory throughout -- `resolve_analysis`/`Analysis.pipeline()` never touch disk (see
 `analyses/base.py`'s `required_dataset_dimensions` docstring), so nothing here needs
-`base_path`/`tmp_path`. `tests/api/test_analyses_registry.py` covers the disk-touching half
-(the registry-drift test, and an exit-criterion end-to-end compile+materialize
-check).
+`base_path`/`tmp_path`. `tests/api/test_analyses_registry.py` covers the disk-touching
+half (the registry-drift test, and one execution check per entry).
+
+**Where a caller's filters end up.** An `InputSelection` names a dataset
+(`variable`/`time_unit`/`grid`) and carries no filtering at all, so every dimension
+filter, `grid_cell`, and caller-written `where` is composed into the pipeline's LEADING
+`filter` STEP instead (`base.selection_filter_where`). Tests here therefore assert on
+`pipeline.steps[0].where`, not on an input's fields.
 """
 
 import json
@@ -31,11 +36,12 @@ from cpra.mp.data.analyses.base import (
     format_dimension_literal,
     is_filterable_dimension,
     normalized_filter_values,
+    selection_filter_where,
 )
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
 from cpra.mp.data.analyses.exit_criterion import ExitCriterion
-from cpra.mp.data.analysis.pipeline import (
+from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
     FilterStep,
     GroupStep,
@@ -145,19 +151,17 @@ class TestResolveAnalysisContract:
 class TestResolveOverADateDimension:
     """A `date`-valued dimension filter must survive all the way into the built pipeline.
 
-    Regression: `calendar_day` is declared `Date` in `structure/dimensions.csv`, so
-    `types.dimension_type` makes `FilterDimensions.calendar_day` a `list[date]` and FastAPI
-    binds `?calendar_day=2019-01-01` to a real `datetime.date`. `InputSelection`'s scalar
-    whitelist listed only `(str, int, float, bool)`, so every named analysis over a date
-    dimension -- a `difference` on any daily dataset, which is exactly what the portal's
-    difference map requests -- failed `Pipeline` validation outright with "must be a scalar
-    or a list of scalars, got date in it".
+    `calendar_day` is declared `Date` in `structure/dimensions.csv`, so
+    `request.types.dimension_type` makes `FilterDimensions.calendar_day` a `list[date]`
+    and FastAPI binds `?calendar_day=2019-01-01` to a real `datetime.date` -- a value that
+    reaches `selection_filter_where` as a `date` object, not a string, and has to come out
+    the other side as a quoted, `::date`-cast SQL literal.
 
-    `format_dimension_literal` was already unit-tested against a `date`
-    (`test_format_dimension_literal_calendar_day_gets_date_cast`), so the registry's own
-    date handling was covered; what had no test was the SEAM, where that helper's output
-    meets `InputSelection`'s validation. Hence this asserts on the resolved pipeline rather
-    than on a helper in isolation.
+    `format_dimension_literal` is already unit-tested against a `date`
+    (`test_format_dimension_literal_calendar_day_gets_date_cast`); what this class covers
+    is the SEAM, where that helper's output meets the composed `where` string and the
+    pipeline's own serialization. Hence it asserts on the resolved pipeline rather than on
+    a helper in isolation.
     """
 
     FILTERS = {
@@ -177,15 +181,17 @@ class TestResolveOverADateDimension:
         assert result.result_kind == "difference"
         assert result.collapsed_dimensions == frozenset({"calendar_day"})
 
-    def test_the_dates_survive_into_the_input_selection(self):
+    def test_the_dates_survive_into_the_leading_filter_step(self):
         result = resolve_analysis(
             "difference",
             dataset=SAL_DATASET,
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
         )
-        selection = result.pipeline.inputs["x"]
-        assert selection.dimension_filters["calendar_day"] == [date(2019, 1, 1), date(2070, 12, 31)]
+        step = result.pipeline.steps[0]
+        assert isinstance(step, FilterStep)
+        assert step.input == "x"
+        assert "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)" in step.where
 
     def test_the_negated_side_is_quoted_and_cast_not_left_as_bare_arithmetic(self):
         """An unquoted date in a SQL predicate is arithmetic -- `2019-01-01` evaluates to
@@ -203,7 +209,10 @@ class TestResolveOverADateDimension:
     def test_both_encodings_round_trip_the_dates(self):
         """The pipeline has to survive being written back out both ways: `pipeline_to_query`
         builds the dotted tile-URL form, and `pipeline.json` serializes via
-        `model_dump(mode="json")` -- which must stay JSON-encodable.
+        `model_dump(mode="json")` -- which must stay JSON-encodable. Both now carry the
+        dates inside the leading `filter` step's `where` string rather than as typed
+        values on the input, so neither can hit a `date`-is-not-JSON-encodable failure;
+        this pins that the composed literal itself round-trips intact.
         """
         result = resolve_analysis(
             "difference",
@@ -211,11 +220,15 @@ class TestResolveOverADateDimension:
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
         )
-        assert pipeline_to_query(result.pipeline)["input.x.calendar_day"] == "2019-01-01,2070-12-31"
+        query = pipeline_to_query(result.pipeline)
+        assert "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)" in query["step.1.where"]
 
         dumped = result.pipeline.model_dump(mode="json")
         json.dumps(dumped)  # must not raise -- a bare `date` is not JSON-encodable
-        assert dumped["inputs"]["x"]["calendar_day"] == ["2019-01-01", "2070-12-31"]
+        assert (
+            "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)"
+            in dumped["steps"][0]["where"]
+        )
 
 
 # ------------------------------------------------------------------------------------------
@@ -261,6 +274,42 @@ class TestSharedHelpers:
     def test_format_dimension_literal_escapes_embedded_quotes(self):
         literal = format_dimension_literal("aggregate_type", "o'brien")
         assert literal == "'o''brien'"
+
+    def test_selection_filter_where_is_none_when_there_is_nothing_to_filter_on(self):
+        assert selection_filter_where({}) is None
+        assert selection_filter_where({"grid_cell": None, "where": None}) is None
+
+    def test_selection_filter_where_orders_dimensions_by_name_not_by_dict_order(self):
+        """The composed string must not depend on the order keys happened to arrive in --
+        two callers passing the same filters get the same `where` either way.
+        """
+        one = selection_filter_where({"scenario_id": 7, "calendar_year": 2030})
+        other = selection_filter_where({"calendar_year": 2030, "scenario_id": 7})
+        assert one == other == "calendar_year = 2030 AND scenario_id = 7"
+
+    def test_selection_filter_where_puts_the_spatial_conjunct_after_the_dimensions(self):
+        assert selection_filter_where({"scenario_id": 7, "grid_cell": "4"}) == (
+            "scenario_id = 7 AND grid_cell = 4"
+        )
+
+    def test_selection_filter_where_rejects_a_coordinate_grid_cell(self):
+        """Resolving coordinates to ids needs the catalog, which this package cannot
+        reach -- the caller resolves them and passes `grid_cell_where` instead.
+        """
+        from cpra.mp.data.analysis.request.errors import RequestError
+
+        with pytest.raises(RequestError, match="digit IDs"):
+            selection_filter_where({"grid_cell": "-90.1,29.5"})
+
+    def test_selection_filter_where_accepts_the_reserved_keys(self):
+        assert selection_filter_where({"grid_cell": "1", "where": "value > 3"}) == (
+            "grid_cell = 1 AND (value > 3)"
+        )
+
+    def test_selection_filter_where_rejects_a_dataset_typed_dimension(self):
+        # `variable`/`time_unit`/`grid` select the dataset; they are not filters.
+        with pytest.raises(InvalidAnalysisParametersError, match="variable"):
+            selection_filter_where({"variable": "ssf"})
 
     def test_default_collapsed_dimensions_empty_without_trailing_group(self):
         pipeline = Difference(
@@ -347,14 +396,31 @@ class TestDifferencePipeline:
     def test_step_shape(self):
         _, pipeline = self._build("asc")
         assert list(pipeline.inputs) == ["x"]
-        assert isinstance(pipeline.steps[0], ProjectStep)
-        assert pipeline.steps[0].to == "ecoregion_v001"
+        # The input names the dataset and nothing else -- every filter is a step.
+        selection = pipeline.inputs["x"]
+        assert (selection.variable, selection.time_unit, selection.grid) == (
+            "ssf",
+            "annual",
+            "ecoregion_v001",
+        )
+        assert set(selection.model_dump(exclude_none=True)) == {"variable", "time_unit", "grid"}
+
+        assert isinstance(pipeline.steps[0], FilterStep)
         assert pipeline.steps[0].input == "x"
         assert isinstance(pipeline.steps[1], CalculateStep)
         group = pipeline.steps[2]
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["model_group_id", "scenario_id", "percentile"])
         assert group.aggregate == "sum"
+
+    def test_emits_no_identity_project_step(self):
+        """A `project` to the dataset's own grid used to lead the chain purely to satisfy
+        the "first step must name its input" rule. The leading `filter` carries that name
+        now, and the identity project would be rejected outright on a raster dataset --
+        `PROJECT_LOWERING_TABLE` has no raster-to-raster entry.
+        """
+        _, pipeline = self._build("asc")
+        assert not any(isinstance(step, ProjectStep) for step in pipeline.steps)
 
     def test_collapsed_dimensions_and_title_suffix(self):
         analysis, _ = self._build("asc")
@@ -363,7 +429,7 @@ class TestDifferencePipeline:
         assert analysis.legend is None
         assert analysis.result_kind == "difference"
 
-    def test_forwards_dimension_filters_and_grid_cell_onto_the_input(self):
+    def test_composes_dimension_filters_and_grid_cell_into_the_leading_filter_step(self):
         _, pipeline = self._build(
             "asc",
             filters={
@@ -374,9 +440,52 @@ class TestDifferencePipeline:
                 "grid_cell": "1,2,3",
             },
         )
-        selection = pipeline.inputs["x"]
-        assert selection.grid_cell == "1,2,3"
-        assert selection.dimension_filters["model_group_id"] == [500]
+        step = pipeline.steps[0]
+        assert isinstance(step, FilterStep)
+        assert step.input == "x"
+        # Dimensions in sorted name order, then the spatial conjunct last.
+        assert step.where == (
+            "calendar_year IN (2030, 2040) AND model_group_id = 500 AND percentile = 50 "
+            "AND scenario_id = 7 AND grid_cell IN (1, 2, 3)"
+        )
+
+    def test_a_single_grid_cell_uses_equality_not_a_one_element_in_list(self):
+        _, pipeline = self._build("asc", filters={"calendar_year": [2030, 2040], "grid_cell": "7"})
+        assert pipeline.steps[0].where == "calendar_year IN (2030, 2040) AND grid_cell = 7"
+
+    def test_a_resolved_grid_cell_where_replaces_the_grid_cell_key(self):
+        """A coordinate-valued `grid_cell` needs the catalog to resolve, so the caller
+        does it and passes the finished conjunct -- which wins over `filters["grid_cell"]`
+        outright rather than being AND-ed alongside it.
+        """
+        analysis = Difference(
+            dataset=SSF_DATASET,
+            filters={"calendar_year": [2030, 2040], "grid_cell": "-90.1,29.5"},
+            parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
+            grid_cell_where="grid_cell IN (11, 12)",
+        )
+        assert analysis.pipeline().steps[0].where == (
+            "calendar_year IN (2030, 2040) AND grid_cell IN (11, 12)"
+        )
+
+    def test_a_callers_own_where_is_split_and_parenthesized_conjunct_by_conjunct(self):
+        _, pipeline = self._build(
+            "asc", filters={"calendar_year": [2030, 2040], "where": "value > 1 AND value < 9"}
+        )
+        # Split FIRST, then parenthesized: one paren pair per top-level conjunct, so the
+        # AND seam the engine classifies each predicate's kind against survives intact.
+        assert pipeline.steps[0].where == (
+            "calendar_year IN (2030, 2040) AND (value > 1) AND (value < 9)"
+        )
+
+    def test_an_unrecognized_filter_name_is_rejected(self):
+        analysis = Difference(
+            dataset=SSF_DATASET,
+            filters={"calendar_year": [2030, 2040], "nonsense": 1},
+            parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
+        )
+        with pytest.raises(InvalidAnalysisParametersError, match="nonsense"):
+            analysis.pipeline()
 
 
 # ------------------------------------------------------------------------------------------
@@ -443,7 +552,13 @@ class TestConcatenatePipeline:
             {"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50}
         )
         assert len(pipeline.steps) == 3
-        assert isinstance(pipeline.steps[0], ProjectStep)
+        leading = pipeline.steps[0]
+        assert isinstance(leading, FilterStep)
+        assert leading.input == "x"
+        assert leading.where == (
+            "calendar_year IN (2030, 2040) AND model_group_id = 500 AND percentile = 50 "
+            "AND scenario_id = 7"
+        )
         calc = pipeline.steps[1]
         assert isinstance(calc, CalculateStep)
         assert calc.expression == "value * 10"
@@ -465,24 +580,34 @@ class TestConcatenatePipeline:
         analysis, pipeline = self._build(
             {"calendar_year": [2030, 2040], "model_group_id": [520, 500], "scenario_id": 7, "percentile": 50}
         )
-        assert len(pipeline.steps) == 5
-        assert isinstance(pipeline.steps[0], ProjectStep)
+        assert len(pipeline.steps) == 4
 
-        filter_step = pipeline.steps[1]
+        # The redundant corner is AND-ed onto the same leading `filter` the caller's own
+        # dimension filters compose into -- both are dimension conditions at the same
+        # point in the chain, so there is no reason for two consecutive filter steps.
+        filter_step = pipeline.steps[0]
         assert isinstance(filter_step, FilterStep)
-        assert filter_step.where == "model_group_id != 520 OR calendar_year != 2030"
+        assert filter_step.input == "x"
+        # Dimension NAMES are sorted (so the string doesn't depend on dict order), but
+        # each dimension's own VALUES keep the caller's order -- `[520, 500]` in, `(520,
+        # 500)` out, matching `request.data_query`'s own conjunct assembly.
+        assert filter_step.where == (
+            "calendar_year IN (2030, 2040) AND model_group_id IN (520, 500) "
+            "AND percentile = 50 AND scenario_id = 7 "
+            "AND NOT (model_group_id = 520 AND calendar_year = 2030)"
+        )
 
-        calc1 = pipeline.steps[2]
+        calc1 = pipeline.steps[1]
         assert isinstance(calc1, CalculateStep)
         assert calc1.expression == "value * 100"
         assert calc1.where == "calendar_year = 2030"
 
-        calc2 = pipeline.steps[3]
+        calc2 = pipeline.steps[2]
         assert isinstance(calc2, CalculateStep)
         assert calc2.expression == "value * 10"
         assert calc2.where == "model_group_id = 500 AND calendar_year = 2040"
 
-        group = pipeline.steps[4]
+        group = pipeline.steps[3]
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["scenario_id", "percentile"])
         assert "model_group_id" not in group.by
@@ -534,29 +659,45 @@ class TestExitCriterionPipeline:
         return analysis, analysis.pipeline()
 
     def test_matches_the_documented_exit_criterion_shape(self):
-        """`docs/data-analysis-api.md`'s "The Exit-Criterion Query" example, reproduced
-        via the named analysis instead of hand-authored JSON.
+        """`docs/analysis-api.md`'s "The Exit-Criterion Query" example, reproduced via
+        the named analysis instead of hand-authored JSON.
         """
         _, pipeline = self._build()
 
-        assert set(pipeline.inputs) == {"marsh", "salinity"}
-        marsh = pipeline.inputs["marsh"]
-        assert marsh.variable == "ffibs_coverage_ratio"
-        assert marsh.time_unit == "annual"
-        assert marsh.grid == "veg_grid_cell_v001"
-        assert marsh.dimension_filters["model_group_id"] == [500]
-        assert marsh.dimension_filters["scenario_id"] == [7]
-        assert marsh.dimension_filters["ffibs_type"] == ["pl_fm"]
-
+        assert set(pipeline.inputs) == {"coverage", "salinity"}
+        coverage = pipeline.inputs["coverage"]
+        assert (coverage.variable, coverage.time_unit, coverage.grid) == (
+            "ffibs_coverage_ratio",
+            "annual",
+            "veg_grid_cell_v001",
+        )
         salinity = pipeline.inputs["salinity"]
-        assert salinity.variable == "sal"
-        assert salinity.time_unit == "annual"
-        assert salinity.grid == "hydro_compartment_v001"
-        assert salinity.dimension_filters["aggregate_type"] == ["2_wk_max"]
+        assert (salinity.variable, salinity.time_unit, salinity.grid) == (
+            "sal",
+            "annual",
+            "hydro_compartment_v001",
+        )
 
-        project_step, join_step, filter_step, group_step = pipeline.steps
+        coverage_filter, salinity_filter, project_step, join_step, filter_step, group_step = (
+            pipeline.steps
+        )
+
+        assert isinstance(coverage_filter, FilterStep)
+        assert coverage_filter.input == "coverage"
+        assert coverage_filter.where == (
+            "ffibs_type = 'pl_fm' AND model_group_id = 500 AND scenario_id = 7"
+        )
+        assert coverage_filter.as_ == "marsh"
+
+        assert isinstance(salinity_filter, FilterStep)
+        assert salinity_filter.input == "salinity"
+        assert salinity_filter.where == (
+            "aggregate_type = '2_wk_max' AND model_group_id = 500 AND scenario_id = 7"
+        )
+        assert salinity_filter.as_ == "selected_salinity"
+
         assert isinstance(project_step, ProjectStep)
-        assert project_step.input == "salinity"
+        assert project_step.input == "selected_salinity"
         assert project_step.to == "veg_grid_cell_v001"
         assert project_step.as_ == "sal"
 
@@ -574,9 +715,19 @@ class TestExitCriterionPipeline:
 
         assert pipeline.output.format == "tif"
 
+    def test_the_join_operands_are_named_for_what_the_threshold_filter_reads(self):
+        """A join's output value columns are named after its OPERANDS, and an `as` may
+        not collide with an input name -- so the two inputs take the longer names and the
+        per-input steps rename down to the `marsh`/`sal` the trailing `where` references.
+        """
+        _, pipeline = self._build()
+        join_step = next(step for step in pipeline.steps if step.op == "join")
+        assert set(join_step.inputs).isdisjoint(pipeline.inputs)
+        assert set(join_step.inputs) == {"marsh", "sal"}
+
     def test_custom_thresholds_are_interpolated(self):
         _, pipeline = self._build(marsh_threshold=0.75, salinity_threshold=3.0)
-        filter_step = pipeline.steps[2]
+        filter_step = pipeline.steps[4]
         assert filter_step.where == "marsh > 0.75 AND sal > 3.0"
 
     def test_collapsed_dimensions_union_both_inputs(self):

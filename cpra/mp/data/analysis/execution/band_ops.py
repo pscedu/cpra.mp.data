@@ -45,12 +45,10 @@ two band-wide row counts.
 selects which bands the entry applies to, evaluated once against `metadata_df` (one row
 per band) rather than once per pixel -- the same
 `(label, expression, where) -> CalculatePlan` compilation `execution.long_ops.
-calculate_long` uses, applied per band the way `analysis/sources.py`'s
-`band_calculate_passes` faithfully-carried-over logic already did for the old engine's
-per-entry list. This module's version handles exactly one `CalculateOp` at a time (a
-`calculate` step is always one entry here, never `sources.py`'s multi-entry list), and
+calculate_long` uses, applied per band. This module's version handles exactly one
+`CalculateOp` at a time (a `calculate` step is always one entry here, never a list), and
 extends the value mask's namespace to `extra_columns` in addition to the band's own
-column -- `sources.py`'s original only ever allowed `[name]` -- matching
+column, matching
 `masked_value_predicate_exprs`' own `extra_columns` convention (a value condition scoped
 by, say, a crosswalk zone id) rather than the narrower one `band_calculate_passes` had no
 occasion to need. The REWRITTEN VALUE gets the same namespace as the mask that gates it: a
@@ -73,12 +71,11 @@ knowable only where the carried column is introduced. Until then, `extra_columns
 "carry this column through unchanged", and the value namespaces above are reachable only by
 calling a lowering directly with an already-classified value conjunct.
 
-**`group_band_wide`'s horizontal `count`.** `sources.py`'s `HORIZONTAL_RASTER_AGGREGATES`
-deliberately has no `count` key -- that dict serves band-COLLAPSE for the old engine's
-raster output writer, where "how many calendar steps satisfied a condition" is a
-different, already-served question. A band-wide `group.aggregate == "count"` here answers
-a different question again: "how many of these bands contributed a non-null value at this
-pixel", the per-pixel cross-band analogue of `execution.long_ops.group_long`'s row count.
+**`group_band_wide`'s horizontal `count`.** A band-wide `group.aggregate == "count"`
+answers "how many of these bands contributed a non-null value at this pixel", the
+per-pixel cross-band analogue of `execution.long_ops.group_long`'s row count. The other
+four horizontal aggregates are pure `pl.*_horizontal` reduces; `count` is not, which is
+why `_HORIZONTAL_AGGREGATES` below does not carry it.
 It needs no `no_contributor` sentinel the other four aggregates need -- a pixel where
 every contributing band is null naturally counts zero contributors, which is already the
 right answer, not an edge case standing in for an undefined one.
@@ -194,11 +191,8 @@ __all__ = [
 # with either positional-name shape `execution/frame.py`'s invariants police.
 JOIN_OPERAND_COLUMN = "_join_operand"
 
-# Horizontal (within-row, across-band) reduce, carried over faithfully from
-# `analysis/sources.py`'s `HORIZONTAL_RASTER_AGGREGATES` -- see that dict's own docstring
-# for why it has no `count` key. `count` is added here as this module's own extension
-# (see the module docstring) rather than by mutating the original, since the two dicts
-# answer different questions and must not be reached for each other's by accident.
+# Horizontal (within-row, across-band) reduce. No `count` key: `count` is not a
+# `pl.*_horizontal` reduce and gets its own branch below -- see the module docstring.
 _HORIZONTAL_AGGREGATES = {
     "max": pl.max_horizontal,
     "mean": pl.mean_horizontal,
@@ -208,9 +202,9 @@ _HORIZONTAL_AGGREGATES = {
 
 
 def _horizontal_aggregate_expr(aggregate: str, exprs: list[pl.Expr], no_contributor: pl.Expr) -> pl.Expr:
-    """`analysis/sources.py`'s `horizontal_aggregate_expr`, faithfully carried over, plus
-    this module's own `count` branch -- see the module docstring for why `count` needs no
-    `no_contributor` sentinel the other four aggregates do.
+    """The horizontal reduce for `aggregate`, plus the `count` branch -- see the module
+    docstring for why `count` needs no `no_contributor` sentinel the other four
+    aggregates do.
     """
     if aggregate == "count":
         return pl.sum_horizontal([expr.is_not_null().cast(pl.UInt32) for expr in exprs])
@@ -226,9 +220,9 @@ def _combine_conjuncts(conjuncts: list[str]) -> str:
 def mask_value_band_wide(band_wide: BandWideFrame, value_where: str, extra_columns: Sequence[str]) -> BandWideFrame:
     """The band-wide lowering of a VALUE predicate conjunct: null out a band's own pixel
     wherever `value_where` (written once, against the placeholder `value`) evaluates false
-    for it -- carrying over `analysis/sources.py`'s `masked_value_predicate_exprs` logic
-    (a per-band `pl.when(mask).then(pl.col(name)).otherwise(None)`, `value_where` rewritten
-    per band via `rewrite_value_column`), never a row drop: dropping a pixel's row would
+    for it -- a per-band `pl.when(mask).then(pl.col(name)).otherwise(None)`, with
+    `value_where` rewritten per band via `rewrite_value_column`, never a row drop:
+    dropping a pixel's row would
     drop it from every OTHER band too, including the ones the predicate holds for.
 
     `extra_columns` is carried through unchanged and also added to each band's own value
@@ -378,9 +372,8 @@ def calculate_band_wide(band_wide: BandWideFrame, op: CalculateOp, extra_columns
     pixel the value half rejects -- pass through unchanged, never dropped (`calculate`
     never drops data; that is `filter`'s job).
 
-    Carries over `analysis/sources.py`'s `band_calculate_passes` logic for exactly one
-    entry (a `CalculateOp` is always one, never that function's multi-entry list -- see the
-    module docstring), including its `is_not_null()` guard (nodata in, nodata out, as a
+    Handles exactly one entry (a `CalculateOp` is always one, never a list -- see the
+    module docstring), including the `is_not_null()` guard (nodata in, nodata out, as a
     structural property rather than a per-expression obligation).
 
     Returns `band_wide` unchanged, without evaluating `op.where`'s dimension half at all,

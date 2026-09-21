@@ -27,7 +27,6 @@ os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 import pytest  # noqa: E402
 
 from cpra.mp.data import config as cpra_config  # noqa: E402
-from cpra.mp.data.analysis.io.raster_io import _read_data_cached  # noqa: E402
 
 
 def pytest_configure(config):
@@ -37,19 +36,6 @@ def pytest_configure(config):
             f"Test sandbox not applied: BASE_PATH is {cpra_config.BASE_PATH}. "
             "Refusing to run against a real data directory."
         )
-
-
-@pytest.fixture(autouse=True)
-def clear_read_cache():
-    """Reset the API's TTL cache around every test.
-
-    ``analysis.utils._read_data_cached`` is wrapped in a ``TTLCache`` keyed only on the
-    dimension kwargs. Without this, two tests using identical dimensions but different
-    ``tmp_path`` directories would silently share the first test's LazyFrame.
-    """
-    _read_data_cached.cache_clear()
-    yield
-    _read_data_cached.cache_clear()
 
 
 @pytest.fixture

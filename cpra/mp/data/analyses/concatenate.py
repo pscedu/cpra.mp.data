@@ -5,9 +5,7 @@ producing a categorical land-type-change code (`variables=["lnd_type"]`,
 
 Two modes, selected by how many `model_group_id` values are selected alongside
 `dimension`'s own two values (see `catalog.ts`'s `threeImage = modelGroupValues.length ===
-2`, NOT `dimension`'s own cardinality -- `dimension` is always exactly 2 for both modes;
-see this package's final report for why the "concatenate takes 2-3" phrasing some of this
-package's own design notes used is an imprecise paraphrase of that real logic):
+2`, NOT `dimension`'s own cardinality -- `dimension` is always exactly 2 for both modes):
 
 * **two-image** (`model_group_id` absent, or selected to exactly 1 value): `calculate`
   `value * 10` where `dimension = t0` (the earlier of the two selected values), then
@@ -18,23 +16,13 @@ package's own design notes used is an imprecise paraphrase of that real logic):
   `model_group_id = mg0 AND dimension = t1`, then `group`/`sum` over every other required
   dimension (excluding `model_group_id`, which the calculates above have folded away).
 
-The `filter` step is emitted BEFORE both `calculate` steps (matching the pipeline's own
-step order) -- `analysis.planner._compile_single_input_chain` accepts a `filter` ordered
-after a `calculate` only when the `where` is dimension-only (the two commute); this
-`filter`'s `where` IS dimension-only (neither conjunct names `value`), so placing it first
-is not strictly required to compile, but is the clearer -- and, per this package's task
-instructions, the mandated -- ordering.
-
-**On the filter's exact spelling.** The redundant corner is naturally "NOT (model_group_id
-= mg1 AND dimension = t0)", but `analysis.planner._validate_filter_where` (the pipeline
-compiler's own compile-time check on every `filter` step's `where`, run regardless of
-whether the conjunct is dimension- or value-shaped) validates each top-level AND-ed
-conjunct through `expressions.parse_value_expr`'s restricted grammar, which parses `not(`
-as an attempted function call and rejects it (`not` is not in `ALLOWED_FUNCTIONS`) --
-`where`'s restricted grammar has no boolean NOT/OR-of-AND-groups spelling at all. The
-logically-equivalent De Morgan's form -- "(model_group_id != mg1) OR (dimension != t0)" --
-uses only `!=`/`OR` at the top level (no parenthesized call, so nothing matches
-`parse_value_expr`'s function-call check), and does compile.
+Both modes' leading `filter` step is the one the caller's own dimension filters/
+`grid_cell`/`where` compose into (`base.selection_filter_where`); in three-image mode the
+redundant-corner conjunct is AND-ed onto that same step rather than emitted as a second
+one, since the two are both dimension conditions applied at the same point in the chain.
+The corner is written directly as `NOT (model_group_id = mg1 AND dimension = t0)` --
+`expressions.classify_where_kinds` reads a `NOT (...)` group's root names the same way it
+reads any other conjunct, so this needs no De Morgan's rewrite to be accepted.
 """
 
 from cpra.mp.data.analyses.base import (
@@ -45,8 +33,9 @@ from cpra.mp.data.analyses.base import (
     is_filterable_dimension,
     normalized_filter_values,
     required_dataset_dimensions,
+    selection_filter_where,
 )
-from cpra.mp.data.analysis.pipeline import parse_pipeline
+from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from pydantic import field_validator
 
 
@@ -121,20 +110,22 @@ class Concatenate(Analysis):
             group_by = [d for d in group_by if d != "model_group_id"]
             mg0, mg1 = sorted(mg_values)
 
-        steps: list[dict] = [{"op": "project", "input": "x", "to": self.dataset.grid}]
+        conjuncts = []
+        selection_where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
+        if selection_where is not None:
+            conjuncts.append(selection_where)
         if three_image:
-            steps.append(
-                {
-                    "op": "filter",
-                    # De Morgan's form of "not (model_group_id = mg1 AND dim = t0)" --
-                    # see this module's own docstring for why the direct NOT/AND-group
-                    # spelling doesn't compile.
-                    "where": (
-                        f"model_group_id != {format_dimension_literal('model_group_id', mg1)} "
-                        f"OR {dim} != {format_dimension_literal(dim, t0)}"
-                    ),
-                }
+            # Drop the redundant corner of the 2x2 (model_group_id, dim) grid, so the
+            # three surviving cells are what the two calculates below encode.
+            conjuncts.append(
+                f"NOT (model_group_id = {format_dimension_literal('model_group_id', mg1)} "
+                f"AND {dim} = {format_dimension_literal(dim, t0)})"
             )
+
+        steps: list[dict] = []
+        if conjuncts:
+            steps.append({"op": "filter", "where": " AND ".join(conjuncts)})
+        if three_image:
             steps.append(
                 {
                     "op": "calculate",
@@ -161,9 +152,13 @@ class Concatenate(Analysis):
                 }
             )
         steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
+        # A pipeline's first step must name its input explicitly; every later step chains
+        # from the one before it. That is normally the leading `filter`, but falls to the
+        # first `calculate` when there was nothing to filter on.
+        steps[0]["input"] = "x"
 
         data = {
-            "inputs": {"x": dataset_input_selection(self.dataset, self.filters)},
+            "inputs": {"x": dataset_input_selection(self.dataset)},
             "steps": steps,
             "output": {"format": "csv"},
         }

@@ -50,11 +50,11 @@ def read_data(*, variable=None, time_unit=None, grid=None, base_path=None, **sel
     An unrecognized keyword raises `cpra.mp.data.exceptions.ValidationError` naming it (and
     every valid dimension filter/option name) -- the same exception type `validate_grid`
     already raises for a missing/unknown `grid`, so `read_data`'s whole error surface stays
-    one exception type rather than mixing in the analysis engine's `AnalysisError`.
+    one exception type rather than mixing in the analysis engine's own error family.
     """
     grid_obj = validate_grid(variable=variable, time_unit=time_unit, grid=grid)
 
-    from cpra.mp.data.analysis.parameters import BaseFilterDimensions
+    from cpra.mp.data.analysis.request.parameters import BaseFilterDimensions
 
     filter_names = set(BaseFilterDimensions.model_fields)
 
@@ -87,11 +87,11 @@ def read_data(*, variable=None, time_unit=None, grid=None, base_path=None, **sel
 
     try:
         return _apply_read_data_selection(lf, grid_obj, options)
-    except Exception as exc:  # AnalysisError or ExpressionError -- see the helper's docstring
-        from cpra.mp.data.analysis.base import AnalysisError
+    except Exception as exc:  # RequestError or ExpressionError -- see the helper's docstring
+        from cpra.mp.data.analysis.request.errors import RequestError
         from cpra.mp.data.analysis.request.expressions import ExpressionError
 
-        if isinstance(exc, (AnalysisError, ExpressionError)):
+        if isinstance(exc, (RequestError, ExpressionError)):
             raise ValidationError(str(exc)) from exc
         raise
 
@@ -100,27 +100,26 @@ def _apply_read_data_selection(lf, grid, options):
     """Apply `read_data`'s `grid_cell`/`where`/`sort`/`select` options to `lf`, the
     `LazyFrame` `read_cog`/`read_parquet` already returned for `grid`.
 
-    Deliberately does NOT build a `create_analysis`/`BaseAnalysis` object to do this, for
-    two concrete reasons rather than as an arbitrary style choice:
+    Deliberately does NOT build and run a `Pipeline` to do this, for two concrete reasons
+    rather than as an arbitrary style choice:
 
-    1. **Recursion** -- `analysis.utils.get_lazy_frame` (which `BaseAnalysis.__init__`
-       calls to populate its own `self.lf`) calls `cpra.mp.data.read_data` directly. Any
-       code path from here into `create_analysis` risks calling back into `read_data`.
+    1. **Recursion** -- the analysis engine's own readers call `cpra.mp.data.read_data`
+       directly to populate the frames a pipeline runs over. Any code path from here into
+       the engine's entry points risks calling back into `read_data`.
     2. **Sync/async mismatch** -- `read_data` is, and must stay, a plain synchronous
        function (this module's whole `read_data`/`write_data`/`compact_data` family is
-       sync). `BaseAnalysis.apply_params()` is `async def`, and `VectorGridAnalysis.
-       apply_steps`' terminal `grid_cell` filter (`vector.apply_grid_cell_selection`)
-       `await`s coordinate resolution -- there is no way to route through it without
-       either making `read_data` async (breaking its signature) or driving an event loop
-       from inside a sync call (fragile, and surprising for a caller already inside one,
-       e.g. a notebook cell).
+       sync). The engine's entry point (`analyze_data`) is `async def`, and coordinate
+       resolution for a `grid_cell` filter is awaited -- there is no way to route through
+       it without either making `read_data` async (breaking its signature) or driving an
+       event loop from inside a sync call (fragile, and surprising for a caller already
+       inside one, e.g. a notebook cell).
 
-    Instead, this reuses the same underlying, grid-engine-independent building blocks
-    `BaseAnalysis` itself is built from: `analysis.expressions.classify_where`/
+    Instead, this reuses the same underlying, grid-engine-independent building blocks the
+    engine itself is built from: `analysis.request.expressions.classify_where`/
     `value_predicate_mask` (explicitly documented, in that module's own docstring, as
-    written to be reused here), and `analysis.geography.resolve_vector_grid_cell_sync`
+    written to be reused here), and `analysis.io.geography.resolve_vector_grid_cell_sync`
     (the same blocking coordinate-resolution path `visualizations/map.py` already uses
-    outside an event loop). Applied directly to `lf`, not through `Options`/`DataOptions`.
+    outside an event loop). Applied directly to `lf`, not through a pipeline.
 
     `grid_cell` and a `where` VALUE conjunct both require a `value` column to mean
     anything -- present on a vector grid's frame, but never present on a raster grid's
@@ -128,17 +127,16 @@ def _apply_read_data_selection(lf, grid, options):
     docstring). Both raise for a raster grid, pointing the caller at `analyze_data`
     instead, rather than silently doing nothing or reinterpreting the request.
 
-    `sort`/`select` are validated against `lf`'s own live schema (not the analysis
-    engine's `stages.SORT_CHOICES`/`required_columns`-derived whitelists) -- those
-    whitelists assume `BaseAnalysis`'s own narrowed-tabular-output shape (vector
-    dimension columns plus `grid_cell`/`value`), which is a genuinely different, and for
-    a raster grid strictly smaller, set of columns than what `read_data` actually
-    returns here (a raster's `path`/`band` columns, in particular, are real and useful to
-    `select`/`sort` by here even though `BaseAnalysis` never exposes them to `Options`).
+    `sort`/`select` are validated against `lf`'s own live schema, not against any fixed
+    column whitelist -- a whitelist would have to assume the engine's narrowed
+    tabular-output shape (vector dimension columns plus `grid_cell`/`value`), which is a
+    genuinely different, and for a raster grid strictly smaller, set of columns than what
+    `read_data` actually returns here (a raster's `path`/`band` columns, in particular,
+    are real and useful to `select`/`sort` by here).
     """
-    from cpra.mp.data.analysis.base import AnalysisError
     from cpra.mp.data.analysis.io.geography import parse_coordinate_pairs, resolve_vector_grid_cell_sync
     from cpra.mp.data.analysis.io.raster_io import unpack_values
+    from cpra.mp.data.analysis.request.errors import RequestError
     from cpra.mp.data.analysis.request.expressions import classify_where, value_predicate_mask
 
     schema_names = set(lf.collect_schema().names())
@@ -151,14 +149,13 @@ def _apply_read_data_selection(lf, grid, options):
 
     if grid_cell is not None:
         if grid.grid_type != "vector":
-            raise AnalysisError(
+            raise RequestError(
                 "read_data(): grid_cell samples raster PIXEL values, which read_data() "
                 "never touches -- it always returns the raster's band/path metadata "
                 "table here, never narrowed by grid_cell -- use analyze_data() instead, "
-                "with a pipeline whose input carries `grid_cell` (or that ends in a "
+                "with a pipeline that filters on `grid_cell` (or that ends in a "
                 "`project`/`group` step) to get a frame back, or `output_path=` to write "
-                "the raster itself",
-                status_code=400,
+                "the raster itself"
             )
         values = unpack_values(grid_cell, "grid_cell")
         if all(value.isdigit() for value in values):
@@ -176,12 +173,11 @@ def _apply_read_data_selection(lf, grid, options):
             lf = lf.sql(f"select * from self where {combined}")
         if value_conjuncts:
             if not has_value_column:
-                raise AnalysisError(
+                raise RequestError(
                     "read_data(): where's value condition(s) need a `value` column, "
                     "which this result doesn't have -- raster grids return band/path "
                     "metadata here, not pixel values -- restrict where to dimension "
-                    "conditions only, or use analyze_data() instead",
-                    status_code=400,
+                    "conditions only, or use analyze_data() instead"
                 )
             combined = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
             mask = value_predicate_mask(combined, sorted(schema_names))
@@ -215,22 +211,29 @@ def write_data(data, **kwargs):
 async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False):
     """Compile and run a pipeline analysis and hand back its result directly -- the
     library entry point for a notebook, a script, or any other caller that wants
-    `cpra.mp.data.analysis`'s query engine (dimension filters, `where`,
-    `group_by`/`group_aggregate`, `summarize_by`/`summarize_aggregate`, `grid_cell`
-    sampling, crosswalks, multi-input joins, ...) without going through the HTTP API or
-    touching the `BaseAnalysis`/`PairedAnalysis` objects that engine builds along the way.
+    `cpra.mp.data.analysis`'s query engine (filters, `calculate`, `group`, crosswalk
+    `project`s, multi-input joins, ...) without going through the HTTP API.
     `read_data` is the equivalent for the raw, un-analyzed access path (`/v1/datasets`);
     this is `/v1/analysis`'s.
 
-    `pipeline` is the JSON-shaped multi-input pipeline body `analysis.parse_pipeline`/
-    `analysis.compile_pipeline` accept: named inputs, an ordered list of
-    project/join/filter/group/calculate steps, and an output description -- see
-    `analysis.pipeline`'s module docstring for the full grammar. It is the ONLY way to
-    describe a request here; there is no flat/keyword calling surface any more (compare
-    `cpra.mp.data.analysis.create_analysis`, which still has one, for a caller that wants
-    it directly rather than through this wrapper).
+    Runs the SAME four stages an HTTP response does, in the same order --
+    `request.pipeline.parse_pipeline` (structure), `request.ops.validate_shapes`
+    (shape/format agreement), `execution.plan.compile_plan`, then either
+    `execution.execute.execute` for a frame or `execution.execute.run_to_path` for a
+    GeoTIFF. There is no second, library-only engine here; a request that answers one way
+    over HTTP answers the same way from a notebook, including its rejections
+    (`request.errors.RequestError` and its subclasses).
 
-    In a notebook, where there's already a running event loop to `await` into::
+    `pipeline` is the JSON-shaped multi-input pipeline body `parse_pipeline` accepts:
+    named inputs (a `variable`/`time_unit`/`grid` dataset selection each, and nothing
+    else -- every filter is a `filter` STEP), an ordered list of project/join/filter/
+    group/calculate steps, and an output description. It is the ONLY way to describe a
+    request here; there is no flat/keyword calling surface.
+
+    Still a coroutine, though nothing inside it awaits any more (the new execution path
+    is synchronous end to end): `await analyze_data(...)` is the spelling every existing
+    notebook and script uses, and changing it would break them for no gain here. In a
+    notebook, where there's already a running event loop::
 
         df = await analyze_data({
             "inputs": {"eco": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
@@ -246,58 +249,79 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
         import asyncio
         df = asyncio.run(analyze_data(pipeline))
 
-    **Return contract** -- follows the compiled analysis's own `output_type`, never
-    re-derived from the parameters given directly:
+    **Return contract** -- follows `output.format`, which `validate_shapes` has already
+    forced to agree with the pipeline's actual final frame shape, so this is not a second
+    guess at that shape:
 
-    * A **tabular-shaped** result (`output_type` is `OutputType.vector` -- every vector
-      grid, plus a raster grid narrowed to a table by a `project`-to-a-vector-grid or a
-      trailing `group` step) returns a polars `DataFrame` (the default) or a `LazyFrame`
-      when `lazy=True` (`collect()` it yourself when ready). `output_path=` makes no
-      sense here -- there is no file format decision to make once the caller already
-      holds the frame -- and raises `AnalysisError` if given.
-    * A **raster-shaped** result (`output_type` is `OutputType.raster`: an unnarrowed
-      raster-grid analysis, or any compiled `PairedAnalysis`, which is always
-      raster-shaped) REQUIRES `output_path=`: the GeoTIFF is written there via
-      `write_raster` and the path is returned as a `pathlib.Path`. Omitting
-      `output_path=` raises `AnalysisError` explaining that this request produces a
-      raster and needs `output_path=` -- add a `project`-to-a-vector-grid or a trailing
-      `group` step instead if a frame was actually wanted. `lazy=True` together with a
-      raster-shaped result also raises `AnalysisError`: there is no lazy raster.
+    * A **tabular** format (`csv`/`ndjson`/`parquet`, i.e. a long final frame) returns a
+      polars `DataFrame`, or a `LazyFrame` when `lazy=True` (`collect()` it yourself when
+      ready). `output_path=` makes no sense here -- there is no format decision left once
+      the caller holds the frame -- and raises `ShapeError` if given.
+    * `format="tif"` (a band-wide final frame) REQUIRES `output_path=`: the GeoTIFF is
+      written there via `run_to_path` and the path is returned as a `pathlib.Path`.
+      Omitting it raises `ShapeError` -- add a `project`-to-a-vector-grid or a trailing
+      `group` step instead if a frame was actually wanted. `lazy=True` with `tif` raises
+      too: there is no lazy raster. A selection that leaves the result with NO bands
+      writes no file at all (`run_to_path` returns `False`), and raises `NotFoundError`
+      rather than handing back a path to a file that isn't there -- the same 404 the HTTP
+      routes answer that request with.
+    * `format="png"`/`"jpg"` are TILE formats and are rejected outright. Both need a
+      tile's `x`/`y`/`z` and pixel size, which this signature has nowhere to put --
+      `execution.sink.render_tile` is the entry point for those.
     """
-    from cpra.mp.data.analysis import AnalysisError, compile_pipeline, parse_pipeline
-    from cpra.mp.data.analysis.types import OutputType
+    from cpra.mp.data.analysis.execution.execute import execute, run_to_path
+    from cpra.mp.data.analysis.execution.plan import compile_plan
+    from cpra.mp.data.analysis.execution.sink import apply_output_shaping
+    from cpra.mp.data.analysis.request.errors import NotFoundError, ShapeError
+    from cpra.mp.data.analysis.request.ops import validate_shapes
+    from cpra.mp.data.analysis.request.pipeline import parse_pipeline
+    from cpra.mp.data.analysis.request.types import DataFormat, TileFormat
 
-    compiled = compile_pipeline(parse_pipeline(pipeline), base_path=base_path)
+    parsed = parse_pipeline(pipeline)
+    validate_shapes(parsed)
+    format = parsed.output.format
 
-    await compiled.apply_params()
+    if format in {TileFormat.png.value, TileFormat.jpg.value}:
+        raise ShapeError(
+            f"analyze_data(): output.format={format!r} is a map TILE format, which needs "
+            "a tile's x/y/z and pixel size -- analyze_data() has nowhere to put those. "
+            "Use format='tif' with output_path= for the whole raster, or call "
+            "cpra.mp.data.analysis.execution.sink.render_tile directly for one tile"
+        )
 
-    if compiled.output_type == OutputType.raster:
+    if format == DataFormat.tif.value:
         if lazy:
-            raise AnalysisError(
-                "analyze_data(): lazy=True has no meaning for a raster-shaped result -- "
-                "there is no lazy raster; omit lazy= for this request",
-                status_code=400,
+            raise ShapeError(
+                "analyze_data(): lazy=True has no meaning for output.format='tif' -- "
+                "there is no lazy raster; omit lazy= for this request"
             )
         if output_path is None:
-            raise AnalysisError(
-                "analyze_data(): this request produces a raster (its output is an image, "
-                "not a table) and needs output_path= to say where to write the GeoTIFF -- "
-                "add a project-to-a-vector-grid or a trailing group step to the pipeline "
-                "instead if you wanted a polars frame back",
-                status_code=400,
+            raise ShapeError(
+                "analyze_data(): output.format='tif' produces a raster (an image, not a "
+                "table) and needs output_path= to say where to write the GeoTIFF -- add "
+                "a project-to-a-vector-grid or a trailing group step to the pipeline "
+                "instead if you wanted a polars frame back"
             )
         output_path = Path(output_path)
-        await compiled.write_raster(str(output_path))
+        if not run_to_path(parsed, output_path, base_path=base_path):
+            raise NotFoundError(
+                "analyze_data(): this pipeline's raster result has no bands -- its "
+                "selection matched nothing, so there was no band count to declare and "
+                f"no GeoTIFF was written to {output_path}"
+            )
         return output_path
 
     if output_path is not None:
-        raise AnalysisError(
-            "analyze_data(): output_path= was given but this request produces a tabular "
-            "result (a polars DataFrame/LazyFrame), not a raster -- drop output_path= and "
-            "use the returned frame directly",
-            status_code=400,
+        raise ShapeError(
+            f"analyze_data(): output_path= was given but output.format={format!r} "
+            "produces a tabular result (a polars DataFrame/LazyFrame), not a raster -- "
+            "drop output_path= and use the returned frame directly"
         )
 
-    if lazy:
-        return compiled.materialize("lazy")
-    return compiled.materialize()
+    # `apply_output_shaping` rather than a bare `execute`, so `output.sort`/`output.select`
+    # mean the same thing here as they do over HTTP -- `run_to_path`'s tabular branch
+    # applies exactly this, once, last.
+    frame = apply_output_shaping(
+        execute(compile_plan(parsed, base_path=base_path), base_path=base_path), parsed.output
+    )
+    return frame if lazy else frame.collect()

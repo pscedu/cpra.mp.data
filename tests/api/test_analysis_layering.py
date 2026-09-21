@@ -1,4 +1,4 @@
-"""Guard test for the layering rules among `cpra.mp.data.analysis`'s three new
+"""Guard test for the layering rules among `cpra.mp.data.analysis`'s three
 subpackages: `request/` (the request model), `io/` (filesystem access), and
 `execution/` (the op algebra).
 
@@ -10,18 +10,11 @@ The four rules:
 4. `api/` may import all three (unrestricted -- not checked here; it is the one place
    allowed to know about HTTP and about every layer at once).
 
-This test is deliberately scoped to just the three new subpackages, not the whole
-`cpra.mp.data.analysis` tree. The legacy modules directly under `analysis/`
-(`base.py`, `raster.py`, `vector.py`, `sources.py`, `pipeline.py`, `ops.py`,
-`stages.py`, `tiles.py`, `types.py`, `metadata.py`, `parameters.py`, `planner.py`,
-`factory.py`, `paired.py`, ...) predate this layering and are not yet sorted into one
-of the three subpackages -- that migration is later-stage work. So a module under
-`request/`, `io/`, or `execution/` importing from the legacy `analysis/` root (e.g.
-`from cpra.mp.data.analysis.base import AnalysisError`) is EXPLICITLY ALLOWED during
-this coexistence period; `_LEGACY_ROOT_IMPORT_ALLOWED` below is that allowance, spelled
-out so that widening or removing it later (once the legacy modules are themselves
-sorted into a subpackage) is a deliberate, visible change to this file rather than a
-silent side effect of moving something.
+Those three subpackages are the whole of `cpra.mp.data.analysis`: nothing lives directly
+under `analysis/` but its own `__init__.py`, which re-exports nothing.
+`test_every_analysis_module_is_under_a_layer` pins that, so a module added at the root --
+which this file's import walk would classify as belonging to no layer and therefore
+police against nothing -- fails loudly instead of quietly escaping the rules above.
 """
 
 import ast
@@ -32,7 +25,7 @@ import cpra.mp.data.analysis
 ANALYSIS_PACKAGE_DIR = Path(cpra.mp.data.analysis.__file__).parent
 ANALYSIS_PACKAGE_NAME = "cpra.mp.data.analysis"
 
-# The three new subpackages this test polices, and what each may import from the other
+# The three subpackages this test polices, and what each may import from the other
 # two (by subpackage name, not by module -- deliberately coarse-grained for now: `io`
 # importing `request` at all, whatever it imports, is treated as satisfying "request
 # types/errors only" for now, because nothing under `io/` today imports from `request/`
@@ -45,12 +38,6 @@ _ALLOWED_SIBLING_IMPORTS = {
     "execution": frozenset({"request", "io"}),
 }
 
-# Explicit coexistence allowance (see module docstring): every one of the three
-# subpackages may import from the legacy `analysis/` root -- any module directly under
-# `cpra.mp.data.analysis` that is not itself part of `request`, `io`, or `execution`.
-_LEGACY_ROOT_IMPORT_ALLOWED = True
-
-
 def _dotted_module_name(path: Path) -> str:
     relative = path.relative_to(ANALYSIS_PACKAGE_DIR)
     parts = [ANALYSIS_PACKAGE_NAME, *relative.with_suffix("").parts]
@@ -60,8 +47,8 @@ def _dotted_module_name(path: Path) -> str:
 
 
 def _subpackage_of(dotted_name: str) -> str | None:
-    """`cpra.mp.data.analysis.io.raster_io` -> `"io"`; `cpra.mp.data.analysis.base` ->
-    `None` (legacy root, not one of the three subpackages)."""
+    """`cpra.mp.data.analysis.io.raster_io` -> `"io"`; `polars` or `cpra.mp.data.config`
+    -> `None` (not one of the three subpackages)."""
     prefix = ANALYSIS_PACKAGE_NAME + "."
     if not dotted_name.startswith(prefix):
         return None
@@ -112,10 +99,10 @@ def test_subpackages_only_import_their_permitted_siblings():
         for imported in _imported_module_names(path.read_text(), path):
             imported_subpackage = _subpackage_of(imported)
             if imported_subpackage is None:
-                # Not one of the three policed subpackages: either outside
-                # `cpra.mp.data.analysis` entirely (stdlib, third-party, `cpra.mp.data`
-                # proper), or the legacy `analysis/` root -- both permitted, the latter
-                # only because of the explicit coexistence allowance above.
+                # Outside `cpra.mp.data.analysis` entirely (stdlib, third-party,
+                # `cpra.mp.data` proper), or the package root itself, which re-exports
+                # nothing. Unrestricted either way -- these rules order the three
+                # subpackages against each other, not against the rest of the world.
                 continue
             if imported_subpackage == this_subpackage:
                 continue  # a module importing a sibling within its own subpackage
@@ -129,9 +116,20 @@ def test_subpackages_only_import_their_permitted_siblings():
     assert not violations, "analysis subpackage layering violation(s):\n" + "\n".join(violations)
 
 
-def test_the_coexistence_allowance_is_explicit():
-    """Pins the deliberate escape hatch itself, so widening or removing it (once the
-    legacy `analysis/` root modules are sorted into one of the three subpackages, at a
-    later stage) is a visible, intentional edit to this file rather than a silent
-    consequence of some other change."""
-    assert _LEGACY_ROOT_IMPORT_ALLOWED is True
+def test_every_analysis_module_is_under_a_layer():
+    """`analysis/` itself holds no modules but `__init__.py`.
+
+    This is what makes the rule above exhaustive rather than merely broad: the walk only
+    police modules it can place in a layer, so a new `analysis/helpers.py` would be
+    importable from all three subpackages, in any direction, without tripping a single
+    assertion. Failing here instead makes "put it in a layer" the only way forward.
+    """
+    stray = sorted(
+        p.name
+        for p in ANALYSIS_PACKAGE_DIR.glob("*.py")
+        if p.name != "__init__.py"
+    )
+    assert not stray, (
+        f"module(s) directly under `analysis/`: {stray} -- move each into `request/`, "
+        f"`io/`, or `execution/` so the layering rules apply to it"
+    )

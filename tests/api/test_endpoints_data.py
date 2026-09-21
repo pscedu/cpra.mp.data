@@ -523,6 +523,11 @@ class TestRasterData:
         coordinate, each labeled with the string the caller sent. Collapsing them to one
         row would leave a caller who asked about two points unable to tell which one they
         got back.
+
+        Compared as a SET: relabeling is a join, and a join's row order is not guaranteed
+        (this assertion, written positionally, failed about half the time). A caller who
+        wants a defined order asks for one -- see `test_sort_and_select_see_the_relabeled_
+        grid_cell`, which is where ordering is actually pinned.
         """
         with rio.open(next(raster_data.rglob("*.tif"))) as src:
             from rasterio.warp import transform
@@ -539,7 +544,7 @@ class TestRasterData:
         response = client.get(f"{RASTER_URL}/data.csv", params={"grid_cell": grid_cell})
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
-        assert df["grid_cell"].to_list() == [f"{lng},{lat}" for lng, lat in points]
+        assert sorted(df["grid_cell"].to_list()) == sorted(f"{lng},{lat}" for lng, lat in points)
         assert df["value"].to_list() == [30, 30]
 
     def test_a_point_outside_the_raster_is_an_empty_result_not_an_error(self, client, raster_data):

@@ -18,8 +18,9 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import Point, Polygon, box
 
-from cpra.mp.data.analysis import AnalysisError
+from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.api import crosswalk as crosswalk_module
+from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.api.crosswalk import Crosswalk
 from cpra.mp.data.grids import GRIDS, WGS84
 from tests.factories import (
@@ -256,10 +257,10 @@ class TestVectorToRaster:
 
     async def test_a_missing_geometry_file_is_a_400(self, vector_crosswalk, geometry_path):
         crosswalk = Crosswalk(VECTOR_GRID, grid_cell="1", to_grid=[RASTER_GRID])
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             await crosswalk.execute()
-        assert excinfo.value.status_code == 400
-        assert "No geometry file for grid" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "No geometry file for grid" in str(excinfo.value)
 
 
 class TestRasterToVector:
@@ -378,10 +379,10 @@ class TestWGS84ToVector:
 
     async def test_a_missing_geometry_file_is_a_400(self, geometry_path):
         crosswalk = self._crosswalk((500500, 3300500), to_grid=["parish_v2020"])
-        with pytest.raises(AnalysisError) as excinfo:
+        with pytest.raises(RequestError) as excinfo:
             await crosswalk.execute()
-        assert excinfo.value.status_code == 400
-        assert "No geometry file for grid: parish_v2020" in excinfo.value.detail
+        assert resolve_status(excinfo.value) == 400
+        assert "No geometry file for grid: parish_v2020" in str(excinfo.value)
 
     async def test_a_raster_destination_returns_the_coordinate_unchanged(self, geometry_path):
         """The same conversion a raster source makes to a raster grid: the coordinate is
