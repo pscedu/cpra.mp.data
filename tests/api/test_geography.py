@@ -1,7 +1,6 @@
 """Tests for converting between coordinates and grid cell IDs using geometry files."""
 
-from types import SimpleNamespace
-
+import polars as pl
 import pytest
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
@@ -11,11 +10,14 @@ from shapely.geometry import box
 
 from cpra.mp.data.analysis import AnalysisError
 from cpra.mp.data.analysis.io.geography import (
+    grid_cell_id_where,
     parse_coordinate_pairs,
     project_coordinates,
     raster_grid_cell_id,
+    relabel_raster_grid_cell,
     representative_points,
     resolve_raster_pixel,
+    resolve_raster_point_labels,
     resolve_vector_grid_cell,
     resolve_vector_grid_cell_sync,
 )
@@ -248,41 +250,161 @@ class TestResolveRasterPixel:
 
 
 class TestRasterGridCellId:
-    """`raster_grid_cell_id` computes FORWARD, from a known absolute pixel, the same id
-    `execution.frame.row_major_grid_cell` would DECODE from a real read of that window --
-    see that function's own docstring for why the two are the same arithmetic.
+    """`raster_grid_cell_id` computes FORWARD, from a known absolute pixel, the same
+    ABSOLUTE id `execution.band_ops.sample_grid_cells_band_wide` would emit for that pixel
+    regardless of what window an actual read covered -- see that function's own docstring
+    for why the two are the same arithmetic, and why no window is involved at all any more.
     """
 
-    def test_matches_row_major_numbering_for_a_full_grid_window(self):
-        """A window that starts at the raster's own origin and spans its full width is the
-        convention every non-point-sample read uses today -- the id should reduce to plain
-        `row * width + col` numbering.
-        """
-        grid = GRIDS[RASTER_GRID]
-        window = SimpleNamespace(row_off=0, col_off=0, width=grid.width)
+    def test_matches_row_major_numbering_over_the_grids_own_width(self):
         row, col = 10, 20
-        assert raster_grid_cell_id((row, col), window) == row * grid.width + col
+        grid = GRIDS[RASTER_GRID]
+        assert raster_grid_cell_id(RASTER_GRID, (row, col)) == row * grid.width + col
 
-    def test_offsets_the_id_for_a_narrower_window(self):
-        """A window that does NOT start at the raster's own origin must shift both the row
-        and column components of the id by the window's own offset before applying the
-        window's (possibly narrower) width -- this is the exact arithmetic a point-sparse
-        read's window needs, once one exists.
-        """
-        window = SimpleNamespace(row_off=5, col_off=3, width=10)
-        assert raster_grid_cell_id((7, 8), window) == 25
+    def test_the_origin_pixel_is_cell_zero(self):
+        assert raster_grid_cell_id(RASTER_GRID, (0, 0)) == 0
 
-    def test_a_pixel_at_the_windows_own_origin_is_cell_zero(self):
-        window = SimpleNamespace(row_off=5, col_off=3, width=10)
-        assert raster_grid_cell_id((5, 3), window) == 0
-
-    def test_window_width_not_raster_width_scales_the_row_component(self):
-        """The multiplier in the row component must be the WINDOW's width, not the full
-        raster's -- using the wrong one is exactly the bug a window narrower than the whole
-        raster would otherwise hide, since the two widths only diverge once a window is
-        actually narrower than the raster it was read from.
+    def test_the_id_is_independent_of_any_window(self):
+        """The whole point of the fix this test guards: an id must mean the same pixel
+        whether or not a read of it was ever narrowed to some window smaller than the full
+        grid -- so there is no `window` argument left to pass here at all, unlike the
+        window-relative id this function used to compute.
         """
         grid = GRIDS[RASTER_GRID]
-        assert grid.width != 10  # guards the premise: the window below must actually differ
-        window = SimpleNamespace(row_off=0, col_off=0, width=10)
-        assert raster_grid_cell_id((2, 4), window) == 2 * 10 + 4
+        row, col = 200, 800
+        assert raster_grid_cell_id(RASTER_GRID, (row, col)) == row * grid.width + col
+
+
+class TestGridCellIdWhere:
+    """Shared by both grid kinds' non-digit `grid_cell` handling once a coordinate has
+    already been resolved down to a plain list of ints.
+    """
+
+    def test_a_single_id_is_an_equality_test(self):
+        assert grid_cell_id_where([7]) == "grid_cell = 7"
+
+    def test_several_ids_are_an_in_list(self):
+        assert grid_cell_id_where([3, 1, 2]) == "grid_cell IN (1, 2, 3)"
+
+    def test_duplicate_ids_collapse_to_a_single_equality_test(self):
+        assert grid_cell_id_where([5, 5, 5]) == "grid_cell = 5"
+
+    def test_no_ids_is_the_pipelines_own_matched_nothing_convention(self):
+        assert grid_cell_id_where([]) == "grid_cell != grid_cell"
+
+
+def _raster_point_label(row: int, col: int) -> tuple[str, str]:
+    """A raw `(lng_token, lat_token)` pair for the CENTER of pixel `(row, col)` on
+    `RASTER_GRID`, formatted with trailing zeros a plain `float(...)!s` round trip would
+    strip -- so a test asserting the resolved label equals this exact string actually
+    proves nothing was reformatted, rather than passing merely because `str(float(x)) ==
+    x` already held for a plainly-formatted value.
+    """
+    lng, lat = _raster_pixel_lng_lat(row, col)
+    return f"{lng:.10f}0", f"{lat:.10f}0"
+
+
+class TestResolveRasterPointLabels:
+    """`resolve_raster_point_labels` is the raster point-query-specific half of Milestone
+    3: resolving each raw token pair to an ABSOLUTE id, while keeping the caller's own
+    strings verbatim for `relabel_raster_grid_cell` to hand back later.
+    """
+
+    def test_the_returned_label_is_the_callers_own_string_verbatim(self):
+        """The deliberate departure from the OLD engine's `f"{x!s},{y!s}"` convention,
+        which reformats through `float()` and back (e.g. `"-90.10"` -> `"-90.1"`). Here the
+        trailing zero must survive untouched.
+        """
+        row, col = 50, 60
+        lng_token, lat_token = _raster_point_label(row, col)
+        tokens = [lng_token, lat_token]
+        cell_id = raster_grid_cell_id(RASTER_GRID, (row, col))
+
+        resolved = resolve_raster_point_labels(RASTER_GRID, tokens)
+
+        assert resolved == {cell_id: [f"{lng_token},{lat_token}"]}
+
+    def test_two_points_on_the_same_pixel_both_keep_their_own_distinct_label(self):
+        """Two different requested points that happen to resolve to the same pixel must
+        not collapse into one label -- each of the caller's original strings for that pixel
+        is preserved, in request order, ready for `relabel_raster_grid_cell` to fan back
+        out into two rows.
+        """
+        row, col = 50, 60
+        lng_token, lat_token = _raster_point_label(row, col)
+        first_label = f"{lng_token},{lat_token}"
+        second_label = f"{lng_token}000,{lat_token}000"
+        tokens = [lng_token, lat_token, f"{lng_token}000", f"{lat_token}000"]
+        cell_id = raster_grid_cell_id(RASTER_GRID, (row, col))
+
+        resolved = resolve_raster_point_labels(RASTER_GRID, tokens)
+
+        assert resolved == {cell_id: [first_label, second_label]}
+
+    def test_a_point_outside_the_extent_is_absent_not_an_error(self):
+        """Mirrors `resolve_raster_pixel`'s own `None`-for-out-of-extent convention: the
+        point simply does not appear in the returned map at all.
+        """
+        grid = GRIDS[RASTER_GRID]
+        minx, miny, maxx, maxy = grid.bounds
+        center_x = (minx + maxx) / 2
+        lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [center_x], [miny - 10_000])]
+
+        resolved = resolve_raster_point_labels(RASTER_GRID, [str(lng), str(lat)])
+
+        assert resolved == {}
+
+    def test_an_in_extent_point_is_kept_when_paired_with_an_out_of_extent_one(self):
+        """Each point is resolved independently -- one point landing outside the grid must
+        not drop another point's label from the result.
+        """
+        grid = GRIDS[RASTER_GRID]
+        minx, miny, maxx, maxy = grid.bounds
+        in_lng_token, in_lat_token = _raster_point_label(0, 0)
+        center_x = (minx + maxx) / 2
+        out_lng, out_lat = [
+            c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [center_x], [miny - 10_000])
+        ]
+        tokens = [in_lng_token, in_lat_token, str(out_lng), str(out_lat)]
+        cell_id = raster_grid_cell_id(RASTER_GRID, (0, 0))
+
+        resolved = resolve_raster_point_labels(RASTER_GRID, tokens)
+
+        assert resolved == {cell_id: [f"{in_lng_token},{in_lat_token}"]}
+
+
+class TestRelabelRasterGridCell:
+    """`relabel_raster_grid_cell` replaces an executed frame's ABSOLUTE integer
+    `grid_cell` with the caller's own coordinate string(s) -- an inner join, so one id
+    mapped to several labels fans a single data row out into several.
+    """
+
+    def test_replaces_the_id_with_the_single_matching_label(self):
+        lf = pl.LazyFrame({"grid_cell": [42], "value": [1.5]})
+
+        result = relabel_raster_grid_cell(lf, {42: ["-90.10,29.90"]}).collect()
+
+        assert result.to_dicts() == [{"grid_cell": "-90.10,29.90", "value": 1.5}]
+
+    def test_two_labels_on_one_id_fan_out_into_two_rows(self):
+        """The property Milestone 3 explicitly calls out: two requested points landing on
+        the same pixel must produce two rows, each with its own distinct original string --
+        not one row, and not a row with both strings run together.
+        """
+        lf = pl.LazyFrame({"grid_cell": [42], "value": [1.5]})
+
+        result = relabel_raster_grid_cell(lf, {42: ["-90.10,29.90", "-90.1,29.9"]}).collect()
+
+        assert result.height == 2
+        assert set(result["grid_cell"]) == {"-90.10,29.90", "-90.1,29.9"}
+        assert list(result["value"]) == [1.5, 1.5]
+
+    def test_a_row_whose_id_has_no_label_is_dropped(self):
+        """An inner join: a `grid_cell` value with nothing in `id_to_labels` simply does
+        not appear in the output, the same as any other row a `where` would exclude.
+        """
+        lf = pl.LazyFrame({"grid_cell": [42, 99], "value": [1.5, 2.5]})
+
+        result = relabel_raster_grid_cell(lf, {42: ["-90.10,29.90"]}).collect()
+
+        assert result.to_dicts() == [{"grid_cell": "-90.10,29.90", "value": 1.5}]

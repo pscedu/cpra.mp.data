@@ -3,6 +3,12 @@ grid kinds: a vector grid's polygon ids (`resolve_vector_grid_cell`, backed by a
 geometry file) and a raster grid's pixel positions (`resolve_raster_pixel`/
 `raster_grid_cell_id`, backed by nothing but `cpra.mp.data.grids.RasterGrid`'s own
 declared extent -- no file is opened to answer a raster coordinate lookup).
+`grid_cell_id_where` builds the `where` conjunct either grid kind's resolved ids feed into
+`request.data_query.build_data_query_pipeline(..., grid_cell_where=...)`;
+`resolve_raster_point_labels`/`relabel_raster_grid_cell` are the raster-only pair that
+additionally relabels an executed raster point query's output back to the caller's own
+coordinate strings, which a vector `grid_cell` query never needs (it reports the polygon id
+itself -- see `analysis.vector.apply_grid_cell_selection`'s docstring on the asymmetry).
 
 Formerly `api/geography.py`; moved here because `vector.apply_grid_cell_selection`
 (called by `VectorGridAnalysis.apply_steps`'s terminal `grid_cell` filter) resolves
@@ -20,6 +26,7 @@ since that failure is decided before either grid kind's own lookup ever begins.
 import asyncio
 import math
 
+import polars as pl
 import pyogrio
 
 # Rasterio doesn't re-export its GDAL error classes from `rasterio.errors`, and this is
@@ -183,8 +190,8 @@ def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -
     """Resolve WGS84 (lng, lat) pairs to ABSOLUTE (row, col) pixel positions on
     `grid_name`'s own full pixel grid -- the raster counterpart of
     `resolve_vector_grid_cell`, for NEW-engine code (see `raster_grid_cell_id` below for
-    the window-relative id a spatial `filter` actually tests against, which this function
-    deliberately does NOT compute).
+    the ABSOLUTE `grid_cell` id a spatial `filter` actually tests against, which this
+    function deliberately does NOT compute).
 
     Returns one entry per input pair, in order, `None` for a point that falls outside the
     raster's own extent -- the same per-point, independent-resolution contract
@@ -222,35 +229,125 @@ def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -
     return resolved
 
 
-def raster_grid_cell_id(pixel: tuple[int, int], window) -> int:
-    """The row-major `grid_cell` id a pixel at ABSOLUTE `(row, col)` (as `resolve_raster_
-    pixel` returns) would be assigned by `execution.frame.row_major_grid_cell` if it were
-    read as part of `window` -- computed forward from a known pixel position, rather than
-    decoded from a row a real read produced.
+def raster_grid_cell_id(grid_name: str, pixel: tuple[int, int]) -> int:
+    """The ABSOLUTE row-major `grid_cell` id a pixel at ABSOLUTE `(row, col)` (as
+    `resolve_raster_pixel` returns) would be assigned by `execution.band_ops.
+    sample_grid_cells_band_wide` -- computed forward from a known pixel position, rather
+    than decoded from a row a real read produced.
 
-    `window` is duck-typed to accept either `io.window.ReadWindow` or a plain
-    `rasterio.windows.Window` -- both carry `row_off`/`col_off`/`width`, which is all this
-    needs; importing this module does not otherwise require `execution` or a specific
-    window type from either caller.
-
-    The formula is the SAME arithmetic `row_major_grid_cell`'s own `join_asof` decode
-    collapses to once a batch's absolute row/col are known
-    (`execution/frame.py`'s `__batch_row`/`__batch_col` are already absolute grid
-    coordinates): `(row - window.row_off) * window.width + (col - window.col_off)`. It
-    holds regardless of how a real read happened to be CHUNKED into batches -- batching
-    only changes which raw row index a pixel lands at partway through a scan, never the id
-    `row_major_grid_cell` decodes it back to -- which is exactly why this function needs no
-    knowledge of `window.batch_layout` at all to reproduce the same answer.
-
-    A caller that narrows `window` for one origin after ids were already computed against
-    a wider one (`execution.execute`'s point-sparse read is exactly this) must recompute
-    EVERY id it still needs against the new window, all at once, and use nothing but those
-    recomputed ids from that point on: a `grid_cell` filter's literal values and the
-    `grid_cell` column an actual read of that window produces must come from calling this
-    function against the identical `window`, or the two silently address different pixels.
+    `row * grid.width + col`, over `grid_name`'s own full pixel width -- no window
+    involved at all. That is deliberate, not an omission: `execution.frame.
+    row_major_grid_cell`'s absolute mode (what `sample_grid_cells_band_wide` always uses to
+    label its output now) numbers every pixel from the RASTER's own origin, never from
+    whatever window a particular read happened to cover, so this id means the same pixel
+    regardless of whether -- or how -- `execution.execute`'s point-sample narrowing chose
+    to read it. A caller building a `grid_cell` filter from a resolved coordinate calls this
+    once per pixel and uses the result directly; there is no window to keep in sync with it,
+    and no "recompute every id together" step the way the window-relative id this function
+    used to return once required.
     """
     row, col = pixel
-    return (row - window.row_off) * window.width + (col - window.col_off)
+    return row * GRIDS[grid_name].width + col
+
+
+def grid_cell_id_where(grid_cell_ids: list[int]) -> str:
+    """The `where` conjunct for an already-resolved, plain list of int `grid_cell` ids --
+    shared by both grid kinds' non-digit `grid_cell` handling, since by the time either
+    `resolve_vector_grid_cell` or `resolve_raster_point_labels`/`raster_grid_cell_id` has
+    run, a coordinate has already become exactly this: a list of ints, with no grid-kind-
+    specific shape left to it.
+
+    `= N` for one id, `IN (...)` for several, and `"grid_cell != grid_cell"` -- the
+    unsatisfiable-for-any-real-value clause `request.data_query`'s own module docstring
+    names as the convention for "matched nothing" -- for zero ids, so a request whose every
+    point resolved to nothing (see `resolve_raster_point_labels`'s docstring, or a vector
+    coordinate landing outside every polygon) still builds a STRUCTURALLY valid `Pipeline`
+    (one that runs and returns an empty result), rather than a `where` string with an empty
+    `IN ()`, which is not valid SQL.
+    """
+    ids = sorted(set(grid_cell_ids))
+    if not ids:
+        return "grid_cell != grid_cell"
+    if len(ids) == 1:
+        return f"grid_cell = {ids[0]}"
+    return f"grid_cell IN ({', '.join(str(cell_id) for cell_id in ids)})"
+
+
+def resolve_raster_point_labels(grid_name: str, tokens: list[str]) -> dict[int, list[str]]:
+    """Resolve a raster point query's raw, comma-flattened `grid_cell` tokens (e.g.
+    `options.grid_cell.split(",")` -- alternating lng, lat, lng, lat, ..., exactly as the
+    caller wrote them and not yet paired up) to the ABSOLUTE ids `grid_cell_id_where` turns
+    into a `where` conjunct, and to the id -> [original label] map a caller uses afterward
+    to relabel the executed result back to coordinate strings (`relabel_raster_grid_cell`,
+    below).
+
+    Each returned map value is that point's own two tokens rejoined with a literal comma --
+    `f"{lng_token},{lat_token}"` -- never a value round-tripped through `float()` and back.
+    This is a deliberate departure from the OLD engine's raster point-query convention
+    (`analysis.raster`'s `column_labels = [f"{x!s},{y!s}" for x, y in zip(lngs, lats)]`,
+    which reformats e.g. `"-90.10"` down to `"-90.1"`): a caller joining the response back
+    to its own request needs the EXACT string it sent, not a value that has been through a
+    float and back. A caller that names the same point twice, or two points that resolve to
+    the same pixel, gets both of their original label strings back in that one id's list --
+    `relabel_raster_grid_cell` fans them back out into one row apiece. Nothing here
+    deduplicates by pixel the way `analysis.vector.apply_grid_cell_selection` deliberately
+    does for a vector grid's ID-labeled output (see that function's own docstring): the
+    raster convention this mirrors was never ID-labeled to begin with, so there is no
+    id-level dedup to preserve going into it.
+
+    A token pair that resolves to no pixel at all (`resolve_raster_pixel`'s own `None`, for
+    a point outside `grid_name`'s raster extent) is simply ABSENT from the returned map --
+    the same "outside every polygon is dropped, not an error" convention
+    `resolve_vector_grid_cell` already keeps for a vector grid, extended here to mean: a
+    request naming a point outside the raster gets no row back for that point (fewer rows
+    than points requested, or none at all), never a 400. `grid_cell_id_where` turns "every
+    point resolved to nothing" into the pipeline's own "matched nothing" `where`, which is
+    what makes that choice hold end-to-end rather than just at this one function.
+    """
+    lngs, lats = parse_coordinate_pairs(tokens)
+    pixels = resolve_raster_pixel(grid_name, lngs, lats)
+
+    id_to_labels: dict[int, list[str]] = {}
+    for point_idx, pixel in enumerate(pixels):
+        if pixel is None:
+            continue
+        label = f"{tokens[2 * point_idx]},{tokens[2 * point_idx + 1]}"
+        cell_id = raster_grid_cell_id(grid_name, pixel)
+        id_to_labels.setdefault(cell_id, []).append(label)
+    return id_to_labels
+
+
+def relabel_raster_grid_cell(lf: pl.LazyFrame, id_to_labels: dict[int, list[str]]) -> pl.LazyFrame:
+    """Replace an executed raster point query's ABSOLUTE integer `grid_cell` column with
+    the original coordinate-string label(s) that resolved to it -- the raster point-query
+    output convention this engine keeps (see `resolve_raster_point_labels`'s docstring for
+    why the label is the caller's own token pair, verbatim, never reformatted).
+
+    An inner join, not a dict lookup: `id_to_labels` (built by `resolve_raster_point_labels`)
+    can map one id to MORE than one label, when two requested points share a pixel --
+    joining `lf` against a flattened `(grid_cell, label)` table fans a single matching data
+    row back out into one row per original label, which a `.replace()`-style substitution
+    could not do; a plain Python dict lookup only ever produces one output per input row. A
+    `grid_cell` value with no entry in `id_to_labels` at all (impossible if `lf` was itself
+    produced by filtering on `grid_cell_id_where(list(id_to_labels))`, but not assumed here)
+    simply drops out of the join, the same as any other row a `where` would exclude.
+    """
+    ids: list[int] = []
+    labels: list[str] = []
+    for cell_id, point_labels in id_to_labels.items():
+        for label in point_labels:
+            ids.append(cell_id)
+            labels.append(label)
+
+    labels_frame = pl.LazyFrame(
+        {"grid_cell": ids, "__grid_cell_label": labels},
+        schema={"grid_cell": pl.Int64, "__grid_cell_label": pl.Utf8},
+    )
+    return (
+        lf.join(labels_frame, on="grid_cell", how="inner")
+        .drop("grid_cell")
+        .rename({"__grid_cell_label": "grid_cell"})
+    )
 
 
 def representative_points(grid_name: str, grid_cell_ids: list[int] | None = None) -> dict[int, tuple]:
