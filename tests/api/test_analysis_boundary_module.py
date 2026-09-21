@@ -43,7 +43,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 import rasterio as rio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -61,7 +61,7 @@ from cpra.mp.data.analysis.request.errors import (
 )
 from cpra.mp.data.analysis.request.expressions import ExpressionError
 from cpra.mp.data.api import pipeline as api_pipeline
-from cpra.mp.data.api.boundary import install_analysis_boundary, resolve_status
+from cpra.mp.data.api.boundary import install_analysis_boundary, resolve_detail, resolve_status
 from cpra.mp.data.tabular import write_parquet
 from tests.factories import ANNUAL_KWARGS, RASTER_KWARGS, annual_frame, write_raster_dataset
 
@@ -115,6 +115,49 @@ class TestResolveStatus:
 
 
 # --------------------------------------------------------------------------------------
+# resolve_detail: the body half of the same question, consulted by both the registered
+# handlers and `PipelineTabularResponse` so the two can never disagree about what a given
+# exception is allowed to say.
+# --------------------------------------------------------------------------------------
+
+
+class TestResolveDetail:
+    def test_an_unlisted_type_answers_with_its_own_message(self):
+        """The default path: these messages are this package's own text, written to be
+        read by the caller, so they pass through verbatim.
+        """
+        assert resolve_detail(RequestError("bad pipeline shape")) == "bad pipeline shape"
+        assert resolve_detail(ColumnNotFoundError("no such column")) == "no such column"
+
+    def test_file_not_found_is_overridden_and_drops_the_path(self):
+        exc = FileNotFoundError(
+            "No such file or directory (os error 2): /ocean/projects/x/variable=marsh/p.parquet"
+        )
+        assert resolve_detail(exc) == "Dataset does not exist"
+
+    def test_a_subclass_of_an_overridden_type_cannot_route_around_the_override(self):
+        """The reason `resolve_detail` walks the MRO instead of doing a dict lookup on
+        `type(exc)`: `FileNotFoundError` has real subclasses in the wild, and an exact-type
+        lookup would let one of them leak the very message its parent is listed to
+        suppress.
+        """
+
+        class WrappedFileNotFound(FileNotFoundError):
+            pass
+
+        exc = WrappedFileNotFound("No such file or directory: /ocean/projects/x/p.parquet")
+        assert resolve_detail(exc) == "Dataset does not exist"
+
+    def test_an_exception_carrying_its_own_detail_uses_it(self):
+        """`HTTPException`-shaped exceptions reaching the tabular response's error path
+        already carry route-authored text in `.detail`; that is preferred over `str(exc)`,
+        which for those renders as a repr-ish string rather than the message.
+        """
+        exc = HTTPException(status_code=400, detail="URL format does not match")
+        assert resolve_detail(exc) == "URL format does not match"
+
+
+# --------------------------------------------------------------------------------------
 # install_analysis_boundary: the registered-handler half, against a throwaway app -- no
 # real pipeline or route involved, only routes built to raise each exception directly.
 # --------------------------------------------------------------------------------------
@@ -156,6 +199,15 @@ def boundary_app():
     def _raise_column_not_found():
         raise ColumnNotFoundError("no such column")
 
+    @app.get("/raise/file-not-found")
+    def _raise_file_not_found():
+        # Spelled the way Polars' reader actually spells it, absolute path and all --
+        # that path is the thing `_DETAIL_BY_TYPE` exists to keep out of the response.
+        raise FileNotFoundError(
+            "No such file or directory (os error 2): "
+            "/ocean/projects/bcs200002p/shared/data-long/variable=marsh/part-0.parquet"
+        )
+
     return app
 
 
@@ -185,6 +237,20 @@ class TestInstallAnalysisBoundary:
         # Every handler returns exactly {"detail": str(exc)} -- if a handler leaked a
         # traceback, wrapped the message differently, or dropped it, this would catch it.
         assert response.json() == {"detail": message}
+
+    def test_file_not_found_answers_404_without_disclosing_the_path(self, boundary_client):
+        """A missing data file is a 404, but the reader's own message names the absolute
+        server path it tried to open, and that must not reach the caller. The old engine's
+        two readers (`api.sources.LazyFrameSource.materialize`, `analysis.base.BaseAnalysis
+        .materialize`) both answer this case with a fixed string for exactly that reason;
+        `_DETAIL_BY_TYPE` is what keeps the new engine from regressing on it while the
+        other registered types keep passing their own (ours to disclose) message through.
+        """
+        response = boundary_client.get("/raise/file-not-found")
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Dataset does not exist"}
+        assert "/ocean/" not in response.text
+        assert "parquet" not in response.text
 
     def test_mro_covers_a_subclass_with_no_registration_of_its_own(self, boundary_client):
         """`ShapeError` (raised by `/raise/shape-error`) is never itself a key in
@@ -319,6 +385,30 @@ class TestFourRoutesEndToEnd:
         metadata = pq.ParquetFile(io.BytesIO(response.content)).metadata
         codec = metadata.row_group(0).column(0).compression
         assert codec.upper() == "GZIP"
+
+    def test_a_missing_dataset_is_404_without_disclosing_the_path(
+        self, client, base_path, monkeypatch
+    ):
+        """Deliberately no `write_parquet`: the combo is legal but nothing is on disk, so
+        the reader raises `FileNotFoundError` inside the sink's writer thread. That thread
+        SWALLOWS the exception rather than letting it reach FastAPI's dispatch, so the
+        registered handler never fires and the streaming response has to resolve both the
+        status and the body itself -- this is the route-level proof that it resolves the
+        body through `resolve_detail` (fixed string) rather than `str(err)` (which names
+        the absolute path the reader tried to open).
+        """
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [],
+            "output": {"format": "csv"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 404, response.text
+        assert "Dataset does not exist" in response.text
+        assert str(base_path) not in response.text
+        assert "parquet" not in response.text
 
     def test_an_exception_the_boundary_does_not_know_is_500_on_the_tabular_route(
         self, client, base_path, monkeypatch

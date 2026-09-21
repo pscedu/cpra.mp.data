@@ -61,6 +61,7 @@ from cpra.mp.data.analysis.execution.plan import DEFAULT_TILE_SIZE, TileRequest
 from cpra.mp.data.analysis.io.output import resolve_legend, stream_tabular, tabular_kwargs
 from cpra.mp.data.analysis.io.raster import NUMPY_TO_POLARS
 from cpra.mp.data.analysis.io.raster_io import warp_array_to_tile
+from cpra.mp.data.analysis.request.errors import ShapeError
 
 __all__ = [
     "DEFAULT_NODATA",
@@ -370,7 +371,7 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
 
     band_names = band_column_names(metadata_df)
     if len(band_names) != 1:
-        raise ValueError(
+        raise ShapeError(
             f"render_tile: {len(band_names)} bands reached the tile sink, not 1 -- a "
             "rendered tile needs exactly one band (add a trailing group step to "
             "collapse the rest)"

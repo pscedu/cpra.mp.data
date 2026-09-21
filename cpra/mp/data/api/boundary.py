@@ -1,8 +1,9 @@
 """The one translation point between the NEW analysis engine's transport-agnostic
 exception families (`request.errors.RequestError` and its members, `request.expressions.
 ExpressionError`, `execution.execute.LoweringNotImplementedError`, plus Polars' own
-`ColumnNotFoundError`) and real HTTP responses, for the `/v1/analysis...` pipeline
-surface (`api/pipeline.py`) and the four routes in `api/__init__.py` that use it.
+`ColumnNotFoundError` and the builtin `FileNotFoundError`) and real HTTP responses, for
+the `/v1/analysis...` pipeline surface (`api/pipeline.py`) and the four routes in
+`api/__init__.py` that use it.
 
 This is the NEW engine's counterpart to `api/__init__.py`'s three existing handlers
 (`analysis_error_handler`, `analysis_registry_error_handler`, `pipeline_error_handler`),
@@ -21,10 +22,12 @@ without a handler per subclass -- provided no subclass ever needs a DIFFERENT st
 than the family default, in which case that subclass gets its own, more specific,
 registration instead (none currently does).
 
-**Response body.** Every handler here returns `{"detail": str(exc)}`, matching
+**Response body.** Every handler here returns `{"detail": <text>}`, matching
 `api/__init__.py`'s `analysis_error_handler` shape exactly, so a caller sees no difference
 in envelope between the old and new exception worlds -- only the status code and the
-message differ per exception type.
+message differ per exception type. The text is `resolve_detail`'s, which is `str(exc)` for
+everything except the few types `_DETAIL_BY_TYPE` overrides because their message is not
+ours to disclose.
 
 **Status code mapping**, each chosen by what the exception's own docstring says it means:
 
@@ -44,6 +47,22 @@ message differ per exception type.
   select` names a column that passed `request.pipeline`'s SYNTAX check
   (`_validate_output_sort_or_select`) but does not exist on the final frame -- the other
   half of that deliberate split; see `execution.sink.apply_output_shaping`'s docstring.
+- `FileNotFoundError` -> 404. Raised by Polars/rasterio's own readers when a real
+  variable/grid/time_unit combo simply has no file on disk yet -- the NEW engine's
+  counterpart to the OLD engine's `BaseAnalysis.materialize`/`api.sources.LazyFrameSource
+  .materialize`, both of which catch this and re-raise as a 404 for the same reason (see
+  `execution.sink`'s `_materialize_closure` docstring, which explicitly leaves this
+  translation to "the error boundary a route installs" -- this entry is that boundary).
+  Not a member of any `request.errors` family: it is raised by the underlying I/O layer
+  (`analysis.io.vector.scan_vector` -> `tabular.read_parquet` -> `pl.scan_parquet(...)
+  .collect()`), not by anything under `request/`, so it is registered here directly
+  rather than wrapped in a `RequestError` subclass. Its body text is overridden
+  (`_DETAIL_BY_TYPE`) rather than passed through: the reader's own message names the
+  absolute path it could not open. Note this entry is app-wide, so a missing file that is
+  a server MISCONFIGURATION (an absent crosswalk or grid file) also answers 404 rather
+  than 500 -- the same conflation the old engine's two readers make, kept deliberately
+  because narrowing it means catching at each read site, of which the new engine has
+  several (tabular sink, vector tile, raster scan).
 
 **`resolve_status`, and why it exists alongside the registered handlers rather than being
 replaced by them.** Both `install_analysis_boundary`'s handlers AND `resolve_status` below
@@ -83,6 +102,7 @@ _STATUS_BY_TYPE: dict[type[Exception], int] = {
     ExpressionError: 400,
     LoweringNotImplementedError: 501,
     ColumnNotFoundError: 400,
+    FileNotFoundError: 404,
 }
 
 
@@ -104,6 +124,37 @@ def resolve_status(exc: Exception) -> int | None:
     return None
 
 
+# The types whose own message must NOT reach the caller, and what to say instead.
+# Everything absent from here answers with `str(exc)`, which is this package's own message
+# text. `FileNotFoundError`'s is the reader's, and it carries the absolute server path of
+# the file that was missing ("No such file or directory (os error 2): /ocean/projects/
+# .../variable=marsh/....parquet") -- a filesystem layout the caller has no business
+# seeing. The old engine's two readers (`api.sources.LazyFrameSource.materialize` and
+# `analysis.base.BaseAnalysis.materialize`) both answer this exact case with a fixed
+# string for that reason, while passing `ColumnNotFoundError`'s message straight through;
+# that split is deliberate and is reproduced here so moving a route onto the new engine
+# cannot start disclosing paths the old one withheld.
+_DETAIL_BY_TYPE: dict[type[Exception], str] = {
+    FileNotFoundError: "Dataset does not exist",
+}
+
+
+def resolve_detail(exc: Exception) -> str:
+    """The response body text for `exc`: the fixed string for a type `_DETAIL_BY_TYPE`
+    overrides, else the exception's own `detail` when it carries one (an `HTTPException`
+    raised before this boundary was reached), else `str(exc)`.
+
+    Walks `type(exc).__mro__` exactly as `resolve_status` does, so a SUBCLASS of an
+    overridden type cannot route around the override and leak the message its parent was
+    listed to suppress.
+    """
+    for klass in type(exc).__mro__:
+        detail = _DETAIL_BY_TYPE.get(klass)
+        if detail is not None:
+            return detail
+    return getattr(exc, "detail", str(exc))
+
+
 def install_analysis_boundary(app: FastAPI) -> None:
     """Register one exception handler per `_STATUS_BY_TYPE` entry onto `app`. Called
     exactly once, from `api/__init__.py`, alongside (not instead of) the three existing
@@ -121,7 +172,7 @@ def install_analysis_boundary(app: FastAPI) -> None:
 
     def _make_handler(status: int):
         async def _handler(request: Request, exc: Exception) -> JSONResponse:
-            return JSONResponse(status_code=status, content={"detail": str(exc)})
+            return JSONResponse(status_code=status, content={"detail": resolve_detail(exc)})
 
         return _handler
 

@@ -54,7 +54,7 @@ from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.execution import sink
 from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.ops import Shape
-from cpra.mp.data.api.boundary import resolve_status
+from cpra.mp.data.api.boundary import resolve_detail, resolve_status
 from cpra.mp.data.api.raster import COMPRESSION_LEVEL_OPTIONS
 from cpra.mp.data.api.tabular import StreamingThread
 from cpra.mp.data.grids import GRIDS
@@ -195,7 +195,7 @@ class PipelineTabularResponse(Response):
                                 }
                             )
                             if err:
-                                chunk = getattr(err, "detail", str(err)).encode("utf-8")
+                                chunk = resolve_detail(err).encode("utf-8")
                                 more_body = False
                         await send(
                             {
