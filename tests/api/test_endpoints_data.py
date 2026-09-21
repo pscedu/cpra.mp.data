@@ -333,15 +333,15 @@ class TestVectorData:
         `group_aggregate` (like `group_by`) is retired from the flat data route
         -- this now goes through the ad-hoc `/v1/analysis.csv` pipeline route's
         `filter` + `group` steps instead, the pipeline equivalent of the same request.
-        The leading identity `project` (`to` the input's own grid) exists purely to give
-        `filter` something to chain from -- a pipeline's first step must name its input
-        explicitly, which only `project`/`join` can do.
+        The leading `filter` names `ssf` as its own `input` (`FilterStep.input` lets a
+        `filter` open a pipeline on its own; there is no default aggregate for a
+        vector-to-vector `project`, so a leading identity `project` is no longer a legal
+        way to do this).
         """
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
-                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
-                {"op": "filter", "where": "value > 2035"},
+                {"op": "filter", "input": "ssf", "where": "value > 2035"},
                 {"op": "group", "by": [], "aggregate": "count"},
             ],
             "output": {"format": "csv"},
@@ -367,10 +367,14 @@ class TestVectorData:
         write_parquet(annual_frame(years=years), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
+        # `GroupStep` has no `input` field of its own and so can never lead a pipeline
+        # (see its docstring); a leading `filter` names the input instead. Its `where` is
+        # vacuously true for every written row -- it exists only to satisfy the chaining
+        # rule, not to narrow anything, since narrowing isn't what this test is about.
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
-                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
+                {"op": "filter", "input": "ssf", "where": "calendar_year >= 2000"},
                 {"op": "group", "by": [], "aggregate": "sum"},
             ],
             "output": {"format": "csv"},
@@ -386,10 +390,16 @@ class TestVectorData:
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_vector_data):
         """"How many cells carry each distinct value per zone" -- one `project`-to-a-
-        coarser-grid step with `aggregate=count_by_value`, asserting the long output
-        shape (grid_cell/value/count/geographic_unit), through the `/v1/analysis.csv`
+        coarser-grid step with `aggregate=count_by_value`, through the `/v1/analysis.csv`
         pipeline route (`summarize_by`/`summarize_aggregate` have no flat spelling
         anymore -- `project`+`aggregate` is their pipeline equivalent).
+
+        The output schema is `grid_cell`/`value_category`/`value`, with no
+        `geographic_unit` column: `execution/project.py::_count_by_value` emits one row
+        per (destination cell, distinct source value), naming the distinct value itself
+        in `value_category` and putting the COUNT in `value` -- the column called `value`
+        holds a count here, not a measured quantity, which is the opposite of every other
+        aggregate's `value` column and easy to misread if you don't already know it.
         """
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
@@ -401,7 +411,8 @@ class TestVectorData:
         response = client.post("/v1/analysis.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
-        assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
+        assert {"grid_cell", "value_category", "value"} <= set(df.columns)
+        assert "geographic_unit" not in df.columns
 
         expected = {100: {}, 200: {}}
         for geo_id in range(1, 33):
@@ -411,7 +422,7 @@ class TestVectorData:
 
         for zone_id, value_counts in expected.items():
             zone_df = df.filter(pl.col("grid_cell") == zone_id)
-            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            actual = dict(zip(zone_df["value_category"].to_list(), zone_df["value"].to_list()))
             assert actual == value_counts
 
     def test_mixed_dimension_and_value_where_aggregating(self, client, vector_data):
@@ -422,25 +433,16 @@ class TestVectorData:
         vacuously true for every remaining cell (see `annual_frame`'s
         `year + geo_id / 100`), so `aggregate=count` should still see all 32 cells.
 
-        The two conjuncts are deliberately spelled as two separate `filter` steps
-        rather than one `"calendar_year > 2035 AND value > 0"` string: a single-input
-        pipeline compiles every `filter` step's `where` onto one combined
-        `Options.where` by wrapping each step's clause in its own parens and AND-ing
-        them together (`planner._compile_single_input_chain`), which is exactly right
-        when each step's own clause is a single conjunct, but corrupts a step whose own
-        `where` is *itself* multiple AND-ed conjuncts (the parens hide the inner AND
-        from the executor's own later re-split of `Options.where` into dimension/value
-        conjuncts, so a perfectly valid one-dimension-one-value `where` gets rejected
-        as if it were one mixed conjunct). That's a pre-existing pipeline-compiler
-        limitation, not something introduced by this test, and out of scope for this
-        change -- splitting across two `filter` steps here avoids it entirely without giving up
-        anything this test is meant to demonstrate.
+        The two conjuncts are spelled as two separate `filter` steps, each running at its
+        own declared position in the walk, rather than one `"calendar_year > 2035 AND
+        value > 0"` string -- either spelling is legal here; two steps is chosen so the
+        dimension narrowing and the value narrowing are each independently visible in the
+        pipeline rather than folded into one opaque predicate.
         """
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
-                {"op": "project", "input": "ssf", "to": "ecoregion_v001"},
-                {"op": "filter", "where": "calendar_year > 2035"},
+                {"op": "filter", "input": "ssf", "where": "calendar_year > 2035"},
                 {"op": "filter", "where": "value > 0"},
                 {"op": "group", "by": [], "aggregate": "count"},
             ],
@@ -524,24 +526,18 @@ class TestRasterData:
         this goes through the pipeline route whose `project`+`aggregate` step compiles onto
         those `Options` fields rather than the plain data route.
 
-        The filter is now declared exactly where it executes: both steps lower onto
-        `Options` (`where`, and `summarize_by`/`summarize_aggregate` respectively), and
-        the flat lowering always emits the `where` filter before the zonal aggregation
-        the summarize applies -- so declaring the filter first is what makes
-        "pixel-level threshold,
-        not a post-count one" the TRUTH of the declared order, not a fact the reader has
-        to already know about the underlying engine to get the right answer.
+        The filter is declared exactly where it executes: each step runs at its own
+        position in the walk, with no reordering, so a `filter` declared BEFORE the
+        `project` genuinely narrows the raw pixels first, and a `filter` declared AFTER
+        it would instead test the zonal counts the `project` produced -- a different,
+        and here wrong, question. Declaring the filter first is therefore not just a
+        style choice; it is what makes "pixel-level threshold, not a post-count one" the
+        actual behavior, not a fact the reader has to already know about the engine to
+        get the right answer.
 
-        This pipeline used to be spelled the other way around --
-        `project(aggregate=count) -> filter(value > X)`, filter declared AFTER project --
-        and relied on the engine silently reordering the filter before the project's
-        aggregation to produce the right answer despite the declared order promising the
-        opposite. `planner._compile_single_input_chain`'s SUMMARIZING-PROJECT ORDER GUARD
-        (its `is_summarizing_project` checks) now rejects that old spelling outright
-        (a value-testing `filter` declared after a many-to-one `project` is a verified
-        wrong answer, not just an unimplemented feature -- see the guard's own
-        `PipelineError` for the numeric counterexample); the leading-filter spelling
-        below is its replacement.
+        The predicate is `value > threshold`, not `vct > threshold`: a raw (unprojected)
+        input's measured column is always named `value` in this engine, never the
+        variable's own name.
         """
         _base_path, _grid, zones = gradient_raster_with_zones
         gradient = raster_array()
@@ -550,7 +546,7 @@ class TestRasterData:
         pipeline = {
             "inputs": {"vct": {"variable": "vct", "time_unit": "annual", "grid": "veg_grid_cell_v001"}},
             "steps": [
-                {"op": "filter", "input": "vct", "where": f"vct > {threshold}"},
+                {"op": "filter", "input": "vct", "where": f"value > {threshold}"},
                 {"op": "project", "to": "hydro_compartment_v001", "aggregate": "count"},
             ],
             "output": {"format": "csv"},
@@ -565,11 +561,17 @@ class TestRasterData:
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_raster_with_zones):
         """"How many pixels of each land-type value per hydro compartment" -- one
-        `project`-to-a-coarser-grid step with `aggregate=count_by_value`, asserting the
-        long output shape (grid_cell/value/count/geographic_unit), through the
+        `project`-to-a-coarser-grid step with `aggregate=count_by_value`, through the
         `/v1/analysis.csv` pipeline route (`summarize_by`/`summarize_aggregate` are
         retired flat-query parameters with no pipeline-step equivalent by that name --
         this test exercises their `project`/`aggregate` replacement instead).
+
+        The output schema is `grid_cell`/`value_category`/`value`, with no
+        `geographic_unit` column: `execution/project.py::_count_by_value` emits one row
+        per (destination cell, distinct source value), naming the distinct value itself
+        in `value_category` and putting the COUNT in `value` -- the column called `value`
+        holds a count here, not a measured quantity, which is the opposite of every other
+        aggregate's `value` column and easy to misread if you don't already know it.
         """
         _base_path, _grid, zones = categorical_raster_with_zones
         categories = raster_array() % 5
@@ -584,13 +586,14 @@ class TestRasterData:
         response = client.post("/v1/analysis.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
-        assert {"grid_cell", "value", "count", "geographic_unit"} <= set(df.columns)
+        assert {"grid_cell", "value_category", "value"} <= set(df.columns)
+        assert "geographic_unit" not in df.columns
 
         for zone_id in (1, 2):
             values, counts = np.unique(categories[zones == zone_id], return_counts=True)
             expected = dict(zip(values.tolist(), counts.tolist()))
             zone_df = df.filter(pl.col("grid_cell") == zone_id)
-            actual = dict(zip(zone_df["value"].to_list(), zone_df["count"].to_list()))
+            actual = dict(zip(zone_df["value_category"].to_list(), zone_df["value"].to_list()))
             assert actual == expected
 
 

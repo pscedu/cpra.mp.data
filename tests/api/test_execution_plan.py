@@ -336,7 +336,7 @@ class TestProjectPushdown:
                     {"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"},
                     {"op": "filter", "input": "p", "where": "value > 1"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
@@ -386,7 +386,7 @@ class TestShapeAnnotation:
 
     def test_a_raster_input_is_band_wide(self):
         pipeline = _pipeline(
-            {"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}}
+            {"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}}
         )
         plan = compile_plan(pipeline)
         assert plan.frame_types["a"].shape == Shape.band_wide
@@ -530,7 +530,7 @@ class TestRasterBandPushdown:
             {
                 "inputs": {"a": raster_input()},
                 "steps": [{"op": "filter", "input": "a", "where": "calendar_year >= 2035"}],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
@@ -555,7 +555,7 @@ class TestRasterBandPushdown:
                     {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"},
                     {"op": "filter", "input": "c", "where": "calendar_year >= 2035"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
@@ -602,7 +602,7 @@ class TestRasterBandPushdown:
             {
                 "inputs": {"a": raster_input()},
                 "steps": [{"op": "filter", "input": "a", "where": "value > 100"}],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
@@ -655,7 +655,7 @@ class TestRasterBandPushdown:
         monkeypatch.setattr(
             plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         assert compile_plan(pipeline).inputs["a"].point_sample_step is None
 
 
@@ -666,7 +666,7 @@ class TestBandLimitError:
             "resolve_raster_bands",
             _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING + 1)]),
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         with pytest.raises(BandLimitError):
             compile_plan(pipeline)
 
@@ -680,7 +680,7 @@ class TestBandLimitError:
             {
                 "inputs": {"a": raster_input()},
                 "steps": [{"op": "filter", "input": "a", "where": "calendar_year = 2000"}],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
@@ -706,7 +706,7 @@ class TestBandWideJoinCeiling:
                 {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
                 {"op": "calculate", "input": "j", "expression": "a + b"},
             ],
-            "output": {"format": "csv"},
+            "output": {"format": "tif"},
         }
 
     def test_operands_individually_under_the_ceiling_but_over_it_together_raises(self, monkeypatch):
@@ -766,7 +766,7 @@ class TestBandWideJoinCeiling:
                 {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
                 {"op": "calculate", "input": "j2", "expression": "value + c"},
             ],
-            "output": {"format": "csv"},
+            "output": {"format": "tif"},
         }
         # Pairwise, every join is under the ceiling; all three together are over it.
         assert 2 * third_over <= ANALYSIS_BAND_CEILING < 3 * third_over
@@ -792,7 +792,7 @@ class TestBandWideJoinCeiling:
                         {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
                         {"op": "calculate", "input": "j2", "expression": "value + c"},
                     ],
-                    "output": {"format": "csv"},
+                    "output": {"format": "tif"},
                 }
             )
         )
@@ -932,7 +932,7 @@ class TestOverviewEligibility:
                     {"op": "join", "type": "spatial", "inputs": ["b", "c"], "as": "j"},
                     {"op": "calculate", "input": "j", "expression": "b + c"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline)
@@ -945,7 +945,7 @@ class TestOverviewEligibility:
         monkeypatch.setattr(
             plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.straddling_vector_grid is None
         assert resolved.overview_permitted is True
@@ -985,7 +985,7 @@ class TestTileReadWindow:
         monkeypatch.setattr(
             plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline)
         assert plan.tile is None
         assert plan.inputs["a"].read_window is None
@@ -995,7 +995,7 @@ class TestTileReadWindow:
         monkeypatch.setattr(
             plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         tile = TileRequest(*_tile_over_the_raster_grid())
         plan = compile_plan(pipeline, tile=tile)
 
@@ -1015,7 +1015,7 @@ class TestTileReadWindow:
         monkeypatch.setattr(
             plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
         )
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "csv"}})
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline, tile=TileRequest(1, 1, 1))
         assert plan.inputs["a"].tile_disjoint is True
         assert plan.inputs["a"].read_window is None
@@ -1050,7 +1050,7 @@ class TestTileReadWindow:
                     {"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum", "as": "p"},
                     {"op": "calculate", "input": "b", "expression": "value * 2", "as": "c"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, tile=tile)

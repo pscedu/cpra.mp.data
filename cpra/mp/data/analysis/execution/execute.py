@@ -706,7 +706,7 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     return result
 
 
-def run_to_path(pipeline, out_path, *, base_path=None, collect_in_memory=False, dtype=None, nodata=None, **profile_options) -> bool:
+def run_to_path(pipeline, out_path, *, base_path=None, dtype=None, nodata=None, **profile_options) -> bool:
     """Compile, run, and sink `pipeline` to `out_path` in one call -- `compile_plan` then
     `execute` then whichever of the two "a whole result, at a path" sinks matches the
     result's own shape (`execution.sink.sink_tabular` for a long frame,
@@ -730,15 +730,21 @@ def run_to_path(pipeline, out_path, *, base_path=None, collect_in_memory=False, 
     raster's `count` from, so there is no analogous "nothing to write" case for that
     branch to report.
 
-    `dtype`/`nodata`/`**profile_options` are forwarded to `write_raster`, left at THIS
-    function's own `None` default when the caller does not set them -- `nodata=None` is
-    not forwarded as a literal `None` (which `write_raster` would take as "declare no
-    nodata at all", a different, real profile choice), it is left OUT of the call
-    entirely so `write_raster`'s own `DEFAULT_NODATA` default takes over. `nodata=0`, a
-    legitimate declared value some datasets use, is forwarded exactly as given -- not
-    treated as "unset" the way a bare `nodata or DEFAULT_NODATA` would wrongly do.
-    Ignored entirely for a long/tabular result, the same way `nodata` has no meaning for
-    a CSV row.
+    `dtype`/`nodata` are forwarded to `write_raster`, left at THIS function's own `None`
+    default when the caller does not set them -- `nodata=None` is not forwarded as a
+    literal `None` (which `write_raster` would take as "declare no nodata at all", a
+    different, real profile choice), it is left OUT of the call entirely so
+    `write_raster`'s own `DEFAULT_NODATA` default takes over. `nodata=0`, a legitimate
+    declared value some datasets use, is forwarded exactly as given -- not treated as
+    "unset" the way a bare `nodata or DEFAULT_NODATA` would wrongly do. Both are ignored
+    entirely for a long/tabular result, the same way neither has meaning for a CSV row.
+
+    `**profile_options` is forwarded whole to whichever sink the result's shape picks --
+    `write_raster`'s rasterio-profile kwargs (`compress`, `zstd_level`, etc.) for a
+    band-wide result, `sink.sink_tabular`'s polars writer kwargs (`compression`,
+    `compression_level`) for a long one. Only one branch runs per call, so the same dict
+    is never split or reinterpreted -- whichever caller built it already built it in the
+    vocabulary the result's own shape needs.
 
     Deferred, function-body-local import of `execution.sink`: `sink.py` imports
     `LoweringNotImplementedError` from this module at ITS top level, so importing `sink`
@@ -758,5 +764,5 @@ def run_to_path(pipeline, out_path, *, base_path=None, collect_in_memory=False, 
         return sink.write_raster(result, out_path, **write_kwargs)
 
     lf = sink.apply_output_shaping(result, pipeline.output)
-    sink.sink_tabular(lf, out_path, pipeline.output.format, collect_in_memory=collect_in_memory)
+    sink.sink_tabular(lf, out_path, pipeline.output.format, **profile_options)
     return True

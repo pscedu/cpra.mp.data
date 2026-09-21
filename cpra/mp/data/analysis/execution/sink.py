@@ -5,10 +5,9 @@ and last.
 Five destinations, five free functions -- none of them classes, none of them holding a
 reference to anything but the arguments they were called with:
 
-- `sink_tabular` -- csv/ndjson/parquet, over a `LongFrame`. Delegates the actual writing to
-  `io.output.stream_tabular`/`write_tabular`/`tabular_kwargs`, which already hold the
-  streaming-vs-collect split and the CSV float-precision rule; this only builds the
-  `materialize` closure those two expect and picks between them.
+- `sink_tabular` -- csv/ndjson/parquet, over a `LongFrame`, always lazily. Delegates the
+  actual writing to `io.output.stream_tabular`/`tabular_kwargs`, which already hold the
+  CSV float-precision rule; this only builds the `materialize` closure that expects.
 - `write_raster` -- `tif`, over a `BandWideFrame`. Returns `False` (not a raise) when the
   frame carries no bands, which is what lets a caller tell "no source data" (a 404) apart
   from every other failure.
@@ -59,7 +58,7 @@ from cpra.mp.data.analysis.execution.frame import (
     row_major_grid_cell,
 )
 from cpra.mp.data.analysis.execution.plan import DEFAULT_TILE_SIZE, TileRequest
-from cpra.mp.data.analysis.io.output import resolve_legend, stream_tabular, tabular_kwargs, write_tabular
+from cpra.mp.data.analysis.io.output import resolve_legend, stream_tabular, tabular_kwargs
 from cpra.mp.data.analysis.io.raster import NUMPY_TO_POLARS
 from cpra.mp.data.analysis.io.raster_io import warp_array_to_tile
 
@@ -105,11 +104,14 @@ def apply_output_shaping(lf: LongFrame, output) -> LongFrame:
     Neither list is checked against the frame's actual columns here -- an unknown name
     surfaces as Polars' own `ColumnNotFoundError` when `lf` is collected, the same way an
     unknown column in a `where`/`calculate` expression already does elsewhere in this
-    package. `request.pipeline.Output`'s own fields carry no format constraint on `sort`/
-    `select` beyond "a string" (`model_config`'s `extra="forbid"` covers the field names,
-    not their contents), so there is no existing check this would be duplicating; a
-    request-layer validator for the two is a gap in `request/`, not something to patch in
-    at the sink.
+    package. `request.pipeline.validate_pipeline` (via `_validate_output_sort_or_select`)
+    already checked the SYNTAX of both strings before this ever runs -- no empty
+    component, no bare `-`, no `-`-prefixed `select` entry, no name repeated -- so what
+    reaches here is syntactically well-formed; existence is deliberately the only half
+    left to Polars, since it needs the frame's real column namespace, which is not known
+    until compile/run time. The two halves of this split are documented in both places on
+    purpose: `request/pipeline.py` cannot check existence, and this function should not
+    duplicate a syntax check it has no need to repeat.
     """
     sort = getattr(output, "sort", None)
     select = getattr(output, "select", None)
@@ -133,10 +135,10 @@ def apply_output_shaping(lf: LongFrame, output) -> LongFrame:
 
 
 def _materialize_closure(lf: LongFrame):
-    """Build the `materialize` callable `io.output.stream_tabular`/`write_tabular` expect:
-    called with no arguments it collects `lf`; called with a method name (plus that
-    method's own args/kwargs) it calls that method on `lf` directly (a `sink_*` method,
-    for the streaming path) -- see those two functions' own docstrings for which is which.
+    """Build the `materialize` callable `io.output.stream_tabular` expects: called with no
+    arguments it collects `lf`; called with a method name (plus that method's own args/
+    kwargs) it calls that method on `lf` directly (a `sink_*` method, for the streaming
+    path) -- see that function's own docstring.
 
     The old engine's version of this same closure (`BaseAnalysis.materialize`) also
     translated `ColumnNotFoundError`/`FileNotFoundError` into `AnalysisError` here; that
@@ -154,24 +156,26 @@ def _materialize_closure(lf: LongFrame):
     return materialize
 
 
-def sink_tabular(lf: LongFrame, out_path, format, *, collect_in_memory, float_precision=None) -> None:
-    """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet`/`arrow`).
-
-    `collect_in_memory` picks the same streaming-vs-collect split `api/tabular.py`'s
-    `PolarsStreamingResponse` already exposes to a caller: `True` collects `lf` and writes
-    the materialized `DataFrame` (`io.output.write_tabular`); `False` sinks it lazily,
-    never materializing the whole frame (`io.output.stream_tabular`) -- the split this
-    function exists to preserve rather than force one branch of.
+def sink_tabular(lf: LongFrame, out_path, format, *, float_precision=None, **profile_options) -> None:
+    """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet`/`arrow`), always
+    lazily (`io.output.stream_tabular`) -- this sink never materializes the whole frame
+    first, unlike the old engine's `BaseAnalysis`, which still picks between this same
+    lazy write and an eager, collect-first one (`io.output.write_tabular`) depending on
+    an estimated result size. Nothing analogous to that size estimate exists for a
+    compiled `ExecutionPlan`, so there is only the one (safe-default) path here.
 
     `float_precision` is forwarded to `io.output.tabular_kwargs`, which only ever uses it
-    for `format == "csv"` -- see that function's own docstring.
+    for `format == "csv"` -- see that function's own docstring. `**profile_options` is
+    forwarded straight through to the underlying Polars writer -- `compression`/
+    `compression_level` for `parquet`, landing here as the plain values `run_to_path`'s
+    caller already resolved from a request's own compression choice (see `api.pipeline
+    .PipelineTabularSource`'s docstring for why those arrive as plain values rather than
+    an `api.models.Compression` object).
     """
     kwargs = tabular_kwargs(format, float_precision)
+    kwargs.update(profile_options)
     materialize = _materialize_closure(lf)
-    if collect_in_memory:
-        write_tabular(materialize, out_path, format, **kwargs)
-    else:
-        stream_tabular(materialize, out_path, format, **kwargs)
+    stream_tabular(materialize, out_path, format, **kwargs)
 
 
 # ----------------------------------------------------------------------------------------
@@ -229,8 +233,8 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     `DEFAULT_NODATA`; `dtype`, left `None`, is inferred (`_resolve_write_dtype`).
     Resolving the request-appropriate values from a `Variable`/route parameter is a
     wiring decision for whichever route eventually calls this, mirroring how `api/
-    raster.py` resolves `variable.max_z_error` at the route layer today rather than
-    inside the dataset object it calls into.
+    raster.py` resolves the request's own compression choice at the route layer today
+    rather than inside the dataset object it calls into.
 
     `**profile_options` is forwarded straight into `rasterio.open`'s write profile,
     layered over this function's own defaults (`driver="GTiff"` plus the frame's own

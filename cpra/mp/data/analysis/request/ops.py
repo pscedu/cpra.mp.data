@@ -470,6 +470,10 @@ def validate_shapes(pipeline: Pipeline) -> None:
     - a `join` mixing a long frame with a band-wide one (`_type_join`);
     - a band-wide `join` whose operands sit on two different grids (`_type_join`);
     - a long final frame under an output format that needs a raster surface (below);
+    - a band-wide final frame under an output format that needs a tabular sink (below --
+      the converse of the previous rule; nothing past this function would otherwise
+      catch it, since `execution.execute.run_to_path` picks its sink from the result's
+      own shape, not from `output.format`);
     - more than one value column reaching the sink (below).
 
     Nothing here opens a file or knows a crosswalk.
@@ -490,4 +494,23 @@ def validate_shapes(pipeline: Pipeline) -> None:
             f"pipeline's final frame is long (tabular), but output.format="
             f"{pipeline.output.format!r} needs a raster surface -- add a project to a "
             "raster grid before the sink"
+        )
+
+    if final.shape == Shape.band_wide and pipeline.output.format not in RASTER_OUTPUT_FORMATS:
+        # The converse of the check above. A band-wide result is a `(LongFrame,
+        # metadata, window)` triple, not a table -- `execution.execute.run_to_path`
+        # picks its sink from the RESULT's shape, never from `pipeline.output.format`
+        # (see that function's docstring), so nothing downstream of `validate_shapes`
+        # would otherwise ever reject "band-wide result, output.format=csv": `run_to_
+        # path` would silently call `sink.write_raster` and hand a caller who asked for
+        # a table a GeoTIFF's bytes at a `.csv`-shaped path (or, from the tile routes,
+        # a `png`/`jpg` URL would never even reach this pipeline shape, since a tabular
+        # `output.format` is only reachable from the `.{format}` data routes, which
+        # write whatever `run_to_path` returns without checking it matches the URL
+        # extension). Rejecting here, at plan-time, is the only place that can catch it
+        # without opening a file.
+        raise ShapeError(
+            f"pipeline's final frame is band-wide (raster), but output.format="
+            f"{pipeline.output.format!r} needs a tabular sink -- add a project to a "
+            "vector grid, or a spatial filter, before the sink"
         )

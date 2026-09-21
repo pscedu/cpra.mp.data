@@ -270,7 +270,10 @@ class Output(BaseModel):
     are only meaningful for a rendered/raster format; not checked here (that needs to
     know the final frame's shape, which needs the shape-typing walk -- see
     `ops.validate_shapes`). `sort`/`select` are a comma-separated `[-]column` list and a
-    comma-separated column subset, respectively.
+    comma-separated column subset, respectively; `validate_pipeline` checks their SYNTAX
+    (via `_validate_output_sort_or_select`) but deliberately not whether a named column
+    exists -- that half surfaces as Polars' `ColumnNotFoundError` at collect time (see
+    `execution.sink.apply_output_shaping`).
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
@@ -331,13 +334,24 @@ def validate_pipeline(pipeline: Pipeline) -> None:
       (`expressions.classify_where_kinds` rejects an aggregate call or a subquery in any
       dimension or spatial conjunct);
     - `calculate.expression` is well-formed arithmetic over the whitelist
-      (`expressions.parse_calculate_expression`, column-namespace check deferred).
+      (`expressions.parse_calculate_expression`, column-namespace check deferred);
+    - `output.sort`/`output.select` are syntactically sound comma-separated `[-]column`
+      lists -- no empty component, no bare `-`, no `-`-prefixed `select` entry, no name
+      repeated within one list (`_validate_output_sort_or_select`). Whether a named
+      column actually EXISTS on the final frame is deliberately not checked here -- see
+      that function's docstring, and `execution.sink.apply_output_shaping`, for the other
+      half of this split.
 
     A step's `as` that no later step ever references is deliberately NOT an error -- a
     pipeline may compute and name an intermediate it doesn't end up using further.
     """
     for name in pipeline.inputs:
         _validate_name(name, "input")
+
+    if pipeline.output.sort is not None:
+        _validate_output_sort_or_select(pipeline.output.sort, "sort")
+    if pipeline.output.select is not None:
+        _validate_output_sort_or_select(pipeline.output.select, "select")
 
     if not pipeline.steps and len(pipeline.inputs) != 1:
         raise RequestError(
@@ -405,6 +419,37 @@ def _validate_step_rules(i: int, step: Any) -> None:
             raise RequestError(f"step {i} (group): {exc}") from exc
     else:  # pragma: no cover -- exhaustive over the Step union
         raise RequestError(f"step {i} has unrecognized op {getattr(step, 'op', None)!r}")
+
+
+def _validate_output_sort_or_select(value: str, field: str) -> None:
+    """Check the SYNTAX of an `output.sort`/`output.select` value -- a comma-separated
+    `[-]column` list -- without knowing whether any named column actually exists on the
+    final frame. That half is deliberately NOT this function's job: it needs the frame's
+    real column namespace, which is only known once the pipeline is compiled and run, so
+    an unknown name surfaces instead as Polars' own `ColumnNotFoundError` when the shaped
+    frame is collected (see `execution.sink.apply_output_shaping`, which performs the
+    split, no name check, and points back here for why). What IS checkable now, from the
+    string alone: no empty component between commas, no bare `-` (a sort descending-
+    marker with no column after it), no `-` prefix on a `select` entry (descending order
+    is a `sort`-only concept), and no column named twice within one list.
+    """
+    parts = value.split(",")
+    seen: set[str] = set()
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            raise RequestError(f"output.{field}={value!r} contains an empty component between commas")
+        if field == "select" and stripped.startswith("-"):
+            raise RequestError(
+                f"output.select entry {stripped!r} must not start with '-' -- the "
+                "descending-sort prefix is only meaningful for output.sort"
+            )
+        column = stripped[1:] if stripped.startswith("-") else stripped
+        if not column:
+            raise RequestError(f"output.{field}={value!r} contains a bare '-' with no column named")
+        if column in seen:
+            raise RequestError(f"output.{field}={value!r} names column {column!r} more than once")
+        seen.add(column)
 
 
 def _validate_where_structurally(i: int, where: str, op: str = "filter") -> None:

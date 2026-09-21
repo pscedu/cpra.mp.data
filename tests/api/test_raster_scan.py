@@ -416,7 +416,7 @@ class TestDroppedBandsAreNeverOpened:
                 {
                     "inputs": {"a": {k: RASTER_KWARGS[k] for k in _SELECTION_FIELDS}},
                     "steps": [{"op": "filter", "input": "a", "where": where}],
-                    "output": {"format": "csv"},
+                    "output": {"format": "tif"},
                 }
             ),
             base_path=base_path,

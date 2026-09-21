@@ -520,7 +520,7 @@ class TestBandWideEndToEnd:
                     {"op": "calculate", "expression": "value * 2", "as": "c"},
                     {"op": "group", "by": [], "aggregate": "sum"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -615,7 +615,7 @@ class TestBandWideEndToEnd:
                     {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
                     {"op": "calculate", "expression": "value"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -689,7 +689,7 @@ class TestBandWideEndToEnd:
                     {"op": "join", "type": "spatial", "inputs": ["ca", "fb"], "as": "j"},
                     {"op": "calculate", "expression": "value"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -828,7 +828,7 @@ class TestBandWideEndToEnd:
                     "a": {"variable": ANNUAL_KWARGS["variable"], "time_unit": "annual", "grid": ANNUAL_KWARGS["grid"]}
                 },
                 "steps": [{"op": "project", "input": "a", "to": RASTER_GRID}],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         lf, metadata_df, window = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
@@ -857,7 +857,7 @@ class TestBandWideEndToEnd:
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
                 "steps": [{"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "f"}],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -1047,7 +1047,7 @@ class TestBandWideEndToEnd:
                     {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "mean", "as": "p"},
                     {"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -1092,7 +1092,7 @@ class TestBandWideEndToEnd:
                     {"op": "join", "type": "spatial", "inputs": ["fa", "b"], "as": "j"},
                     {"op": "calculate", "expression": "value"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path)
@@ -1134,7 +1134,7 @@ class TestTileScopedReads:
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
                 "steps": [],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         tile = TileRequest(*_tile_over_the_raster_grid())
@@ -1166,7 +1166,7 @@ class TestTileScopedReads:
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
                 "steps": [],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         plan = compile_plan(pipeline, base_path=base_path, tile=TileRequest(1, 1, 1))
@@ -1209,7 +1209,7 @@ class TestTileScopedReads:
                     {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
                     {"op": "calculate", "expression": "value"},
                 ],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         tile = TileRequest(*_tile_over_the_raster_grid())
@@ -1248,7 +1248,7 @@ class TestTileScopedReads:
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
                 "steps": [],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline, base_path=base_path).inputs["a"]
@@ -1276,7 +1276,7 @@ class TestTileScopedReads:
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
                 "steps": [],
-                "output": {"format": "csv"},
+                "output": {"format": "tif"},
             }
         )
         resolved = compile_plan(pipeline, base_path=base_path).inputs["a"]

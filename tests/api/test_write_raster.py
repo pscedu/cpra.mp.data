@@ -37,7 +37,6 @@ from cpra.mp.data.raster import (
     vrt,
     write_cog,
 )
-from cpra.mp.data.variables import VARIABLES
 
 RASTER_KWARGS = dict(
     variable="hsi",
@@ -875,53 +874,15 @@ def test_decade_group_years_constant_is_ten():
     assert PENTAD_GROUP_YEARS == 5
 
 
-# --- max_z_error-driven LERC_ZSTD compression ------------------------------------------
+def test_write_cog_compresses_with_zstd_and_a_predictor(base_path):
+    """The codec `_cog_profile` gives every raster write, asserted on the file itself rather
+    than on the profile dict: ZSTD with PREDICTOR, which is what makes integer bands delta-
+    encode well. Nothing else in this module checks the codec `write_cog` actually lands.
+    """
 
-
-def test_write_cog_uses_lerc_when_variable_has_max_z_error(base_path, monkeypatch):
-    """A variable's max_z_error switches write_cog's profile to LERC_ZSTD at that tolerance."""
-
-    monkeypatch.setattr(VARIABLES["hsi"], "max_z_error", 0.001)
-    data = _band_data(2019)
-    write_cog(data, base_path=base_path, catalog_path=None, calendar_year=2019, **RASTER_KWARGS)
-
-    (cog_path,) = base_path.glob("**/*.tif")
-    with rasterio.open(cog_path) as src:
-        assert src.profile["compress"] == "lerc_zstd"
-        np.testing.assert_allclose(src.read(1), data, atol=0.001)
-
-
-def test_write_cog_defaults_to_zstd_without_max_z_error(base_path):
-    """A variable with no max_z_error keeps the ordinary ZSTD profile, not LERC_ZSTD."""
-
-    assert VARIABLES["hsi"].max_z_error is None
     write_cog(_band_data(2019), base_path=base_path, catalog_path=None, calendar_year=2019, **RASTER_KWARGS)
 
     (cog_path,) = base_path.glob("**/*.tif")
     with rasterio.open(cog_path) as src:
         assert src.profile["compress"] == "zstd"
-
-
-def test_compact_cog_uses_lerc_when_variable_has_max_z_error(base_path, monkeypatch):
-    """compact_cog's merged output also switches codec when the variable requests it."""
-
-    monkeypatch.setattr(VARIABLES["hsi"], "max_z_error", 0.001)
-    for year in YEARS:
-        write_cog(_band_data(year), base_path=base_path, catalog_path=None, calendar_year=year, **RASTER_KWARGS)
-    outputs = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)["outputs"]
-    assert len(outputs) == 1
-
-    with rasterio.open(outputs[0]) as src:
-        assert src.profile["compress"] == "lerc_zstd"
-        for band, year in enumerate(YEARS, start=1):
-            np.testing.assert_allclose(src.read(band), _band_data(year), atol=0.001)
-
-
-def test_cog_profile_omits_predictor_for_lerc():
-    """PREDICTOR is a ZSTD/DEFLATE concept; LERC_ZSTD's own quantization replaces it."""
-
-    grid = GRIDS[RASTER_KWARGS["grid"]]
-    profile = _cog_profile(grid, "float32", max_z_error=0.001)
-    assert profile["compress"] == "LERC_ZSTD"
-    assert profile["max_z_error"] == 0.001
-    assert "predictor" not in profile
+        assert src.tags(ns="IMAGE_STRUCTURE").get("PREDICTOR") is not None

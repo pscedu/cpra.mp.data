@@ -3,7 +3,7 @@
 One class per destination, plus one for the `execution.run_to_path` composition helper:
 
 - `TestApplyOutputShaping`: `output.sort`/`output.select`, in isolation from any op walk.
-- `TestSinkTabular`: csv/ndjson/parquet, both the streaming and the collect-first path.
+- `TestSinkTabular`: csv/ndjson/parquet, always streamed, including parquet compression.
 - `TestWriteRaster`: `tif`, including the `False`-not-raised no-bands case.
 - `TestRenderTile`: `png`/`jpg`, including a pre-colorization-array assertion (the array
   `legends.Legend.colorize_pixels` is actually handed, captured via a stub legend rather
@@ -43,6 +43,7 @@ from io import BytesIO
 import mercantile
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 import rasterio
 from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
@@ -145,31 +146,22 @@ class TestApplyOutputShaping:
 
 
 class TestSinkTabular:
-    """Each format's own writer is Polars' own (`write_csv`/`write_ndjson`/
-    `write_parquet`, or their `sink_*` streaming counterparts) -- this only checks that
-    `sink_tabular` wires `materialize`, `collect_in_memory`, and `float_precision`
-    correctly, via output any of those writers would produce for the given input, pinned
-    by direct computation against the same writer (not captured from `sink_tabular`
-    itself) in each test.
+    """Each format's own writer is Polars' own streaming `sink_*` spelling (`sink_csv`/
+    `sink_ndjson`/`sink_parquet`) -- this only checks that `sink_tabular` wires
+    `materialize`, `float_precision`, and any writer kwargs correctly, via output any of
+    those writers would produce for the given input, pinned by direct computation against
+    the same writer (not captured from `sink_tabular` itself) in each test.
     """
 
     def _lf(self):
         return pl.DataFrame({"grid_cell": [1, 2], "value": [1.23456, 2.5]}).lazy()
 
-    def test_csv_collect_in_memory_rounds_to_float_precision(self, tmp_path):
+    def test_csv_rounds_to_float_precision(self, tmp_path):
         # `float_precision=2`: 1.23456 -> "1.23", 2.5 -> "2.50" -- Polars' own CSV writer
         # behavior, confirmed independently against `DataFrame.write_csv` before pinning
         # here, not merely captured from `sink_tabular`'s own output.
         out_path = tmp_path / "out.csv"
-        sink_tabular(self._lf(), out_path, "csv", collect_in_memory=True, float_precision=2)
-        assert out_path.read_text() == "grid_cell,value\n1,1.23\n2,2.50\n"
-
-    def test_csv_streaming_matches_the_collect_path(self, tmp_path):
-        # Same frame, same float_precision, `collect_in_memory=False` this time --
-        # streamed through `sink_csv` rather than collected first. Byte-identical output
-        # is the whole point of the split: which one runs must not change the answer.
-        out_path = tmp_path / "out.csv"
-        sink_tabular(self._lf(), out_path, "csv", collect_in_memory=False, float_precision=2)
+        sink_tabular(self._lf(), out_path, "csv", float_precision=2)
         assert out_path.read_text() == "grid_cell,value\n1,1.23\n2,2.50\n"
 
     def test_ndjson_ignores_float_precision(self, tmp_path):
@@ -177,15 +169,30 @@ class TestSinkTabular:
         # own rule) -- ndjson's writer takes no such argument, so passing one through
         # unconditionally would raise; this proves that branch is skipped for ndjson.
         out_path = tmp_path / "out.ndjson"
-        sink_tabular(self._lf(), out_path, "ndjson", collect_in_memory=True, float_precision=2)
+        sink_tabular(self._lf(), out_path, "ndjson", float_precision=2)
         assert out_path.read_text() == '{"grid_cell":1,"value":1.23456}\n{"grid_cell":2,"value":2.5}\n'
 
-    def test_parquet_streaming_round_trips_the_exact_values(self, tmp_path):
+    def test_parquet_round_trips_the_exact_values(self, tmp_path):
         out_path = tmp_path / "out.parquet"
-        sink_tabular(self._lf(), out_path, "parquet", collect_in_memory=False)
+        sink_tabular(self._lf(), out_path, "parquet")
         back = pl.read_parquet(out_path)
         assert back["grid_cell"].to_list() == [1, 2]
         assert back["value"].to_list() == [1.23456, 2.5]
+
+    def test_parquet_honors_requested_compression(self, tmp_path):
+        # `compression`/`compression_level` pass straight through `sink_tabular`'s
+        # `**profile_options` to Polars' `sink_parquet`, as the plain values `api.tabular
+        # .stream_or_write_to_file` computes from a request's own `Compression` model --
+        # never the model itself (see `api.pipeline.PipelineTabularSource`'s docstring
+        # for why only plain values may cross into this package). gzip/9 is chosen
+        # because it differs from `sink_parquet`'s own default (zstd), so a bug that
+        # dropped these kwargs on the floor would still produce a valid, just
+        # wrongly-compressed, file rather than an error.
+        out_path = tmp_path / "out.parquet"
+        sink_tabular(self._lf(), out_path, "parquet", compression="gzip", compression_level=9)
+        metadata = pq.ParquetFile(out_path).metadata
+        codec = metadata.row_group(0).column(0).compression
+        assert codec.upper() == "GZIP"
 
 
 class TestWriteRaster:
@@ -759,7 +766,7 @@ class TestRunToPath:
             }
         )
         out_path = base_path.parent / "out.csv"
-        assert run_to_path(pipeline, out_path, base_path=base_path, collect_in_memory=True) is True
+        assert run_to_path(pipeline, out_path, base_path=base_path) is True
 
         # grid_cell < 2 keeps pixels 0 and 1 of each band; both years both pixels share
         # one fill value each (30 for 2030, 40 for 2040), so the CSV is 2 rows per year,
@@ -771,6 +778,29 @@ class TestRunToPath:
         assert [r[0] for r in rows] == ["2040", "2040", "2030", "2030"]
         assert {r[1] for r in rows[:2]} == {"40"}
         assert {r[1] for r in rows[2:]} == {"30"}
+
+    def test_parquet_output_forwards_compression_to_the_sink(self, base_path):
+        # Proves the whole chain end to end: `run_to_path`'s `**profile_options` reach
+        # `sink.sink_tabular` reach `io.output.stream_tabular` reach Polars'
+        # `sink_parquet`, landing in the written file's own metadata -- not just that
+        # `sink_tabular` itself forwards them (`TestSinkTabular
+        # .test_parquet_honors_requested_compression` above already covers that link in
+        # isolation).
+        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 5)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "grid_cell < 2"}],
+                "output": {"format": "parquet"},
+            }
+        )
+        out_path = base_path.parent / "out.parquet"
+        assert run_to_path(
+            pipeline, out_path, base_path=base_path, compression="gzip", compression_level=9
+        ) is True
+        metadata = pq.ParquetFile(out_path).metadata
+        codec = metadata.row_group(0).column(0).compression
+        assert codec.upper() == "GZIP"
 
     def test_tif_output_writes_a_raster_and_returns_true(self, base_path):
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 12)

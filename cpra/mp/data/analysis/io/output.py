@@ -67,15 +67,20 @@ def stream_tabular(materialize, out_path, format, *args, **kwargs):
     `materialize` is the caller's own materialize callable (`BaseAnalysis.materialize`),
     passed in rather than an `lf` because that method is also where the
     `ColumnNotFoundError`/`FileNotFoundError` -> `AnalysisError` mapping lives.
+
+    `*args`/`**kwargs` pass straight through to the underlying `sink_*` method -- this is
+    how a caller's `compression`/`compression_level` (parquet) reach the Polars writer.
+    Row-group sizing is not among them: nothing upstream resolves or forwards a row-group
+    parameter today, so `sink_parquet` runs on its own default.
     """
-    # TODO: Set parquet compression and row group parameters.
     materialize(SINK_METHODS[format], out_path, *args, **kwargs)
 
 
 @timing
 def write_tabular(materialize, out_path, format, *args, **kwargs):
-    """Collect the frame and write it to `out_path`. See `stream_tabular` for `materialize`."""
-    # TODO: Set parquet compression and row group parameters.
+    """Collect the frame and write it to `out_path`. See `stream_tabular` for `materialize`
+    and for what `*args`/`**kwargs` (and row-group sizing's absence from them) means here.
+    """
     df = materialize()
     getattr(df, WRITE_METHODS[format])(out_path, *args, **kwargs)
 

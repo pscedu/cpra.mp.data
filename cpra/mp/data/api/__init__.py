@@ -9,18 +9,20 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.analysis import AnalysisError, create_analysis
-from cpra.mp.data.analysis.pipeline import (
-    PipelineError,
+from cpra.mp.data.analysis.pipeline import PipelineError
+from cpra.mp.data.analysis.planner import compile_pipeline
+from cpra.mp.data.analysis.request.ops import validate_shapes
+from cpra.mp.data.analysis.request.pipeline import (
     parse_pipeline,
     pipeline_from_query,
 )
-from cpra.mp.data.analysis.planner import compile_pipeline
 from cpra.mp.data.analysis.types import (
     CrosswalkGrid,
     DataFormat,
     OutputType,
     TileFormat,
 )
+from cpra.mp.data.api.boundary import install_analysis_boundary
 from cpra.mp.data.api.crosswalk import Crosswalk
 from cpra.mp.data.api.models import (
     Analysis,
@@ -40,6 +42,11 @@ from cpra.mp.data.api.models import (
     Variable,
     Visualization,
     VisualizationQuery,
+)
+from cpra.mp.data.api.pipeline import (
+    respond_to_analysis as respond_to_analysis_pipeline,
+    respond_to_analysis_tile as respond_to_analysis_pipeline_tile,
+    respond_to_analysis_vector_tile as respond_to_analysis_pipeline_vector_tile,
 )
 from cpra.mp.data.api.raster import RasterioStreamingResponse, RasterioTileResponse
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -206,6 +213,15 @@ async def analysis_registry_error_handler(request: Request, exc: AnalysisRegistr
 @app.exception_handler(PipelineError)
 async def pipeline_error_handler(request: Request, exc: PipelineError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+# The NEW engine's counterpart to the three handlers above -- covers `request.errors.
+# RequestError` and its members, `request.expressions.ExpressionError`, `execution.
+# execute.LoweringNotImplementedError`, and Polars' own `ColumnNotFoundError`, for the four
+# `/v1/analysis...` pipeline routes below that are now bound onto the new engine. See
+# `api.boundary`'s own module docstring for the full mapping and why it is a separate,
+# independent set of handlers from the three above rather than a unification of them.
+install_analysis_boundary(app)
 
 
 @app.get("/v1/variables.json", tags=["Catalog"])
@@ -430,12 +446,16 @@ async def post_analysis(
     compression: Annotated[Compression, Query()],
     body: dict[str, Any] = Body(...),
 ):
-    try:
-        pipeline = parse_pipeline(body)
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # `request.pipeline.parse_pipeline`'s own exceptions (`RequestError` and members,
+    # `ExpressionError`) are NOT caught here -- they flow to `api.boundary`'s registered
+    # handlers instead of a route-local `except PipelineError` (the old engine's own
+    # `PipelineError` family is unrelated and never raised by the new `request.pipeline`
+    # module; see that module's docstring on the two families' independence).
+    pipeline = parse_pipeline(body)
     _check_output_format_agreement(pipeline, format)
-    return await _respond_to_analysis(pipeline, format, compression)
+    validate_compression(compression, format)
+    validate_shapes(pipeline)
+    return await respond_to_analysis_pipeline(pipeline, format.value, compression)
 
 
 @app.get("/v1/analysis.{format}", tags=["Analysis"])
@@ -445,12 +465,11 @@ async def get_analysis(format: DataFormat, compression: Annotated[Compression, Q
     pipeline_params = {
         k: v for k, v in request.query_params.items() if k not in _COMPRESSION_QUERY_FIELDS
     }
-    try:
-        pipeline = pipeline_from_query(pipeline_params)
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    pipeline = pipeline_from_query(pipeline_params)
     _check_output_format_agreement(pipeline, format)
-    return await _respond_to_analysis(pipeline, format, compression)
+    validate_compression(compression, format)
+    validate_shapes(pipeline)
+    return await respond_to_analysis_pipeline(pipeline, format.value, compression)
 
 
 # The vector-tile counterpart to `get_analysis_tile` below -- reuses `VectorTileResponse`
@@ -472,37 +491,31 @@ async def get_analysis(format: DataFormat, compression: Annotated[Compression, Q
 # coerce into `TileFormat` and this route would never be reached.
 @app.get("/v1/analysis/{z}/{x}/{y}.pbf", tags=["Analysis"])
 async def get_analysis_vector_tile(z: int, x: int, y: int, request: Request):
-    try:
-        pipeline = pipeline_from_query(dict(request.query_params))
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        compiled = compile_pipeline(pipeline)
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    await compiled.apply_params()
-    compiled.validate_vector_tile()
-    return VectorTileResponse(compiled, x, y, z)
+    # No `_check_output_format_agreement` call here, same as before the rebind: `pbf` is
+    # not a member of `request.types.DataFormat`/`TileFormat` either (see `request.
+    # pipeline.Output.format`'s docstring), so there is still nothing on the URL side to
+    # cross-check `pipeline.output.format` against. `api.pipeline.
+    # respond_to_analysis_pipeline_vector_tile`'s own `_require_vector_final_frame` check
+    # (raising `ShapeError`, -> 400 via `api.boundary`) is this route's replacement for the
+    # old engine's `compiled.validate_vector_tile()` -- see that helper's docstring for why
+    # `request.ops.validate_shapes` cannot perform this particular check itself.
+    #
+    # `validate_shapes` still runs here despite that gap -- it is the only thing that
+    # enforces every OTHER sink-shape/aggregate-legality rule (the raster/vector sink
+    # cross-check is simply not among them for `pbf`, since `output.format` never says
+    # `pbf`), and `execution.plan.compile_plan` documents itself as expecting to be called
+    # only after it already has.
+    pipeline = pipeline_from_query(dict(request.query_params))
+    validate_shapes(pipeline)
+    return await respond_to_analysis_pipeline_vector_tile(pipeline, x, y, z)
 
 
 @app.get("/v1/analysis/{z}/{x}/{y}.{format}", tags=["Analysis"])
 async def get_analysis_tile(z: int, x: int, y: int, format: TileFormat, request: Request):
-    try:
-        pipeline = pipeline_from_query(dict(request.query_params))
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    pipeline = pipeline_from_query(dict(request.query_params))
     _check_output_format_agreement(pipeline, format)
-
-    try:
-        compiled = compile_pipeline(pipeline)
-    except PipelineError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    await compiled.apply_params()
-    compiled.validate_tile()
-    return RasterioTileResponse(compiled, x, y, z, format)
+    validate_shapes(pipeline)
+    return await respond_to_analysis_pipeline_tile(pipeline, x, y, z, format.value)
 
 
 @app.get("/v1/visualizations.json", tags=["Visualization"])

@@ -234,17 +234,40 @@ class TestAnalysisVectorTileRoute:
     `get_vector_tile`/`TestGetVectorTile` above, exercised through the real ASGI app
     (`client`) rather than `BaseAnalysis.get_vector_tile()` directly, since the point of
     this gap is the route itself: it did not exist before.
+
+    Rebound onto the NEW engine (`request.pipeline.parse_pipeline`/
+    `pipeline_to_query`, `execution.plan.compile_plan`, `execution.sink.
+    sink_vector_tile`) rather than the old `analysis.pipeline`/`planner.compile_pipeline`/
+    `VectorTileResponse` stack the three tests below originally exercised -- two of the
+    three needed real changes, not just an updated expectation, because they leaned on
+    old-engine behavior the new engine's stricter op rules do not reproduce:
+
+    - `VECTOR_PIPELINE` no longer includes a `project ... to: ecoregion_v001` step: the
+      old engine apparently tolerated a same-grid project as a no-op, but the new engine's
+      `project` lowering table requires an explicit `aggregate` for a vector-to-vector
+      project with no default (there is no single obviously-correct way to combine several
+      source rows onto one target cell), and this input is already on `ecoregion_v001` --
+      the step was never doing anything, so it is simply dropped instead of given an
+      aggregate that would change nothing.
+    - `test_rejects_a_raster_output_grid`'s pipeline used to project a raster input onto
+      the SAME raster grid it started on; the new engine's project-direction table has no
+      raster-to-raster entry at all (there is no crosswalk between two raster lattices --
+      see `execution.execute`'s raster-to-raster `ShapeError`), so that pipeline now fails
+      earlier, with a different message, than the one this test means to exercise. Fixed
+      by dropping the project (the input is already raster-typed) and reaching the same
+      band-wide-final-frame-on-a-raster-grid condition via a `filter`+`group` chain
+      instead -- still the same reason a `.pbf` request on it should be rejected.
     """
 
     VECTOR_PIPELINE = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-        "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+        "steps": [],
         "output": {"format": "csv"},
     }
 
     async def test_serves_a_real_vector_tile(self, client, base_path, tiles_path, monkeypatch):
         from cpra.mp.data import config
-        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from cpra.mp.data.analysis.request.pipeline import parse_pipeline, pipeline_to_query
         from cpra.mp.data.tabular import write_parquet
 
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
@@ -254,6 +277,9 @@ class TestAnalysisVectorTileRoute:
         query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
         response = client.get(f"/v1/analysis/{TILE.z}/{TILE.x}/{TILE.y}.pbf", params=query)
 
+        # A wrong grid/route wiring would either 4xx here or return an empty/garbled MVT
+        # payload -- the value assertion below independently recomputes the expected
+        # number from `annual_frame` rather than trusting whatever the response says.
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
         result = VectorTile()
@@ -262,13 +288,18 @@ class TestAnalysisVectorTileRoute:
         assert result.layers[0].values[0].double_value == pytest.approx(expected, rel=1e-5)
 
     async def test_rejects_a_raster_output_grid(self, client, base_path, monkeypatch):
-        """A pipeline whose final grid is raster (no `grid_cell`/`summarize_by` narrowing
-        it to tabular) 400s on `.pbf` via `compiled.validate_vector_tile()` -- the same
-        rule `get_vector_tile` enforces on the data route, reached here without ever
-        needing a PMTiles archive on disk (the rejection fires before any tile lookup).
+        """A pipeline whose final frame is band-wide (raster), reached via a `filter`+
+        `group` chain over a raster input with no project narrowing it to a vector grid,
+        400s on `.pbf` -- `api.pipeline._require_vector_final_frame` (the new engine's
+        replacement for the old `compiled.validate_vector_tile()`) rejects it outright as
+        a `ShapeError`, reached here without ever needing a PMTiles archive on disk (the
+        rejection fires before any tile lookup, same as the old engine's own check did).
+        A test that instead let this reach `sink_vector_tile` and get a `None` back would
+        wrongly conflate "this request can never make a vector tile" with "no data here
+        right now" -- the two 400-vs-204 paths this suite must keep telling apart.
         """
         from cpra.mp.data import config
-        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from cpra.mp.data.analysis.request.pipeline import parse_pipeline, pipeline_to_query
         from tests.factories import RASTER_KWARGS, write_raster_dataset
 
         write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
@@ -277,7 +308,7 @@ class TestAnalysisVectorTileRoute:
         pipeline = {
             "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
             "steps": [
-                {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
+                {"op": "filter", "input": "vct", "where": "calendar_year > 0"},
                 {"op": "group", "by": [], "aggregate": "max"},
             ],
             "output": {"format": "tif"},
@@ -286,14 +317,23 @@ class TestAnalysisVectorTileRoute:
         response = client.get("/v1/analysis/3/1/2.pbf", params=query)
 
         assert response.status_code == 400
-        assert "invalid output type for vector tile" in response.json()["detail"]
+        assert "not a long frame on a vector grid" in response.json()["detail"]
 
-    async def test_missing_tile_returns_404(self, client, base_path, monkeypatch):
-        """Same pipeline as the success case, but with no PMTiles archive written for
-        the grid -- `validate_vector_tile` itself 404s (no tile file for grid), never
-        reaching `VectorTileResponse`."""
+    async def test_missing_tile_returns_204(self, client, base_path, monkeypatch):
+        """Same pipeline as the success case, but with no PMTiles archive written for the
+        grid.
+
+        Under the OLD engine this 404ed ("no tile file for grid") -- `sink_vector_tile`'s
+        own docstring makes this a DELIBERATE behavior change, not an oversight: "no
+        archive for this grid" is exactly as much "nothing to render" as "no feature under
+        this pixel" or "every matching row was null," and the new engine answers all of
+        them the same bodiless-204 way rather than singling one out as a client-facing
+        error. A test still asserting 404 here would be pinning the exact old-engine
+        behavior deliverable E is required to update, not a case where the old assertion
+        happens to still hold.
+        """
         from cpra.mp.data import config
-        from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+        from cpra.mp.data.analysis.request.pipeline import parse_pipeline, pipeline_to_query
         from cpra.mp.data.tabular import write_parquet
 
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
@@ -302,5 +342,8 @@ class TestAnalysisVectorTileRoute:
         query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
         response = client.get(f"/v1/analysis/{TILE.z}/{TILE.x}/{TILE.y}.pbf", params=query)
 
-        assert response.status_code == 404
-        assert "no tile file for grid" in response.json()["detail"]
+        # A 204 that still carried a body would violate the HTTP spec for that status and
+        # would trip up a client trusting Content-Length; content == b"" is the part a
+        # not-actually-empty response would fail.
+        assert response.status_code == 204
+        assert response.content == b""

@@ -25,7 +25,7 @@ from cpra.mp.data.analysis.parameters import (
     FilterDimensions,
     Options,
 )
-from cpra.mp.data.analysis.pipeline import parse_pipeline, pipeline_to_query
+from cpra.mp.data.analysis.request.pipeline import parse_pipeline, pipeline_to_query
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.tabular import write_parquet
 from tests.factories import (
@@ -181,18 +181,21 @@ class TestAnalysisCompression:
     `get_analysis`), since this is about query binding and routing, not `create_analysis`.
     """
 
+    # Neither pipeline needs a step at all -- both exist only to give the route a body to
+    # write (one a GeoTIFF, one a table), and a single-input pipeline needs no steps to be
+    # valid. Earlier versions opened with a `project` from each input's own grid back onto
+    # itself, which the old engine required as a way to name the input; that identity
+    # `project` is not legal here (there is no raster-to-raster crosswalk, and no default
+    # aggregate for a vector-to-vector project), so it is dropped rather than replaced.
     RASTER_PIPELINE = {
         "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-        "steps": [
-            {"op": "project", "input": "vct", "to": "veg_grid_cell_v001"},
-            {"op": "group", "by": [], "aggregate": "max"},
-        ],
+        "steps": [],
         "output": {"format": "tif"},
     }
 
     VECTOR_PIPELINE = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
-        "steps": [{"op": "project", "input": "eco", "to": "ecoregion_v001"}],
+        "steps": [],
         "output": {"format": "csv"},
     }
 

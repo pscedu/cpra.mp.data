@@ -22,7 +22,6 @@ class Variable:
         display_number_format=None,
         float_precision=None,
         difference_legend_limit=None,
-        max_z_error=None,
         nodata=None,
     ):
         self.name = name
@@ -53,11 +52,6 @@ class Variable:
         # colorizes raster pixels with it directly and only scales the legend it hands the
         # client for display.
         self.difference_legend_limit = difference_legend_limit
-        # When set, raster writes for this variable default to LERC_ZSTD compression at this
-        # error tolerance instead of ZSTD+predictor -- see cpra.mp.data.raster._cog_profile.
-        # No variable sets it since elev moved to Int32 millimeters + ZSTD/predictor, so the
-        # structure spreadsheet has no column for it; the write path still honors it.
-        self.max_z_error = max_z_error
         # The nodata sentinel raster writes declare for this variable, in storage units.
         # The default (-9999) predates per-variable sentinels and is what every raster on
         # disk already declares; a variable overrides it only when -9999 is a plausible

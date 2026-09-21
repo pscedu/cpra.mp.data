@@ -401,6 +401,22 @@ class TestSinkRules:
         )
         validate_shapes(pipeline)
 
+    def test_band_wide_final_shape_under_tabular_format_rejected(self):
+        # The converse of `test_long_final_shape_under_raster_output_format_rejected`, and
+        # the only thing standing between a caller and a wrong-content-type response:
+        # `execution.execute.run_to_path` chooses its sink from the RESULT's shape, never
+        # from `output.format`, so without this rule a `csv` request over a raster result
+        # is answered 200 with a GeoTIFF's bytes rather than rejected.
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="tabular sink"):
+            validate_shapes(pipeline)
+
 
 class TestCompileOps:
     def test_compiles_one_op_per_step_in_order(self):
