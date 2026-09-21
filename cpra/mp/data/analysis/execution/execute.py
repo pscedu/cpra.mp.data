@@ -58,11 +58,31 @@ raises on an empty band list (it derives its window from the VRT it opens, and a
 read opens nothing), so that case is built directly with `execution.frame.empty_band_wide`
 over a window taken from the raster grid's own geometry instead -- see
 `_grid_read_window` and `execution.plan`'s module docstring, "loose end" paragraph, which
-names this exact construction. `ResolvedInput.point_sample_step` is read from the plan but
-not acted on here: it marks where a later spatial filter first samples an origin, for a
-point-sparse read this walk does not implement -- every band-wide input is opened as a full
-window regardless, and the spatial filter itself (`execution.band_ops.
-sample_grid_cells_band_wide`) is what turns the already-opened frame long.
+names this exact construction.
+
+**A point sample reads a narrower window when the spatial filter says exactly which
+pixels it needs -- and narrowing the window never changes what a `grid_cell` id means.**
+`ResolvedInput.point_sample_step` names the step number of the first spatial `filter`
+reached while an origin was still band-wide (`execution.plan`'s own module docstring);
+before the ordinary input-opening loop runs, `execute` looks that step up in `plan.ops`
+and tries `_derive_point_sample_window` against its `where`. When that `where` is simple
+enough to name the exact absolute pixel ids before any file is opened (`grid_cell = N` or
+`grid_cell IN (...)`, unquoted integers -- `_parse_point_sample_ids`), the origin is
+opened over the SMALLEST window covering those pixels instead of its full extent. `where`
+itself is never touched: `band_ops.sample_grid_cells_band_wide` always emits `grid_cell`
+as the pixel's ABSOLUTE row-major position over the origin's full grid
+(`execution.frame.row_major_grid_cell`'s `grid_width=` mode -- see `_run_filter_band_wide`
+for where that width comes from), regardless of how much of the grid the read actually
+covered, so the literal a caller wrote keeps naming the same pixel whether or not this
+narrowing found anywhere to apply. Window narrowing is therefore a pure read-size
+optimization here, not something a caller can observe in the result. Anything the `where`
+cannot resolve into exact ids up front -- a negation, an `OR`, more than one spatial
+conjunct, or a pixel outside the origin's own extent -- falls back to the full-window read
+this walk has always done, which is always correct, merely more expensive than a window
+`_derive_point_sample_window` could have derived. A tile-scoped origin (`resolved.
+read_window is not None`) is never narrowed this way at all -- the tile's own window
+already governs what gets read, and combining the two is a case no caller in this
+codebase produces today.
 
 **The raster-to-vector crosswalk is attached HERE, at open time, not inside
 `project.project_raster_to_vector`.** `ResolvedInput.straddling_vector_grid` names the
@@ -122,6 +142,8 @@ back to the canonical `project.ZONE_COLUMN` name -- so a lowering reading any on
 crosswalks the underlying shared scan actually combined.
 """
 
+import re
+
 import polars as pl
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
@@ -141,7 +163,9 @@ from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, c
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.vector import scan_vector
+from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
+    FilterOp,
     FrameType,
     JoinOp,
     Op,
@@ -224,8 +248,20 @@ def _run_filter_band_wide(
     stripped here, immediately, the one place this walk can tell the shape actually
     changed (`frame_types[op.output].shape` -- known statically, from the plan, not by
     inspecting the runtime result).
+
+    `grid_width` -- `op.input`'s own grid's full pixel width (`GRIDS[...].width`) -- is
+    passed to `band_ops.filter_band_wide` unconditionally, whether or not `op.where`
+    actually turns out to have a spatial conjunct: this lowering has no cheaper way to know
+    which case it is in than `filter_band_wide` itself already does (`classify_where_kinds`),
+    and a `grid_width` `filter_band_wide` never needed costs nothing to have computed.
+    `frame_types[op.input].grid` is the frame's CURRENTLY-addressed grid (`request.ops.
+    FrameType`'s own docstring), which is what a still-band-wide frame's spatial conjunct is
+    always written against.
     """
-    result = band_ops.filter_band_wide(frames[op.input], op.where, extra_columns=extra_columns)
+    grid_width = GRIDS[frame_types[op.input].grid].width
+    result = band_ops.filter_band_wide(
+        frames[op.input], op.where, extra_columns=extra_columns, grid_width=grid_width
+    )
     if extra_columns and frame_types[op.output].shape is Shape.long:
         return result.drop(list(extra_columns))
     return result
@@ -399,6 +435,124 @@ def _lowering_for(kind: str, key: object, registry: dict[tuple[str, object], obj
     return registry[(kind, key)]
 
 
+# The two `where` shapes `request.data_query._grid_cell_conjunct` (and any other caller
+# resolving a coordinate to a literal id list before compiling a pipeline) ever produces
+# for a raster spatial filter -- unquoted integers only, matching the convention every
+# ABSOLUTE `grid_cell` id in this codebase already uses before any window has narrowed it.
+# See `_parse_point_sample_ids` for what happens when a `where` does not match either one.
+_POINT_SAMPLE_EQ_RE = re.compile(r"^grid_cell\s*=\s*(\d+)$", re.IGNORECASE)
+_POINT_SAMPLE_IN_RE = re.compile(r"^grid_cell\s+in\s*\(\s*(\d+(?:\s*,\s*\d+)*)\s*\)$", re.IGNORECASE)
+
+
+def _parse_point_sample_ids(where: str) -> list[int] | None:
+    """Pull literal ABSOLUTE `grid_cell` ids out of `where`'s spatial conjunct, if `where`
+    is simple enough to say exactly which pixels a point sample needs BEFORE any file is
+    opened: exactly one top-level spatial conjunct (`request.expressions.
+    classify_where_kinds`), and that one conjunct is exactly `grid_cell = N` or `grid_cell
+    IN (N1, N2, ...)` with unquoted integer literals -- the two forms `request.data_query.
+    _grid_cell_conjunct` produces for a raster point query.
+
+    Returns `None` -- not an error -- for anything else: two or more top-level spatial
+    conjuncts, or one spatial conjunct that isn't exactly one of the two recognized forms
+    (`grid_cell != 5`, `grid_cell = 5 OR grid_cell = 6`, a comparison this module was never
+    taught to read). `None` means "cannot narrow the window with confidence", not "no
+    pixels match" -- the caller (`_derive_point_sample_window`) falls back to reading the
+    origin's full extent, which is always a CORRECT answer for any `where` this function
+    cannot parse, only a more expensive one than a window this function could have derived.
+    """
+    kinds = classify_where_kinds(where)
+    spatial = kinds[PredicateKind.spatial]
+    if len(spatial) != 1:
+        return None
+    conjunct = spatial[0].strip()
+    match = _POINT_SAMPLE_EQ_RE.match(conjunct)
+    if match:
+        return [int(match.group(1))]
+    match = _POINT_SAMPLE_IN_RE.match(conjunct)
+    if match:
+        return [int(token) for token in match.group(1).split(",")]
+    return None
+
+
+def _derive_point_sample_window(grid_name: str, where: str) -> Window | None:
+    """Size a point sample's own narrower read window from a spatial `filter`'s `where` --
+    still written in `grid_name`'s full-grid, absolute-id convention, since every producer
+    of a spatial conjunct reaching a still-band-wide raster origin uses that convention
+    (`execution.plan`'s module docstring; no narrowing has happened yet at the point this
+    `where` was written), and the convention `band_ops.sample_grid_cells_band_wide` emits
+    its own `grid_cell` output in too -- see the module docstring for why that makes
+    narrowing the window here a pure read-size optimization rather than something able to
+    change what `where`'s literals mean.
+
+    Returns `None` -- caller falls back to a full-window read -- when `_parse_point_sample_
+    ids` cannot resolve `where` into exact ids, or when any resolved id falls outside
+    `grid_name`'s own `(height, width)` extent (an out-of-range literal a caller supplied
+    directly, with no coordinate resolution step in between to have already rejected it).
+
+    `where` itself is never touched here or by any caller of this function: only the
+    window is derived. The smallest window covering every resolved pixel, from the same
+    `divmod(id, grid.width)` decode this module already uses to validate an id is in range.
+    """
+    ids = _parse_point_sample_ids(where)
+    if ids is None:
+        return None
+
+    grid = GRIDS[grid_name]
+    rows: list[int] = []
+    cols: list[int] = []
+    for cell_id in ids:
+        row, col = divmod(cell_id, grid.width)
+        if not (0 <= row < grid.height) or not (0 <= col < grid.width):
+            return None
+        rows.append(row)
+        cols.append(col)
+
+    row_off, col_off = min(rows), min(cols)
+    height = max(rows) - row_off + 1
+    width = max(cols) - col_off + 1
+    return Window(col_off, row_off, width, height)
+
+
+def _point_sample_overrides(plan: ExecutionPlan) -> dict[str, Window]:
+    """For every raster origin in `plan.inputs` whose `point_sample_step` resolved to a
+    narrower window, the window to open that origin's read over instead of its full
+    extent -- see `_derive_point_sample_window` for how, and `execute`'s own docstring for
+    how the result gets used.
+
+    Deliberately skips an origin under either of two conditions, in both cases leaving
+    that origin to the full-window read this walk has always done: `resolved.read_window
+    is not None` (a tile-scoped origin -- narrowing further on top of a tile window is a
+    combination no caller in this codebase produces, see the module docstring), or
+    `has_no_bands(resolved.band_metadata)` (a zero-band origin already takes the
+    grid-derived empty-frame path in `_open_band_wide_input`, which has no real read for a
+    narrower window to change anything about). `resolved.tile_disjoint` origins are
+    likewise skipped for the same "no real read happens" reason.
+
+    Looks the step up in `plan.ops` by `step_no` rather than assuming position, since a
+    `point_sample_step` is a step NUMBER (declared order), not necessarily that op's index
+    in `plan.ops` (an op whose predicate does not survive to any origin's `ResolvedInput`
+    can still occupy an earlier position in the list). `isinstance(op, FilterOp)` is
+    asserted implicitly by construction: `plan.py` only ever records `point_sample_step`
+    from a `FilterOp`'s own `step_no` (see `execution.plan`'s module docstring), so a step
+    number recorded there always resolves back to a `FilterOp` here.
+    """
+    windows: dict[str, Window] = {}
+    ops_by_step = {op.step_no: op for op in plan.ops}
+    for name, resolved in plan.inputs.items():
+        if resolved.point_sample_step is None:
+            continue
+        if resolved.read_window is not None or resolved.tile_disjoint:
+            continue
+        if has_no_bands(resolved.band_metadata):
+            continue
+        op = ops_by_step[resolved.point_sample_step]
+        assert isinstance(op, FilterOp)
+        window = _derive_point_sample_window(resolved.selection.grid, op.where)
+        if window is not None:
+            windows[name] = window
+    return windows
+
+
 def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
     """An undecimated `ReadWindow` built from `grid_name`'s own geometry, with no file
     opened -- the window a zero-band raster origin gets, since `io.raster.scan_raster`
@@ -438,7 +592,9 @@ def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
     )
 
 
-def _open_band_wide_input(resolved: ResolvedInput) -> tuple[BandWideFrame, tuple[str, ...]]:
+def _open_band_wide_input(
+    resolved: ResolvedInput, *, point_sample_window: Window | None = None
+) -> tuple[BandWideFrame, tuple[str, ...]]:
     """Open one raster-shaped `ResolvedInput`, returning its frame alongside whatever
     `extra_columns` that frame's `lf` now carries beyond its `b<i>` band columns.
 
@@ -455,7 +611,12 @@ def _open_band_wide_input(resolved: ResolvedInput) -> tuple[BandWideFrame, tuple
 
     `resolved.read_window` rides along on every one of those `scan_raster` calls: `None`
     for an ordinary request (read the origin whole), or the window `compile_plan` sized for
-    a tile. A `tile_disjoint` origin -- the tile's footprint misses this raster's extent
+    a tile -- UNLESS `point_sample_window` is given, which then takes its place. `execute`
+    passes one only for an origin whose `point_sample_step` resolved to a narrower window
+    (`_derive_point_sample_window`); `resolved.read_window` itself is left untouched by that
+    decision (it is still `None` for the ordinary, non-tile request every point sample so
+    far has been), so this is a call-site override, not a second copy of the same field.
+    A `tile_disjoint` origin -- the tile's footprint misses this raster's extent
     entirely -- has no window to read at all and becomes the same zero-band empty frame the
     first case produces, so "this tile is outside the data" arrives at the sink as the
     no-bands result every other "nothing to show" already arrives as, rather than as a
@@ -466,7 +627,7 @@ def _open_band_wide_input(resolved: ResolvedInput) -> tuple[BandWideFrame, tuple
     """
     if resolved.tile_disjoint:
         return empty_band_wide(_grid_read_window(resolved.selection.grid)), ()
-    window = resolved.read_window
+    window = point_sample_window if point_sample_window is not None else resolved.read_window
     if has_no_bands(resolved.band_metadata):
         return empty_band_wide(_grid_read_window(resolved.selection.grid, window)), ()
     if resolved.straddling_vector_grid is not None:
@@ -660,7 +821,21 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     Returns the single input's frame for a zero-step pipeline: there is nothing to walk,
     and the request layer's own rule guarantees exactly one input in that case.
+
+    Before any of that: `_point_sample_overrides` looks for a raster origin whose
+    `point_sample_step` resolved to a window narrower than its full extent, per-origin --
+    see that function and `_derive_point_sample_window` for how, and the module docstring's
+    "a point sample reads a narrower window" paragraph for why. Every origin it names gets
+    opened over that narrower window (`_open_band_wide_input`'s own `point_sample_window`
+    override) instead of the full-extent read `resolved.read_window` alone would give.
+    `plan.ops` itself is walked unchanged below -- narrowing the window never requires
+    rewriting any op, since `band_ops.sample_grid_cells_band_wide` emits `grid_cell` as an
+    ABSOLUTE id regardless of how much of the grid its read actually covered, so the same
+    `where` a caller wrote against the full grid keeps meaning the same pixels whether or
+    not this narrowing found anywhere to apply.
     """
+    point_sample_windows = _point_sample_overrides(plan)
+
     extra_columns: dict[str, tuple[str, ...]] = {}
 
     band_wide_join_frames: dict[str, BandWideFrame] = {}
@@ -681,7 +856,9 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
         elif name in band_wide_join_frames:
             frames[name] = band_wide_join_frames[name]
         else:
-            frames[name], extra_columns[name] = _open_band_wide_input(resolved)
+            frames[name], extra_columns[name] = _open_band_wide_input(
+                resolved, point_sample_window=point_sample_windows.get(name)
+            )
 
     lowerings = _bind_band_wide_lowerings(extra_columns)
 

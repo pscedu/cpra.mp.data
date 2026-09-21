@@ -327,29 +327,47 @@ def assert_same_pixel_grid(one: ReadWindow, other: ReadWindow) -> None:
     )
 
 
-def row_major_grid_cell(lf: pl.LazyFrame, window: ReadWindow, name: str = "grid_cell") -> pl.LazyFrame:
-    """`lf` with a `name` column holding each row's ROW-MAJOR pixel position within
-    `window` -- the cell id a raster grid addresses that pixel by, recovered from the row
-    index the frame actually carries.
+def row_major_grid_cell(
+    lf: pl.LazyFrame, window: ReadWindow, name: str = "grid_cell", *, grid_width: int | None = None
+) -> pl.LazyFrame:
+    """`lf` with a `name` column holding each row's row-major pixel position, recovered
+    from the row index the frame actually carries.
 
-    A plain `with_row_index` is not that id. It is only that id when `window.batch_layout`
-    describes a single batch covering the whole window, which is the case for a small read
-    and for a windowed one, and NOT the case for a full read of a real grid: there the read
-    is chunked to bound its buffer, each batch covers a sub-rectangle of a block row, and
-    the frame's rows run row-major WITHIN each batch, batch after batch. Row 1 of such a
-    frame is the pixel one column to the right, but row `batch_width` is the pixel at the
-    start of the batch's second line -- not the pixel at the start of the raster's second
-    line, which lives thousands of rows further on in another batch entirely. How many
-    batches a read is cut into depends on its band count, so this is not even a fixed
-    property of a grid: the same pixel sits at two different row indices in a one-band and
-    a four-band read of the same window.
+    Two modes, chosen by `grid_width`:
+
+    - `grid_width=None` (default): the id is WINDOW-relative -- row-major within `window`
+      itself, `0` at `window`'s own top-left pixel. This is what the raster sinks need
+      (`execution/sink.py`'s `write_raster`/`render_tile`): they are placing pixels back
+      into an output whose own shape IS the window, so a position relative to the window is
+      exactly the position they need.
+    - `grid_width=<int>`: the id is ABSOLUTE -- row-major over a full grid `grid_width`
+      pixels wide, counting from that grid's own origin rather than the window's. This is
+      what a band-wide-to-long transition needs when the read window might be narrower than
+      the full grid (`execution.band_ops.sample_grid_cells_band_wide`): the id a caller
+      filtered on, and the id that comes back, must mean the same pixel regardless of how
+      much of the grid the read actually covered.
+
+    A plain `with_row_index` is not that id in either mode. It is only that id when
+    `window.batch_layout` describes a single batch covering the whole window, which is the
+    case for a small read and for a windowed one, and NOT the case for a full read of a real
+    grid: there the read is chunked to bound its buffer, each batch covers a sub-rectangle
+    of a block row, and the frame's rows run row-major WITHIN each batch, batch after batch.
+    Row 1 of such a frame is the pixel one column to the right, but row `batch_width` is the
+    pixel at the start of the batch's second line -- not the pixel at the start of the
+    raster's second line, which lives thousands of rows further on in another batch
+    entirely. How many batches a read is cut into depends on its band count, so this is not
+    even a fixed property of a grid: the same pixel sits at two different row indices in a
+    one-band and a four-band read of the same window.
 
     Decoded with a backward `join_asof` on each batch's starting row index -- the frame's
     row index is ascending by construction, which is exactly what `join_asof` needs, and it
     keeps the whole decode lazy rather than materializing a per-pixel lookup table. The
     arithmetic per row is then the obvious one: which batch the row falls in, its offset
     within that batch, that offset split into a line and a column by the BATCH's width, and
-    those placed back inside `window` by the batch's own offsets.
+    those placed on the raster by the batch's own offsets -- which are already absolute
+    (each batch's `col`/`row` are its position in the SOURCE, not in `window`). The
+    window-relative mode then subtracts `window`'s own offset and scales by `window.width`;
+    the absolute mode leaves the raster-relative row/col as-is and scales by `grid_width`.
 
     `window.batch_layout` is empty for a `ReadWindow` not built by a batched scan (a
     hand-constructed one in a test, say). That is treated as the single-batch case -- the
@@ -373,16 +391,17 @@ def row_major_grid_cell(lf: pl.LazyFrame, window: ReadWindow, name: str = "grid_
         },
     )
     offset = pl.col("__row_index") - pl.col("__batch_start")
+    absolute_row = pl.col("__batch_row") + offset // pl.col("__batch_width")
+    absolute_col = pl.col("__batch_col") + offset % pl.col("__batch_width")
+    if grid_width is None:
+        id_expr = (absolute_row - window.row_off) * window.width + (absolute_col - window.col_off)
+    else:
+        id_expr = absolute_row * grid_width + absolute_col
     return (
         lf.with_row_index("__row_index")
         .with_columns(pl.col("__row_index").cast(pl.Int64))
         .join_asof(batches.lazy(), left_on="__row_index", right_on="__batch_start", strategy="backward")
-        .with_columns(
-            (
-                (pl.col("__batch_row") + offset // pl.col("__batch_width") - window.row_off) * window.width
-                + (pl.col("__batch_col") + offset % pl.col("__batch_width") - window.col_off)
-            ).alias(name)
-        )
+        .with_columns(id_expr.alias(name))
         .drop("__row_index", "__batch_start", "__batch_col", "__batch_row", "__batch_width")
     )
 

@@ -582,6 +582,111 @@ class TestBandWideEndToEnd:
         assert sorted(df["calendar_year"].to_list()) == [2030, 2040]
         assert sorted(df["value"].to_list()) == pytest.approx([60.0, 80.0])
 
+    def test_point_sample_reads_a_narrower_window_and_the_value_it_names(self, base_path, monkeypatch):
+        # `RASTER_GRID` is 365 rows x 1052 columns, so a pixel away from the origin --
+        # (row=200, col=800) here -- has an ABSOLUTE row-major id (200*1052+800 = 211200).
+        # Narrowing the read window to that single pixel must not change what id comes
+        # back: `sample_grid_cells_band_wide` emits `grid_cell` as this ABSOLUTE id
+        # (`row_major_grid_cell`'s `grid_width=` mode), never a position relative to
+        # whatever window the read actually used, so the literal a caller filtered on
+        # (211200) is exactly the id the one surviving row reports -- even though the read
+        # itself only covered a 1x1 window whose only pixel would be relative id 0. Two
+        # independent, provable failure shapes this test can still catch: (a) the window
+        # narrows correctly but the emitted id is window-relative instead of absolute --
+        # the assertion on `grid_cell` below would see `0`, not `211200`; (b) the window
+        # itself is derived wrong (e.g. `divmod` against the wrong axis) -- the read then
+        # covers some OTHER pixel, which this fixture deliberately fills with a different
+        # value (1) than the target pixel (77), so a wrong window silently returns the
+        # wrong number instead of raising. Asserting the narrowed window, the absolute
+        # `grid_cell`, and the value together catches any of these; none could hide behind
+        # the others.
+        row, col = 200, 800
+        grid = GRIDS[RASTER_GRID]
+        assert grid.width != grid.height  # test premise: a row/col swap must be detectable
+        cell_id = row * grid.width + col
+        target_value = 77
+
+        def data_fn(year):
+            data = raster_array(fill=1, grid_name=RASTER_GRID, dtype="int32")
+            data[row, col] = target_value
+            return data
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=data_fn)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [{"op": "filter", "input": "a", "where": f"grid_cell = {cell_id}"}],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].point_sample_step is not None
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+        from cpra.mp.data.analysis.io.raster import scan_raster as real_scan_raster
+
+        windows = []
+
+        def capturing_scan_raster(*args, **kwargs):
+            windows.append(kwargs.get("window"))
+            return real_scan_raster(*args, **kwargs)
+
+        monkeypatch.setattr(execute_module, "scan_raster", capturing_scan_raster)
+
+        df = execute(plan, base_path=base_path).collect()
+
+        assert len(windows) == 1
+        window = windows[0]
+        assert (window.col_off, window.row_off, window.width, window.height) == (col, row, 1, 1)
+
+        # `grid_cell` in the result is the ABSOLUTE id the caller's `where` named, not a
+        # position relative to the narrowed window the read actually used -- narrowing the
+        # window is a pure read-size optimization, invisible in what an id in the output
+        # means.
+        assert df["grid_cell"].to_list() == [cell_id]
+        assert df["value"].to_list() == pytest.approx([float(target_value)])
+
+    def test_point_sample_ids_round_trip_through_a_narrowed_window(self, base_path, monkeypatch):
+        # A two-pixel round trip that the origin-adjacent fixtures elsewhere in this class
+        # (`grid_cell == 0`, at the raster's own origin) cannot exercise: at the origin,
+        # window-relative and absolute ids happen to coincide by coincidence (row_off=
+        # col_off=0), so a test filtering there would pass whether or not the emitted id was
+        # absolute. `row=200, col=800` and its immediate row-neighbor `col=801` sit far
+        # from the origin, so window-relative ids (`0, 1`) and absolute ids (`211200,
+        # 211201`) are provably different values here -- only the fix (absolute ids) makes
+        # this round-trip correctly; the pre-fix window-relative behavior would have
+        # returned `[0, 1]` instead.
+        row, col = 200, 800
+        grid = GRIDS[RASTER_GRID]
+        cell_id_a = row * grid.width + col
+        cell_id_b = row * grid.width + col + 1
+
+        def data_fn(year):
+            data = raster_array(fill=1, grid_name=RASTER_GRID, dtype="int32")
+            data[row, col] = 11
+            data[row, col + 1] = 22
+            return data
+
+        write_raster_dataset(base_path, years=(2030,), data_fn=data_fn)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": f"grid_cell IN ({cell_id_a}, {cell_id_b})"}
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].point_sample_step is not None
+
+        df = execute(plan, base_path=base_path).collect()
+
+        rows = {row["grid_cell"]: row["value"] for row in df.to_dicts()}
+        assert set(rows) == {cell_id_a, cell_id_b}
+        assert rows[cell_id_a] == pytest.approx(11.0)
+        assert rows[cell_id_b] == pytest.approx(22.0)
+
     def test_band_wide_join_reads_operands_from_one_shared_scan(self, base_path, monkeypatch):
         # Two DIFFERENT raster variables on `RASTER_GRID` -- `vct` fills 10 everywhere,
         # `ffibs_score` fills 5.0 everywhere -- joined spatially into one band-wide frame,

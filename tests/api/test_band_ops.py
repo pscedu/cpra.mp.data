@@ -200,7 +200,9 @@ class TestSampleGridCellsBandWide:
         metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         band_wide = (lf, metadata_df, _window(height=3))
 
-        result = sample_grid_cells_band_wide(band_wide, "grid_cell < 2", extra_columns=[]).collect()
+        result = sample_grid_cells_band_wide(
+            band_wide, "grid_cell < 2", extra_columns=[], grid_width=band_wide[2].width
+        ).collect()
 
         # 2 surviving pixels (grid_cell 0 and 1) x 2 bands = 4 long rows.
         assert result.height == 4
@@ -220,7 +222,10 @@ class TestSampleGridCellsBandWide:
         band_wide = (lf, metadata_df, _window(height=2))
 
         result = sample_grid_cells_band_wide(
-            band_wide, "grid_cell = 1 and calendar_year = 2021 and value > 20", extra_columns=[]
+            band_wide,
+            "grid_cell = 1 and calendar_year = 2021 and value > 20",
+            extra_columns=[],
+            grid_width=band_wide[2].width,
         ).collect()
 
         # Only (grid_cell=1, calendar_year=2021) survives the spatial+dimension conjuncts,
@@ -241,7 +246,7 @@ class TestFilterBandWide:
 
     def test_dispatches_spatial_where_to_long(self):
         band_wide = _two_band_fixture()
-        result = filter_band_wide(band_wide, "grid_cell = 0", extra_columns=[])
+        result = filter_band_wide(band_wide, "grid_cell = 0", extra_columns=[], grid_width=band_wide[2].width)
         collected = result.collect()
         assert collected["grid_cell"].to_list() == [0, 0]
 
@@ -529,7 +534,9 @@ class TestSpatialFilterCommutesWithCalculateAndGroup:
 
         calculated = calculate_band_wide(band_wide, calculate_op, extra_columns=[])
         grouped = group_band_wide(calculated, group_op, extra_columns=[])
-        long_result = sample_grid_cells_band_wide(grouped, "grid_cell = 1", extra_columns=[]).collect()
+        long_result = sample_grid_cells_band_wide(
+            grouped, "grid_cell = 1", extra_columns=[], grid_width=grouped[2].width
+        ).collect()
 
         assert long_result.height == 1
         assert long_result["value"].to_list() == [107]

@@ -1,11 +1,20 @@
-"""Convert between vector grid cell IDs and lat/lng coordinates using grid geometry.
+"""Convert between grid cell IDs and lat/lng coordinates using grid geometry, for both
+grid kinds: a vector grid's polygon ids (`resolve_vector_grid_cell`, backed by a `.fgb`
+geometry file) and a raster grid's pixel positions (`resolve_raster_pixel`/
+`raster_grid_cell_id`, backed by nothing but `cpra.mp.data.grids.RasterGrid`'s own
+declared extent -- no file is opened to answer a raster coordinate lookup).
 
 Formerly `api/geography.py`; moved here because `vector.apply_grid_cell_selection`
 (called by `VectorGridAnalysis.apply_steps`'s terminal `grid_cell` filter) resolves
 `grid_cell` coordinates through this module directly, and `cpra.mp.data.analysis` may not
 import FastAPI (see this package's other modules, and
-`tests/api/test_analysis_boundary.py`) -- so every `HTTPException` this module used to
-raise is an `AnalysisError` instead.
+`tests/api/test_analysis_boundary.py`) -- so every `HTTPException` the OLD-engine-facing
+functions here used to raise is an `AnalysisError` instead. The raster functions are NEW-
+engine code with no old-engine counterpart to match, so they raise from `request.errors`
+instead -- see `resolve_raster_pixel`'s own docstring. Both families of function still
+share `parse_coordinate_pairs`/`project_coordinates` below, which keep raising
+`AnalysisError` for a bad/unprojectable coordinate regardless of which grid kind is asking,
+since that failure is decided before either grid kind's own lookup ever begins.
 """
 
 import asyncio
@@ -17,11 +26,13 @@ import pyogrio
 # the only handle on the failure PROJ reports for an unprojectable point.
 from rasterio._err import CPLE_BaseError
 from rasterio.crs import CRS
+from rasterio.transform import from_bounds, rowcol
 from rasterio.warp import transform, transform_bounds
 from shapely.geometry import Point
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.base import AnalysisError
+from cpra.mp.data.analysis.request.errors import NotFoundError
 from cpra.mp.data.grids import GRIDS
 
 
@@ -166,6 +177,80 @@ async def resolve_vector_grid_cell(grid_name: str, lngs: list[float], lats: list
     return await asyncio.gather(
         *[loop.run_in_executor(None, _resolve_point, fgb_path, x, y) for x, y in points]
     )
+
+
+def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -> list[tuple[int, int] | None]:
+    """Resolve WGS84 (lng, lat) pairs to ABSOLUTE (row, col) pixel positions on
+    `grid_name`'s own full pixel grid -- the raster counterpart of
+    `resolve_vector_grid_cell`, for NEW-engine code (see `raster_grid_cell_id` below for
+    the window-relative id a spatial `filter` actually tests against, which this function
+    deliberately does NOT compute).
+
+    Returns one entry per input pair, in order, `None` for a point that falls outside the
+    raster's own extent -- the same per-point, independent-resolution contract
+    `resolve_vector_grid_cell` already keeps for a point outside every polygon. A request
+    where EVERY point resolves to `None` is not special-cased here: it is exactly what
+    "none of these points are inside this grid" means, resolved one point at a time same
+    as any other outcome. What that should mean for a spatial filter downstream (an empty
+    result vs. a 400) is a decision for a CALLER building a `where` conjunct out of this
+    list, not for a lookup that has no opinion about how its answer gets used -- mirrored
+    by `resolve_vector_grid_cell`'s own docstring making the identical distinction.
+
+    Opens no data file: `cpra.mp.data.grids.RasterGrid` already carries everything a pixel
+    lookup needs (`bounds`, `height`, `width`, `crs`) -- the same "the grid's own geometry
+    is enough, no raster need be opened" property `io.raster_io.raster_grid_geometry` and
+    `execution.plan.compile_plan` already rely on for a raster origin's window/extent (only
+    resolving which BANDS exist touches the catalog). `NotFoundError` (this module's NEW
+    family, not `AnalysisError` -- see the module docstring) is raised for a name that
+    isn't a raster grid at all, the raster-side counterpart of `_geometry_path`'s missing-
+    file 400 for a vector grid.
+    """
+    grid = GRIDS.get(grid_name)
+    if grid is None or grid.grid_type != "raster":
+        raise NotFoundError(f"{grid_name!r} is not a raster grid")
+
+    xs, ys = project_coordinates(lngs, lats, CRS.from_user_input(grid.crs))
+    grid_transform = from_bounds(*grid.bounds, width=grid.width, height=grid.height)
+    rows, cols = rowcol(grid_transform, xs, ys)
+
+    resolved: list[tuple[int, int] | None] = []
+    for row, col in zip(rows, cols):
+        if 0 <= row < grid.height and 0 <= col < grid.width:
+            resolved.append((int(row), int(col)))
+        else:
+            resolved.append(None)
+    return resolved
+
+
+def raster_grid_cell_id(pixel: tuple[int, int], window) -> int:
+    """The row-major `grid_cell` id a pixel at ABSOLUTE `(row, col)` (as `resolve_raster_
+    pixel` returns) would be assigned by `execution.frame.row_major_grid_cell` if it were
+    read as part of `window` -- computed forward from a known pixel position, rather than
+    decoded from a row a real read produced.
+
+    `window` is duck-typed to accept either `io.window.ReadWindow` or a plain
+    `rasterio.windows.Window` -- both carry `row_off`/`col_off`/`width`, which is all this
+    needs; importing this module does not otherwise require `execution` or a specific
+    window type from either caller.
+
+    The formula is the SAME arithmetic `row_major_grid_cell`'s own `join_asof` decode
+    collapses to once a batch's absolute row/col are known
+    (`execution/frame.py`'s `__batch_row`/`__batch_col` are already absolute grid
+    coordinates): `(row - window.row_off) * window.width + (col - window.col_off)`. It
+    holds regardless of how a real read happened to be CHUNKED into batches -- batching
+    only changes which raw row index a pixel lands at partway through a scan, never the id
+    `row_major_grid_cell` decodes it back to -- which is exactly why this function needs no
+    knowledge of `window.batch_layout` at all to reproduce the same answer.
+
+    A caller that narrows `window` for one origin after ids were already computed against
+    a wider one (`execution.execute`'s point-sparse read is exactly this) must recompute
+    EVERY id it still needs against the new window, all at once, and use nothing but those
+    recomputed ids from that point on: a `grid_cell` filter's literal values and the
+    `grid_cell` column an actual read of that window produces must come from calling this
+    function against the identical `window`, or the two silently address different pixels.
+    """
+    row, col = pixel
+    return (row - window.row_off) * window.width + (col - window.col_off)
 
 
 def representative_points(grid_name: str, grid_cell_ids: list[int] | None = None) -> dict[int, tuple]:

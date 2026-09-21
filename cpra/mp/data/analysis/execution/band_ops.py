@@ -290,43 +290,60 @@ def select_dimension_band_wide(
     return out_lf, kept_metadata, window
 
 
-def sample_grid_cells_band_wide(band_wide: BandWideFrame, where: str, extra_columns: Sequence[str]) -> LongFrame:
+def sample_grid_cells_band_wide(
+    band_wide: BandWideFrame, where: str, extra_columns: Sequence[str], *, grid_width: int
+) -> LongFrame:
     """The band-wide lowering of a `where` containing a SPATIAL (`grid_cell`) conjunct:
     the one case that changes the frame's shape, from band-wide to long -- see the module
     docstring for why the transition itself, not a row drop, is what "spatial filter"
     means on the band-wide side.
 
     Unconditionally unpivots every pixel into one long row per (pixel, band) observation:
-    `grid_cell` is the pixel's row-major position within `window`, via
-    `frame.row_major_grid_cell` and NOT a plain `with_row_index` -- row order is the only
-    positional information a band-wide frame keeps, but that order is the order the READ
-    produced, which is row-major only for a single-batch read (see that function, and
-    `execution/frame.py`'s module docstring). A raw row index would hand the long frame
-    cell ids that address the right pixels in the wrong places on any raster large enough
-    to have been chunked, which is all of the real ones. Each band's row then picks up that
-    band's own dimension values from `metadata_df` via a join on band identity. `where` in
-    its ENTIRETY -- every conjunct, of every kind, not just the spatial one(s) -- is then
+    `grid_cell` is the pixel's ABSOLUTE row-major position over the full `grid_width`-wide
+    source grid, via `frame.row_major_grid_cell`'s absolute mode and NOT a plain
+    `with_row_index` or a window-relative id -- row order is the only positional
+    information a band-wide frame keeps, but that order is the order the READ produced,
+    which is row-major only for a single-batch read (see that function, and
+    `execution/frame.py`'s module docstring), and `window` may itself cover only part of
+    the grid (`execution.execute`'s point-sample window narrowing). Using the ABSOLUTE id
+    rather than a window-relative one is what keeps that narrowing a pure read-size
+    optimization: a caller's `where: "grid_cell = N"` names the same pixel, and gets the
+    same `N` back, whether or not the read that answered it happened to be narrowed.
+    `grid_width` is therefore required here, not optional -- there is no meaningful
+    fallback once a spatial conjunct is in play. Each band's row then picks up that band's
+    own dimension values from `metadata_df` via a join on band identity. `where` in its
+    ENTIRETY -- every conjunct, of every kind, not just the spatial one(s) -- is then
     applied by `execution.long_ops.filter_long`, which already knows how to run a mixed
     dimension/value/spatial `where` against a long frame (a spatial conjunct is just an
-    ordinary `grid_cell` column there).
+    ordinary `grid_cell` column there, and needs no further rewriting: the id it names is
+    already the id `row_major_grid_cell` just produced).
     """
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
     names = band_column_names(metadata_df)
-    indexed = row_major_grid_cell(lf, window)
+    indexed = row_major_grid_cell(lf, window, grid_width=grid_width)
     long_lf = indexed.unpivot(index=["grid_cell", *extra_columns], on=names, variable_name="__band", value_name="value")
     band_identity = pl.DataFrame({"__band": pl.Series(names, dtype=pl.String)}).hstack(metadata_df)
     with_metadata = long_lf.join(band_identity.lazy(), on="__band", how="left").drop("__band")
     return long_ops.filter_long(with_metadata, where)
 
 
-def filter_band_wide(band_wide: BandWideFrame, where: str, extra_columns: Sequence[str]) -> BandWideFrame | LongFrame:
+def filter_band_wide(
+    band_wide: BandWideFrame, where: str, extra_columns: Sequence[str], *, grid_width: int | None = None
+) -> BandWideFrame | LongFrame:
     """The `filter` op's band-wide dispatcher: classify `where`'s conjuncts
     (`request.expressions.classify_where_kinds`) and route to the one of the three
     predicate-kind lowerings above that a spatial conjunct's presence selects -- exactly
     the precedence `request.ops._type_filter` already types this against (spatial, if
     present, wins outright; otherwise dimension runs before value -- see the module
     docstring for why that order is a non-observable choice rather than a requirement).
+
+    `grid_width` is only needed for the spatial branch (`sample_grid_cells_band_wide`
+    requires it, to decode absolute pixel ids); left `None` for a `where` that turns out
+    to have no spatial conjunct, since neither `select_dimension_band_wide` nor
+    `mask_value_band_wide` needs it. A spatial conjunct with no `grid_width` supplied is a
+    caller error, not a case to silently fall back on -- raised here rather than left to
+    surface as a `TypeError` one call down.
 
     A `where` combining a dimension and a value conjunct (no spatial one) stays band-wide
     the whole time: `select_dimension_band_wide` first, `mask_value_band_wide` second,
@@ -336,7 +353,12 @@ def filter_band_wide(band_wide: BandWideFrame, where: str, extra_columns: Sequen
     validate_extra_columns(extra_columns)
     kinds = classify_where_kinds(where)
     if kinds[PredicateKind.spatial]:
-        return sample_grid_cells_band_wide(band_wide, where, extra_columns)
+        if grid_width is None:
+            raise ValueError(
+                f"filter_band_wide needs grid_width to decode the spatial conjunct in {where!r} "
+                "into absolute pixel ids"
+            )
+        return sample_grid_cells_band_wide(band_wide, where, extra_columns, grid_width=grid_width)
 
     result = band_wide
     if kinds[PredicateKind.dimension]:

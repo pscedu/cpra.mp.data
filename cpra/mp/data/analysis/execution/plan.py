@@ -129,12 +129,22 @@ only by inspecting the plan.
 
 **A spatial predicate reaching a band-wide read is a point sample.** Recorded as
 `ResolvedInput.point_sample_step` (the step number of the `filter` that first samples that
-origin) -- purely a marker for now. What point-sparse read mechanism actually consumes it,
-and how per-pixel ops recorded before that point get replayed against the sampled rows,
-is for the executor that eventually opens a band-wide input to decide; this module commits
-only to WHERE that filter sits in the declared chain and to no longer tracking origin
-validity for that origin past it (per the table above, a spatial filter turns a band-wide
-frame long, so anything after it addresses a different, already-materialized frame).
+origin). `execution.execute` reads it to attempt a NARROWER window for that origin's read,
+built from the same full-grid, absolute-id convention every producer of a spatial conjunct
+reaching a still-band-wide origin already uses (see `execution.execute._derive_point_
+sample_window`) -- but only when the filter's own `where` is simple enough to name the
+exact pixels before the read happens (`grid_cell = N` / `grid_cell IN (...)`, unquoted
+integers); anything else -- a negation, an `OR`, a comparison other than equality --
+falls back to reading the origin whole, which is still correct, only slower, and is a
+choice this module leaves entirely to the executor. Narrowing the window this way changes
+nothing about `where` itself, or about what a `grid_cell` id in the eventual result means:
+`execution.band_ops.sample_grid_cells_band_wide` always emits an ABSOLUTE id (row-major
+over the origin's full grid, not the narrowed window), so the literal `where` was written
+against keeps naming the same pixel regardless of how much of the grid the read actually
+covered. What this module commits to is unchanged by that choice: only WHERE the filter
+sits in the declared chain, and to no longer tracking origin validity for that origin past
+it (per the table above, a spatial filter turns a band-wide frame long, so anything after
+it addresses a different, already-materialized frame).
 
 **Overview eligibility is a per-raster-SOURCE property, decided here rather than wherever
 the read happens.** A tile read is free to let GDAL serve a decimated window from a raster's
