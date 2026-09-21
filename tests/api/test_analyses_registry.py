@@ -24,21 +24,15 @@ assembled by the `exit_criterion_data` fixture in `tests/api/conftest.py` -- sha
 `tests/api/test_analyses_endpoints.py`, which needs the same data to drive the same
 analysis through its HTTP routes.
 
-**`exit-criterion` has no execution test here, on purpose.** Its pipeline resolves,
-type-checks and compiles -- all three are covered below -- but running it needs two
-lowerings the execution engine does not have yet: a vector-to-raster `project` whose
-output feeds a band-wide `join` (the two operands come from separate `scan_raster` calls
-with different band counts, so their read windows disagree on `batch_layout` and
-`join_band_wide`'s pixel-grid precondition rejects them), and a `filter` whose `where`
-names a band-wide join's OPERAND value columns (`marsh`/`sal`), which
-`expressions.classify_predicate_kind` reads as dimension names and looks for on the
-band metadata table. `TestExitCriterionUnsupportedExecution` pins both failures so the
-gap is recorded as a known, reproducible shortfall rather than an untested claim -- and
-so whichever lowering lands first has a test that changes when it does.
+**`exit-criterion` gets its own execution class.** Every other registered analysis is
+long-shaped and runs through `_run` below; `exit-criterion` is band-wide end to end and
+is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
+together with a `filter` naming that join's operand value columns, so
+`TestExitCriterionExecution` runs it separately and pins the two halves apart.
 """
 
-import polars as pl
 import pytest
+import rasterio as rio
 
 from cpra.mp.data import config
 from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis
@@ -274,18 +268,21 @@ class TestConcatenateExecution:
         assert set(df["value"].to_list()) == {111.0}
 
 
-class TestExitCriterionUnsupportedExecution:
-    """`exit-criterion` resolves, type-checks and compiles (see `TestRegistryDrift`), but
-    cannot yet RUN -- see this module's docstring. Both missing lowerings are pinned here,
-    each against the smallest pipeline that isolates it, so the gap is a recorded,
-    reproducible fact and so the test changes when either lowering lands.
+class TestExitCriterionExecution:
+    """`exit-criterion` is the only registered analysis whose pipeline is band-wide end to
+    end, and the only one that exercises the two pieces of machinery a paired raster shape
+    needs: a vector-to-raster `project` feeding a band-wide `join` (both operands read off
+    ONE `scan_raster`, so their `batch_layout`s agree), and a `filter` whose `where` names
+    the join's OPERAND value columns rather than `value`. Each is pinned here against the
+    smallest pipeline that isolates it.
     """
 
-    def test_the_analysis_itself_fails_at_the_band_wide_join(self, exit_criterion_data, tmp_path):
-        """A vector-to-raster `project` reads only the crosswalk (one band) in its own
-        `scan_raster` call, while the sibling raster operand is read whole (two bands
-        here). A read's `batch_layout` depends on its band count, so the two frames
-        disagree about how pixels are chunked and cannot be aligned row-for-row.
+    def test_the_analysis_itself_runs_to_a_uniform_2040_raster(self, exit_criterion_data, tmp_path):
+        """The whole analysis, end to end, over `exit_criterion_data` -- marsh crosses 0.5
+        only in 2040, salinity crosses 5.5 only in 2040, so the `min of=calendar_year`
+        answer is 2040 at every pixel. The vector operand reaches the join through a
+        vector-to-raster `project`, which is the half of the shape the sibling test below
+        deliberately leaves out.
         """
         resolved = resolve_analysis(
             "exit-criterion",
@@ -293,15 +290,20 @@ class TestExitCriterionUnsupportedExecution:
             filters={},
             params={"model_group_id": 500, "scenario_id": 7},
         )
-        with pytest.raises(AssertionError, match="do not share a pixel grid"):
-            run_to_path(resolved.pipeline, tmp_path / "out.tif", base_path=exit_criterion_data)
+        out = tmp_path / "out.tif"
+        run_to_path(resolved.pipeline, out, base_path=exit_criterion_data)
 
-    def test_a_filter_on_a_band_wide_joins_operand_names_is_read_as_a_dimension(self, base_path, monkeypatch):
-        """The second gap, isolated from the first: two RASTER operands DO share one scan
-        (so `batch_layout` matches), but the trailing `filter where="marsh > ... AND
-        sal > ..."` still fails -- neither conjunct names `value` or `grid_cell`, so
-        `classify_predicate_kind` sorts both as dimension predicates and they are
-        evaluated against the band metadata table, which has no such column.
+        with rio.open(out) as src:
+            assert (src.read(1) == 2040).all()
+
+    def test_a_filter_on_a_band_wide_joins_operand_names_pairs_the_operands(self, base_path, monkeypatch):
+        """The other half, isolated: two RASTER operands (no `project` at all), so the
+        only thing under test is the trailing `filter where="marsh > ... AND sal > ..."`.
+        Both conjuncts name operand value columns, so the filter has to pair each
+        operand's band with its counterpart on the dimensions they share and mask the
+        pair, rather than reading `marsh`/`sal` as dimension names on the band metadata.
+        2030 is (0.3, 4.0) and fails both conjuncts; 2040 is (0.7, 6.0) and passes both,
+        so the surviving `min of=calendar_year` is 2040.
         """
         from cpra.mp.data.analysis.request.pipeline import parse_pipeline
         from tests.factories import write_raster_dataset
@@ -338,5 +340,7 @@ class TestExitCriterionUnsupportedExecution:
         )
         validate_shapes(pipeline)
         plan = compile_plan(pipeline, base_path=base_path)
-        with pytest.raises(pl.exceptions.ColumnNotFoundError, match='unable to find column "marsh"'):
-            execute(plan, base_path=base_path)[0].collect()
+        df = execute(plan, base_path=base_path)[0].collect()
+
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == [2040]

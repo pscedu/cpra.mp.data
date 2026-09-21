@@ -700,11 +700,14 @@ class TestBandWideJoinCeiling:
         }
 
     def _join_pipeline(self):
+        # The value `filter` is what collapses the join's two operand-named value columns
+        # back to one, which every output requires -- see `request.ops.validate_shapes`.
+        # Nothing here depends on the predicate itself; these tests never execute.
         return {
             "inputs": self._two_raster_inputs(),
             "steps": [
                 {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                {"op": "calculate", "input": "j", "expression": "a + b"},
+                {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5"},
             ],
             "output": {"format": "tif"},
         }
@@ -762,9 +765,9 @@ class TestBandWideJoinCeiling:
             "inputs": inputs,
             "steps": [
                 {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                {"op": "calculate", "input": "j", "expression": "a + b", "as": "m"},
+                {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5", "as": "m"},
                 {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
-                {"op": "calculate", "input": "j2", "expression": "value + c"},
+                {"op": "filter", "input": "j2", "where": "m > 0.5 AND c > 0.5"},
             ],
             "output": {"format": "tif"},
         }
@@ -788,9 +791,9 @@ class TestBandWideJoinCeiling:
                     "inputs": inputs,
                     "steps": [
                         {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                        {"op": "calculate", "input": "j", "expression": "a + b", "as": "m"},
+                        {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5", "as": "m"},
                         {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
-                        {"op": "calculate", "input": "j2", "expression": "value + c"},
+                        {"op": "filter", "input": "j2", "where": "m > 0.5 AND c > 0.5"},
                     ],
                     "output": {"format": "tif"},
                 }
@@ -930,7 +933,7 @@ class TestOverviewEligibility:
                 "steps": [
                     {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "sum", "as": "zp"},
                     {"op": "join", "type": "spatial", "inputs": ["b", "c"], "as": "j"},
-                    {"op": "calculate", "input": "j", "expression": "b + c"},
+                    {"op": "filter", "input": "j", "where": "b > 0.5 AND c > 0.5"},
                 ],
                 "output": {"format": "tif"},
             }

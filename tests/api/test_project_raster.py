@@ -26,6 +26,7 @@ import rasterio as rio
 from rasterio.transform import from_origin
 
 from cpra.mp.data.analysis.execution import project
+from cpra.mp.data.analysis.execution.frame import DOMAIN_COLUMN
 from cpra.mp.data.analysis.execution.project import project_raster_to_vector, project_vector_to_raster
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
@@ -436,7 +437,9 @@ class TestVectorToRasterZeroPivotDimensions:
         out_lf, metadata_out, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
         out = out_lf.collect()
 
-        assert list(out.columns) == ["b0"]
+        # `DOMAIN_COLUMN` rides alongside the bands out of every vector-to-raster
+        # projection -- see its own comment in `execution/frame.py`.
+        assert list(out.columns) == ["b0", DOMAIN_COLUMN]
         assert out["b0"].to_list() == [5.0, 6.0]
         assert metadata_out.columns == [RESERVED_BAND_INDEX_COLUMN]
         assert metadata_out[RESERVED_BAND_INDEX_COLUMN].to_list() == [0]

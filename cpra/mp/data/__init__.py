@@ -238,8 +238,8 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
         df = await analyze_data({
             "inputs": {"eco": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
-                {"op": "project", "input": "eco", "to": "ecoregion_v001"},
-                {"op": "group", "by": [], "aggregate": "mean"},
+                {"op": "filter", "input": "eco", "where": "model_group_id = 500 AND scenario_id = 7"},
+                {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
             ],
             "output": {"format": "csv"},
         })

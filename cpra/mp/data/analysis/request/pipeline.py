@@ -55,7 +55,7 @@ from cpra.mp.data.analysis.request.expressions import (
     classify_where_kinds,
     parse_calculate_expression,
 )
-from cpra.mp.data.analysis.request.types import AggregateFunction, CompressionAlgorithm, DataFormat, Grid, TileFormat, TimeUnit, Variable
+from cpra.mp.data.analysis.request.types import AggregateFunction, DataFormat, Grid, TileFormat, TimeUnit, Variable
 from cpra.mp.data.dimensions import DIMENSIONS
 
 # Every name a user chooses -- an input's key in `Pipeline.inputs`, or a step's `as` --
@@ -227,13 +227,16 @@ class GroupStep(BaseModel):
     `count_by_value` (a different output shape group's one-row-per-group contract cannot
     absorb; see `request.aggregates.validate_group_aggregate`); `value` must not be a
     member of `by` (`request.aggregates.validate_group_by`) since it names the measured
-    quantity, not a dimension. Always consumes the previous step's output -- there is no
-    `input` field -- so `group` can never be a pipeline's first step.
+    quantity, not a dimension. `input` chains from the previous step when omitted, the
+    same as `project`/`filter`/`calculate`; naming it is what lets a `group` lead a
+    pipeline, so "read one dataset and collapse it" needs no filter in front of it purely
+    to satisfy the chaining rule.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True, use_enum_values=True)
 
     op: Literal["group"] = "group"
+    input: str | None = None
     by: list[str]
     aggregate: AggregateFunction
     of: str = "value"
@@ -248,15 +251,12 @@ Step = Annotated[
 
 def _step_explicit_inputs(step: Any) -> list[str]:
     """The names a step references BY ITSELF, before any chaining default is applied --
-    `[]` means "consumes the previous step's output" (`project`, `filter`, and
-    `calculate` can also mean this via an omitted `input`; `group` always means this,
-    having no field to be explicit with).
+    `[]` means "consumes the previous step's output", which every op but `join` can mean
+    via an omitted `input`.
     """
-    if isinstance(step, (ProjectStep, FilterStep, CalculateStep)):
-        return [step.input] if step.input is not None else []
     if isinstance(step, JoinStep):
         return list(step.inputs)
-    return []
+    return [step.input] if step.input is not None else []
 
 
 # --------------------------------------------------------------------------------------
@@ -266,14 +266,21 @@ def _step_explicit_inputs(step: Any) -> list[str]:
 
 class Output(BaseModel):
     """`format` reuses `DataFormat` (tabular formats + `tif`) and `TileFormat`
-    (`png`/`jpg`) directly rather than a third format enum. `color_map` and `compression`
-    are only meaningful for a rendered/raster format; not checked here (that needs to
-    know the final frame's shape, which needs the shape-typing walk -- see
-    `ops.validate_shapes`). `sort`/`select` are a comma-separated `[-]column` list and a
-    comma-separated column subset, respectively; `validate_pipeline` checks their SYNTAX
-    (via `_validate_output_sort_or_select`) but deliberately not whether a named column
-    exists -- that half surfaces as Polars' `ColumnNotFoundError` at collect time (see
+    (`png`/`jpg`) directly rather than a third format enum. `color_map` is only
+    meaningful for a rendered/raster format; not checked here (that needs to know the
+    final frame's shape, which needs the shape-typing walk -- see `ops.validate_shapes`).
+    `sort`/`select` are a comma-separated `[-]column` list and a comma-separated column
+    subset, respectively; `validate_pipeline` checks their SYNTAX (via
+    `_validate_output_sort_or_select`) but deliberately not whether a named column exists
+    -- that half surfaces as Polars' `ColumnNotFoundError` at collect time (see
     `execution.sink.apply_output_shaping`).
+
+    **No `compression` field.** Compression is a pair of QUERY parameters
+    (`compression_algorithm`/`compression_level`, bound as `api.models.Compression` on
+    the analysis routes), not part of the pipeline body. This model carried a
+    `compression` field for a while that round-tripped through the dotted encoding and
+    was never read by anything, so a caller who set it silently got the default instead;
+    it is rejected outright now (`extra="forbid"`) rather than accepted and ignored.
     """
 
     model_config = ConfigDict(extra="forbid", use_enum_values=True)
@@ -282,7 +289,6 @@ class Output(BaseModel):
     color_map: str | None = None
     sort: str | None = None
     select: str | None = None
-    compression: CompressionAlgorithm | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -318,11 +324,10 @@ def validate_pipeline(pipeline: Pipeline) -> None:
       (`_validate_name`);
     - a zero-step pipeline has exactly one input (nothing selects among several with no
       step to combine or choose between them);
-    - **chaining**: the first step must name its input(s) explicitly (`project.input`,
-      `filter.input`, `calculate.input`, or `join.inputs` -- `group` never can, so it may
-      never be the first step); a later step with no explicit reference consumes the
-      immediately preceding step's output; every explicit reference (an input name, or a
-      prior -- not later -- step's `as`) must already be known at that point;
+    - **chaining**: the first step must name its input(s) explicitly (any op's `input`,
+      or `join.inputs`); a later step with no explicit reference consumes the immediately
+      preceding step's output; every explicit reference (an input name, or a prior -- not
+      later -- step's `as`) must already be known at that point;
     - every step's `as`, when given, matches the identifier/reserved-name/dimension-
       collision rule and does not collide with an input name or an earlier step's `as`;
     - `group.aggregate` folds and is not `count_by_value`; `group.by` does not contain
@@ -374,8 +379,7 @@ def validate_pipeline(pipeline: Pipeline) -> None:
         elif i == 1:
             raise RequestError(
                 f"step 1 ({step.op}) has no input to chain from -- the first step must "
-                "name its input explicitly (project.input, filter.input, "
-                "calculate.input, or join.inputs)"
+                f"name its input explicitly ({step.op}.input, or join.inputs)"
             )
 
         as_name = getattr(step, "as_", None)
@@ -515,7 +519,7 @@ _STEP_FIELDS: dict[str, frozenset[str]] = {
     "join": frozenset({"op", "type", "inputs", "as"}),
     "filter": frozenset({"op", "input", "where", "as"}),
     "calculate": frozenset({"op", "input", "expression", "where", "as"}),
-    "group": frozenset({"op", "by", "aggregate", "of", "as"}),
+    "group": frozenset({"op", "input", "by", "aggregate", "of", "as"}),
 }
 _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
     "project": frozenset(),
@@ -525,7 +529,7 @@ _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
     "group": frozenset({"by"}),
 }
 
-_OUTPUT_FIELDS = frozenset({"format", "color_map", "sort", "select", "compression"})
+_OUTPUT_FIELDS = frozenset({"format", "color_map", "sort", "select"})
 
 
 def _insert_dotted(tree: dict[str, Any], segments: list[str], value: str, full_key: str) -> None:
@@ -759,6 +763,8 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
             if step.as_ is not None:
                 params[f"{prefix}.as"] = step.as_
         elif isinstance(step, GroupStep):
+            if step.input is not None:
+                params[f"{prefix}.input"] = step.input
             params[f"{prefix}.by"] = ",".join(step.by)
             params[f"{prefix}.aggregate"] = str(step.aggregate)
             if step.of != "value":
@@ -775,7 +781,5 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
         params["output.sort"] = pipeline.output.sort
     if pipeline.output.select is not None:
         params["output.select"] = pipeline.output.select
-    if pipeline.output.compression is not None:
-        params["output.compression"] = str(pipeline.output.compression)
 
     return dict(sorted(params.items(), key=lambda item: _query_sort_key(item[0])))

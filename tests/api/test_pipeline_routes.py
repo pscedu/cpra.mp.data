@@ -46,6 +46,13 @@ from tests.factories import (
     write_vector_crosswalk,
 )
 
+# The nodata sentinel these routes write into a GeoTIFF. Spelled as a literal rather than
+# imported from `execution.sink.DEFAULT_NODATA`, because what these tests pin is the value
+# a client reads back out of the file, not the constant that happens to produce it: the
+# `.tif` route passes no `nodata=`, so the sink's default is what lands on disk, and the
+# same number is used regardless of the band dtype.
+NODATA = -9999
+
 # The `exit-criterion` analysis's own shape, spelled as a raw pipeline body: two inputs on
 # different grids, one `project`ed onto the other's grid, joined, filtered on both value
 # columns, and collapsed to the earliest calendar year that satisfies the filter.
@@ -184,7 +191,8 @@ def accumulator_edge_case_data(base_path, crosswalk_path, monkeypatch):
 
     * rows [0, h/3): `marsh` is 0.3 in both years -- NEVER satisfies `marsh > 0.5`, so
       the pixel has zero valid contributing bands in every aggregate (`any_valid` stays
-      False) and must come out as `nodata_value` (-1 for the `of=calendar_year` dtype).
+      False) and must come out as the raster sink's nodata sentinel
+      (`execution.sink.DEFAULT_NODATA`, -9999).
     * rows [h/3, 2h/3): `marsh` is 0.7 in 2030, 0.2 in 2040 -- satisfies the where-clause
       in ONLY 2030, so exactly one band contributes.
     * rows [2h/3, h): `marsh` is 0.6 in both years -- satisfies the where-clause in BOTH
@@ -229,7 +237,8 @@ def count_edge_case_data(base_path, crosswalk_path, monkeypatch):
       in-domain -> 0.
     * rows [3h/5, 4h/5): zone 0 -- the crosswalk raster's own nodata value
       (`write_raster_crosswalk` fixes it at 0) -- OUTSIDE the pairing crosswalk's domain
-      entirely -> the nodata sentinel (-1), never a real 0, regardless of `marsh`/`sal`.
+      entirely -> the nodata sentinel (`execution.sink.DEFAULT_NODATA`, -9999), never a
+      real 0, regardless of `marsh`/`sal`.
     * rows [4h/5, h): zone 1; `marsh` crosses 0.5 in 2030 only -> a MIXED pixel, exactly
       one contributing band -> a count of 1.
     """
@@ -279,25 +288,18 @@ def _tile_for_grid(base_path, grid_glob="*.tif", zoom=8):
 class TestNotebookQueryEndToEnd:
     """`NOTEBOOK_QUERY`, byte-exact, through the real ASGI routes.
 
-    Three of these are `xfail(strict=True)` against a known gap in the band-wide `join`
-    lowering, reproduced empirically against these fixtures:
-    `execution.frame.assert_same_pixel_grid` rejects `marsh` (the raw
-    `veg_grid_cell_v001` raster input) paired against `sal` (the vector input, `project`ed
-    onto `veg_grid_cell_v001` via `execution.project`'s crosswalk broadcast) because the
-    two reads' `ReadWindow.batch_layout` (and, for the tile route, the full crop geometry)
-    do not match -- see that function's own docstring, which names the intended fix as one
-    shared `scan_raster(..., crosswalks=...)` read rather than two independently-read
-    windows compared after the fact. That is an execution-layer correctness gap in the
-    join lowering, not a stale expectation here. `strict=True` so these keep proving the
-    shape hasn't silently started passing without anyone updating this comment, without
-    blocking the suite.
+    The paired shape these exercise is the one that puts a raw raster input (`marsh`, on
+    `veg_grid_cell_v001`) and a vector input broadcast onto that same grid (`sal`, via
+    `execution.project`'s crosswalk) through a single band-wide `join`. Getting the two
+    operands onto the same pixel grid is not free: `execution.frame.assert_same_pixel_grid`
+    compares `ReadWindow.batch_layout`, and band count drives chunking, so a `project` that
+    opened its crosswalk in its own one-band read would land its pixels somewhere other
+    than where the four-band `marsh` read put them. Both operands therefore come off the
+    ONE `scan_raster(..., crosswalks=...)` the join group plans -- see
+    `execution.plan.ExecutionPlan.band_wide_join_zone_crosswalks`. These tests are the
+    end-to-end proof of that, which is why they assert pixel values and not just a 200.
     """
 
-    @pytest.mark.xfail(
-        reason="execution.frame.assert_same_pixel_grid rejects marsh/sal's batch_layout "
-        "mismatch on every band-wide join -- see class docstring",
-        strict=True,
-    )
     def test_post(self, client, notebook_query_data):
         response = client.post("/v1/analysis.tif", json=NOTEBOOK_QUERY)
         assert response.status_code == 200, response.text
@@ -305,11 +307,6 @@ class TestNotebookQueryEndToEnd:
             data = src.read(1)
         assert (data == 2040).all()
 
-    @pytest.mark.xfail(
-        reason="execution.frame.assert_same_pixel_grid rejects marsh/sal's batch_layout "
-        "mismatch on every band-wide join -- see class docstring",
-        strict=True,
-    )
     def test_get_dotted_query(self, client, notebook_query_data):
         query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
         response = client.get("/v1/analysis.tif", params=query)
@@ -318,11 +315,6 @@ class TestNotebookQueryEndToEnd:
             data = src.read(1)
         assert (data == 2040).all()
 
-    @pytest.mark.xfail(
-        reason="execution.frame.assert_same_pixel_grid rejects marsh/sal's batch_layout "
-        "mismatch on every band-wide join -- see class docstring",
-        strict=True,
-    )
     def test_get_png_tile(self, client, notebook_query_data):
         tile_query = copy.deepcopy(NOTEBOOK_QUERY)
         tile_query["output"] = {"format": "png"}
@@ -383,24 +375,18 @@ class TestPairedAccumulatorEdgeCases:
     use `accumulator_edge_case_data`'s three row bands -- see that fixture's docstring --
     to pin those cases against hand-computed values.
 
-    All three tests here go through the same `marsh`/`sal` band-wide `join` as
-    `TestNotebookQueryEndToEnd`, and hit the identical `execution.frame.
-    assert_same_pixel_grid` `batch_layout` rejection documented on that class.
-    `xfail(strict=True)` for the same reason, so they keep proving the gap hasn't silently
-    started passing.
+    What `sum` and `mean` are really pinning is that the collapse counts CONTRIBUTORS, not
+    bands: a band that failed the paired value filter contributes nothing, and must not be
+    silently read as a zero (which would drag `mean` down and inflate `sum`). A pixel with
+    no contributor at all is nodata rather than 0 -- that distinction belongs to `count`
+    alone, and `TestPairedCountConsistency` owns it.
     """
-
-    _XFAIL_REASON = (
-        "execution.frame.assert_same_pixel_grid rejects marsh/sal's batch_layout mismatch "
-        "on every band-wide join -- see TestNotebookQueryEndToEnd's class docstring"
-    )
 
     def _pipeline(self, aggregate):
         query = copy.deepcopy(NOTEBOOK_QUERY)
         query["steps"][-1]["aggregate"] = aggregate
         return query
 
-    @pytest.mark.xfail(reason=_XFAIL_REASON, strict=True)
     def test_sum_aggregate_by_valid_band_count(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
         response = client.post("/v1/analysis.tif", json=self._pipeline("sum"))
@@ -408,17 +394,16 @@ class TestPairedAccumulatorEdgeCases:
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
             nodata = src.nodata
-        assert nodata == -1
+        assert nodata == NODATA
         # Never-valid band: no contributor at all -> nodata, not 0 (a naive sum-with-
         # null-as-zero over an ALL-null row would wrongly emit 0 here).
-        assert (data[:third, :] == -1).all()
+        assert (data[:third, :] == NODATA).all()
         # Valid only in 2030 -> sum is that single contributor, not padded with a zero
         # for 2040's non-contributing band.
         assert (data[third : 2 * third, :] == 2030).all()
         # Valid in both bands -> sum of both.
         assert (data[2 * third :, :] == 2030 + 2040).all()
 
-    @pytest.mark.xfail(reason=_XFAIL_REASON, strict=True)
     def test_mean_aggregate_divides_by_valid_count_not_band_count(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
         response = client.post("/v1/analysis.tif", json=self._pipeline("mean"))
@@ -426,15 +411,14 @@ class TestPairedAccumulatorEdgeCases:
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
             nodata = src.nodata
-        assert nodata == -1
-        assert (data[:third, :] == -1).all()
+        assert nodata == NODATA
+        assert (data[:third, :] == NODATA).all()
         # One valid contributor -> mean IS that contributor (2030), not (2030 + 0) / 2 --
         # the bug a "divide by total band count" implementation would produce.
         assert (data[third : 2 * third, :] == 2030).all()
         # Two valid contributors -> their arithmetic mean.
         assert (data[2 * third :, :] == (2030 + 2040) // 2).all()
 
-    @pytest.mark.xfail(reason=_XFAIL_REASON, strict=True)
     def test_max_aggregate_all_masked_row_is_nodata(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
         response = client.post("/v1/analysis.tif", json=self._pipeline("max"))
@@ -442,8 +426,8 @@ class TestPairedAccumulatorEdgeCases:
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
             nodata = src.nodata
-        assert nodata == -1
-        assert (data[:third, :] == -1).all()
+        assert nodata == NODATA
+        assert (data[:third, :] == NODATA).all()
         assert (data[third : 2 * third, :] == 2030).all()
         assert (data[2 * third :, :] == 2040).all()
 
@@ -452,23 +436,17 @@ class TestPairedCountConsistency:
     """`count` on a paired pipeline: the zero-vs-nodata fixture scenarios (`count_edge_
     case_data`'s five row bands) and an ASGI tile test.
 
-    Both tests here go through the same `marsh`/`sal` band-wide `join` as
-    `TestNotebookQueryEndToEnd` and hit the identical `execution.frame.
-    assert_same_pixel_grid` `batch_layout` rejection documented on that class --
-    `xfail(strict=True)` for the same reason.
+    `count` is the only aggregate for which "no band contributed" and "this pixel was
+    never in the crosswalk's domain" are different answers -- 0 and nodata respectively.
+    The other four reduce both to nodata, so nothing else in this module can tell whether
+    `execution.frame.DOMAIN_COLUMN` is being carried and honored. These tests can.
     """
-
-    _XFAIL_REASON = (
-        "execution.frame.assert_same_pixel_grid rejects marsh/sal's batch_layout mismatch "
-        "on every band-wide join -- see TestNotebookQueryEndToEnd's class docstring"
-    )
 
     def _pipeline(self):
         query = copy.deepcopy(NOTEBOOK_QUERY)
         query["steps"][-1] = {"op": "group", "by": [], "aggregate": "count"}
         return query
 
-    @pytest.mark.xfail(reason=_XFAIL_REASON, strict=True)
     def test_zero_vs_nodata_and_mixed_pixel(self, client, count_edge_case_data):
         _base_path, fifth = count_edge_case_data
         response = client.post("/v1/analysis.tif", json=self._pipeline())
@@ -476,15 +454,14 @@ class TestPairedCountConsistency:
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
             nodata = src.nodata
-        assert nodata == -1
+        assert nodata == NODATA
         assert data.dtype == np.int32
         assert (data[:fifth, :] == 0).all()  # all-bands-fail (in-domain) -> real 0
         assert (data[fifth : 2 * fifth, :] == 0).all()  # raster-nodata-all-bands -> real 0
         assert (data[2 * fifth : 3 * fifth, :] == 0).all()  # pairing-miss-all-bands -> real 0
-        assert (data[3 * fifth : 4 * fifth, :] == -1).all()  # outside-zone -> nodata
+        assert (data[3 * fifth : 4 * fifth, :] == NODATA).all()  # outside-zone -> nodata
         assert (data[4 * fifth :, :] == 1).all()  # mixed pixel -> exact count
 
-    @pytest.mark.xfail(reason=_XFAIL_REASON, strict=True)
     def test_get_png_tile(self, client, count_edge_case_data):
         base_path, _fifth = count_edge_case_data
         tile_query = self._pipeline()
@@ -1097,13 +1074,6 @@ class TestCalculateStepEndToEnd:
         assert "calculate" in detail
         assert "group_aggregate" in detail
 
-    @pytest.mark.xfail(
-        reason="the join step this pipeline goes through before ever reaching the inserted "
-        "calculate hits execution.frame.assert_same_pixel_grid's batch_layout rejection "
-        "(see TestNotebookQueryEndToEnd's class docstring) before any calculate-after-join "
-        "rule could fire, so this can't currently prove what it claims to",
-        strict=True,
-    )
     def test_paired_shape_rejects_calculate(self, client, notebook_query_data):
         pipeline = copy.deepcopy(NOTEBOOK_QUERY)
         pipeline["steps"].insert(2, {"op": "calculate", "expression": "sal * 0.5"})
@@ -1131,22 +1101,15 @@ class TestRejections:
         assert response.status_code == 400
         assert "does not match" in response.json()["detail"]
 
-    @pytest.mark.xfail(
-        reason=(
-            "Validation gap, reproduced empirically against these fixtures: request/ops.py's "
-            "JoinStep/JoinOp place no upper bound on join operand count, so a chained "
-            "3-input join (two spatial joins folding a, b, c together) is structurally "
-            "accepted and falls through to execution. It then crashes with a raw "
-            "polars.exceptions.ColumnNotFoundError -- not the intended 'not yet supported' "
-            "message -- because group's default of='value' no longer resolves after a "
-            "multi-way join renames each operand's value column. boundary.py's blanket "
-            "ColumnNotFoundError handler still maps this to 400, so the route never 500s, "
-            "but the message this test asserts on is never produced. Closing the gap is a "
-            "request/ops.py validation change."
-        ),
-        strict=True,
-    )
     def test_three_inputs_is_400(self, client, base_path, monkeypatch):
+        """A chained 3-input join (two spatial joins folding a, b, c together) is
+        structurally well-formed, so it gets past `validate_pipeline`; what rejects it is
+        the shape walk, because the second join's `ab` operand carries two value columns
+        and a join has only one name per operand to give them. Left unchecked this reaches
+        execution and dies on `group`'s default `of="value"`, which the first join already
+        renamed away -- a 400 either way (boundary.py maps `ColumnNotFoundError` too), but
+        one whose message says nothing about what the caller actually asked for.
+        """
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 

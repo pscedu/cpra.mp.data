@@ -62,24 +62,15 @@ def get_write_catalog_path(catalog_path=CATALOG_PATH_UNSET):
     return Path(catalog_path) if catalog_path is not None else None
 
 
-# GDAL thread count for raster reads/writes (see api.utils.raster_gdal_env). Tunable
-# because the API runs as a single process and already spreads files across a thread
-# pool, so the two widths multiply under concurrent requests.
+# GDAL thread count for raster reads/writes (see analysis.io.raster_io.raster_gdal_env).
+# Tunable because the API runs as a single process and already spreads files across a
+# thread pool, so the two widths multiply under concurrent requests.
 RASTER_NUM_THREADS = get_config("RASTER_NUM_THREADS", "ALL_CPUS")
 
-# CreateCopy streaming chunk, and the block cache that bounds it -- GDAL clamps the swath
-# to half of GDAL_CACHEMAX, so the two must be raised together (see
-# api.utils.raster_copy_gdal_env). The cache is process-global, so this also bounds cache
-# growth across concurrent requests instead of leaving it at GDAL's default 5% of RAM.
-RASTER_SWATH_SIZE_MB = int(get_config("RASTER_SWATH_SIZE_MB", "512"))
+# GDAL's own block cache, entered around every raster read
+# (analysis.io.raster_io.raster_gdal_env). Process-global, so this bounds cache growth
+# across concurrent requests instead of leaving it at GDAL's default 5% of RAM.
 RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
-
-# Kill switch for the VRT+CreateCopy download path, falling back to windowed reads.
-RASTER_USE_VRT_COPY = get_config("RASTER_USE_VRT_COPY", "True").lower() in TRUE_VALUES
-
-# Above this, a windowed read's per-window NumPy buffer is big enough that the VRT copy is
-# the lighter path; below it the windowed read wins (see Dataset._windowed_read_is_lighter).
-RASTER_WINDOW_BUFFER_LIMIT_MB = int(get_config("RASTER_WINDOW_BUFFER_LIMIT_MB", "200"))
 
 # Target size, in MB, for one summarize-loop batch's read buffer (n_bands x block_height x
 # batch_width x itemsize -- see analysis.io.raster_io.raster_blocks_per_batch, which turns
@@ -104,7 +95,7 @@ RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", "64"))
 
 # Explicit override for the number of raster blocks unioned into one summarize-loop batch,
 # bypassing the RASTER_BATCH_BUFFER_MB / band-count derivation in
-# api.utils.raster_blocks_per_batch entirely. Unset (None) by default.
+# analysis.io.raster_io.raster_blocks_per_batch entirely. Unset (None) by default.
 _raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
 RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
 

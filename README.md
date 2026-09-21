@@ -174,6 +174,11 @@ single-dataset filter/calculate/group, is expressed as a (possibly one-input) pi
 `analyze_data` is `async`; in a notebook, just `await` it, or wrap the call with
 `asyncio.run` in a plain script.
 
+An entry under `inputs` names a dataset — the `variable`/`time_unit`/`grid` triple — and
+nothing else. Every narrowing, whether by dimension, by value, or by cell, is a `filter`
+step, so a pipeline always opens with a step that names its input explicitly — including
+a `group`, if collapsing the dataset is the only thing you want.
+
 The return value depends on the pipeline's own `output.format`:
 
 * **Tabular** output (`csv`/`ndjson`/`parquet`) returns a Polars `DataFrame` — or a
@@ -187,13 +192,11 @@ from cpra.mp.data import analyze_data
 # Count the days each hydro compartment's salinity exceeded 5.5 in one scenario.
 df = await analyze_data({
     "inputs": {
-        "sal": {
-            "variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001",
-            "model_group_id": 500, "scenario_id": 7, "aggregate_type": "mean",
-        }
+        "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}
     },
     "steps": [
-        {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
+        {"op": "filter", "input": "sal",
+         "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = 'mean'"},
         {"op": "filter", "where": "value > 5.5"},
         {"op": "group", "by": [], "aggregate": "count"},
     ],
@@ -204,21 +207,24 @@ df = await analyze_data({
 
 ### Raster Analyses
 
-A pipeline that reaggregates raster pixels onto a coarser vector zone (a many-to-one
-`project`) still returns a table — surviving dimensions become columns, so there is no
-band bookkeeping:
+A raster dataset's frame is a stack of bands, not a table, so a pipeline over one either
+keeps that shape all the way to a GeoTIFF or turns it into a table on the way — with a
+`project` onto a vector grid, or with a `filter` on `grid_cell`. Asking for a tabular
+format from a pipeline that does neither is rejected up front, as is asking for `tif` from
+one whose result is a table.
+
+Projecting raster pixels onto a vector zone returns a table; surviving dimensions become
+columns, so there is no band bookkeeping:
 
 ```python
 # Mean elevation per hydro compartment, per year, averaged across two scenarios.
 df = await analyze_data({
     "inputs": {
-        "elev": {
-            "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-            "model_group_id": 500, "scenario_id": [7, 8],
-        }
+        "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
     },
     "steps": [
-        {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "mean"},
+        {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
+        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
         {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
     ],
     "output": {"format": "csv"},
@@ -226,21 +232,19 @@ df = await analyze_data({
 # columns: grid_cell, calendar_year, value — one row per (compartment, year)
 ```
 
-A pipeline whose result is a full-resolution raster image (a band collapse with no
-zonal `project`) has no sensible tabular form, so it requires `output_path` and writes a
-GeoTIFF instead, returning the path:
+A pipeline that stays on the raster grid has no sensible tabular form, so it requires
+`output_path` and writes a GeoTIFF instead, returning the path. Each band in the written
+file carries a description naming the dimension values it resolved from, so band order is
+not the only record of which band is which:
 
 ```python
 path = await analyze_data(
     {
         "inputs": {
-            "elev": {
-                "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-                "model_group_id": 500, "scenario_id": [7, 8],
-            }
+            "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
         },
         "steps": [
-            {"op": "project", "input": "elev", "to": "morph_pixel_v001"},
+            {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
             {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
         ],
         "output": {"format": "tif"},
@@ -262,19 +266,21 @@ request shape and operations):
 path = await analyze_data(
     {
         "inputs": {
-            "marsh": {
+            "coverage": {
                 "variable": "ffibs_coverage_ratio", "time_unit": "annual",
                 "grid": "veg_grid_cell_v001",
-                "model_group_id": 500, "scenario_id": 7, "ffibs_type": "pl_fm",
             },
             "salinity": {
                 "variable": "sal", "time_unit": "annual",
                 "grid": "hydro_compartment_v001",
-                "model_group_id": 500, "scenario_id": 7, "aggregate_type": "2_wk_max",
             },
         },
         "steps": [
-            {"op": "project", "input": "salinity", "to": "veg_grid_cell_v001", "as": "sal"},
+            {"op": "filter", "input": "coverage", "as": "marsh",
+             "where": "model_group_id = 500 AND scenario_id = 7 AND ffibs_type = 'pl_fm'"},
+            {"op": "filter", "input": "salinity", "as": "selected_salinity",
+             "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = '2_wk_max'"},
+            {"op": "project", "input": "selected_salinity", "to": "veg_grid_cell_v001", "as": "sal"},
             {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
             {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
             {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
@@ -284,6 +290,11 @@ path = await analyze_data(
     output_path="first_exceedance_year.tif",
 )
 ```
+
+A `join` leaves one value column per operand, named after the operand — which is why the
+`filter` above spells the two conditions `marsh` and `sal` rather than `value`. Exactly
+one measured quantity may reach the output, so that pairing has to be collapsed before the
+sink; the value `filter` here is what does it.
 
 A small set of pre-built pipelines — a difference between two scenarios, a land-type
 concatenation, this same earliest-exceedance-year query — is also available by name with

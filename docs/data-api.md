@@ -174,7 +174,7 @@ Every one of these has a pipeline equivalent on the [Analysis API](analysis-api.
 | `calculate.N.expression` / `calculate.N.where` | A pipeline `calculate` step directly, in the same order |
 | `group_by` / `group_aggregate` | A pipeline `group` step |
 | `summarize_by` / `summarize_aggregate` | A pipeline `project` step's `to`/`aggregate` fields |
-| `summarize_grid_cell` | A pipeline `filter` step naming `grid_cell`, placed immediately after a many-to-one `project` |
+| `summarize_grid_cell` | A pipeline `filter` step naming `grid_cell`, placed after the `project` that produced the zones (a `grid_cell` filter before the `project` selects source cells instead) |
 | `unpivot` | Nothing -- data is already served in long format (`grid_cell`/`value` columns); this was already a documented no-op |
 
 See [Analysis API](analysis-api.md) for the full pipeline grammar, and

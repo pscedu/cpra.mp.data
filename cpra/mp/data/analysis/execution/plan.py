@@ -222,6 +222,32 @@ that legitimately narrows a raster origin to zero surviving bands is not an erro
 value that is legal but simply absent from the data is supposed to produce an empty
 result rather than a failure.
 
+**A band-wide join's operands need one shared read even when one of them started life as a
+vector.** The shared read exists because positional alignment is only correct when every
+operand was chunked identically, and chunking follows BAND COUNT (`io.raster_io.
+raster_blocks_per_batch`; `execution.project`'s module docstring gives the measured
+mis-pairing for the two-read shape). That argument does not care where an operand's pixels
+came from -- only that they came from the same read -- so it applies unchanged to a
+vector input broadcast onto the raster grid by a vector-to-raster `project`, whose pixel
+order is set by the crosswalk raster IT reads. `band_wide_join_scans` therefore records
+only the RASTER origins (they are the ones contributing bands to the union, and the ones
+the ceiling check sums), while `band_wide_join_zone_crosswalks` records, for the same join
+output, one `ZoneCrosswalk` per vector-to-raster `project` upstream of ANY of that join's
+operands -- the crosswalk artifacts `execution.execute` must hand `io.raster.scan_raster`
+as `crosswalks=` entries on that one combined call, so the projected operand's pixel order
+is the raster operands' by construction rather than by coincidence. Tracked in its own
+forward pass (`zone_crosswalks_upstream_of`) rather than inside the main walk: unlike
+everything `states` carries, it cannot be invalidated by a pushdown decision, and it has
+to be complete before the first `JoinOp` consults it.
+
+A band-wide join with NO raster origin at all -- every operand a separately-projected
+vector input -- is the one shape left out, since there are no data bands for a shared read
+to be built around and `scan_raster` has no zero-band answer to give (see the loose end
+below). Those operands stay independently read, and `execution.band_ops.join_band_wide`'s
+own `assert_same_pixel_grid` precondition is what decides whether their chunkings happened
+to agree; single-band crosswalk reads over one grid usually do, but nothing here makes
+them.
+
 There is one loose end there, recorded because it is easy to trip over from either side:
 `io.raster.scan_raster` raises `ValueError` on zero-band metadata, since it derives the
 read's window from the VRT it opens and a zero-band read opens nothing. That is a property
@@ -352,23 +378,50 @@ class ResolvedInput:
 
 
 @dataclasses.dataclass(frozen=True)
+class ZoneCrosswalk:
+    """One vector-to-raster `project` step's crosswalk, named so that the shared read a
+    band-wide `join` performs can carry it -- see the module docstring's paragraph on
+    why that read, and not a second one inside the lowering, is where it belongs.
+
+    `step_no` is the `ProjectOp`'s own step number, which is how `execution.execute` hands
+    the resulting zone column back to exactly the lowering that asked for it.
+    `raster_grid` is the step's `to` (the destination pixel lattice, and the grid the
+    shared read is already addressing); `vector_grid` is the grid its input frame is
+    currently on. The pair is what `io.crosswalk_read.resolve_raster_crosswalk_path`
+    takes, in that order -- resolved at read time rather than here, matching
+    `ResolvedInput.straddling_vector_grid`, which likewise records the grid and leaves the
+    artifact lookup to `execution.execute`.
+    """
+
+    step_no: int
+    raster_grid: str
+    vector_grid: str
+
+
+@dataclasses.dataclass(frozen=True)
 class ExecutionPlan:
     """`inputs`: every `Pipeline.inputs` entry, resolved (see `ResolvedInput`). `ops`:
     `request.ops.compile_ops`'s output, unchanged. `frame_types`: every input/step-output
     name's `request.ops.FrameType`, computed once here so `execute.py`'s walk never
     re-derives one. `band_wide_join_scans`: every band-wide `join` step's output name
-    mapped to the origins whose bands were read as one shared union for its ceiling check
-    (see the module docstring) -- empty unless the pipeline has such a join. `tile`: the
-    `TileRequest` this plan was compiled for, or `None` for a full-extent one; the sink
-    needs it to warp the result onto the tile's own grid, and it is recorded here so that
-    it comes from the same place the read windows were derived from rather than being
-    passed to the sink a second time and trusted to match.
+    mapped to the RASTER origins whose bands were read as one shared union for its ceiling
+    check (see the module docstring) -- empty unless the pipeline has such a join.
+    `band_wide_join_zone_crosswalks`: the same join outputs mapped to the `ZoneCrosswalk`s
+    that shared read must also carry, one per vector-to-raster `project` upstream of any
+    of that join's operands -- empty for a join whose operands are all raster origins.
+    `tile`: the `TileRequest` this plan was compiled for, or `None` for a full-extent one;
+    the sink needs it to warp the result onto the tile's own grid, and it is recorded here
+    so that it comes from the same place the read windows were derived from rather than
+    being passed to the sink a second time and trusted to match.
     """
 
     inputs: dict[str, ResolvedInput]
     ops: list[Op]
     frame_types: dict[str, FrameType]
     band_wide_join_scans: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = dataclasses.field(
+        default_factory=dict
+    )
     tile: TileRequest | None = None
 
 
@@ -436,6 +489,45 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     raster_dimension_parts: dict[str, list] = {name: [] for name in raster_origins}
     point_sample_step: dict[str, int] = {}
     band_wide_join_origin_groups: dict[str, tuple[str, ...]] = {}
+    band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = {}
+
+    # Which vector-to-raster `project` steps produced the pixels a given frame is made of
+    # -- the vector-side counterpart of `origin_sets` below, and the input to the same
+    # "one shared read" rule (see the module docstring). Derived in its own forward pass
+    # rather than inside the main walk because it must be complete BEFORE the first
+    # `JoinOp` reads it, and because it is a property of the ops alone: unlike everything
+    # the main walk tracks, no pushdown decision can invalidate it.
+    zone_crosswalks_upstream_of: dict[str, tuple[ZoneCrosswalk, ...]] = {name: () for name in pipeline.inputs}
+    for op in ops:
+        if isinstance(op, JoinOp):
+            zone_crosswalks_upstream_of[op.output] = tuple(
+                dict.fromkeys(
+                    crosswalk for operand in op.inputs for crosswalk in zone_crosswalks_upstream_of[operand]
+                )
+            )
+            continue
+        if isinstance(op, ProjectOp):
+            from_kind, to_kind = project_direction(frame_types[op.input], op.to)
+            if (from_kind, to_kind) == ("vector", "raster"):
+                # A vector-to-raster project CREATES this branch's pixel lattice, so
+                # whatever came before it is irrelevant to how the branch is chunked; the
+                # crosswalk it broadcasts across is the whole answer. (There can never be
+                # a second one further along the same chain: this step's output is
+                # band-wide, so any later `project` off it is a raster-to-something one.)
+                zone_crosswalks_upstream_of[op.output] = (
+                    ZoneCrosswalk(step_no=op.step_no, raster_grid=op.to, vector_grid=frame_types[op.input].grid),
+                )
+            else:
+                # Either direction out of here is long, so there is no pixel order left
+                # for a shared read to have to agree with.
+                zone_crosswalks_upstream_of[op.output] = ()
+            continue
+        # A spatial `filter` unpivots band-wide to long (`execution.band_ops.
+        # filter_band_wide`), which retires the pixel order along with the shape; every
+        # other op leaves it exactly as it found it.
+        zone_crosswalks_upstream_of[op.output] = (
+            zone_crosswalks_upstream_of[op.input] if frame_types[op.output].shape is Shape.band_wide else ()
+        )
 
     # Provenance, tracked independently of `states` -- see the module docstring. A tuple
     # rather than a set so the recorded scan order is the order the operands were
@@ -455,11 +547,16 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             # that doesn't exist, so a miss here is a broken invariant and should say so.
             union = tuple(dict.fromkeys(name for operand in op.inputs for name in origin_sets[operand]))
             origin_sets[op.output] = union
-            if (
-                frame_types[op.output].shape is Shape.band_wide
-                and all(origin_kind[name] == "raster" for name in union)
-            ):
-                band_wide_join_origin_groups[op.output] = union
+            if frame_types[op.output].shape is Shape.band_wide:
+                # Only the RASTER origins contribute bands to the shared read. A vector
+                # origin reaches a band-wide join solely by way of a vector-to-raster
+                # `project` (nothing else gives a vector input pixels), and that step's
+                # crosswalk -- not the origin -- is what has to ride along on the same
+                # read; `zone_crosswalks_upstream_of` is where it was recorded.
+                raster_union = tuple(name for name in union if origin_kind[name] == "raster")
+                if raster_union:
+                    band_wide_join_origin_groups[op.output] = raster_union
+                    band_wide_join_zone_crosswalks[op.output] = zone_crosswalks_upstream_of[op.output]
             states[op.output] = None
             continue
 
@@ -623,6 +720,9 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         ops=ops,
         frame_types=frame_types,
         band_wide_join_scans=dict(band_wide_join_origin_groups),
+        band_wide_join_zone_crosswalks={
+            output: crosswalks for output, crosswalks in band_wide_join_zone_crosswalks.items() if crosswalks
+        },
         tile=tile,
     )
 

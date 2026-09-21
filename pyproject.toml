@@ -87,7 +87,13 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95"
+addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95 -m 'not memory'"
+# Deselected by default via `addopts` above; run with `pytest -m memory` (or `-m ''` for
+# everything). A `memory` test measures a subprocess's peak RSS, so its result depends on
+# the machine, the allocator, and what else is running -- real signal, but not something a
+# build should gate on. Deselecting costs no coverage: the measurement happens in a child
+# process, so these tests contribute none to begin with.
+markers = ["memory: measures peak RSS in a subprocess; environment-dependent, opt-in"]
 # Fail on deprecations this package is responsible for, so they get fixed rather than
 # accumulating. Deliberately narrow: a blanket "error" would break the build on unrelated
 # deprecations from rasterio/GDAL, Polars, or Starlette on any dependency bump.

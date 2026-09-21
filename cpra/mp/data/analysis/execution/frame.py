@@ -92,6 +92,7 @@ from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_I
 # whole band-wide contract from one place rather than tracking which layer owns each half.
 __all__ = [
     "BAND_NAME_RE",
+    "DOMAIN_COLUMN",
     "RESERVED_BAND_INDEX_COLUMN",
     "ReadWindow",
     "LongFrame",
@@ -119,6 +120,23 @@ LongFrame = pl.LazyFrame
 # The band-wide triple, spelled once as a type so every lowering's signature says the
 # same three things in the same order instead of each writing out the tuple by hand.
 BandWideFrame = tuple[pl.LazyFrame, pl.DataFrame, ReadWindow]
+
+#: The reserved `extra_columns` name carrying whether a pixel is INSIDE the domain of the
+#: crosswalk that gave it values at all -- non-null there, null outside.
+#:
+#: Introduced by `execution.project.project_vector_to_raster`, whose crosswalk raster has
+#: its own nodata: a pixel the crosswalk does not map to any vector cell is not a pixel
+#: whose answer is "nothing", it is a pixel the question was never asked about. Every band
+#: is null in both cases, so the bands alone cannot tell them apart, and one aggregate
+#: genuinely needs them apart: `group.aggregate == "count"` answers 0 for "in domain, no
+#: band contributed" and must answer nodata for "outside the domain entirely" -- see
+#: `execution.band_ops.group_band_wide`, the one consumer. (For the other four aggregates
+#: the distinction is invisible: both cases already reduce to null.)
+#:
+#: A reserved `extra_columns` name rather than a fourth element of `BandWideFrame`: it is
+#: carried, unread, through every intervening lowering exactly like a crosswalk zone id
+#: is, which is the contract `extra_columns` already exists for.
+DOMAIN_COLUMN = "__domain__"
 
 
 def band_column_names(metadata_df: pl.DataFrame) -> list[str]:

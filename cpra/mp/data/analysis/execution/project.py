@@ -136,6 +136,15 @@ ZONE_COLUMN` (below) is the column that read's zone ids come back in, attached o
 origin, exactly like a `variable`/`time_unit` dimension column would be if this were a
 vector scan.
 
+The same rule binds the OTHER direction, for the same reason and by the same route.
+`project_vector_to_raster` reads a crosswalk too -- it is the only raster read that
+direction has -- and when its output is about to be joined band-wide against raster
+operands read separately, an independent crosswalk scan puts it in a different pixel order
+from theirs just as surely. So `execute.py` attaches that crosswalk to the join group's one
+combined read as well (`execution.plan.ZoneCrosswalk` records which artifact; `ZoneSource`
+below is how the resulting column arrives), and the lowering reads the crosswalk itself
+only when there is no such join for its pixel order to have to agree with.
+
 **`count_by_value` is the one aggregate that unpivots per pixel.** See
 `_zonal_count_by_value` below: its accumulator is per (zone, distinct value), not the single
 scalar per (zone, band) the other five collapse to while the frame is still wide, so the
@@ -199,12 +208,16 @@ that narrower case itself, rather than this function receiving a long frame with
 column to aggregate by and failing on a missing-column error instead.
 """
 
+from typing import NamedTuple
+
 import polars as pl
 
 from cpra.mp.data.analysis.execution.fold import fold_count_by_value, fold_group_by, should_fold_group_by
 from cpra.mp.data.analysis.execution.frame import (
+    DOMAIN_COLUMN,
     BandWideFrame,
     LongFrame,
+    ReadWindow,
     add_reserved_band_index,
     band_column_names,
     drop_reserved_band_index,
@@ -219,6 +232,7 @@ from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 
 __all__ = [
     "ZONE_COLUMN",
+    "ZoneSource",
     "project_vector_to_vector",
     "project_raster_to_vector",
     "project_vector_to_raster",
@@ -445,6 +459,22 @@ def project_vector_to_vector(
 #: so it still cannot collide with a dataset dimension riding along on `metadata_df`.
 ZONE_COLUMN = "__zone__"
 
+
+class ZoneSource(NamedTuple):
+    """An already-open crosswalk read for `project_vector_to_raster` to broadcast across,
+    supplied by `execute.py` when this step's output is about to be joined band-wide with
+    raster operands that were read separately -- see the module docstring's "the crosswalk
+    rides on the data bands' OWN read" paragraph, which applies to this direction too.
+
+    `lf` carries exactly one column, `ZONE_COLUMN`, one row per pixel in `window`'s own
+    order; `window` is the `ReadWindow` that read produced, which is the whole point --
+    passing it through unchanged is what makes the projected frame's `batch_layout`
+    identical to its join partners' rather than merely similar.
+    """
+
+    lf: pl.LazyFrame
+    window: ReadWindow
+
 #: The column an unpivot puts a band's own `b<i>` name in, and the key the per-band
 #: dimension values are then joined back on. Internal to the reshape: dropped before the
 #: frame is returned.
@@ -611,7 +641,12 @@ def _pivot_dimension_columns(lf: pl.LazyFrame) -> list[str]:
     ]
 
 
-def project_vector_to_raster(frames: dict[str, LongFrame], op: ProjectOp, frame_types: dict[str, FrameType]) -> BandWideFrame:
+def project_vector_to_raster(
+    frames: dict[str, LongFrame],
+    op: ProjectOp,
+    frame_types: dict[str, FrameType],
+    zone_source: ZoneSource | None = None,
+) -> BandWideFrame:
     """The `("project", ("vector", "raster"))` lowering: broadcast `frames[op.input]`'s
     rows onto `op.to`'s pixels via the raster-to-vector crosswalk between `op.to` (the
     raster grid) and `frame_types[op.input].grid` (the vector grid), with no aggregation --
@@ -625,26 +660,57 @@ def project_vector_to_raster(frames: dict[str, LongFrame], op: ProjectOp, frame_
     reasoning, including why `DATASET_SELECTION_COLUMNS` is excluded and why the crosswalk
     join uses `maintain_order="left"`.
 
-    The one real raster read this direction performs is of the crosswalk artifact itself,
-    not of any data raster -- there is no data raster on this direction's input side at
-    all -- so the returned `ReadWindow.source` names the crosswalk file. Reads it as an
-    ordinary single-band `scan_raster` source (not via that function's own `crosswalks=`
-    parameter, which requires an already-nonempty data-band `metadata_df`): the crosswalk
-    IS the sole band here, and `scan_raster`'s own per-band nodata masking (honored by
-    default, `mask_nodata=True`) already nulls it out correctly, since the crosswalk
-    GeoTIFF's own GDAL profile declares its nodata sentinel formally.
+    **Where the crosswalk read comes from: `zone_source`, when the walk has one to give.**
+    There is no data raster on this direction's input side at all, so the crosswalk
+    artifact is the only thing there is to read -- but if this step's output is about to
+    be joined band-wide against raster operands, that read must be the SAME read those
+    operands came from, for exactly the reason the module docstring's "the crosswalk rides
+    on the data bands' OWN read" paragraph gives for the opposite direction: chunking
+    follows band count, so an independent single-band crosswalk scan and an N-band data
+    scan of the identical window emit the identical pixels in two different orders, and
+    `execution.band_ops.join_band_wide` aligns its operands positionally. `execute.py`'s
+    band-wide-join prelude therefore attaches this step's crosswalk to that join group's
+    one combined `scan_raster` call (`execution.plan.ZoneCrosswalk` is what records which
+    artifact, decided at compile time) and hands the resulting single-column frame down
+    here as `zone_source` -- so the returned window IS the join partners' window, sharing
+    their `batch_layout` by construction rather than by coincidence.
+
+    `zone_source` is `None` for a step whose output is never joined with a separately-read
+    raster -- a lone vector-to-raster projection sunk straight to a GeoTIFF, say. Nothing
+    else's pixel order has to be matched there, so this function reads the crosswalk
+    itself: an ordinary single-band `scan_raster` source (not via that function's own
+    `crosswalks=` parameter, which requires an already-nonempty data-band `metadata_df`),
+    since the crosswalk IS the sole band in that case, and `scan_raster`'s per-band nodata
+    masking (honored by default, `mask_nodata=True`) already nulls it out correctly
+    because the crosswalk GeoTIFF's own GDAL profile declares its nodata sentinel
+    formally. Either way the returned `ReadWindow.source` names whatever the read actually
+    opened -- the crosswalk alone for the standalone case, the join group's combined VRT
+    sources for the shared one. `assert_same_pixel_grid` deliberately excludes `source`
+    from its comparison, which is what lets the shared case pass it.
+
+    **The returned frame carries one extra column, `frame.DOMAIN_COLUMN`.** Broadcasting
+    across the crosswalk leaves every band null at a pixel the crosswalk does not map,
+    which is indistinguishable -- from the bands alone -- from a pixel it does map onto a
+    vector cell that simply has no data. The two are not the same answer, and
+    `execution.band_ops.group_band_wide`'s `count` is where the difference shows, so the
+    zone rides along as `DOMAIN_COLUMN` rather than being dropped here; see that constant's
+    own comment. Callers report it in `extra_columns` like any other carried column.
 
     Raises `request.errors.NotFoundError` (via `io.crosswalk_read.
     resolve_raster_crosswalk_path`) if no raster-to-vector crosswalk artifact exists for
-    `op.to` and this vector grid.
+    `op.to` and this vector grid. Only reachable in the standalone case -- when
+    `zone_source` is given, `execute.py` already resolved that path to perform the read.
     """
     lf = frames[op.input]
     current = frame_types[op.input]
-    crosswalk_path = resolve_raster_crosswalk_path(op.to, current.grid)
 
-    crosswalk_metadata = pl.DataFrame({"path": [str(crosswalk_path)], "band": [1]})
-    zone_band_wide_lf, _zone_metadata, window = scan_raster(crosswalk_metadata)
-    zone_lf = zone_band_wide_lf.select(pl.col("b0").alias("__zone__"))
+    if zone_source is not None:
+        zone_lf, window = zone_source
+    else:
+        crosswalk_path = resolve_raster_crosswalk_path(op.to, current.grid)
+        crosswalk_metadata = pl.DataFrame({"path": [str(crosswalk_path)], "band": [1]})
+        zone_band_wide_lf, _zone_metadata, window = scan_raster(crosswalk_metadata)
+        zone_lf = zone_band_wide_lf.select(pl.col("b0").alias(ZONE_COLUMN))
 
     dim_cols = _pivot_dimension_columns(lf)
     # `group_by` (never `select`) even in the `dim_cols == []` case, so a frame with no
@@ -670,7 +736,16 @@ def project_vector_to_raster(frames: dict[str, LongFrame], op: ProjectOp, frame_
     wide = wide.rename({str(k): f"b{k}" for k in range(band_count)})
 
     broadcast = zone_lf.join(
-        wide.lazy(), left_on="__zone__", right_on="grid_cell", how="left", maintain_order="left"
+        wide.lazy(), left_on=ZONE_COLUMN, right_on="grid_cell", how="left", maintain_order="left"
     )
-    out_lf = broadcast.select([f"b{k}" for k in range(band_count)])
+    # The zone itself rides along as `DOMAIN_COLUMN` -- see that constant's own comment.
+    # It is the zone COLUMN, not a derived boolean, because null-vs-not is the entire
+    # question and the zone already answers it: a pixel the crosswalk raster's nodata
+    # covers has no zone, and so was never in the domain this projection can speak about.
+    # Kept distinct from `ZONE_COLUMN`, which the raster-to-vector direction carries for a
+    # different purpose (a groupable key, not a domain mask) and which a single pipeline
+    # can legitimately carry at the same time as this one.
+    out_lf = broadcast.select(
+        [*(f"b{k}" for k in range(band_count)), pl.col(ZONE_COLUMN).alias(DOMAIN_COLUMN)]
+    )
     return out_lf, metadata_out, window

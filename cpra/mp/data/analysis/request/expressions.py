@@ -32,6 +32,7 @@ outside the API (the `read_data()` entry point in `cpra/mp/data/__init__.py` doe
 """
 
 import re
+from collections.abc import Iterable
 from enum import Enum
 from typing import NamedTuple
 
@@ -74,6 +75,19 @@ _NON_STREAMING_KEYWORDS = ("order by", "group by", " join ", " over ", "partitio
 
 _IDENTIFIER_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
+# Logical operators the scan above cannot tell from a call: `(a > 1) and (b < 2)` puts the
+# word `and` immediately before a `(`, which is the exact shape `_IDENTIFIER_CALL_RE`
+# looks for, so a perfectly ordinary parenthesized conjunction reports a nonexistent
+# function named `and`. Skipped by name in both scans below.
+#
+# Deliberately just these two. Every other SQL word that can precede a `(` -- `in`,
+# `not`, `exists` -- can precede a SUBQUERY, and being caught by the function scan is
+# currently the only thing standing between a value conjunct and `value in (select 1)`
+# (`_check_no_dimension_subquery_or_aggregate`'s `select` check runs on DIMENSION
+# conjuncts only). `and`/`or` cannot introduce one on their own: whatever follows them is
+# an expression the scan then examines in its own right.
+_LOGICAL_OPERATOR_WORDS = frozenset({"and", "or"})
+
 # A subquery keyword inside a DIMENSION conjunct (see `classify_where`/
 # `_check_no_dimension_subquery`). `pl.sql_expr` happens to reject a subquery that
 # names a FROM relation ("... in (select max(x) from self)": nothing is registered
@@ -108,6 +122,8 @@ def _check_no_aggregate_calls(expr_str):
     """
     for match in _IDENTIFIER_CALL_RE.finditer(expr_str):
         name = match.group(1).lower()
+        if name in _LOGICAL_OPERATOR_WORDS:
+            continue
         if name in AGGREGATE_FUNCTION_NAMES:
             raise ExpressionError(
                 f"aggregate function '{name}' is not allowed inside this expression -- "
@@ -118,6 +134,8 @@ def _check_no_aggregate_calls(expr_str):
 def _check_allowed_calls(expr_str):
     for match in _IDENTIFIER_CALL_RE.finditer(expr_str):
         name = match.group(1).lower()
+        if name in _LOGICAL_OPERATOR_WORDS:
+            continue
         if name in AGGREGATE_FUNCTION_NAMES:
             continue  # reported by _check_no_aggregate_calls with a more specific message
         if name not in ALLOWED_FUNCTIONS:
@@ -492,6 +510,29 @@ def rewrite_value_column(expr_str, column_name):
     return _VALUE_TOKEN_RE.sub(column_name, expr_str)
 
 
+def rewrite_value_columns(expr_str, mapping):
+    """The many-column generalization of `rewrite_value_column`: rewrite every value
+    column named in `mapping` (a `{value column name -> concrete column name}` dict) in
+    one pass.
+
+    A PAIRED frame -- one a `join` left carrying an operand-named value column per operand
+    rather than a single `value` -- needs every one of those names rewritten at once, since
+    a single conjunct can reference two of them (`marsh > sal`). One pass, not one
+    `rewrite_value_column` call per entry: sequential substitutions would re-rewrite a
+    name that an earlier substitution's REPLACEMENT happened to spell, which is reachable
+    here because the replacements are positional band names (`b0`, `b1`) and nothing stops
+    an operand from being named `b0`.
+
+    Same word-boundary discipline and the same no-validation-of-its-own contract as
+    `rewrite_value_column`: the result is re-parsed and re-whitelisted by
+    `parse_value_expr` immediately after.
+    """
+    if not mapping:
+        return expr_str
+    pattern = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in mapping) + r")\b")
+    return pattern.sub(lambda match: mapping[match.group(0)], expr_str)
+
+
 def value_predicate_mask(expr_str, allowed_columns):
     """Parse a value predicate and return it as a mask with `null` coerced to `False`.
 
@@ -531,12 +572,21 @@ class PredicateKind(str, Enum):
     spatial = "spatial"
 
 
-def classify_predicate_kind(conjunct: str) -> PredicateKind:
+def classify_predicate_kind(conjunct: str, value_columns: Iterable[str] = ("value",)) -> PredicateKind:
     """Classify one top-level AND conjunct (as `split_top_level_and` produces) into a
-    `PredicateKind`, by whether it references the reserved `grid_cell` column, the
-    reserved `value` column, or neither. A conjunct naming both is rejected outright, the
+    `PredicateKind`, by whether it references the reserved `grid_cell` column, one of
+    `value_columns`, or neither. A conjunct naming both is rejected outright, the
     same rule `classify_where` already applies to a conjunct naming both `value` and a
     dimension: there is no lowering for a single comparison that tests two kinds at once.
+
+    `value_columns` defaults to just the reserved `value`, which is what every frame with
+    a single measured quantity carries. A PAIRED frame -- one a `join` left carrying one
+    operand-named value column per operand (`request.ops.FrameType.value_columns`) --
+    passes those names instead, so `marsh > 0.5` is recognized as the VALUE predicate it
+    is rather than falling through to `dimension` on the strength of not being spelled
+    `value`. Both callers that have a frame type in hand (`request.ops._type_filter` and
+    `execution.execute`'s band-wide filter lowering) pass it; the default keeps every
+    caller that does not have one, or whose frame is not paired, on the original rule.
     """
     try:
         expr = pl.sql_expr(conjunct)
@@ -545,12 +595,12 @@ def classify_predicate_kind(conjunct: str) -> PredicateKind:
 
     referenced = set(expr.meta.root_names())
     is_spatial = "grid_cell" in referenced
-    is_value = "value" in referenced
+    is_value = bool(referenced & set(value_columns))
     if is_spatial and is_value:
         raise ExpressionError(
-            f"where conjunct {conjunct!r} references both `grid_cell` and `value` -- a "
-            "single AND-term can only be one predicate kind; write them as separate "
-            "AND-ed conjuncts"
+            f"where conjunct {conjunct!r} references both `grid_cell` and a value column "
+            f"({', '.join(sorted(referenced & set(value_columns)))}) -- a single AND-term "
+            "can only be one predicate kind; write them as separate AND-ed conjuncts"
         )
     if is_spatial:
         return PredicateKind.spatial
@@ -559,13 +609,18 @@ def classify_predicate_kind(conjunct: str) -> PredicateKind:
     return PredicateKind.dimension
 
 
-def classify_where_kinds(where_str: str) -> dict[PredicateKind, list[str]]:
+def classify_where_kinds(
+    where_str: str, value_columns: Iterable[str] = ("value",)
+) -> dict[PredicateKind, list[str]]:
     """The three-way counterpart of `classify_where`: split `where_str` into its
     top-level AND conjuncts (`split_top_level_and`) and sort each into one of the three
     `PredicateKind`s (`classify_predicate_kind`), rather than the dimension/value split
     `classify_where` performs -- added alongside it, for the pipeline request layer's own
     shape-typing needs, without changing `classify_where` or anything that already calls
     it.
+
+    `value_columns` is forwarded to `classify_predicate_kind` unchanged; see there for
+    what a PAIRED frame's operand-named value columns change about the classification.
 
     Every dimension and spatial conjunct additionally gets the same structural safety
     check a dimension conjunct already gets from `classify_where`
@@ -584,7 +639,7 @@ def classify_where_kinds(where_str: str) -> dict[PredicateKind, list[str]]:
     for conjunct in split_top_level_and(where_str):
         if not conjunct:
             raise ExpressionError(f"empty conjunct in where={where_str!r}")
-        kind = classify_predicate_kind(conjunct)
+        kind = classify_predicate_kind(conjunct, value_columns)
         if kind is not PredicateKind.value:
             _check_no_dimension_subquery_or_aggregate(conjunct)
         result[kind].append(conjunct)

@@ -403,28 +403,6 @@ def _calendar_value(value, calendar_dim):
     return date.fromisoformat(value) if calendar_dim == "calendar_day" else int(value)
 
 
-def set_vrt_band_descriptions(vrt_text, descriptions):
-    """Set each band's ``<Description>`` in ``vrt_text`` from ``descriptions`` (band order).
-
-    ``vrt()`` only carries over a description that physically exists on the source band, so
-    this is set explicitly rather than inherited: a LEGACY COG SHIM file has none on disk
-    (``_read_cog_metadata`` synthesizes it in Python from a dataset tag and never writes it
-    back), and its bands would otherwise come out unlabeled.  Same repair as
-    ``_patch_legacy_vrt``'s second fix, but applied unconditionally by callers that already
-    know every band's label -- notably the API download path, which is handed a
-    ``(path, band, calendar value)`` frame.
-    """
-
-    root = xml.etree.ElementTree.fromstring(vrt_text)
-    for band_el, description in zip(root.findall("VRTRasterBand"), descriptions):
-        desc_el = band_el.find("Description")
-        if desc_el is None:
-            desc_el = xml.etree.ElementTree.Element("Description")
-            band_el.insert(0, desc_el)
-        desc_el.text = description
-    return xml.etree.ElementTree.tostring(root).decode("UTF-8")
-
-
 def scale_vrt_bands(vrt_text, factors):
     """Multiply each band of ``vrt_text`` by its factor (band order) inside the VRT.
 

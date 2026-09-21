@@ -4,6 +4,17 @@
 `execution/long_ops.py`'s four long-shape lowerings, plus `filter_band_wide`, the
 dispatcher a `filter` op with a mixed-kind `where` runs through.
 
+**A fourth filter lowering for PAIRED frames.** The three kinds above assume a frame with
+one measured quantity. A frame a `join` left carrying one operand-named value column per
+operand (`request.ops.FrameType.value_columns`) has several, and a `where` over it
+(`marsh > 0.5 and sal > 5.5`) asks one question about a PAIR of bands rather than a
+question about each band separately -- so the value branch routes to
+`pair_and_mask_band_wide` instead, which reconstitutes the pairs from band metadata,
+collapses each to one band, and masks it. `filter_band_wide` picks between the two on
+`value_columns` alone; everything else about the dispatch is unchanged. See that
+function for what pairs with what, and why an unpairable band is dropped rather than
+raised on.
+
 **Why a filter's three kinds are three functions, not one.** `request.expressions.
 PredicateKind`'s own docstring already says what each kind means for a band-wide frame:
 a value conjunct is always a per-cell mask (dropping the row would drop the pixel from
@@ -94,14 +105,17 @@ see `execute.py`'s module docstring), so there is no "outside the walk" boundary
 function to have already crossed. Whatever eventually finishes a band-wide walk owns that
 call, the same way `execution/frame.py` already documents.
 
-**`group_band_wide` ignores `GroupOp.of`.** `of` picks which column an aggregate reads in
-long shape (default `"value"`, generalizing to e.g. "first year a condition held"); a
-band-wide frame's per-band measurement IS the band column itself, with no second column a
-band-wide `group` could plausibly read instead. This is a real gap between one field's
-long-shape meaning and its (absent) band-wide one that the governing documents do not
-resolve -- flagged here rather than silently accepting an `of` that would have no effect,
-and recorded in the migration's running notes as a decision made without unambiguous
-text.
+**`GroupOp.of`, band-wide: the bands say WHETHER, `of` says WHICH.** `of` picks which
+column an aggregate reads in long shape (default `"value"`, generalizing to e.g. "first
+year a condition held"). A band-wide frame has no second per-PIXEL column to read
+instead -- but it does have `metadata_df`, one row of dimension values per band, and
+that is where the long-shape reading lands: `of: calendar_year` makes each band
+contribute its own calendar year, as a scalar, at every pixel where that band is
+non-null. The two halves of "first year a condition held" then sit in the two places
+band-wide shape keeps them: the condition is the per-pixel mask an upstream `filter`
+already applied to each band, and the year is that band's metadata row.
+`min of=calendar_year` over the survivors is the whole of it. An `of` naming neither
+`value` nor a metadata column is rejected rather than ignored.
 
 **`join_band_wide`'s operand-provenance column.** A long-shape join
 (`execution.long_ops.join_long`) renames each operand's `value` column to its own step
@@ -153,6 +167,8 @@ import polars as pl
 
 from cpra.mp.data.analysis.execution import long_ops
 from cpra.mp.data.analysis.execution.frame import (
+    DOMAIN_COLUMN,
+    RESERVED_BAND_INDEX_COLUMN,
     BandWideFrame,
     LongFrame,
     ReadWindow,
@@ -170,13 +186,16 @@ from cpra.mp.data.analysis.request.expressions import (
     compile_calculate_entries,
     parse_value_expr,
     rewrite_value_column,
+    rewrite_value_columns,
     value_predicate_mask,
 )
 from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp, calculate_label
 
 __all__ = [
     "JOIN_OPERAND_COLUMN",
+    "PAIRING_KEY_EXCLUDED_COLUMNS",
     "mask_value_band_wide",
+    "pair_and_mask_band_wide",
     "select_dimension_band_wide",
     "sample_grid_cells_band_wide",
     "filter_band_wide",
@@ -190,6 +209,14 @@ __all__ = [
 # `BAND_NAME_RE` and `RESERVED_BAND_INDEX_COLUMN` (`_band`), so it can never collide
 # with either positional-name shape `execution/frame.py`'s invariants police.
 JOIN_OPERAND_COLUMN = "_join_operand"
+
+# Metadata columns `pair_and_mask_band_wide` never pairs on -- see its docstring.
+# `variable`/`time_unit`/`grid` identify WHICH DATASET a band came from, and a spatial
+# join's whole premise is that its operands are different datasets; `path`/`band` name a
+# physical file and are per-band by construction; `JOIN_OPERAND_COLUMN` is the axis being
+# paired ACROSS, so pairing on it would put every operand in its own group and pair
+# nothing with anything.
+PAIRING_KEY_EXCLUDED_COLUMNS = frozenset({"variable", "time_unit", "grid", "path", "band", JOIN_OPERAND_COLUMN})
 
 # Horizontal (within-row, across-band) reduce. No `count` key: `count` is not a
 # `pl.*_horizontal` reduce and gets its own branch below -- see the module docstring.
@@ -207,7 +234,10 @@ def _horizontal_aggregate_expr(aggregate: str, exprs: list[pl.Expr], no_contribu
     aggregates do.
     """
     if aggregate == "count":
-        return pl.sum_horizontal([expr.is_not_null().cast(pl.UInt32) for expr in exprs])
+        # Signed, though a count never is: this lands in a GeoTIFF whose nodata sentinel
+        # (`execution.sink.DEFAULT_NODATA`) is negative, and an unsigned band has nowhere
+        # to put it. The width is the same either way.
+        return pl.sum_horizontal([expr.is_not_null().cast(pl.Int32) for expr in exprs])
     agg_fn = _HORIZONTAL_AGGREGATES[aggregate]
     no_contributor_at = pl.all_horizontal([expr.is_null() for expr in exprs])
     return pl.when(no_contributor_at).then(no_contributor).otherwise(agg_fn(exprs))
@@ -239,6 +269,114 @@ def mask_value_band_wide(band_wide: BandWideFrame, value_where: str, extra_colum
         exprs.append(pl.when(mask).then(pl.col(name)).otherwise(None).alias(name))
     out_lf = lf.select([*exprs, *extra_columns])
     return out_lf, metadata_df, window
+
+
+def _pairing_key_columns(metadata_df: pl.DataFrame) -> list[str]:
+    """The metadata columns `pair_and_mask_band_wide` pairs bands on: every column that is
+    non-null in EVERY band's row, minus `PAIRING_KEY_EXCLUDED_COLUMNS`.
+
+    The non-null test is what makes this work without a schema: `join_band_wide` merges
+    its operands' metadata with `how="diagonal_relaxed"`, so a column only one operand
+    carries (a raster's `ffibs_type`, a vector's `aggregate_type`) is present but null on
+    the other side, and pairing on it could only ever pair a band with nothing. A column
+    every operand carries a real value for is exactly a dimension they can be compared
+    along, which is exactly what a pairing key is.
+    """
+    return [
+        name
+        for name, nulls in zip(metadata_df.columns, metadata_df.null_count().row(0))
+        if nulls == 0 and name not in PAIRING_KEY_EXCLUDED_COLUMNS
+    ]
+
+
+def pair_and_mask_band_wide(
+    band_wide: BandWideFrame, value_where: str, extra_columns: Sequence[str], value_columns: Sequence[str]
+) -> BandWideFrame:
+    """The band-wide lowering of a value predicate over a PAIRED frame -- one a `join` left
+    carrying one operand-named value column per operand (`request.ops.FrameType.
+    value_columns`), where `value_where` names those operands rather than the placeholder
+    `value`: `marsh > 0.5 and sal > 5.5`.
+
+    A paired frame's bands are not comparable as they stand. `marsh`'s 2030 band and
+    `sal`'s 2030 band are two measurements OF THE SAME THING, and the predicate is one
+    question about that pair -- but band-wide shape has no column to put a pair in, only a
+    flat positional list in which the two sit side by side with nothing saying they belong
+    together. So this lowering does what `mask_value_band_wide` cannot: it reconstitutes
+    the pairs, and COLLAPSES each one to a single band.
+
+    * Bands pair by `_pairing_key_columns` -- the dimensions every operand carries a real
+      value for (`calendar_year`, in practice, plus whatever scenario columns the operands
+      agree on). A group with anything other than exactly one band per operand is dropped,
+      not raised on: that is a pairing MISS (an operand has no counterpart at this
+      dimension combination), the same non-event as a pixel whose crosswalk finds no
+      vector cell, and an empty result for a request that pairs nothing is a legitimate
+      all-nodata answer rather than an error.
+    * Each surviving pair becomes ONE band, carrying the value of its LOWEST-POSITIONED
+      band -- which is the operand the request named first, since `join_band_wide` lays
+      its operands' bands out in `JoinOp.inputs` order. A pair has two measurements and
+      an output band has room for one; nothing in the request says which, and the
+      first-named operand is the only determinate choice available. (Read off the band
+      positions rather than off `value_columns`, whose order is not meaningful: it comes
+      from a `frozenset`.) It rarely matters -- band-wide `calculate` is rejected over a
+      paired frame, so the collapsed value's only consumer is a `group`, and a `group`
+      that means to reduce something else says so with `of` -- but it must be SOME value,
+      and it must be the same one every time.
+    * The predicate masks that band: `value_where` has every operand name rewritten to its
+      own band column in this pair (`request.expressions.rewrite_value_columns`, one pass
+      -- a conjunct may reference two operands at once, `marsh > sal`), then evaluates
+      once per pair as a single `pl.when(...)`. Null where the pair fails, exactly the
+      masking discipline `mask_value_band_wide` uses and for the same reason.
+
+    The returned `metadata_df` carries the pairing key columns alone, one row per
+    surviving pair -- the dimensions that still mean something once the operand axis is
+    gone. `add_reserved_band_index` covers the no-shared-dimension case for the same
+    "zero columns loses the row count" reason `group_band_wide`'s `by == []` branch does.
+    """
+    validate_extra_columns(extra_columns)
+    lf, metadata_df, window = band_wide
+    if has_no_bands(metadata_df):
+        return empty_band_wide(window)
+    names = band_column_names(metadata_df)
+    operands = list(value_columns)
+    key_columns = _pairing_key_columns(metadata_df)
+
+    indexed = metadata_df.with_row_index("__pos")
+    if key_columns:
+        grouped = indexed.group_by(key_columns, maintain_order=True).agg(
+            pl.col("__pos"), pl.col(JOIN_OPERAND_COLUMN).alias("__operands")
+        )
+    else:
+        grouped = indexed.select(
+            pl.col("__pos").implode(), pl.col(JOIN_OPERAND_COLUMN).implode().alias("__operands")
+        )
+
+    kept_rows = []
+    band_exprs = []
+    for row_index, (positions, row_operands) in enumerate(
+        zip(grouped.get_column("__pos").to_list(), grouped.get_column("__operands").to_list())
+    ):
+        by_operand = dict(zip(row_operands, positions))
+        if len(by_operand) != len(positions) or set(by_operand) != set(operands):
+            continue
+        substitutions = {operand: names[position] for operand, position in by_operand.items()}
+        mask = value_predicate_mask(
+            rewrite_value_columns(value_where, substitutions),
+            allowed_columns=[*substitutions.values(), *extra_columns],
+        )
+        carried = pl.col(names[min(positions)])
+        band_exprs.append(pl.when(mask).then(carried).otherwise(None).alias(f"b{len(kept_rows)}"))
+        kept_rows.append(row_index)
+
+    if not kept_rows:
+        return empty_band_wide(window)
+
+    kept = grouped[kept_rows]
+    metadata_out = (
+        kept.select(key_columns)
+        if key_columns
+        else add_reserved_band_index(kept).select(RESERVED_BAND_INDEX_COLUMN)
+    )
+    return lf.select([*band_exprs, *extra_columns]), metadata_out, window
 
 
 def select_dimension_band_wide(
@@ -323,7 +461,12 @@ def sample_grid_cells_band_wide(
 
 
 def filter_band_wide(
-    band_wide: BandWideFrame, where: str, extra_columns: Sequence[str], *, grid_width: int | None = None
+    band_wide: BandWideFrame,
+    where: str,
+    extra_columns: Sequence[str],
+    *,
+    grid_width: int | None = None,
+    value_columns: Sequence[str] = ("value",),
 ) -> BandWideFrame | LongFrame:
     """The `filter` op's band-wide dispatcher: classify `where`'s conjuncts
     (`request.expressions.classify_where_kinds`) and route to the one of the three
@@ -331,6 +474,15 @@ def filter_band_wide(
     the precedence `request.ops._type_filter` already types this against (spatial, if
     present, wins outright; otherwise dimension runs before value -- see the module
     docstring for why that order is a non-observable choice rather than a requirement).
+
+    `value_columns` is the incoming frame's value columns (`request.ops.FrameType.
+    value_columns`), and does two things. It is forwarded to `classify_where_kinds`, so a
+    PAIRED frame's operand-named conjuncts (`marsh > 0.5`) classify as VALUE rather than
+    falling through to dimension for not being spelled `value`. And when there is more
+    than one of them, the value branch runs `pair_and_mask_band_wide` instead of
+    `mask_value_band_wide`: a paired frame's bands have to be paired up before a predicate
+    naming two operands means anything. It defaults to the unpaired `("value",)`, which is
+    every frame that never went through a `join`.
 
     `grid_width` is only needed for the spatial branch (`sample_grid_cells_band_wide`
     requires it, to decode absolute pixel ids); left `None` for a `where` that turns out
@@ -345,7 +497,7 @@ def filter_band_wide(
     behind (nothing for a value mask to do to zero bands).
     """
     validate_extra_columns(extra_columns)
-    kinds = classify_where_kinds(where)
+    kinds = classify_where_kinds(where, value_columns)
     if kinds[PredicateKind.spatial]:
         if grid_width is None:
             raise ValueError(
@@ -360,7 +512,11 @@ def filter_band_wide(
         if has_no_bands(result[1]):
             return result
     if kinds[PredicateKind.value]:
-        result = mask_value_band_wide(result, _combine_conjuncts(kinds[PredicateKind.value]), extra_columns)
+        value_where = _combine_conjuncts(kinds[PredicateKind.value])
+        if len(value_columns) > 1:
+            result = pair_and_mask_band_wide(result, value_where, extra_columns, value_columns)
+        else:
+            result = mask_value_band_wide(result, value_where, extra_columns)
     return result
 
 
@@ -433,14 +589,34 @@ def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequen
     lowering's answer on the metadata side; see the module docstring for why the reserved
     column is left standing in what this function returns rather than dropped here.
 
-    `op.of` is ignored -- see the module docstring for why a band-wide frame has no second
-    column a `group` could plausibly read instead of the band itself.
+    `op.of` names the per-band quantity the aggregate reads. Left at its `"value"` default
+    it is the band column itself, the only measurement a band-wide frame has. Set to a
+    METADATA column (`of: calendar_year`) it is that band's own value for that column --
+    a scalar per band, not a pixel array -- contributed wherever the band is non-null at
+    this pixel and withheld where it is not. That is what makes "the first year this
+    condition held" expressible in band-wide shape: the bands carry WHETHER, and `of`
+    supplies WHICH, so `min of=calendar_year` reduces to the earliest year whose band
+    survived. Any other `of` is rejected: it names neither a metadata column nor the
+    band, so there is nothing for it to read.
+
+    A frame carrying `frame.DOMAIN_COLUMN` (a vector-to-raster `project` is upstream) has
+    every output band additionally nulled wherever that column is -- a pixel outside the
+    crosswalk's domain gets nodata, never a real answer. This is invisible to the four
+    reducing aggregates, whose answer there is already null; it exists for `count`, which
+    would otherwise report a confident 0 for a pixel nobody ever asked about. See
+    `DOMAIN_COLUMN`'s own comment.
     """
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
         return empty_band_wide(window)
     names = band_column_names(metadata_df)
+    if op.of != "value" and op.of not in metadata_df.columns:
+        raise ValueError(
+            f"group of={op.of!r} names neither a band-wide frame's own measurement "
+            f"('value') nor one of its band metadata columns ({sorted(metadata_df.columns)})"
+        )
+    of_values = metadata_df.get_column(op.of).to_list() if op.of != "value" else None
     indexed = metadata_df.with_row_index("__pos")
     groups_df = indexed.group_by(op.by, maintain_order=True).agg(pl.col("__pos"))
 
@@ -450,10 +626,24 @@ def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequen
         metadata_out = add_reserved_band_index(groups_df).drop("__pos")
 
     no_contributor = pl.lit(None)
+    in_domain = pl.col(DOMAIN_COLUMN).is_not_null() if DOMAIN_COLUMN in extra_columns else None
     band_exprs = []
     for k, positions in enumerate(groups_df.get_column("__pos").to_list()):
-        contributing = [pl.col(names[position]) for position in positions]
-        band_exprs.append(_horizontal_aggregate_expr(op.aggregate, contributing, no_contributor).alias(f"b{k}"))
+        if of_values is None:
+            contributing = [pl.col(names[position]) for position in positions]
+        else:
+            # The band decides WHETHER it contributes; `of` decides WHAT. `pl.when` on the
+            # band's own nullity rather than a bare literal, so a band masked out upstream
+            # (a failed predicate, a nodata pixel) withholds its `of` value at that pixel
+            # instead of contributing it everywhere the band merely exists.
+            contributing = [
+                pl.when(pl.col(names[position]).is_not_null()).then(pl.lit(of_values[position])).otherwise(None)
+                for position in positions
+            ]
+        expr = _horizontal_aggregate_expr(op.aggregate, contributing, no_contributor)
+        if in_domain is not None:
+            expr = pl.when(in_domain).then(expr).otherwise(None)
+        band_exprs.append(expr.alias(f"b{k}"))
 
     out_lf = lf.select([*band_exprs, *extra_columns])
     return out_lf, metadata_out, window
@@ -476,9 +666,14 @@ def join_band_wide(operands: list[BandWideFrame], names: list[str], extra_column
     from -- the band-wide reading of "each operand's value renamed to its step name"; see
     the module docstring.
 
-    `extra_columns` is read from `operands[0]` alone: a column both operands carry (a
+    `extra_columns` names the carried columns the OUTPUT should have; each is taken from
+    the first operand whose frame actually carries it. A column several operands carry (a
     shared crosswalk, say) is guaranteed identical row-for-row once the pixel-grid
-    precondition holds, so there is nothing a second copy from another operand would add.
+    precondition holds, so which copy is taken cannot matter -- but WHETHER a column is
+    taken does, because an operand can introduce one the others never had:
+    `execution.project.project_vector_to_raster` attaches `frame.DOMAIN_COLUMN` to its own
+    output, and a join pairing that projection against a plain raster read would drop it
+    if only `operands[0]` were consulted.
     """
     validate_extra_columns(extra_columns)
     if len(operands) != len(names):
@@ -500,14 +695,19 @@ def join_band_wide(operands: list[BandWideFrame], names: list[str], extra_column
     aligned = []
     renamed_metadatas = []
     next_position = 0
-    for k, ((lf, metadata_df, _window), name) in enumerate(zip(operands, names)):
+    unclaimed = list(extra_columns)
+    for (lf, metadata_df, _window), name in zip(operands, names):
         local_names = band_column_names(metadata_df)
         select_cols = [
             pl.col(local_name).alias(f"b{next_position + i}") for i, local_name in enumerate(local_names)
         ]
         next_position += len(local_names)
-        if k == 0:
-            select_cols += [pl.col(column) for column in extra_columns]
+        # First operand that carries it wins, and it is then off the list -- taking a
+        # second copy would put two columns of the same name into the horizontal concat.
+        present = lf.collect_schema().names()
+        claimed = [column for column in unclaimed if column in present]
+        select_cols += [pl.col(column) for column in claimed]
+        unclaimed = [column for column in unclaimed if column not in claimed]
         aligned.append(lf.select(select_cols))
         # Guarded on height: `with_columns` of a literal against a zero-ROW frame
         # broadcasts to length ONE rather than staying empty, so a zero-band operand would

@@ -163,20 +163,22 @@ returns:
 ```json
 {
   "inputs": {
-    "x": {
-      "variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001",
-      "model_group_id": 520, "scenario_id": [7, 8], "aggregate_type": "2_wk_max",
-      "calendar_year": 2030
-    }
+    "x": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "x", "to": "hydro_compartment_v001"},
+    {"op": "filter", "input": "x", "where": "aggregate_type = '2_wk_max' AND calendar_year = 2030 AND model_group_id = 520 AND scenario_id IN (7, 8)"},
     {"op": "calculate", "expression": "value * -1", "where": "scenario_id = 8"},
-    {"op": "group", "by": ["model_group_id", "aggregate_type", "calendar_year"], "aggregate": "sum"}
+    {"op": "group", "by": ["model_group_id", "aggregate_type", "calendar_year"], "aggregate": "sum", "of": "value"}
   ],
   "output": {"format": "csv"}
 }
 ```
+
+The URL's dataset filters land in a `filter` **step**, not on the input: an input names a
+dataset and nothing else (see [Analysis API](analysis-api.md#request-shape)). The
+registry builds that step in sorted conjunct order, which is why the `where` above reads
+`aggregate_type ... AND calendar_year ... AND model_group_id ... AND scenario_id ...`
+rather than in the order the query string listed them.
 
 which is exactly the hand-authored "Map Query Comparing Two Scenarios" pipeline shown in
 the [Analysis API](analysis-api.md#map-query-comparing-two-scenarios) -- proving the named

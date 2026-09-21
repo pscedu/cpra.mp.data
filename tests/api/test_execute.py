@@ -315,14 +315,9 @@ class TestEndToEnd:
     def test_group_collapses_to_one_row_per_grid_cell(self, annual_dataset):
         df = self._run(
             annual_dataset,
-            [
-                # `group` can never be a pipeline's first step (`GroupStep`'s own
-                # docstring -- it has no field to be explicit with); this pass-through
-                # filter (every fixture value is well above -1) exists only to give it
-                # something to chain from.
-                {"op": "filter", "input": "a", "where": "value > -1", "as": "f"},
-                {"op": "group", "by": [], "aggregate": "sum"},
-            ],
+            # A `group` naming its input is a whole pipeline on its own -- read the
+            # dataset, collapse it -- with no filter in front purely to chain from.
+            [{"op": "group", "input": "a", "by": [], "aggregate": "sum"}],
         )
         # One row per grid_cell (32 cells), summed over the two years:
         # (2030 + g/100) + (2040 + g/100) = 4070 + 2*g/100, for g in 1..32.
@@ -690,11 +685,12 @@ class TestBandWideEndToEnd:
     def test_band_wide_join_reads_operands_from_one_shared_scan(self, base_path, monkeypatch):
         # Two DIFFERENT raster variables on `RASTER_GRID` -- `vct` fills 10 everywhere,
         # `ffibs_score` fills 5.0 everywhere -- joined spatially into one band-wide frame,
-        # then a trailing `calculate expression="value"` (identity, per band) to collapse
-        # back to the single-value-column sink rule (`_type_join` types a join's output as
-        # carrying `value_columns={*op.inputs}`, which `_type_calculate` then always
-        # collapses to `{"value"}`, exactly like `TestEndToEnd`'s own long-shape join
-        # tests). `plan.band_wide_join_scans` should record this join's two operands as one
+        # then a trailing `group by=[]` to collapse back to the single-value-column sink
+        # rule (`_type_join` types a join's output as carrying `value_columns={*op.inputs}`,
+        # which every output rejects; `_type_group` collapses it to `{"value"}`). `sum`
+        # rather than some other aggregate because 10 + 5 = 15 is only reachable if BOTH
+        # operands' bands made it into the frame with their own values intact.
+        # `plan.band_wide_join_scans` should record this join's two operands as one
         # shared-scan group; `scan_raster` is monkeypatched to a call-counting wrapper
         # around the real function so this is checked at the IO level -- if the walk
         # opened each operand with its own `scan_raster` call instead of the one shared
@@ -718,7 +714,7 @@ class TestBandWideEndToEnd:
                 "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
                 "steps": [
                     {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                    {"op": "calculate", "expression": "value"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
                 ],
                 "output": {"format": "tif"},
             }
@@ -742,9 +738,8 @@ class TestBandWideEndToEnd:
         df = lf.collect()
 
         assert len(calls) == 1
-        assert df.columns == ["b0", "b1"]
-        assert df["b0"].unique().to_list() == pytest.approx([10.0])
-        assert df["b1"].unique().to_list() == pytest.approx([5.0])
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == pytest.approx([15.0])
 
     def test_raster_to_vector_project_runs_through_execute(self, base_path, crosswalk_path):
         # A constant-fill (10) raster and a crosswalk with ONE zone covering the whole
@@ -792,7 +787,7 @@ class TestBandWideEndToEnd:
                     {"op": "calculate", "input": "fa", "expression": "value * 2", "as": "ca"},
                     {"op": "filter", "input": "b", "where": "calendar_year == 2099", "as": "fb"},
                     {"op": "join", "type": "spatial", "inputs": ["ca", "fb"], "as": "j"},
-                    {"op": "calculate", "expression": "value"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
                 ],
                 "output": {"format": "tif"},
             }
@@ -1195,7 +1190,7 @@ class TestBandWideEndToEnd:
                 "steps": [
                     {"op": "filter", "input": "a", "where": "calendar_year == 2099", "as": "fa"},
                     {"op": "join", "type": "spatial", "inputs": ["fa", "b"], "as": "j"},
-                    {"op": "calculate", "expression": "value"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
                 ],
                 "output": {"format": "tif"},
             }
@@ -1312,7 +1307,7 @@ class TestTileScopedReads:
                 "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
                 "steps": [
                     {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                    {"op": "calculate", "expression": "value"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
                 ],
                 "output": {"format": "tif"},
             }
@@ -1338,8 +1333,10 @@ class TestTileScopedReads:
         assert len(calls) == 1
         assert (window.width, window.height) == (int(compiled.width), int(compiled.height))
         assert df.height == window.width * window.height
-        assert df["b0"].unique().to_list() == pytest.approx([10.0])
-        assert df["b1"].unique().to_list() == pytest.approx([5.0])
+        # 10 + 5: the trailing `group by=[] aggregate="sum"` collapses the join's two
+        # operand-named value columns to one, and only reaches 15 if both operands' bands
+        # came off the shared scan with their own values.
+        assert df["b0"].unique().to_list() == pytest.approx([15.0])
 
     def test_a_join_groups_shared_window_is_the_union_of_its_operands(self, base_path):
         # `_shared_tile_window` directly, since a pipeline that makes two operands of one

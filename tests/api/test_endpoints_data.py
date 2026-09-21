@@ -371,10 +371,9 @@ class TestVectorData:
         write_parquet(annual_frame(years=years), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        # `GroupStep` has no `input` field of its own and so can never lead a pipeline
-        # (see its docstring); a leading `filter` names the input instead. Its `where` is
-        # vacuously true for every written row -- it exists only to satisfy the chaining
-        # rule, not to narrow anything, since narrowing isn't what this test is about.
+        # The leading `filter`'s `where` is vacuously true for every written row -- it
+        # exists to keep this pipeline shaped like the ones the fold path sees in
+        # practice, not to narrow anything, since narrowing isn't what this test is about.
         pipeline = {
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [

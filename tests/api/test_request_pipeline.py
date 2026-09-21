@@ -180,13 +180,22 @@ class TestChaining:
         with pytest.raises(RequestError, match="unknown"):
             parse_pipeline(data)
 
-    def test_group_cannot_be_first_step(self):
-        """`group` has no `input` field at all -- it always consumes the previous
-        step's output -- so it can never satisfy the first-step chaining rule."""
+    def test_group_without_an_input_cannot_be_first_step(self):
+        """`group` chains like every other non-`join` op, so a leading one with no
+        `input` fails the first-step rule for the same reason a leading `filter` does."""
         data = simple_pipeline()
         data["steps"] = [{"op": "group", "by": [], "aggregate": "sum"}]
         with pytest.raises(RequestError, match="no input to chain from"):
             parse_pipeline(data)
+
+    def test_group_naming_its_input_can_be_first_step(self):
+        """"Read one dataset and collapse it" is a whole pipeline, and naming the input
+        on the `group` is what expresses it -- no filter in front purely to chain from.
+        """
+        data = simple_pipeline()
+        data["steps"] = [{"op": "group", "input": "marsh", "by": [], "aggregate": "sum"}]
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[0].input == "marsh"
 
     def test_a_dangling_as_that_is_never_referenced_is_not_an_error(self):
         data = simple_pipeline()
@@ -448,12 +457,19 @@ class TestQueryCodec:
                 {"op": "filter", "where": "marsh > 0.5 AND sal_r > 5.5"},
                 {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
             ],
-            "output": {"format": "tif", "compression": "deflate"},
+            "output": {"format": "tif"},
         }
         pipeline = parse_pipeline(data)
         query = pipeline_to_query(pipeline)
         pipeline2 = pipeline_from_query(query)
         assert pipeline_to_query(pipeline2) == query
+
+    def test_round_trips_a_group_that_names_its_input(self):
+        data = simple_pipeline()
+        data["steps"] = [{"op": "group", "input": "marsh", "by": ["calendar_year"], "aggregate": "sum"}]
+        query = pipeline_to_query(parse_pipeline(data))
+        assert query["step.1.input"] == "marsh"
+        assert pipeline_from_query(query).steps[0].input == "marsh"
 
     def test_query_keys_are_naturally_sorted(self):
         data = simple_pipeline()
@@ -482,7 +498,7 @@ class TestQueryCodec:
         """The round-trip above exercises the fields a pipeline cannot omit. This one
         sets every field the encoder is allowed to DROP when it holds a default or
         `None` -- each step type's `as`, `calculate.where`, `group.of` at a non-default,
-        and all four optional output fields -- because dropping a field and reviving the
+        and all three optional output fields -- because dropping a field and reviving the
         same default on decode is what makes the round-trip stable rather than merely
         reversible once, and a field that silently fails to survive would otherwise show
         up first as a cache key that changes on every re-encode.
@@ -506,7 +522,6 @@ class TestQueryCodec:
                 "color_map": "viridis",
                 "sort": "-value",
                 "select": "grid_cell,value",
-                "compression": "gzip",
             },
         }
         pipeline = parse_pipeline(data)
@@ -663,6 +678,21 @@ class TestQueryCodecMalformedInput:
     def test_unknown_output_field_rejected(self):
         with pytest.raises(RequestError, match="unknown field"):
             pipeline_from_query(simple_query(**{"output.bogus": "x"}))
+
+    def test_output_compression_is_rejected_rather_than_ignored(self):
+        """`output.compression` used to decode and round-trip here while nothing ever
+        read it, so a caller who asked for gzip silently got the default. Both encodings
+        reject it outright now; compression is the `compression_algorithm`/
+        `compression_level` QUERY parameters (`api.models.Compression`), which are
+        stripped from the query dict before it ever reaches this decoder.
+        """
+        with pytest.raises(RequestError, match="unknown field"):
+            pipeline_from_query(simple_query(**{"output.compression": "gzip"}))
+
+        data = simple_pipeline()
+        data["output"]["compression"] = "gzip"
+        with pytest.raises(RequestError):
+            parse_pipeline(data)
 
     def test_a_well_formed_query_expressing_a_structurally_invalid_pipeline_is_still_rejected(self):
         """Once the dotted structure resolves, the result goes through the same

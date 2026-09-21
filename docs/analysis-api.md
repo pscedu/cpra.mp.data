@@ -21,19 +21,23 @@ A small, fixed set of named, pre-built pipelines (`difference`, `concatenate`,
 `exit-criterion`) is also available without hand-authoring pipeline JSON at all -- see
 [the named-analysis registry](analyses-api.md).
 
-Three endpoints accept a pipeline, sharing one request model:
+Four endpoints accept a pipeline, sharing one request model:
 
 ```
-POST /v1/analysis.<format>
-GET  /v1/analysis.<format>
+POST /v1/analysis.<csv|ndjson|parquet|tif>
+GET  /v1/analysis.<csv|ndjson|parquet|tif>
 GET  /v1/analysis/{z}/{x}/{y}.<png|jpg>
+GET  /v1/analysis/{z}/{x}/{y}.pbf
 ```
 
-`POST` takes the pipeline as a JSON body. `GET` (both the flat and the tile form) takes
+`POST` takes the pipeline as a JSON body. `GET` (the flat form and both tile forms) takes
 the identical pipeline flattened into a dotted query string, so a pipeline can be
-embedded in a map tile URL template. In every case, `<format>` in the URL must agree with
-the pipeline's own `output.format` -- a mismatch (e.g. a `.csv` URL for a pipeline whose
-`output.format` is `"tif"`) is rejected with a 400 before anything is read.
+embedded in a map tile URL template. On the `.{format}` routes, `<format>` in the URL must
+agree with the pipeline's own `output.format` -- a mismatch (e.g. a `.csv` URL for a
+pipeline whose `output.format` is `"tif"`) is rejected with a 400 before anything is read.
+The `.pbf` vector-tile route is the exception: `pbf` is not a spellable `output.format`,
+so there is nothing to cross-check; that route instead requires the pipeline's final
+frame to be a table on a vector grid, and rejects anything else with a 400.
 
 ## Request Shape
 
@@ -41,111 +45,178 @@ A pipeline has three parts:
 
 ```json
 {
-  "inputs": {
-    "<name>": {"variable": "...", "time_unit": "...", "grid": "...", "<dimension>": "..."}
-  },
+  "inputs": {"<name>": {"variable": "...", "time_unit": "...", "grid": "..."}},
   "steps": [ {"op": "...", ...} ],
   "output": {"format": "...", "color_map": "...", "sort": "...", "select": "..."}
 }
 ```
 
-**`inputs`** names one or more dataset selections. Each is the same `variable`/
-`time_unit`/`grid` triple the flat data endpoints take, plus any number of dimension
-filters (e.g. `model_group_id`, `scenario_id`) as extra keys -- a scalar or a
-comma-separated/JSON-list of values, exactly as on the flat endpoints -- plus the
-reserved `grid_cell` key, filtering that input's own source grid exactly like the flat
-`grid_cell=` parameter.
+**`inputs`** names one or more dataset selections. An input names a dataset and nothing
+else: exactly the `variable`/`time_unit`/`grid` triple, with no other keys accepted. There
+is no input-level filtering of any kind -- every narrowing, whether by dimension
+(`scenario_id = 7`), by value (`value > 5`), or by cell (`grid_cell IN (1, 2)`), is a
+`filter` **step**, so a request narrows its result the same way no matter where in the
+chain the narrowing happens. (This is a change: earlier versions accepted dimension
+filters and a `grid_cell` key directly on an input. Those keys are now rejected outright
+rather than silently ignored; move each one into a `filter` step.)
 
 **`steps`** is an ordered list of operations, each consuming a named input or a previous
-step's own output:
+step's output:
 
 | Op | Fields | Description |
 |---|---|---|
-| `project` | `input` (optional, chains from the previous step if omitted), `to` (target grid), `aggregate` (required moving to a coarser grid, forbidden moving to a finer one; may be `sum`/`max`/`min`/`mean`/`count`/`count_by_value`), `as` | Move a named input onto a different grid via a crosswalk. |
-| `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine named inputs/step outputs on shared dimensions and `grid_cell`. |
-| `filter` | `where` | A SQL-style predicate over the in-scope named columns (e.g. `marsh > 0.5 AND sal > 5.5`), always over the previous step's output. |
-| `calculate` | `expression`, `where` (optional) | Conditionally rewrite the running value: one expression/where pair per step (several pairs = repeated steps, applied sequentially -- step N+1 sees step N's output), always over the previous step's output. Rows/bands not matching `where` flow through unchanged; `calculate` never drops data. |
-| `group` | `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate` (`sum`/`min`/`max`/`count`/`mean` -- the decomposable aggregates only; `count_by_value` is never valid here), `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held") | Collapse rows/bands, always over the previous step's output. |
+| `project` | `input` (optional, chains from the previous step if omitted), `to` (target grid), `aggregate` (required whenever the target may draw from several source cells -- there is no default; forbidden only when broadcasting a vector grid onto a raster one; `sum`/`max`/`min`/`mean`/`count`/`count_by_value`), `as` | Move a frame onto a different grid via a crosswalk. |
+| `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine frames cell-for-cell on a shared grid, naming each operand's measurement after the operand. |
+| `filter` | `input` (optional), `where`, `as` | A SQL-style predicate -- over dimensions, over the value, or over `grid_cell`. |
+| `calculate` | `input` (optional), `expression`, `where` (optional), `as` | Conditionally rewrite the running value: one expression/where pair per step (several pairs = repeated steps, applied sequentially -- step N+1 sees step N's output). Rows/bands not matching `where` flow through unchanged; `calculate` never drops data. |
+| `group` | `input` (optional), `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate` (`sum`/`min`/`max`/`count`/`mean` -- the decomposable aggregates only; `count_by_value` is never valid here), `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held"), `as` | Collapse rows/bands. |
 
-`filter`, `calculate`, and `group` never take an explicit input -- they always consume
-whatever the immediately preceding step produced -- so the **first** step of every
-pipeline must be a `project` (naming its input explicitly) or a `join` (naming two or
-more inputs explicitly). A single-input pipeline that changes no grid at all still opens
-with an identity `project` (`to` equal to the input's own grid) purely to satisfy this
-rule.
+Every op may name its input explicitly; when it doesn't, it consumes whatever the
+immediately preceding step produced (`join` is the exception -- its `inputs` is required,
+so it never chains). The **first** step must name its input, whichever op it is: a
+single-input pipeline that changes no grid opens with a `filter` naming the input, or
+with a `group` naming it if collapsing is the only thing it does. There is no identity
+`project` to open with: a `project` onto the frame's own grid is not a no-op, and a
+vector-to-vector `project` with no `aggregate` is rejected outright, since a target cell
+may draw from any number of source cells and there is no default for that.
 
-A pipeline `calculate`/`filter` expression references the running value **by its
-in-scope column name** -- the input or step name (e.g.
-`{"op": "calculate", "expression": "sal * 0.6", "where": "model_group_id = 500"}` after an
-input named `sal`); the placeholder name `value` is also accepted, since both spellings
-resolve to the same running value in a single-input chain.
+**A pipeline may have zero steps.** A plain selection -- nothing to compute -- is a
+pipeline with an empty `steps` list, exactly one input, and an `output`.
 
-**`output`** gives the response `format` (any tabular/`tif` format, or a tile format for
-the tile route), an optional `color_map` for rendered raster output, and optional
-`sort`/`select`, with exactly the same semantics as the flat data endpoints' `sort`/
-`select` parameters.
+### Naming and the Column Namespace
 
-## What Compiles Today
+Input names and step `as` names must match `[a-z_][a-z0-9_]*`, must not collide with each
+other, and must not be `value`, `grid_cell`, `value_category`, a positional band name
+(`b0`, `b1`, ...), or any dimension the data structure already declares.
 
-Not every step sequence a pipeline could describe is executable yet. Three shapes are
-supported; anything else is rejected with a 400 naming the specific unsupported shape
-and why, rather than a generic failure.
+The running measurement is spelled **`value`** in every `filter.where` and
+`calculate.expression`, in every single-input chain. The one exception is a frame
+produced by a `join`: there, each operand's measurement is named after the operand, so a
+`join` of `marsh` and `sal` is filtered with `marsh > 0.5 AND sal > 5.5`. Referring to a
+single-input chain's measurement by the input's own name does *not* work -- that name is
+classified as a dimension, and fails against the real dimension set.
 
-1. **Single-input chains equivalent to a flat dataset request**: one input, an opening
-   `project` (identity, or many-to-one onto a coarser grid with `aggregate`), then
-   optionally `filter` and/or `calculate` step(s) and at most one trailing `group`, to any
-   tabular or `tif`/tile format. One ordering caveat falls out of this: a `filter` step
-   ordered *after* a `calculate` step is accepted only when its `where` is dimension-only
-   (the two commute); a value condition there would test the pre-calculate value, so it
-   is rejected with a 400 suggesting the filter be moved before the calculate (or folded
-   into the calculate entry's own `where`). A `filter` naming `grid_cell` right after a
-   many-to-one `project` is understood as filtering the *summarized zones*, not the
-   source grid's own cells -- only one such filter is accepted per pipeline, and it must
-   be a clean literal-ID selection (`grid_cell = 1` or `grid_cell IN (1, 2)`), not an
-   arbitrary predicate.
-2. **Project-only reaggregation**: the same shape as (1), specialized to a many-to-one
-   `project` (e.g. raster pixels reaggregated onto a coarser vector zone) with a tabular
-   output -- no `filter`/`group` needed. `output.sort`/`output.select`/`output.color_map`
-   still apply to this degenerate case.
-3. **The paired (spatially-joined) shape** (`calculate` steps are not supported in this
-   shape and are rejected with a 400 naming it -- apply the
-   rewrite on the flat endpoint or a single-input pipeline feeding the analysis instead):
-   exactly two inputs -- a coarser one broadcast (one-to-many `project`, no `aggregate`)
-   onto a finer *raster* grid, immediately `join`ed against that raster input, then any
-   number of `filter` steps and exactly one trailing `group` with `by: []` (a per-pixel
-   collapse across bands, e.g. across years -- not a zonal collapse) and a numeric `of`
-   (`calendar_year`, or the running `value`) for every aggregate except `count`, which has
-   none. Because this shape's result is inherently one raster surface, only
-   `tif`/`png`/`jpg` output is implemented for it; a tabular paired output is rejected
-   outright. This shape rejects `grid_cell` on either input, and rejects `output.sort`/
-   `output.select` outright (they would silently no-op against a per-pixel raster
-   result).
+A conjunct that references `grid_cell` is a spatial predicate; one that references a value
+column is a value predicate; anything else is a dimension predicate. A single conjunct may
+not mix `grid_cell` with a value column. Otherwise a `where` can freely combine all three
+kinds in one string (`calendar_year > 2040 AND value > 3`).
 
-A `join`'s two sides must agree on every dimension they share (present on all joined
-inputs and filtered to the same value(s)), and a dimension present on only one side must
-be pinned to a single value there, since there is no row on the other side to align it
-against. The coarse/zone side of a `project`/`join` is also capped at a configured row
-ceiling (`ANALYSIS_JOIN_MAX_ROWS`), checked before that side is materialized, so an
-unbounded selection is rejected rather than silently read in full.
+### Output
 
-Everything else -- three or more inputs, a `join` not immediately preceded by its
-broadcasting `project`, a tabular output for the paired shape, `filter`/`group` in an
-order the compiler doesn't recognize, and so on -- is rejected informatively rather than
-silently misexecuted.
+**`output`** gives the response `format`, an optional `color_map` for rendered raster
+output, and optional `sort`/`select`, with exactly the same semantics as the flat data
+endpoints' `sort`/`select` parameters. `sort`/`select` are checked for syntax at parse
+time (comma-separated `[-]column`, no empty component, no bare `-`, no `-` prefix in
+`select`, no repeats); whether a named column exists on the final frame surfaces when the
+result is collected.
+
+Compression is **not** part of the pipeline body -- it is a pair of query parameters,
+`compression_algorithm` (default `zstd`) and `compression_level` (default `6`), accepted
+on both `POST /v1/analysis.{format}` and `GET /v1/analysis.{format}`. For `tif` output the
+algorithm must be one of `deflate`/`lzw`/`lzma`/`zstd`/`none`; for tabular output, one of
+`gzip`/`lz4`/`zstd`/`none`. There is no `output.compression` field -- an earlier version
+accepted one and then ignored it; it is now rejected like any other unknown output field.
+
+GeoTIFF output carries a band description per band, spelled `"<dimension>=<value>"` and
+comma-joined, so a downloaded file records which band is which without relying on band
+order.
+
+## Shapes: What the Compiler Accepts
+
+Every frame in a pipeline has one of two shapes, and the shape is what decides which
+lowering each op gets:
+
+- **long** -- a table, one row per (`grid_cell`, dimension combination), with a `value`
+  column. This is the shape of every vector-grid input and of every tabular output.
+- **band-wide** -- a raster surface, one band per surviving dimension combination, with
+  no rows. This is the shape of every raster-grid input and of every `tif`/`png`/`jpg`
+  output.
+
+The rules, in full:
+
+| Op | Effect on shape |
+|---|---|
+| `project` vector -> vector | long -> long (`aggregate` required) |
+| `project` raster -> vector | band-wide -> long (`aggregate` required) |
+| `project` vector -> raster | long -> band-wide (a broadcast; `aggregate` forbidden) |
+| `project` raster -> raster | **never legal** -- there is no crosswalk between two raster lattices |
+| `filter` on a dimension or a value | shape unchanged |
+| `filter` on `grid_cell` (spatial) | band-wide -> long; long -> long |
+| `calculate` | shape unchanged |
+| `group` | shape unchanged |
+| `join` | shape unchanged; operands must agree on shape **and** grid |
+
+Two consequences of the spatial-filter row are worth calling out. A `grid_cell` filter
+over a raster frame is what turns it into a table, which is how a raster dataset reaches a
+CSV without a zonal `project`. And because that leaves the frame still addressed against
+the raster lattice, a later `project` from it is still raster-to-something.
+
+There is no longer any restriction on step *ordering* beyond the chaining rule: a `filter`
+after a `calculate` sees the post-calculate value, a `grid_cell` filter may appear anywhere
+and as many times as you like, and `filter`/`calculate`/`group` compose in any sequence.
+Every combination this table permits has an executor -- nothing is accepted at parse time
+and then refused as unimplemented at run time.
+
+### What Is Rejected, and Why
+
+Each of these is a 400 naming the specific problem:
+
+- **A raster-to-raster `project`** (above).
+- **A `project` with no `aggregate`** where the target may draw from several source cells,
+  or **with** one where it may not (the vector-to-raster broadcast).
+- **A second `count_by_value` in one chain** -- the first already occupies the
+  `value_category` column. `count_by_value` is a `project` aggregate only; it is never a
+  valid `group.aggregate`, because it changes the output's row count rather than folding.
+- **A `join` mixing a long operand with a band-wide one**, or **whose operands sit on two
+  different grids** -- `grid_cell` identifies a cell *within* one grid, so two frames on
+  different grids have no cell in common. Insert a `project` first.
+- **A `join` over an operand that is itself an uncollapsed `join`'s output** -- a join
+  names each operand's measurement after the operand, and an operand carrying several
+  measurements has no single one for that name to mean. `join(a, b)` is fine;
+  `join(join(a, b), c)` is not, until something collapses the pairing in between.
+- **A `calculate` over a paired band-wide frame** -- a band-wide frame's bands are
+  positional, so there is no per-operand column for the expression to name. Collapse the
+  pairing with a value `filter` first.
+- **More than one value column reaching the sink** -- every output writes exactly one
+  measured quantity. A `join`'s paired frame must therefore be collapsed before the
+  output: a value `filter` or a `group` over a band-wide frame, or a `calculate` over a
+  long one.
+- **A long final frame under a raster output format** (`tif`/`png`/`jpg`), or **a
+  band-wide final frame under a tabular one** (`csv`/`ndjson`/`parquet`). Add a `project`,
+  or (from band-wide) a spatial `filter`.
+- **`join.type: "attribute"`** -- reserved for a future release; only `"spatial"` is
+  implemented.
+- **A first step that names no input** (any op with `input` omitted), or any step
+  referencing a name that isn't yet defined.
+- **A zero-step pipeline with more than one input** -- nothing selects among several
+  inputs with no step to combine or choose between them.
+
+Two further rejections need information only available once compilation has read the
+catalog, so they surface slightly later but are still 400s: a `project` from a raster
+frame that an earlier spatial `filter` already turned long, and one raster input fanning
+out into two raster-to-vector `project`s with different targets.
+
+### Limits
+
+The vector (zone) side of a `project`/spatial `join` is capped at a configured row ceiling
+(`ANALYSIS_JOIN_MAX_ROWS`, default 200,000), checked before that side is materialized, so
+an unbounded selection is rejected rather than silently read in full. `count_by_value` is
+capped at `COUNT_BY_VALUE_MAX_DISTINCT` (default 1,000) distinct values, which catches a
+caller pointing it at a continuous column.
 
 ## Memory Behavior
 
-The paired shape (3) exists specifically to avoid materializing a full joined table:
-naively broadcasting a coarse dataset onto every pixel of a fine raster grid, across
-every year, and then grouping, means holding one column per year for every pixel in
-memory at once before the aggregate can drop most of it. Instead, the compiled plan reads
-both inputs' small ROW metadata up front (file paths/bands for the raster input; the
-already row-ceiling-bounded coarse table), then executes as a single pass over the
-raster's own block windows: for each window, it reads that window from every year's band
-plus the pairing crosswalk, looks up each pixel's paired coarse value, applies the
-`filter`/`group` collapse for just that window, and writes the collapsed window straight
-back at its own position -- never holding a full-extent array of any per-pixel
-intermediate.
+The paired shape -- a vector dataset broadcast onto a raster grid and joined against a
+raster dataset there -- exists specifically to avoid materializing a full joined table:
+naively broadcasting a vector dataset onto every pixel of a raster grid, across every
+year, and then grouping, means holding one column per year for every pixel in memory at
+once before the aggregate can drop most of it. Instead, the compiled plan reads both
+inputs' small metadata up front (file paths/bands for the raster input; the already
+row-ceiling-bounded vector table), then executes as a single pass over the raster's own
+block windows: for each window, it reads that window from every year's band plus the
+pairing crosswalk, looks up each pixel's paired vector value, applies the `filter`/`group`
+collapse for just that window, and writes the collapsed window straight back at its own
+position -- never holding a full-extent array of any per-pixel intermediate.
 
 ## Examples
 
@@ -154,26 +225,22 @@ intermediate.
 #### Map Query Comparing Two Scenarios
 
 This pipeline returns the difference in annual salinity (two-week-max aggregate) between
-two scenarios in one year (scenario 7 minus scenario 8): an identity `project`, a
-`calculate` step negating scenario 8's rows, then a `group` collapsing the two scenarios
-into one value per grid cell. `model_group_id`, `aggregate_type`, and `calendar_year` are
-each pinned to one value here (so listing them in `group.by` alongside the truly-varying
-`scenario_id` is a no-op on this particular request), because `sal` always carries an
-`aggregate_type` dimension at every time granularity -- pin it explicitly rather than
-leaving it to match every stored value.
+two scenarios in one year (scenario 7 minus scenario 8): a `filter` selecting the two
+scenarios, a `calculate` step negating scenario 8's rows, then a `group` collapsing the
+two scenarios into one value per grid cell. `model_group_id`, `aggregate_type`, and
+`calendar_year` are each pinned to one value here (so listing them in `group.by` alongside
+the truly-varying `scenario_id` is a no-op on this particular request), because `sal`
+always carries an `aggregate_type` dimension at every time granularity -- pin it
+explicitly rather than leaving it to match every stored value.
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "sal": {
-      "variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001",
-      "model_group_id": 520, "scenario_id": [7, 8], "aggregate_type": "2_wk_max",
-      "calendar_year": 2030
-    }
+    "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
+    {"op": "filter", "input": "sal", "where": "model_group_id = 520 AND scenario_id IN (7, 8) AND aggregate_type = '2_wk_max' AND calendar_year = 2030"},
     {"op": "calculate", "expression": "value * -1", "where": "scenario_id = 8"},
     {"op": "group", "by": ["model_group_id", "aggregate_type", "calendar_year"], "aggregate": "sum"}
   ],
@@ -192,22 +259,21 @@ than assuming they're already pinned to one value each.
 #### Query with Additional Dimensions
 
 This pipeline returns decadal damage for a single grid cell. Since `aep`, `asset_type`,
-and `percentile` are not filtered on the input, the query matches all available values for
-those dimensions; the results are summed across `asset_type` (the one dimension not
-listed in `group.by`) to give the total damage for each AEP-percentile combination.
+and `percentile` are not filtered, the query matches all available values for those
+dimensions; the results are summed across `asset_type` (the one dimension not listed in
+`group.by`) to give the total damage for each AEP-percentile combination. The cell
+restriction is an ordinary `filter` on `grid_cell`, which may be folded into the dimension
+filter or kept separate as here.
 
 ```json
 POST /v1/analysis.ndjson
 {
   "inputs": {
-    "damage": {
-      "variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001",
-      "model_group_id": 500, "scenario_id": 7, "pumping_id": 0, "fragility_scenario": 0,
-      "grid_cell": "12"
-    }
+    "damage": {"variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001"}
   },
   "steps": [
-    {"op": "project", "input": "damage", "to": "clara_grid_cell_v001"},
+    {"op": "filter", "input": "damage", "where": "model_group_id = 500 AND scenario_id = 7 AND pumping_id = 0 AND fragility_scenario = 0"},
+    {"op": "filter", "where": "grid_cell = 12"},
     {"op": "group", "by": ["aep", "percentile"], "aggregate": "sum"}
   ],
   "output": {"format": "ndjson", "sort": "aep,percentile"}
@@ -217,21 +283,17 @@ POST /v1/analysis.ndjson
 #### Conditional Count
 
 This pipeline counts, per grid cell, how many decadal damage values exceed a threshold: a
-`filter` step masks non-matching values (since a `group` step downstream makes this an
-aggregating request), and `group`'s `count` aggregate then counts only what wasn't
-masked.
+value `filter` drops non-matching rows, and `group`'s `count` aggregate counts what's
+left.
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "damage": {
-      "variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001",
-      "model_group_id": 500, "scenario_id": 7
-    }
+    "damage": {"variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001"}
   },
   "steps": [
-    {"op": "project", "input": "damage", "to": "clara_grid_cell_v001"},
+    {"op": "filter", "input": "damage", "where": "model_group_id = 500 AND scenario_id = 7"},
     {"op": "filter", "where": "value > 1000000"},
     {"op": "group", "by": [], "aggregate": "count"}
   ],
@@ -241,40 +303,50 @@ POST /v1/analysis.csv
 
 #### Single-Input Pipeline Equivalent to a Flat Request
 
-An identity `project` (no grid change), a `filter`, and a `group`:
+One `filter` mixing dimension and value conditions, then a `group`:
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001", "model_group_id": 520, "scenario_id": 7}
+    "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
-    {"op": "filter", "where": "sal > 5"},
+    {"op": "filter", "input": "sal", "where": "model_group_id = 520 AND scenario_id = 7 AND value > 5"},
     {"op": "group", "by": ["calendar_day"], "aggregate": "max"}
   ],
   "output": {"format": "csv"}
 }
 ```
 
-#### Single-Input Pipeline with Calculate Steps: a Confidence-Weighted Collapse
-
-Two model groups weighted 0.6/0.4 via two sequential `calculate` steps (each selecting
-its model group's rows with a dimension `where`), collapsed with `group`/`sum`. The
-expression names the running value by the input's own name (`sal`), the same way
-`filter.where` would:
+A plain selection with no transformation at all is a pipeline with no steps:
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001", "model_group_id": [500, 510], "scenario_id": 7, "aggregate_type": "2_wk_max"}
+    "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
+  },
+  "steps": [],
+  "output": {"format": "csv", "sort": "calendar_year,grid_cell"}
+}
+```
+
+#### Single-Input Pipeline with Calculate Steps: a Confidence-Weighted Collapse
+
+Two model groups weighted 0.6/0.4 via two sequential `calculate` steps (each selecting its
+model group's rows with a dimension `where`), collapsed with `group`/`sum`:
+
+```json
+POST /v1/analysis.csv
+{
+  "inputs": {
+    "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "sal", "to": "hydro_compartment_v001"},
-    {"op": "calculate", "expression": "sal * 0.6", "where": "model_group_id = 500"},
-    {"op": "calculate", "expression": "sal * 0.4", "where": "model_group_id = 510"},
+    {"op": "filter", "input": "sal", "where": "model_group_id IN (500, 510) AND scenario_id = 7 AND aggregate_type = '2_wk_max'"},
+    {"op": "calculate", "expression": "value * 0.6", "where": "model_group_id = 500"},
+    {"op": "calculate", "expression": "value * 0.4", "where": "model_group_id = 510"},
     {"op": "group", "by": ["calendar_year"], "aggregate": "sum"}
   ],
   "output": {"format": "csv"}
@@ -282,7 +354,7 @@ POST /v1/analysis.csv
 ```
 
 The same pipeline in the dotted `GET` encoding spells each step as
-`step.2.op=calculate&step.2.expression=sal%20*%200.6&step.2.where=model_group_id%20%3D%20500`,
+`step.2.op=calculate&step.2.expression=value%20*%200.6&step.2.where=model_group_id%20%3D%20500`,
 and works on the tile route the same way.
 
 ### Raster-Grid Pipelines
@@ -299,20 +371,18 @@ GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_i
 #### Map Query Comparing Two Years
 
 This pipeline returns the colorized elevation difference between two years (2050 minus
-2045): an identity `project`, a `calculate` step negating 2045's band, then a `group`
-collapsing the two years into one band per pixel, rendered on the analysis tile route.
+2045): a `filter` selecting the two years, a `calculate` step negating 2045's band, then a
+`group` collapsing the two bands into one per pixel, rendered on the analysis tile route.
+Each step here leaves the frame band-wide, which is what the `png` output requires.
 
 ```json
 {
   "inputs": {
-    "elev": {
-      "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-      "model_group_id": 500, "scenario_id": 7, "calendar_year": [2045, 2050]
-    }
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
   },
   "steps": [
-    {"op": "project", "input": "elev", "to": "morph_pixel_v001"},
-    {"op": "calculate", "expression": "elev * -1", "where": "calendar_year = 2045"},
+    {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year IN (2045, 2050)"},
+    {"op": "calculate", "expression": "value * -1", "where": "calendar_year = 2045"},
     {"op": "group", "by": [], "aggregate": "sum"}
   ],
   "output": {"format": "png", "color_map": "elevation_difference"}
@@ -321,7 +391,7 @@ collapsing the two years into one band per pixel, rendered on the analysis tile 
 
 As a `GET` request to `/v1/analysis/{z}/{x}/{y}.png`, this pipeline is flattened into the
 same dotted query encoding shown in the exit-criterion example below
-(`input.elev.variable=elev&...&step.1.op=project&...&output.format=png&output.color_map=elevation_difference`);
+(`input.elev.variable=elev&...&step.1.op=filter&...&output.format=png&output.color_map=elevation_difference`);
 there is no `POST` form for the tile route.
 
 #### Confidence-Weighted Surface Across Model Groups
@@ -336,43 +406,37 @@ NoData in one group's band simply contributes nothing from that group.
 ```json
 {
   "inputs": {
-    "elev": {
-      "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-      "model_group_id": [500, 510, 520], "scenario_id": 7, "calendar_year": 2050
-    }
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
   },
   "steps": [
-    {"op": "project", "input": "elev", "to": "morph_pixel_v001"},
-    {"op": "calculate", "expression": "elev * 0.6", "where": "model_group_id = 500"},
-    {"op": "calculate", "expression": "elev * 0.3", "where": "model_group_id = 510"},
-    {"op": "calculate", "expression": "elev * 0.1", "where": "model_group_id = 520"},
+    {"op": "filter", "input": "elev", "where": "model_group_id IN (500, 510, 520) AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "calculate", "expression": "value * 0.6", "where": "model_group_id = 500"},
+    {"op": "calculate", "expression": "value * 0.3", "where": "model_group_id = 510"},
+    {"op": "calculate", "expression": "value * 0.1", "where": "model_group_id = 520"},
     {"op": "group", "by": [], "aggregate": "sum"}
   ],
   "output": {"format": "png", "color_map": "elevation"}
 }
 ```
 
-The same pipeline works on the `.tif` output too (drop the tile route, `POST` this to
-`/v1/analysis.tif` with `output.format` set to `"tif"`), and can `project` onto a vector
-zone instead of collapsing to a full-resolution raster, for a tabular result.
+The same pipeline works on `.tif` output too (drop the tile route, `POST` this to
+`/v1/analysis.tif` with `output.format` set to `"tif"`).
 
-#### Single Year Query Summarized by Hydro Compartment
+#### Single Year Summarized by Hydro Compartment
 
-This pipeline returns elevation for a single year summarized by hydro compartment as a
-Parquet file -- a many-to-one `project` with no `filter`/`group` needed at all
-(`output.sort` still applies to this degenerate, project-only shape):
+Elevation for a single year summarized by hydro compartment as a Parquet file -- the
+`project` is raster-to-vector, so it both aggregates and turns the frame into a table,
+which is what makes a tabular output legal here:
 
 ```json
 POST /v1/analysis.parquet
 {
   "inputs": {
-    "elev": {
-      "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-      "model_group_id": 500, "scenario_id": 7, "calendar_year": 2050
-    }
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
   },
   "steps": [
-    {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "mean"}
+    {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"}
   ],
   "output": {"format": "parquet", "sort": "calendar_year,grid_cell"}
 }
@@ -381,22 +445,20 @@ POST /v1/analysis.parquet
 #### Conditional Pixel Count per Zone
 
 This pipeline counts, per hydro compartment, the pixels whose elevation exceeds a
-threshold in a single year: a many-to-one `project` with `aggregate: "count"`, plus a
-`filter` step whose value condition masks non-matching pixels before the count (since the
-project's own `count` aggregate makes this an aggregating request).
+threshold in a single year: a value `filter` masks the non-matching pixels, then a
+`project` with `aggregate: "count"` counts what survives in each zone. The filter must
+precede the project -- after it, `value` is the already-counted zone total.
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "elev": {
-      "variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001",
-      "model_group_id": 500, "scenario_id": 7, "calendar_year": 2050
-    }
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
   },
   "steps": [
-    {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "count"},
-    {"op": "filter", "where": "value > 0"}
+    {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "filter", "where": "value > 2"},
+    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "count"}
   ],
   "output": {"format": "csv"}
 }
@@ -406,39 +468,59 @@ POST /v1/analysis.csv
 
 This pipeline counts, per hydro compartment, the pixels carrying each distinct land-type
 value in a single year, using `count_by_value` as the `project` aggregate. The output has
-one row per (zone, value) pair.
+one row per (zone, value) pair, with the category in a `value_category` column -- which a
+later `group` may itself group by.
 
 ```json
 POST /v1/analysis.csv
 {
   "inputs": {
-    "lnd_type": {
-      "variable": "lnd_type", "time_unit": "annual", "grid": "morph_pixel_v001",
-      "model_group_id": 500, "scenario_id": 7, "calendar_year": 2050
-    }
+    "lnd_type": {"variable": "lnd_type", "time_unit": "annual", "grid": "morph_pixel_v001"}
   },
   "steps": [
-    {"op": "project", "input": "lnd_type", "to": "hydro_compartment_v001", "aggregate": "count_by_value"}
+    {"op": "filter", "input": "lnd_type", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "project", "to": "hydro_compartment_v001", "aggregate": "count_by_value"}
+  ],
+  "output": {"format": "csv", "sort": "grid_cell,value_category"}
+}
+```
+
+#### Raster Values for Specific Pixels
+
+A spatial `filter` is the other way out of band-wide shape: it turns the raster frame into
+a table of just the named cells, with no zonal aggregation at all.
+
+```json
+POST /v1/analysis.csv
+{
+  "inputs": {
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
+  },
+  "steps": [
+    {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "filter", "where": "grid_cell IN (1, 2, 3)"}
   ],
   "output": {"format": "csv"}
 }
 ```
 
-#### Project-Only Reaggregation
+#### Broadcasting a Vector Dataset onto a Raster Grid
 
-Reaggregate raster elevation onto hydro compartments as a zonal mean, with no
-`filter`/`group` needed:
+The reverse direction: render a hydro-compartment salinity value as a full-resolution
+raster surface on the vegetation grid. No `aggregate` is given (nor allowed) -- each
+target pixel draws from exactly one source zone.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/analysis.tif
 {
   "inputs": {
-    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001", "model_group_id": 500, "scenario_id": 7, "calendar_year": 2050}
+    "salinity": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "elev", "to": "hydro_compartment_v001", "aggregate": "mean"}
+    {"op": "filter", "input": "salinity", "where": "aggregate_type = '2_wk_max' AND model_group_id = 500 AND scenario_id = 7 AND calendar_year = 2050"},
+    {"op": "project", "to": "veg_grid_cell_v001"}
   ],
-  "output": {"format": "csv"}
+  "output": {"format": "tif"}
 }
 ```
 
@@ -451,23 +533,25 @@ pairs it against marsh coverage there, keeps only pixel-years where marsh covera
 exceeds 0.5 *and* paired salinity exceeds 5.5, and reports the earliest (`min`) such
 `calendar_year` per pixel, as a GeoTIFF.
 
+Note the shape of the chain: each input is narrowed by its own `filter` (named with `as`
+so the `join` can reference it), the vector input is projected onto the raster grid, the
+`join` pairs the two -- leaving a frame with two value columns, `marsh` and `sal` -- and
+the value `filter` naming both is what collapses that pairing back to a single measured
+quantity, which the output requires.
+
 **As an explicit pipeline:**
 
 ```json
 POST /v1/analysis.tif
 {
   "inputs": {
-    "marsh": {
-      "variable": "ffibs_coverage_ratio", "time_unit": "annual", "grid": "veg_grid_cell_v001",
-      "model_group_id": 500, "scenario_id": 7, "ffibs_type": "pl_fm"
-    },
-    "salinity": {
-      "variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001",
-      "model_group_id": 500, "scenario_id": 7, "aggregate_type": "2_wk_max"
-    }
+    "coverage": {"variable": "ffibs_coverage_ratio", "time_unit": "annual", "grid": "veg_grid_cell_v001"},
+    "salinity": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
   },
   "steps": [
-    {"op": "project", "input": "salinity", "to": "veg_grid_cell_v001", "as": "sal"},
+    {"op": "filter", "input": "coverage", "where": "ffibs_type = 'pl_fm' AND model_group_id = 500 AND scenario_id = 7", "as": "marsh"},
+    {"op": "filter", "input": "salinity", "where": "aggregate_type = '2_wk_max' AND model_group_id = 500 AND scenario_id = 7", "as": "selected_salinity"},
+    {"op": "project", "input": "selected_salinity", "to": "veg_grid_cell_v001", "as": "sal"},
     {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
     {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
     {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"}
@@ -481,7 +565,7 @@ integer segment = a 1-based list position, comma = a list value -- never inside 
 which is one opaque string):
 
 ```
-GET /v1/analysis.tif?input.marsh.variable=ffibs_coverage_ratio&input.marsh.time_unit=annual&input.marsh.grid=veg_grid_cell_v001&input.marsh.model_group_id=500&input.marsh.scenario_id=7&input.marsh.ffibs_type=pl_fm&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&input.salinity.model_group_id=500&input.salinity.scenario_id=7&input.salinity.aggregate_type=2_wk_max&step.1.op=project&step.1.input=salinity&step.1.to=veg_grid_cell_v001&step.1.as=sal&step.2.op=join&step.2.type=spatial&step.2.inputs=marsh,sal&step.2.as=paired&step.3.op=filter&step.3.where=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.4.op=group&step.4.by=&step.4.aggregate=min&step.4.of=calendar_year&output.format=tif
+GET /v1/analysis.tif?input.coverage.variable=ffibs_coverage_ratio&input.coverage.time_unit=annual&input.coverage.grid=veg_grid_cell_v001&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&step.1.op=filter&step.1.input=coverage&step.1.where=ffibs_type%20%3D%20%27pl_fm%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.1.as=marsh&step.2.op=filter&step.2.input=salinity&step.2.where=aggregate_type%20%3D%20%272_wk_max%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.2.as=selected_salinity&step.3.op=project&step.3.input=selected_salinity&step.3.to=veg_grid_cell_v001&step.3.as=sal&step.4.op=join&step.4.type=spatial&step.4.inputs=marsh,sal&step.4.as=paired&step.5.op=filter&step.5.where=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.6.op=group&step.6.by=&step.6.aggregate=min&step.6.of=calendar_year&output.format=tif
 ```
 
 And as map tiles, replacing `output.format=tif` with `output.format=png`:

@@ -360,7 +360,20 @@ def _type_project(step_no: int, step: ProjectStep | ProjectOp, current: FrameTyp
 
 
 def _type_filter(step: FilterStep | FilterOp, current: FrameType) -> FrameType:
-    kinds = classify_where_kinds(step.where)
+    """`current.value_columns`, not the bare `value` default, is what the conjuncts are
+    classified against -- on a PAIRED frame (one a `join` left carrying one operand-named
+    value column per operand) `marsh > 0.5` is a value conjunct, and classifying it as a
+    dimension one would send it to a lowering that evaluates it against band metadata,
+    where no such column exists.
+
+    A value conjunct over a paired BAND-WIDE frame also collapses the pairing: the
+    lowering (`execution.band_ops.pair_and_mask_band_wide`) pairs each operand's band with
+    its counterpart on the dimensions they share and emits ONE band per pair, so the
+    result carries one value column again. Long shape does not collapse -- a long value
+    filter is an ordinary row filter that leaves every operand column standing -- so the
+    collapse is conditioned on the shape, not on the predicate kind alone.
+    """
+    kinds = classify_where_kinds(step.where, current.value_columns)
     if kinds[PredicateKind.spatial]:
         kind = PredicateKind.spatial
     elif kinds[PredicateKind.value]:
@@ -368,10 +381,20 @@ def _type_filter(step: FilterStep | FilterOp, current: FrameType) -> FrameType:
     else:
         kind = PredicateKind.dimension
     new_shape = FILTER_LOWERING_TABLE[(kind, current.shape)]
-    return dataclasses.replace(current, shape=new_shape)
+    value_columns = current.value_columns
+    if kind is PredicateKind.value and current.shape is Shape.band_wide and len(value_columns) > 1:
+        value_columns = frozenset({"value"})
+    return dataclasses.replace(current, shape=new_shape, value_columns=value_columns)
 
 
-def _type_calculate(current: FrameType) -> FrameType:
+def _type_calculate(step_no: int, current: FrameType) -> FrameType:
+    if current.shape is Shape.band_wide and len(current.value_columns) > 1:
+        raise ShapeError(
+            f"step {step_no} (calculate): a calculate over a paired band-wide frame "
+            f"(value columns {sorted(current.value_columns)}) is not yet supported -- a "
+            "band-wide frame's bands are positional, so there is no per-operand column "
+            "for an expression to name; collapse the pairing with a value filter first"
+        )
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
 
@@ -393,6 +416,17 @@ def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[Frame
     band-wide frame long while leaving it addressed against the same raster lattice, so a
     long frame is not necessarily on a vector grid, and this check is about the lattice
     either way.
+
+    **Each operand must carry exactly one value column**, which is what bounds the operand
+    count in practice: a join names each operand's measurement after the operand itself
+    (`value_columns = frozenset(step.inputs)` below), and an operand that already carries
+    several -- because it is itself a join's output -- has no single measurement for that
+    name to refer to. So `join(a, b)` is fine and `join(join(a, b), c)` is not, until
+    something in between collapses the pairing back to one value column (a value `filter`
+    over a band-wide frame does exactly that; see `_type_filter`). Rejecting here rather
+    than at execution is the point: left alone, the chained form reaches the sink and
+    fails on a `value` column that no longer exists, which tells the caller nothing about
+    what they actually asked for.
     """
     shapes = {s.shape for s in operand_states}
     if len(shapes) != 1:
@@ -412,6 +446,18 @@ def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[Frame
             "one grid first"
         )
     grid = next(iter(grids))
+
+    already_paired = [
+        name for name, state in zip(step.inputs, operand_states) if len(state.value_columns) > 1
+    ]
+    if already_paired:
+        raise ShapeError(
+            f"step {step_no} (join): operand(s) {already_paired} already carry more than "
+            "one value column, and joining one of those is not yet supported -- a join "
+            "names each operand's measurement after the operand, so an operand with "
+            "several measurements has no single one for that name to mean; collapse it "
+            "to one value column first (a value filter over a band-wide frame does)"
+        )
 
     has_count_by_value = any(s.has_count_by_value for s in operand_states)
     value_columns = frozenset(step.inputs)
@@ -446,7 +492,7 @@ def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameTy
         elif isinstance(op, FilterOp):
             new_type = _type_filter(op, frame_types[op.input])
         elif isinstance(op, CalculateOp):
-            new_type = _type_calculate(frame_types[op.input])
+            new_type = _type_calculate(op.step_no, frame_types[op.input])
         elif isinstance(op, GroupOp):
             new_type = _type_group(frame_types[op.input])
         else:  # pragma: no cover -- exhaustive over the Op union
@@ -467,8 +513,10 @@ def validate_shapes(pipeline: Pipeline) -> None:
     - `project.aggregate` missing where required, or supplied where forbidden
       (`_type_project`, via `request.aggregates.validate_project_aggregate`);
     - a second `count_by_value` in one chain (`_type_project`);
+    - a `calculate` over a paired band-wide frame (`_type_calculate`);
     - a `join` mixing a long frame with a band-wide one (`_type_join`);
     - a band-wide `join` whose operands sit on two different grids (`_type_join`);
+    - a `join` over an operand that is itself an uncollapsed join's output (`_type_join`);
     - a long final frame under an output format that needs a raster surface (below);
     - a band-wide final frame under an output format that needs a tabular sink (below --
       the converse of the previous rule; nothing past this function would otherwise
@@ -486,7 +534,9 @@ def validate_shapes(pipeline: Pipeline) -> None:
         raise ShapeError(
             f"pipeline's final frame carries {len(final.value_columns)} value columns "
             f"{sorted(final.value_columns)} -- every output writes exactly one measured "
-            "quantity; add a calculate to collapse them into one"
+            "quantity; collapse them into one first: a calculate over a long (vector) "
+            "frame, or a value filter or a group over a band-wide (raster) one, where a "
+            "calculate has no per-operand column to name (see _type_calculate)"
         )
 
     if final.shape == Shape.long and pipeline.output.format in RASTER_OUTPUT_FORMATS:

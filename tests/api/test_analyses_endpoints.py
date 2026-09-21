@@ -17,16 +17,13 @@ route disagreeing about what `filters`/`grid_cell`/`params` mean.
   tile route, which needs a band-wide final frame. Substituting these for
   `Meta.variables`' real-world datasets follows that module's own documented convention
   (the engine cares about grid TYPES and SHAPES, not variable semantics).
-* `exit-criterion` (`type="custom"`) carries the custom routes. Its pipeline resolves,
-  type-checks and compiles, and its `pipeline.json`/route-kind/`.pbf` behavior is fully
-  checked below -- but it cannot presently be EXECUTED, so the two routes that run it are
-  `xfail(strict=True)`. The blocker is an execution-layer gap, not a route one, and is
-  already pinned the same way for the same pipeline reached through the explicit
-  `/v1/analysis.*` routes (`tests/api/test_pipeline_exec.py::TestNotebookQueryEndToEnd`):
-  a vector-to-raster `project` feeding a band-wide `join` reads its two operands through
-  separate `scan_raster` calls whose `ReadWindow.batch_layout` disagree, which
-  `execution.frame.assert_same_pixel_grid` rejects. `strict=True` so the day that lowering
-  lands, these fail loudly instead of quietly staying skipped.
+* `exit-criterion` (`type="custom"`) carries the custom routes. It is the one registered
+  analysis that is band-wide end to end -- a vector-to-raster `project` feeding a
+  band-wide `join`, then a `filter` naming that join's operand value columns -- so the
+  two routes that execute it are also this module's only coverage of that shape reaching
+  a client. What the shape itself does is pinned at the engine level
+  (`tests/api/test_analyses_registry.py::TestExitCriterionExecution`); what these pin is
+  that the custom routes deliver its bytes.
 
 `grid_cell` is the one request parameter the registry deliberately cannot handle alone:
 resolving a coordinate against real geometry needs `io/`, which nothing under `request/`
@@ -455,20 +452,12 @@ class TestCustomAnalysisVectorTileRejection:
 class TestCustomAnalysisExecution:
     """The two custom routes that actually RUN the analysis.
 
-    Both are `xfail(strict=True)` for the execution-layer gap described in this module's
-    docstring -- the same one `tests/api/test_pipeline_exec.py::TestNotebookQueryEndToEnd`
-    pins for the identical pipeline reached through `/v1/analysis.tif`. Everything up to
-    `execute()` works here (resolve, validate, compile), which is why the sibling classes
-    above pass; `strict=True` makes these fail loudly the day the lowering lands, rather
-    than silently continuing to skip.
+    `exit_criterion_data` is built so marsh and salinity each cross their threshold only
+    in 2040, making the `min of=calendar_year` answer a uniform 2040 raster -- a value
+    the route can only produce if the whole band-wide chain (shared scan, crosswalk
+    broadcast, operand-named filter, band collapse) survived the trip through HTTP.
     """
 
-    @pytest.mark.xfail(
-        reason="a vector-to-raster project feeding a band-wide join reads its operands "
-        "through separate scan_raster calls, whose batch_layout "
-        "execution.frame.assert_same_pixel_grid rejects -- see module docstring",
-        strict=True,
-    )
     def test_data_tif(self, client, exit_criterion_data):
         response = client.get("/v1/analyses/exit-criterion/data.tif", params=EXIT_CRITERION_QUERY)
         assert response.status_code == 200, response.text
@@ -476,12 +465,6 @@ class TestCustomAnalysisExecution:
             data = src.read(1)
         assert (data == 2040).all()
 
-    @pytest.mark.xfail(
-        reason="a vector-to-raster project feeding a band-wide join reads its operands "
-        "through separate scan_raster calls, whose batch_layout "
-        "execution.frame.assert_same_pixel_grid rejects -- see module docstring",
-        strict=True,
-    )
     def test_png_tile(self, client, exit_criterion_data):
         tile = _tile_for_grid(exit_criterion_data)
         response = client.get(

@@ -54,10 +54,11 @@ from cpra.mp.data.analysis.execution import plan as plan_module
 from cpra.mp.data.analysis.execution import run_to_path
 from cpra.mp.data.analysis.execution import sink as sink_module
 from cpra.mp.data.analysis.execution.execute import execute
-from cpra.mp.data.analysis.execution.frame import empty_band_wide
+from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN, empty_band_wide
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.execution.sink import (
     DEFAULT_NODATA,
+    _band_descriptions,
     _resolve_write_dtype,
     apply_output_shaping,
     empty_tile,
@@ -232,6 +233,15 @@ class TestWriteRaster:
             band1, band2 = src.read()
             assert (band1 == 60).all()
             assert (band2 == 80).all()
+            # Each band is labeled with its own metadata row, so the only thing that
+            # differs between these two strings is the dimension that actually differs
+            # between the two bands.
+            assert src.descriptions == (
+                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                "model_group_id=500, scenario_id=7, calendar_year=2030",
+                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                "model_group_id=500, scenario_id=7, calendar_year=2040",
+            )
 
     def test_group_by_a_real_column_collapses_to_one_band(self, base_path):
         # `variable` is constant ("vct") across both years, so grouping by it merges both
@@ -260,6 +270,10 @@ class TestWriteRaster:
         with rasterio.open(out_path) as src:
             assert src.count == 1
             assert (src.read(1) == 140).all()
+            # The grouped band is described by exactly what still identifies it -- the one
+            # `by` column. Every dimension the group merged across is gone from
+            # `metadata_df`, so none of them can be claimed here either.
+            assert src.descriptions == ("variable=vct",)
 
     def test_group_by_nothing_collapses_to_one_band(self, base_path):
         # `by=[]` drops every dimension column out of `metadata_df`, so the reserved
@@ -294,6 +308,10 @@ class TestWriteRaster:
             assert src.count == 1
             assert (src.height, src.width) == (grid.height, grid.width)
             assert (src.read(1) == 80).all()
+            # Nothing identifies this band -- the reserved index is a position, not a
+            # dimension, and it is the only column left. An unset description rather than
+            # an invented one.
+            assert src.descriptions == (None,)
 
     def test_no_bands_returns_false_and_writes_nothing(self, base_path):
         # The canonical empty band-wide result (execution.frame.empty_band_wide) --
@@ -343,6 +361,46 @@ class TestResolveWriteDtype:
     def test_mixed_dtypes_fall_back_to_float64(self):
         df = pl.DataFrame({"b0": pl.Series([1], dtype=pl.Float32), "b1": pl.Series([2], dtype=pl.Int32)})
         assert _resolve_write_dtype(df, ["b0", "b1"], None) == "float64"
+
+
+class TestBandDescriptions:
+    """`_band_descriptions` in isolation -- the metadata shapes a real pipeline only
+    reaches through a whole write are cheaper to pin here directly. The ordinary cases
+    (a full dimension set, one surviving `by` column, the reserved index alone) are
+    checked against actual files in `TestWriteRaster` instead.
+    """
+
+    def test_every_dimension_column_is_spelled_in_column_order(self):
+        metadata_df = pl.DataFrame({"variable": ["vct", "vct"], "calendar_year": [2030, 2040]})
+        assert _band_descriptions(metadata_df) == [
+            "variable=vct, calendar_year=2030",
+            "variable=vct, calendar_year=2040",
+        ]
+
+    def test_the_read_plumbing_columns_are_left_out(self):
+        # `path`/`band` say where the pixels came from, not what the band is, and the
+        # reserved index is a position. None of the three belongs in a label.
+        metadata_df = pl.DataFrame(
+            {
+                RESERVED_BAND_INDEX_COLUMN: pl.Series([0], dtype=pl.UInt32),
+                "path": ["/data/some-uuid.tif"],
+                "band": [1],
+                "calendar_year": [2030],
+            }
+        )
+        assert _band_descriptions(metadata_df) == ["calendar_year=2030"]
+
+    def test_a_null_dimension_is_omitted_rather_than_spelled_as_null(self):
+        # The shape a band-wide `join` produces: unioning two operands' metadata columns
+        # leaves each band null in whatever dimension only the OTHER operand had.
+        metadata_df = pl.DataFrame({"variable": ["vct", "sal"], "depth": [None, 3]})
+        assert _band_descriptions(metadata_df) == ["variable=vct", "variable=sal, depth=3"]
+
+    def test_a_row_with_nothing_left_to_say_is_empty(self):
+        # Not `None`: this returns one string per band unconditionally, and `write_raster`
+        # is what turns the empty one into an unset description.
+        metadata_df = pl.DataFrame({RESERVED_BAND_INDEX_COLUMN: pl.Series([0, 1], dtype=pl.UInt32)})
+        assert _band_descriptions(metadata_df) == ["", ""]
 
 
 # The tile fully containing `veg_grid_cell_v001`'s bounds. `veg_grid_cell_v001` spans

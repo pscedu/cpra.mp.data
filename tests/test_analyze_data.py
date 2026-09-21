@@ -175,14 +175,19 @@ class TestPipelineRaster:
             assert src.count == 2
             assert np.all(src.read(1) == 2030)
             assert np.all(src.read(2) == 2040)
-            # Band ORDER still carries the calendar year, but the band DESCRIPTIONS that
-            # used to spell it out ("calendar_year=2030", ...) are not written any more:
-            # `execution.sink.write_raster` builds its profile from the band-wide frame's
-            # window alone and never calls `set_band_description`, though its
-            # `metadata_df` holds each band's dimension values. Asserted rather than
-            # dropped so the gap stays visible -- `io.catalog` documents recovering
-            # calendar years FROM these descriptions.
-            assert src.descriptions == (None, None)
+            # Band order is not the only record of which band is which: each band says so
+            # itself, in the same `"<dimension>=<value>"` spelling `cpra.mp.data.raster`
+            # writes and parses back out, so a client holding only these bytes can still
+            # tell 2030 from 2040. Every dimension the band resolved from is spelled, not
+            # just the calendar one -- the three that name the dataset are redundant for a
+            # single-input request like this one and are exactly what distinguishes the
+            # bands once a `join` has put two datasets in one file.
+            assert src.descriptions == (
+                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                "model_group_id=500, scenario_id=7, calendar_year=2030",
+                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                "model_group_id=500, scenario_id=7, calendar_year=2040",
+            )
 
     async def test_a_tif_selection_matching_nothing_raises_rather_than_returning_a_missing_path(
         self, raster_data, tmp_path

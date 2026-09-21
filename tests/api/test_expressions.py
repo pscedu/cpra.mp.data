@@ -20,6 +20,7 @@ from cpra.mp.data.analysis.request.expressions import (
     parse_calculate_expression,
     parse_value_expr,
     rewrite_value_column,
+    rewrite_value_columns,
     split_top_level_and,
     value_predicate_mask,
 )
@@ -40,6 +41,28 @@ class TestParseValueExpr:
         expr = parse_value_expr("abs(value) > 3", ["value"])
         df = pl.DataFrame({"value": [-5, 1]})
         assert df.select(expr.alias("out"))["out"].to_list() == [True, False]
+
+    @pytest.mark.parametrize("word", ["and", "AND", "or", "OR"])
+    def test_a_parenthesized_conjunct_is_not_read_as_a_function_call(self, word):
+        """`(value > 1) and (value < 5)` puts a bare word immediately before a `(`, which
+        is exactly the shape the function scan looks for -- so an ordinary parenthesized
+        conjunction used to be rejected as a call to a nonexistent function named `and`.
+        Note this is not a paired-frame concern: `where: "value > 1 AND value < 5"` on a
+        single raster input has the same shape once `rewrite_value_column` has run.
+        """
+        expr = parse_value_expr(f"(value > 1) {word} (value < 5)", ["value"])
+        df = pl.DataFrame({"value": [0, 3, 9]})
+        expected = [False, True, False] if word.lower() == "and" else [True, True, True]
+        assert df.select(expr.alias("out"))["out"].to_list() == expected
+
+    def test_a_subquery_after_in_is_still_rejected(self):
+        """The logical-operator exemption above is deliberately just `and`/`or`. Every
+        other SQL word that can precede a `(` -- `in`, `not`, `exists` -- can precede a
+        SUBQUERY, and the function scan is what currently stops one reaching the planner
+        through a value conjunct.
+        """
+        with pytest.raises(ExpressionError):
+            parse_value_expr("value in (select 1)", ["value"])
 
     def test_unknown_column_is_rejected(self):
         with pytest.raises(ExpressionError, match="not_a_column"):
@@ -194,6 +217,28 @@ class TestRewriteValueColumn:
         rewritten = rewrite_value_column("value = min(value)", "b0")
         with pytest.raises(ExpressionError, match="min"):
             parse_value_expr(rewritten, ["b0"])
+
+
+class TestRewriteValueColumns:
+    def test_rewrites_every_named_column_in_one_pass(self):
+        assert (
+            rewrite_value_columns("marsh > 0.5 AND sal > 5.5", {"marsh": "b0", "sal": "b2"})
+            == "b0 > 0.5 AND b2 > 5.5"
+        )
+
+    def test_one_pass_not_sequential(self):
+        """Replacements are band names, so a sequential rewrite could feed one
+        substitution's output into the next one's pattern -- rewriting `b1` to `b0` and
+        then `b0` to `b1` would leave both operands naming the same band, which is a
+        silently wrong answer rather than an error. One pass cannot do that.
+        """
+        assert rewrite_value_columns("b1 > 1 AND b0 > 2", {"b1": "b0", "b0": "b1"}) == "b0 > 1 AND b1 > 2"
+
+    def test_respects_word_boundaries(self):
+        assert rewrite_value_columns("marshland > 3", {"marsh": "b0"}) == "marshland > 3"
+
+    def test_empty_mapping_is_the_identity(self):
+        assert rewrite_value_columns("value > 3", {}) == "value > 3"
 
 
 class TestValuePredicateMask:

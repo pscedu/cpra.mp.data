@@ -347,7 +347,17 @@ print(json.dumps({
 """
 
 
+@pytest.mark.memory
 class TestMemoryRegression:
+    """Deselected by default (`pyproject.toml`'s `addopts` carries `-m 'not memory'`); run
+    with `pytest -m memory`. What this class measures is real and worth keeping -- peak RSS
+    is the entire point of folding, and no deterministic proxy captures it -- but the
+    measurement depends on the machine, the allocator, and what else is running, which is
+    not something a build should gate on. It already needs `preexec_fn` (below) to stop
+    `ru_maxrss` reading back the parent's high-water mark; that is the kind of fragility
+    that belongs behind an opt-in rather than in front of every commit.
+    """
+
     def test_folded_peak_rss_is_lower_than_unfolded_on_a_high_cardinality_group_by(self, tmp_path):
         """Reproduces, at a size a test suite can afford, the same mechanism measured at
         production scale in `api/fold.py`'s module docstring and `config.TABULAR_FOLD_STEP`

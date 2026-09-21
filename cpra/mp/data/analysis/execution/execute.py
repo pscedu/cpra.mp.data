@@ -123,11 +123,30 @@ band-wide join output, the raster origins that must come from one combined read.
 `_open_band_wide_join_group` below performs that one scan over the concatenated band
 metadata and slices the result back into one per-origin frame, before the ordinary
 input-opening loop runs -- which is then skipped for any origin this prelude already
-opened. A join whose operands are NOT all raster origins (e.g. one side is the output of a
-vector-to-raster `project`) is deliberately absent from `plan.band_wide_join_scans` (see
-`execution.plan`'s module docstring) and gets no shared-scan treatment here either; its
-operands are read however the rest of the walk already produced them, relying on
-`join_band_wide`'s own precondition to fail loudly if their windows do not coincide.
+opened.
+
+**An operand that entered the join as a VECTOR belongs to that same shared scan.** A
+vector-to-raster `project` gets its pixel order from the crosswalk raster it broadcasts
+across, so reading that crosswalk on its own puts the projected operand in a different
+order from the data bands it is about to be aligned with -- the identical failure, for the
+identical reason, as reading a raster-to-vector crosswalk separately. `plan.
+band_wide_join_zone_crosswalks` names, per band-wide join output, one `plan.ZoneCrosswalk`
+per such `project` upstream of any of that join's operands; `_open_band_wide_join_group`
+attaches each to the SAME `scan_raster` call (one more `crosswalks=` entry, under its own
+`f"__zone_step_{n}__"` column so two artifacts never collide) and hands the resulting
+column back as a `project.ZoneSource` keyed by that project's step number.
+`_bind_band_wide_lowerings` routes it to the one lowering that asked for it, exactly as it
+routes `extra_columns`, leaving the walk's uniform call signature alone. A `project` with
+no such entry -- nothing downstream joins its output against a separately-read raster --
+reads the crosswalk itself, which is correct precisely because there is no other pixel
+order for it to have to match.
+
+The one shape still left out is a band-wide join with no raster origin at ALL (every
+operand a separately-projected vector input): there are no data bands to build a shared
+read around, and `scan_raster` has no zero-band answer to give, so `plan.
+band_wide_join_scans` skips it and those operands are read however the walk produced them,
+relying on `join_band_wide`'s own precondition to fail loudly if their chunkings do not
+coincide.
 
 Different operands in one shared join group can still straddle DIFFERENT destination
 grids (one origin's `straddling_vector_grid` naming grid X, another's naming grid Y --
@@ -152,6 +171,7 @@ from rasterio.windows import transform as window_transform
 
 from cpra.mp.data.analysis.execution import band_ops, long_ops, project
 from cpra.mp.data.analysis.execution.frame import (
+    DOMAIN_COLUMN,
     BandWideFrame,
     LongFrame,
     ReadWindow,
@@ -159,7 +179,7 @@ from cpra.mp.data.analysis.execution.frame import (
     has_no_bands,
     released_band_metadata,
 )
-from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, compile_plan
+from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, ZoneCrosswalk, compile_plan
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 from cpra.mp.data.analysis.io.raster import scan_raster
@@ -261,7 +281,11 @@ def _run_filter_band_wide(
     """
     grid_width = GRIDS[frame_types[op.input].grid].width
     result = band_ops.filter_band_wide(
-        frames[op.input], op.where, extra_columns=extra_columns, grid_width=grid_width
+        frames[op.input],
+        op.where,
+        extra_columns=extra_columns,
+        grid_width=grid_width,
+        value_columns=sorted(frame_types[op.input].value_columns),
     )
     if extra_columns and frame_types[op.output].shape is Shape.long:
         return result.drop(list(extra_columns))
@@ -288,10 +312,11 @@ def _run_join_band_wide(
     # `_open_band_wide_join_group` in `execute`'s prelude (see the module docstring). This
     # entry does not distinguish the two cases; `band_ops.join_band_wide`'s own
     # `assert_same_pixel_grid` precondition is what actually enforces that the operands
-    # came from one shared read where that guarantee matters. `extra_columns` here is
-    # already `op.inputs[0]`'s own -- `_bind_band_wide_lowerings` supplies exactly that,
-    # matching `join_band_wide`'s own documented "reads `extra_columns` from `operands[0]`
-    # alone" contract.
+    # came from one shared read where that guarantee matters. `extra_columns` here is the
+    # UNION over the operands (`_output_extra_columns`), matching `join_band_wide`'s own
+    # documented "each column taken from the first operand that carries it" contract:
+    # a vector-to-raster `project` operand brings `DOMAIN_COLUMN` that no other operand
+    # has, and reading `op.inputs[0]`'s alone would drop it.
     return band_ops.join_band_wide(
         [frames[name] for name in op.inputs], list(op.inputs), extra_columns=extra_columns
     )
@@ -346,10 +371,12 @@ def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_ty
 # module docstring), which is per-EXECUTION state, not something a module-level constant
 # dict can hold. `_bind_band_wide_lowerings` below builds the real, per-`execute()`-call
 # registry by overriding just these four entries with closures bound over that call's own
-# `extra_columns` dict, leaving every other entry (including both `project` directions,
-# neither of which needs `extra_columns`) exactly as registered here. `tests/api/
-# test_execute.py::TestLoweringTableAgreement` reads this dict's KEYS only, never calls its
-# values, so the placeholder arity mismatch here is never itself exercised.
+# `extra_columns` dict. It overrides the vector-to-raster `project` entry too, over a
+# second piece of the same per-execution state (that call's crosswalk reads, keyed by step
+# number -- see that function), which is why the value registered here for it is likewise a
+# placeholder. `tests/api/test_execute.py::TestLoweringTableAgreement` reads this dict's
+# KEYS only, never calls its values, so the placeholder arity mismatch here is never itself
+# exercised.
 _LOWERINGS: dict[tuple[str, object], object] = {
     ("filter", Shape.long): _run_filter,
     ("filter", Shape.band_wide): _run_filter_band_wide,
@@ -365,7 +392,9 @@ _LOWERINGS: dict[tuple[str, object], object] = {
 }
 
 
-def _bind_band_wide_lowerings(extra_columns: dict[str, tuple[str, ...]]) -> dict[tuple[str, object], object]:
+def _bind_band_wide_lowerings(
+    extra_columns: dict[str, tuple[str, ...]], zone_sources: dict[int, project.ZoneSource]
+) -> dict[tuple[str, object], object]:
     """The real registry for one `execute()` call: `_LOWERINGS` with its four
     `Shape.band_wide` non-project entries overridden by closures bound over this call's own
     `extra_columns` -- see `_LOWERINGS`'s own comment for why they cannot simply be module-
@@ -376,8 +405,19 @@ def _bind_band_wide_lowerings(extra_columns: dict[str, tuple[str, ...]]) -> dict
     than being handed it as a call argument, so the CALL signature every entry in the
     returned dict is invoked with stays the uniform `(frames, op, frame_types)` the walk
     loop already uses for everything else.
+
+    The vector-to-raster `project` entry is bound the same way and for the same reason,
+    over `zone_sources` -- `_open_band_wide_join_group`'s crosswalk reads, keyed by the
+    project step number that asked for one. `.get(op.step_no)` returns `None` for a step
+    whose output is never joined against a separately-read raster, which is exactly the
+    argument that tells `project.project_vector_to_raster` to read the crosswalk itself.
     """
     lowerings = dict(_LOWERINGS)
+    lowerings[("project", ("vector", "raster"))] = (
+        lambda frames, op, frame_types: project.project_vector_to_raster(
+            frames, op, frame_types, zone_sources.get(op.step_no)
+        )
+    )
     lowerings[("filter", Shape.band_wide)] = lambda frames, op, frame_types: _run_filter_band_wide(
         frames, op, frame_types, extra_columns.get(op.input, ())
     )
@@ -388,7 +428,7 @@ def _bind_band_wide_lowerings(extra_columns: dict[str, tuple[str, ...]]) -> dict
         frames, op, frame_types, extra_columns.get(op.input, ())
     )
     lowerings[("join", Shape.band_wide)] = lambda frames, op, frame_types: _run_join_band_wide(
-        frames, op, frame_types, extra_columns.get(op.inputs[0], ())
+        frames, op, frame_types, _output_extra_columns(op, frame_types, extra_columns)
     )
     return lowerings
 
@@ -399,6 +439,34 @@ def _operand_names(op: Op) -> list[str]:
     a list rather than a single name.
     """
     return list(op.inputs) if isinstance(op, JoinOp) else [op.input]
+
+
+def _output_extra_columns(
+    op: Op, frame_types: dict[str, FrameType], extra_columns: dict[str, tuple[str, ...]]
+) -> tuple[str, ...]:
+    """The carried non-band columns `op`'s band-wide output has, given what its operands
+    had. Three cases, in the order they are checked:
+
+    A vector-to-raster `project` INTRODUCES one: `project.project_vector_to_raster`
+    attaches `DOMAIN_COLUMN` to everything it returns (see that function, and the
+    constant's own comment). Its input is a long frame that carried nothing, so this is
+    the whole of its output's set -- and it is not inherited from the operand, which is
+    why the plain `.get(operand)` below cannot produce it.
+
+    A `join` UNIONS them: an operand can carry a column the others never had, which is
+    exactly what the case above creates, and `band_ops.join_band_wide` is written to take
+    each named column from the first operand that has it. Order follows `op.inputs` so the
+    result is deterministic.
+
+    Everything else INHERITS its first operand's, unchanged -- a `filter`/`calculate`/
+    `group` passes its carried columns through, and none of them invents one.
+    """
+    if isinstance(op, ProjectOp) and project_direction(frame_types[op.input], op.to) == ("vector", "raster"):
+        return (DOMAIN_COLUMN,)
+    operands = _operand_names(op)
+    if isinstance(op, JoinOp):
+        return tuple(dict.fromkeys(column for name in operands for column in extra_columns.get(name, ())))
+    return extra_columns.get(operands[0], ())
 
 
 def _dispatch_key(op: Op, frame_types: dict[str, FrameType]) -> object:
@@ -685,13 +753,46 @@ def _shared_tile_window(origins: tuple[str, ...], inputs: dict[str, ResolvedInpu
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
 
 
+def _empty_zone_sources(
+    zone_crosswalks: tuple[ZoneCrosswalk, ...], window: ReadWindow
+) -> dict[int, project.ZoneSource]:
+    """A zero-row `ZoneSource` per entry, over `window` -- what a band-wide join group that
+    never got to scan anything (tile-disjoint, or every origin narrowed to zero bands) owes
+    its vector-to-raster `project` steps.
+
+    Zero rows because there are no pixels: the join partners those steps will be aligned
+    against are `execution.frame.empty_band_wide` frames over this same window, and a left
+    join from an empty zone column produces the matching zero-row broadcast. The schema is
+    still declared (rather than a bare `pl.LazyFrame()`) so the broadcast's own join on
+    `ZONE_COLUMN` resolves a real column instead of failing on a missing one; `Int32`
+    matches what a crosswalk raster's zone ids read back as, and is only ever joined
+    against an equally empty frame here.
+    """
+    return {
+        zone_crosswalk.step_no: project.ZoneSource(
+            pl.LazyFrame(schema={project.ZONE_COLUMN: pl.Int32}), window
+        )
+        for zone_crosswalk in zone_crosswalks
+    }
+
+
 def _open_band_wide_join_group(
-    origins: tuple[str, ...], inputs: dict[str, ResolvedInput]
-) -> dict[str, tuple[BandWideFrame, tuple[str, ...]]]:
+    origins: tuple[str, ...],
+    inputs: dict[str, ResolvedInput],
+    zone_crosswalks: tuple[ZoneCrosswalk, ...] = (),
+) -> tuple[dict[str, tuple[BandWideFrame, tuple[str, ...]]], dict[int, project.ZoneSource]]:
     """One shared `scan_raster` call over the UNION of `origins`' band metadata, sliced
     back into one `(BandWideFrame, extra_columns)` pair per origin -- what
     `plan.band_wide_join_scans` records a band-wide join's raster operands as needing (see
     the module docstring for why one scan apiece is not equivalent).
+
+    `zone_crosswalks` is `plan.band_wide_join_zone_crosswalks`'s entry for the same join:
+    one `ZoneCrosswalk` per vector-to-raster `project` upstream of any of that join's
+    operands. Each rides on this same scan as one more `crosswalks=` entry, and comes back
+    in the second return value as a `project.ZoneSource` keyed by the project's own step
+    number -- which is how `_bind_band_wide_lowerings` gets it to exactly the lowering
+    that needs it. A projected operand's pixel order is the raster operands' because it
+    came out of their read, not because the two happened to chunk alike.
 
     Band order in the combined read is the concatenation order, so origin *k*'s bands are
     exactly the metadata rows (and the resulting `b<i>` columns) at the offset its
@@ -716,6 +817,11 @@ def _open_band_wide_join_group(
     `_open_band_wide_input`'s own zero-band case, `extra_columns=()` throughout for the
     same reason given there. A tile-disjoint group takes the same exit for the same reason,
     one step earlier: there are no pixels under the tile to scan even where bands exist.
+    Both exits still return a `ZoneSource` per `zone_crosswalks` entry -- an empty one over
+    that same shared window, which is what keeps the projected operand's frame aligned
+    with the empty frames its join partners get. Letting the lowering fall back to its own
+    full-extent read there would hand `join_band_wide` a real, fully-populated operand to
+    align against empty ones, which is the same mismatch this function exists to prevent.
 
     Under a tile-scoped plan the shared scan reads ONE window covering every origin's own
     (`_shared_tile_window`) -- which is not necessarily any single origin's, since only an
@@ -734,13 +840,19 @@ def _open_band_wide_join_group(
     read_window = _shared_tile_window(origins, inputs)
     if read_window is _DISJOINT:
         window = _grid_read_window(inputs[origins[0]].selection.grid)
-        return {name: (empty_band_wide(window), ()) for name in origins}
+        return (
+            {name: (empty_band_wide(window), ()) for name in origins},
+            _empty_zone_sources(zone_crosswalks, window),
+        )
 
     band_metadata = [inputs[name].band_metadata for name in origins]
     heights = [df.height for df in band_metadata]
     if sum(heights) == 0:
         window = _grid_read_window(inputs[origins[0]].selection.grid, read_window)
-        return {name: (empty_band_wide(window), ()) for name in origins}
+        return (
+            {name: (empty_band_wide(window), ()) for name in origins},
+            _empty_zone_sources(zone_crosswalks, window),
+        )
 
     zero_names = [name for name, height in zip(origins, heights) if height == 0]
     if zero_names:
@@ -764,7 +876,23 @@ def _open_band_wide_join_group(
         crosswalks.append((column, str(crosswalk_path)))
         zone_columns[name] = column
 
+    # Keyed by step number rather than by origin: a vector-to-raster `project`'s crosswalk
+    # belongs to the STEP, not to any raster origin in this group (the group's origins are
+    # the join's other operands), and two projects in one pipeline can legitimately want
+    # the same artifact under two separate columns.
+    project_zone_columns: dict[int, str] = {}
+    for zone_crosswalk in zone_crosswalks:
+        crosswalk_path = resolve_raster_crosswalk_path(zone_crosswalk.raster_grid, zone_crosswalk.vector_grid)
+        column = f"__zone_step_{zone_crosswalk.step_no}__"
+        crosswalks.append((column, str(crosswalk_path)))
+        project_zone_columns[zone_crosswalk.step_no] = column
+
     lf, out_metadata, window = scan_raster(combined, crosswalks=crosswalks, window=read_window)
+
+    zone_sources = {
+        step_no: project.ZoneSource(lf.select(pl.col(column).alias(project.ZONE_COLUMN)), window)
+        for step_no, column in project_zone_columns.items()
+    }
 
     frames: dict[str, tuple[BandWideFrame, tuple[str, ...]]] = {}
     offset = 0
@@ -779,7 +907,7 @@ def _open_band_wide_join_group(
             extra_columns,
         )
         offset += height
-    return frames
+    return frames, zone_sources
 
 
 def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame:
@@ -795,6 +923,11 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     those also reports the `extra_columns` (non-band columns, a crosswalk zone id notably)
     its frame now carries, tracked in a plain `dict[str, tuple[str, ...]]` for the rest of
     this call -- see `_bind_band_wide_lowerings` for how the walk below reads it.
+
+    That same prelude collects the crosswalk reads any vector-to-raster `project` feeding
+    one of those joins needs (`plan.band_wide_join_zone_crosswalks`), keyed by step number
+    in `zone_sources` and routed to the lowering the same way -- see the module docstring's
+    paragraph on why a projected operand belongs to the join's shared scan.
 
     Then walks `plan.ops` once, front to back, dispatching each through this call's own
     registry (`_LOWERINGS` with its band-wide entries bound to `extra_columns`, via
@@ -840,10 +973,22 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     extra_columns: dict[str, tuple[str, ...]] = {}
 
     band_wide_join_frames: dict[str, BandWideFrame] = {}
-    for origins in plan.band_wide_join_scans.values():
-        for name, (frame, extra) in _open_band_wide_join_group(origins, plan.inputs).items():
+    zone_sources: dict[int, project.ZoneSource] = {}
+    for output, origins in plan.band_wide_join_scans.items():
+        opened, group_zone_sources = _open_band_wide_join_group(
+            origins, plan.inputs, plan.band_wide_join_zone_crosswalks.get(output, ())
+        )
+        for name, (frame, extra) in opened.items():
             band_wide_join_frames[name] = frame
             extra_columns[name] = extra
+        # `setdefault`, not assignment: one `project` step can feed two band-wide joins
+        # over DIFFERENT raster origins (a fan-out), and it runs once, so only one of those
+        # two reads can be the one its pixels actually come from. Keeping the first makes
+        # which one deterministic; the second join then fails on `join_band_wide`'s own
+        # `assert_same_pixel_grid` precondition, which is the correct outcome -- those two
+        # joins genuinely cannot both align against a single projection.
+        for step_no, zone_source in group_zone_sources.items():
+            zone_sources.setdefault(step_no, zone_source)
 
     frames: dict[str, LongFrame | BandWideFrame] = {}
     for name, resolved in plan.inputs.items():
@@ -861,14 +1006,14 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
                 resolved, point_sample_window=point_sample_windows.get(name)
             )
 
-    lowerings = _bind_band_wide_lowerings(extra_columns)
+    lowerings = _bind_band_wide_lowerings(extra_columns, zone_sources)
 
     last_output: str | None = None
     for op in plan.ops:
         lowering = _lowering_for(op.op, _dispatch_key(op, plan.frame_types), lowerings)
         frames[op.output] = lowering(frames, op, plan.frame_types)
         if plan.frame_types[op.output].shape is Shape.band_wide:
-            extra_columns[op.output] = extra_columns.get(_operand_names(op)[0], ())
+            extra_columns[op.output] = _output_extra_columns(op, plan.frame_types, extra_columns)
         last_output = op.output
 
     if last_output is None:

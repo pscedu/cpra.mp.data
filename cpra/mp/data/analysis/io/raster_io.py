@@ -26,7 +26,6 @@ from cpra.mp.data.config import (
     RASTER_BLOCKS_PER_BATCH,
     RASTER_CACHE_MAX_MB,
     RASTER_NUM_THREADS,
-    RASTER_SWATH_SIZE_MB,
 )
 from cpra.mp.data.grids import GRIDS
 
@@ -142,32 +141,6 @@ def raster_gdal_env():
     """
 
     return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB)
-
-
-def raster_copy_gdal_env():
-    """GDAL configuration for the VRT + ``CreateCopy`` download path.
-
-    ``CreateCopy`` streams the output in ``GDAL_SWATH_SIZE`` chunks, only 10MB by default.
-    Each chunk re-enters GDAL's per-block path, which for a PIXEL-interleaved multiband
-    COG decompresses every band of every tile it touches -- the same cost that makes a
-    one-block-row-at-a-time loop slow. Raising the swath amortizes it: measured 91.8s ->
-    22.8s for one band of a 52-band float32 COG. GDAL clamps the swath to half of
-    ``GDAL_CACHEMAX``, so the cache has to be raised alongside it; capping the cache is
-    also what keeps peak memory down (3-4x lower than the windowed path).
-
-    ``GDAL_CACHEMAX`` must be an int -- a str raises ``TypeError`` from ``rio.Env``.
-
-    ``GDAL_PAM_ENABLED=NO`` stops GDAL writing a ``.aux.xml`` sidecar for the per-band
-    descriptions the copy carries over (the GTiff output embeds them natively). The
-    response streams only the TIFF, so a sidecar would just be orphaned in the temp dir.
-    """
-
-    return rio.Env(
-        GDAL_NUM_THREADS=RASTER_NUM_THREADS,
-        GDAL_SWATH_SIZE=str(RASTER_SWATH_SIZE_MB * 1024 * 1024),
-        GDAL_CACHEMAX=RASTER_CACHE_MAX_MB,
-        GDAL_PAM_ENABLED="NO",
-    )
 
 
 def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):

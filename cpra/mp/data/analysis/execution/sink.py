@@ -51,6 +51,7 @@ from pmtiles.reader import MmapSource, Reader
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.execution.frame import (
+    RESERVED_BAND_INDEX_COLUMN,
     BandWideFrame,
     LongFrame,
     band_column_names,
@@ -208,6 +209,43 @@ def _resolve_write_dtype(df: pl.DataFrame, band_names: list[str], dtype: str | N
     return "float64"
 
 
+# `metadata_df` columns that say where a band was READ FROM rather than what it IS: the two
+# columns `io.raster.scan_raster` requires, plus the reserved index `execution.frame.
+# released_band_metadata` leaves behind when a `group` collapsed every dimension away. None
+# of the three identifies a band to a person opening the file, and the reserved one is not
+# even allowed out of the walk as a dimension, so a band description never mentions them.
+_NON_IDENTIFYING_METADATA_COLUMNS = frozenset({"path", "band", RESERVED_BAND_INDEX_COLUMN})
+
+
+def _band_descriptions(metadata_df: pl.DataFrame) -> list[str]:
+    """One band label per `metadata_df` row, in band order: the row's dimension values
+    spelled `"<dimension>=<value>"` and joined with `", "`.
+
+    `"<dimension>=<value>"` is not a format invented here -- it is the one
+    `cpra.mp.data.raster` already writes (`write_cog`) and already parses back out
+    (`_read_cog_band_rows`, which `read_cog` uses to recover a band's calendar value,
+    since a UUID-named COG's path cannot carry it). A single-dimension band therefore
+    comes out byte-identical to what that path would have written, which is what keeps a
+    downloaded one-calendar-dimension GeoTIFF readable by the same machinery; a band that
+    survived with several dimensions spells all of them, which that parser was never
+    promised and does not claim to round-trip.
+
+    A null is omitted rather than rendered: `band_ops.join_band_wide` unions its operands'
+    metadata columns, so a band from one operand carries nulls for a dimension only the
+    other operand had, and "this band has no such dimension" is what that means. A row
+    with nothing left to say yields `""`, which `write_raster` skips -- an empty
+    description is indistinguishable from an absent one once GDAL has written it, so there
+    is no value in setting it.
+    """
+    columns = [name for name in metadata_df.columns if name not in _NON_IDENTIFYING_METADATA_COLUMNS]
+    if not columns:
+        return [""] * metadata_df.height
+    return [
+        ", ".join(f"{name}={value}" for name, value in row.items() if value is not None)
+        for row in metadata_df.select(columns).iter_rows(named=True)
+    ]
+
+
 def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAULT_NODATA, **profile_options) -> bool:
     """Write `band_wide` to `out_path` as a GeoTIFF, one band per surviving `b<i>` column.
 
@@ -217,6 +255,11 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     has its own answer for it: `api/pipeline.py`'s `PipelineRasterResponse` turns it into
     a 404, `cpra.mp.data.analyze_data` into a `NotFoundError`. Every other case writes the
     file and returns `True`.
+
+    Each band is labeled with its own `metadata_df` row (`_band_descriptions`), so band
+    order alone is not the only record of which band is which -- the file says so itself.
+    That matters most for the download path: band order is decided by the walk, and a
+    client holding only the bytes has nothing else to read a band's calendar value off.
 
     Row order in `band_wide`'s `LazyFrame` is the READ's emission order, not necessarily
     row-major (see `execution/frame.py`'s band-wide invariants) -- `row_major_grid_cell`
@@ -268,6 +311,9 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(data)
+        for index, description in enumerate(_band_descriptions(metadata_df), start=1):
+            if description:
+                dst.set_band_description(index, description)
     return True
 
 

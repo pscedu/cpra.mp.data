@@ -24,7 +24,12 @@ from cpra.mp.data.analysis.execution.band_ops import (
     sample_grid_cells_band_wide,
     select_dimension_band_wide,
 )
-from cpra.mp.data.analysis.execution.frame import RESERVED_BAND_INDEX_COLUMN, ReadWindow, row_major_grid_cell
+from cpra.mp.data.analysis.execution.frame import (
+    DOMAIN_COLUMN,
+    RESERVED_BAND_INDEX_COLUMN,
+    ReadWindow,
+    row_major_grid_cell,
+)
 from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp
 
 
@@ -375,6 +380,171 @@ class TestGroupBandWide:
         band_wide = (pl.LazyFrame(), pl.DataFrame(), window)
         op = GroupOp(step_no=1, input="x", by=[], aggregate="sum", output="y")
         out_lf, out_metadata, out_window = group_band_wide(band_wide, op, extra_columns=[])
+        assert out_lf.collect().is_empty()
+        assert out_metadata.is_empty()
+        assert out_window == window
+
+    def test_of_a_metadata_column_contributes_that_columns_value_per_band(self):
+        """`of="regime"` makes each band contribute its own metadata scalar wherever the
+        band is non-null, so `min` over group "a" answers "which regime got here first"
+        rather than reducing the pixel values. `max` on the same fixture would be
+        indistinguishable from `min` if the lowering silently ignored `of` and reduced
+        the bands, so both are checked.
+        """
+        lf = pl.LazyFrame({"b0": [1, None, 3], "b1": [10, 20, None]})
+        metadata_df = pl.DataFrame({"regime": ["a", "a"], "rank": [7, 4]})
+        band_wide = (lf, metadata_df, _window())
+
+        op = GroupOp(step_no=1, input="x", by=["regime"], aggregate="min", of="rank", output="y")
+        result = group_band_wide(band_wide, op, extra_columns=[])[0].collect()
+        # pixel0: both bands contribute -> min(7, 4); pixel1: only b1 -> 4; pixel2: only b0 -> 7.
+        assert result["b0"].to_list() == [4, 4, 7]
+
+        op = GroupOp(step_no=1, input="x", by=["regime"], aggregate="max", of="rank", output="y")
+        result = group_band_wide(band_wide, op, extra_columns=[])[0].collect()
+        assert result["b0"].to_list() == [7, 4, 7]
+
+    def test_of_naming_neither_value_nor_a_metadata_column_raises(self):
+        band_wide = _three_band_fixture()
+        op = GroupOp(step_no=1, input="x", by=[], aggregate="min", of="calendar_year", output="y")
+        with pytest.raises(ValueError, match="names neither"):
+            group_band_wide(band_wide, op, extra_columns=[])
+
+    def test_count_is_nodata_outside_the_domain_and_zero_inside_it(self):
+        """The one place `DOMAIN_COLUMN` is readable from the outside: every band is null
+        at both pixels below, so `count` can only tell them apart by the carried zone.
+        Pixel 0 is in the crosswalk's domain and genuinely counted zero contributors;
+        pixel 1 was never mapped at all, and must come back null (which the sink then
+        writes as its nodata sentinel), not as a confident 0.
+        """
+        lf = pl.LazyFrame({"b0": [None, None], "b1": [None, None], DOMAIN_COLUMN: [5, None]})
+        metadata_df = pl.DataFrame({"regime": ["a", "a"]})
+        band_wide = (lf, metadata_df, _window(height=2))
+
+        op = GroupOp(step_no=1, input="x", by=[], aggregate="count", output="y")
+        result = group_band_wide(band_wide, op, extra_columns=[DOMAIN_COLUMN])[0].collect()
+
+        assert result["b0"].to_list() == [0, None]
+
+
+class TestPairAndMaskBandWide:
+    """The fourth `filter` lowering: a value `where` over a frame whose value columns are
+    a join's operand names. Each operand's band is paired with its counterpart on the
+    dimensions they share, the pair is masked as one, and what comes back carries one
+    value column again.
+    """
+
+    def _paired_fixture(self):
+        """Two operands, two years each, laid out the way `join_band_wide` lays them out
+        (all of `left`'s bands, then all of `right`'s). `variable` differs per operand and
+        must NOT be paired on -- a spatial join's whole premise is that its operands are
+        different datasets.
+        """
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [3.0, 4.0], "b2": [10.0, 20.0], "b3": [30.0, 40.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2040, 2030, 2040],
+                "variable": ["marsh_var", "marsh_var", "sal_var", "sal_var"],
+                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal", "sal"],
+            }
+        )
+        return lf, metadata_df, _window(height=2)
+
+    def test_pairs_on_the_shared_dimension_and_collapses_to_one_band_per_pair(self):
+        band_wide = self._paired_fixture()
+        out_lf, out_metadata, _window_out = filter_band_wide(
+            band_wide, "marsh > 1.5 AND sal > 15.0", extra_columns=[], value_columns=["marsh", "sal"]
+        )
+        result = out_lf.collect()
+
+        # One band per calendar_year, down from four, and the operand axis is gone.
+        assert out_metadata.columns == ["calendar_year"]
+        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert list(result.columns) == ["b0", "b1"]
+        # The carried value is the lower-positioned operand's band -- `marsh`'s, here.
+        # 2030 pairs b0 (marsh) with b2 (sal): pixel0's marsh 1.0 fails `> 1.5`; pixel1
+        # passes both (2.0, 20.0) and carries marsh's 2.0.
+        assert result["b0"].to_list() == [None, 2.0]
+        # 2040 pairs b1 (marsh 3.0/4.0) with b3 (sal 30.0/40.0) -- both pixels pass.
+        assert result["b1"].to_list() == [3.0, 4.0]
+
+    def test_a_band_with_no_counterpart_is_dropped(self):
+        """An incomplete pair has no answer to give: the predicate names both operands,
+        and one of them has nothing at this dimension. Dropping the band is the only
+        honest option -- masking it would silently answer as if the missing operand had
+        passed.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0], "b2": [3.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2040, 2030],
+                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal"],
+            }
+        )
+        out_lf, out_metadata, _window_out = filter_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            "marsh > 0 AND sal > 0",
+            extra_columns=[],
+            value_columns=["marsh", "sal"],
+        )
+
+        # 2040 has a `marsh` band and no `sal` one, so only 2030 survives.
+        assert out_metadata["calendar_year"].to_list() == [2030]
+        assert out_lf.collect().columns == ["b0"]
+
+    def test_two_bands_from_one_operand_at_the_same_dimension_are_dropped(self):
+        """A pairing group holding the SAME operand twice is not a pair either -- which
+        of the two would `marsh` mean? Distinguished from the missing-counterpart case
+        above because the group is the right SIZE here, just not the right shape.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0]})
+        metadata_df = pl.DataFrame(
+            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "marsh"]}
+        )
+        out_lf, out_metadata, out_window = filter_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            "marsh > 0 AND sal > 0",
+            extra_columns=[],
+            value_columns=["marsh", "sal"],
+        )
+
+        assert out_metadata.is_empty()
+        assert out_lf.collect().is_empty()
+        assert out_window == _window(height=1)
+
+    def test_no_shared_dimension_pairs_every_band_into_one_group(self):
+        """When the operands share no non-null dimension at all there is nothing to key
+        on, so the whole frame is one pairing group. It still has to be a well-formed
+        pair, and the surviving band is indexed by `RESERVED_BAND_INDEX_COLUMN` -- the
+        same fallback `group_band_wide` uses for `by == []`.
+        """
+        lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
+        metadata_df = pl.DataFrame(
+            {
+                # Every pairable column is null in at least one row, so none qualifies.
+                "calendar_year": [2030, None],
+                JOIN_OPERAND_COLUMN: ["marsh", "sal"],
+            }
+        )
+        out_lf, out_metadata, _window_out = filter_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            "marsh > 1 AND sal > 1",
+            extra_columns=[],
+            value_columns=["marsh", "sal"],
+        )
+
+        assert out_metadata.columns == [RESERVED_BAND_INDEX_COLUMN]
+        assert out_metadata[RESERVED_BAND_INDEX_COLUMN].to_list() == [0]
+        assert out_lf.collect()["b0"].to_list() == [5.0]
+
+    def test_no_bands_returns_empty(self):
+        window = _window(height=2)
+        out_lf, out_metadata, out_window = filter_band_wide(
+            (pl.LazyFrame(), pl.DataFrame(), window),
+            "marsh > 0 AND sal > 0",
+            extra_columns=[],
+            value_columns=["marsh", "sal"],
+        )
         assert out_lf.collect().is_empty()
         assert out_metadata.is_empty()
         assert out_window == window
