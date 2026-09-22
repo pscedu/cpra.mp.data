@@ -27,8 +27,9 @@ Returns the full list of registered analyses, each with:
 | `legend` | A named legend/color-map hint for rendered output, or `null` |
 | `result_kind` | `"value"`, `"difference"`, or `"category"` -- a presentation hint for how to label the result |
 
-As of this writing, three analyses are registered: `difference` and `concatenate`
-(`type="dataset"`), and `salinity-veg-investigation` (`type="custom"`).
+As of this writing, four analyses are registered: `difference`, `concatenate` and
+`land-type-confidence` (`type="dataset"`), and `salinity-veg-investigation`
+(`type="custom"`).
 
 ## Dataset-Scoped vs. Custom Routes
 
@@ -122,6 +123,49 @@ which is always exactly 2 for both modes):
 GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/concatenate/data.csv?model_group_id=500,510&scenario_id=7&calendar_year=2040,2050&dimension=calendar_year
 ```
 
+### `land-type-confidence`
+
+`type="dataset"`. A confidence-weighted land/water surface over the five-member land-type
+ensemble (`variables=["lnd_type"]`). Each member (`scenario_id` 34-38) is reduced to a land
+(`1.0`) / water (`0.0`) indicator, then the five are combined as a weighted sum:
+
+| `scenario_id` | Weight |
+|---|---|
+| 34 | 0.085 |
+| 35 | 0.25 |
+| 36 | 0.33 |
+| 37 | 0.25 |
+| 38 | 0.085 |
+
+The weights sum to exactly `1.0`, so the result is the weighted FRACTION of the ensemble
+calling a cell land: `0.0` = every member says water, `1.0` = every member says land,
+anything between = the weight of the members that disagree. Land is `lnd_type` `1`, `3`
+and `4`; water is `2` and `5`; anything else -- including nodata -- is dropped rather
+than mapped, so an unrecognized code never reaches the sum as itself.
+
+This analysis declares **no parameters of its own**: the ensemble, the weights and the
+mapping are all fixed, and a request is dimension filters alone (typically
+`model_group_id` and `calendar_year`, plus the usual `grid_cell`/`where`).
+
+**Selection rule**: `scenario_id` may not be filtered by the caller -- the analysis
+supplies the full five-member set itself, and the weights are only a weighted mean over
+all of it, so a subset would silently return a partial sum that reads like a confidence
+but isn't. Supplying one is rejected with a 400.
+
+Every other dimension is kept in the `group`, so omitting `calendar_year` returns one
+result per year rather than summing years together. On a pixel grid that means one raster
+band per year, which for the full 44-year ensemble is a very large read -- filter to the
+year(s) you want.
+
+A cell that is nodata in only SOME members is summed over the members it has, so its
+weights no longer total `1.0` and its confidence reads low rather than being rescaled to
+the members that actually reported.
+
+```
+GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/land-type-confidence/data.tif?model_group_id=705&calendar_year=2050
+GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/land-type-confidence/data/{z}/{x}/{y}.png?model_group_id=705&calendar_year=2050
+```
+
 ### `salinity-veg-investigation`
 
 `type="custom"`. The earliest calendar year at which marsh coverage
@@ -175,6 +219,15 @@ returns:
   "output": {"format": "csv"}
 }
 ```
+
+**About `output.format` here.** A `Pipeline`'s `output.format` is required, so every
+analysis's `pipeline()` sets one; on the `data.{format}`/tile routes that value is always
+overwritten by the format in the URL, which is why the same analysis can be fetched as
+`csv`, `tif`, `png` or `.pbf` without declaring any of them. `pipeline.json` is the one
+route with no format segment to source an override from, so it returns whatever the
+analysis itself set -- and that value is therefore the format the published pipeline is
+meant to be resubmittable under (`tif` for an analysis whose result is a raster surface,
+`csv` for one that ends tabular).
 
 The URL's dataset filters land in a `filter` **step**, not on the input: an input names a
 dataset and nothing else (see [Analysis API](analysis-api.md#request-shape)). The

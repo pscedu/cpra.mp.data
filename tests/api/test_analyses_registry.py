@@ -24,12 +24,16 @@ assembled by the `salinity_veg_data` fixture in `tests/api/conftest.py` -- share
 `tests/api/test_analyses_endpoints.py`, which needs the same data to drive the same
 analysis through its HTTP routes.
 
-**`salinity-veg-investigation` gets its own execution class.** Every other registered
-analysis is long-shaped and runs through `_run` below; `salinity-veg-investigation` is
-band-wide end to end and is the only entry that exercises a vector-to-raster `project`
-feeding a band-wide `join` together with a `filter` naming that join's operand value
-columns, so `TestSalinityVegInvestigationExecution` runs it separately and pins the two
-halves apart.
+`land-type-confidence` is also `type="dataset"`, but its own `Meta.variables = ["lnd_type"]`
+lives only on a raster grid and its `pipeline()` sinks to `tif`, so a vector stand-in would
+not survive `validate_shapes`; it runs on `tests/factories.py`'s `vct`/`veg_grid_cell_v001`
+raster stand-in (`RASTER_KWARGS`) instead, through `run_to_path` rather than `_run`.
+
+**`salinity-veg-investigation` gets its own execution class.** The long-shaped registered
+analyses run through `_run` below; `salinity-veg-investigation` is band-wide end to end and
+is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
+together with a `filter` naming that join's operand value columns, so
+`TestSalinityVegInvestigationExecution` runs it separately and pins the two halves apart.
 """
 
 import pytest
@@ -37,10 +41,17 @@ import rasterio as rio
 
 from cpra.mp.data import config
 from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis
+from cpra.mp.data.analyses.land_type_confidence import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.request.ops import validate_shapes
-from tests.factories import ANNUAL_KWARGS, write_annual_dataset, write_ffibs_coverage_dataset
+from tests.factories import (
+    ANNUAL_KWARGS,
+    RASTER_KWARGS,
+    write_annual_dataset,
+    write_ffibs_coverage_dataset,
+    write_raster_dataset,
+)
 
 SSF_DATASET = DatasetRef(
     variable=ANNUAL_KWARGS["variable"], time_unit=ANNUAL_KWARGS["time_unit"], grid=ANNUAL_KWARGS["grid"]
@@ -50,12 +61,35 @@ COMMON_ANNUAL_FILTERS = {
     "scenario_id": ANNUAL_KWARGS["scenario_id"],
     "percentile": ANNUAL_KWARGS["percentile"],
 }
+# `land-type-confidence`'s real dataset is `lnd_type`, whose only grid in `variables.csv`
+# is `morph_pixel` -- a RASTER grid, and far too large to write as a fixture. The
+# representative dataset here is therefore `vct`/`veg_grid_cell_v001` (`RASTER_KWARGS`),
+# the same raster stand-in `tests/api/test_analyses_endpoints.py` uses, rather than the
+# vector `ssf` the other dataset-scoped entries run on: the analysis's own `output.format`
+# is `tif`, so only a raster selection gets past `validate_shapes`.
+RASTER_DATASET = DatasetRef(
+    variable=RASTER_KWARGS["variable"], time_unit=RASTER_KWARGS["time_unit"], grid=RASTER_KWARGS["grid"]
+)
+# It supplies `scenario_id` itself and rejects a caller-selected one, so its filters are
+# `vct`'s other required dimensions plus the single year the ensemble is written for.
+ENSEMBLE_FILTERS = {"model_group_id": RASTER_KWARGS["model_group_id"], "calendar_year": 2050}
+
+
+def _write_ensemble(base_path, code_by_scenario, years=(2050,)):
+    """Write one COG per `scenario_id`, each uniformly filled with a `lnd_type` code. The
+    stand-in variable's own semantics never come into it -- the analysis only ever
+    compares `value` against `1`-`5`.
+    """
+    for scenario_id, code in code_by_scenario.items():
+        write_raster_dataset(
+            base_path, years=years, scenario_id=scenario_id, fill_fn=lambda year, code=code: code
+        )
 
 
 def _run(resolved, base_path):
     """Take a `ResolvedAnalysis` all the way through the real request/execution path --
     `validate_shapes` -> `compile_plan` -> `execute` -> `.collect()` -- and return the
-    resulting `DataFrame`. Every `type="dataset"` entry here is long-shaped (a vector
+    resulting `DataFrame`. Every entry run through this helper is long-shaped (a vector
     grid, no `project`), so `execute`'s result is always a `LongFrame`.
     """
     validate_shapes(resolved.pipeline)
@@ -77,10 +111,15 @@ class TestRegistryDrift:
     """
 
     def test_every_registered_analysis_name_is_covered_by_this_test(self):
-        # If a fourth analysis lands and nobody updates the tests below, this is the
-        # tripwire: it fails loudly instead of the drift test silently covering only 3
-        # of 4 entries.
-        assert set(ANALYSES) == {"salinity-veg-investigation", "difference", "concatenate"}
+        # If another analysis lands and nobody updates the tests below, this is the
+        # tripwire: it fails loudly instead of the drift test silently covering only some
+        # of the entries.
+        assert set(ANALYSES) == {
+            "salinity-veg-investigation",
+            "difference",
+            "concatenate",
+            "land-type-confidence",
+        }
 
     def test_difference_compiles(self, base_path):
         write_annual_dataset(base_path, years=(2030, 2040))
@@ -118,6 +157,21 @@ class TestRegistryDrift:
             },
             params={"dimension": "calendar_year"},
         )
+        validate_shapes(resolved.pipeline)
+        assert compile_plan(resolved.pipeline, base_path=base_path) is not None
+
+    def test_land_type_confidence_compiles(self, base_path):
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1))
+        resolved = resolve_analysis(
+            "land-type-confidence",
+            dataset=RASTER_DATASET,
+            filters=ENSEMBLE_FILTERS,
+            params={},
+        )
+        # Its own `output.format` is `tif`, unoverridden here -- which is exactly the form
+        # `pipeline.json` publishes, so this also pins that a caller resubmitting that
+        # pipeline verbatim gets a valid one rather than a tabular-sink rejection.
+        assert resolved.pipeline.output.format == "tif"
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
@@ -267,6 +321,96 @@ class TestConcatenateExecution:
         # Still 111: the 1000.0 corner is (520, 2030), which the NOT conjunct drops. Had
         # it survived it would have been multiplied by 100 and added 100000 to the sum.
         assert set(df["value"].to_list()) == {111.0}
+
+
+class TestLandTypeConfidenceExecution:
+    """The weighted sum, over an ensemble whose members are written one uniform `lnd_type`
+    code each -- so every pixel's result is the total weight of the members this test made
+    land, and a member leaking in (or dropping out) moves that total by its own weight
+    rather than being averaged away.
+
+    Unlike the other `type="dataset"` entries above, this one runs on a RASTER grid and
+    ends band-wide, so it goes through `run_to_path` and rasterio rather than `_run`.
+    """
+
+    def _run_confidence(self, base_path, tmp_path, dataset=RASTER_DATASET):
+        """Resolve the analysis over what's already on disk and run it to a GeoTIFF."""
+        resolved = resolve_analysis(
+            "land-type-confidence", dataset=dataset, filters=ENSEMBLE_FILTERS, params={}
+        )
+        validate_shapes(resolved.pipeline)
+        out = tmp_path / "confidence.tif"
+        run_to_path(resolved.pipeline, out, base_path=base_path)
+        return out
+
+    def _assert_confidence(self, base_path, tmp_path, value_by_scenario, expected):
+        """Run the analysis over an ensemble built from `value_by_scenario` and assert
+        every pixel's confidence is `expected`. Compared with a tolerance rather than
+        exactly: the members are accumulated in Float32, so the five weighted terms land a
+        bit or two either side of the exact answer.
+        """
+        _write_ensemble(base_path, value_by_scenario)
+        with rio.open(self._run_confidence(base_path, tmp_path)) as src:
+            # One band: the group keeps `model_group_id` and `calendar_year`, and the
+            # ensemble is written for one of each.
+            assert src.count == 1
+            band = src.read(1, masked=True)
+            assert band.count(), "the analysis returned no valid pixels at all"
+            assert band.compressed() == pytest.approx(expected)
+
+    def test_every_member_land_sums_to_one(self, base_path, tmp_path):
+        # 1 is a land code, so every member votes land and the weights total 1.0 --
+        # the property that makes the result readable as a fraction at all.
+        self._assert_confidence(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), 1.0)
+
+    def test_every_member_water_sums_to_zero(self, base_path, tmp_path):
+        # 2 is a water code: mapped to 0.0, weighted, and summed -- still 0.0.
+        self._assert_confidence(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), 0.0)
+
+    def test_a_split_ensemble_sums_to_the_land_members_weight(self, base_path, tmp_path):
+        # 34 and 36 say land (codes 1 and 3), the rest water (codes 2 and 5).
+        self._assert_confidence(
+            base_path,
+            tmp_path,
+            {34: 1, 35: 2, 36: 3, 37: 5, 38: 2},
+            SCENARIO_WEIGHTS[34] + SCENARIO_WEIGHTS[36],
+        )
+
+    def test_every_land_code_maps_the_same_way(self, base_path, tmp_path):
+        # Codes 1, 3 and 4 are all land, so an ensemble split across them is no different
+        # from an all-1 ensemble -- the mapping is by class, not by code.
+        self._assert_confidence(base_path, tmp_path, {34: 1, 35: 3, 36: 4, 37: 1, 38: 3}, 1.0)
+
+    def test_an_unmapped_code_contributes_nothing(self, base_path, tmp_path):
+        """A code outside 1-5 is dropped by the value-domain filter rather than reaching
+        the sum as itself. Member 36 carries the largest weight, so its absence is the
+        most visible: had the 9 survived unmapped it would have added 9 * 0.33.
+        """
+        self._assert_confidence(
+            base_path,
+            tmp_path,
+            {34: 1, 35: 1, 36: 9, 37: 1, 38: 1},
+            1.0 - SCENARIO_WEIGHTS[36],
+        )
+
+    def test_a_scenario_outside_the_ensemble_is_excluded(self, base_path, tmp_path):
+        """`scenario_id` is collapsed by the trailing group, so a sixth scenario on disk
+        would be summed straight into the result if the leading filter let it through --
+        and it carries no weight `calculate`, so it would arrive as its raw code.
+        """
+        _write_ensemble(base_path, {7: 1})
+        self._assert_confidence(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), 1.0)
+
+    def test_an_unselected_year_is_excluded(self, base_path, tmp_path):
+        """The group keeps `calendar_year`, so a second year would surface as its own band
+        rather than corrupting 2050's -- but only the filtered year should be read at all.
+        """
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2040,))
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2050,))
+        with rio.open(self._run_confidence(base_path, tmp_path)) as src:
+            assert src.count == 1
+            assert "calendar_year=2050" in src.descriptions[0]
+            assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
 
 
 class TestSalinityVegInvestigationExecution:

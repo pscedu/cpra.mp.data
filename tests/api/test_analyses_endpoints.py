@@ -24,6 +24,12 @@ route disagreeing about what `filters`/`grid_cell`/`params` mean.
   a client. What the shape itself does is pinned at the engine level
   (`tests/api/test_analyses_registry.py::TestSalinityVegInvestigationExecution`); what
   these pin is that the custom routes deliver its bytes.
+* `land-type-confidence` (`type="dataset"`) reuses the routes `difference` already
+  carries, and is covered only where it DIFFERS from them: it declares no parameters of
+  its own and supplies its own `scenario_id`, so its query string is dimension filters
+  alone and a caller-supplied `scenario_id` must 400. It rides the raster stand-in
+  (`vct`/`veg_grid_cell_v001`), since its real variable is raster-only and its own
+  `pipeline()` sinks to `tif` to match.
 
 `grid_cell` is the one request parameter the registry deliberately cannot handle alone:
 resolving a coordinate against real geometry needs `io/`, which nothing under `request/`
@@ -43,6 +49,8 @@ from rasterio.warp import transform, transform_bounds
 from shapely.geometry import box
 
 from cpra.mp.data import config
+from cpra.mp.data.analyses.land_type_confidence import SCENARIO_WEIGHTS
+from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from tests.factories import (
     ANNUAL_KWARGS,
@@ -85,6 +93,16 @@ RASTER_DIFFERENCE_QUERY = {
 # `salinity-veg-investigation` is `type="custom"`: no dataset and no dimension filters,
 # just its own two required parameters.
 SALINITY_VEG_QUERY = {"model_group_id": 500, "scenario_id": 7}
+
+# `land-type-confidence` declares no parameters at all, and supplies `scenario_id` itself
+# -- so its query is `vct`'s other required dimensions and nothing else. It rides the raster
+# stand-in rather than the vector one: its real variable (`lnd_type`) is raster-only, and
+# its own `pipeline()` sinks to `tif` accordingly.
+LAND_TYPE_CONFIDENCE_URL = f"/v1/datasets/{RV}/{RT}/{RG}/analyses/land-type-confidence"
+LAND_TYPE_CONFIDENCE_QUERY = {
+    "calendar_year": [2050],
+    "model_group_id": [RASTER_KWARGS["model_group_id"]],
+}
 
 
 def _lng_lat(x, y):
@@ -517,6 +535,61 @@ class TestAnalysisRegistryErrorMapping:
         assert response.status_code == 400
 
 
+class TestLandTypeConfidenceRoute:
+    """`land-type-confidence` on the dataset-scoped routes. The route machinery itself is
+    already carried by `difference` above; what these pin is the one thing that differs --
+    it declares NO parameters of its own and supplies its own `scenario_id`, so its query
+    string is dimension filters alone and a caller-supplied `scenario_id` has to come back
+    as a 400 rather than silently narrowing the ensemble. What the pipeline computes is
+    pinned at the engine level (`test_analyses_registry.py::TestLandTypeConfidenceExecution`).
+    """
+
+    @pytest.fixture
+    def ensemble_dataset(self, base_path, monkeypatch):
+        """The five ensemble members, every one of them holding a land code, so the
+        weighted sum is 1.0 at every pixel.
+        """
+        for scenario_id in SCENARIO_WEIGHTS:
+            write_raster_dataset(base_path, years=(2050,), scenario_id=scenario_id, fill_fn=lambda year: 1)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        return base_path
+
+    def test_returns_the_confidence_surface(self, client, ensemble_dataset):
+        response = client.get(f"{LAND_TYPE_CONFIDENCE_URL}/data.tif", params=LAND_TYPE_CONFIDENCE_QUERY)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            band = src.read(1, masked=True)
+        assert band.count()
+        assert band.compressed() == pytest.approx(1.0)
+
+    def test_a_caller_supplied_scenario_id_400s(self, client, ensemble_dataset):
+        response = client.get(
+            f"{LAND_TYPE_CONFIDENCE_URL}/data.tif",
+            params={**LAND_TYPE_CONFIDENCE_QUERY, "scenario_id": [34]},
+        )
+        assert response.status_code == 400
+        assert "fixed ensemble" in response.json()["detail"]
+
+    def test_pipeline_json_shows_the_ensemble_the_url_never_named(self, client, ensemble_dataset):
+        response = client.get(f"{LAND_TYPE_CONFIDENCE_URL}/pipeline.json", params=LAND_TYPE_CONFIDENCE_QUERY)
+        assert response.status_code == 200, response.text
+        expanded = parse_pipeline(response.json())
+        assert expanded.steps[0].where == (
+            "calendar_year = 2050 AND model_group_id = 500 AND scenario_id IN (34, 35, 36, 37, 38)"
+        )
+        assert expanded.steps[-1].by == ["model_group_id", "calendar_year"]
+
+    def test_pipeline_json_publishes_a_resubmittable_pipeline(self, client, ensemble_dataset):
+        """`pipeline.json` is the one route that does NOT override `output.format` from a
+        URL segment, so whatever `pipeline()` set is what a caller gets back -- and a caller
+        resubmitting it verbatim has to get a pipeline the request layer accepts. A tabular
+        format here would not: this analysis's final frame is band-wide.
+        """
+        response = client.get(f"{LAND_TYPE_CONFIDENCE_URL}/pipeline.json", params=LAND_TYPE_CONFIDENCE_QUERY)
+        assert response.json()["output"]["format"] == "tif"
+        validate_shapes(parse_pipeline(response.json()))  # no raise
+
+
 class TestAnalysesCatalog:
     def test_lists_every_registered_analysis(self, client):
         response = client.get("/v1/analyses.json")
@@ -525,4 +598,5 @@ class TestAnalysesCatalog:
             "difference",
             "concatenate",
             "salinity-veg-investigation",
+            "land-type-confidence",
         }

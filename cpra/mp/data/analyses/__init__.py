@@ -29,6 +29,7 @@ from cpra.mp.data.analyses.base import (
 )
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
+from cpra.mp.data.analyses.land_type_confidence import LandTypeConfidence
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.errors import RequestError
 
@@ -36,7 +37,10 @@ from cpra.mp.data.analysis.request.errors import RequestError
 # the `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and
 # the only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name
 # -> class` dict, so registration order has no behavioral effect.
-ANALYSES = {cls.Meta.name: cls for cls in [SalinityVegInvestigation, Difference, Concatenate]}
+ANALYSES = {
+    cls.Meta.name: cls
+    for cls in [SalinityVegInvestigation, Difference, Concatenate, LandTypeConfidence]
+}
 
 __all__ = [
     "ANALYSES",
@@ -77,8 +81,9 @@ def resolve_analysis(
     function returns, the same way they would for a hand-authored pipeline.) `params` is
     the analysis's own declared parameters (`dimension`/`order` for `difference`,
     `dimension` for `concatenate`, `model_group_id`/`scenario_id`/`marsh_threshold`/
-    `salinity_threshold` for `salinity-veg-investigation`), raw and unvalidated until this
-    call.
+    `salinity_threshold` for `salinity-veg-investigation`, none at all for
+    `land-type-confidence`, whose selection is entirely `filters`), raw and unvalidated
+    until this call.
 
     `grid_cell_where` is an already-resolved spatial conjunct (`"grid_cell IN (1, 2)"`)
     for a caller that had to turn coordinates into IDs itself -- resolving coordinates

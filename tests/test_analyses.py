@@ -1,6 +1,6 @@
 """Unit tests for `cpra.mp.data.analyses`: the registry (`ANALYSES`), `resolve_analysis`'s
-exception contract (unknown name / wrong route kind / invalid parameters), and each of the
-three v1 entries' own parameter validation, cardinality rules, and `pipeline()`
+exception contract (unknown name / wrong route kind / invalid parameters), and each
+registered entry's own parameter validation, cardinality rules, and `pipeline()`
 derivation.
 
 Pure/in-memory throughout -- `resolve_analysis`/`Analysis.pipeline()` never touch disk (see
@@ -40,6 +40,12 @@ from cpra.mp.data.analyses.base import (
 )
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
+from cpra.mp.data.analyses.land_type_confidence import (
+    LAND_VALUES,
+    SCENARIO_WEIGHTS,
+    WATER_VALUES,
+    LandTypeConfidence,
+)
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
@@ -51,6 +57,10 @@ from cpra.mp.data.analysis.request.pipeline import (
 
 SSF_DATASET = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v001")
 SAL_DATASET = DatasetRef(variable="sal", time_unit="daily", grid="hydro_compartment_v001")
+# `land-type-confidence`'s real dataset. Nothing here reads from disk -- these tests build
+# pipelines and inspect them -- so the real variable/grid can be named directly rather than
+# through the small stand-ins the execution tests need.
+LND_TYPE_DATASET = DatasetRef(variable="lnd_type", time_unit="annual", grid="morph_pixel_v002")
 
 
 # ------------------------------------------------------------------------------------------
@@ -59,8 +69,13 @@ SAL_DATASET = DatasetRef(variable="sal", time_unit="daily", grid="hydro_compartm
 
 
 class TestRegistry:
-    def test_contains_exactly_the_three_v1_entries(self):
-        assert set(ANALYSES) == {"salinity-veg-investigation", "difference", "concatenate"}
+    def test_contains_exactly_the_registered_entries(self):
+        assert set(ANALYSES) == {
+            "salinity-veg-investigation",
+            "difference",
+            "concatenate",
+            "land-type-confidence",
+        }
 
     def test_keyed_by_meta_name(self):
         for name, cls in ANALYSES.items():
@@ -79,6 +94,11 @@ class TestRegistry:
 
         assert ANALYSES["salinity-veg-investigation"].Meta.type == "custom"
         assert ANALYSES["salinity-veg-investigation"].Meta.result_kind == "value"
+
+        assert ANALYSES["land-type-confidence"].Meta.type == "dataset"
+        assert ANALYSES["land-type-confidence"].Meta.variables == ["lnd_type"]
+        assert ANALYSES["land-type-confidence"].Meta.legend is None
+        assert ANALYSES["land-type-confidence"].Meta.result_kind == "value"
 
 
 # ------------------------------------------------------------------------------------------
@@ -655,7 +675,9 @@ class TestSalinityVegInvestigationParameters:
 class TestSalinityVegInvestigationPipeline:
     def _build(self, **overrides):
         params = {"model_group_id": 500, "scenario_id": 7, **overrides}
-        analysis = SalinityVegInvestigation(dataset=None, filters={}, parameters=SalinityVegInvestigation.Parameters(**params))
+        analysis = SalinityVegInvestigation(
+            dataset=None, filters={}, parameters=SalinityVegInvestigation.Parameters(**params)
+        )
         return analysis, analysis.pipeline()
 
     def test_matches_the_documented_salinity_veg_shape(self):
@@ -741,3 +763,162 @@ class TestSalinityVegInvestigationPipeline:
         assert analysis.result_kind == "value"
         assert analysis.legend is None
         assert analysis.title_suffix == ""
+
+
+# ------------------------------------------------------------------------------------------
+# `land-type-confidence`
+# ------------------------------------------------------------------------------------------
+
+
+class TestLandTypeConfidenceParameters:
+    def test_declares_no_parameters_of_its_own(self):
+        LandTypeConfidence.Parameters()  # no raise
+
+    def test_rejects_extra_fields(self):
+        with pytest.raises(ValidationError):
+            LandTypeConfidence.Parameters(dimension="calendar_year")
+
+
+class TestLandTypeConfidenceSelection:
+    params = LandTypeConfidence.Parameters()
+
+    def test_accepts_filters_that_do_not_name_scenario_id(self):
+        LandTypeConfidence.validate_selection(
+            self.params, {"model_group_id": 705, "calendar_year": 2050}
+        )  # no raise
+
+    def test_rejects_a_caller_selected_scenario_id(self):
+        with pytest.raises(InvalidAnalysisParametersError, match="fixed ensemble"):
+            LandTypeConfidence.validate_selection(self.params, {"scenario_id": 34})
+
+    def test_rejects_a_scenario_id_selecting_the_whole_ensemble_too(self):
+        # Even the exact member set is rejected: the analysis supplies it itself, and
+        # accepting it here would mean accepting a SUBSET next.
+        with pytest.raises(InvalidAnalysisParametersError):
+            LandTypeConfidence.validate_selection(
+                self.params, {"scenario_id": sorted(SCENARIO_WEIGHTS)}
+            )
+
+
+class TestLandTypeConfidenceWeights:
+    def test_the_weights_sum_to_one(self):
+        # What makes the trailing `group`/`sum` a weighted MEAN rather than an
+        # unnormalized total -- a result outside 0..1 would not be a confidence.
+        assert sum(SCENARIO_WEIGHTS.values()) == pytest.approx(1.0)
+
+    def test_every_land_type_code_is_classified_exactly_once(self):
+        assert set(LAND_VALUES).isdisjoint(WATER_VALUES)
+        assert set(LAND_VALUES) | set(WATER_VALUES) == {1, 2, 3, 4, 5}
+
+
+class TestLandTypeConfidencePipeline:
+    def _build(self, filters=None, dataset=LND_TYPE_DATASET):
+        analysis = LandTypeConfidence(
+            dataset=dataset,
+            filters={"model_group_id": 705, "calendar_year": 2050} if filters is None else filters,
+            parameters=LandTypeConfidence.Parameters(),
+        )
+        return analysis, analysis.pipeline()
+
+    def test_the_leading_filter_supplies_the_fixed_ensemble(self):
+        _, pipeline = self._build()
+        leading = pipeline.steps[0]
+        assert isinstance(leading, FilterStep)
+        assert leading.input == "x"
+        assert leading.where == (
+            "calendar_year = 2050 AND model_group_id = 705 AND scenario_id IN (34, 35, 36, 37, 38)"
+        )
+
+    def test_a_second_filter_drops_everything_outside_the_mapping(self):
+        _, pipeline = self._build()
+        domain = pipeline.steps[1]
+        assert isinstance(domain, FilterStep)
+        assert domain.where == "value = 1 OR value = 2 OR value = 3 OR value = 4 OR value = 5"
+
+    def test_the_mapping_calculates_come_before_the_weights(self):
+        _, pipeline = self._build()
+        land, water = pipeline.steps[2], pipeline.steps[3]
+        assert isinstance(land, CalculateStep)
+        assert land.expression == "1.0"
+        assert land.where == "value = 1 OR value = 3 OR value = 4"
+        assert isinstance(water, CalculateStep)
+        assert water.expression == "0.0"
+        assert water.where == "value = 2 OR value = 5"
+
+    def test_one_weight_calculate_per_member_in_ascending_order(self):
+        _, pipeline = self._build()
+        weights = pipeline.steps[4:-1]
+        assert [step.where for step in weights] == [
+            f"scenario_id = {scenario_id}" for scenario_id in sorted(SCENARIO_WEIGHTS)
+        ]
+        assert [step.expression for step in weights] == [
+            f"value * {SCENARIO_WEIGHTS[scenario_id]}" for scenario_id in sorted(SCENARIO_WEIGHTS)
+        ]
+
+    def test_the_group_sums_over_every_dimension_but_scenario_id(self):
+        analysis, pipeline = self._build()
+        group = pipeline.steps[-1]
+        assert isinstance(group, GroupStep)
+        assert group.aggregate == "sum"
+        assert sorted(group.by) == ["calendar_year", "model_group_id"]
+        assert "scenario_id" not in group.by
+        assert analysis.collapsed_dimensions == frozenset({"scenario_id"})
+
+    def test_the_step_count_is_the_mapping_plus_one_per_member(self):
+        _, pipeline = self._build()
+        assert len(pipeline.steps) == 4 + len(SCENARIO_WEIGHTS) + 1
+
+    def test_the_output_format_is_the_one_the_pipeline_can_actually_run_under(self):
+        # `Output.format` is required, so `pipeline()` has to set something; every
+        # `data.{format}`/tile route then overwrites it from its own URL segment, leaving
+        # `pipeline.json` -- which has no format segment -- as the only place this value is
+        # observable. `lnd_type` is raster-only, so the pipeline always ends band-wide and a
+        # tabular sink here would publish a pipeline that fails on resubmission.
+        _, pipeline = self._build()
+        assert pipeline.output.format == "tif"
+
+    def test_the_ensemble_conjunct_is_present_even_with_no_caller_filters(self):
+        # The fixed member set alone guarantees the leading `filter` exists, which is what
+        # lets `pipeline()` name the input on `steps[0]` unconditionally.
+        _, pipeline = self._build(filters={})
+        assert pipeline.steps[0].input == "x"
+        assert pipeline.steps[0].where == "scenario_id IN (34, 35, 36, 37, 38)"
+
+    def test_a_grid_cell_filter_composes_with_the_ensemble_conjunct(self):
+        _, pipeline = self._build(filters={"model_group_id": 705, "grid_cell": "3,5"})
+        assert pipeline.steps[0].where == (
+            "model_group_id = 705 AND scenario_id IN (34, 35, 36, 37, 38) AND grid_cell IN (3, 5)"
+        )
+
+    def test_meta_and_presentation(self):
+        analysis, _ = self._build()
+        assert analysis.legend is None
+        assert analysis.result_kind == "value"
+        assert analysis.title_suffix == " Confidence"
+
+    def test_resolves_through_resolve_analysis(self):
+        resolved = resolve_analysis(
+            "land-type-confidence",
+            dataset=LND_TYPE_DATASET,
+            filters={"model_group_id": 705, "calendar_year": 2050},
+            params={},
+        )
+        assert isinstance(resolved, ResolvedAnalysis)
+        assert resolved.pipeline.steps[-1].aggregate == "sum"
+        assert resolved.collapsed_dimensions == frozenset({"scenario_id"})
+
+    def test_a_scenario_id_filter_is_rejected_by_resolve_analysis(self):
+        with pytest.raises(InvalidAnalysisParametersError):
+            resolve_analysis(
+                "land-type-confidence",
+                dataset=LND_TYPE_DATASET,
+                filters={"model_group_id": 705, "scenario_id": [34, 35]},
+                params={},
+            )
+
+    def test_the_get_encoding_numbers_all_ten_steps(self):
+        # The ten steps are positional in the GET encoding (`step.<n>.` is 1-based), so a
+        # caller can reproduce the analysis as a hand-authored pipeline URL.
+        query = pipeline_to_query(self._build()[1])
+        assert query["step.10.op"] == "group"
+        assert query["step.5.expression"] == "value * 0.085"
