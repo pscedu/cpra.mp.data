@@ -5,14 +5,22 @@ the HTTP status has to be decided from whatever the thread has done by the time 
 chunk is ready.
 """
 
+import time
+
+import anyio
 import polars as pl
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
+from cpra.mp.data.api import tabular
 from cpra.mp.data.api.models import Compression
-from cpra.mp.data.api.pipeline import _TABULAR_MIME_TYPES, COMPRESSION_LEVEL_OPTIONS
+from cpra.mp.data.api.pipeline import (
+    _TABULAR_MIME_TYPES,
+    COMPRESSION_LEVEL_OPTIONS,
+    PipelineTabularResponse,
+)
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
 
@@ -108,6 +116,144 @@ class TestPolarsStreamingResponse:
                 raise RuntimeError("boom")
 
         response = self._client(Boom(pl.LazyFrame({"a": [1]}))).get("/test")
+        assert response.status_code == 500
+        assert response.text == "boom"
+
+
+class SlowSource(LazyFrameSource):
+    """A writer that produces nothing for `delay` seconds and then writes normally -- the
+    shape of a slow read, and the only shape in which the response's read loop has anything
+    to wait on. A fast source writes before the loop's first read and never waits at all.
+    """
+
+    def __init__(self, lf, delay):
+        super().__init__(lf)
+        self.delay = delay
+
+    def stream_tabular(self, out_path, format, *args, **kwargs):
+        time.sleep(self.delay)
+        super().stream_tabular(out_path, format, *args, **kwargs)
+
+
+def count_reads(monkeypatch):
+    """Count every `file.read` the response's poll loop performs. Returns a one-key dict so
+    the caller can read the running total.
+    """
+    counted = {"n": 0}
+    original = anyio.AsyncFile.read
+
+    async def counting_read(self, *args, **kwargs):
+        counted["n"] += 1
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.AsyncFile, "read", counting_read)
+    return counted
+
+
+class TestPollPacing:
+    """The read loop polls a temp file a background thread is still writing, and an empty
+    read while that thread is alive means "nothing yet". Unpaced, that is a spin -- ~70,000
+    thread-pool-dispatched reads of an empty file measured on one 3.5-second request -- and
+    `api.tabular.sleep_between_polls` is what bounds it.
+    """
+
+    DELAY = 0.25
+
+    def test_the_interval_doubles_and_then_holds_at_the_cap(self):
+        async def intervals():
+            # `None` is how a caller spells "first poll of this stall" -- neither response
+            # class names a bound itself, so this is the only entry point to the series.
+            out, interval = [], None
+            for _ in range(8):
+                interval = await tabular.sleep_between_polls(interval)
+                out.append(interval)
+            return out
+
+        got = anyio.run(intervals)
+        assert got[0] == tabular.POLL_INTERVAL_MIN * 2
+        assert got[1] == tabular.POLL_INTERVAL_MIN * 4
+        # It reaches the cap and stays there rather than growing without bound, which is
+        # what keeps a finished write from going unnoticed for an arbitrarily long time.
+        assert got[-1] == tabular.POLL_INTERVAL_MAX
+        assert max(got) == tabular.POLL_INTERVAL_MAX
+
+    def test_the_cap_is_short_enough_to_not_dominate_a_quick_response(self):
+        # The pacing's whole cost is that a finished write is noticed up to one interval
+        # late, so the cap IS the worst-case added latency. Pinned because raising it is
+        # the tempting way to cut the poll count further, and it is paid by every request.
+        assert tabular.POLL_INTERVAL_MAX <= 0.01
+        assert tabular.POLL_INTERVAL_MIN < tabular.POLL_INTERVAL_MAX
+
+    def _reads_for(self, response_factory, *, paced):
+        # Its own patch context per call, not the `monkeypatch` fixture: the two calls run
+        # inside one test, and a fixture would not undo the control's zeroed bounds until
+        # the test ended -- which would silently make the paced run unpaced too.
+        with pytest.MonkeyPatch.context() as patch:
+            if not paced:
+                # The same loop with the pacing neutralized -- what it did before this fix.
+                patch.setattr(tabular, "POLL_INTERVAL_MIN", 0)
+                patch.setattr(tabular, "POLL_INTERVAL_MAX", 0)
+            counted = count_reads(patch)
+            response = serve(response_factory).get("/test")
+        assert response.status_code == 200
+        assert "a\n1\n2" in response.text
+        return counted["n"]
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            pytest.param(
+                lambda source: PolarsStreamingResponse(source, "csv", Compression()),
+                id="PolarsStreamingResponse",
+            ),
+            pytest.param(
+                lambda source: PipelineTabularResponse(source, "csv", Compression()),
+                id="PipelineTabularResponse",
+            ),
+        ],
+    )
+    def test_a_slow_writer_does_not_spin_the_read_loop(self, factory):
+        """Both classes carry a copy of the loop, so both have to be paced -- and the second
+        one's docstring says it shares the pacing rather than copying it, which only means
+        anything if it is checked here too.
+
+        Measured against the unpaced loop rather than an absolute count: how many reads a
+        spin fits into a quarter second is a property of the machine, but the ratio between
+        spinning and not is the behavior being fixed. `PipelineTabularResponse` is built on
+        a duck-typed source here, the same way `stream_or_write_to_file` consumes one.
+        """
+        source = SlowSource(pl.LazyFrame({"a": [1, 2]}), self.DELAY)
+        spun = self._reads_for(lambda: factory(source), paced=False)
+        paced = self._reads_for(lambda: factory(source), paced=True)
+
+        # A quarter second at a 10 ms cap is tens of polls (measured: 30 for both classes);
+        # unpaced it is thousands (measured: ~4,000, a ratio of ~135x).
+        assert paced < 100
+        assert spun > 20 * paced
+
+    def test_a_fast_response_is_not_slowed_by_the_pacing(self):
+        # The backoff starts at `POLL_INTERVAL_MIN` precisely so this case pays nothing
+        # noticeable: a writer that finishes in milliseconds does a handful of reads, none
+        # of which waits longer than half a millisecond.
+        source = LazyFrameSource(pl.LazyFrame({"a": [1, 2]}))
+        started = time.perf_counter()
+        response = serve(lambda: PolarsStreamingResponse(source, "csv", Compression())).get("/test")
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        assert "a\n1\n2" in response.text
+        assert elapsed < 20 * tabular.POLL_INTERVAL_MAX
+
+    def test_a_writer_that_fails_slowly_still_reports_its_status(self):
+        # The paced branch is the one with nothing to send, so it must not swallow the
+        # not-alive-and-empty exit that carries a failed writer's status out.
+        class SlowBoom(SlowSource):
+            def stream_tabular(self, *args, **kwargs):
+                time.sleep(self.delay)
+                raise RuntimeError("boom")
+
+        source = SlowBoom(pl.LazyFrame({"a": [1]}), self.DELAY)
+        response = serve(lambda: PolarsStreamingResponse(source, "csv", Compression())).get("/test")
         assert response.status_code == 500
         assert response.text == "boom"
 

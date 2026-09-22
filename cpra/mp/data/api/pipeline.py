@@ -54,7 +54,7 @@ from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.ops import Shape
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
-from cpra.mp.data.api.tabular import StreamingThread
+from cpra.mp.data.api.tabular import StreamingThread, sleep_between_polls
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
 
@@ -161,6 +161,11 @@ class PipelineTabularResponse(Response):
     boundary's own exception handlers can never disagree about what status a given
     exception type means, without hand-maintaining that mapping a second time here.
 
+    The loop's poll pacing is NOT copied, though -- `api.tabular.sleep_between_polls` is
+    imported and shared, bounds and all, since an empty read while the writer thread is
+    alive means the same thing in both classes and nothing about this one's status handling
+    would want to pace it differently.
+
     Always streams (`collect_in_memory=False`): there is no size estimate for a compiled
     `ExecutionPlan` to compare against `config.STREAM_THRESHOLD` -- estimating a
     pipeline's own result size ahead of running it is not implemented. Streaming is the
@@ -191,37 +196,44 @@ class PipelineTabularResponse(Response):
             sent_headers = False
             async with await anyio.open_file(fp.name, mode="rb") as file:
                 more_body = True
+                poll_interval = None
                 while more_body:
                     is_alive = write_thread.is_alive()
                     chunk = await file.read(self.chunk_size)
                     chunk_has_data = len(chunk) > 0
                     more_body = chunk_has_data or is_alive
-                    if chunk_has_data or not more_body:
-                        if not sent_headers:
-                            sent_headers = True
-                            err = write_thread.exception
-                            status = 200
-                            if err is not None:
-                                status = resolve_status(err)
-                                if status is None:
-                                    status = getattr(err, "status_code", 500)
-                            await send(
-                                {
-                                    "type": "http.response.start",
-                                    "status": status,
-                                    "headers": self.raw_headers,
-                                }
-                            )
-                            if err:
-                                chunk = resolve_detail(err).encode("utf-8")
-                                more_body = False
+                    # Nothing written yet and the writer still going -- the one case with
+                    # nothing to send, and so the one this loop would otherwise spin in.
+                    # See `api.tabular.sleep_between_polls`, which paces both copies.
+                    if not chunk_has_data and more_body:
+                        poll_interval = await sleep_between_polls(poll_interval)
+                        continue
+                    poll_interval = None
+                    if not sent_headers:
+                        sent_headers = True
+                        err = write_thread.exception
+                        status = 200
+                        if err is not None:
+                            status = resolve_status(err)
+                            if status is None:
+                                status = getattr(err, "status_code", 500)
                         await send(
                             {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                "more_body": more_body,
+                                "type": "http.response.start",
+                                "status": status,
+                                "headers": self.raw_headers,
                             }
                         )
+                        if err:
+                            chunk = resolve_detail(err).encode("utf-8")
+                            more_body = False
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": more_body,
+                        }
+                    )
 
 
 def _raster_profile_options(compression) -> dict:
