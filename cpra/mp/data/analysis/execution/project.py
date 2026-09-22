@@ -315,7 +315,7 @@ def _finalize_mean(lf: pl.LazyFrame) -> pl.LazyFrame:
     ).drop("__project_num__", "__project_denom__")
 
 
-def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list[str], max_distinct: int) -> pl.LazyFrame:
+def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list[str]) -> pl.LazyFrame:
     """The unbatched `count_by_value` lowering: one row per (dimensions, destination
     cell, distinct `value`), with the distinct value in `value_category` and its count in
     `value`.
@@ -331,9 +331,15 @@ def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list
     not already present -- so probing here can only over-count relative to the true
     post-join, per-destination cardinality, never under-count it. See
     `fold.fold_count_by_value`'s docstring for the identical argument on the folded path.
+
+    The bound is `config.COUNT_BY_VALUE_MAX_DISTINCT`, read here rather than taken as a
+    parameter: it is one deployment-wide configuration value, not a per-call decision, and
+    there is nothing a caller could correctly pass but that. (`fold.fold_count_by_value`
+    does take it, because it is a general fold utility with no config dependency of its
+    own; this is a lowering, and reads the config it is governed by directly.)
     """
     n_unique = lf.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
-    validate_count_by_value_cardinality(n_unique, "value", max_distinct)
+    validate_count_by_value_cardinality(n_unique, "value", COUNT_BY_VALUE_MAX_DISTINCT)
     joined = lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
         pl.col("dst_id").alias("grid_cell")
     )
@@ -386,7 +392,7 @@ def project_vector_to_vector(
                 ),
             )
             return _readdress(collapsed.lazy(), op.to)
-        return _readdress(_count_by_value(lf, crosswalk_lf, dim_cols, COUNT_BY_VALUE_MAX_DISTINCT), op.to)
+        return _readdress(_count_by_value(lf, crosswalk_lf, dim_cols), op.to)
 
     def _join(chunk: pl.LazyFrame) -> pl.LazyFrame:
         return chunk.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner")
@@ -476,7 +482,7 @@ class ZoneSource(NamedTuple):
 _BAND_IDENTITY_COLUMN = "__band__"
 
 
-def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str], max_distinct: int) -> pl.LazyFrame:
+def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str]) -> pl.LazyFrame:
     """`count_by_value`'s zonal lowering: one row per (band, destination cell, distinct
     value), the distinct value in `value_category` and its count in `value` -- the same
     output shape `_count_by_value` gives the vector-to-vector direction, so a caller does
@@ -500,13 +506,15 @@ def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str], max_distinct:
 
     The cardinality probe reads the unpivoted `value` column across ALL bands at once,
     which can only over-count relative to any single band's own cardinality -- so a
-    request that passes here would pass a per-band probe too, never the reverse.
+    request that passes here would pass a per-band probe too, never the reverse. The bound
+    it is checked against is `config.COUNT_BY_VALUE_MAX_DISTINCT`, read directly for the
+    same reason `_count_by_value` reads it directly -- see that function's docstring.
     """
     per_pixel = in_zone.unpivot(
         index=[ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value"
     )
     n_unique = per_pixel.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
-    validate_count_by_value_cardinality(n_unique, "value", max_distinct)
+    validate_count_by_value_cardinality(n_unique, "value", COUNT_BY_VALUE_MAX_DISTINCT)
     return per_pixel.group_by(
         _BAND_IDENTITY_COLUMN,
         pl.col(ZONE_COLUMN).alias("grid_cell"),
@@ -586,7 +594,7 @@ def project_raster_to_vector(
     in_zone = lf.filter(pl.col(ZONE_COLUMN).is_not_null())
 
     if op.aggregate == "count_by_value":
-        long_lf = _zonal_count_by_value(in_zone, names, COUNT_BY_VALUE_MAX_DISTINCT)
+        long_lf = _zonal_count_by_value(in_zone, names)
     else:
         zonal = in_zone.group_by(pl.col(ZONE_COLUMN).alias("grid_cell")).agg(
             [_zonal_aggregate_expr(op.aggregate, name) for name in names]
