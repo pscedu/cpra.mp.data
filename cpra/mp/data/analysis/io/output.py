@@ -25,14 +25,19 @@ from cpra.mp.data.legends import LEGENDS, Legend
 # Polars' two spellings of each tabular writer: the lazy sink (streams, never materializes
 # the whole frame) and the eager write (collects first). `api/tabular.py` picks between
 # them per request via `collect_in_memory`.
+#
+# Keyed by `DataFormat`'s tabular members and no others. Both tables also carried an
+# `arrow` -> `sink_ipc`/`write_ipc` entry, left over from a format vocabulary the request
+# layer no longer has: `DataFormat` is `{csv, ndjson, parquet, tif}`, every route binds its
+# `{format}` path segment straight to that enum, and `Output.format` is `DataFormat |
+# TileFormat` -- so no request could ever name `arrow` and reach a writer for it. An entry
+# no key can select is not a supported format, only one that reads like one.
 SINK_METHODS = {
-    "arrow": "sink_ipc",
     "csv": "sink_csv",
     "ndjson": "sink_ndjson",
     "parquet": "sink_parquet",
 }
 WRITE_METHODS = {
-    "arrow": "write_ipc",
     "csv": "write_csv",
     "ndjson": "write_ndjson",
     "parquet": "write_parquet",

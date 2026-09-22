@@ -21,7 +21,7 @@ caller for `render_tile`/`sink_vector_tile` directly.
 
 **Reuse vs. purpose-built, by response shape:**
 
-- Tabular (csv/ndjson/parquet/arrow): `PipelineTabularResponse` below reuses `api.tabular
+- Tabular (csv/ndjson/parquet): `PipelineTabularResponse` below reuses `api.tabular
   .StreamingThread` verbatim (the temp-file-plus-background-thread machinery,
   unchanged) but is NOT `api.tabular.PolarsStreamingResponse` itself, despite looking
   almost identical to it. The one load-bearing difference is documented on the class.
@@ -68,11 +68,10 @@ COMPRESSION_LEVEL_OPTIONS = {
     CompressionAlgorithm.zstd: "zstd_level",
 }
 
-# The four tabular formats' MIME types -- copied from `api.tabular.PolarsStreamingResponse
+# The three tabular formats' MIME types -- copied from `api.tabular.PolarsStreamingResponse
 # .mime_types` rather than imported from it, so this module's own response class does not
 # depend on that one's internals beyond `StreamingThread`, which it genuinely reuses.
 _TABULAR_MIME_TYPES = {
-    "arrow": "application/vnd.apache.arrow.file",
     "csv": "text/csv",
     "ndjson": "application/x-ndjson",
     "parquet": "application/vnd.apache.parquet",
@@ -135,7 +134,7 @@ class PipelineTabularSource:
 
 
 class PipelineTabularResponse(Response):
-    """The tabular (csv/ndjson/parquet/arrow) response for the pipeline surface: reuses
+    """The tabular (csv/ndjson/parquet) response for the pipeline surface: reuses
     `api.tabular.StreamingThread` and its temp-file-plus-chunked-read loop verbatim, but is
     a separate class from `api.tabular.PolarsStreamingResponse` rather than that class
     reused outright, for one load-bearing reason.

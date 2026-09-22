@@ -157,7 +157,8 @@ def _materialize_closure(lf: LongFrame):
 
 
 def sink_tabular(lf: LongFrame, out_path, format, *, float_precision=None, **profile_options) -> None:
-    """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet`/`arrow`), always
+    """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet` -- `DataFormat`'s
+    tabular members, which are exactly the keys `io.output.SINK_METHODS` carries), always
     lazily (`io.output.stream_tabular`) -- this sink never materializes the whole frame
     first. `io.output.write_tabular` is the eager, collect-first alternative, reached
     only when a caller has already decided the result is small; nothing estimates a

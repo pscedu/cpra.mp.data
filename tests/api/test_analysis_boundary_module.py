@@ -314,11 +314,10 @@ class TestFourRoutesEndToEnd:
     def test_tabular_ndjson_returns_real_rows(self, client, base_path, monkeypatch):
         """Same baseline as the csv case above, for `ndjson` -- the format `PipelineTabular
         Response._TABULAR_MIME_TYPES`/`PipelineTabularSource.stream_tabular` also serve
-        alongside csv/parquet. (`arrow` is the fourth name in that MIME map, but this
-        route's own `{format}` path segment is bound directly to `analysis.request.types
-        .DataFormat`, which has no live `arrow` member -- `/v1/analysis.arrow` is rejected
-        by FastAPI's own enum path-param validation before any code in this module runs,
-        so there is no route-level case to add for it here.)
+        alongside csv/parquet. Those three are the whole map: it carried an `arrow` entry
+        as well, which no request could ever select, since this route's `{format}` path
+        segment is bound directly to `analysis.request.types.DataFormat` and that enum has
+        no `arrow` member.
         """
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)

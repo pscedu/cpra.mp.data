@@ -10,9 +10,9 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from cpra.mp.data.analysis.request.types import CompressionAlgorithm
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.models import Compression
-from cpra.mp.data.api.pipeline import COMPRESSION_LEVEL_OPTIONS
+from cpra.mp.data.api.pipeline import _TABULAR_MIME_TYPES, COMPRESSION_LEVEL_OPTIONS
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
 
@@ -59,6 +59,21 @@ class TestPolarsStreamingResponse:
         source = LazyFrameSource(pl.LazyFrame({"a": [1]}))
         response = self._client(source, format=format).get("/test")
         assert response.headers["content-type"].startswith(media_type)
+
+    def test_both_mime_maps_carry_exactly_the_tabular_data_formats(self):
+        """The two maps are deliberately separate copies (see `_TABULAR_MIME_TYPES`'s own
+        comment for why this module's response class does not import that one's), so they
+        can drift from each other and from the format vocabulary alike -- and did: both
+        carried an `arrow` entry that no route could reach, since every `{format}` path
+        segment binds straight to `DataFormat` and that enum has no `arrow` member.
+
+        `tif` is absent from both because a GeoTIFF is not streamed by either class --
+        `api.pipeline.PipelineRasterResponse` serves it from a temp file instead.
+        """
+        tabular_formats = {format.value for format in DataFormat if format is not DataFormat.tif}
+        assert set(PolarsStreamingResponse.mime_types) == tabular_formats
+        assert set(_TABULAR_MIME_TYPES) == tabular_formats
+        assert PolarsStreamingResponse.mime_types == _TABULAR_MIME_TYPES
 
     def test_parquet_body_is_readable(self, tmp_path):
         import io

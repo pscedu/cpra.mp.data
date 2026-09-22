@@ -53,6 +53,25 @@ class TestSinkAndWriteMethodTables:
     def test_every_format_has_both_a_sink_and_a_write_spelling(self):
         assert SINK_METHODS.keys() == WRITE_METHODS.keys()
 
+    def test_the_tables_cover_exactly_the_tabular_data_formats(self):
+        """The vocabulary these tables spell has to be the vocabulary the request layer
+        can actually name. Both once carried an `arrow` -> `sink_ipc`/`write_ipc` entry
+        that no `DataFormat` member selects, so `execution.sink.sink_tabular` documented a
+        format it could never be asked for and a reader had no way to tell that from a
+        working one.
+
+        Pinned against `DataFormat` itself rather than a written-out list of three names:
+        a format added to the enum then fails here until it has a writer, and a writer
+        added for a format the enum does not carry fails here too.
+
+        `tif` is excluded because it is not tabular. A GeoTIFF is written by
+        `execution.sink`'s raster path, which never consults these tables -- which is also
+        why `api.tabular.PolarsStreamingResponse.mime_types` has no `tif` entry.
+        """
+        tabular_formats = {format.value for format in DataFormat if format is not DataFormat.tif}
+        assert set(SINK_METHODS) == tabular_formats
+        assert set(WRITE_METHODS) == tabular_formats
+
     def test_the_method_names_are_the_real_polars_lazyframe_and_dataframe_methods(self):
         lf = pl.LazyFrame({"value": [1]})
         df = lf.collect()

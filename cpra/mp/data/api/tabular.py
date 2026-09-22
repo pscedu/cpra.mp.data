@@ -52,7 +52,6 @@ class PolarsStreamingResponse(Response):
     background = None
     chunk_size = 64 * 1024
     mime_types = {
-        "arrow": "application/vnd.apache.arrow.file",
         "csv": "text/csv",
         "ndjson": "application/x-ndjson",
         "parquet": "application/vnd.apache.parquet",
