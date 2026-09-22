@@ -121,6 +121,9 @@ omit = [
     "cpra/mp/data/cli/__main__.py",
 ]
 
+[tool.ruff]
+line-length = 120
+
 [tool.basedpyright]
 reportAny = false
 reportExplicitAny = false
