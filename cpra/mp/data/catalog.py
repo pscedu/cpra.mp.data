@@ -324,8 +324,21 @@ class CatalogQuery:
         the Hive-partitioned catalog under ``catalog_path`` is read for the
         variable/time_unit/grid selected by the dataset dimensions (a wildcard for any
         left unset), so a single request never unions the heterogeneous per-variable
-        schemas of the whole tree.  ``PART_COLS`` are cast to String to match the values
-        the dataset dimensions carry.
+        schemas of the whole tree.  ``PART_COLS`` are taken from each file's own path
+        (the partitioned write strips them from the file itself) as Strings, to match
+        the values the dataset dimensions carry.
+
+        Files are read one at a time and concatenated with ``diagonal_relaxed`` rather
+        than handed to ``pl.read_parquet`` as a list, for the same reason
+        ``compact_partition`` does it: a partition holds one file per append, and appends
+        made at different times need not agree on their columns.  The ``cli.catalog
+        build`` rescan gives every file it writes the union of every dimension found
+        anywhere in the tree, while ``write_parquet``/``write_cog``'s incremental hooks
+        write only the dimensions of the one dataset they wrote -- so the two disagree
+        the moment a rescan sees a variable the older files never had.
+        ``pl.read_parquet`` over a file list rejects that as a schema mismatch; here the
+        absent columns come back null, which is already what a dimension a row doesn't
+        have means.
         """
         if self._catalog is not None:
             return self._catalog
@@ -333,12 +346,17 @@ class CatalogQuery:
         for name in PART_COLS:
             value = getattr(self.dataset_dimensions, name, None)
             parts.append(f"{name}={value}" if value else f"{name}=*")
-        files = [str(p) for p in self._catalog_path.glob("/".join(parts) + "/*.parquet")]
-        if not files:
+        frames = [
+            pl.read_parquet(path).with_columns(
+                pl.lit(v, dtype=pl.String).alias(k)
+                for k, v in parse_path_dims(path.parent.relative_to(self._catalog_path)).items()
+            )
+            for path in self._catalog_path.glob("/".join(parts) + "/*.parquet")
+        ]
+        if not frames:
             msg = "No catalog entries for the requested dataset"
             raise ValueError(msg)
-        frame = pl.read_parquet(files, hive_partitioning=True)
-        return frame.with_columns(pl.col(c).cast(pl.String) for c in PART_COLS)
+        return pl.concat(frames, how="diagonal_relaxed")
 
     def _update(self, dimension_name, dimension_values):
         dimension = DIMENSIONS.get(dimension_name)

@@ -335,3 +335,75 @@ class TestCatalogQueryRepeatedExecute:
 
         with pytest.raises(ValueError, match="No common values for dimension scenario_id"):
             query.execute()
+
+
+class TestCatalogQueryHeterogeneousPartitionFiles:
+    """A catalog partition holds one file per append, and the appends need not agree on
+    their columns: the `cli.catalog build` rescan writes every file the union of every
+    dimension in the tree, while write_parquet/write_cog's incremental hooks write only
+    the one dataset's own -- so the two disagree the moment a rescan sees a variable the
+    older files never had. `_load_catalog` has to read a partition in that state, the
+    same hazard `compact_partition` already guards against on the write side.
+    """
+
+    PARTITION = ("variable=sal", "time_unit=annual", "grid=hydro_compartment_v001")
+
+    def _write(self, base_path, catalog_path, scenario_id):
+        write_parquet(
+            _tabular_data([2020, 2021]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **{**TABULAR_KWARGS, "scenario_id": scenario_id},
+        )
+
+    def _widen_one_file(self, catalog_path, scenario_id):
+        """Give whichever file holds `scenario_id` an extra all-null dimension column,
+        the way a full-tree rescan does for a dimension only some other variable has."""
+        directory = catalog_path.joinpath(*self.PARTITION)
+        for path in directory.glob("*.parquet"):
+            frame = pl.read_parquet(path)
+            if frame["scenario_id"].to_list() == [scenario_id]:
+                frame.with_columns(pl.lit(None, dtype=pl.Int16).alias("aep")).write_parquet(path)
+                return
+        raise AssertionError(f"no catalog file for scenario_id={scenario_id}")
+
+    def test_files_disagreeing_on_their_columns_are_read_together(self, base_path, catalog_path):
+        """Both files' rows reach the query. `pl.read_parquet` over the file list raises
+        `SchemaError: extra column in file outside of expected schema: aep` here."""
+        self._write(base_path, catalog_path, scenario_id=7)
+        self._write(base_path, catalog_path, scenario_id=8)
+        self._widen_one_file(catalog_path, scenario_id=8)
+        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+
+        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+
+        assert result["choices"]["scenario_id"] == [7, 8]
+
+    def test_a_dimension_only_the_widened_file_carries_is_ignored(self, base_path, catalog_path):
+        """The extra column is all-null -- a dimension of some other variable entirely --
+        so it contributes no choices rather than a null one."""
+        self._write(base_path, catalog_path, scenario_id=7)
+        self._write(base_path, catalog_path, scenario_id=8)
+        self._widen_one_file(catalog_path, scenario_id=8)
+        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+
+        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+
+        assert "aep" not in result["choices"]
+        assert "aep" not in result["results"]
+
+    def test_the_partition_dimensions_come_from_the_path(self, base_path, catalog_path):
+        """The Hive-partitioned write strips variable/time_unit/grid out of the files
+        themselves, so reading a file alone yields neither -- `_load_catalog` has to put
+        them back from the directory names."""
+        self._write(base_path, catalog_path, scenario_id=7)
+        on_disk = pl.read_parquet(next(catalog_path.joinpath(*self.PARTITION).glob("*.parquet")))
+        assert not {"variable", "time_unit", "grid"} & set(on_disk.columns)
+        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+
+        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+
+        assert result["choices"]["variable"] == ["sal"]
+        assert result["choices"]["time_unit"] == ["annual"]
+        assert result["choices"]["grid"] == ["hydro_compartment_v001"]
