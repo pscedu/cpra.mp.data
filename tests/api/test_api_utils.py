@@ -257,6 +257,26 @@ class TestLazyFrameSource:
         with pytest.raises(KeyError):
             source.write_tabular(tmp_path / "out.xyz", "xyz")
 
+    def test_stream_sinks_lazily_and_write_collects_first(self, tmp_path):
+        """The two methods now differ only in which `io.output` writer they hand
+        `materialize` to, and the format tests above cannot tell them apart -- both leave a
+        correct file behind either way. Pin the difference where it is observable: what
+        reaches `materialize`. Streaming passes a `sink_*` method name and the destination;
+        collecting calls it with nothing, taking its `collect` default.
+        """
+        calls = []
+
+        class Recording(LazyFrameSource):
+            def materialize(self, method="collect", *args, **kwargs):
+                calls.append(method)
+                return super().materialize(method, *args, **kwargs)
+
+        source = Recording(pl.LazyFrame({"a": [1]}))
+        source.stream_tabular(tmp_path / "streamed.parquet", "parquet")
+        source.write_tabular(tmp_path / "written.parquet", "parquet")
+
+        assert calls == ["sink_parquet", "collect"]
+
     @pytest.mark.parametrize("format", list(DataFormat))
     def test_tabular_kwargs_are_empty_for_every_format(self, format):
         """A source with no variable behind it, like a crosswalk or the dataset list, adds

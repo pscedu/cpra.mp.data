@@ -1,7 +1,7 @@
 from fastapi import HTTPException
 from polars.exceptions import ColumnNotFoundError
 
-from cpra.mp.data.analysis.io.raster_io import timing
+from cpra.mp.data.analysis.io import output
 
 
 class LazyFrameSource:
@@ -27,25 +27,20 @@ class LazyFrameSource:
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Dataset does not exist")
 
-    @timing
     def stream_tabular(self, out_path, format, *args, **kwargs):
-        sink_method = {
-            "arrow": "sink_ipc",
-            "csv": "sink_csv",
-            "ndjson": "sink_ndjson",
-            "parquet": "sink_parquet",
-        }[format]
-        # TODO: Set parquet compression and row group parameters.
-        self.materialize(sink_method, out_path, *args, **kwargs)
+        """Sink the frame to `out_path` without materializing it.
 
-    @timing
+        The writing is `io.output.stream_tabular`, which owns the format -> `sink_*` method
+        table and the `@timing` wrapper. What this class contributes is `materialize`:
+        `io.output`'s two writers take the materialize callable as a parameter exactly so
+        the caller keeps ownership of how a failed collect is reported, and this one
+        reports it as an `HTTPException` -- which `io.output` could not raise itself, since
+        nothing under `analysis/` may import FastAPI.
+        """
+        output.stream_tabular(self.materialize, out_path, format, *args, **kwargs)
+
     def write_tabular(self, out_path, format, *args, **kwargs):
-        write_method = {
-            "arrow": "write_ipc",
-            "csv": "write_csv",
-            "ndjson": "write_ndjson",
-            "parquet": "write_parquet",
-        }[format]
-        # TODO: Set parquet compression and row group parameters.
-        df = self.materialize()
-        getattr(df, write_method)(out_path, *args, **kwargs)
+        """Collect the frame and write it to `out_path`. See `stream_tabular` for what
+        `io.output` owns here and what this class adds.
+        """
+        output.write_tabular(self.materialize, out_path, format, *args, **kwargs)
