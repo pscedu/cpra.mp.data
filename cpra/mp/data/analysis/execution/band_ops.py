@@ -194,14 +194,14 @@ from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp, calculate_la
 __all__ = [
     "JOIN_OPERAND_COLUMN",
     "PAIRING_KEY_EXCLUDED_COLUMNS",
-    "mask_value_band_wide",
-    "pair_and_mask_band_wide",
-    "select_dimension_band_wide",
-    "sample_grid_cells_band_wide",
-    "filter_band_wide",
     "calculate_band_wide",
+    "filter_band_wide",
     "group_band_wide",
     "join_band_wide",
+    "mask_value_band_wide",
+    "pair_and_mask_band_wide",
+    "sample_grid_cells_band_wide",
+    "select_dimension_band_wide",
 ]
 
 # The metadata column `join_band_wide` adds recording which operand (step name)

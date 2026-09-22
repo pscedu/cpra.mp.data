@@ -67,11 +67,11 @@ from cpra.mp.data.analysis.request.errors import ShapeError
 __all__ = [
     "DEFAULT_NODATA",
     "apply_output_shaping",
-    "sink_tabular",
-    "write_raster",
-    "render_tile",
     "empty_tile",
+    "render_tile",
+    "sink_tabular",
     "sink_vector_tile",
+    "write_raster",
 ]
 
 #: The sentinel a raster sink falls back to when neither an explicit `nodata=` argument
@@ -120,7 +120,7 @@ def apply_output_shaping(lf: LongFrame, output) -> LongFrame:
 
     if sort:
         parts = [part.strip() for part in sort.split(",") if part.strip()]
-        columns = [part[1:] if part.startswith("-") else part for part in parts]
+        columns = [part.removeprefix("-") for part in parts]
         descending = [part.startswith("-") for part in parts]
         lf = lf.sort(columns, descending=descending)
 
@@ -156,8 +156,8 @@ def _materialize_closure(lf: LongFrame):
     return materialize
 
 
-def sink_tabular(lf: LongFrame, out_path, format, *, float_precision=None, **profile_options) -> None:
-    """Write `lf` to `out_path` as `format` (`csv`/`ndjson`/`parquet` -- `DataFormat`'s
+def sink_tabular(lf: LongFrame, out_path, data_format, *, float_precision=None, **profile_options) -> None:
+    """Write `lf` to `out_path` as `data_format` (`csv`/`ndjson`/`parquet` -- `DataFormat`'s
     tabular members, which are exactly the keys `io.output.SINK_METHODS` carries), always
     lazily (`io.output.stream_tabular`) -- this sink never materializes the whole frame
     first. `io.output.write_tabular` is the eager, collect-first alternative, reached
@@ -166,17 +166,17 @@ def sink_tabular(lf: LongFrame, out_path, format, *, float_precision=None, **pro
     here.
 
     `float_precision` is forwarded to `io.output.tabular_kwargs`, which only ever uses it
-    for `format == "csv"` -- see that function's own docstring. `**profile_options` is
+    for `csv` -- see that function's own docstring. `**profile_options` is
     forwarded straight through to the underlying Polars writer -- `compression`/
     `compression_level` for `parquet`, landing here as the plain values `run_to_path`'s
     caller already resolved from a request's own compression choice (see `api.pipeline
     .PipelineTabularSource`'s docstring for why those arrive as plain values rather than
     an `api.models.Compression` object).
     """
-    kwargs = tabular_kwargs(format, float_precision)
+    kwargs = tabular_kwargs(data_format, float_precision)
     kwargs.update(profile_options)
     materialize = _materialize_closure(lf)
-    stream_tabular(materialize, out_path, format, **kwargs)
+    stream_tabular(materialize, out_path, data_format, **kwargs)
 
 
 # ----------------------------------------------------------------------------------------
@@ -302,16 +302,16 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
         [df.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False) for name in band_names]
     ).reshape(len(band_names), read_height, read_width)
 
-    profile = dict(
-        driver="GTiff",
-        height=read_height,
-        width=read_width,
-        count=len(band_names),
-        dtype=out_dtype,
-        crs=window.crs,
-        transform=window.transform,
-        nodata=nodata,
-    )
+    profile = {
+        "driver": "GTiff",
+        "height": read_height,
+        "width": read_width,
+        "count": len(band_names),
+        "dtype": out_dtype,
+        "crs": window.crs,
+        "transform": window.transform,
+        "nodata": nodata,
+    }
     profile.update(profile_options)
 
     with rasterio.open(out_path, "w", **profile) as dst:
@@ -327,7 +327,7 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
 # ----------------------------------------------------------------------------------------
 
 
-def _encode_tile_image(color: np.ndarray, format) -> bytes:
+def _encode_tile_image(color: np.ndarray, image_format) -> bytes:
     """Encode one `(tile_size, tile_size, 4)` RGBA array as `png`/`jpg` bytes.
 
     Shared by `render_tile` and `empty_tile` so the blank tile a caller sends for a miss is
@@ -342,15 +342,15 @@ def _encode_tile_image(color: np.ndarray, format) -> bytes:
     (`Image.fromarray` infers RGB vs RGBA from the array's own shape; passing `mode=`
     explicitly is deprecated as of Pillow 11.)
     """
-    image = Image.fromarray(color[:, :, :3] if format == "jpg" else color)
+    image = Image.fromarray(color[:, :, :3] if image_format == "jpg" else color)
     with BytesIO() as memfile:
-        image.save(memfile, format=("JPEG" if format == "jpg" else "PNG"))
+        image.save(memfile, format="JPEG" if image_format == "jpg" else "PNG")
         return memfile.getvalue()
 
 
-def empty_tile(format, tile_size: int = DEFAULT_TILE_SIZE) -> bytes:
-    """A blank `tile_size`-square tile of `format` -- the body a caller pairs with the 404
-    it sends when `render_tile` returned `None`.
+def empty_tile(image_format, tile_size: int = DEFAULT_TILE_SIZE) -> bytes:
+    """A blank `tile_size`-square tile of `image_format` -- the body a caller pairs with
+    the 404 it sends when `render_tile` returned `None`.
 
     The status code is the route's decision, not this module's; what this exists for is that
     a 404 on an image URL should still carry a decodable image. A client that requested
@@ -363,10 +363,18 @@ def empty_tile(format, tile_size: int = DEFAULT_TILE_SIZE) -> bytes:
     A caller sending this for a MISSING tile and a caller rendering a real one both go
     through `_encode_tile_image`, so the two cannot drift in format or in size.
     """
-    return _encode_tile_image(np.zeros((tile_size, tile_size, 4), dtype="uint8"), format)
+    return _encode_tile_image(np.zeros((tile_size, tile_size, 4), dtype="uint8"), image_format)
 
 
-def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_map=None, variable_legend=None, nodata=DEFAULT_NODATA) -> bytes | None:
+def render_tile(
+    band_wide: BandWideFrame,
+    tile: TileRequest,
+    image_format,
+    *,
+    color_map=None,
+    variable_legend=None,
+    nodata=DEFAULT_NODATA,
+) -> bytes | None:
     """Render one `png`/`jpg` map tile from an already-executed band-wide result.
 
     `band_wide` is exactly what `execution.execute.execute` returns for a plan compiled
@@ -457,7 +465,7 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
     )
 
     legend = resolve_legend(color_map, variable_legend)
-    return _encode_tile_image(legend.colorize_pixels(tile_data), format)
+    return _encode_tile_image(legend.colorize_pixels(tile_data), image_format)
 
 
 # ----------------------------------------------------------------------------------------

@@ -281,8 +281,10 @@ def resolve_raster_point_labels(grid_name: str, tokens: list[str]) -> dict[int, 
     This is a deliberate departure from the long-standing raster point-query convention
     of relabeling columns as `f"{x!s},{y!s}"` over the PARSED floats, which reformats e.g.
     `"-90.10"` down to `"-90.1"`: a caller joining the response back to its own request
-    needs the EXACT string it sent, not a value that has been through a float and back. A caller that names the same point twice, or two points that resolve to
-    the same pixel, gets both of their original label strings back in that one id's list --
+    needs the EXACT string it sent, not a value that has been through a float and back.
+
+    A caller that names the same point twice, or two points that resolve to the same
+    pixel, gets both of their original label strings back in that one id's list --
     `relabel_raster_grid_cell` fans them back out into one row apiece. Nothing here
     deduplicates by pixel the way a vector grid's ID-labeled output does, where two
     coordinates landing in the same polygon collapse to that one id: the raster

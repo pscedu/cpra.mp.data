@@ -168,7 +168,7 @@ def _check_column_namespace(expr, allowed_columns):
     referenced = set(expr.meta.root_names())
     disallowed = referenced - set(allowed_columns)
     if disallowed:
-        token = sorted(disallowed)[0]
+        token = min(disallowed)
         raise ExpressionError(f"column '{token}' is not in the allowed namespace {sorted(allowed_columns)}")
 
 
@@ -210,6 +210,17 @@ def parse_value_expr(expr_str, allowed_columns, *, reject_aggregates=True):
 
     _check_column_namespace(expr, allowed_columns)
     return expr
+
+
+def _is_word_char(ch):
+    """Whether `ch` can sit inside a SQL identifier, which is what makes an adjacent
+    "and" part of a longer word (`band`, `and_count`) rather than the operator.
+
+    A module-level `def` rather than the lambda this used to be, bound inside
+    `split_top_level_and`'s innermost branch: rebinding the same two-term test on every
+    candidate "and" was never the point, and a named function says what it tests.
+    """
+    return ch.isalnum() or ch == "_"
 
 
 def split_top_level_and(where_str):
@@ -258,8 +269,7 @@ def split_top_level_and(where_str):
         if depth == 0 and where_str[i : i + 3].lower() == "and":
             before = where_str[i - 1] if i > 0 else " "
             after = where_str[i + 3] if i + 3 < n else " "
-            is_word_char = lambda c: c.isalnum() or c == "_"  # noqa: E731
-            if not is_word_char(before) and not is_word_char(after):
+            if not _is_word_char(before) and not _is_word_char(after):
                 conjuncts.append(where_str[start:i])
                 i += 3
                 start = i

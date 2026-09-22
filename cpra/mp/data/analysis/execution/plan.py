@@ -644,10 +644,14 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 vector_columns_ok[origin] = True
             new_dimensions = by_set if incoming.dimensions is None else (incoming.dimensions & by_set)
             new_grid_cell = incoming.grid_cell and ("grid_cell" in by_set)
-            states[op.output] = _Validity(origin=origin, value=False, dimensions=new_dimensions, grid_cell=new_grid_cell)
+            states[op.output] = _Validity(
+                origin=origin, value=False, dimensions=new_dimensions, grid_cell=new_grid_cell
+            )
             continue
 
-        raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")  # pragma: no cover -- exhaustive over the Op union
+        # Unreachable: the branches above are exhaustive over the `Op` union, which is why
+        # this line is excluded from coverage rather than exercised by a test.
+        raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")  # pragma: no cover
 
     raster_band_metadata: dict[str, pl.DataFrame] = {}
     for name in raster_origins:

@@ -56,7 +56,7 @@ def timing(func):
         start = time()
         result = func(*args, **kwargs)
         if DEBUG:
-            print("func:%r args:[%r, %r] took: %2.4f sec" % (func.__name__, args, kwargs, time() - start))
+            print(f"func:{func.__name__!r} args:[{args!r}, {kwargs!r}] took: {time() - start:2.4f} sec")
         return result
 
     return wrapped
@@ -516,8 +516,9 @@ def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, 
             mem.write(data)
         # Reopened read-only: rasterio deprecates warping a dataset that is still open for
         # writing, and the written bytes are already complete once the block above exits.
-        with memfile.open() as mem:
-            with WarpedVRT(
+        with (
+            memfile.open() as mem,
+            WarpedVRT(
                 mem,
                 crs=TILE_CRS,
                 transform=tile_transform,
@@ -528,8 +529,9 @@ def _warp_array_to_tile(data, array_transform, src_crs, tile_bounds, tile_size, 
                 add_alpha=False,
                 dtype=dtype,
                 resampling=resampling,
-            ) as vrt:
-                return vrt.read()
+            ) as vrt,
+        ):
+            return vrt.read()
 
 
 def warp_window_to_tile(

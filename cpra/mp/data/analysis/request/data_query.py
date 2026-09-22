@@ -26,7 +26,8 @@ needs `io/catalog.py`/`io/geography.py`, which is `io/`'s job, and `request/` ma
   literal IDs" needs nothing but the string itself.
 - Anything else -- a coordinate pair, or any `grid_cell` value on a raster dataset, which
   is *always* coordinates (see `api/data_query.py`'s module docstring on why the raster
-  branch never applies the digit rule) -- is the caller's problem to resolve first. Pass the already-resolved spatial `where` conjunct as `grid_cell_where`
+  branch never applies the digit rule) -- is the caller's problem to resolve first. Pass
+  the already-resolved spatial `where` conjunct as `grid_cell_where`
   (e.g. `"grid_cell IN (1, 2)"`, or `"grid_cell != grid_cell"` for "matched nothing") and
   this function uses it verbatim instead of trying to parse `options.grid_cell` itself.
   `grid_cell_where`, when given, entirely REPLACES this module's own `options.grid_cell`
@@ -39,9 +40,14 @@ needs `io/catalog.py`/`io/geography.py`, which is `io/`'s job, and `request/` ma
 
 from datetime import date
 
-from cpra.mp.data.analysis.request.parameters import BaseFilterDimensions, DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.expressions import split_top_level_and
+from cpra.mp.data.analysis.request.parameters import (
+    BaseFilterDimensions,
+    DataOptions,
+    DatasetDimensions,
+    FilterDimensions,
+)
 from cpra.mp.data.analysis.request.pipeline import FilterStep, InputSelection, Output, Pipeline, validate_pipeline
 from cpra.mp.data.analysis.request.types import dimension_type
 
@@ -100,10 +106,10 @@ def grid_cell_conjunct(grid_cell: str) -> str:
     `execution.long_ops.filter_long`'s docstring; `tests/api/test_execution_plan.py` pins
     `where: "grid_cell = 7"`, unquoted, as the real usage). Every token must be a plain
     (unsigned, non-decimal) digit string, the same rule a vector grid uses to tell a
-    literal ID apart from a coordinate -- anything else must be resolved by the caller and passed as this function's caller's
-    own `grid_cell_where` instead (see the module docstring); reaching this function with
-    a non-digit token is therefore a caller error, not a user-input error, and is reported
-    as such.
+    literal ID apart from a coordinate -- anything else must be resolved by the caller and
+    passed as its own `grid_cell_where` instead (see the module docstring); reaching this
+    function with a non-digit token is therefore a caller error, not a user-input error,
+    and is reported as such.
 
     Public, rather than private to `build_data_query_pipeline` below, because the named-
     analysis registry (`cpra/mp/data/analyses/base.py`) composes its own leading `filter`

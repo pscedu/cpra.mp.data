@@ -100,7 +100,8 @@ import polars as pl
 from polars.io.plugins import register_io_source
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
-from rasterio.windows import Window, transform as window_transform
+from rasterio.windows import Window
+from rasterio.windows import transform as window_transform
 
 from cpra.mp.data.analysis.io.raster_io import batched_windows, raster_blocks_per_batch, raster_gdal_env
 from cpra.mp.data.analysis.io.window import ReadWindow

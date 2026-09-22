@@ -34,7 +34,7 @@ chaining and `as` rules `parse_pipeline` already enforced), never shape validity
 
 import dataclasses
 from enum import Enum
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -42,6 +42,7 @@ from cpra.mp.data.analysis.request import aggregates
 from cpra.mp.data.analysis.request.errors import AggregateError, RequestError, ShapeError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.pipeline import (
+    RASTER_OUTPUT_FORMATS,
     CalculateStep,
     FilterStep,
     GroupStep,
@@ -49,7 +50,6 @@ from cpra.mp.data.analysis.request.pipeline import (
     JoinStep,
     Pipeline,
     ProjectStep,
-    RASTER_OUTPUT_FORMATS,
     _step_explicit_inputs,
 )
 from cpra.mp.data.analysis.request.types import AggregateFunction, Grid
@@ -136,7 +136,7 @@ class GroupOp(BaseModel):
 
 
 Op = Annotated[
-    Union[ProjectOp, JoinOp, FilterOp, CalculateOp, GroupOp],
+    ProjectOp | JoinOp | FilterOp | CalculateOp | GroupOp,
     Field(discriminator="op"),
 ]
 
@@ -356,7 +356,9 @@ def _type_project(step_no: int, step: ProjectStep | ProjectOp, current: FrameTyp
             )
         has_count_by_value = True
 
-    return FrameType(shape=out_shape, grid=step.to, has_count_by_value=has_count_by_value, value_columns=frozenset({"value"}))
+    return FrameType(
+        shape=out_shape, grid=step.to, has_count_by_value=has_count_by_value, value_columns=frozenset({"value"})
+    )
 
 
 def _type_filter(step: FilterStep | FilterOp, current: FrameType) -> FrameType:

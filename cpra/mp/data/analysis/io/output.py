@@ -15,6 +15,8 @@ holds no compiled object to reach these through.
 `HTTPException`, since `cpra.mp.data.analysis` may not import FastAPI.
 """
 
+import re
+
 import polars as pl
 
 from cpra.mp.data.analysis.io.raster_io import timing
@@ -43,8 +45,20 @@ WRITE_METHODS = {
     "parquet": "write_parquet",
 }
 
+#: The color spellings `Legend.colorize_pixels` can actually decode: an optional `#`, then
+#: either six hex digits (`rrggbb`, which it pads to opaque) or eight (`rrggbbaa`).
+#:
+#: Checked here because `colorize_pixels` does not check at all -- it slices the string
+#: into byte pairs and calls `int(pair, 16)`, so anything else raises a bare `ValueError`
+#: deep inside a tile render, which surfaces as a 500 for what is plainly a malformed
+#: request. Validating the custom map where it is PARSED makes it a `RequestError` -> 400
+#: like the three rejections already in `resolve_legend`, and it only applies to the
+#: custom branch: a named `LEGENDS` entry and a variable's own declared legend are this
+#: package's own data, not caller input.
+_CUSTOM_COLOR_RE = re.compile(r"#?(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\Z")
 
-def tabular_kwargs(format, float_precision):
+
+def tabular_kwargs(data_format, float_precision):
     """Round CSV output to the variable's `float_precision`, when it sets one.
 
     CSV only: it's the one writer polars gives a `float_precision`, and the only format
@@ -57,13 +71,13 @@ def tabular_kwargs(format, float_precision):
     would change the number in the binary formats too, where the request asked for the
     stored value.
     """
-    if format == DataFormat.csv and float_precision is not None:
+    if data_format == DataFormat.csv and float_precision is not None:
         return {"float_precision": float_precision}
     return {}
 
 
 @timing
-def stream_tabular(materialize, out_path, format, *args, **kwargs):
+def stream_tabular(materialize, out_path, data_format, *args, **kwargs):
     """Sink the frame to `out_path` without materializing it.
 
     `materialize` is the caller's own materialize callable, passed in rather than an
@@ -76,16 +90,16 @@ def stream_tabular(materialize, out_path, format, *args, **kwargs):
     Row-group sizing is not among them: nothing upstream resolves or forwards a row-group
     parameter today, so `sink_parquet` runs on its own default.
     """
-    materialize(SINK_METHODS[format], out_path, *args, **kwargs)
+    materialize(SINK_METHODS[data_format], out_path, *args, **kwargs)
 
 
 @timing
-def write_tabular(materialize, out_path, format, *args, **kwargs):
+def write_tabular(materialize, out_path, data_format, *args, **kwargs):
     """Collect the frame and write it to `out_path`. See `stream_tabular` for `materialize`
     and for what `*args`/`**kwargs` (and row-group sizing's absence from them) means here.
     """
     df = materialize()
-    getattr(df, WRITE_METHODS[format])(out_path, *args, **kwargs)
+    getattr(df, WRITE_METHODS[data_format])(out_path, *args, **kwargs)
 
 
 def resolve_legend(color_map, variable_legend) -> Legend:
@@ -95,7 +109,9 @@ def resolve_legend(color_map, variable_legend) -> Legend:
     `continuous:<value>,<color>,...` or `discrete:<color>,<value>,...` -- the two
     orderings differ because a continuous map is a list of (stop value, color) pairs while
     a discrete one is a list of (color, upper bound) pairs, whose last bound is open-ended
-    and therefore appended as `None` here.
+    and therefore appended as `None` here. Both halves of a custom map are validated: the
+    colors against `_CUSTOM_COLOR_RE` and the values as floats, since a custom map is the
+    only legend built from caller input and `Legend` itself checks neither.
 
     Anything else is a lookup: a named `LEGENDS` entry, else the variable's own declared
     legend (`variable_legend`, `None` when it declares none), else `LEGENDS["default"]`.
@@ -116,7 +132,9 @@ def resolve_legend(color_map, variable_legend) -> Legend:
             colors = color_strs[::2]
             value_strs = color_strs[1::2]
 
-        # TODO: Check that the color strings are valid.
+        for color in colors:
+            if not _CUSTOM_COLOR_RE.match(color):
+                raise RequestError(f"invalid color map color: {color}")
 
         try:
             values = [float(val) for val in value_strs]
@@ -130,6 +148,6 @@ def resolve_legend(color_map, variable_legend) -> Legend:
         if len(values) != len(colors):
             raise RequestError("mismatched colors and values in color map")
 
-        return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
+        return Legend("custom", pl.DataFrame({"color": colors, "upper_bound": values}), type=map_type)
 
     return LEGENDS.get(color_map) or variable_legend or LEGENDS["default"]

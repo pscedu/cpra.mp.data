@@ -233,9 +233,9 @@ from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 __all__ = [
     "ZONE_COLUMN",
     "ZoneSource",
-    "project_vector_to_vector",
     "project_raster_to_vector",
     "project_vector_to_raster",
+    "project_vector_to_vector",
 ]
 
 # Aggregates that read a `scale_factor`-weighted `value` -- see the module docstring for
@@ -475,6 +475,7 @@ class ZoneSource(NamedTuple):
 
     lf: pl.LazyFrame
     window: ReadWindow
+
 
 #: The column an unpivot puts a band's own `b<i>` name in, and the key the per-band
 #: dimension values are then joined back on. Internal to the reshape: dropped before the

@@ -8,6 +8,7 @@ none of this depends on which ops ran or in what order, so a plain frame is enou
 pin its behavior.
 """
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -151,6 +152,40 @@ class TestResolveLegend:
             resolve_legend("sideways:#ff0000,1", None)
         assert str(excinfo.value) == "invalid color map type: sideways"
         assert resolve_status(excinfo.value) == 400
+
+    @pytest.mark.parametrize("color", ["#fff", "red", "#ff00zz", "", "#ff0000f", "#ff0000fff"])
+    def test_an_undecodable_color_is_rejected_as_a_bad_request(self, color):
+        """`Legend.colorize_pixels` decodes a color by slicing it into byte pairs and
+        calling `int(pair, 16)`, which raises a bare `ValueError` on anything that is not
+        6 or 8 hex digits -- and it raises it mid-render, long after the request was
+        accepted, so the caller sees a 500 for what is plainly a malformed request. The
+        custom branch is the only legend built from caller input, so it is checked where
+        it is parsed.
+
+        Three-digit shorthand (`#fff`) is in this list on purpose: it LOOKS valid and is
+        valid CSS, but `colorize_pixels` pads it to `"fffff"`, whose fourth byte pair is
+        the empty string -- so accepting it would be accepting a crash.
+        """
+        with pytest.raises(RequestError) as excinfo:
+            resolve_legend(f"continuous:0,{color}", None)
+        assert str(excinfo.value) == f"invalid color map color: {color}"
+        assert resolve_status(excinfo.value) == 400
+
+    @pytest.mark.parametrize("color", ["#ff0000", "ff0000", "#00000000", "00000000", "#AbCdEf"])
+    def test_an_accepted_color_survives_all_the_way_through_colorize_pixels(self, color):
+        """The complement of the rejection above, checked by actually DECODING rather than
+        by re-stating the regex: `#` is optional, case is irrelevant, and the 8-digit
+        `rrggbbaa` form has to survive -- `visualizations/map.py` builds its difference
+        ramp with a literal `#00000000` transparent stop, so rejecting that spelling would
+        break the map rather than protect it.
+
+        The check is `colorize_pixels` itself because that is the function the validation
+        exists to keep from raising; a regex that agreed with a second regex would prove
+        nothing about it.
+        """
+        legend = resolve_legend(f"continuous:0,{color},10,#0000ff", None)
+        assert legend.break_points["color"].to_list() == [color, "#0000ff"]
+        assert legend.colorize_pixels(np.array([[[0.0]]])).shape[-1] == 4
 
     def test_a_non_numeric_value_is_rejected(self):
         with pytest.raises(RequestError) as excinfo:

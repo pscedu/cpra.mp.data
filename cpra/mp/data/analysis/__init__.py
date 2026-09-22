@@ -9,12 +9,14 @@ above it and never the other way round:
   file and knows no crosswalk.
 * `io/` -- how bytes are read. Rasters (`io.raster`/`io.raster_io`), vectors
   (`io.vector`), crosswalks (`io.crosswalk_read`), the dataset catalog (`io.catalog`),
-  grid geometry and coordinate resolution (`io.geography`), and tabular output
-  (`io.output`).
+  grid geometry and coordinate resolution (`io.geography`), the description of one
+  windowed raster read (`io.window`, whose `ReadWindow` the algebra above carries
+  through unchanged), and tabular output (`io.output`).
 * `execution/` -- how a `Pipeline` runs. Compiles it to an `ExecutionPlan`
   (`execution.plan`), walks that plan over long and band-wide frames
   (`execution.execute`, `execution.long_ops`, `execution.band_ops`,
-  `execution.project`), and writes the result (`execution.sink`).
+  `execution.project`, over the frame contract in `execution.frame` and the group-by
+  folding rule in `execution.fold`), and writes the result (`execution.sink`).
 * the HTTP binding, which does NOT live here -- see `cpra.mp.data.api`.
 
 Nothing under this package may import FastAPI -- see `tests/api/test_analysis_boundary.py`,

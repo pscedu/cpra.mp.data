@@ -245,7 +245,7 @@ class GroupStep(BaseModel):
 
 
 Step = Annotated[
-    Union[ProjectStep, JoinStep, FilterStep, CalculateStep, GroupStep],
+    ProjectStep | JoinStep | FilterStep | CalculateStep | GroupStep,
     Field(discriminator="op"),
 ]
 
@@ -449,7 +449,7 @@ def _validate_output_sort_or_select(value: str, field: str) -> None:
                 f"output.select entry {stripped!r} must not start with '-' -- the "
                 "descending-sort prefix is only meaningful for output.sort"
             )
-        column = stripped[1:] if stripped.startswith("-") else stripped
+        column = stripped.removeprefix("-")
         if not column:
             raise RequestError(f"output.{field}={value!r} contains a bare '-' with no column named")
         if column in seen:

@@ -124,9 +124,9 @@ def should_fold_group_by(
       crosswalk before `apply_summarize`'s own group_by runs). `grid_cell` itself is
       deliberately NOT one of these any more: it narrows the OUTPUT, applied terminally
       after every group_by in the walk has already run, so by the time any group_by
-      reaches this function it has not dropped a single row yet. Measured case: the identical high-cardinality group-by with a
-      genuinely selective filter already runs in 0.1 s / 285 MB, so folding it too would
-      only add overhead for no benefit.
+      reaches this function it has not dropped a single row yet. Measured case: the
+      identical high-cardinality group-by with a genuinely selective filter already runs
+      in 0.1 s / 285 MB, so folding it too would only add overhead for no benefit.
 
     The rule: fold if and only if the key includes a high-cardinality column AND there is
     no selective filter already bounding the input. This is deliberately conservative in
