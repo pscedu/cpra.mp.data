@@ -19,7 +19,6 @@ from rasterio.warp import transform_bounds
 
 from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
 from cpra.mp.data.analysis.request.errors import RequestError
-from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.config import (
     DEBUG,
     RASTER_BATCH_BUFFER_MB,
@@ -28,21 +27,6 @@ from cpra.mp.data.config import (
     RASTER_NUM_THREADS,
 )
 from cpra.mp.data.grids import GRIDS
-
-RASTER_COMPRESSION_ALGORITHMS = [
-    CompressionAlgorithm.deflate,
-    CompressionAlgorithm.lzw,
-    CompressionAlgorithm.lzma,
-    CompressionAlgorithm.none,
-    CompressionAlgorithm.zstd,
-]
-
-TABULAR_COMPRESSION_ALGORITHMS = [
-    CompressionAlgorithm.gzip,
-    CompressionAlgorithm.lz4,
-    CompressionAlgorithm.none,
-    CompressionAlgorithm.zstd,
-]
 
 
 def unpack_values(values_str, param_name, choices=None, separator=","):
