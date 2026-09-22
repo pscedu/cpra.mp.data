@@ -11,9 +11,9 @@ deliberately faithful carry-overs of numerically fussy leaf logic that predates 
 package, rather than improvements made in passing; rewriting them would re-derive bugs
 that were expensive to find the first time.
 
-`project` has no long-shape entry here on purpose: `project` is the one op that CHANGES
-shape (`request.ops.PROJECT_LOWERING_TABLE`), so it has no single-shape lowering the way
-the other four do, and this vertical slice does not lower it at all yet.
+`project` has no entry here on purpose: `project` is the one op that CHANGES shape
+(`request.ops.PROJECT_LOWERING_TABLE`), so it has no single-shape lowering the way the
+other four do. Its lowerings live in `execution/project.py`, one per direction.
 """
 
 import polars as pl

@@ -3,9 +3,9 @@
 Every function under `request/` raises out of this family -- an ordinary `ValueError`
 subclass hierarchy, never `HTTPException`, never a FastAPI import -- so the family stays
 usable wherever a `Pipeline` gets parsed or validated, API route or not. A single
-boundary -- to be written wherever this package is eventually mounted on a transport, and
-deliberately absent here -- maps a caught member of this family onto a transport response,
-using the exception's own TYPE to decide how: a caller that already knows a failure's
+boundary -- installed wherever this package is mounted on a transport, and deliberately
+absent from this package itself -- maps a caught member of this family onto a transport
+response, using the exception's own TYPE to decide how: a caller that already knows a failure's
 request-level meaning (a shape mismatch is always a bad request; a lookup with nothing to
 find is always "not found") expresses that by raising the matching subclass, rather than
 attaching a status code as an afterthought at the point something is raised.

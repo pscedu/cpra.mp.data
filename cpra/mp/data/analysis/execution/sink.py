@@ -34,9 +34,9 @@ raster) despite both being requests against a raster frame.
 What this module does NOT do: decide `resolve_output_type` (that is structural, from the
 frame's own shape, computed once in `io.output`); re-check anything `request.ops.
 validate_shapes` already rejects (a long frame under a raster-only format, more than one
-value column reaching here); or translate an exception into a transport response (an HTTP
-route's job, not written yet -- see `execution.execute`'s own docstring on the same point
-for `LoweringNotImplementedError`).
+value column reaching here); or translate an exception into a transport response (the
+error boundary a route installs -- `api/boundary.py`, named again at the one place below
+where the distinction decides what this module does).
 """
 
 import gzip

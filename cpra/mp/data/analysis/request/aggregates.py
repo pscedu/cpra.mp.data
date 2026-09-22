@@ -16,7 +16,7 @@ read the identical `DECOMPOSABLE_AGGREGATES` set, so there is exactly one place 
 of which aggregates fold can drift; only the trivial "not in the set: raise" wrapper is
 duplicated, once per layer, each raising that layer's own exception type.
 
-SCOPE NOTE: this module does not yet carry the `mean` (sum, count) accumulator pair or
+SCOPE NOTE: this module deliberately does not carry the `mean` (sum, count) accumulator pair or
 `count_by_value`'s partial-fold accumulator -- both are execution machinery, not a
 vocabulary fact, and so belong with `execution/fold.py`'s own aggregate lowering rather
 than here.

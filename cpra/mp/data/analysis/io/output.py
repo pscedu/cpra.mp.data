@@ -136,8 +136,9 @@ def resolve_output_type(grid_type, *, grid_cell, summarize_by) -> OutputType:
 
     Not simply `grid_type`: a raster grid still answers as `vector` once `grid_cell`
     (pointwise sampling) or `summarize_by` (zonal summarize) narrows it to a tabular
-    result, which is why `tiles.validate_raster_tile`/`tiles.validate_vector_tile` check
-    this rather than which analysis class produced the frame.
+    result. That is a statement about the FRAME rather than about which analysis produced
+    it -- `request.ops.validate_shapes` reaches the same verdict by typing the frame
+    through the ops themselves, and is what the routes enforce against.
     """
     if grid_type == "vector" or grid_cell or summarize_by:
         return OutputType.vector

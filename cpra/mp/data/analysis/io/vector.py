@@ -20,11 +20,10 @@ partitioning, dataset-dimension literal columns, required-column projection) -- 
 than re-deriving any of that a second time here.
 
 `columns`/`predicate` are the pushdown seam `execution/plan.py`'s `ResolvedInput` carries:
-nothing computes a real projection/predicate decision yet, but the scan already knows
-how to use one once a plan supplies it, via
-an ordinary `.select`/`.filter` Polars can push into partition pruning and row-group
-statistics -- see that module's own docstring for why the decision lives on the plan
-rather than being invented here.
+`compile_plan` decides both and `execution/execute.py` passes them in, and the scan spends
+them as an ordinary `.select`/`.filter` Polars can push into partition pruning and
+row-group statistics -- see that module's own docstring for why the decision lives on the
+plan rather than being invented here.
 
 `io` may import `request` (used here only for `InputSelection`'s type) but never
 `execution` -- see `tests/api/test_analysis_layering.py`.

@@ -1,5 +1,5 @@
 """Turn a plain data query -- the flat `DatasetDimensions`/`FilterDimensions`/`DataOptions`
-triple the `/v1/datasets/{variable}/{time_unit}/{grid}` routes accept -- into a NEW-engine
+triple the `/v1/datasets/{variable}/{time_unit}/{grid}` routes accept -- into a
 `request.pipeline.Pipeline`, the one thing `api/pipeline.py`'s `respond_to_analysis*`
 functions know how to answer.
 

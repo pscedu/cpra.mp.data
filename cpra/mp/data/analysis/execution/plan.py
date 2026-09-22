@@ -260,11 +260,11 @@ undecimated window is fully determined by the raster grid itself, which already 
 `bounds`, `height`, `width` and `crs` (`cpra.mp.data.grids.RasterGrid`); the transform
 follows from `from_bounds(*bounds, width, height)`, and `batch_layout` is legitimately
 empty when no batch was ever read. So an empty band-wide frame for a zero-band selection
-is constructible without opening a file, and the grid is where its window should come
-from. Nothing reaches this combination today only because `execute` does not yet dispatch
-band-wide ops to `execution.band_ops` (which has implemented them); whoever wires that up
-owns building the empty frame, and should take the window from the grid rather than
-weakening the empty-result rule.
+is constructible without opening a file, and the grid is where its window comes from:
+`execution.execute._grid_read_window` is that construction, and is how a zero-BAND origin
+already gets a window rather than a `ValueError`. What it does not settle is the shape
+above -- a join group with no raster origin AT ALL has no shared read to build in the
+first place, which is a different gap with a different answer.
 
 **Compile still opens no data file for a vector input** -- `io.vector.scan_vector` is
 never called here, matching the request layer's own "no IO at plan time" property. A

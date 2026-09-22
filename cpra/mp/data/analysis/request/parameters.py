@@ -79,13 +79,13 @@ class DataOptions(BaseModel):
     # `where` accepted) and VALUE conditions (against actual pixel/cell VALUES, written
     # against the placeholder column `value` -- historically the separate, now-retired
     # `value_where` parameter), AND-ed together in one string, e.g.
-    # `calendar_year > 2040 AND value > 3`. `api.expressions.classify_where` splits
+    # `calendar_year > 2040 AND value > 3`. `request.expressions.classify_where` splits
     # `where` on top-level `AND` and sorts each conjunct by which kind it is: a dimension
     # conjunct is handed to `lf.sql()` largely unrestricted, the same as always; a value
-    # conjunct is parsed through `api.expressions.parse_value_expr`'s restricted
+    # conjunct is parsed through `request.expressions.parse_value_expr`'s restricted
     # whitelist instead, since it runs on the hot per-row path an aggregate or a subquery
-    # inside it can force off of streaming pushdown entirely -- see `api/expressions.py`'s
-    # module docstring. A single AND-term may not reference both kinds (rejected with an
+    # inside it can force off of streaming pushdown entirely -- see that module's own
+    # docstring. A single AND-term may not reference both kinds (rejected with an
     # error explaining the rule); write dimension and value conditions as separate AND-ed
     # conjuncts instead.
     #

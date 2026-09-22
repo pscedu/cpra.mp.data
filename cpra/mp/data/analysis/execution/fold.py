@@ -24,8 +24,8 @@ The fix: cut the input by row offset instead of asking one `group_by` to see it 
 `.slice()` lands against -- see `fold_group_by`'s docstring for why the fold is only a
 memory fix (not also a slowdown) when slice sits directly on the scan. A caller that needs
 a filter or join to run too (the crosswalk reaggregation site does) supplies
-`chunk_transform`, applied to each already-sliced chunk -- the same slice-then-filter
-order `vector._scale_and_join` uses, and for the same reason: a join or
+`chunk_transform`, applied to each already-sliced chunk -- the same slice-then-join order
+`execution/project.py`'s vector-to-vector reaggregation uses, and for the same reason: a join or
 row-dropping filter placed BEFORE the slice would size the slice against the join's
 (potentially larger, fanned-out) output instead of against the source rows this module's
 `step` default was actually measured against. Every `.collect()` in this module forces
@@ -144,10 +144,9 @@ def should_fold_group_by(
     Given that asymmetry, this function is intentionally simple rather than clever: it
     does not attempt to estimate actual cardinality (which would need a scan of its own,
     defeating the point of a cheap plan-time check) or account for every way a filter
-    might shrink row count (e.g. `where`'s value conjunct, which MASKS values to null
-    rather than dropping rows when the request is aggregating -- see
-    `ops.FilterOp.mask_value` -- is deliberately not treated as selective here -- it
-    doesn't change how many rows reach the group-by at all).
+    might shrink row count (e.g. a `calculate`'s own `where`, which MASKS a row's value
+    rather than dropping the row -- see `long_ops.calculate_long` -- is deliberately not
+    treated as selective here: it doesn't change how many rows reach the group-by at all).
     """
     if has_selective_filter:
         return False
@@ -202,14 +201,14 @@ def fold_group_by(
     `chunk_transform`, when given, is applied to each chunk immediately AFTER the slice
     and before `group_by` -- the place for a per-chunk filter or join that must run (the
     crosswalk reaggregation site's join to a destination zone, scaled by
-    `scale_factor`), matching `vector._scale_and_join`'s slice-then-filter order.
+    `scale_factor`), matching that site's own slice-then-join order.
     `n_rows` (and therefore the chunk boundaries) is always computed from `lf_source()`
     alone, before `chunk_transform` runs -- a caller whose transform can multiply row
     count (a many-to-one crosswalk join) still gets chunks sized off the SOURCE side,
     which is what actually bounds the underlying scan's memory. A caller building
     `lf_source`/`chunk_transform` around an upstream operation that is itself expensive
     regardless of chunking should only route through `should_fold_group_by` when that
-    operation is known to be cheap (see `vector.py`'s two call sites).
+    operation is known to be cheap (see `execution/project.py`'s two call sites).
 
     `keys` is passed to `group_by` as-is for the FIRST (partial) pass -- it may contain
     plain column names or Polars expressions (e.g. an aliased crosswalk destination
@@ -217,9 +216,8 @@ def fold_group_by(
     group columns from the collected partial's own schema (everything except the
     value/accumulator columns) -- this sidesteps needing to know how a non-string key or
     an aliased expression resolves to a concrete column name (a bare Polars literal key,
-    though this package's own callers no longer produce one -- see
-    `stages.resolve_group_by_columns` -- would resolve to a column literally named
-    "literal"), since after one `.collect()` there is no more ambiguity to resolve.
+    which this package's own callers never produce, would resolve to a column literally
+    named "literal"), since after one `.collect()` there is no more ambiguity to resolve.
 
     Decomposable aggregates only -- `validate_decomposable` raises `FoldError` (an
     ordinary exception, before any file is read) for anything else. `count` is the one

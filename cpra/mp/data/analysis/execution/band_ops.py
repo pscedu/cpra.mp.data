@@ -100,10 +100,9 @@ case, on the metadata side instead of the pixel side: this lowering's answer is
 that carried its height is dropped. The reserved column is left standing in the frame this
 function returns, matching `add_reserved_band_index`'s own docstring ("must never reach
 anything outside the walk") rather than `drop_reserved_band_index`ing it here: this
-module builds band-wide lowerings, not the walk itself (no band-wide walk exists yet --
-see `execute.py`'s module docstring), so there is no "outside the walk" boundary for this
-function to have already crossed. Whatever eventually finishes a band-wide walk owns that
-call, the same way `execution/frame.py` already documents.
+module builds band-wide lowerings, not the walk itself, so there is no "outside the walk"
+boundary for this function to have already crossed. `execute` owns that call and makes it
+as the walk returns, releasing the frame through `released_band_metadata`.
 
 **`GroupOp.of`, band-wide: the bands say WHETHER, `of` says WHICH.** `of` picks which
 column an aggregate reads in long shape (default `"value"`, generalizing to e.g. "first
@@ -577,9 +576,9 @@ def calculate_band_wide(band_wide: BandWideFrame, op: CalculateOp, extra_columns
 def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequence[str]) -> BandWideFrame:
     """The band-wide lowering of a `group`: a HORIZONTAL reduce across each output group's
     contributing bands, at every pixel -- the within-row axis, unrelated to
-    `execution.long_ops.group_long`'s across-row collapse (`execution/fold.py`'s
-    cliff-shaped-collapse fold rule has no counterpart here; see the module docstring of
-    whatever caller reasons about that).
+    `execution.long_ops.group_long`'s across-row collapse. `execution/fold.py`'s
+    cliff-shaped-collapse fold rule has no counterpart here: a horizontal reduce reads one
+    row at a time, so there is no group whose accumulator could outgrow memory.
 
     `op.by` (may be empty) groups `metadata_df`'s rows exactly like a long `group_long`
     groups long rows, except the aggregate reduces ACROSS the bands one group collects

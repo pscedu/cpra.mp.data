@@ -400,11 +400,11 @@ def _bind_band_wide_lowerings(
     `extra_columns` -- see `_LOWERINGS`'s own comment for why they cannot simply be module-
     level constants the way every other entry is.
 
-    Each closure reads `extra_columns.get(op.input, ())` (or, for `join`,
-    `op.inputs[0]`'s -- `_operand_names(op)[0]` gives the right name either way) rather
-    than being handed it as a call argument, so the CALL signature every entry in the
-    returned dict is invoked with stays the uniform `(frames, op, frame_types)` the walk
-    loop already uses for everything else.
+    Each closure reads `extra_columns.get(op.input, ())` -- or, for `join`, whatever
+    `_output_extra_columns` unions across its operands, since an operand can carry a column
+    the others never had -- rather than being handed it as a call argument, so the CALL
+    signature every entry in the returned dict is invoked with stays the uniform
+    `(frames, op, frame_types)` the walk loop already uses for everything else.
 
     The vector-to-raster `project` entry is bound the same way and for the same reason,
     over `zone_sources` -- `_open_band_wide_join_group`'s crosswalk reads, keyed by the
@@ -975,10 +975,11 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     registry (`_LOWERINGS` with its band-wide entries bound to `extra_columns`, via
     `_bind_band_wide_lowerings`) on `(op kind, dispatch key)` -- reading the frame types the
     plan already recorded at compile time rather than re-deriving any of them here. After
-    each op that leaves a band-wide result, `extra_columns[op.output]` is set to whatever
-    `op`'s own first operand (`_operand_names(op)[0]`) carried -- the same "operands[0]
-    alone" rule `join_band_wide` itself already documents, which happens to also be correct
-    for the other three ops (each has exactly one operand). An op whose output is long
+    each op that leaves a band-wide result, `extra_columns[op.output]` is set by
+    `_output_extra_columns`: a vector-to-raster `project` INTRODUCES `DOMAIN_COLUMN`, a
+    `join` UNIONS its operands' columns, and everything else inherits its one operand's
+    unchanged -- see that function for why the three cases cannot collapse into one. An op
+    whose output is long
     (a vector-to-vector or raster-to-vector `project`, or a spatial `filter`) needs no entry
     here: nothing downstream ever reads a long name out of `extra_columns` (`.get(...,  ())`
     on a name that was never set already returns the right, empty answer), and a spatial

@@ -183,7 +183,7 @@ async def resolve_vector_grid_cell(grid_name: str, lngs: list[float], lats: list
 def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -> list[tuple[int, int] | None]:
     """Resolve WGS84 (lng, lat) pairs to ABSOLUTE (row, col) pixel positions on
     `grid_name`'s own full pixel grid -- the raster counterpart of
-    `resolve_vector_grid_cell`, for NEW-engine code (see `raster_grid_cell_id` below for
+    `resolve_vector_grid_cell` (see `raster_grid_cell_id` below for
     the ABSOLUTE `grid_cell` id a spatial `filter` actually tests against, which this
     function deliberately does NOT compute).
 
@@ -347,10 +347,10 @@ def relabel_raster_grid_cell(lf: pl.LazyFrame, id_to_labels: dict[int, list[str]
 def representative_points(grid_name: str, grid_cell_ids: list[int] | None = None) -> dict[int, tuple]:
     """Get a representative WGS84 (lng, lat) point for each grid cell in a vector grid.
 
-    The point is PostGIS's `ST_PointOnSurface`, so it is guaranteed to lie inside the
-    polygon it names — unlike a centroid, which a concave or multi-part grid cell can
-    place outside itself, and which would then be a coordinate that doesn't select the
-    grid cell it came from.
+    The point is shapely's `representative_point()` (the same guarantee PostGIS's
+    `ST_PointOnSurface` gives), so it is guaranteed to lie inside the polygon it names —
+    unlike a centroid, which a concave or multi-part grid cell can place outside itself,
+    and which would then be a coordinate that doesn't select the grid cell it came from.
 
     Grid cells are read by attribute filter rather than by scanning the whole file, and
     IDs with no polygon are simply absent from the result.

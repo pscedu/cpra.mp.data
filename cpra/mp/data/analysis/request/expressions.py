@@ -1,7 +1,8 @@
 """A restricted expression surface for value-level predicates and conditional aggregates.
 
-`Options.where` accepts a single SQL-flavored boolean expression that may mix two kinds
-of AND-ed conditions: DIMENSION conditions (against the raster metadata table --
+A `filter`/`calculate` step's `where` accepts a single SQL-flavored boolean expression
+that may mix two kinds of AND-ed conditions: DIMENSION conditions (against the raster
+metadata table --
 path/band/dimensions -- or a vector frame's dimension columns) and VALUE conditions
 (against actual pixel/cell VALUES, via the placeholder column `value`). Dimension
 conjuncts are handed to `pl.sql_expr` -- or even a full `lf.sql(...)` call -- largely
@@ -175,8 +176,8 @@ def parse_value_expr(expr_str, allowed_columns, *, reject_aggregates=True):
     """Parse `expr_str` as a value-level SQL expression against a restricted whitelist.
 
     `allowed_columns` is the column namespace this particular caller's frame exposes --
-    band names plus `grid_cell` for a raster row (see `raster_source.scan_rasters`'s
-    `b<i>` convention), or `value`/`grid_cell`/dimension columns for a vector row. Every
+    band names plus `grid_cell` for a raster row (see `io.raster.scan_raster`'s `b<i>`
+    convention), or `value`/`grid_cell`/dimension columns for a vector row. Every
     column `expr_str` references must be in it; the check runs by NAME
     (`Expr.meta.root_names()`), not by guessing at the frame's schema, so a caller that
     thinks a column is exposed but got the name wrong fails here rather than with a
@@ -273,9 +274,10 @@ def classify_where(where_str):
     into a DIMENSION conjunct (references no `value` column) or a VALUE conjunct
     (references `value`, and nothing outside `value` plus literals/whitelisted
     functions) -- the seam this module's two existing surfaces are unified across: a
-    dimension conjunct is recombined by the caller (`base.apply_dimension_filter`) into
-    the existing unrestricted `lf.sql()` path, and a value conjunct is recombined and
-    handed to `parse_value_expr`'s restricted whitelist, exactly the two mechanisms that
+    dimension conjunct is recombined by the caller (`execution.long_ops.filter_long`, and
+    its band-wide counterpart) into an unrestricted `lf.sql()`/`pl.sql_expr` path, and a
+    value conjunct is recombined and handed to
+    `parse_value_expr`'s restricted whitelist, exactly the two mechanisms that
     already existed for `where` and the former `value_where` respectively.
 
     Classification is by NAME (`pl.sql_expr(conjunct).meta.root_names()`), not by
@@ -497,8 +499,8 @@ def rewrite_value_column(expr_str, column_name):
 
     Lets one user-supplied expression, written once against the placeholder `value` (the
     uniform surface both grid types present -- see the module docstring), be evaluated
-    against a raster's actual per-band synthetic column (`raster_source.scan_rasters`'s
-    `b<i>` names) once per selected band. A vector frame already has a real `value`
+    against a raster's actual per-band synthetic column (`io.raster.scan_raster`'s `b<i>`
+    names) once per selected band. A vector frame already has a real `value`
     column, so it never needs this rewrite -- it parses the placeholder string directly.
 
     A word-boundary regex substitution, not a bare `str.replace`: a plain substring swap

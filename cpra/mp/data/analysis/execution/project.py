@@ -354,7 +354,8 @@ def project_vector_to_vector(
     onto `op.to`'s cells via the crosswalk between `frame_types[op.input].grid` and
     `op.to`, with `op.aggregate` (never `None` here -- `request.aggregates.
     validate_project_aggregate` requires one for every direction but vector-to-raster,
-    which has no lowering in this module at all).
+    which broadcasts one value per target pixel rather than summarizing and so is required
+    to carry none).
 
     Dimension columns (everything but `grid_cell`/`value`) are part of the group key, not
     just the destination cell -- a `calendar_year`/`scenario_id`/... column already on the
