@@ -100,7 +100,9 @@ _raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
 RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
 
 # Ceiling on the number of distinct values `count_by_value` may enumerate (per grid, not
-# per zone -- see api.expressions.count_by_value_frame). count_by_value's output row count
+# per zone -- the probe runs on the source frame's own `value` column, before the
+# crosswalk join, in both analysis.execution.project and analysis.execution.fold).
+# count_by_value's output row count
 # is bounded by (number of summarize zones) x (number of distinct values in the scoped
 # selection); the zone count is already bounded by the crosswalk file, but the
 # distinct-value count is unbounded unless something stops a caller from pointing

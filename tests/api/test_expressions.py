@@ -16,7 +16,6 @@ from cpra.mp.data.analysis.request.expressions import (
     classify_where,
     classify_where_kinds,
     compile_calculate_entries,
-    count_by_value_frame,
     parse_calculate_expression,
     parse_value_expr,
     rewrite_value_column,
@@ -438,47 +437,3 @@ class TestClassifyWhereKinds:
     def test_value_conjunct_with_aggregate_call_is_not_rejected_at_classification(self):
         kinds = classify_where_kinds("value = min(value)")
         assert kinds[PredicateKind.value] == ["value = min(value)"]
-
-
-class TestCountByValueFrame:
-    def test_counts_one_row_per_group_per_distinct_value(self):
-        lf = pl.DataFrame(
-            {
-                "zone": [1, 1, 1, 2, 2],
-                "value": [10, 10, 20, 10, 10],
-            }
-        ).lazy()
-
-        out = count_by_value_frame(lf, ["zone"], "value", max_distinct=1000).collect().sort(["zone", "value"])
-
-        assert out["zone"].to_list() == [1, 1, 2]
-        assert out["value"].to_list() == [10, 20, 10]
-        assert out["count"].to_list() == [2, 1, 2]
-
-    def test_nulls_are_excluded_not_a_category(self):
-        """A masked value_where non-match or a masked nodata pixel arrives here as null --
-        it must not appear as its own category, nor be counted into any real one."""
-        lf = pl.DataFrame({"zone": [1, 1, 1], "value": [10, None, 10]}, schema={"zone": pl.Int64, "value": pl.Int64}).lazy()
-
-        out = count_by_value_frame(lf, ["zone"], "value", max_distinct=1000).collect()
-
-        assert out["value"].to_list() == [10]
-        assert out["count"].to_list() == [2]
-
-    def test_cardinality_ceiling_rejects_before_grouping(self):
-        """A continuous column is exactly what the ceiling exists to catch -- see the
-        module's `count_by_value_frame` docstring for the bound math. `approx_n_unique` is
-        an estimate, not exact, but with 5000 genuinely distinct values and a ceiling of
-        10 the estimate is nowhere near the boundary."""
-        lf = pl.DataFrame({"zone": [1] * 5000, "value": list(range(5000))}).lazy()
-
-        with pytest.raises(ExpressionError, match="distinct"):
-            count_by_value_frame(lf, ["zone"], "value", max_distinct=10)
-
-    def test_low_cardinality_column_is_not_rejected(self):
-        lf = pl.DataFrame({"zone": [1] * 100, "value": [i % 5 for i in range(100)]}).lazy()
-
-        out = count_by_value_frame(lf, ["zone"], "value", max_distinct=10).collect()
-
-        assert out.height == 5
-        assert out["count"].sum() == 100

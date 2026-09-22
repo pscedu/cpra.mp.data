@@ -318,13 +318,12 @@ def _finalize_mean(lf: pl.LazyFrame) -> pl.LazyFrame:
 def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list[str], max_distinct: int) -> pl.LazyFrame:
     """The unbatched `count_by_value` lowering: one row per (dimensions, destination
     cell, distinct `value`), with the distinct value in `value_category` and its count in
-    `value` -- a deliberately different schema from
-    `request.expressions.count_by_value_frame` (which keeps the counted column's own name
-    and calls the count `count`), because that schema drops null `value`s before both the
-    cardinality probe and the grouped count, where this one keeps null as its own
-    category: a destination whose only contributing cells are nodata should say so (one
-    row, `value_category=null`), not vanish from the result. That function is left alone
-    rather than reused or modified here.
+    `value`.
+
+    Null is a category here, not a value to drop: neither the cardinality probe nor the
+    grouped count filters nulls out, so a destination whose only contributing cells are
+    nodata says so (one row, `value_category=null`) rather than vanishing from the
+    result. `fold.fold_count_by_value` keeps null the same way on the folded path.
 
     The probe runs on `lf`'s OWN `value` column, before the crosswalk join -- the join can
     only drop rows (a source cell overlapping no destination) or duplicate a row's already-
