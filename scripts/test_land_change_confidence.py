@@ -13,7 +13,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.windows import Window
 
 from cpra.mp.data import read_cog
-from cpra.mp.data.api.utils import parallel_read_rasters
+from cpra.mp.data.analysis.io.raster_io import parallel_read_rasters
 from cpra.mp.data.grids import GRIDS
 
 # Maps lnd_type values to confidence output values.
