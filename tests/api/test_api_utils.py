@@ -11,13 +11,16 @@ import polars as pl
 import pytest
 import rasterio as rio
 from fastapi import HTTPException
+from rasterio.env import get_gdal_config
 
+import cpra.mp.data.analysis.io.raster_io as raster_io
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.analysis.io.raster_io import (
     enum_value,
     parallel_read_rasters,
     parallel_sample_rasters,
     raster_blocks_per_batch,
+    raster_gdal_env,
     unpack_values,
 )
 from cpra.mp.data.analysis.request.errors import RequestError
@@ -412,3 +415,61 @@ class TestRasterBlocksPerBatch:
         monkeypatch.setattr(api_utils, "RASTER_BATCH_BUFFER_MB", 8)
         # 8 MB budget / (2 bands x 512 x 512 x 4 bytes = 2 MiB per block) -> 4 blocks.
         assert raster_blocks_per_batch(2, 512, 512, 4) == 4
+
+
+class TestRasterGdalEnv:
+    """What the read env actually puts into GDAL, read back out of GDAL rather than off the
+    `rio.Env` object -- the two disagreed, and the whole point of these tests is the
+    disagreement.
+    """
+
+    def test_the_cache_cap_reaches_gdal_as_bytes_not_megabytes(self, monkeypatch):
+        """`GDAL_CACHEMAX` is the one config option rasterio does not hand to GDAL's own
+        parser: it special-cases the name and calls `GDALSetCacheMax64`, which takes a byte
+        count, so the megabyte figure the constant is named for has to be converted first.
+        Passed through as it stood, the 2048 in `RASTER_CACHE_MAX_MB` asked GDAL for a 2 KB
+        block cache -- which cost nothing on a full-resolution windowed read (each source
+        block is touched once) and roughly 100x on an overview-served one (blocks are
+        revisited, and every revisit re-decompressed).
+
+        The expected value is written out as a literal rather than as the same arithmetic
+        the code under test performs, so this fails if that arithmetic is dropped.
+        """
+        monkeypatch.setattr(raster_io, "RASTER_CACHE_MAX_MB", 64)
+        with raster_gdal_env():
+            assert get_gdal_config("GDAL_CACHEMAX") == 67_108_864
+
+    def test_the_cap_is_not_the_bare_megabyte_figure(self, monkeypatch):
+        """The specific regression, stated as itself: a cap that arrives as the raw constant
+        is a cache three orders of magnitude smaller than the one asked for, and nothing
+        about the read that follows reports it -- it only runs slowly.
+        """
+        monkeypatch.setattr(raster_io, "RASTER_CACHE_MAX_MB", 2048)
+        with raster_gdal_env():
+            cache_max = get_gdal_config("GDAL_CACHEMAX")
+        assert cache_max != 2048
+        assert cache_max >= 64 * 1024 * 1024
+
+    def test_the_thread_count_is_passed_through_unchanged(self, monkeypatch):
+        """Unlike the cap, `GDAL_NUM_THREADS` is an ordinary config option and takes GDAL's
+        own spellings, so it is forwarded verbatim -- no conversion, and in particular none
+        borrowed from the cap beside it.
+
+        Checked with `ALL_CPUS` (the configured default) rather than a count because
+        `get_gdal_config` parses a numeric string back as an `int`, which would leave the
+        assertion testing that round trip instead of the forwarding.
+        """
+        monkeypatch.setattr(raster_io, "RASTER_NUM_THREADS", "ALL_CPUS")
+        with raster_gdal_env():
+            assert get_gdal_config("GDAL_NUM_THREADS") == "ALL_CPUS"
+
+    def test_the_settings_do_not_outlive_the_env(self, monkeypatch):
+        """Scoping the cap matters as much as its size: it is process-global while the env is
+        open (see `raster_gdal_env`), so a value that leaked past `__exit__` would follow
+        every later read in the process, including ones that never entered this env.
+        """
+        monkeypatch.setattr(raster_io, "RASTER_CACHE_MAX_MB", 64)
+        with raster_gdal_env():
+            inside = get_gdal_config("GDAL_CACHEMAX")
+        assert inside == 67_108_864
+        assert get_gdal_config("GDAL_CACHEMAX") != inside

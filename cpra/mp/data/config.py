@@ -70,6 +70,10 @@ RASTER_NUM_THREADS = get_config("RASTER_NUM_THREADS", "ALL_CPUS")
 # GDAL's own block cache, entered around every raster read
 # (analysis.io.raster_io.raster_gdal_env). Process-global, so this bounds cache growth
 # across concurrent requests instead of leaving it at GDAL's default 5% of RAM.
+#
+# In megabytes, as the name says. raster_gdal_env converts it to the bytes rasterio's
+# GDAL_CACHEMAX handling actually takes -- see that function for why the units are not
+# interchangeable there the way they are for GDAL's own config parser.
 RASTER_CACHE_MAX_MB = int(get_config("RASTER_CACHE_MAX_MB", "2048"))
 
 # Target size, in MB, for one summarize-loop batch's read buffer (n_bands x block_height x

@@ -99,6 +99,23 @@ def raster_gdal_env():
     the cap also bounds cache growth across concurrent requests rather than leaving it at
     GDAL's default 5% of RAM.
 
+    ``GDAL_CACHEMAX`` is passed in BYTES, which is why the megabyte-denominated config
+    constant is converted here rather than handed over as it stands. rasterio does not treat
+    this option the way it treats the others: ``rasterio._env.set_gdal_config`` special-cases
+    the name and calls ``GDALSetCacheMax64`` with the value directly, and that entry point
+    takes a byte count -- it never reaches the GDAL config parser that would have read a bare
+    ``2048`` as megabytes. Unconverted, ``RASTER_CACHE_MAX_MB``'s default asked for a 2 KB
+    cache, which is no cache at all.
+
+    A missing cache is invisible on a full-resolution windowed read, which touches each source
+    block once, and ruinous on one GDAL serves out of an overview, which revisits blocks and
+    re-decompresses every revisit. Measured on one real ``elev`` COG, a 1149x1144 window
+    decimated to half resolution: 0.08s with a 64 MB cache or anything larger, 11.7s with the
+    2 KB one, against 0.1s either way for that same window read at full resolution. Eleven
+    bands of it decimated took 147s. That asymmetry is why the units went unnoticed for as
+    long as they did -- until decimated reads started coming through here, nothing that
+    entered this env re-read a block.
+
     ``rio.Env`` is thread-local storage (``rasterio.env.ThreadEnv`` subclasses
     ``threading.local``), but the GDAL config option it sets is not always thread-scoped:
     rasterio's ``_env.pyx`` uses ``CPLSetConfigOption`` (process-global) when the *calling*
@@ -119,12 +136,16 @@ def raster_gdal_env():
     call in the calling coroutine (see callers) is an acceptably small, bounded exposure
     given how fast an open is relative to the read/write loop that follows it.
 
-    Deliberately not applied to tile requests. Those read a window decimated to roughly the
-    tile's own resolution (``tile_read_shape``), which GDAL serves out of the source's
-    overviews -- a small enough read that threading measured no benefit on it.
+    Applied to tile requests too, which it once was not. A tile reads a window decimated to
+    roughly the tile's own resolution, served out of the source's overviews, and threading
+    measured no benefit on a read that small -- so the older reader left tile reads outside
+    this env entirely. ``io/raster.py``'s scan has one read path rather than two and enters
+    this env around every read, tile or not, which is what the cache paragraph above is about:
+    on a decimated read the cap is not a memory nicety, it is the difference between a tile in
+    half a second and a tile in half a minute.
     """
 
-    return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB)
+    return rio.Env(GDAL_NUM_THREADS=RASTER_NUM_THREADS, GDAL_CACHEMAX=RASTER_CACHE_MAX_MB * 1024 * 1024)
 
 
 def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):
