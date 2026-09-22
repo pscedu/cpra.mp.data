@@ -44,7 +44,8 @@ or choose between them) and an output description, nothing else.
 
 import re
 from collections.abc import Mapping, Sequence
-from typing import Annotated, Any, Literal, Union
+from types import UnionType
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -507,29 +508,61 @@ def append_steps(pipeline: Pipeline, extra_steps: Sequence[Step], output: Output
 # The dotted GET/tile query codec
 # --------------------------------------------------------------------------------------
 
+def _query_fields(model: type[BaseModel]) -> frozenset[str]:
+    """The names a dotted query may spell for `model`'s fields: the ALIAS where one is
+    declared, the field name otherwise. The alias is what matters -- `as_` is a Python
+    spelling forced by the keyword, and `as` is what a URL actually carries.
+    """
+    return frozenset(info.alias or name for name, info in model.model_fields.items())
+
+
+def _query_list_fields(model: type[BaseModel]) -> frozenset[str]:
+    """Those of `_query_fields(model)` whose value is a LIST, and which the decoder
+    therefore splits on commas.
+
+    Read off each field's annotation rather than named by hand, which is what keeps
+    `where`/`expression` out of it structurally rather than by remembering to: each is a
+    single SQL-flavored/arithmetic `str` that may contain commas, spaces, and operators
+    verbatim, and splitting one would corrupt it. A field can only be split here if its
+    model says it holds a list.
+    """
+    return frozenset(
+        info.alias or name for name, info in model.model_fields.items() if _is_list_annotation(info.annotation)
+    )
+
+
+def _is_list_annotation(annotation: Any) -> bool:
+    """Whether `annotation` is a list, including as one arm of a union (`list[str] | None`
+    -- no field is declared that way today, but a future optional list must not silently
+    stop being comma-split).
+    """
+    if get_origin(annotation) is list:
+        return True
+    if get_origin(annotation) in (Union, UnionType):
+        return any(get_origin(arg) is list for arg in get_args(annotation))
+    return False
+
+
+# The step models the `op` discriminator chooses between, read back off `Step` itself so a
+# sixth op added to that union reaches the query codec without a second edit here.
+_STEP_MODELS: tuple[type[BaseModel], ...] = get_args(get_args(Step)[0])
+
 # The only fields an input may carry -- see `InputSelection`.
-_INPUT_FIELDS = frozenset({"variable", "time_unit", "grid"})
+_INPUT_FIELDS = _query_fields(InputSelection)
 
 # Per-op field whitelist and which of those fields are comma-list-valued, for the
-# `step.<i>.<field>` namespace. `where`/`expression` are deliberately never in a list-
-# fields set: each is a single SQL-flavored/arithmetic string that may itself contain
-# commas, spaces, and operators verbatim, and must never be split.
+# `step.<i>.<field>` namespace. Both are DERIVED from the step models rather than mirrored
+# from them: a hand-kept copy has to be chased every time a field is added to a step, and
+# the failure mode when it isn't chased is a legal request rejected as "unknown field".
+# Keyed by each model's own `op` literal, which is the same value the discriminator reads.
 _STEP_FIELDS: dict[str, frozenset[str]] = {
-    "project": frozenset({"op", "input", "to", "aggregate", "as"}),
-    "join": frozenset({"op", "type", "inputs", "as"}),
-    "filter": frozenset({"op", "input", "where", "as"}),
-    "calculate": frozenset({"op", "input", "expression", "where", "as"}),
-    "group": frozenset({"op", "input", "by", "aggregate", "of", "as"}),
+    model.model_fields["op"].default: _query_fields(model) for model in _STEP_MODELS
 }
 _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
-    "project": frozenset(),
-    "join": frozenset({"inputs"}),
-    "filter": frozenset(),
-    "calculate": frozenset(),
-    "group": frozenset({"by"}),
+    model.model_fields["op"].default: _query_list_fields(model) for model in _STEP_MODELS
 }
 
-_OUTPUT_FIELDS = frozenset({"format", "color_map", "sort", "select"})
+_OUTPUT_FIELDS = _query_fields(Output)
 
 
 def _insert_dotted(tree: dict[str, Any], segments: list[str], value: str, full_key: str) -> None:

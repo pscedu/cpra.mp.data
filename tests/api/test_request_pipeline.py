@@ -11,10 +11,22 @@ Real variables/grids/dimensions from `cpra/mp/data/structure/` are used througho
 fake dimensions), following the existing `test_pipeline.py`'s own convention.
 """
 
+from typing import Literal
+
 import pytest
+from pydantic import BaseModel, Field
 
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.pipeline import (
+    _INPUT_FIELDS,
+    _OUTPUT_FIELDS,
+    _STEP_FIELDS,
+    _STEP_LIST_FIELDS,
+    _STEP_MODELS,
+    _query_fields,
+    _query_list_fields,
+    InputSelection,
+    Output,
     Pipeline,
     append_steps,
     parse_pipeline,
@@ -712,3 +724,88 @@ def test_empty_input_name_rejected():
 def test_validate_pipeline_can_be_called_directly_on_an_already_shape_valid_pipeline():
     pipeline = Pipeline.model_validate(simple_pipeline())
     validate_pipeline(pipeline)  # does not raise
+
+
+class TestTheQueryCodecsFieldTablesTrackTheModels:
+    """The dotted query codec whitelists field names per op, and those whitelists are
+    DERIVED from the step models rather than mirrored from them.
+
+    The failure this guards against is concrete and has happened: adding `input` to
+    `GroupStep` left the hand-kept table behind, so a legal `step.N.input` on a `group`
+    was rejected as an unknown field until the table was chased by hand. These tests fail
+    on the model side of that drift, not on a second copy of the answer.
+    """
+
+    def test_the_derived_tables_spell_out_what_each_op_accepts(self):
+        """Written out rather than re-derived from `model_fields`: repeating the
+        derivation here would assert only that one expression equals itself, and would
+        pass just as happily if `_query_fields` dropped every aliased field.
+        """
+        assert _STEP_FIELDS == {
+            "project": {"op", "input", "to", "aggregate", "as"},
+            "join": {"op", "type", "inputs", "as"},
+            "filter": {"op", "input", "where", "as"},
+            "calculate": {"op", "input", "expression", "where", "as"},
+            "group": {"op", "input", "by", "aggregate", "of", "as"},
+        }
+
+    def test_the_tables_cover_exactly_the_ops_the_discriminator_accepts(self):
+        ops = {model.model_fields["op"].default for model in _STEP_MODELS}
+        assert set(_STEP_FIELDS) == ops
+        assert set(_STEP_LIST_FIELDS) == ops
+
+    def test_only_list_valued_fields_are_comma_split(self):
+        """A `str` field must never be split: `where`/`expression` carry commas verbatim
+        inside a single SQL-flavored or arithmetic expression."""
+        assert _STEP_LIST_FIELDS["join"] == {"inputs"}
+        assert _STEP_LIST_FIELDS["group"] == {"by"}
+        for op in ("project", "filter", "calculate"):
+            assert _STEP_LIST_FIELDS[op] == frozenset(), op
+        for op, list_fields in _STEP_LIST_FIELDS.items():
+            assert list_fields <= _STEP_FIELDS[op], op
+
+    def test_an_optional_list_field_would_still_be_comma_split(self):
+        """No step declares `list[str] | None` today, so nothing in the real models
+        exercises the union arm of `_is_list_annotation` -- but a future optional list
+        that quietly stopped being split would be a wrong answer rather than an error,
+        which is why the arm exists and why it is pinned here against a stand-in.
+        """
+
+        class OptionalListStep(BaseModel):
+            op: Literal["stand_in"] = "stand_in"
+            maybe: list[str] | None = None
+            plain: str = ""
+            renamed: str = Field(default="", alias="as")
+
+        assert _query_list_fields(OptionalListStep) == {"maybe"}
+        assert _query_fields(OptionalListStep) == {"op", "maybe", "plain", "as"}
+
+    def test_the_tables_carry_the_alias_not_the_python_field_name(self):
+        """`as_` exists only because `as` is a Python keyword; a URL spells `as`."""
+        for op, fields in _STEP_FIELDS.items():
+            assert "as" in fields, op
+            assert "as_" not in fields, op
+
+    def test_the_input_and_output_tables_are_derived_the_same_way(self):
+        assert _INPUT_FIELDS == {"variable", "time_unit", "grid"}
+        assert _OUTPUT_FIELDS == {"format", "color_map", "sort", "select"}
+        assert _INPUT_FIELDS == set(InputSelection.model_fields)
+        assert _OUTPUT_FIELDS == set(Output.model_fields)
+
+    def test_a_group_steps_input_field_survives_the_round_trip(self):
+        """The regression itself, end to end rather than through the table: the field
+        that drifted is spellable, decodes, and comes back out of `pipeline_to_query`.
+        """
+        params = {
+            "input.marsh.variable": "ffibs_coverage_ratio",
+            "input.marsh.time_unit": "annual",
+            "input.marsh.grid": VECTOR_GRID,
+            "step.1.op": "group",
+            "step.1.input": "marsh",
+            "step.1.by": "calendar_year",
+            "step.1.aggregate": "mean",
+            "output.format": "csv",
+        }
+        pipeline = pipeline_from_query(params)
+        assert pipeline.steps[0].input == "marsh"
+        assert pipeline_to_query(pipeline)["step.1.input"] == "marsh"
