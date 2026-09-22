@@ -86,13 +86,17 @@ def _sample_groups(sources: Sequence[tuple[object, object]]):
     group's band list)` for source *i*.
 
     Grouped by FILE first, which is the whole point -- 52 bands spread over 5 files is 5
-    reads, not 52, and each file is opened once instead of once per band the way a VRT
-    assembled from the same sources opens it. Then split again by DTYPE within a file,
-    because `rasterio`'s `sample` shares `read`'s one-array-per-call constraint and raises
+    sample calls, not 52, and each file is opened once instead of once per band the way a
+    VRT assembled from the same sources opens it. Then split again by DTYPE within a file,
+    because a sample call shares `read`'s one-array-per-call constraint and raises
     `ValueError: more than one 'dtype' found` the moment a single call spans two of them --
     the same grouping, and the same reason, as `io.raster.scan_raster`'s `read_groups`.
     That second split is normally a no-op (a COG this package writes has one dtype for all
     its bands), so this is usually exactly one group per file.
+
+    This is the BAND axis only. Grouping along the other axis -- which coordinates share a
+    block, and so can come from one windowed read -- belongs to the read itself and is
+    `io.raster_io._sample_raster`'s job, not something a caller has to arrange.
 
     Each group gets its OWN entry, and therefore its own dataset handle at the call site: a
     `rasterio` dataset is not safe to sample from two threads at once, and
@@ -153,7 +157,11 @@ def sample_raster_points(
     (`execution.frame.empty_band_wide`), never something a reader invents.
 
     Reads through `io.raster_io.parallel_sample_rasters`, one thread per (file, dtype)
-    group -- see `_sample_groups`. Pixel coordinates are derived from `grid_name`'s OWN
+    group -- see `_sample_groups` -- and, within a group, one windowed read per COG block
+    the coordinates land on rather than one read apiece (see `io.raster_io._sample_raster`,
+    which is where that grouping and its measurements live).
+
+    Pixel coordinates are derived from `grid_name`'s OWN
     geometry (`rasterio.transform.from_bounds` over its declared bounds, then
     `rasterio.transform.xy` at pixel centres), never from an opened file's transform, so the
     id -> pixel -> coordinate chain is closed over one source of truth: the same

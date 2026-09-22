@@ -50,6 +50,14 @@ def _write_grid_tif(path, bands, nodata=None, dtype="int32"):
         "width": grid.width,
         "crs": grid.crs,
         "transform": from_bounds(*grid.bounds, width=grid.width, height=grid.height),
+        # TILED, because the reader groups sampled coordinates by block (see
+        # `io.raster_io._sample_raster`) and an untiled GeoTIFF's blocks are whole rows --
+        # which makes every block group one-dimensional and hides a row/column mix-up that
+        # a real 2D block would catch. Production COGs are tiled 512x512; 128 keeps that
+        # shape while still giving this 365x1052 grid several blocks on both axes.
+        "tiled": True,
+        "blockxsize": 128,
+        "blockysize": 128,
     }
     if nodata is not None:
         profile["nodata"] = nodata
@@ -86,12 +94,16 @@ class TestEquivalenceWithTheBandWideReader:
     """
 
     def test_the_two_readers_produce_the_same_frame(self, tmp_path):
-        # Three pixels, all far from the raster's own origin so that a row/col transposition
+        # Four pixels, all far from the raster's own origin so that a row/col transposition
         # or a window-relative id would land somewhere else and show up as a wrong VALUE.
+        # Two of them -- (200, 800) and (205, 810) -- share a 128x128 block, and share it at
+        # DIFFERENT row and column offsets within it, which is what makes the pair sensitive
+        # to how the reader indexes back into a block it read once for both (see
+        # `io.raster_io._sample_raster`); the other two land on blocks of their own.
         # Two files with two bands each, so the comparison also covers band ordering across
         # a file boundary -- the one place the point reader's per-file grouping could
         # scramble what the band-wide reader's flat VRT source list keeps in order.
-        targets = {(200, 800): 11, (11, 1051): 22, (364, 0): 33}
+        targets = {(200, 800): 11, (205, 810): 7, (11, 1051): 22, (364, 0): 33}
         path_a = _write_grid_tif(
             tmp_path / "a.tif", [targets, {pixel: value * 2 for pixel, value in targets.items()}]
         )
@@ -121,7 +133,7 @@ class TestEquivalenceWithTheBandWideReader:
         # Not a vacuous comparison: the fixture really did put distinguishable numbers at
         # each (pixel, band), so an empty or constant frame could not pass the check above.
         assert expected.height == len(cells) * metadata_df.height
-        assert sorted(expected["value"].unique().to_list()) == [0, 11, 22, 33, 44, 66, 99]
+        assert sorted(expected["value"].unique().to_list()) == [0, 7, 11, 14, 21, 22, 33, 44, 66, 99]
 
     def test_the_reader_reads_only_the_named_pixels(self, tmp_path):
         # The reason the substitution exists. `scan_raster` over the same metadata yields

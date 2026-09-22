@@ -11,7 +11,9 @@ import polars as pl
 import pytest
 import rasterio as rio
 from fastapi import HTTPException
+from rasterio.crs import CRS
 from rasterio.env import get_gdal_config
+from rasterio.transform import from_bounds
 
 import cpra.mp.data.analysis.io.raster_io as raster_io
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
@@ -388,6 +390,150 @@ class TestParallelRasterHelpers:
             dataset.close()
 
         assert recorder.num_threads is None
+
+
+class TestBlockGroupedSampling:
+    """`_sample_raster` groups coordinates by COG block and issues one windowed read per
+    block instead of one 1x1 read per coordinate. The contract it has to keep while doing
+    that is `rasterio`'s own `sample`, value for value, so most of these compare against it
+    directly rather than against hand-written expectations.
+    """
+
+    BLOCK = 16  # GTiff tiles must be a multiple of 16; this is the smallest legal one.
+
+    @pytest.fixture
+    def tiled(self, base_path):
+        """A 64x64 two-band raster in 16x16 blocks -- 16 blocks, so coordinates can be
+        placed to share a block or to land on different ones. Every pixel holds a distinct
+        value, so a sample attributed to the wrong pixel cannot coincidentally be right.
+        """
+        path = base_path / "tiled.tif"
+        rows = np.arange(64).reshape(64, 1) * 100
+        cols = np.arange(64).reshape(1, 64)
+        data = np.stack([rows + cols, rows + cols + 500_000]).astype("int32")
+        with rio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=64,
+            height=64,
+            count=2,
+            dtype="int32",
+            nodata=-7,
+            tiled=True,
+            blockxsize=self.BLOCK,
+            blockysize=self.BLOCK,
+            crs=CRS.from_epsg(4326),
+            transform=from_bounds(0, 0, 64, 64, 64, 64),
+        ) as dst:
+            dst.write(data)
+        return path
+
+    @staticmethod
+    def _xy(dataset, positions):
+        return [dataset.xy(row, col) for row, col in positions]
+
+    def test_it_matches_rasterios_own_sample_value_for_value(self, tiled):
+        # Coordinates chosen to hit every case the grouping distinguishes at once: several
+        # in one block, several alone in their own, a repeat, and an order that is not the
+        # order the blocks are visited in.
+        positions = [(0, 0), (40, 40), (1, 2), (63, 63), (2, 1), (40, 41), (0, 0), (17, 33)]
+        with rio.open(tiled) as dataset:
+            coordinates = self._xy(dataset, positions)
+            got = raster_io._sample_raster(dataset, coordinates, [1, 2])
+            want = list(dataset.sample(coordinates, indexes=[1, 2]))
+
+        assert [tuple(v) for v in got] == [tuple(v) for v in want]
+        # Not a comparison of two lists of nodata: the values are the planted ones.
+        assert tuple(got[1]) == (4040, 504040)
+        assert tuple(got[3]) == (6363, 506363)
+
+    def test_a_coordinate_off_the_raster_yields_the_nodata_fill(self, tiled):
+        # `sample`'s out-of-extent behaviour is to yield the dataset nodata rather than
+        # raise, and callers code to that; grouping must not quietly turn it into an error
+        # or into a read of some clamped in-range pixel.
+        with rio.open(tiled) as dataset:
+            inside = dataset.xy(5, 5)
+            outside = [(-100.0, -100.0), (1000.0, 1000.0)]
+            coordinates = [inside, *outside]
+            got = raster_io._sample_raster(dataset, coordinates, [1, 2])
+            want = list(dataset.sample(coordinates, indexes=[1, 2]))
+
+        assert [tuple(v) for v in got] == [tuple(v) for v in want]
+        assert tuple(got[0]) == (505, 500505)
+        assert tuple(got[1]) == (-7, -7) and tuple(got[2]) == (-7, -7)
+
+    def test_it_reads_once_per_block_not_once_per_coordinate(self, tiled):
+        # The behaviour change itself. 12 coordinates inside one 16x16 block must cost one
+        # read; spread one per block they cost one read each. Checked by counting, because
+        # the values alone cannot tell the two apart.
+        class CountingDataset:
+            """Forwards everything `_sample_raster` touches, recording `read` windows."""
+
+            def __init__(self, dataset):
+                self._dataset = dataset
+                self.windows = []
+
+            def __getattr__(self, name):
+                return getattr(self._dataset, name)
+
+            def read(self, **kwargs):
+                self.windows.append(kwargs["window"])
+                return self._dataset.read(**kwargs)
+
+        shared = [(r, c) for r in range(3) for c in range(4)]
+        spread = [(r * self.BLOCK, c * self.BLOCK) for r in range(4) for c in range(3)]
+        with rio.open(tiled) as dataset:
+            counter = CountingDataset(dataset)
+            raster_io._sample_raster(counter, self._xy(dataset, shared), [1])
+            shared_reads = list(counter.windows)
+
+            counter.windows.clear()
+            raster_io._sample_raster(counter, self._xy(dataset, spread), [1])
+            spread_reads = list(counter.windows)
+
+        assert len(shared) == len(spread) == 12
+        assert len(shared_reads) == 1
+        assert len(spread_reads) == 12
+        # And the one read covers only the coordinates' own bounding box, not the whole
+        # block -- 3 rows by 4 columns, which is what was asked for.
+        assert (shared_reads[0].height, shared_reads[0].width) == (3, 4)
+
+    def test_a_sample_does_not_retain_the_block_it_came_from(self, tiled):
+        # A numpy slice of the block array is a VIEW, and a view keeps its whole parent
+        # alive -- one retained view per coordinate turns a bounded per-block read into
+        # every block ever read, held until the caller drops the last sample. That cost
+        # 5.8 GiB of peak RSS for 1,000 scattered coordinates when this was first written,
+        # and nothing about the returned VALUES would have shown it.
+        positions = [(r * 4, c * 4) for r in range(16) for c in range(16)]
+        with rio.open(tiled) as dataset:
+            got = raster_io._sample_raster(dataset, self._xy(dataset, positions), [1, 2])
+
+        assert len(got) == 256
+        assert all(value.base is None for value in got)
+
+    def test_the_band_argument_is_accepted_in_every_form_sample_accepts(self, tiled):
+        # `sample` normalizes `indexes` itself -- None for every band, a bare int for one,
+        # a list for a subset -- and this reimplements that, since it no longer calls
+        # `sample` to do it. All three have to keep meaning what they meant.
+        with rio.open(tiled) as dataset:
+            coordinates = self._xy(dataset, [(9, 9), (40, 40)])
+            every = raster_io._sample_raster(dataset, coordinates)
+            one = raster_io._sample_raster(dataset, coordinates, 2)
+            listed = raster_io._sample_raster(dataset, coordinates, [2])
+
+        assert [tuple(v) for v in every] == [(909, 500909), (4040, 504040)]
+        assert [tuple(v) for v in one] == [(500909,), (504040,)]
+        assert [tuple(v) for v in one] == [tuple(v) for v in listed]
+
+    def test_no_coordinates_is_no_samples_rather_than_a_read(self, tiled):
+        # Not reachable through the point reader, which rejects an empty id list before it
+        # gets here, but `sample` answers `[]` and this claims to answer what `sample`
+        # answers. Zipping an empty coordinate list is also the one input that would raise
+        # on the unpacking below rather than return anything at all.
+        with rio.open(tiled) as dataset:
+            assert raster_io._sample_raster(dataset, [], [1]) == []
+            assert list(dataset.sample([], indexes=[1])) == []
 
 
 class TestRasterBlocksPerBatch:
