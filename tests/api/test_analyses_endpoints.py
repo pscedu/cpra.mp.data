@@ -17,13 +17,13 @@ route disagreeing about what `filters`/`grid_cell`/`params` mean.
   tile route, which needs a band-wide final frame. Substituting these for
   `Meta.variables`' real-world datasets follows that module's own documented convention
   (the engine cares about grid TYPES and SHAPES, not variable semantics).
-* `exit-criterion` (`type="custom"`) carries the custom routes. It is the one registered
-  analysis that is band-wide end to end -- a vector-to-raster `project` feeding a
-  band-wide `join`, then a `filter` naming that join's operand value columns -- so the
+* `salinity-veg-investigation` (`type="custom"`) carries the custom routes. It is the one
+  registered analysis that is band-wide end to end -- a vector-to-raster `project` feeding
+  a band-wide `join`, then a `filter` naming that join's operand value columns -- so the
   two routes that execute it are also this module's only coverage of that shape reaching
   a client. What the shape itself does is pinned at the engine level
-  (`tests/api/test_analyses_registry.py::TestExitCriterionExecution`); what these pin is
-  that the custom routes deliver its bytes.
+  (`tests/api/test_analyses_registry.py::TestSalinityVegInvestigationExecution`); what
+  these pin is that the custom routes deliver its bytes.
 
 `grid_cell` is the one request parameter the registry deliberately cannot handle alone:
 resolving a coordinate against real geometry needs `io/`, which nothing under `request/`
@@ -82,9 +82,9 @@ RASTER_DIFFERENCE_QUERY = {
     "scenario_id": [RASTER_KWARGS["scenario_id"]],
 }
 
-# `exit-criterion` is `type="custom"`: no dataset and no dimension filters, just its own
-# two required parameters.
-EXIT_CRITERION_QUERY = {"model_group_id": 500, "scenario_id": 7}
+# `salinity-veg-investigation` is `type="custom"`: no dataset and no dimension filters,
+# just its own two required parameters.
+SALINITY_VEG_QUERY = {"model_group_id": 500, "scenario_id": 7}
 
 
 def _lng_lat(x, y):
@@ -138,7 +138,7 @@ class TestRouteKindRejection:
         assert "Invalid analysis type" in response.json()["detail"]
 
     def test_custom_analysis_rejected_on_dataset_route(self, client):
-        response = client.get(f"/v1/datasets/{V}/{T}/{G}/analyses/exit-criterion/data.csv")
+        response = client.get(f"/v1/datasets/{V}/{T}/{G}/analyses/salinity-veg-investigation/data.csv")
         assert response.status_code == 400
         assert "Invalid analysis type" in response.json()["detail"]
 
@@ -267,14 +267,15 @@ class TestDatasetAnalysisGridCell:
 
     def test_a_grid_cell_on_a_custom_route_is_rejected_rather_than_ignored(self, client):
         """A custom analysis names its own inputs -- two, on two different grids for
-        `exit-criterion` -- so the route cannot resolve a coordinate against "the" grid,
-        and `ExitCriterion.validate_selection` rejects the whole selection rather than
-        letting it be silently dropped. The distinction matters: silently ignoring a
-        `grid_cell` would return a whole-extent raster to a point query.
+        `salinity-veg-investigation` -- so the route cannot resolve a coordinate against
+        "the" grid, and `SalinityVegInvestigation.validate_selection` rejects the whole
+        selection rather than letting it be silently dropped. The distinction matters:
+        silently ignoring a `grid_cell` would return a whole-extent raster to a point
+        query.
         """
         response = client.get(
-            "/v1/analyses/exit-criterion/data.tif",
-            params={**EXIT_CRITERION_QUERY, "grid_cell": "-91.5,29.5"},
+            "/v1/analyses/salinity-veg-investigation/data.tif",
+            params={**SALINITY_VEG_QUERY, "grid_cell": "-91.5,29.5"},
         )
         assert response.status_code == 400
         assert "takes no selection" in response.json()["detail"]
@@ -396,12 +397,12 @@ class TestDatasetAnalysisPipelineJson:
 
 
 class TestCustomAnalysisPipelineJson:
-    """`exit-criterion`'s expansion -- the one registered `type="custom"` entry, and the
-    only one with multiple named inputs and a `project` + spatial `join`.
+    """`salinity-veg-investigation`'s expansion -- the one registered `type="custom"`
+    entry, and the only one with multiple named inputs and a `project` + spatial `join`.
     """
 
     def test_expands_to_the_paired_shape(self, client):
-        response = client.get("/v1/analyses/exit-criterion/pipeline.json", params=EXIT_CRITERION_QUERY)
+        response = client.get("/v1/analyses/salinity-veg-investigation/pipeline.json", params=SALINITY_VEG_QUERY)
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
         assert len(expanded.inputs) == 2
@@ -416,34 +417,35 @@ class TestCustomAnalysisPipelineJson:
 
     def test_color_map_override_is_reflected(self, client):
         response = client.get(
-            "/v1/analyses/exit-criterion/pipeline.json",
-            params={**EXIT_CRITERION_QUERY, "color_map": "ffibs"},
+            "/v1/analyses/salinity-veg-investigation/pipeline.json",
+            params={**SALINITY_VEG_QUERY, "color_map": "ffibs"},
         )
         assert response.json()["output"]["color_map"] == "ffibs"
 
     def test_the_analysiss_own_parameters_are_validated_by_the_registry(self, client):
-        """`marsh_threshold` is bounded to [0, 1] by `ExitCriterion.Parameters`; the route
+        """`marsh_threshold` is bounded to [0, 1] by `SalinityVegInvestigation.Parameters`; the route
         does not know that and does not need to -- `resolve_analysis` raises
         `InvalidAnalysisParametersError`, which `api/__init__` maps to 400.
         """
         response = client.get(
-            "/v1/analyses/exit-criterion/pipeline.json",
-            params={**EXIT_CRITERION_QUERY, "marsh_threshold": 42},
+            "/v1/analyses/salinity-veg-investigation/pipeline.json",
+            params={**SALINITY_VEG_QUERY, "marsh_threshold": 42},
         )
         assert response.status_code == 400
         assert "marsh_threshold" in response.json()["detail"]
 
 
 class TestCustomAnalysisVectorTileRejection:
-    """`exit-criterion`'s final frame is band-wide on a raster grid, so it can never serve
-    a `.pbf` tile. Unaffected by the execution gap the class below pins: a `.pbf` request
-    never reaches `execute()` at all -- `api.pipeline._require_vector_final_frame` reads
-    the plan's `frame_types` and rejects before any data is read.
+    """`salinity-veg-investigation`'s final frame is band-wide on a raster grid, so it can
+    never serve a `.pbf` tile. Unaffected by the execution gap the class below pins: a
+    `.pbf` request never reaches `execute()` at all --
+    `api.pipeline._require_vector_final_frame` reads the plan's `frame_types` and rejects
+    before any data is read.
     """
 
     def test_rejects_a_raster_output_grid(self, client):
         response = client.get(
-            "/v1/analyses/exit-criterion/tiles/3/1/2.pbf", params=EXIT_CRITERION_QUERY
+            "/v1/analyses/salinity-veg-investigation/tiles/3/1/2.pbf", params=SALINITY_VEG_QUERY
         )
         assert response.status_code == 400
         assert "not a long frame on a vector grid" in response.json()["detail"]
@@ -452,24 +454,24 @@ class TestCustomAnalysisVectorTileRejection:
 class TestCustomAnalysisExecution:
     """The two custom routes that actually RUN the analysis.
 
-    `exit_criterion_data` is built so marsh and salinity each cross their threshold only
+    `salinity_veg_data` is built so marsh and salinity each cross their threshold only
     in 2040, making the `min of=calendar_year` answer a uniform 2040 raster -- a value
     the route can only produce if the whole band-wide chain (shared scan, crosswalk
     broadcast, operand-named filter, band collapse) survived the trip through HTTP.
     """
 
-    def test_data_tif(self, client, exit_criterion_data):
-        response = client.get("/v1/analyses/exit-criterion/data.tif", params=EXIT_CRITERION_QUERY)
+    def test_data_tif(self, client, salinity_veg_data):
+        response = client.get("/v1/analyses/salinity-veg-investigation/data.tif", params=SALINITY_VEG_QUERY)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
         assert (data == 2040).all()
 
-    def test_png_tile(self, client, exit_criterion_data):
-        tile = _tile_for_grid(exit_criterion_data)
+    def test_png_tile(self, client, salinity_veg_data):
+        tile = _tile_for_grid(salinity_veg_data)
         response = client.get(
-            f"/v1/analyses/exit-criterion/data/{tile.z}/{tile.x}/{tile.y}.png",
-            params=EXIT_CRITERION_QUERY,
+            f"/v1/analyses/salinity-veg-investigation/data/{tile.z}/{tile.x}/{tile.y}.png",
+            params=SALINITY_VEG_QUERY,
         )
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
@@ -496,7 +498,7 @@ class TestAnalysisRegistryErrorMapping:
         from cpra.mp.data.analyses.base import InvalidAnalysisParametersError
 
         self._patch(monkeypatch, InvalidAnalysisParametersError("dimension must select exactly 2 values"))
-        response = client.get("/v1/analyses/exit-criterion/data.csv")
+        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
         assert response.status_code == 400
         assert "exactly 2 values" in response.json()["detail"]
 
@@ -504,14 +506,14 @@ class TestAnalysisRegistryErrorMapping:
         from cpra.mp.data.analyses.base import UnknownAnalysisError
 
         self._patch(monkeypatch, UnknownAnalysisError("unknown analysis name"))
-        response = client.get("/v1/analyses/exit-criterion/data.csv")
+        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
         assert response.status_code == 404
 
     def test_type_mismatch_error_maps_to_400(self, client, monkeypatch):
         from cpra.mp.data.analyses.base import AnalysisTypeMismatchError
 
         self._patch(monkeypatch, AnalysisTypeMismatchError("type mismatch"))
-        response = client.get("/v1/analyses/exit-criterion/data.csv")
+        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
         assert response.status_code == 400
 
 
@@ -522,5 +524,5 @@ class TestAnalysesCatalog:
         assert {entry["name"] for entry in response.json()} == {
             "difference",
             "concatenate",
-            "exit-criterion",
+            "salinity-veg-investigation",
         }

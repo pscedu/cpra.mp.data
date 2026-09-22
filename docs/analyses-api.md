@@ -2,12 +2,13 @@
 
 A named analysis is a pre-built [pipeline](analysis-api.md) with its own request-shaped
 parameters -- a `difference` between two scenarios, a `concatenate` land-type-change
-code, an `exit-criterion` earliest-crossing-year surface -- registered under a short name
-so a caller never has to hand-author the equivalent pipeline JSON. Every named analysis
-is **sugar over the same pipeline grammar** documented in the [Analysis API](analysis-api.md):
-resolving one always produces a real `Pipeline`, run through exactly the same compiler any
-hand-authored pipeline uses. Nothing is reachable only through a named analysis, and
-`pipeline.json` (below) lets a caller see the exact pipeline any request would run.
+code, a `salinity-veg-investigation` earliest-crossing-year surface -- registered under a
+short name so a caller never has to hand-author the equivalent pipeline JSON. Every named
+analysis is **sugar over the same pipeline grammar** documented in the
+[Analysis API](analysis-api.md): resolving one always produces a real `Pipeline`, run
+through exactly the same compiler any hand-authored pipeline uses. Nothing is reachable
+only through a named analysis, and `pipeline.json` (below) lets a caller see the exact
+pipeline any request would run.
 
 ## Catalog
 
@@ -19,7 +20,7 @@ Returns the full list of registered analyses, each with:
 
 | Field | Description |
 |---|---|
-| `name` | The analysis's route name (e.g. `difference`, `concatenate`, `exit-criterion`) |
+| `name` | The analysis's route name (e.g. `difference`, `concatenate`, `salinity-veg-investigation`) |
 | `label` | A human-readable display label |
 | `type` | `"dataset"` (operates on one caller-chosen dataset) or `"custom"` (its inputs are fixed by the analysis itself) |
 | `variables` | The variable(s) it's meaningful for, or `null` for any |
@@ -27,7 +28,7 @@ Returns the full list of registered analyses, each with:
 | `result_kind` | `"value"`, `"difference"`, or `"category"` -- a presentation hint for how to label the result |
 
 As of this writing, three analyses are registered: `difference` and `concatenate`
-(`type="dataset"`), and `exit-criterion` (`type="custom"`).
+(`type="dataset"`), and `salinity-veg-investigation` (`type="custom"`).
 
 ## Dataset-Scoped vs. Custom Routes
 
@@ -42,9 +43,9 @@ GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/tiles/{z
 GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/pipeline.json
 ```
 
-A `type="custom"` analysis (`exit-criterion`) fixes its own inputs inside its `pipeline()`
-method -- it isn't scoped to any one caller-chosen dataset, so its routes have no
-`/v1/datasets/...` prefix at all:
+A `type="custom"` analysis (`salinity-veg-investigation`) fixes its own inputs inside
+its `pipeline()` method -- it isn't scoped to any one caller-chosen dataset, so its
+routes have no `/v1/datasets/...` prefix at all:
 
 ```
 GET /v1/analyses/{analysis_name}/data.{format}
@@ -64,9 +65,10 @@ Every route above accepts:
   the analysis as its pipeline input's own filters.
 - The analysis's own declared parameters (e.g. `dimension`/`order` for `difference`,
   `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold` for
-  `exit-criterion`) as additional query parameters -- there is no fixed parameter set at
-  the route level, since it differs per analysis; whatever isn't one of the route's own
-  known fields is handed to the analysis's `Parameters` model for validation.
+  `salinity-veg-investigation`) as additional query parameters -- there is no fixed
+  parameter set at the route level, since it differs per analysis; whatever isn't one
+  of the route's own known fields is handed to the analysis's `Parameters` model for
+  validation.
 - `format`, `color_map`, `sort`, and `select` as request-level overrides on the *resolved*
   pipeline's `output` -- these are never part of the registry entry itself (the same
   value can be rendered with different color maps by different callers), and always win
@@ -120,14 +122,14 @@ which is always exactly 2 for both modes):
 GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/concatenate/data.csv?model_group_id=500,510&scenario_id=7&calendar_year=2040,2050&dimension=calendar_year
 ```
 
-### `exit-criterion`
+### `salinity-veg-investigation`
 
 `type="custom"`. The earliest calendar year at which marsh coverage
 (`ffibs_coverage_ratio`/annual/`veg_grid_cell_v001`, fixed `ffibs_type=pl_fm`) and paired
 salinity (`sal`/annual/`hydro_compartment_v001`, fixed `aggregate_type=2_wk_max`) both
 cross their thresholds, at every vegetation-grid pixel -- the paired (`project` + spatial
 `join`) pipeline shape shown in full in the
-[Analysis API's exit-criterion example](analysis-api.md#the-exit-criterion-query-earliest-year-marsh-and-salinity-both-cross-a-threshold).
+[Analysis API's salinity-veg-investigation example](analysis-api.md#the-salinity-veg-investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).
 Because it's `type="custom"`, its two inputs are fixed by its own `pipeline()` method --
 there is no `/v1/datasets/.../` dataset to scope it to.
 
@@ -143,8 +145,8 @@ rejected the same way any paired-shape pipeline's tabular output would be, since
 result is inherently one raster surface.
 
 ```
-GET /v1/analyses/exit-criterion/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
-GET /v1/analyses/exit-criterion/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7
+GET /v1/analyses/salinity-veg-investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
+GET /v1/analyses/salinity-veg-investigation/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7
 ```
 
 ## Seeing the Expanded Pipeline: `pipeline.json`
@@ -183,6 +185,6 @@ rather than in the order the query string listed them.
 which is exactly the hand-authored "Map Query Comparing Two Scenarios" pipeline shown in
 the [Analysis API](analysis-api.md#map-query-comparing-two-scenarios) -- proving the named
 analysis is sugar over the same pipeline grammar, never a second engine. This holds for
-every registered analysis: `.../analyses/exit-criterion/pipeline.json?...` likewise
+every registered analysis: `.../analyses/salinity-veg-investigation/pipeline.json?...` likewise
 returns exactly the explicit paired-shape `Pipeline` shown in the
-[exit-criterion example](analysis-api.md#the-exit-criterion-query-earliest-year-marsh-and-salinity-both-cross-a-threshold).
+[salinity-veg-investigation example](analysis-api.md#the-salinity-veg-investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).

@@ -78,8 +78,8 @@ def raster_dimensions():
 
 
 @pytest.fixture
-def exit_criterion_data(base_path, crosswalk_path, monkeypatch):
-    """The two hardcoded inputs of the `exit-criterion` named analysis, on disk.
+def salinity_veg_data(base_path, crosswalk_path, monkeypatch):
+    """The two hardcoded inputs of the `salinity-veg-investigation` named analysis, on disk.
 
     Marsh (raster) 0.3->2030, 0.7->2040 (crosses `marsh > 0.5` only in 2040); salinity
     (vector, one zone) 4.0->2030, 6.0->2040 (crosses `sal > 5.5` only in 2040) -- and

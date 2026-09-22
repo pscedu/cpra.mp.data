@@ -1,8 +1,9 @@
 """Shared machinery for `cpra.mp.data.analyses`'s registry entries: the exception family
 the registry (`cpra/mp/data/analyses/__init__.py`) raises, the `DatasetRef`/`ResolvedAnalysis`
 value objects the interface contract with the API route layer names explicitly, the
-`Analysis` base class every entry (`difference.py`, `concatenate.py`, `exit_criterion.py`)
-subclasses, and a handful of small pure helpers (SQL-literal quoting, structural
+`Analysis` base class every entry (`difference.py`, `concatenate.py`,
+`salinity_veg_investigation.py`) subclasses, and a handful of small pure helpers
+(SQL-literal quoting, structural
 `collapsed_dimensions` derivation) those entries share.
 
 Mirrors `cpra.mp.data.visualizations.base`'s conventions where they overlap (a nested
@@ -239,9 +240,9 @@ def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     its inputs carries, minus whatever the pipeline's OWN trailing `group.by` still keeps
     (derived structurally, rather than each analysis hand-declaring it) --
     `frozenset()` when the last step isn't a `group` at all (nothing has been collapsed).
-    For `exit-criterion`, whose trailing `group.by` is always `[]`, this is simply every
-    dimension either input carries (both are pinned single-valued dataset selections, so
-    nothing meaningful varies in the output either way).
+    For `salinity-veg-investigation`, whose trailing `group.by` is always `[]`, this is
+    simply every dimension either input carries (both are pinned single-valued dataset
+    selections, so nothing meaningful varies in the output either way).
     """
     last_step = pipeline.steps[-1]
     if not isinstance(last_step, GroupStep):
@@ -330,7 +331,7 @@ class Analysis:
         """A cardinality/consistency rule that needs `filters` alongside `parameters` --
         raise `InvalidAnalysisParametersError` to reject. The default performs no extra
         check (an analysis whose `Parameters` model alone is a sufficient validity check,
-        e.g. `exit-criterion`, does not need to override this).
+        e.g. `salinity-veg-investigation`, does not need to override this).
         """
 
     def pipeline(self) -> Pipeline:

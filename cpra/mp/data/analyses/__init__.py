@@ -29,14 +29,14 @@ from cpra.mp.data.analyses.base import (
 )
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
-from cpra.mp.data.analyses.exit_criterion import ExitCriterion
+from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.errors import RequestError
 
-# Landed in this order (`exit-criterion` first -- the only entry exercising the
-# `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and the
-# only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name ->
-# class` dict, so registration order has no behavioral effect.
-ANALYSES = {cls.Meta.name: cls for cls in [ExitCriterion, Difference, Concatenate]}
+# Landed in this order (`salinity-veg-investigation` first -- the only entry exercising
+# the `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and
+# the only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name
+# -> class` dict, so registration order has no behavioral effect.
+ANALYSES = {cls.Meta.name: cls for cls in [SalinityVegInvestigation, Difference, Concatenate]}
 
 __all__ = [
     "ANALYSES",
@@ -67,7 +67,7 @@ def resolve_analysis(
     against `filters`, then build and return its `pipeline()`.
 
     `dataset` is `None` for a `type="custom"` analysis (its inputs are hardcoded in its
-    own `pipeline()` method -- see `exit_criterion.py`); `filters` is the dataset's
+    own `pipeline()` method -- see `salinity_veg_investigation.py`); `filters` is the dataset's
     dimension filters plus the two reserved keys `grid_cell` and `where`, which the
     analysis composes into its pipeline's leading `filter` STEP (see
     `base.selection_filter_where`) rather than onto its input selection -- an
@@ -77,7 +77,8 @@ def resolve_analysis(
     function returns, the same way they would for a hand-authored pipeline.) `params` is
     the analysis's own declared parameters (`dimension`/`order` for `difference`,
     `dimension` for `concatenate`, `model_group_id`/`scenario_id`/`marsh_threshold`/
-    `salinity_threshold` for `exit-criterion`), raw and unvalidated until this call.
+    `salinity_threshold` for `salinity-veg-investigation`), raw and unvalidated until this
+    call.
 
     `grid_cell_where` is an already-resolved spatial conjunct (`"grid_cell IN (1, 2)"`)
     for a caller that had to turn coordinates into IDs itself -- resolving coordinates

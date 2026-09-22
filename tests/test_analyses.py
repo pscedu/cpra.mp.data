@@ -40,7 +40,7 @@ from cpra.mp.data.analyses.base import (
 )
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
-from cpra.mp.data.analyses.exit_criterion import ExitCriterion
+from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
     FilterStep,
@@ -60,7 +60,7 @@ SAL_DATASET = DatasetRef(variable="sal", time_unit="daily", grid="hydro_compartm
 
 class TestRegistry:
     def test_contains_exactly_the_three_v1_entries(self):
-        assert set(ANALYSES) == {"exit-criterion", "difference", "concatenate"}
+        assert set(ANALYSES) == {"salinity-veg-investigation", "difference", "concatenate"}
 
     def test_keyed_by_meta_name(self):
         for name, cls in ANALYSES.items():
@@ -77,8 +77,8 @@ class TestRegistry:
         assert ANALYSES["concatenate"].Meta.legend == "lnd_chng"
         assert ANALYSES["concatenate"].Meta.result_kind == "category"
 
-        assert ANALYSES["exit-criterion"].Meta.type == "custom"
-        assert ANALYSES["exit-criterion"].Meta.result_kind == "value"
+        assert ANALYSES["salinity-veg-investigation"].Meta.type == "custom"
+        assert ANALYSES["salinity-veg-investigation"].Meta.result_kind == "value"
 
 
 # ------------------------------------------------------------------------------------------
@@ -100,7 +100,7 @@ class TestResolveAnalysisContract:
     def test_custom_analysis_with_dataset_raises_type_mismatch(self):
         with pytest.raises(AnalysisTypeMismatchError):
             resolve_analysis(
-                "exit-criterion",
+                "salinity-veg-investigation",
                 dataset=SSF_DATASET,
                 filters={},
                 params={"model_group_id": 500, "scenario_id": 7},
@@ -621,45 +621,45 @@ class TestConcatenatePipeline:
 
 
 # ------------------------------------------------------------------------------------------
-# `exit-criterion`
+# `salinity-veg-investigation`
 # ------------------------------------------------------------------------------------------
 
 
-class TestExitCriterionParameters:
+class TestSalinityVegInvestigationParameters:
     def test_requires_model_group_id_and_scenario_id(self):
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(scenario_id=7)
+            SalinityVegInvestigation.Parameters(scenario_id=7)
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(model_group_id=500)
+            SalinityVegInvestigation.Parameters(model_group_id=500)
 
     def test_defaults(self):
-        params = ExitCriterion.Parameters(model_group_id=500, scenario_id=7)
+        params = SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7)
         assert params.marsh_threshold == 0.5
         assert params.salinity_threshold == 5.5
 
     def test_marsh_threshold_bounds(self):
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=1.5)
+            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=1.5)
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=-0.1)
+            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=-0.1)
 
     def test_salinity_threshold_lower_bound(self):
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(model_group_id=500, scenario_id=7, salinity_threshold=-1)
+            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, salinity_threshold=-1)
 
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
-            ExitCriterion.Parameters(model_group_id=500, scenario_id=7, bogus=1)
+            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, bogus=1)
 
 
-class TestExitCriterionPipeline:
+class TestSalinityVegInvestigationPipeline:
     def _build(self, **overrides):
         params = {"model_group_id": 500, "scenario_id": 7, **overrides}
-        analysis = ExitCriterion(dataset=None, filters={}, parameters=ExitCriterion.Parameters(**params))
+        analysis = SalinityVegInvestigation(dataset=None, filters={}, parameters=SalinityVegInvestigation.Parameters(**params))
         return analysis, analysis.pipeline()
 
-    def test_matches_the_documented_exit_criterion_shape(self):
-        """`docs/analysis-api.md`'s "The Exit-Criterion Query" example, reproduced via
+    def test_matches_the_documented_salinity_veg_shape(self):
+        """`docs/analysis-api.md`'s "The Salinity-Veg Investigation" example, reproduced via
         the named analysis instead of hand-authored JSON.
         """
         _, pipeline = self._build()

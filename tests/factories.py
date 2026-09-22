@@ -180,9 +180,10 @@ def write_ffibs_coverage_dataset(base_path, values_by_year, **overrides):
     ``values_by_year`` entry.
 
     The raster half of the marsh-coverage-plus-salinity pair: the two variables the
-    ``exit-criterion`` named analysis hardcodes, and the smallest real dataset that puts a
-    raster grid and a vector grid on the same pair of years. ``ffibs_type`` is required by
-    ``variables.csv`` and defaults to the ``pl_fm`` value that analysis selects.
+    ``salinity-veg-investigation`` named analysis hardcodes, and the smallest real dataset
+    that puts a raster grid and a vector grid on the same pair of years. ``ffibs_type`` is
+    required by ``variables.csv`` and defaults to the ``pl_fm`` value that analysis
+    selects.
     """
     kwargs = {**RASTER_KWARGS, "variable": "ffibs_coverage_ratio", "ffibs_type": "pl_fm", **overrides}
     for year, value in values_by_year.items():

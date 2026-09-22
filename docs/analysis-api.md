@@ -18,8 +18,8 @@ round trip. See the
 [README's Analyzing Data section](../README.md#analyzing-data) for usage.
 
 A small, fixed set of named, pre-built pipelines (`difference`, `concatenate`,
-`exit-criterion`) is also available without hand-authoring pipeline JSON at all -- see
-[the named-analysis registry](analyses-api.md).
+`salinity-veg-investigation`) is also available without hand-authoring pipeline JSON at
+all -- see [the named-analysis registry](analyses-api.md).
 
 Four endpoints accept a pipeline, sharing one request model:
 
@@ -390,7 +390,7 @@ Each step here leaves the frame band-wide, which is what the `png` output requir
 ```
 
 As a `GET` request to `/v1/analysis/{z}/{x}/{y}.png`, this pipeline is flattened into the
-same dotted query encoding shown in the exit-criterion example below
+same dotted query encoding shown in the salinity-veg-investigation example below
 (`input.elev.variable=elev&...&step.1.op=filter&...&output.format=png&output.color_map=elevation_difference`);
 there is no `POST` form for the tile route.
 
@@ -526,7 +526,7 @@ POST /v1/analysis.tif
 
 ### Multi-Input (Paired) Pipelines
 
-#### The Exit-Criterion Query: Earliest Year Marsh and Salinity Both Cross a Threshold
+#### The Salinity-Veg Investigation: Earliest Year Marsh and Salinity Both Cross a Threshold
 
 This pipeline broadcasts annual salinity (by hydro compartment) onto the vegetation grid,
 pairs it against marsh coverage there, keeps only pixel-years where marsh coverage
@@ -574,18 +574,18 @@ And as map tiles, replacing `output.format=tif` with `output.format=png`:
 GET /v1/analysis/{z}/{x}/{y}.png?...same query as above, with output.format=png
 ```
 
-**As the `exit-criterion` named analysis** -- the same request, with the `Pipeline` above
-built by the registry rather than hand-authored:
+**As the `salinity-veg-investigation` named analysis** -- the same request, with the
+`Pipeline` above built by the registry rather than hand-authored:
 
 ```
-GET /v1/analyses/exit-criterion/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
+GET /v1/analyses/salinity-veg-investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
 ```
 
-`exit-criterion` is a `type="custom"` analysis (its two inputs are fixed by its own
+`salinity-veg-investigation` is a `type="custom"` analysis (its two inputs are fixed by its own
 `pipeline()` method, not supplied by a dataset in the URL -- see
-[the registry doc](analyses-api.md#exit-criterion)), so this route has no
+[the registry doc](analyses-api.md#salinity-veg-investigation)), so this route has no
 `/v1/datasets/{variable}/{time_unit}/{grid}/` prefix. Fetching
-`GET /v1/analyses/exit-criterion/pipeline.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
+`GET /v1/analyses/salinity-veg-investigation/pipeline.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
 returns exactly the explicit `Pipeline` JSON shown at the top of this section (with
 `model_group_id`/`scenario_id` substituted from the request) -- proving the named
 analysis is sugar over the same pipeline grammar, never a second engine.

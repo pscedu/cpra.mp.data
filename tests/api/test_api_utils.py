@@ -189,7 +189,7 @@ class TestGetAnalysisClass:
         monkeypatch.setattr(
             api_utils,
             "ANALYSES",
-            {"concatenate": _FakeDatasetAnalysisClass, "exit-criterion": _FakeCustomAnalysisClass},
+            {"concatenate": _FakeDatasetAnalysisClass, "salinity-veg-investigation": _FakeCustomAnalysisClass},
         )
 
     def test_returns_a_known_analysis(self):
@@ -212,11 +212,11 @@ class TestGetAnalysisClass:
 
     def test_custom_type_mismatch_the_other_direction(self):
         with pytest.raises(HTTPException) as excinfo:
-            get_analysis_class("exit-criterion", "dataset")
+            get_analysis_class("salinity-veg-investigation", "dataset")
         assert excinfo.value.status_code == 400
 
     def test_type_is_optional(self):
-        assert get_analysis_class("exit-criterion") is not None
+        assert get_analysis_class("salinity-veg-investigation") is not None
 
 
 class TestLazyFrameSource:

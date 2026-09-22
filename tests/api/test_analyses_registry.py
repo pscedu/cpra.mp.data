@@ -17,18 +17,19 @@ lives on `morph_pixel_v001` (8265x20674 pixels), far too large to write as a tes
 the `Meta.variables` declaration itself is unaffected by this substitution, only which
 dataset proves the pipeline-construction MACHINERY works.
 
-`exit-criterion` is `type="custom"` with hardcoded inputs (`ffibs_coverage_ratio`/
-`veg_grid_cell_v001`, `sal`/`hydro_compartment_v001`), written by
+`salinity-veg-investigation` is `type="custom"` with hardcoded inputs
+(`ffibs_coverage_ratio`/`veg_grid_cell_v001`, `sal`/`hydro_compartment_v001`), written by
 `tests/factories.py`'s `write_ffibs_coverage_dataset`/`write_sal_annual_dataset` and
-assembled by the `exit_criterion_data` fixture in `tests/api/conftest.py` -- shared with
+assembled by the `salinity_veg_data` fixture in `tests/api/conftest.py` -- shared with
 `tests/api/test_analyses_endpoints.py`, which needs the same data to drive the same
 analysis through its HTTP routes.
 
-**`exit-criterion` gets its own execution class.** Every other registered analysis is
-long-shaped and runs through `_run` below; `exit-criterion` is band-wide end to end and
-is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
-together with a `filter` naming that join's operand value columns, so
-`TestExitCriterionExecution` runs it separately and pins the two halves apart.
+**`salinity-veg-investigation` gets its own execution class.** Every other registered
+analysis is long-shaped and runs through `_run` below; `salinity-veg-investigation` is
+band-wide end to end and is the only entry that exercises a vector-to-raster `project`
+feeding a band-wide `join` together with a `filter` naming that join's operand value
+columns, so `TestSalinityVegInvestigationExecution` runs it separately and pins the two
+halves apart.
 """
 
 import pytest
@@ -79,7 +80,7 @@ class TestRegistryDrift:
         # If a fourth analysis lands and nobody updates the tests below, this is the
         # tripwire: it fails loudly instead of the drift test silently covering only 3
         # of 4 entries.
-        assert set(ANALYSES) == {"exit-criterion", "difference", "concatenate"}
+        assert set(ANALYSES) == {"salinity-veg-investigation", "difference", "concatenate"}
 
     def test_difference_compiles(self, base_path):
         write_annual_dataset(base_path, years=(2030, 2040))
@@ -120,9 +121,9 @@ class TestRegistryDrift:
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
-    def test_exit_criterion_compiles(self, exit_criterion_data, base_path):
+    def test_salinity_veg_investigation_compiles(self, salinity_veg_data, base_path):
         resolved = resolve_analysis(
-            "exit-criterion",
+            "salinity-veg-investigation",
             dataset=None,
             filters={},
             params={"model_group_id": 500, "scenario_id": 7},
@@ -268,30 +269,30 @@ class TestConcatenateExecution:
         assert set(df["value"].to_list()) == {111.0}
 
 
-class TestExitCriterionExecution:
-    """`exit-criterion` is the only registered analysis whose pipeline is band-wide end to
-    end, and the only one that exercises the two pieces of machinery a paired raster shape
-    needs: a vector-to-raster `project` feeding a band-wide `join` (both operands read off
-    ONE `scan_raster`, so their `batch_layout`s agree), and a `filter` whose `where` names
-    the join's OPERAND value columns rather than `value`. Each is pinned here against the
-    smallest pipeline that isolates it.
+class TestSalinityVegInvestigationExecution:
+    """`salinity-veg-investigation` is the only registered analysis whose pipeline is
+    band-wide end to end, and the only one that exercises the two pieces of machinery a
+    paired raster shape needs: a vector-to-raster `project` feeding a band-wide `join`
+    (both operands read off ONE `scan_raster`, so their `batch_layout`s agree), and a
+    `filter` whose `where` names the join's OPERAND value columns rather than `value`.
+    Each is pinned here against the smallest pipeline that isolates it.
     """
 
-    def test_the_analysis_itself_runs_to_a_uniform_2040_raster(self, exit_criterion_data, tmp_path):
-        """The whole analysis, end to end, over `exit_criterion_data` -- marsh crosses 0.5
+    def test_the_analysis_itself_runs_to_a_uniform_2040_raster(self, salinity_veg_data, tmp_path):
+        """The whole analysis, end to end, over `salinity_veg_data` -- marsh crosses 0.5
         only in 2040, salinity crosses 5.5 only in 2040, so the `min of=calendar_year`
         answer is 2040 at every pixel. The vector operand reaches the join through a
         vector-to-raster `project`, which is the half of the shape the sibling test below
         deliberately leaves out.
         """
         resolved = resolve_analysis(
-            "exit-criterion",
+            "salinity-veg-investigation",
             dataset=None,
             filters={},
             params={"model_group_id": 500, "scenario_id": 7},
         )
         out = tmp_path / "out.tif"
-        run_to_path(resolved.pipeline, out, base_path=exit_criterion_data)
+        run_to_path(resolved.pipeline, out, base_path=salinity_veg_data)
 
         with rio.open(out) as src:
             assert (src.read(1) == 2040).all()

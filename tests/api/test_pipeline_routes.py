@@ -10,12 +10,13 @@ is that the routes wire them together, that the request encodings agree with eac
 and that a rejection reaches the caller as a 4xx with a message naming the problem.
 
 **On variable/grid choices below.** The paired shape's fixtures (`notebook_query_data` and
-its two siblings) use the variable/grid/dimension names from the `exit-criterion` named
-analysis (`ffibs_coverage_ratio`/`veg_grid_cell_v001` paired against
-`sal`/`hydro_compartment_v001`). `tests/factories.py` has no ready-made builder for either
-(its `annual_frame`/`write_raster_dataset` helpers are hardcoded to `ssf`/`vct`), so this
-module writes them directly with `write_parquet`/`write_cog`, mirroring those helpers' own
-shape. The single-input shapes, which have no such requirement, reuse
+its two siblings) use the variable/grid/dimension names from the
+`salinity-veg-investigation` named analysis (`ffibs_coverage_ratio`/`veg_grid_cell_v001`
+paired against `sal`/`hydro_compartment_v001`). `tests/factories.py` has no ready-made
+builder for either (its `annual_frame`/`write_raster_dataset` helpers are hardcoded to
+`ssf`/`vct`), so this module writes them directly with `write_parquet`/`write_cog`,
+mirroring those helpers' own shape. The single-input shapes, which have no such
+requirement, reuse
 `tests/factories.py`'s `ssf`/`ecoregion_v001` and `vct`/`veg_grid_cell_v001` fixtures
 directly, per that module's own convention -- the engine cares about grid TYPES and
 SHAPES, not real-world variable semantics.
@@ -53,9 +54,10 @@ from tests.factories import (
 # same number is used regardless of the band dtype.
 NODATA = -9999
 
-# The `exit-criterion` analysis's own shape, spelled as a raw pipeline body: two inputs on
-# different grids, one `project`ed onto the other's grid, joined, filtered on both value
-# columns, and collapsed to the earliest calendar year that satisfies the filter.
+# The `salinity-veg-investigation` analysis's own shape, spelled as a raw pipeline body:
+# two inputs on different grids, one `project`ed onto the other's grid, joined, filtered
+# on both value columns, and collapsed to the earliest calendar year that satisfies the
+# filter.
 #
 # An input here names a dataset and nothing else -- `request.pipeline.InputSelection` is
 # `extra="forbid"` with only `variable`/`time_unit`/`grid`, by design (see its own

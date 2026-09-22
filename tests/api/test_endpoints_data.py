@@ -148,8 +148,8 @@ def categorical_raster_with_zones(base_path, crosswalk_path, monkeypatch):
 def gradient_raster_with_zones(base_path, crosswalk_path, monkeypatch):
     """A raster whose pixels are a gradient (see `raster_array`'s no-fill case), split
     into two zones by row, for a `summarize_by`+`where`-value-conjunct conditional-count
-    request -- the exit-criterion query, end to end through the ASGI app rather than a
-    unit-level `Dataset`.
+    request -- "count pixels per compartment where value > X", end to end through the ASGI
+    app rather than a unit-level `Dataset`.
     """
     from cpra.mp.data.grids import GRIDS
 

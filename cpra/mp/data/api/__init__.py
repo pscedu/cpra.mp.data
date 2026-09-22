@@ -582,7 +582,7 @@ def _analysis_filters(query: AnalysisQuery, *, dimensions: bool = True) -> dict:
     `dimensions=False` for a `type="custom"` analysis, which has no `{variable}/
     {time_unit}/{grid}` URL segment: with no dataset in the request there is nothing for
     a dimension filter to narrow, so a dimension-NAMED query parameter on one of those
-    routes is the analysis's own parameter instead (`exit-criterion` declares
+    routes is the analysis's own parameter instead (`salinity-veg-investigation` declares
     `model_group_id`/`scenario_id`, which are also real dimension names) and is routed to
     `params` by `_analysis_extra_params`'s matching `known` set. Only the two reserved
     keys below survive here.
@@ -622,9 +622,10 @@ def _analysis_extra_params(request: Request, known: frozenset) -> dict:
     """Everything in the query string besides `known` (the bound query model's own
     fields) is the named analysis's own declared parameter set -- `dimension`/`order` for
     `difference`, `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold`
-    for `exit-criterion`, etc. There is no fixed field set for these at the route level
-    (it varies per analysis), so they are read directly off the raw query string and
-    handed to `resolve_analysis(params=...)` for the registry itself to validate --
+    for `salinity-veg-investigation`, etc. There is no fixed field set for these at the
+    route level (it varies per analysis), so they are read directly off the raw query
+    string and handed to `resolve_analysis(params=...)` for the registry itself to
+    validate --
     the same "no flat spelling a route-level query model can bind" reasoning
     `reject_retired_params` above uses to check the raw query string directly for the
     retired `calculate.*` family.
@@ -683,18 +684,19 @@ def _resolve_custom_analysis(analysis_name, request, query):
     """The three custom named-analysis routes' shared prologue.
 
     No `grid_cell` resolution counterpart to `_resolve_dataset_analysis`'s: a custom
-    analysis names its own inputs (there is no `{grid}` URL segment, and `exit-criterion`
-    reads two different grids), so there is no single grid to resolve a coordinate
-    against. `grid_cell` on these routes therefore means literal ids, and a coordinate
-    value is rejected by `request.data_query.grid_cell_conjunct` with a message saying so.
+    analysis names its own inputs (there is no `{grid}` URL segment, and
+    `salinity-veg-investigation` reads two different grids), so there is no single grid to
+    resolve a coordinate against. `grid_cell` on these routes therefore means literal ids,
+    and a coordinate value is rejected by `request.data_query.grid_cell_conjunct` with a
+    message saying so.
 
     The dimension/parameter split is the mirror image of the dataset routes': with no
     dataset in the URL there is nothing for a dimension filter to narrow, so the
     `FilterDimensions` half of the bound query model is subtracted from
     `_analysis_extra_params`'s `known` set and a dimension-named query parameter reaches
-    the analysis's own `Parameters` instead. `exit-criterion` needs exactly that -- it
-    declares `model_group_id`/`scenario_id`, both real dimension names, and would
-    otherwise see them bound as filters it has no dataset to apply them to.
+    the analysis's own `Parameters` instead. `salinity-veg-investigation` needs exactly
+    that -- it declares `model_group_id`/`scenario_id`, both real dimension names, and
+    would otherwise see them bound as filters it has no dataset to apply them to.
     """
     get_analysis_class(analysis_name, "custom")
     known = frozenset(type(query).model_fields) - frozenset(FilterDimensions.model_fields)
