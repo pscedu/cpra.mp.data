@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import uuid
 import xml.etree.ElementTree
 from collections import Counter
@@ -193,16 +194,60 @@ def _read_cog_metadata(path):
         return descriptions, ds.dtypes[0], is_legacy, tags
 
 
+# Width of ``_metadata_pool``.  Deliberately a constant rather than ``ThreadPoolExecutor``'s
+# ``os.cpu_count()``-derived default: opening a COG header is latency-bound, not CPU-bound,
+# so the useful width is how many opens can be in flight at once, which has nothing to do
+# with how many cores could run them.  See ``_metadata_pool`` for the measurements.
+_METADATA_POOL_WORKERS = 16
+
+_metadata_pool_instance = None
+_metadata_pool_lock = threading.Lock()
+
+
+def _metadata_pool():
+    """The thread pool ``_parallel_read_cog_metadata`` opens COGs on -- created on first
+    use, then kept for the life of the process.
+
+    Kept rather than rebuilt per call because the first ``rio.open`` on a fresh thread pays
+    GDAL's per-thread setup, measured at roughly six times a later open on the same thread.
+    That fixed cost is large enough to swamp the work: over 81 real COGs on local disk, a
+    per-call pool ran at 0.33x a plain serial loop -- it was *losing* -- and at 1 ms of
+    per-open latency it only broke even (1.03x).  A pool that is already warm measured
+    0.80x and 2.21x on those same two, and pulls further ahead as latency grows (6.9x at
+    5 ms, 13.9x at 20 ms, where a per-call pool reached 7.3x).
+
+    Latency is what this is for.  The local, warm-cache case is the 0.80x row and is a real
+    but small loss (~14 ms over 81 files); the deployed data lives on a shared parallel
+    filesystem, where per-open latency is what the whole sweep above is parameterized by.
+
+    Safe to hold for the process's life here: the API serves single-process under
+    ``uvicorn.run``, and the one place that does use several processes
+    (``scripts/migrate_to_long_format.py``) deliberately spawns rather than forks, so no
+    child can inherit a pool whose worker threads did not come with it.
+    """
+
+    global _metadata_pool_instance
+    with _metadata_pool_lock:
+        if _metadata_pool_instance is None:
+            _metadata_pool_instance = ThreadPoolExecutor(
+                max_workers=_METADATA_POOL_WORKERS, thread_name_prefix="cog-metadata"
+            )
+        return _metadata_pool_instance
+
+
 def _parallel_read_cog_metadata(paths):
     """Read ``(descriptions, dtype, is_legacy, tags)`` for several COGs in parallel threads.
 
     The calendar value a file/band covers can only be determined by opening it (the
     filename is an opaque UUID), so both ``read_cog`` and ``compact_cog`` must open every
     candidate file; doing so in parallel keeps that from being latency-bound.
+
+    Results come back in ``paths`` order regardless of which open finished first, which
+    ``_read_cog_band_rows`` relies on when it zips the two together.  Runs on the shared
+    ``_metadata_pool()`` rather than a pool of its own -- see there for why.
     """
 
-    with ThreadPoolExecutor() as pool:
-        return list(pool.map(_read_cog_metadata, paths))
+    return list(_metadata_pool().map(_read_cog_metadata, paths))
 
 
 def _read_cog_band_rows(paths):

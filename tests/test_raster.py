@@ -1,5 +1,6 @@
 """Tests for writing, locating, and virtually stacking COGs."""
 
+import time
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -7,7 +8,7 @@ import polars as pl
 import pytest
 import rasterio as rio
 
-from cpra.mp.data import config
+from cpra.mp.data import config, raster
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import cog_path_expression, compact_cog, read_cog, vrt, write_cog
@@ -136,6 +137,69 @@ class TestWriteCog:
             **RASTER_KWARGS,
         )
         assert list(base_path.rglob("*.tif"))
+
+
+class TestMetadataPool:
+    """`_parallel_read_cog_metadata` opens every candidate COG to find out which calendar
+    values it covers -- the filenames are opaque UUIDs -- so it is the fixed cost in front
+    of `read_cog`, `compact_cog`, and `catalog.raster_rows` alike.
+    """
+
+    @pytest.fixture
+    def cogs(self, base_path):
+        write_raster_dataset(base_path, years=tuple(range(2030, 2038)), fill_fn=lambda y: y - 2000)
+        return sorted(str(p) for p in base_path.rglob("*.tif"))
+
+    def test_the_pool_is_shared_rather_than_built_per_call(self):
+        # Building one per call is what this costs: GDAL's per-thread setup is paid again by
+        # every worker of every new pool, which measured ~6x a later open on the same thread
+        # -- enough that a per-call pool read 81 COGs slower than a plain serial loop did.
+        assert raster._metadata_pool() is raster._metadata_pool()
+
+    def test_the_pool_width_does_not_follow_the_machine(self):
+        """`ThreadPoolExecutor`'s own default is `min(32, os.cpu_count() + 4)`, which on a
+        small host is 6. Width is exactly what buys the overlap this pool exists for, and an
+        open's latency has nothing to do with the core count: over 81 COGs at 20 ms per open,
+        4 workers measured 3.9x a serial read where 16 measured 13.9x.
+        """
+        assert raster._metadata_pool()._max_workers == raster._METADATA_POOL_WORKERS
+        assert raster._METADATA_POOL_WORKERS >= 16
+
+    def test_results_come_back_in_the_order_the_paths_were_given(self, cogs):
+        """`_read_cog_band_rows` zips `paths` against these results positionally, so a path
+        paired with another file's descriptions would mislabel its bands' calendar values
+        without anything raising. Opens finish in whatever order the filesystem allows; the
+        shuffle is what makes completion order unlikely to match input order.
+        """
+        shuffled = list(reversed(cogs))
+        pooled = raster._parallel_read_cog_metadata(shuffled)
+
+        assert pooled == [raster._read_cog_metadata(path) for path in shuffled]
+        # Not vacuous only because the files genuinely differ: distinct years, distinct
+        # descriptions. Identical files would pass this no matter how the results were paired.
+        assert len({result[0] for result in pooled}) == len(shuffled)
+
+    def test_the_opens_actually_overlap(self, cogs, monkeypatch):
+        """The whole point is that a slow open does not block the next one. Timed rather
+        than asserted structurally because "runs on a pool" is satisfiable by a pool of one
+        worker, which would not be this.
+        """
+        delay = 0.05
+        real_open = rio.open
+
+        def slow_open(path, *args, **kwargs):
+            time.sleep(delay)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(rio, "open", slow_open)
+        started = time.perf_counter()
+        raster._parallel_read_cog_metadata(cogs)
+        elapsed = time.perf_counter() - started
+
+        # Eight files, each stalled `delay`; serially that is 8 * delay. Half of that is a
+        # wide margin around the ~1 * delay a pool this size should actually take.
+        assert len(cogs) == 8
+        assert elapsed < len(cogs) * delay / 2
 
 
 class TestReadCog:
