@@ -10,7 +10,7 @@ import rasterio as rio
 from cpra.mp.data import config
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.raster import cog_path_expression, read_cog, vrt, write_cog
+from cpra.mp.data.raster import cog_path_expression, compact_cog, read_cog, vrt, write_cog
 from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
 
 DATASET_KWARGS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
@@ -228,6 +228,71 @@ class TestVrt:
 
         with rio.open(vrt(df["path"])) as src:
             assert src.count == 1
+
+    @pytest.fixture
+    def three_band_cog(self, base_path):
+        """One COG carrying three bands, filled 30/31/32 -- what a compacted run looks like,
+        and the only shape in which a source list can name one file more than once. The years
+        are consecutive because that is what `compact_cog` merges.
+        """
+        write_raster_dataset(base_path, years=(2030, 2031, 2032), fill_fn=lambda y: y - 2000)
+        compact_cog(base_path=base_path, catalog_path=None, group_years=None, **RASTER_KWARGS)
+        tifs = list(base_path.rglob("*.tif"))
+        assert len(tifs) == 1
+        return str(tifs[0])
+
+    def test_a_file_is_opened_once_however_many_of_its_bands_are_used(self, three_band_cog, monkeypatch):
+        """A source list names (path, band) pairs, so a multi-band COG usually appears in it
+        several times -- but one open already yields every band's XML, and re-opening per
+        source re-read the same header only to discard all but one band of the result.
+
+        Counts opens rather than asserting a duration because the saving is the opens: on a
+        real 52-band request over 5 files this was 52 of them instead of 5.
+        """
+        opened = []
+        real_open = rio.open
+
+        def counting_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(rio, "open", counting_open)
+        out = vrt([(three_band_cog, band) for band in (1, 2, 3)])
+
+        assert opened == [three_band_cog]
+        assert [b.get("band") for b in ET.fromstring(out).findall("VRTRasterBand")] == ["1", "2", "3"]
+
+    def test_the_same_band_can_be_used_twice(self, three_band_cog):
+        """Each file is parsed once, so both of these sources resolve to the same element of
+        the same tree -- and one element cannot be two output bands. Copied per source, so
+        that numbering the second does not renumber the first.
+
+        The numbers are what breaks, not the pixels: GDAL takes band order from the elements'
+        document order, so an element repeated by reference still reads correctly while
+        carrying whichever number was written to it last.
+        """
+        out = vrt([(three_band_cog, 2), (three_band_cog, 2)])
+        assert [b.get("band") for b in ET.fromstring(out).findall("VRTRasterBand")] == ["1", "2"]
+
+        with rio.open(out) as src:
+            assert src.count == 2
+            assert src.read(1)[0, 0] == 31
+            assert src.read(2)[0, 0] == 31
+
+    def test_bands_of_one_file_can_be_selected_in_any_order(self, three_band_cog):
+        """Output band order follows the source list, not the source file's own band order,
+        including when every source is the same file. The first source is also the one whose
+        dataset element becomes the output root, so this is the case where that element has
+        to give up its own band 1 and be renumbered to keep a later band instead.
+        """
+        out = vrt([(three_band_cog, 3), (three_band_cog, 1)])
+        # Sequential from 1, not the numbers these bands had in their source file (3 and 1).
+        assert [b.get("band") for b in ET.fromstring(out).findall("VRTRasterBand")] == ["1", "2"]
+
+        with rio.open(out) as src:
+            assert src.count == 2
+            assert src.read(1)[0, 0] == 32
+            assert src.read(2)[0, 0] == 30
 
     def test_childless_band_elements_are_not_dropped(self):
         """Regression: the band was appended under `if band_el:`, and an Element with no

@@ -3,6 +3,7 @@ import uuid
 import xml.etree.ElementTree
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 
@@ -93,18 +94,17 @@ def cog_path_expression(df, base_path=None, separator="/"):
     )
 
 
-def _vrt_source_elements(source):
-    """Open one ``vrt`` source and return its ``(dataset_el, selected_band_el)`` VRT XML.
+def _vrt_dataset_element(path):
+    """Open one COG and return GDAL's own VRT serialization of it as a parsed element.
 
-    ``source`` is a bare path (band 1) or a ``(path, band)`` pair; ``band_el`` is that
-    source's chosen ``VRTRasterBand`` element (still parented to ``dataset_el``).
+    The returned ``VRTDataset`` element describes the file whole -- its geotransform, CRS
+    and dataset metadata, plus one ``VRTRasterBand`` child for every band the file has.
+    ``vrt()`` picks out the bands its sources asked for.
     """
 
-    path, band = source if isinstance(source, tuple) else (source, 1)
     with rio.open(path) as raster, MemoryFile() as memory:
         copy(raster, memory.name, driver="VRT")
-        dataset_el = xml.etree.ElementTree.fromstring(memory.read().decode("utf-8"))
-    return dataset_el, dataset_el.find(f"VRTRasterBand[@band='{band}']")
+        return xml.etree.ElementTree.fromstring(memory.read().decode("utf-8"))
 
 
 def vrt(sources):
@@ -115,26 +115,48 @@ def vrt(sources):
     contiguous runs that span already multi-band COGs.  Output band order matches
     ``sources`` order; each output band inherits its source band's own description.
 
-    Each source's XML is extracted in parallel (opening/copying a COG to a VRT is
-    I/O-bound and releases the GIL, same as ``_parallel_read_cog_metadata``); the tree is
-    then assembled serially so the output is identical regardless of thread scheduling.
+    Each distinct *path* is opened once, not once per source.  A multi-band COG usually
+    serves many sources here, and ``_vrt_dataset_element`` already describes all of its
+    bands in one go, so opening it per source re-read the same header and re-serialized
+    the same bands only to throw all but one of them away: a 52-band request over 5 files
+    did 52 opens for 5 files' worth of information, and measured ~150 ms against ~10 ms.
+
+    The work is serial despite being file-bound, and deliberately so.  Most of an open
+    stays under the GIL -- a *warm* thread pool measured only 1.45x at two workers and no
+    better at twelve -- and a pool built per call never gets to be warm, since the first
+    ``rio.open`` on a fresh thread costs roughly six times a later one.  A per-call pool
+    measured 0.20x-0.68x of a plain loop (worse the more workers it had, and worst on the
+    small source lists that are the common case), so there is nothing here to parallelize
+    that would not cost more than it returns.  Being serial also makes the output trivially
+    independent of scheduling, which callers that post-process the XML rely on.
     """
 
     # Adapted from: https://gis.stackexchange.com/a/421687
-    with ThreadPoolExecutor() as pool:
-        extracted = list(pool.map(_vrt_source_elements, sources))
+    selected = [source if isinstance(source, tuple) else (source, 1) for source in sources]
+    trees = {path: _vrt_dataset_element(path) for path in dict.fromkeys(path for path, _band in selected)}
 
-    out_el = None
-    for out_idx, (dataset_el, band_el) in enumerate(extracted, start=1):
+    def band_element(path, band):
+        return trees[path].find(f"VRTRasterBand[@band='{band}']")
+
+    # The first source's dataset element becomes the output root -- the merged VRT inherits
+    # that file's geometry and metadata -- so its band is kept where it already is and the
+    # rest of that file's bands are dropped from around it.
+    out_el = trees[selected[0][0]]
+    first_el = band_element(*selected[0])
+    # Copies, because nothing stops two sources naming the same (path, band): each tree
+    # holds one element per band, and appending that single object twice would emit it twice
+    # carrying only whichever number was set last, so the output's bands would stop being
+    # numbered 1..n.  Taken before the removal below, which would otherwise put a later
+    # source on this same file out of `band_element`'s reach.
+    rest = [deepcopy(band_element(path, band)) for path, band in selected[1:]]
+
+    for extra in list(out_el.findall("VRTRasterBand")):
+        if extra is not first_el:
+            out_el.remove(extra)
+    first_el.set("band", "1")
+    for out_idx, band_el in enumerate(rest, start=2):
         band_el.set("band", str(out_idx))
-        if out_el is None:
-            out_el = dataset_el
-            # Keep only the selected band; drop any other bands this source has.
-            for extra in list(out_el.findall("VRTRasterBand")):
-                if extra is not band_el:
-                    out_el.remove(extra)
-        else:
-            out_el.append(band_el)
+        out_el.append(band_el)
 
     return xml.etree.ElementTree.tostring(out_el).decode("UTF-8")
 
