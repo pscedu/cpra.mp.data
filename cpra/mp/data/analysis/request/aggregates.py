@@ -104,6 +104,28 @@ def validate_project_aggregate(aggregate: str | None, *, direction_takes_aggrega
     validate_decomposable(aggregate)
 
 
+def validate_count_by_value_cardinality(n_unique: int, value_column: str, max_distinct: int) -> None:
+    """Raise `AggregateError` if a measured distinct-value count is too high for
+    `count_by_value` to be what the caller meant.
+
+    The LIMIT rule lives here, with the rest of the aggregate vocabulary's legality, and
+    is shared by all three `count_by_value` lowerings (`execution/project.py`'s
+    vector-to-vector and zonal paths, `execution/fold.py`'s folded path). The MEASUREMENT
+    deliberately does not: each of the three probes a different frame, at a different
+    point, for a reason its own docstring argues (before the crosswalk join; after the
+    per-pixel unpivot; against the bare pre-`chunk_transform` source). Those are three
+    distinct decisions about what to count, not one decision written out three times --
+    and running a probe is execution machinery, which this module does not carry (see the
+    module docstring's scope note).
+    """
+    if n_unique > max_distinct:
+        raise AggregateError(
+            f"count_by_value would produce approximately {n_unique} distinct values for "
+            f"{value_column!r}, over the limit of {max_distinct} -- count_by_value is meant "
+            "for bounded categorical data (e.g. a land-type code), not continuous data"
+        )
+
+
 def validate_group_by(by: list[str]) -> None:
     """`value` is not a dimension, so it is never a legal member of `group.by` -- a
     group's `by` key must be built from dimension columns (and, after a `count_by_value`,

@@ -225,7 +225,7 @@ from cpra.mp.data.analysis.execution.frame import (
 )
 from cpra.mp.data.analysis.io.crosswalk_read import read_vector_crosswalk, resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
-from cpra.mp.data.analysis.request.errors import AggregateError
+from cpra.mp.data.analysis.request.aggregates import validate_count_by_value_cardinality
 from cpra.mp.data.analysis.request.ops import FrameType, ProjectOp
 from cpra.mp.data.analysis.request.pipeline import DATASET_SELECTION_COLUMNS
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
@@ -333,12 +333,7 @@ def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list
     `fold.fold_count_by_value`'s docstring for the identical argument on the folded path.
     """
     n_unique = lf.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
-    if n_unique > max_distinct:
-        raise AggregateError(
-            f"count_by_value would produce approximately {n_unique} distinct values for "
-            f"'value', over the limit of {max_distinct} -- count_by_value is meant for "
-            "bounded categorical data (e.g. a land-type code), not continuous data"
-        )
+    validate_count_by_value_cardinality(n_unique, "value", max_distinct)
     joined = lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
         pl.col("dst_id").alias("grid_cell")
     )
@@ -511,12 +506,7 @@ def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str], max_distinct:
         index=[ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value"
     )
     n_unique = per_pixel.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
-    if n_unique > max_distinct:
-        raise AggregateError(
-            f"count_by_value would produce approximately {n_unique} distinct values for "
-            f"'value', over the limit of {max_distinct} -- count_by_value is meant for "
-            "bounded categorical data (e.g. a land-type code), not continuous data"
-        )
+    validate_count_by_value_cardinality(n_unique, "value", max_distinct)
     return per_pixel.group_by(
         _BAND_IDENTITY_COLUMN,
         pl.col(ZONE_COLUMN).alias("grid_cell"),

@@ -52,8 +52,7 @@ from typing import Any
 
 import polars as pl
 
-from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES
-from cpra.mp.data.analysis.request.errors import AggregateError
+from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES, validate_count_by_value_cardinality
 from cpra.mp.data.config import TABULAR_FOLD_STEP
 
 # Group-by columns whose presence, on its own, is treated as a high-cardinality signal --
@@ -377,12 +376,7 @@ def fold_count_by_value(
         raise FoldError(f"fold step must be positive, got {step}")
 
     n_unique = lf_source().select(pl.col(value_column).approx_n_unique()).collect(engine="streaming").item()
-    if n_unique > max_distinct:
-        raise AggregateError(
-            f"count_by_value would produce approximately {n_unique} distinct values for "
-            f"'{value_column}', over the limit of {max_distinct} -- count_by_value is meant "
-            "for bounded categorical data (e.g. a land-type code), not continuous data"
-        )
+    validate_count_by_value_cardinality(n_unique, value_column, max_distinct)
 
     n_rows = lf_source().select(pl.len()).collect(engine="streaming").item()
 
