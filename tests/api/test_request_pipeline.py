@@ -792,6 +792,57 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
         assert _INPUT_FIELDS == set(InputSelection.model_fields)
         assert _OUTPUT_FIELDS == set(Output.model_fields)
 
+    def test_the_encoder_can_emit_every_name_the_decoder_whitelists(self):
+        """The encoder is derived from `model_fields` too, so the two halves of the codec
+        cannot drift apart by omission -- a field the decoder accepts but the encoder never
+        writes would let a request be accepted and then re-serialize to something that no
+        longer said what it said.
+
+        Asserted against a pipeline whose every field is set to a NON-default value, since
+        the encoder drops a field sitting at its default: for that pipeline, and only that
+        pipeline, the names emitted per op are exactly the names the whitelist allows. A
+        field added to a step model will fail this test until it is added below as well,
+        which is the point -- the new field has to be shown encoding, not just decoding.
+        """
+        data = {
+            "inputs": {
+                "marsh": {"variable": "ffibs_coverage_ratio", "time_unit": "annual", "grid": RASTER_GRID},
+                "salinity": {"variable": "sal", "time_unit": "annual", "grid": VECTOR_GRID},
+            },
+            "steps": [
+                {"op": "project", "input": "salinity", "to": RASTER_GRID, "aggregate": "mean", "as": "sal_r"},
+                {"op": "join", "type": "spatial", "inputs": ["marsh", "sal_r"], "as": "paired"},
+                {"op": "filter", "input": "paired", "where": "marsh > 0.5", "as": "recent"},
+                {"op": "calculate", "input": "recent", "expression": "marsh * 2", "where": "marsh > 0", "as": "big"},
+                {
+                    "op": "group",
+                    "input": "big",
+                    "by": ["calendar_year"],
+                    "aggregate": "min",
+                    "of": "calendar_year",
+                    "as": "earliest",
+                },
+            ],
+            "output": {"format": "csv", "color_map": "viridis", "sort": "-value", "select": "grid_cell,value"},
+        }
+        query = pipeline_to_query(parse_pipeline(data))
+
+        emitted_steps: dict[str, set[str]] = {}
+        emitted_inputs: set[str] = set()
+        emitted_output: set[str] = set()
+        for key in query:
+            segments = key.split(".")
+            if segments[0] == "input":
+                emitted_inputs.add(segments[2])
+            elif segments[0] == "step":
+                emitted_steps.setdefault(query[f"step.{segments[1]}.op"], set()).add(segments[2])
+            else:
+                emitted_output.add(segments[1])
+
+        assert emitted_steps == _STEP_FIELDS
+        assert emitted_inputs == _INPUT_FIELDS
+        assert emitted_output == _OUTPUT_FIELDS
+
     def test_a_group_steps_input_field_survives_the_round_trip(self):
         """The regression itself, end to end rather than through the table: the field
         that drifted is spellable, decodes, and comes back out of `pipeline_to_query`.

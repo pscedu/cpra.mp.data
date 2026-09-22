@@ -745,6 +745,40 @@ def _query_sort_key(param_name: str) -> tuple:
     return tuple((0, int(seg)) if seg.isdigit() else (1, seg) for seg in param_name.split("."))
 
 
+def _encode_model(model: BaseModel, prefix: str, params: dict[str, str]) -> None:
+    """Write `model`'s fields into `params` under `prefix`, spelled the way the dotted
+    codec spells them.
+
+    Read off `model_fields` -- the same source `_query_fields`/`_query_list_fields` read
+    the DECODER's per-model whitelist off. That symmetry is the point. While the encoder
+    was a hand-written branch per model and the decoder was derived, a field added to a
+    step decoded the moment it was declared and encoded never: a request could be accepted
+    and then re-serialize to something that no longer said what it said. Now both halves
+    move when the model does.
+
+    Three rules, each the generalization of what the per-model branches did by hand:
+
+    - The NAME is the field's alias where it declares one, its own name otherwise. `as_` is
+      a Python spelling forced by the keyword; `as` is what a URL carries.
+    - A field AT ITS DEFAULT is dropped, which covers `None` (every optional field) and a
+      real default alike (`GroupStep.of == "value"`). A required field has no default to
+      equal, so it is always written. See `pipeline_to_query` for why dropping -- rather
+      than writing the default out explicitly -- is what makes the round trip stable.
+    - A LIST is comma-joined, which is the spelling `_query_list_fields` tells the decoder
+      to split back apart.
+
+    The discriminator falls out of the second rule rather than needing an exception to it:
+    a step's `op` always equals its own default, so this drops it, and `pipeline_to_query`
+    writes it itself.
+    """
+    for name, info in type(model).model_fields.items():
+        value = getattr(model, name)
+        if value == info.default:
+            continue
+        encoded = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        params[f"{prefix}.{info.alias or name}"] = encoded
+
+
 def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
     """Encode `pipeline` into the dotted GET/tile query form -- the inverse of
     `pipeline_from_query`. Returns a plain `dict[str, str]`, its keys in the canonical
@@ -761,58 +795,17 @@ def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:
     params: dict[str, str] = {}
 
     for name, selection in pipeline.inputs.items():
-        prefix = f"input.{name}"
-        params[f"{prefix}.variable"] = str(selection.variable)
-        params[f"{prefix}.time_unit"] = str(selection.time_unit)
-        params[f"{prefix}.grid"] = str(selection.grid)
+        _encode_model(selection, f"input.{name}", params)
 
     for i, step in enumerate(pipeline.steps, start=1):
         prefix = f"step.{i}"
+        # `op` is written here rather than by `_encode_model`, which drops every field
+        # sitting at its default and would therefore drop exactly this one -- a step's `op`
+        # is always its own model's default. It is also the one field the decoder cannot
+        # do without: it chooses which model validates the rest.
         params[f"{prefix}.op"] = step.op
-        if isinstance(step, ProjectStep):
-            if step.input is not None:
-                params[f"{prefix}.input"] = step.input
-            params[f"{prefix}.to"] = str(step.to)
-            if step.aggregate is not None:
-                params[f"{prefix}.aggregate"] = str(step.aggregate)
-            if step.as_ is not None:
-                params[f"{prefix}.as"] = step.as_
-        elif isinstance(step, JoinStep):
-            params[f"{prefix}.type"] = step.type
-            params[f"{prefix}.inputs"] = ",".join(step.inputs)
-            params[f"{prefix}.as"] = step.as_
-        elif isinstance(step, FilterStep):
-            if step.input is not None:
-                params[f"{prefix}.input"] = step.input
-            params[f"{prefix}.where"] = step.where
-            if step.as_ is not None:
-                params[f"{prefix}.as"] = step.as_
-        elif isinstance(step, CalculateStep):
-            if step.input is not None:
-                params[f"{prefix}.input"] = step.input
-            params[f"{prefix}.expression"] = step.expression
-            if step.where is not None:
-                params[f"{prefix}.where"] = step.where
-            if step.as_ is not None:
-                params[f"{prefix}.as"] = step.as_
-        elif isinstance(step, GroupStep):
-            if step.input is not None:
-                params[f"{prefix}.input"] = step.input
-            params[f"{prefix}.by"] = ",".join(step.by)
-            params[f"{prefix}.aggregate"] = str(step.aggregate)
-            if step.of != "value":
-                params[f"{prefix}.of"] = step.of
-            if step.as_ is not None:
-                params[f"{prefix}.as"] = step.as_
-        else:  # pragma: no cover -- exhaustive over the Step union
-            raise RequestError(f"cannot encode unknown step op {step.op!r}")
+        _encode_model(step, prefix, params)
 
-    params["output.format"] = str(pipeline.output.format)
-    if pipeline.output.color_map is not None:
-        params["output.color_map"] = pipeline.output.color_map
-    if pipeline.output.sort is not None:
-        params["output.sort"] = pipeline.output.sort
-    if pipeline.output.select is not None:
-        params["output.select"] = pipeline.output.select
+    _encode_model(pipeline.output, "output", params)
 
     return dict(sorted(params.items(), key=lambda item: _query_sort_key(item[0])))
