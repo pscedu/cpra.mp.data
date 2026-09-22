@@ -57,8 +57,32 @@ over a window taken from the raster grid's own geometry instead -- see
 `_grid_read_window` and `execution.plan`'s module docstring, "loose end" paragraph, which
 names this exact construction.
 
-**A point sample reads a narrower window when the spatial filter says exactly which
-pixels it needs -- and narrowing the window never changes what a `grid_cell` id means.**
+**A point sample that names its pixels, and nothing else, skips the band-wide reader
+entirely.** `io.raster_points.sample_raster_points` samples exactly the named pixels out of
+the underlying files and returns a LONG frame directly -- no window, no VRT, no unpivot of
+everything else. `_point_sample_reads` is the gate, and `execute` consults it before it
+opens anything; every origin it names is opened through that reader instead of
+`_open_band_wide_input`, and `execute`'s own local copy of `plan.frame_types` records that
+origin as `Shape.long` so the walk dispatches its spatial `filter` to the ordinary long
+lowering. That substitution is exact rather than merely equivalent: `band_ops.
+sample_grid_cells_band_wide` -- the band-wide lowering the gated origin would otherwise
+have reached -- ends by handing its unpivoted frame to `long_ops.filter_long` with the
+whole `where`, which is precisely what the long lowering then does to the frame the point
+reader built to match it column for column. What the gate buys is the read: three
+coordinates scattered across a 20674x8265 grid cost 4.3 million pixel rows through the
+bounding box below and 3 through this one.
+
+The gate is narrow on purpose (see `_point_sample_reads` for the conditions, one by one).
+It rejects, rather than trying to handle, anything where the origin carries a crosswalk, is
+tile-scoped, or has an op between it and its spatial filter -- and it inherits the
+rejection of an origin read more than once, which `compile_plan` has already made. Every
+rejection falls back to the bounding-box read described next, which is always correct; a
+narrow gate that is obviously right is worth more here than a wide one that has to reason
+about what an intervening op did to a frame's rows.
+
+**A point sample the gate rejected still reads a narrower window when the spatial filter
+says exactly which pixels it needs -- and narrowing the window never changes what a
+`grid_cell` id means.**
 `ResolvedInput.point_sample_step` names the step number of the first spatial `filter`
 reached while an origin was still band-wide (`execution.plan`'s own module docstring);
 before the ordinary input-opening loop runs, `execute` looks that step up in `plan.ops`
@@ -158,7 +182,9 @@ back to the canonical `project.ZONE_COLUMN` name -- so a lowering reading any on
 crosswalks the underlying shared scan actually combined.
 """
 
+import dataclasses
 import re
+from collections.abc import Container
 
 import polars as pl
 from rasterio.crs import CRS
@@ -180,6 +206,7 @@ from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, Z
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 from cpra.mp.data.analysis.io.raster import scan_raster
+from cpra.mp.data.analysis.io.raster_points import sample_raster_points
 from cpra.mp.data.analysis.io.vector import scan_vector
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
@@ -548,11 +575,95 @@ def _derive_point_sample_window(grid_name: str, where: str) -> Window | None:
     return Window(col_off, row_off, width, height)
 
 
-def _point_sample_overrides(plan: ExecutionPlan) -> dict[str, Window]:
+def _point_sample_reads(plan: ExecutionPlan) -> dict[str, list[int]]:
+    """For every raster origin the POINT reader (`io.raster_points.sample_raster_points`)
+    should open instead of `_open_band_wide_input`, the absolute `grid_cell` ids to sample
+    it at -- the gate the module docstring's "skips the band-wide reader entirely"
+    paragraph describes. An origin this names is opened long; every other raster origin is
+    opened band-wide exactly as before.
+
+    Six conditions, all required, each rejecting into the bounding-box fallback rather than
+    into an error:
+
+    * `resolved.point_sample_step is not None` -- a spatial `filter` was reached while this
+      origin was still band-wide (`execution.plan`'s own module docstring). Without one
+      there is no set of pixels to sample and nothing to gate.
+    * Not tile-scoped, and not already empty: `resolved.read_window is None`, not
+      `resolved.tile_disjoint`, and `metadata_df` has bands. The same three skips
+      `_point_sample_overrides` makes below, for the same reasons -- a tile's own window
+      already governs the read, and the other two have no real read at all.
+    * `resolved.straddling_vector_grid is None`. A crosswalk is attached to a band-wide
+      read (`_open_band_wide_input`) and consumed positionally by a later `project`; this
+      reader returns no pixel grid for one to ride along on. An origin needing one is not a
+      point sample in any case -- it is a zonal aggregate that happens to share an origin.
+    * The origin is not part of a band-wide join's shared scan
+      (`plan.band_wide_join_scans`). Such an origin's read is owned by
+      `_open_band_wide_join_group`, which aligns several origins into one window; a long
+      frame cannot participate in that alignment. (Shape typing already makes this
+      unreachable -- a spatial filter turns a frame long, and a long frame is not a
+      band-wide join operand -- but the gate states it rather than relying on that.)
+    * **The spatial filter reads the origin itself** (`op.input == name`), not something
+      derived from it. This is the condition that makes the substitution exact rather than
+      approximate. The long lowering the walk will dispatch to applies `op.where` to
+      whatever frame it is handed; the point reader's frame holds only the named pixels.
+      Those two agree only if nothing ran in between -- an intervening
+      `calculate`/`group`/`join` would have run against every pixel of the bounding box on
+      the old path and against three on this one, and for a `group` in particular those are
+      different answers. `point_sample_step` is recorded through a chain of ops that left
+      the origin's pixels alone, so it can point at a filter one or more steps downstream;
+      this gate wants the first step, and nothing else.
+
+      The fan-out case -- a second op reading the same origin, still expecting it to be
+      band-wide -- needs no condition here, because `compile_plan` has already foreclosed
+      it: an origin more than one op reads is invalidated on sight (its `reference_count`
+      exceeds one, so `plan`'s `_incoming` returns nothing for it), and an invalidated
+      origin never records a `point_sample_step` at all. The first condition above is
+      therefore what rejects a fan-out, and the gate cannot widen past that without
+      `compile_plan` widening first.
+    * `_parse_point_sample_ids` resolves `op.where` to literal ids AND
+      `_derive_point_sample_window` accepts them -- the same parse and the same range check
+      the fallback already runs, so the two paths can never disagree about which `where`
+      names exactly which pixels.
+
+    Deliberately NOT a `compile_plan` concern, even though every input it reads is on the
+    plan: it decides which READER opens an origin, which is this module's job, and it wants
+    `_parse_point_sample_ids`, which lives here. `compile_plan` already recorded everything
+    it can decide without opening anything (`point_sample_step`, and the `overview_permitted
+    = False` that keeps a point-sampled origin off the overviews).
+    """
+    reads: dict[str, list[int]] = {}
+    ops_by_step = {op.step_no: op for op in plan.ops}
+    joined = {name for origins in plan.band_wide_join_scans.values() for name in origins}
+    for name, resolved in plan.inputs.items():
+        if resolved.point_sample_step is None:
+            continue
+        if resolved.read_window is not None or resolved.tile_disjoint:
+            continue
+        if has_no_bands(resolved.band_metadata):
+            continue
+        if resolved.straddling_vector_grid is not None or name in joined:
+            continue
+        op = ops_by_step[resolved.point_sample_step]
+        assert isinstance(op, FilterOp)
+        if op.input != name:
+            continue
+        ids = _parse_point_sample_ids(op.where)
+        if ids is None or _derive_point_sample_window(resolved.selection.grid, op.where) is None:
+            continue
+        reads[name] = ids
+    return reads
+
+
+def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozenset()) -> dict[str, Window]:
     """For every raster origin in `plan.inputs` whose `point_sample_step` resolved to a
     narrower window, the window to open that origin's read over instead of its full
     extent -- see `_derive_point_sample_window` for how, and `execute`'s own docstring for
     how the result gets used.
+
+    `skip` names the origins `_point_sample_reads` already claimed for the point reader.
+    Those never reach `_open_band_wide_input` at all, so a window sized for one here would
+    be dead -- and, worse, misleading, since a reader that opens no window would appear to
+    have been handed one.
 
     Deliberately skips an origin under either of two conditions, in both cases leaving
     that origin to the full-window read this walk has always done: `resolved.read_window
@@ -574,7 +685,7 @@ def _point_sample_overrides(plan: ExecutionPlan) -> dict[str, Window]:
     windows: dict[str, Window] = {}
     ops_by_step = {op.step_no: op for op in plan.ops}
     for name, resolved in plan.inputs.items():
-        if resolved.point_sample_step is None:
+        if resolved.point_sample_step is None or name in skip:
             continue
         if resolved.read_window is not None or resolved.tile_disjoint:
             continue
@@ -965,7 +1076,16 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     Returns the single input's frame for a zero-step pipeline: there is nothing to walk,
     and the request layer's own rule guarantees exactly one input in that case.
 
-    Before any of that: `_point_sample_overrides` looks for a raster origin whose
+    Before any of that: `_point_sample_reads` looks for a raster origin whose spatial
+    `filter` names its pixels outright and is that origin's only consumer (see that
+    function for the whole gate). Each one it names is opened by
+    `io.raster_points.sample_raster_points` -- LONG, one row per (named pixel, band),
+    nothing else read -- rather than band-wide, and this call's own copy of
+    `plan.frame_types` records it as `Shape.long` so the walk below dispatches its `filter`
+    to the long lowering. `plan` itself is never mutated. Origins the gate rejects continue
+    to the window narrowing described next, which is what this walk has always done.
+
+    Then, for what is left: `_point_sample_overrides` looks for a raster origin whose
     `point_sample_step` resolved to a window narrower than its full extent, per-origin --
     see that function and `_derive_point_sample_window` for how, and the module docstring's
     "a point sample reads a narrower window" paragraph for why. Every origin it names gets
@@ -977,7 +1097,20 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     `where` a caller wrote against the full grid keeps meaning the same pixels whether or
     not this narrowing found anywhere to apply.
     """
-    point_sample_windows = _point_sample_overrides(plan)
+    point_sample_reads = _point_sample_reads(plan)
+    point_sample_windows = _point_sample_overrides(plan, skip=point_sample_reads)
+
+    # A gated origin is opened LONG, so the walk must dispatch its spatial `filter` to the
+    # long lowering rather than the band-wide one. Recorded as this call's own copy of the
+    # plan's frame types -- `compile_plan` is what decided the shapes, and it decided them
+    # correctly for the reader it knew about; which reader `execute` picks is a decision
+    # this module makes and this module therefore records, without mutating a plan a caller
+    # may hold, compare, or run again.
+    frame_types = plan.frame_types
+    if point_sample_reads:
+        frame_types = dict(frame_types)
+        for name in point_sample_reads:
+            frame_types[name] = dataclasses.replace(frame_types[name], shape=Shape.long)
 
     extra_columns: dict[str, tuple[str, ...]] = {}
 
@@ -1001,7 +1134,13 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     frames: dict[str, LongFrame | BandWideFrame] = {}
     for name, resolved in plan.inputs.items():
-        if plan.frame_types[name].shape is Shape.long:
+        if name in point_sample_reads:
+            # Checked before the shape test, not after: `frame_types` above already calls
+            # this origin long, and the long branch is the VECTOR scan.
+            frames[name] = sample_raster_points(
+                resolved.band_metadata, resolved.selection.grid, point_sample_reads[name]
+            )
+        elif frame_types[name].shape is Shape.long:
             frames[name] = scan_vector(
                 resolved.selection,
                 base_path=base_path,
@@ -1023,17 +1162,17 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
         # shares every key with `_LOWERINGS` and differs only in the band-wide values. The
         # lookup cannot miss: `TestLoweringTableAgreement` pins those keys equal to what
         # `validate_shapes` accepts, and this plan already passed it.
-        lowering = lowerings[(op.op, _dispatch_key(op, plan.frame_types))]
-        frames[op.output] = lowering(frames, op, plan.frame_types)
-        if plan.frame_types[op.output].shape is Shape.band_wide:
-            extra_columns[op.output] = _output_extra_columns(op, plan.frame_types, extra_columns)
+        lowering = lowerings[(op.op, _dispatch_key(op, frame_types))]
+        frames[op.output] = lowering(frames, op, frame_types)
+        if frame_types[op.output].shape is Shape.band_wide:
+            extra_columns[op.output] = _output_extra_columns(op, frame_types, extra_columns)
         last_output = op.output
 
     if last_output is None:
         (last_output,) = frames.keys()
 
     result = frames[last_output]
-    if plan.frame_types[last_output].shape is Shape.band_wide:
+    if frame_types[last_output].shape is Shape.band_wide:
         lf, metadata_df, window = result
         stray = extra_columns.get(last_output, ())
         if stray:
