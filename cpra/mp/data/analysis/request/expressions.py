@@ -269,6 +269,26 @@ def split_top_level_and(where_str):
     return [c.strip() for c in conjuncts]
 
 
+def combine_conjuncts(conjuncts: Iterable[str]) -> str:
+    """Re-join conjuncts `classify_where` sorted apart back into one `where` string.
+
+    Each conjunct is PARENTHESISED before joining, and that is the whole point of the
+    function existing rather than being a bare `" and ".join(...)` at each site. A
+    conjunct may contain a lower-precedence operator of its own -- only `and` is a split
+    point, so `b = 2 or b = 3` comes back as ONE conjunct -- and joining unparenthesised
+    lets that `or` rebind across the seam. For `a = 1 and b = 2 or b = 3`, which splits
+    into `["a = 1", "b = 2 or b = 3"]`, the naive join re-reads as
+    `(a = 1 and b = 2) or b = 3` and admits rows the conjunct list does not. Parenthesised,
+    the joined string selects exactly what applying the conjuncts as successive filters
+    selects, which is what a list of conjuncts means everywhere it is used.
+
+    Lives here, beside the splitter it inverts, rather than in either lowering that calls
+    it: `execution/band_ops.py` may import `execution/long_ops.py` but not the reverse, so
+    neither of the two is a place both can reach.
+    """
+    return " and ".join(f"({conjunct})" for conjunct in conjuncts)
+
+
 def classify_where(where_str):
     """Split `where` into top-level AND conjuncts (`split_top_level_and`) and sort each
     into a DIMENSION conjunct (references no `value` column) or a VALUE conjunct
@@ -481,9 +501,9 @@ def compile_calculate_entries(entries, allowed_columns=("value",)):
             except ExpressionError as exc:
                 raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
             if dimension_conjuncts:
-                dimension_where = " and ".join(f"({c})" for c in dimension_conjuncts)
+                dimension_where = combine_conjuncts(dimension_conjuncts)
             if value_conjuncts:
-                value_where = " and ".join(f"({c})" for c in value_conjuncts)
+                value_where = combine_conjuncts(value_conjuncts)
                 try:
                     parse_value_expr(value_where, allowed_columns)
                 except ExpressionError as exc:

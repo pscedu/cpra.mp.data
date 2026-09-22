@@ -137,7 +137,7 @@ def _apply_read_data_selection(lf, grid, options):
     from cpra.mp.data.analysis.io.geography import parse_coordinate_pairs, resolve_vector_grid_cell_sync
     from cpra.mp.data.analysis.io.raster_io import unpack_values
     from cpra.mp.data.analysis.request.errors import RequestError
-    from cpra.mp.data.analysis.request.expressions import classify_where, value_predicate_mask
+    from cpra.mp.data.analysis.request.expressions import classify_where, combine_conjuncts, value_predicate_mask
 
     schema_names = set(lf.collect_schema().names())
     has_value_column = "value" in schema_names
@@ -169,8 +169,7 @@ def _apply_read_data_selection(lf, grid, options):
     if where is not None:
         dimension_conjuncts, value_conjuncts = classify_where(where)
         if dimension_conjuncts:
-            combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
-            lf = lf.sql(f"select * from self where {combined}")
+            lf = lf.sql(f"select * from self where {combine_conjuncts(dimension_conjuncts)}")
         if value_conjuncts:
             if not has_value_column:
                 raise RequestError(
@@ -179,8 +178,7 @@ def _apply_read_data_selection(lf, grid, options):
                     "metadata here, not pixel values -- restrict where to dimension "
                     "conditions only, or use analyze_data() instead"
                 )
-            combined = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
-            mask = value_predicate_mask(combined, sorted(schema_names))
+            mask = value_predicate_mask(combine_conjuncts(value_conjuncts), sorted(schema_names))
             lf = lf.filter(mask)
 
     if sort is not None:

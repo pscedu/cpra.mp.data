@@ -23,6 +23,7 @@ from cpra.mp.data.analysis.execution.frame import LongFrame
 from cpra.mp.data.analysis.request.expressions import (
     ExpressionError,
     classify_where,
+    combine_conjuncts,
     compile_calculate_entries,
     parse_value_expr,
     value_predicate_mask,
@@ -56,10 +57,9 @@ def filter_long(lf: LongFrame, where: str) -> LongFrame:
         return lf
     dimension_conjuncts, value_conjuncts = classify_where(where)
     if dimension_conjuncts:
-        combined = " and ".join(f"({conjunct})" for conjunct in dimension_conjuncts)
-        lf = lf.sql(f"select * from self where {combined}")
+        lf = lf.sql(f"select * from self where {combine_conjuncts(dimension_conjuncts)}")
     if value_conjuncts:
-        value_where = " and ".join(f"({conjunct})" for conjunct in value_conjuncts)
+        value_where = combine_conjuncts(value_conjuncts)
         lf = lf.filter(value_predicate_mask(value_where, lf.collect_schema().names()))
     return lf
 

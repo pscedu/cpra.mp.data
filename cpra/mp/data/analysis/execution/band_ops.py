@@ -182,6 +182,7 @@ from cpra.mp.data.analysis.execution.frame import (
 from cpra.mp.data.analysis.request.expressions import (
     PredicateKind,
     classify_where_kinds,
+    combine_conjuncts,
     compile_calculate_entries,
     parse_value_expr,
     rewrite_value_column,
@@ -240,10 +241,6 @@ def _horizontal_aggregate_expr(aggregate: str, exprs: list[pl.Expr], no_contribu
     agg_fn = _HORIZONTAL_AGGREGATES[aggregate]
     no_contributor_at = pl.all_horizontal([expr.is_null() for expr in exprs])
     return pl.when(no_contributor_at).then(no_contributor).otherwise(agg_fn(exprs))
-
-
-def _combine_conjuncts(conjuncts: list[str]) -> str:
-    return " and ".join(f"({conjunct})" for conjunct in conjuncts)
 
 
 def mask_value_band_wide(band_wide: BandWideFrame, value_where: str, extra_columns: Sequence[str]) -> BandWideFrame:
@@ -507,11 +504,11 @@ def filter_band_wide(
 
     result = band_wide
     if kinds[PredicateKind.dimension]:
-        result = select_dimension_band_wide(result, _combine_conjuncts(kinds[PredicateKind.dimension]), extra_columns)
+        result = select_dimension_band_wide(result, combine_conjuncts(kinds[PredicateKind.dimension]), extra_columns)
         if has_no_bands(result[1]):
             return result
     if kinds[PredicateKind.value]:
-        value_where = _combine_conjuncts(kinds[PredicateKind.value])
+        value_where = combine_conjuncts(kinds[PredicateKind.value])
         if len(value_columns) > 1:
             result = pair_and_mask_band_wide(result, value_where, extra_columns, value_columns)
         else:

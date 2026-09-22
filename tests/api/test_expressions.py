@@ -15,6 +15,7 @@ from cpra.mp.data.analysis.request.expressions import (
     classify_predicate_kind,
     classify_where,
     classify_where_kinds,
+    combine_conjuncts,
     compile_calculate_entries,
     parse_calculate_expression,
     parse_value_expr,
@@ -307,6 +308,46 @@ class TestSplitTopLevelAnd:
 
     def test_strips_surrounding_whitespace_from_each_conjunct(self):
         assert split_top_level_and("  a > 1   and   b > 2  ") == ["a > 1", "b > 2"]
+
+
+class TestCombineConjuncts:
+    """`combine_conjuncts` is `split_top_level_and`'s inverse, and the parenthesisation is
+    the whole of it -- see that function's docstring."""
+
+    def test_joins_with_and(self):
+        assert combine_conjuncts(["calendar_year > 2040", "scenario_id = 1"]) == (
+            "(calendar_year > 2040) and (scenario_id = 1)"
+        )
+
+    def test_a_single_conjunct_is_still_parenthesised(self):
+        assert combine_conjuncts(["value > 1"]) == "(value > 1)"
+
+    def test_no_conjuncts_is_the_empty_string(self):
+        # Every call site guards on a non-empty list first, so this is the boundary rather
+        # than a live case -- pinned so the guard's removal would be a test failure and not
+        # a silently empty `where` clause.
+        assert combine_conjuncts([]) == ""
+
+    def test_a_conjuncts_own_or_cannot_rebind_across_the_seam(self):
+        """The reason the parens are not optional. `a = 1 and b = 2 or b = 3` splits into
+        two conjuncts, the second carrying a lower-precedence `or`; joined bare, that `or`
+        re-binds across the `and` and admits a row neither conjunct does. The
+        parenthesised join selects exactly what applying the conjuncts as successive
+        filters selects, which is what a conjunct list means everywhere it is used.
+        """
+        conjuncts = split_top_level_and("a = 1 and b = 2 or b = 3")
+        assert conjuncts == ["a = 1", "b = 2 or b = 3"]
+
+        df = pl.DataFrame({"a": [1, 1, 2, 2], "b": [2, 3, 2, 3]})
+        successive = df.lazy()
+        for conjunct in conjuncts:
+            successive = successive.sql(f"select * from self where {conjunct}")
+
+        combined = df.lazy().sql(f"select * from self where {combine_conjuncts(conjuncts)}")
+        naive = df.lazy().sql(f"select * from self where {' and '.join(conjuncts)}")
+
+        assert combined.collect().to_dicts() == successive.collect().to_dicts()
+        assert naive.collect().to_dicts() != successive.collect().to_dicts()
 
 
 class TestClassifyWhere:
