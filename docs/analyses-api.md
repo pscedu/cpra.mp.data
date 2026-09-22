@@ -119,8 +119,12 @@ which is always exactly 2 for both modes):
 `model_group_id`, if given, must select exactly 1 (two-image) or exactly 2 (three-image)
 -- any other count is rejected with a 400.
 
+`lnd_type` lives only on the `morph_pixel` pixel grid, so the result is a raster surface
+and a tabular `data.{format}` is rejected -- ask for `tif` (or `png`/`jpg` on the tile
+routes).
+
 ```
-GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/concatenate/data.csv?model_group_id=500,510&scenario_id=7&calendar_year=2040,2050&dimension=calendar_year
+GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/concatenate/data.tif?model_group_id=500,510&scenario_id=7&calendar_year=2040,2050&dimension=calendar_year
 ```
 
 ### `land-type-confidence`
@@ -226,8 +230,9 @@ overwritten by the format in the URL, which is why the same analysis can be fetc
 `csv`, `tif`, `png` or `.pbf` without declaring any of them. `pipeline.json` is the one
 route with no format segment to source an override from, so it returns whatever the
 analysis itself set -- and that value is therefore the format the published pipeline is
-meant to be resubmittable under (`tif` for an analysis whose result is a raster surface,
-`csv` for one that ends tabular).
+meant to be resubmittable under. The dataset-scoped analyses derive it from the selected
+grid's kind: `tif` on a pixel grid, whose result is a raster surface, and `csv` on a vector
+one, whose result is a table.
 
 The URL's dataset filters land in a `filter` **step**, not on the input: an input names a
 dataset and nothing else (see [Analysis API](analysis-api.md#request-shape)). The

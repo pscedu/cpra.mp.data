@@ -29,6 +29,7 @@ from cpra.mp.data.analyses.base import (
     Analysis,
     InvalidAnalysisParametersError,
     dataset_input_selection,
+    dataset_output_format,
     format_dimension_literal,
     is_filterable_dimension,
     normalized_filter_values,
@@ -160,6 +161,13 @@ class Concatenate(Analysis):
         data = {
             "inputs": {"x": dataset_input_selection(self.dataset)},
             "steps": steps,
-            "output": {"format": "csv"},
+            # Derived from the dataset's grid kind rather than fixed: this analysis neither
+            # projects nor otherwise changes shape, so a vector selection ends tabular and
+            # a raster one ends band-wide, and `validate_shapes` rejects the mismatched
+            # sink in either direction. Only `pipeline.json` ever shows this value -- the
+            # `data.{format}`/tile routes overwrite it from their own URL segment -- but
+            # what `pipeline.json` publishes has to be resubmittable, and this analysis's
+            # own `Meta.variables` (`lnd_type`) lives only on a raster grid.
+            "output": {"format": dataset_output_format(self.dataset)},
         }
         return parse_pipeline(data)

@@ -13,6 +13,7 @@ from cpra.mp.data.analyses.base import (
     Analysis,
     InvalidAnalysisParametersError,
     dataset_input_selection,
+    dataset_output_format,
     format_dimension_literal,
     is_filterable_dimension,
     normalized_filter_values,
@@ -99,7 +100,14 @@ class Difference(Analysis):
         data = {
             "inputs": {"x": dataset_input_selection(self.dataset)},
             "steps": steps,
-            "output": {"format": "csv"},
+            # Derived from the dataset's grid kind rather than fixed: `Meta.variables` is
+            # `None` here, so this analysis really does run on both kinds, and it neither
+            # projects nor otherwise changes shape -- a vector selection ends tabular, a
+            # raster one band-wide, and `validate_shapes` rejects the mismatched sink
+            # either way. Only `pipeline.json` ever shows the value, since the
+            # `data.{format}`/tile routes overwrite it from their own URL segment, but what
+            # `pipeline.json` publishes has to still validate if a caller resubmits it.
+            "output": {"format": dataset_output_format(self.dataset)},
         }
         return parse_pipeline(data)
 

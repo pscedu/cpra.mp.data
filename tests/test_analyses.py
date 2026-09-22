@@ -32,6 +32,7 @@ from cpra.mp.data.analyses import (
 )
 from cpra.mp.data.analyses.base import (
     cast_dimension_value,
+    dataset_output_format,
     default_collapsed_dimensions,
     format_dimension_literal,
     is_filterable_dimension,
@@ -331,6 +332,14 @@ class TestSharedHelpers:
         with pytest.raises(InvalidAnalysisParametersError, match="variable"):
             selection_filter_where({"variable": "ssf"})
 
+    def test_dataset_output_format_follows_the_grid_kind(self):
+        """A `type="dataset"` analysis that never changes shape ends band-wide on a raster
+        grid and tabular on a vector one, and `validate_shapes` rejects the mismatched sink
+        in either direction -- so the declared format has to be derived, not fixed.
+        """
+        assert dataset_output_format(SSF_DATASET) == "csv"  # ecoregion_v001, vector
+        assert dataset_output_format(LND_TYPE_DATASET) == "tif"  # morph_pixel_v002, raster
+
     def test_default_collapsed_dimensions_empty_without_trailing_group(self):
         pipeline = Difference(
             dataset=SSF_DATASET,
@@ -392,10 +401,10 @@ class TestDifferenceCardinality:
 
 
 class TestDifferencePipeline:
-    def _build(self, order, filters=None):
+    def _build(self, order, filters=None, dataset=SSF_DATASET):
         filters = filters or {"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50}
         analysis = Difference(
-            dataset=SSF_DATASET,
+            dataset=dataset,
             filters=filters,
             parameters=Difference.Parameters(dimension="calendar_year", order=order),
         )
@@ -448,6 +457,22 @@ class TestDifferencePipeline:
         assert analysis.title_suffix == " Difference"
         assert analysis.legend is None
         assert analysis.result_kind == "difference"
+
+    def test_the_output_format_follows_the_selected_dataset(self):
+        """`difference` declares `Meta.variables = None`, so it genuinely runs on both grid
+        kinds, and it never changes shape -- its final frame is long on a vector grid and
+        band-wide on a raster one. `pipeline.json` is the one route that publishes this
+        value rather than overwriting it from a URL segment, so a fixed format would hand
+        raster callers a pipeline `validate_shapes` rejects on resubmission.
+        """
+        _, vector = self._build("asc")
+        assert vector.output.format == "csv"
+        _, raster = self._build(
+            "asc",
+            filters={"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7},
+            dataset=LND_TYPE_DATASET,
+        )
+        assert raster.output.format == "tif"
 
     def test_composes_dimension_filters_and_grid_cell_into_the_leading_filter_step(self):
         _, pipeline = self._build(
@@ -559,9 +584,9 @@ class TestConcatenateCardinality:
 
 
 class TestConcatenatePipeline:
-    def _build(self, filters):
+    def _build(self, filters, dataset=SSF_DATASET):
         analysis = Concatenate(
-            dataset=SSF_DATASET,
+            dataset=dataset,
             filters=filters,
             parameters=Concatenate.Parameters(dimension="calendar_year"),
         )
@@ -638,6 +663,19 @@ class TestConcatenatePipeline:
         analysis, _ = self._build({"calendar_year": [2030, 2040], "model_group_id": 500})
         assert analysis.legend == "lnd_chng"
         assert analysis.result_kind == "category"
+
+    def test_the_output_format_follows_the_selected_dataset(self):
+        """`concatenate` neither projects nor changes shape, so its final frame's kind is
+        the input grid's -- and `pipeline.json`, the only route that does not overwrite
+        this value from a URL segment, has to publish a pipeline that would still validate
+        on resubmission. `Meta.variables` is `lnd_type`, which lives only on a raster grid,
+        so the real-world answer is `tif`.
+        """
+        filters = {"calendar_year": [2030, 2040], "model_group_id": 500}
+        _, vector = self._build({**filters, "scenario_id": 7, "percentile": 50})
+        assert vector.output.format == "csv"
+        _, raster = self._build({**filters, "scenario_id": 7}, dataset=LND_TYPE_DATASET)
+        assert raster.output.format == "tif"
 
 
 # ------------------------------------------------------------------------------------------

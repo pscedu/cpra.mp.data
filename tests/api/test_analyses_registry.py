@@ -160,6 +160,27 @@ class TestRegistryDrift:
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
+    def test_concatenate_compiles_on_a_raster_grid_too(self, base_path):
+        """`concatenate`'s own `Meta.variables` (`lnd_type`) is raster-only, so the raster
+        selection is the one it really runs under -- and its `output.format` is derived
+        from the grid kind, which `validate_shapes` then checks against the final frame.
+        The two-image case above proves the vector half of the same derivation.
+        """
+        write_raster_dataset(base_path, years=(2030, 2040))
+        resolved = resolve_analysis(
+            "concatenate",
+            dataset=RASTER_DATASET,
+            filters={
+                "model_group_id": RASTER_KWARGS["model_group_id"],
+                "scenario_id": RASTER_KWARGS["scenario_id"],
+                "calendar_year": [2030, 2040],
+            },
+            params={"dimension": "calendar_year"},
+        )
+        assert resolved.pipeline.output.format == "tif"
+        validate_shapes(resolved.pipeline)
+        assert compile_plan(resolved.pipeline, base_path=base_path) is not None
+
     def test_land_type_confidence_compiles(self, base_path):
         _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1))
         resolved = resolve_analysis(

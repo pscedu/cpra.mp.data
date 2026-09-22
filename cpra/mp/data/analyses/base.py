@@ -27,6 +27,7 @@ from cpra.mp.data.analysis.request.data_query import grid_cell_conjunct
 from cpra.mp.data.analysis.request.expressions import split_top_level_and
 from cpra.mp.data.analysis.request.pipeline import GroupStep, Pipeline
 from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
 
 # The two keys `resolve_analysis`'s `filters` mapping may carry that are NOT dimension
@@ -163,14 +164,36 @@ def dataset_input_selection(dataset: DatasetRef) -> dict[str, Any]:
     WHICH dataset to read and carries no filtering of any kind (it is `extra="forbid"`, so
     a dimension name folded in here is a hard rejection, not a silently-ignored key) --
     a caller's dimension filters become a `filter` STEP instead, via
-    `selection_filter_where` below. Shared by `difference.py`/`concatenate.py`, the two
-    single-input (`type="dataset"`) entries.
+    `selection_filter_where` below. Shared by the single-input (`type="dataset"`) entries.
     """
     return {
         "variable": dataset.variable,
         "time_unit": dataset.time_unit,
         "grid": dataset.grid,
     }
+
+
+def dataset_output_format(dataset: DatasetRef) -> str:
+    """The `output.format` a single-input analysis over `dataset` should declare: `tif` on
+    a raster grid, `csv` on a vector one.
+
+    `Output.format` is required, so every `pipeline()` has to name one -- but on the
+    `data.{format}` and tile routes the value never survives: each of those overwrites it
+    from its own URL segment before running anything, which is what lets one analysis be
+    fetched as `csv`, `tif`, `png` or `.pbf` without declaring any of them. `pipeline.json`
+    is the exception: it has no format segment to source an override from, so it publishes
+    whatever `pipeline()` set, and a caller resubmitting that pipeline verbatim has to get
+    one the request layer accepts.
+
+    That makes the declared value a real contract rather than a placeholder, and
+    `request.ops.validate_shapes` enforces it in both directions: a long (vector) final
+    frame under a raster format is rejected, and so is a band-wide (raster) one under a
+    tabular format. A `type="dataset"` analysis reads whichever dataset the route resolved
+    for it, so the only value that is right for every reachable selection is one derived
+    from that dataset's own grid kind -- these analyses neither project nor change shape,
+    so the final frame's kind is the input grid's kind.
+    """
+    return "tif" if GRIDS[dataset.grid].grid_type == "raster" else "csv"
 
 
 def selection_filter_where(

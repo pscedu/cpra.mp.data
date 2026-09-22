@@ -407,11 +407,22 @@ class TestDatasetAnalysisPipelineJson:
 
     def test_format_is_not_overridden_by_the_route(self, client, vector_dataset):
         """There is no `{format}`/`.pbf` URL segment on this route to source an override
-        from, so the pipeline's own `output.format` (`difference` builds `csv`) is left
-        untouched.
+        from, so the pipeline's own `output.format` -- `csv`, for `difference` over this
+        vector dataset -- is left untouched.
         """
         response = client.get(f"{DATASET_URL}/pipeline.json", params=DIFFERENCE_QUERY)
         assert response.json()["output"]["format"] == "csv"
+
+    def test_the_unoverridden_format_matches_the_datasets_grid_kind(self, client, raster_dataset):
+        """The same route over a RASTER dataset. Since nothing overrides the format here,
+        what `pipeline.json` publishes is what a caller resubmitting it would run -- so it
+        has to match the shape the pipeline actually produces, which on a pixel grid is a
+        raster surface rather than a table.
+        """
+        response = client.get(f"{RASTER_DATASET_URL}/pipeline.json", params=RASTER_DIFFERENCE_QUERY)
+        assert response.status_code == 200, response.text
+        assert response.json()["output"]["format"] == "tif"
+        validate_shapes(parse_pipeline(response.json()))  # no raise
 
 
 class TestCustomAnalysisPipelineJson:

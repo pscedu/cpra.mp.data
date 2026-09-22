@@ -34,6 +34,7 @@ from cpra.mp.data.analyses.base import (
     Analysis,
     InvalidAnalysisParametersError,
     dataset_input_selection,
+    dataset_output_format,
     format_dimension_literal,
     required_dataset_dimensions,
     selection_filter_where,
@@ -119,15 +120,11 @@ class LandTypeConfidence(Analysis):
         data = {
             "inputs": {"x": dataset_input_selection(self.dataset)},
             "steps": steps,
-            # `Output.format` is required, and every `data.{format}`/tile route overwrites
-            # it from its own URL segment -- so the value set here is only ever observable
-            # on `pipeline.json`, which has no format segment to override it with. It has
-            # to be a format the published pipeline would actually RUN under, or
-            # `pipeline.json` hands a caller something `validate_shapes` rejects on
-            # resubmission. `lnd_type` lives only on `morph_pixel` (a raster grid), so a
-            # valid selection for this analysis always ends band-wide, and `tif` is the
-            # only tabular-vs-raster sink that fits it.
-            "output": {"format": "tif"},
+            # Derived from the dataset's grid kind: this analysis never changes shape, and
+            # only `pipeline.json` ever shows the value, where it has to be a sink the
+            # published pipeline would actually run under. `lnd_type` lives only on
+            # `morph_pixel` (a raster grid), so in practice that is always `tif`.
+            "output": {"format": dataset_output_format(self.dataset)},
         }
         return parse_pipeline(data)
 
