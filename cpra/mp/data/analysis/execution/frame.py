@@ -83,6 +83,7 @@ from collections.abc import Iterable
 import polars as pl
 
 from cpra.mp.data.analysis.io.window import ReadWindow
+from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_INDEX_COLUMN
 
 # `BAND_NAME_RE`/`RESERVED_BAND_INDEX_COLUMN` come from the request layer (the name-shape
@@ -365,6 +366,17 @@ def row_major_grid_cell(
       filtered on, and the id that comes back, must mean the same pixel regardless of how
       much of the grid the read actually covered.
 
+    **The absolute mode refuses a DECIMATED window**, and the window-relative one does not.
+    A decimated row stands for a block of source pixels, one of which GDAL picked; there is
+    no single grid cell of the full-resolution grid the row can honestly be labeled with, so
+    an absolute id here would be a number that names a real pixel and means a different one.
+    A window-relative id has no such problem: it addresses the array that was actually read,
+    which is exactly what the raster sinks want (they reshape that same array). The refusal
+    is a guard rather than a live path -- `execution.plan.compile_plan` sets
+    `overview_permitted` to `False` for any origin with a `point_sample_step`, and a spatial
+    filter over a band-wide frame is the only thing that reaches the absolute mode -- so
+    tripping it means that gate was widened without this being revisited.
+
     A plain `with_row_index` is not that id in either mode. It is only that id when
     `window.batch_layout` describes a single batch covering the whole window, which is the
     case for a small read and for a windowed one, and NOT the case for a full read of a real
@@ -384,7 +396,8 @@ def row_major_grid_cell(
     within that batch, that offset split into a line and a column by the BATCH's width, and
     those placed on the raster by the batch's own offsets -- which are already absolute
     (each batch's `col`/`row` are its position in the SOURCE, not in `window`). The
-    window-relative mode then subtracts `window`'s own offset and scales by `window.width`;
+    window-relative mode then subtracts `window`'s own offset and scales by the read's own
+    width (`window.read_shape`, which is `window.width` for an undecimated read);
     the absolute mode leaves the raster-relative row/col as-is and scales by `grid_width`.
 
     `window.batch_layout` is empty for a `ReadWindow` not built by a batched scan (a
@@ -392,7 +405,21 @@ def row_major_grid_cell(
     whole window, one batch -- so the id reduces to the plain row-major index, which is
     what such a window means.
     """
-    layout = window.batch_layout or ((window.col_off, window.row_off, window.width, window.height),)
+    read_height, read_width = window.read_shape
+    if window.decimation != (1, 1):
+        if grid_width is not None:
+            raise ShapeError(
+                f"row_major_grid_cell: cannot label the pixels of a window decimated by "
+                f"{window.decimation} with absolute grid cell ids -- each row stands for a "
+                "block of source pixels, not one of them"
+            )
+        assert not window.batch_layout, (
+            f"decimated window {window!r} carries a batch layout -- a decimated read is a "
+            "single batch, and a source-pixel layout cannot describe a decimated array"
+        )
+    # The batch extents are in array units, so the single-batch fallback is the DECIMATED
+    # extent (identical to the window's own whenever `decimation` is `(1, 1)`).
+    layout = window.batch_layout or ((window.col_off, window.row_off, read_width, read_height),)
     starts = list(itertools.accumulate((w * h for _c, _r, w, h in layout), initial=0))[:-1]
     batches = pl.DataFrame(
         {
@@ -412,7 +439,7 @@ def row_major_grid_cell(
     absolute_row = pl.col("__batch_row") + offset // pl.col("__batch_width")
     absolute_col = pl.col("__batch_col") + offset % pl.col("__batch_width")
     if grid_width is None:
-        id_expr = (absolute_row - window.row_off) * window.width + (absolute_col - window.col_off)
+        id_expr = (absolute_row - window.row_off) * read_width + (absolute_col - window.col_off)
     else:
         id_expr = absolute_row * grid_width + absolute_col
     return (

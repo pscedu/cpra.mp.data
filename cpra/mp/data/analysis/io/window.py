@@ -4,7 +4,7 @@ the source it sits, and at what resolution.
 It lives in `io/` because that is what it describes. A read window's every field is a
 property of something that came off disk: the source's identity, the pixel offset and
 size within it, the affine transform and CRS that place those pixels on the ground, and
-the decimation level actually read. The raster scan constructs one; the op algebra
+the per-axis decimation actually read. The raster scan constructs one; the op algebra
 carries it along and checks it never changes; a raster sink reads it back to write the
 result out. Both of those layers need the type, and the request layer -- which answers a
 tile URL knowing only the declared ops and each input's grid kind -- does not need it at
@@ -38,10 +38,20 @@ class ReadWindow:
     whatever builds the scan, not to this module.
 
     `col_off`/`row_off`/`width`/`height` are the read's pixel offset and size within
-    `source`, plain ints rather than `rasterio.windows.Window` (whose fields are floats)
-    because the read window carried here is always pixel-aligned. `transform` and `crs`
-    are the read's affine transform and coordinate system; `decimation` is the
-    overview/decimation level actually read, `1` meaning full resolution.
+    `source`, in SOURCE pixels -- plain ints rather than `rasterio.windows.Window` (whose
+    fields are floats) because the read window carried here is always pixel-aligned.
+    `transform` and `crs` are the affine transform and coordinate system of the array that
+    actually came back.
+
+    `decimation` is the `(row_factor, col_factor)` the read was decimated by, `(1, 1)`
+    meaning full resolution. Per axis, not a single level, because the factor is chosen per
+    axis (`io/raster_io.py`'s `tile_read_shape`): a window clipped to a sliver along one
+    axis can still be the whole raster along the other, and a single factor taken from the
+    shorter one would leave the longer one unbounded. `read_shape` is the `(height, width)`
+    of the array those factors actually produced, and is what a consumer reshaping the
+    frame back into a raster must use -- `height`/`width` stay in source pixels so that the
+    window keeps describing the same GROUND however it was read, which is what lets
+    `assert_same_pixel_grid` compare extent and resolution as two separate questions.
 
     `batch_layout` is the ORDER the read emitted its pixels in: one
     `(col_off, row_off, width, height)` tuple per batch the scan produced, in the order it
@@ -69,5 +79,19 @@ class ReadWindow:
     height: int
     transform: Affine
     crs: CRS
-    decimation: int = 1
+    decimation: tuple[int, int] = (1, 1)
     batch_layout: tuple[tuple[int, int, int, int], ...] = ()
+
+    @property
+    def read_shape(self) -> tuple[int, int]:
+        """The `(height, width)` of the array this read produced: the source extent floor-
+        divided by `decimation`, and equal to `(height, width)` exactly when undecimated.
+
+        Floor-divided, not ceil-divided, because that is what the read itself asked GDAL
+        for -- the effective ratio has to be at least the factor for GDAL to serve the
+        matching overview level rather than the next finer one (`io/raster_io.py`'s
+        `tile_read_shape`, which derives the same number from the same factors). Derived
+        rather than stored so the two can never disagree about how many pixels came back.
+        """
+        row_factor, col_factor = self.decimation
+        return (max(1, self.height // row_factor), max(1, self.width // col_factor))

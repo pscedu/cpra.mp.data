@@ -15,6 +15,7 @@ from rasterio.crs import CRS
 from rasterio.transform import Affine
 
 from cpra.mp.data.analysis.execution import frame
+from cpra.mp.data.analysis.request.errors import ShapeError
 from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_INDEX_COLUMN
 
 
@@ -27,7 +28,7 @@ def make_window(**overrides) -> frame.ReadWindow:
         height=10,
         transform=Affine.identity(),
         crs=CRS.from_epsg(6478),
-        decimation=1,
+        decimation=(1, 1),
     )
     defaults.update(overrides)
     return frame.ReadWindow(**defaults)
@@ -273,7 +274,7 @@ class TestAssertWindowUnchanged:
             {"row_off": 5},
             {"width": 999},
             {"height": 999},
-            {"decimation": 2},
+            {"decimation": (2, 2)},
             {"source": "a-different-raster.tif"},
             {"crs": CRS.from_epsg(4326)},
             {"transform": Affine.translation(10, 10)},
@@ -307,7 +308,7 @@ class TestAssertSamePixelGrid:
             {"row_off": 5},
             {"width": 999},
             {"height": 999},
-            {"decimation": 2},
+            {"decimation": (2, 2)},
             {"crs": CRS.from_epsg(4326)},
             {"transform": Affine.translation(10, 10)},
             {"batch_layout": ((0, 0, 2, 4), (2, 0, 2, 4))},
@@ -396,6 +397,50 @@ class TestRowMajorGridCell:
 
         assert frame.row_major_grid_cell(lf, window).collect().columns == ["b0", "grid_cell"]
 
+    def test_a_decimated_window_is_numbered_over_the_pixels_actually_read(self):
+        """A 4x4 window read at (2, 2) comes back as a 2x2 array, so the ids run 0..3 over
+        THAT array. Numbering it over the window's 16 source pixels instead -- which
+        `window.width` alone would do -- gives four rows the ids 0, 1, 4, 5, and the sink's
+        reshape then scatters them across a raster four times too large.
+        """
+        window = make_window(width=4, height=4, decimation=(2, 2), batch_layout=())
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        assert frame.row_major_grid_cell(lf, window).collect()["grid_cell"].to_list() == [0, 1, 2, 3]
+
+    def test_a_decimated_window_refuses_absolute_grid_cell_ids(self):
+        """The mode that would lie. A decimated row stands for a block of source pixels,
+        one of which GDAL picked, so there is no absolute id over the full grid that names
+        it honestly -- and an absolute id is exactly what a caller filters against.
+        """
+        window = make_window(width=4, height=4, decimation=(2, 2))
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        with pytest.raises(ShapeError, match="decimated"):
+            frame.row_major_grid_cell(lf, window, grid_width=100)
+
+    def test_an_undecimated_window_still_allows_absolute_ids(self):
+        # The refusal above is conditioned on decimation, not on the mode: a full-resolution
+        # window must keep answering the absolute question it has always answered.
+        window = make_window(col_off=1, row_off=1, width=2, height=2, batch_layout=((1, 1, 2, 2),))
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        out = frame.row_major_grid_cell(lf, window, grid_width=10).collect()
+
+        assert out["grid_cell"].to_list() == [11, 12, 21, 22]
+
+    def test_a_decimated_window_carrying_a_batch_layout_is_a_contract_violation(self):
+        """Mixed units: a batch layout is in source pixels and a decimated array is not, so
+        a window claiming both cannot be decoded. `io.raster.scan_raster` never produces
+        one (it records an empty layout for a decimated read, and refuses to decimate a
+        batched full read at all); this is the guard that says so out loud.
+        """
+        window = make_window(width=4, height=4, decimation=(2, 2), batch_layout=((0, 0, 4, 4),))
+        lf = pl.LazyFrame({"b0": [1, 2, 3, 4]})
+
+        with pytest.raises(AssertionError, match="batch layout"):
+            frame.row_major_grid_cell(lf, window)
+
 
 class TestAssertHeightPreserved:
     def test_passes_when_height_is_unchanged_even_if_the_data_is_not(self):
@@ -440,7 +485,28 @@ class TestReadWindow:
         assert make_window() is not make_window()
 
     def test_a_changed_field_breaks_equality(self):
-        assert make_window() != make_window(decimation=2)
+        assert make_window() != make_window(decimation=(2, 2))
+
+    def test_read_shape_is_the_source_extent_when_undecimated(self):
+        assert make_window(width=10, height=7).read_shape == (7, 10)
+
+    def test_read_shape_floor_divides_per_axis(self):
+        # Per axis and floor-divided, both: 7 // 4 == 1 on the row axis while the column
+        # axis is untouched, and neither rounds up. Ceil-division here would ask GDAL for
+        # an effective ratio just under the factor, which makes it serve the read off the
+        # next FINER overview level and undoes the saving the factor was chosen for.
+        assert make_window(width=10, height=7, decimation=(4, 1)).read_shape == (1, 10)
+
+    def test_read_shape_never_goes_below_one_pixel(self):
+        # A sliver window under a large factor floor-divides to zero, which is not a shape
+        # any read can return; the floor is 1 on both axes.
+        assert make_window(width=3, height=1, decimation=(8, 8)).read_shape == (1, 1)
+
+    def test_read_shape_is_not_a_field_so_it_cannot_drift_from_decimation(self):
+        # Derived, not stored: rebuilding the same window with a different factor changes
+        # the shape, and there is no way to construct one whose shape contradicts it.
+        assert "read_shape" not in {field.name for field in dataclasses.fields(make_window())}
+        assert make_window(width=8, height=8, decimation=(2, 2)).read_shape == (4, 4)
 
 
 # ----------------------------------------------------------------------------------

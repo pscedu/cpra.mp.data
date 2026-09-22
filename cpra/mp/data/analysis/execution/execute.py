@@ -622,8 +622,8 @@ def _point_sample_overrides(plan: ExecutionPlan) -> dict[str, Window]:
     return windows
 
 
-def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
-    """An undecimated `ReadWindow` built from `grid_name`'s own geometry, with no file
+def _grid_read_window(grid_name: str, window=None, decimation: tuple[int, int] = (1, 1)) -> ReadWindow:
+    """A `ReadWindow` built from `grid_name`'s own geometry, with no file
     opened -- the window a zero-band raster origin gets, since `io.raster.scan_raster`
     cannot produce one itself (it raises on empty metadata; see the module docstring).
     `cpra.mp.data.grids.RasterGrid` already carries everything a full window needs
@@ -639,7 +639,9 @@ def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
     it to that sub-window, which is what a zero-band origin under a tile-scoped plan needs:
     a `join` compares its operands' windows field by field (`frame.assert_same_pixel_grid`)
     and would reject a zero-band operand still describing the whole grid beside a real one
-    describing the tile's window.
+    describing the tile's window. `decimation` is carried for the same reason and behaves
+    the same way: it is one more field that comparison reads, so a zero-band operand must
+    claim whatever resolution its sibling was read at even though it has no rows to read.
     """
     grid = GRIDS[grid_name]
     grid_transform = from_bounds(*grid.bounds, width=grid.width, height=grid.height)
@@ -656,7 +658,7 @@ def _grid_read_window(grid_name: str, window=None) -> ReadWindow:
         height=height,
         transform=window_transform(Window(col_off, row_off, width, height), grid_transform),
         crs=CRS.from_user_input(grid.crs),
-        decimation=1,
+        decimation=decimation,
         batch_layout=(),
     )
 
@@ -685,6 +687,9 @@ def _open_band_wide_input(
     (`_derive_point_sample_window`); `resolved.read_window` itself is left untouched by that
     decision (it is still `None` for the ordinary, non-tile request every point sample so
     far has been), so this is a call-site override, not a second copy of the same field.
+    `resolved.decimation` rides along beside it -- the resolution `compile_plan` decided
+    this origin's window may be read at, `(1, 1)` unless it was both tile-scoped and
+    overview-eligible.
     A `tile_disjoint` origin -- the tile's footprint misses this raster's extent
     entirely -- has no window to read at all and becomes the same zero-band empty frame the
     first case produces, so "this tile is outside the data" arrives at the sink as the
@@ -696,18 +701,27 @@ def _open_band_wide_input(
     """
     if resolved.tile_disjoint:
         return empty_band_wide(_grid_read_window(resolved.selection.grid)), ()
-    window = point_sample_window if point_sample_window is not None else resolved.read_window
+    if point_sample_window is not None:
+        # A point sample overrides the window, so it must also override the resolution: the
+        # pixel under a coordinate is the whole answer, and a decimated grid can hand back a
+        # neighbour's value instead. `compile_plan` already sets `overview_permitted` (and
+        # therefore `decimation`) accordingly for any origin with a `point_sample_step`;
+        # this keeps the override a single decision rather than two that must agree.
+        window, decimation = point_sample_window, (1, 1)
+    else:
+        window, decimation = resolved.read_window, resolved.decimation
     if has_no_bands(resolved.band_metadata):
-        return empty_band_wide(_grid_read_window(resolved.selection.grid, window)), ()
+        return empty_band_wide(_grid_read_window(resolved.selection.grid, window, decimation)), ()
     if resolved.straddling_vector_grid is not None:
         crosswalk_path = resolve_raster_crosswalk_path(resolved.selection.grid, resolved.straddling_vector_grid)
         opened = scan_raster(
             resolved.band_metadata,
             crosswalks=[(project.ZONE_COLUMN, str(crosswalk_path))],
             window=window,
+            decimation=decimation,
         )
         return opened, (project.ZONE_COLUMN,)
-    return scan_raster(resolved.band_metadata, window=window), ()
+    return scan_raster(resolved.band_metadata, window=window, decimation=decimation), ()
 
 
 #: `_shared_tile_window`'s answer for a join group whose tile misses the data entirely --
@@ -751,6 +765,29 @@ def _shared_tile_window(origins: tuple[str, ...], inputs: dict[str, ResolvedInpu
     col_end = max(int(w.col_off) + int(w.width) for w in windows)
     row_end = max(int(w.row_off) + int(w.height) for w in windows)
     return Window(col_off, row_off, col_end - col_off, row_end - row_off)
+
+
+def _shared_tile_decimation(origins: tuple[str, ...], inputs: dict[str, ResolvedInput]) -> tuple[int, int]:
+    """The ONE resolution a band-wide join group's shared scan reads at: the per-axis
+    MINIMUM of its origins' own factors.
+
+    One scan can only be decimated one way, and `frame.assert_same_pixel_grid` compares
+    `decimation` precisely because two frames read at different resolutions do not address
+    the same pixels -- so the group needs a single answer rather than an answer per operand.
+    The minimum is the conservative one in both directions that matter. It is `(1, 1)`
+    whenever any one origin is not overview-eligible (`compile_plan` gives that origin
+    `(1, 1)`, and no factor is smaller), which is what keeps a `project`'s full-resolution
+    requirement from being undone by the operand it is joined against. And where every
+    origin IS eligible, the minimum reads at least as many pixels as the coarsest operand
+    would have alone -- which matters because the shared window is the UNION of theirs
+    (`_shared_tile_window`), wider than any single one and therefore able to bear a factor
+    at least as coarse as any of them. Recomputing the factors against that union would be
+    the tighter answer; it would also mean carrying the `TileRequest` down here to re-derive
+    something `compile_plan` has already decided, to save pixels on a read that is already
+    bounded.
+    """
+    factors = [inputs[name].decimation for name in origins]
+    return (min(row for row, _col in factors), min(col for _row, col in factors))
 
 
 def _empty_zone_sources(
@@ -825,7 +862,8 @@ def _open_band_wide_join_group(
 
     Under a tile-scoped plan the shared scan reads ONE window covering every origin's own
     (`_shared_tile_window`) -- which is not necessarily any single origin's, since only an
-    origin feeding a raster-to-vector `project` gets the straddling-feature widening.
+    origin feeding a raster-to-vector `project` gets the straddling-feature widening -- at
+    ONE resolution covering every origin's own (`_shared_tile_decimation`).
 
     A PARTIAL zero-band mismatch within an otherwise-nonzero group (one operand resolves
     to zero bands, another does not) raises `ValueError` naming the mismatched origins,
@@ -845,10 +883,12 @@ def _open_band_wide_join_group(
             _empty_zone_sources(zone_crosswalks, window),
         )
 
+    decimation = _shared_tile_decimation(origins, inputs) if read_window is not None else (1, 1)
+
     band_metadata = [inputs[name].band_metadata for name in origins]
     heights = [df.height for df in band_metadata]
     if sum(heights) == 0:
-        window = _grid_read_window(inputs[origins[0]].selection.grid, read_window)
+        window = _grid_read_window(inputs[origins[0]].selection.grid, read_window, decimation)
         return (
             {name: (empty_band_wide(window), ()) for name in origins},
             _empty_zone_sources(zone_crosswalks, window),
@@ -887,7 +927,9 @@ def _open_band_wide_join_group(
         crosswalks.append((column, str(crosswalk_path)))
         project_zone_columns[zone_crosswalk.step_no] = column
 
-    lf, out_metadata, window = scan_raster(combined, crosswalks=crosswalks, window=read_window)
+    lf, out_metadata, window = scan_raster(
+        combined, crosswalks=crosswalks, window=read_window, decimation=decimation
+    )
 
     zone_sources = {
         step_no: project.ZoneSource(lf.select(pl.col(column).alias(project.ZONE_COLUMN)), window)

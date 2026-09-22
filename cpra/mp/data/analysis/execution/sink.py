@@ -292,15 +292,19 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     ordered = row_major_grid_cell(lf, window).sort("grid_cell").select(band_names)
     df = ordered.collect()
 
+    # `read_shape`, not `height`/`width`: those are the window's SOURCE extent, which is the
+    # array's shape only when the read was undecimated. `window.transform` is already scaled
+    # to match, so the written file is georeferenced correctly either way.
+    read_height, read_width = window.read_shape
     out_dtype = _resolve_write_dtype(df, band_names, dtype)
     data = np.stack(
         [df.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False) for name in band_names]
-    ).reshape(len(band_names), window.height, window.width)
+    ).reshape(len(band_names), read_height, read_width)
 
     profile = dict(
         driver="GTiff",
-        height=window.height,
-        width=window.width,
+        height=read_height,
+        width=read_width,
         count=len(band_names),
         dtype=out_dtype,
         crs=window.crs,
@@ -433,11 +437,14 @@ def render_tile(band_wide: BandWideFrame, tile: TileRequest, format, *, color_ma
         .get_column(band_names[0])
         .fill_null(nodata)
         .to_numpy()
-        .reshape(window.height, window.width)
+        .reshape(*window.read_shape)
     )
     # `window.transform` already describes these pixels -- `scan_raster` derived it for the
-    # window it read -- so this is `warp_array_to_tile`, not `warp_window_to_tile`, which
-    # exists to derive that same transform for a caller who has only the source's.
+    # window it read, and scaled it to match if that read was decimated -- so this is
+    # `warp_array_to_tile`, not `warp_window_to_tile`, which exists to derive that same
+    # transform for a caller who has only the source's. That is also why a decimated tile
+    # needs nothing here: the array is smaller and its transform is coarser by exactly the
+    # same ratio, so the warp onto the tile grid is the identical call either way.
     tile_data = warp_array_to_tile(
         array[np.newaxis, :, :],
         array_transform=window.transform,

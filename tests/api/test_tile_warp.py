@@ -34,7 +34,7 @@ import rasterio as rio
 from rasterio import windows
 from rasterio.coords import BoundingBox
 from rasterio.enums import Resampling
-from rasterio.transform import from_bounds
+from rasterio.transform import Affine, from_bounds
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 
@@ -51,6 +51,7 @@ from cpra.mp.data.analysis.io.raster_io import (
     _warp_array_to_tile,
     raster_grid_geometry,
     resampling_buffer_px,
+    tile_decimation_factors,
     tile_disjoint_from_source,
     tile_read_shape,
     tile_source_window,
@@ -591,7 +592,39 @@ class TestDecimatedTileReads:
 
         assert _axis_decimation_factor(window.height, 528) == 1
         assert _axis_decimation_factor(window.width, 528) == 4
+        assert tile_decimation_factors(window, TILE_SIZE) == (1, 4)
         assert tile_read_shape(window, TILE_SIZE) == (100, 750)
+
+    @pytest.mark.parametrize("extent", [(297, 226), (3000, 100), (20674, 8285), (100, 100), (1, 1)])
+    @pytest.mark.parametrize("tile_size", [16, TILE_SIZE])
+    def test_a_read_windows_shape_agrees_with_the_rule_that_sized_it(self, extent, tile_size):
+        """The two halves of the decimation contract, computed in two modules: the shape
+        `tile_read_shape` says a window will come back as, and the shape
+        `io.window.ReadWindow` later claims those same factors produced. They are what the
+        scan's `out_shape` and the sink's reshape are respectively derived from, so a
+        one-pixel disagreement is a reshape failure at best and silently rotated
+        georeferencing at worst.
+        """
+        width, height = extent
+        window = windows.Window(0, 0, width, height)
+        factors = tile_decimation_factors(window, tile_size)
+        read_window = ReadWindow(
+            source=(),
+            col_off=0,
+            row_off=0,
+            width=width,
+            height=height,
+            transform=Affine.identity(),
+            crs=TILE_CRS,
+            decimation=factors,
+        )
+
+        expected = tile_read_shape(window, tile_size)
+        if expected is None:
+            assert factors == (1, 1)
+            assert read_window.read_shape == (height, width)
+        else:
+            assert read_window.read_shape == expected
 
 
 class TestWarpWindowToTileRejectsAMismatchedWindow:
@@ -1097,7 +1130,7 @@ def _warp_first_then_collapse(metadata_df, tile_bounds, tile_size, aggregate):
         height=tile_size,
         transform=tile_transform,
         crs=TILE_CRS,
-        decimation=1,
+        decimation=(1, 1),
         batch_layout=(),
     )
     collapsed_lf, _metadata_out, _window = group_band_wide(

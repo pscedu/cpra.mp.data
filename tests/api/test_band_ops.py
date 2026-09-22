@@ -42,7 +42,7 @@ def _window(**overrides):
         height=3,
         transform=Affine.identity(),
         crs=CRS.from_epsg(4326),
-        decimation=1,
+        decimation=(1, 1),
     )
     defaults.update(overrides)
     return ReadWindow(**defaults)

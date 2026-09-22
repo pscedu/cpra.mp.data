@@ -67,7 +67,7 @@ from cpra.mp.data.analysis.execution.sink import (
     sink_vector_tile,
     write_raster,
 )
-from cpra.mp.data.analysis.io.raster_io import tile_source_window, warp_window_to_tile
+from cpra.mp.data.analysis.io.raster_io import tile_read_shape, tile_source_window, warp_window_to_tile
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import Output, parse_pipeline
 from cpra.mp.data.grids import GRIDS
@@ -512,6 +512,13 @@ class TestRenderTile:
         # The expectation is built by reading that same window straight off the file with
         # rasterio and warping it, which shares no code with the chain under test past
         # `warp_window_to_tile` itself.
+        #
+        # This is also the one sink test that runs the DECIMATED read end to end. A 16px
+        # tile puts `tile_decimation_factors`' target at 48 source pixels, which this
+        # fixture's window (297x226) is well over on both axes, so the compiled plan reads
+        # it at (4, 4) -- asserted below rather than assumed, since the whole point of the
+        # comparison is that the chain's own georeferencing tracked the factor it chose.
+        # Production's 256px tiles put that target at 528 and leave this fixture whole.
         grid = GRIDS[RASTER_GRID]
         write_raster_dataset(base_path, years=(2030,), data_fn=lambda _y: raster_array() + 1)
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
@@ -524,18 +531,21 @@ class TestRenderTile:
         assert int(window.width) < grid.width
         assert int(window.height) < grid.height
         assert int(window.col_off) > 0
+        assert plan.inputs["a"].decimation == (4, 4)
         assert result is not None
 
+        out_shape = tile_read_shape(window, tile_size)
         path = next(base_path.rglob("*.tif"))
         with rasterio.open(path) as src:
             expected = warp_window_to_tile(
-                src.read(1, window=window)[np.newaxis, :, :],
+                src.read(1, window=window, out_shape=out_shape)[np.newaxis, :, :],
                 window=window,
                 src_transform=src.transform,
                 src_crs=src.crs,
                 tile_bounds=mercantile.xy_bounds(*PARTIAL_TILE),
                 tile_size=tile_size,
                 nodata=DEFAULT_NODATA,
+                out_shape=out_shape,
                 resampling=Resampling.nearest,
             )
         np.testing.assert_array_equal(captured[0], expected)

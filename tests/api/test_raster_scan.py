@@ -202,6 +202,144 @@ class TestWindowedReadEqualsDirect:
         assert (read_window.col_off, read_window.row_off) == (2, 3)
         assert (read_window.width, read_window.height) == (4, 3)
         assert read_window.transform == window_transform(window, raster_transform)
+        assert read_window.decimation == (1, 1)
+        assert read_window.read_shape == (3, 4)
+
+
+class TestDecimatedWindowedRead:
+    """`decimation` asks GDAL to serve the window out of the source's overview pyramid.
+    What the scan owes its caller is that the smaller array is still described correctly:
+    the same ground, at a coarser resolution, with the frame's row count and the window's
+    transform both saying so.
+    """
+
+    def _gradient(self, tmp_path, size=8):
+        # Unique per pixel, so a wrong stride or a transposed axis shows up as a wrong
+        # VALUE rather than merely a wrong shape.
+        data = np.arange(size * size, dtype="int32").reshape(size, size)
+        return _write_tif(tmp_path / "grad.tif", data), data
+
+    def test_row_count_and_window_report_the_decimated_shape(self, tmp_path):
+        path, _ = self._gradient(tmp_path)
+        window = Window(0, 0, 8, 8)
+
+        lf, _, read_window = scan_raster(_metadata([(path, 1)]), window=window, decimation=(2, 2))
+
+        assert lf.collect().height == 16
+        assert read_window.read_shape == (4, 4)
+        # The SOURCE extent is unchanged: the window still describes the same ground, which
+        # is what lets `assert_same_pixel_grid` treat extent and resolution as two separate
+        # questions rather than one conflated one.
+        assert (read_window.width, read_window.height) == (8, 8)
+        assert read_window.decimation == (2, 2)
+
+    def test_values_match_a_direct_decimated_rasterio_read(self, tmp_path):
+        path, _ = self._gradient(tmp_path)
+        window = Window(0, 0, 8, 8)
+
+        lf, _, _ = scan_raster(_metadata([(path, 1)]), window=window, decimation=(2, 2))
+
+        with rio.open(path) as src:
+            expected = src.read(1, window=window, out_shape=(4, 4))
+        assert lf.collect()["b0"].to_numpy().reshape(4, 4).tolist() == expected.tolist()
+
+    def test_every_decimated_value_is_a_real_source_value(self, tmp_path):
+        """Nearest, not an average -- which is what keeps a band's nodata sentinel intact
+        for the masking below to find, and what makes a decimated tile a real sample of the
+        data rather than a blend of it.
+        """
+        path, data = self._gradient(tmp_path)
+
+        lf, _, _ = scan_raster(_metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=(2, 2))
+
+        assert set(lf.collect()["b0"].to_list()) <= set(data.ravel().tolist())
+
+    def test_the_transform_is_scaled_so_the_array_covers_the_same_ground(self, tmp_path):
+        path, _ = self._gradient(tmp_path)
+        window = Window(0, 0, 8, 8)
+
+        _, _, read_window = scan_raster(_metadata([(path, 1)]), window=window, decimation=(2, 2))
+
+        with rio.open(path) as src:
+            undecimated = window_transform(window, src.transform)
+        # Same origin, pixels twice as large on each axis: the array is half the size and
+        # covers the identical extent. A transform left unscaled here is the sub-pixel error
+        # `warp_window_to_tile`'s docstring describes -- every rendered pixel displaced,
+        # with nothing in the output to say so.
+        assert (read_window.transform.c, read_window.transform.f) == (undecimated.c, undecimated.f)
+        assert (read_window.transform.a, read_window.transform.e) == (
+            undecimated.a * 2,
+            undecimated.e * 2,
+        )
+
+    def test_a_per_axis_factor_decimates_only_that_axis(self, tmp_path):
+        path, _ = self._gradient(tmp_path)
+
+        _, _, read_window = scan_raster(
+            _metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=(4, 1)
+        )
+
+        assert read_window.read_shape == (2, 8)
+
+    def test_a_crosswalk_rides_the_same_decimated_read(self, tmp_path):
+        """One read, so the zone ids stay positionally aligned with the bands for free --
+        and stay real zone ids, since nearest never blends two zones into a third.
+        """
+        path, _ = self._gradient(tmp_path)
+        zones = np.repeat(np.arange(4, dtype="int32"), 16).reshape(8, 8)
+        crosswalk_path = _write_tif(tmp_path / "xwalk.tif", zones)
+
+        lf, _, read_window = scan_raster(
+            _metadata([(path, 1)]),
+            crosswalks=[("zone", crosswalk_path)],
+            window=Window(0, 0, 8, 8),
+            decimation=(2, 2),
+        )
+        out = lf.collect()
+
+        assert out.height == 16 == read_window.read_shape[0] * read_window.read_shape[1]
+        assert set(out["zone"].to_list()) <= {0, 1, 2, 3}
+
+    def test_a_decimated_read_records_no_batch_layout(self, tmp_path):
+        """A decimated read is one batch over the whole window. Recording the source-pixel
+        extents an undecimated single-batch read records would be a unit mismatch against
+        the smaller array the rows actually came from, and `row_major_grid_cell` reads the
+        layout in array units.
+        """
+        path, _ = self._gradient(tmp_path)
+
+        _, _, decimated = scan_raster(_metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=(2, 2))
+        _, _, whole = scan_raster(_metadata([(path, 1)]), window=Window(0, 0, 8, 8))
+
+        assert decimated.batch_layout == ()
+        assert whole.batch_layout == ((0, 0, 8, 8),)
+
+    def test_decimation_without_a_window_is_rejected(self, tmp_path):
+        """The one combination that cannot be made correct: a full read is chunked into
+        batches whose layout is expressed in source pixels, and floor-dividing each batch
+        separately does not tile the decimated array -- so every row index downstream would
+        decode to the wrong pixel. Refused outright rather than silently read whole.
+        """
+        path, _ = self._gradient(tmp_path)
+
+        with pytest.raises(ValueError, match="requires an explicit window"):
+            scan_raster(_metadata([(path, 1)]), decimation=(2, 2))
+
+    @pytest.mark.parametrize("decimation", [(0, 1), (1, -2)])
+    def test_a_factor_below_one_is_rejected(self, tmp_path, decimation):
+        path, _ = self._gradient(tmp_path)
+
+        with pytest.raises(ValueError, match="must be >= 1"):
+            scan_raster(_metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=decimation)
+
+    def test_the_default_is_full_resolution(self, tmp_path):
+        path, data = self._gradient(tmp_path)
+        window = Window(0, 0, 8, 8)
+
+        lf, _, read_window = scan_raster(_metadata([(path, 1)]), window=window)
+
+        assert read_window.decimation == (1, 1)
+        assert lf.collect()["b0"].to_list() == data.ravel().tolist()
 
 
 class TestTwoTierNodataMasking:

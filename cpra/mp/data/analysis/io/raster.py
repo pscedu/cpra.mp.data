@@ -60,10 +60,25 @@ assumed valid after it.
 `window`, when given, restricts the scan to that single `rasterio.windows.Window` read
 whole, in one batch, rather than tiling the full raster -- a caller specific enough to name
 its own window has already decided how much of it to hold in memory at once. This is
-plumbing only: nothing in this module computes a window on its own (choosing a window is
-the caller's decision, not this scan's), and no resampling parameter exists yet -- every
-read is `Resampling.nearest`, GDAL's own default for an unspecified resampling method,
-and the only one a decimation-free window read ever needs.
+plumbing only: nothing in this module computes a window on its own, nor how coarsely to
+read it (both are the caller's decision, not this scan's -- `execution.plan.compile_plan`
+makes them together, since which pixels a tile needs and whether that tile may be served
+off overviews are the same request's questions).
+
+**Decimation.** `decimation` is a per-axis `(row_factor, col_factor)`, and reading a window
+into a correspondingly smaller buffer is what makes GDAL serve it out of the source's own
+overview pyramid (rasterio passes `out_shape` straight through to GDAL's overview
+selection) instead of decompressing every full-resolution pixel. It is only accepted
+alongside an explicit `window`: a decimated read is a single-batch read by construction,
+because the batch layout a full read is chunked into is expressed in source pixels and
+floor-dividing each batch separately would not tile the decimated array (`execution/
+frame.py`'s `row_major_grid_cell` decodes a row index through that layout, and would
+decode it to the wrong pixel). Every read here stays `Resampling.nearest` -- GDAL's own
+default for an unspecified resampling method -- decimated or not, which is what keeps every
+value a real source value: the COGs this reads carry overviews built with NEAREST (see
+`cpra.mp.data.raster`'s `_cog_profile`), so a decimated pixel is a pixel that was really
+there, and a band's NoData sentinel survives decimation intact for the masking below to
+find.
 
 `io` may import `request` but never `execution` -- see
 `tests/api/test_analysis_layering.py`. What `scan_raster` takes from `request` is only
@@ -84,6 +99,7 @@ import numpy as np
 import polars as pl
 from polars.io.plugins import register_io_source
 from rasterio.io import MemoryFile
+from rasterio.transform import Affine
 from rasterio.windows import Window, transform as window_transform
 
 from cpra.mp.data.analysis.io.raster_io import batched_windows, raster_blocks_per_batch, raster_gdal_env
@@ -136,6 +152,7 @@ def scan_raster(
     *,
     crosswalks: Sequence[tuple[str, object]] = (),
     window: Window | None = None,
+    decimation: tuple[int, int] = (1, 1),
     mask_nodata: bool = True,
 ) -> tuple[pl.LazyFrame, pl.DataFrame, ReadWindow]:
     """Open `metadata_df`'s bands as a band-wide triple, via a per-request VRT.
@@ -173,6 +190,17 @@ def scan_raster(
     extent -- see `execution/frame.py`'s `assert_window_unchanged`, the invariant every
     downstream lowering checks against what this function handed it first.
 
+    `decimation` is the `(row_factor, col_factor)` to read `window` at (see module
+    docstring), `(1, 1)` -- full resolution -- by default, and REQUIRES an explicit
+    `window`: a factor without one raises `ValueError` rather than silently reading whole.
+    A crosswalk rides the same decimated read as the data bands, so its zone ids stay
+    positionally aligned with them for free, and stay real zone ids rather than blends
+    (`Resampling.nearest`). The returned `ReadWindow` keeps `window`'s own SOURCE extent in
+    `col_off`/`row_off`/`width`/`height` -- it still describes the same ground -- while its
+    `transform` is scaled to the pixels that actually came back, so a consumer holding only
+    the window (`execution/sink.py`) can georeference the array without knowing it was
+    decimated at all. `ReadWindow.read_shape` is that array's shape.
+
     `mask_nodata` (default on) governs DATA bands only. A `crosswalks` column is masked
     unconditionally regardless of this flag -- see module docstring.
     """
@@ -185,6 +213,17 @@ def scan_raster(
         )
     if "path" not in metadata_df.columns or "band" not in metadata_df.columns:
         raise ValueError("scan_raster requires metadata_df to carry 'path' and 'band' columns")
+
+    row_factor, col_factor = (int(factor) for factor in decimation)
+    if row_factor < 1 or col_factor < 1:
+        raise ValueError(f"scan_raster: decimation factors must be >= 1, got {decimation!r}")
+    decimated = row_factor != 1 or col_factor != 1
+    if decimated and window is None:
+        raise ValueError(
+            f"scan_raster: decimation {decimation!r} requires an explicit window -- a full "
+            "read is chunked into batches whose layout is expressed in source pixels, which "
+            "a decimated array does not tile (see the module docstring)"
+        )
 
     crosswalk_names = [str(name) for name, _ in crosswalks]
     _validate_crosswalk_names(crosswalk_names)
@@ -226,18 +265,35 @@ def scan_raster(
             blocks_per_batch = raster_blocks_per_batch(len(sources), block_height, block_width, itemsize)
             window_list = list(batched_windows(ref, blocks_per_batch))
 
+    source_height, source_width = int(read_window.height), int(read_window.width)
+    out_shape = (max(1, source_height // row_factor), max(1, source_width // col_factor)) if decimated else None
+
+    window_affine = window_transform(read_window, raster_transform)
+    if out_shape is not None:
+        # The array covers the window's whole ground extent at a coarser resolution, so its
+        # origin is the window's and only its pixel size changes. Scaled by the EFFECTIVE
+        # ratio (source extent over the shape actually returned) rather than by the
+        # requested factors, since `out_shape` is floor-divided and the two differ whenever
+        # the extent is not a multiple of the factor.
+        window_affine *= Affine.scale(source_width / out_shape[1], source_height / out_shape[0])
+
     result_window = ReadWindow(
         source=tuple(sources),
         col_off=int(read_window.col_off),
         row_off=int(read_window.row_off),
-        width=int(read_window.width),
-        height=int(read_window.height),
-        transform=window_transform(read_window, raster_transform),
+        width=source_width,
+        height=source_height,
+        transform=window_affine,
         crs=raster_crs,
-        decimation=1,
-        batch_layout=tuple(
-            (int(w.col_off), int(w.row_off), int(w.width), int(w.height)) for w in window_list
-        ),
+        decimation=(row_factor, col_factor),
+        # Empty for a decimated read -- "the whole window, one batch", which is what a
+        # decimated read always is. Recording the source-pixel extents a full-resolution
+        # single-batch read records would be a unit mismatch against the smaller array the
+        # rows actually came from, and `frame.row_major_grid_cell` reads this layout in
+        # array units.
+        batch_layout=()
+        if decimated
+        else tuple((int(w.col_off), int(w.row_off), int(w.width), int(w.height)) for w in window_list),
     )
 
     schema = pl.Schema({name: NUMPY_TO_POLARS[dt] for name, dt in zip(column_names, dtypes)})
@@ -279,7 +335,10 @@ def scan_raster(
             with raster_gdal_env(), MemoryFile(vrt_bytes, ext=".vrt") as memfile, memfile.open() as src:
                 by_position = {}
                 for indexes, positions in read_groups:
-                    group_data = src.read(indexes=indexes, window=batch_window)
+                    # `out_shape` is a 2-tuple even for a multi-band read: rasterio
+                    # broadcasts it across `indexes` and returns `(len(indexes), *out_shape)`.
+                    # `None` (the undecimated case) reads the window at full resolution.
+                    group_data = src.read(indexes=indexes, window=batch_window, out_shape=out_shape)
                     for i, position in enumerate(positions):
                         by_position[position] = group_data[i].ravel()
                     del group_data

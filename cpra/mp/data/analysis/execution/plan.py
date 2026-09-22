@@ -182,16 +182,20 @@ so it never appears in `straddling_vector_grid`, and nothing about attaching a r
 already-resolved pixel values to a vector chain's rows demands full resolution the way
 redistributing the pixels themselves onto new polygons does.
 
-`straddling_vector_grid` is read by `_resolve_tile_window` below, which forwards it to
-`io.raster_io.tile_source_window` as that function's own argument of the same name.
-`overview_permitted` still has NO reader: the call it gates is `io.raster_io.
-tile_read_shape`, which neither takes it nor consults it, and no read in this package
-passes a decimated shape at all -- `io.raster.scan_raster` has no parameter for one. So no
-tile read is currently decimated, which is safe (a full-resolution read is never the wrong
-answer, only a slower one) but leaves the rule computed and asserted
-(`tests/api/test_execution_plan.py`) rather than enforced. Recorded here rather than left
-to be noticed, because a field that is written, tested, and never read looks from the
-outside exactly like a field that is working.
+Both are read by `_resolve_tile_window` below. `straddling_vector_grid` is forwarded to
+`io.raster_io.tile_source_window` as that function's own argument of the same name;
+`overview_permitted` gates `io.raster_io.tile_decimation_factors`, whose answer becomes
+`ResolvedInput.decimation` and travels to `io.raster.scan_raster` unchanged. A
+non-permitted origin gets `(1, 1)` and reads every source pixel, which is what makes the
+rule above an enforcement rather than an annotation.
+
+A band-wide `join`'s operands are read as ONE shared scan, which can therefore carry only
+ONE decimation; `execution.execute` takes the per-axis MINIMUM of the group's factors,
+which is `(1, 1)` -- full resolution for the whole group -- the moment any one operand's
+origin is not permitted. That is deliberately the conservative direction: the shared read
+covers the UNION of the operands' windows, which is wider than any single one and could
+bear a coarser factor than the minimum, so the group reads at worst a few times more pixels
+than it strictly needs and never fewer.
 
 **The tile read window is decided here, not at the read.** A tile is a property of the
 REQUEST, and which pixels it needs off each raster origin depends on things only this
@@ -279,6 +283,8 @@ from rasterio.enums import Resampling
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
 from cpra.mp.data.analysis.io.raster_io import (
     raster_grid_geometry,
+    resampling_buffer_px,
+    tile_decimation_factors,
     tile_disjoint_from_source,
     tile_source_window,
 )
@@ -355,14 +361,17 @@ class ResolvedInput:
     for and how they are derived. An input's grid kind decides which group of fields is
     populated; the other group is left at its default.
 
-    `read_window`/`tile_disjoint` are the tile read decision for a raster input, and are the
-    default pair (`None`, `False`) -- meaning "read this origin at full extent" -- unless
-    `compile_plan` was given a `TileRequest`. Under one, `read_window` is the
-    `rasterio.windows.Window` that tile needs off this origin, and `tile_disjoint` is
-    `True` (with `read_window` still `None`) for the separate case where the tile's
-    footprint misses this origin's extent altogether. The two cases are distinct fields
-    rather than one nullable one because `None` already means "full extent" and a disjoint
-    tile is the opposite of that -- see the module docstring's tile paragraph.
+    `read_window`/`tile_disjoint`/`decimation` are the tile read decision for a raster
+    input, and are the default triple (`None`, `False`, `(1, 1)`) -- meaning "read this
+    origin at full extent and full resolution" -- unless `compile_plan` was given a
+    `TileRequest`. Under one, `read_window` is the `rasterio.windows.Window` that tile needs
+    off this origin, and `tile_disjoint` is `True` (with `read_window` still `None`) for the
+    separate case where the tile's footprint misses this origin's extent altogether. The two
+    cases are distinct fields rather than one nullable one because `None` already means
+    "full extent" and a disjoint tile is the opposite of that -- see the module docstring's
+    tile paragraph. `decimation` is the per-axis `(row_factor, col_factor)` that window may
+    be read at, `(1, 1)` whenever `overview_permitted` is `False` -- it is what the
+    eligibility rule above is FOR, and `io.raster.scan_raster` takes it under the same name.
     """
 
     selection: InputSelection
@@ -375,6 +384,7 @@ class ResolvedInput:
     overview_permitted: bool = True
     read_window: object | None = None  # `rasterio.windows.Window | None`; same reasoning.
     tile_disjoint: bool = False
+    decimation: tuple[int, int] = (1, 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -698,15 +708,19 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     for name, selection in pipeline.inputs.items():
         if origin_kind[name] == "raster":
             target = straddling_vector_grid.get(name)
-            read_window, tile_disjoint = _resolve_tile_window(tile, selection.grid, target)
+            permitted = target is None and name not in point_sample_step
+            read_window, tile_disjoint, decimation = _resolve_tile_window(
+                tile, selection.grid, target, overview_permitted=permitted
+            )
             inputs[name] = ResolvedInput(
                 selection=selection,
                 band_metadata=raster_band_metadata[name],
                 point_sample_step=point_sample_step.get(name),
                 straddling_vector_grid=target,
-                overview_permitted=target is None and name not in point_sample_step,
+                overview_permitted=permitted,
                 read_window=read_window,
                 tile_disjoint=tile_disjoint,
+                decimation=decimation,
             )
         else:
             predicate = None
@@ -727,9 +741,16 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     )
 
 
-def _resolve_tile_window(tile: TileRequest | None, grid_name: str, straddling_vector_grid: str | None):
-    """The `(read_window, tile_disjoint)` pair one raster origin gets -- `(None, False)`,
-    "read it whole", whenever there is no tile to scope it to.
+def _resolve_tile_window(
+    tile: TileRequest | None,
+    grid_name: str,
+    straddling_vector_grid: str | None,
+    *,
+    overview_permitted: bool = True,
+):
+    """The `(read_window, tile_disjoint, decimation)` triple one raster origin gets --
+    `(None, False, (1, 1))`, "read it whole, at full resolution", whenever there is no tile
+    to scope it to.
 
     Sized from the GRID's geometry (`io.raster_io.raster_grid_geometry`) rather than from
     an opened raster, which is what keeps this module's promise to open no data files while
@@ -747,12 +768,22 @@ def _resolve_tile_window(tile: TileRequest | None, grid_name: str, straddling_ve
     widening that makes a tile whose pixels feed a raster-to-vector `project` read every
     pixel of each feature it touches, not just the part inside the tile. Deriving WHICH grid
     that is belongs here; applying it belongs there.
+
+    `overview_permitted` is the caller's already-derived answer (see the module docstring's
+    paragraph on overview eligibility) and is what turns `io.raster_io.
+    tile_decimation_factors` on: permitted, the window is decimated to roughly
+    `TILE_READ_OVERSAMPLE` times the tile's own resolution, which is what keeps a low-zoom
+    tile's cost a function of the tile rather than of the zoom; not permitted, the factors
+    stay `(1, 1)` and every source pixel is read. The buffer the factors are sized against
+    is the same `resampling_buffer_px(tile.resampling)` that `tile_source_window` just
+    widened the window by, rather than the bare `TILE_READ_BUFFER_PX` default, so the
+    decimation target describes the window this function is actually returning.
     """
     if tile is None:
-        return None, False
+        return None, False, (1, 1)
     geometry = raster_grid_geometry(grid_name)
     if tile_disjoint_from_source(geometry, tile.bounds):
-        return None, True
+        return None, True, (1, 1)
     window = tile_source_window(
         geometry,
         tile.bounds,
@@ -760,5 +791,10 @@ def _resolve_tile_window(tile: TileRequest | None, grid_name: str, straddling_ve
         straddling_vector_grid=straddling_vector_grid,
     )
     if window is None:
-        return None, True
-    return window, False
+        return None, True, (1, 1)
+    if not overview_permitted:
+        return window, False, (1, 1)
+    factors = tile_decimation_factors(
+        window, tile.tile_size, buffer_px=resampling_buffer_px(tile.resampling)
+    )
+    return window, False, factors

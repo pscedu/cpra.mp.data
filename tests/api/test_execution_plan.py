@@ -22,6 +22,7 @@ import dataclasses
 import mercantile
 import polars as pl
 import pytest
+from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 
 from cpra.mp.data.analysis.execution import plan as plan_module
@@ -31,7 +32,7 @@ from cpra.mp.data.analysis.execution.plan import (
     TileRequest,
     compile_plan,
 )
-from cpra.mp.data.analysis.io.raster_io import TILE_CRS
+from cpra.mp.data.analysis.io.raster_io import TILE_CRS, resampling_buffer_px, tile_decimation_factors
 from cpra.mp.data.analysis.request.errors import BandLimitError, ShapeError
 from cpra.mp.data.analysis.request.ops import Shape, validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
@@ -1074,3 +1075,124 @@ class TestTileReadWindow:
         plan = compile_plan(pipeline, tile=TileRequest(*_tile_over_the_raster_grid()))
         assert plan.inputs["a"].read_window is None
         assert plan.inputs["a"].tile_disjoint is False
+        assert plan.inputs["a"].decimation == (1, 1)
+
+
+#: A tile small enough that `veg_grid_cell_v001`'s windows clear the decimation threshold.
+#:
+#: The factors are sized against `oversample * (tile_size + 2 * buffer_px)` source pixels,
+#: which at the production 256px tile is 528 -- more than this 1052x365 grid's short axis,
+#: and only just under its long one, so nothing on it ever decimates at that size. A 16px
+#: tile puts the same threshold at 48 and makes the decision visible on the fixture grid
+#: these tests already use, rather than requiring a grid two orders of magnitude larger.
+_DECIMATING_TILE_SIZE = 16
+
+
+def _expected_factors(window, tile_size=_DECIMATING_TILE_SIZE):
+    """What `_resolve_tile_window` should have chosen for `window`, derived the same way it
+    does -- against the buffer `tile_source_window` actually widened by, not the bare
+    default."""
+    return tile_decimation_factors(window, tile_size, buffer_px=resampling_buffer_px(Resampling.nearest))
+
+
+class TestTileDecimation:
+    """`ResolvedInput.decimation` -- the resolution each raster origin's tile window may be
+    read at, which is what `overview_permitted` has always been computed to decide.
+
+    The window is unaffected either way: a decimated read covers the same ground, so only
+    how many pixels come back changes.
+    """
+
+    def test_no_tile_means_full_resolution(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
+        assert compile_plan(pipeline).inputs["a"].decimation == (1, 1)
+
+    def test_a_disjoint_tile_is_full_resolution(self, monkeypatch):
+        # Nothing to read, so nothing to decimate -- and the zero-band frame this becomes
+        # is compared field by field against its join partners, which must not see a factor
+        # no read ever applied.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
+        plan = compile_plan(pipeline, tile=TileRequest(1, 1, 1))
+        assert plan.inputs["a"].tile_disjoint is True
+        assert plan.inputs["a"].decimation == (1, 1)
+
+    def test_an_eligible_origin_is_decimated_to_the_tile_read_rule(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
+        tile = TileRequest(*_tile_over_the_raster_grid(zoom=6), tile_size=_DECIMATING_TILE_SIZE)
+        resolved = compile_plan(pipeline, tile=tile).inputs["a"]
+
+        assert resolved.overview_permitted is True
+        assert resolved.decimation == _expected_factors(resolved.read_window)
+        # Not vacuously equal: this tile really is one the rule decimates.
+        assert resolved.decimation != (1, 1)
+
+    def test_a_raster_to_vector_project_origin_stays_full_resolution(self, monkeypatch, geometry_path):
+        """The rule the whole eligibility computation exists for, now enforced rather than
+        recorded: "a" feeds a project and reads every source pixel, while "b" -- same grid,
+        same tile, no project -- is decimated. The control is what separates "the gate
+        works" from "this tile was too small to decimate anyway".
+        """
+        from shapely.geometry import box
+
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid(zoom=6), tile_size=_DECIMATING_TILE_SIZE)
+        grid = GRIDS[RASTER_GRID]
+        write_grid_geometry(
+            geometry_path, VECTOR_GRID, [(1, box(*transform_bounds(TILE_CRS, grid.crs, *tile.bounds)))]
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(), "b": raster_input(variable="sal")},
+                "steps": [
+                    {"op": "project", "input": "a", "to": VECTOR_GRID, "aggregate": "sum", "as": "p"},
+                    {"op": "calculate", "input": "b", "expression": "value * 2", "as": "c"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, tile=tile)
+
+        assert plan.inputs["a"].decimation == (1, 1)
+        assert plan.inputs["b"].decimation == _expected_factors(plan.inputs["b"].read_window)
+        assert plan.inputs["b"].decimation != (1, 1)
+
+    def test_a_point_sample_origin_stays_full_resolution(self, monkeypatch):
+        # The other half of the gate: an overview pixel is a real value, but not necessarily
+        # the one under the sampled coordinate.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "grid_cell = 7"}],
+                "output": {"format": "csv"},
+            }
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid(zoom=6), tile_size=_DECIMATING_TILE_SIZE)
+        resolved = compile_plan(pipeline, tile=tile).inputs["a"]
+
+        assert resolved.overview_permitted is False
+        assert resolved.decimation == (1, 1)
+
+    def test_a_production_sized_tile_over_this_grid_decimates_nothing(self, monkeypatch):
+        # The threshold is real, not a formality: at 256px the target is 528 source pixels,
+        # which this grid never exceeds by a factor of two on either axis. A rule that
+        # decimated here would be decimating reads that are already tile-sized.
+        monkeypatch.setattr(
+            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
+        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
+        tile = TileRequest(*_tile_over_the_raster_grid(zoom=6))
+        assert compile_plan(pipeline, tile=tile).inputs["a"].decimation == (1, 1)

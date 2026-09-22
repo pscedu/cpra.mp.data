@@ -432,6 +432,21 @@ def _axis_decimation_factor(extent, target):
     return 1 << (ratio.bit_length() - 1)
 
 
+def tile_decimation_factors(window, tile_size, buffer_px=TILE_READ_BUFFER_PX, oversample=TILE_READ_OVERSAMPLE):
+    """The ``(row_factor, col_factor)`` to decimate `window` by while reading it for a
+    tile -- ``(1, 1)`` when it is already small enough to read whole.
+
+    The factors themselves, rather than the shape they produce: this is what
+    `execution.plan.compile_plan` records on a `ResolvedInput` and what
+    `io.raster.scan_raster` is handed, since a factor survives being carried around a
+    compile step while a shape is only meaningful beside the window it was derived from.
+    `tile_read_shape` is the same decision expressed as a shape, derived from this so the
+    two cannot disagree; see it for how the factors are chosen and why per axis.
+    """
+    target = oversample * (tile_size + 2 * buffer_px)
+    return (_axis_decimation_factor(window.height, target), _axis_decimation_factor(window.width, target))
+
+
 def tile_read_shape(window, tile_size, buffer_px=TILE_READ_BUFFER_PX, oversample=TILE_READ_OVERSAMPLE):
     """The ``(height, width)`` to decimate `window` to while reading it for a tile, or None
     when `window` is already small enough to read whole.
@@ -473,10 +488,13 @@ def tile_read_shape(window, tile_size, buffer_px=TILE_READ_BUFFER_PX, oversample
     rather than the next finer one. The shape still describes the WHOLE window -- it is the
     same ground extent at a coarser resolution -- which is what `warp_window_to_tile` needs
     to scale the georeferencing by.
+
+    The same arithmetic lives on `io.window.ReadWindow.read_shape`, which answers it for a
+    window that has already been read and is carrying its own factors; both derive the
+    shape from `tile_decimation_factors`' answer the same way, so a decimated scan's frame
+    and this function agree on the pixel count by construction.
     """
-    target = oversample * (tile_size + 2 * buffer_px)
-    height_factor = _axis_decimation_factor(window.height, target)
-    width_factor = _axis_decimation_factor(window.width, target)
+    height_factor, width_factor = tile_decimation_factors(window, tile_size, buffer_px, oversample)
     if height_factor == 1 and width_factor == 1:
         return None
     return (max(1, int(window.height) // height_factor), max(1, int(window.width) // width_factor))
