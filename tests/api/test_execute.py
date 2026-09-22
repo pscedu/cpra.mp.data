@@ -5,8 +5,7 @@ Five concerns, in five test classes:
 - `TestLoweringTableAgreement`: the bidirectional coverage check the module docstring
   promises -- every `(op, shape)` combination `request.ops`'s lowering tables (or, for
   `calculate`/`group`, `Shape` itself) declare legal is covered by EXACTLY one of
-  `execute.py`'s registered executors or its `NOT_YET_IMPLEMENTED` set, never both, never
-  neither.
+  `execute.py`'s registered executors -- no more, no fewer.
 - `TestLoweringNotImplemented`: the exception hierarchy `LoweringNotImplementedError`
   itself must hold, plus the one dispatch key that still raises it on purpose -- see that
   class's own docstring for why a raster-to-vector `project` reached through an earlier
@@ -39,7 +38,6 @@ from rasterio.windows import Window
 
 from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.execute import (
-    NOT_YET_IMPLEMENTED,
     LoweringNotImplementedError,
     _LOWERINGS,
     _shared_tile_window,
@@ -127,46 +125,26 @@ class TestLoweringTableAgreement:
         """
         return {key for (registered_kind, key) in _LOWERINGS if registered_kind == kind}
 
-    def test_filter_shapes_are_fully_partitioned(self):
+    def test_filter_shapes_are_fully_covered(self):
         domain = {shape for (_kind, shape) in FILTER_LOWERING_TABLE}
-        registered = self._registered("filter")
-        not_yet = NOT_YET_IMPLEMENTED["filter"]
-        assert registered | not_yet == domain
-        assert registered.isdisjoint(not_yet)
+        assert self._registered("filter") == domain
 
-    def test_join_shapes_are_fully_partitioned(self):
-        domain = set(JOIN_LOWERING_TABLE)
-        registered = self._registered("join")
-        not_yet = NOT_YET_IMPLEMENTED["join"]
-        assert registered | not_yet == domain
-        assert registered.isdisjoint(not_yet)
+    def test_join_shapes_are_fully_covered(self):
+        assert self._registered("join") == set(JOIN_LOWERING_TABLE)
 
-    def test_calculate_shapes_are_fully_partitioned(self):
+    def test_calculate_shapes_are_fully_covered(self):
         # `calculate` has no lowering table of its own (`_type_calculate` types it
         # unconditionally shape-preserving) -- the declared domain is `Shape` itself.
-        domain = set(Shape)
-        registered = self._registered("calculate")
-        not_yet = NOT_YET_IMPLEMENTED["calculate"]
-        assert registered | not_yet == domain
-        assert registered.isdisjoint(not_yet)
+        assert self._registered("calculate") == set(Shape)
 
-    def test_group_shapes_are_fully_partitioned(self):
-        domain = set(Shape)
-        registered = self._registered("group")
-        not_yet = NOT_YET_IMPLEMENTED["group"]
-        assert registered | not_yet == domain
-        assert registered.isdisjoint(not_yet)
+    def test_group_shapes_are_fully_covered(self):
+        assert self._registered("group") == set(Shape)
 
-    def test_project_directions_are_fully_partitioned(self):
+    def test_project_directions_are_fully_covered(self):
         # `project` is keyed by direction, not shape -- it is the op the incoming shape
-        # cannot select a lowering for. No direction is registered in this vertical slice,
-        # so every `PROJECT_LOWERING_TABLE` pair must be named not-yet-implemented, and
-        # nothing beyond the table may appear there.
-        domain = set(PROJECT_LOWERING_TABLE)
-        registered = self._registered("project")
-        not_yet = NOT_YET_IMPLEMENTED["project"]
-        assert registered | not_yet == domain
-        assert registered.isdisjoint(not_yet)
+        # cannot select a lowering for, so its domain is `PROJECT_LOWERING_TABLE`'s pairs
+        # rather than `Shape`'s members.
+        assert self._registered("project") == set(PROJECT_LOWERING_TABLE)
 
     def test_every_registered_lowering_is_named_by_a_table(self):
         # The other direction, across all five ops at once: no entry may sit in
@@ -179,28 +157,15 @@ class TestLoweringTableAgreement:
             "group": set(Shape),
             "project": set(PROJECT_LOWERING_TABLE),
         }
-        assert set(NOT_YET_IMPLEMENTED) == set(domains)
         for kind, key in _LOWERINGS:
             assert kind in domains, f"{kind!r} is not an op the request layer types"
             assert key in domains[kind], f"{kind!r} has no declared lowering for {key!r}"
 
-    def test_not_yet_implemented_set_is_empty_for_every_op(self):
-        # A concrete pin on "the executor wires everything the lowering tables declare
-        # legal" -- this fails the moment a lowering table grows an entry (a new grid kind,
-        # a new predicate combination) without the executor growing the lowering to match,
-        # forcing whoever widened the table to either implement it or name the gap here
-        # rather than leaving `NOT_YET_IMPLEMENTED` stale.
-        assert NOT_YET_IMPLEMENTED["filter"] == frozenset()
-        assert NOT_YET_IMPLEMENTED["calculate"] == frozenset()
-        assert NOT_YET_IMPLEMENTED["group"] == frozenset()
-        assert NOT_YET_IMPLEMENTED["join"] == frozenset()
-        assert NOT_YET_IMPLEMENTED["project"] == frozenset()
-
 
 class TestLoweringNotImplemented:
-    """`LoweringNotImplementedError`'s own contract, plus the one dispatch key that still
-    raises it on purpose even though every `(op, key)` combination `NOT_YET_IMPLEMENTED`
-    used to name now has a real lowering.
+    """`LoweringNotImplementedError`'s own contract, plus the one case that raises it on
+    purpose even though every `(op, key)` combination the lowering tables declare legal has
+    a registered lowering.
 
     `project_direction` keys a `project` off the incoming frame's DECLARED grid
     (`frame_types[op.input].grid`), not its current actual shape -- so a raster-origin
@@ -210,11 +175,10 @@ class TestLoweringNotImplemented:
     that data has already been through a different reduction (point sampling, not zonal
     aggregation), and reusing the raster-to-vector lowering on it would silently answer a
     different question than the one it exists to answer -- so the registered lowering
-    itself raises `LoweringNotImplementedError` for exactly that narrower case, rather than
-    the coarse `(op, direction)` keying in `NOT_YET_IMPLEMENTED` (which cannot express a
-    shape-dependent sub-case) claiming the whole direction is unimplemented when the
-    ordinary case works fine (see `TestBandWideEndToEnd`'s own raster-to-vector `project`
-    test).
+    itself raises `LoweringNotImplementedError` for exactly that narrower case. The
+    alternative -- refusing the whole `("raster", "vector")` direction, which is the finest
+    distinction the dispatch key can draw -- would reject the ordinary case too, and that
+    one works fine (see `TestBandWideEndToEnd`'s own raster-to-vector `project` test).
     """
 
     def test_raster_to_vector_project_after_a_spatial_filter_raises(self):

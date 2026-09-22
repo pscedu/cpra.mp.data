@@ -22,15 +22,12 @@ uses, via the shared `request.ops.project_direction`.
 
 **The lowering-table-vs-executor agreement.** `request/ops.py` holds
 `FILTER_LOWERING_TABLE`/`PROJECT_LOWERING_TABLE`/`JOIN_LOWERING_TABLE` as declarative data:
-every combination the request layer will type successfully. `NOT_YET_IMPLEMENTED` below is
-the missing other half -- a named, deliberate record of exactly which combinations this
-walk does not execute -- so `tests/api/test_execute.py` can assert, in both directions,
-that the registered lowerings and the not-yet-implemented set together partition exactly
-what the tables declare legal: no orphan executor for a combination no table names, and no
-combination falling through neither set. Every combination the tables declare legal now has
-a registered lowering, so `NOT_YET_IMPLEMENTED` is empty; it stays here, rather than being
-deleted, so the next lowering table that grows a new combination has somewhere to name the
-gap instead of leaving it un-wired by omission.
+every combination the request layer will type successfully. `_LOWERINGS` below must match
+that data exactly, and `tests/api/test_execute.py::TestLoweringTableAgreement` asserts it
+in both directions: no orphan executor for a combination no table names, and no combination
+a table names that the walk cannot run. That equality is what makes a lowering table
+widening (a new grid kind, a new predicate combination) a test failure rather than a
+run-time surprise -- whoever widens the table has to wire the executor in the same change.
 
 `calculate` and `group` have no lowering table of their own -- `request/ops.py` types both
 as unconditionally shape-preserving, in code rather than as data -- so their entries below
@@ -38,7 +35,7 @@ are declared directly against `Shape`'s two members. There is no table for them 
 from.
 
 **`project_raster_to_vector`'s registered lowering can still raise
-`LoweringNotImplementedError`, for one narrower case `NOT_YET_IMPLEMENTED` cannot express.**
+`LoweringNotImplementedError`, for one case the dispatch key cannot express.**
 `project_direction` keys off the incoming frame's DECLARED grid, not its current actual
 shape, so a raster-origin frame an earlier spatial filter already turned long dispatches to
 the same `("raster", "vector")` entry a genuinely band-wide raster origin does. The two
@@ -196,35 +193,25 @@ from cpra.mp.data.analysis.request.ops import (
 )
 from cpra.mp.data.grids import GRIDS
 
-__all__ = ["LoweringNotImplementedError", "NOT_YET_IMPLEMENTED", "execute", "run_to_path"]
+__all__ = ["LoweringNotImplementedError", "execute", "run_to_path"]
 
 
 class LoweringNotImplementedError(NotImplementedError):
     """Raised by the walk when it reaches an `(op, key)` combination `request/ops.py`'s
-    shape typing already accepts as legal, but for which no executor exists yet in this
-    vertical slice.
+    shape typing already accepts as legal, but which this walk cannot run.
+
+    `_LOWERINGS` covers every combination the lowering tables declare legal, so the only
+    live raiser is `_run_project_raster_to_vector`, for the sub-case its dispatch key
+    cannot distinguish (see the module docstring). The type stays a named part of this
+    module's interface for the same reason that guard does: a wider dispatch key would
+    retire it, and nothing narrower would.
 
     Deliberately NOT a member of the request layer's error family: the pipeline itself is
     well-formed -- it already passed `validate_shapes` -- so this is not a bad request, it
-    is this engine's own, temporary, capability gap. A caller that wants "the engine cannot
-    run this yet" catches this type; a caller that wants "the request was invalid" was
-    never going to see it for a request that passed validation.
+    is this engine's own capability gap. A caller that wants "the engine cannot run this"
+    catches this type; a caller that wants "the request was invalid" was never going to see
+    it for a request that passed validation.
     """
-
-
-# The named, deliberate not-yet-implemented set -- see the module docstring. Every
-# combination each lowering table declares legal has a registered executor now, so every
-# value here is empty; the keys stay present (rather than the dict being deleted) because
-# `tests/api/test_execute.py::TestLoweringTableAgreement` reads this set unconditionally
-# for all five ops, and because it is where the next lowering table to grow a combination
-# this walk cannot yet run should name the gap.
-NOT_YET_IMPLEMENTED: dict[str, frozenset] = {
-    "filter": frozenset(),
-    "calculate": frozenset(),
-    "group": frozenset(),
-    "join": frozenset(),
-    "project": frozenset(),
-}
 
 
 def _run_filter(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
@@ -328,8 +315,8 @@ def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_ty
     `project.project_raster_to_vector` with the identical `(frames, op, frame_types)`
     every other entry receives, unmodified.
 
-    What it exists for is the one dispatch-key ambiguity `NOT_YET_IMPLEMENTED` cannot
-    express (see the module docstring): `project_direction` keys off `op.input`'s
+    What it exists for is the one ambiguity the dispatch key cannot express (see the
+    module docstring): `project_direction` keys off `op.input`'s
     DECLARED grid, so a raster-origin frame an earlier spatial filter already turned long
     reaches this same entry -- but `frames[op.input]` for that frame is an ordinary
     `LongFrame`, not the `BandWideFrame` triple `project.project_raster_to_vector` unpacks.
@@ -481,27 +468,6 @@ def _dispatch_key(op: Op, frame_types: dict[str, FrameType]) -> object:
     if isinstance(op, ProjectOp):
         return project_direction(incoming, op.to)
     return incoming.shape
-
-
-def _lowering_for(kind: str, key: object, registry: dict[tuple[str, object], object]):
-    """Look up `kind`'s lowering for `key` in `registry`, raising
-    `LoweringNotImplementedError` if `key` is in `NOT_YET_IMPLEMENTED[kind]` -- the one
-    place that check happens, so every op shares an identical failure path instead of
-    repeating it.
-
-    `registry` is a parameter (rather than reading module-level `_LOWERINGS` directly) so
-    the same lookup serves both the static table (whose keys `NOT_YET_IMPLEMENTED` and the
-    lowering tables must agree with -- see `tests/api/test_execute.py::
-    TestLoweringTableAgreement`) and `execute`'s own per-call registry from
-    `_bind_band_wide_lowerings`, which shares every key with `_LOWERINGS` and only differs
-    in four of the values.
-    """
-    if key in NOT_YET_IMPLEMENTED[kind]:
-        raise LoweringNotImplementedError(
-            f"no {kind!r} lowering yet for {key!r} -- this pipeline's shape typing already "
-            "accepted it, the walk just cannot run it yet"
-        )
-    return registry[(kind, key)]
 
 
 # The two `where` shapes `request.data_query.grid_cell_conjunct` (and any other caller
@@ -1053,7 +1019,11 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     last_output: str | None = None
     for op in plan.ops:
-        lowering = _lowering_for(op.op, _dispatch_key(op, plan.frame_types), lowerings)
+        # Keyed off `lowerings` -- `_bind_band_wide_lowerings`'s per-call registry, which
+        # shares every key with `_LOWERINGS` and differs only in the band-wide values. The
+        # lookup cannot miss: `TestLoweringTableAgreement` pins those keys equal to what
+        # `validate_shapes` accepts, and this plan already passed it.
+        lowering = lowerings[(op.op, _dispatch_key(op, plan.frame_types))]
         frames[op.output] = lowering(frames, op, plan.frame_types)
         if plan.frame_types[op.output].shape is Shape.band_wide:
             extra_columns[op.output] = _output_extra_columns(op, plan.frame_types, extra_columns)
