@@ -31,12 +31,12 @@ selected by whichever caller wants a vector tile rather than read off `output.fo
 same way `png`/`jpg` (raster tiles) are already a separate code path from `tif` (a whole
 raster) despite both being requests against a raster frame.
 
-What this module does NOT do: decide `resolve_output_type` (that is structural, from the
-frame's own shape, computed once in `io.output`); re-check anything `request.ops.
-validate_shapes` already rejects (a long frame under a raster-only format, more than one
-value column reaching here); or translate an exception into a transport response (the
-error boundary a route installs -- `api/boundary.py`, named again at the one place below
-where the distinction decides what this module does).
+What this module does NOT do: decide which shape a request answers in, or re-check
+anything `request.ops.validate_shapes` already rejected (a long frame under a raster-only
+format, more than one value column reaching here) -- both are settled at compile time, by
+typing the frame through the ops themselves. Nor does it translate an exception into a
+transport response (the error boundary a route installs -- `api/boundary.py`, named again
+at the one place below where the distinction decides what this module does).
 """
 
 import gzip

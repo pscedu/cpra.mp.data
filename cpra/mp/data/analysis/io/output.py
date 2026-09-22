@@ -19,7 +19,7 @@ import polars as pl
 
 from cpra.mp.data.analysis.io.raster_io import timing
 from cpra.mp.data.analysis.request.errors import RequestError
-from cpra.mp.data.analysis.request.types import DataFormat, OutputType
+from cpra.mp.data.analysis.request.types import DataFormat
 from cpra.mp.data.legends import LEGENDS, Legend
 
 # Polars' two spellings of each tabular writer: the lazy sink (streams, never materializes
@@ -128,18 +128,3 @@ def resolve_legend(color_map, variable_legend) -> Legend:
         return Legend("custom", pl.DataFrame(dict(color=colors, upper_bound=values)), type=map_type)
 
     return LEGENDS.get(color_map) or variable_legend or LEGENDS["default"]
-
-
-def resolve_output_type(grid_type, *, grid_cell, summarize_by) -> OutputType:
-    """The output type for a request, given its dataset's grid type and the two options
-    that can narrow a raster to a table.
-
-    Not simply `grid_type`: a raster grid still answers as `vector` once `grid_cell`
-    (pointwise sampling) or `summarize_by` (zonal summarize) narrows it to a tabular
-    result. That is a statement about the FRAME rather than about which analysis produced
-    it -- `request.ops.validate_shapes` reaches the same verdict by typing the frame
-    through the ops themselves, and is what the routes enforce against.
-    """
-    if grid_type == "vector" or grid_cell or summarize_by:
-        return OutputType.vector
-    return OutputType.raster

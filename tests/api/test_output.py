@@ -15,13 +15,12 @@ from cpra.mp.data.analysis.io.output import (
     SINK_METHODS,
     WRITE_METHODS,
     resolve_legend,
-    resolve_output_type,
     stream_tabular,
     tabular_kwargs,
     write_tabular,
 )
 from cpra.mp.data.analysis.request.errors import RequestError
-from cpra.mp.data.analysis.request.types import DataFormat, OutputType
+from cpra.mp.data.analysis.request.types import DataFormat
 from cpra.mp.data.api.boundary import resolve_status
 from cpra.mp.data.legends import LEGENDS, Legend
 
@@ -156,18 +155,3 @@ class TestResolveLegend:
         assert resolve_legend(None, None) is LEGENDS["default"]
         assert resolve_legend("not-a-real-legend-name", None) is LEGENDS["default"]
 
-
-class TestResolveOutputType:
-    def test_a_vector_grid_is_always_vector(self):
-        assert resolve_output_type("vector", grid_cell=None, summarize_by=None) == OutputType.vector
-
-    def test_a_raster_grid_with_no_narrowing_option_stays_raster(self):
-        assert resolve_output_type("raster", grid_cell=None, summarize_by=None) == OutputType.raster
-
-    def test_a_raster_grid_narrowed_by_grid_cell_becomes_vector(self):
-        assert resolve_output_type("raster", grid_cell="1,2", summarize_by=None) == OutputType.vector
-
-    def test_a_raster_grid_narrowed_by_summarize_by_becomes_vector(self):
-        assert (
-            resolve_output_type("raster", grid_cell=None, summarize_by="parish_v2020") == OutputType.vector
-        )

@@ -329,9 +329,9 @@ async def get_model_data(
 ):
     # `validate_shapes` replaces the old `validate_format(format, dataset.output_type)`
     # entirely, and covers strictly more: `output_type` was "vector unless this is a raster
-    # grid with no grid_cell/summarize_by" (`analysis.output.resolve_output_type`), i.e. a
-    # restatement of the final frame's shape derived from the two options that can change
-    # it, where `validate_shapes` types the frame through the ops themselves. Both reject
+    # grid with no grid_cell/summarize_by", i.e. a restatement of the final frame's shape
+    # derived from the two options that can change it, where `validate_shapes` types the
+    # frame through the ops themselves. Both reject
     # the same two requests -- a raster grid asked for a tabular format, and a point query
     # asked for `tif` -- with a different message; nothing that used to pass now fails.
     #
@@ -372,7 +372,7 @@ async def get_model_tile(
     # different places. "Not a tabular result" is `validate_shapes` below: `png`/`jpg` are
     # `RASTER_OUTPUT_FORMATS` members, so a long final frame -- which a `grid_cell` point
     # query on a raster grid produces, and which a vector grid produces unconditionally --
-    # is a 400 there, the same rejection `resolve_output_type`-plus-`validate_raster_tile`
+    # is a 400 there, the same rejection the retired output-type-plus-tile-validator pair
     # made. "Exactly one band" is `execution.sink.render_tile`'s own check, which raises
     # `ShapeError` (-> 400) at render time rather than at validate time: it needs the band
     # count, which is only known once the catalog has been read.
