@@ -21,6 +21,7 @@ class Variable:
         display_scale_factor=None,
         display_number_format=None,
         float_precision=None,
+        nodata=None,
         difference_legend_limit=None,
     ):
         self.name = name
@@ -48,6 +49,10 @@ class Variable:
         # attributes this is not a presentation hint the client may ignore: it changes the
         # bytes in the download, so the values a user gets are the ones the model means.
         self.float_precision = float_precision
+        # The value this variable's rasters use for "no data", where it differs from the
+        # -9999 the raster writer defaults to. Set from the structure spreadsheet; null for
+        # every variable but `elev`, whose values are stored in millimetres.
+        self.nodata = nodata
         self.difference_legend_limit = difference_legend_limit
 
 
