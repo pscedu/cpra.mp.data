@@ -6,14 +6,13 @@ weighted mean using the CPRA scenario probabilities. The result is written as `l
 under scenario_id=0 -- scenario is the dimension being collapsed, so the output is no
 longer attributable to any one of them.
 
-`lnd_conf_chng` is that confidence measured against a baseline built from the first year,
-offset by +/-1 according to whether the baseline pixel reads as land or water. The offset
-is what makes the change value carry two facts at once: its sign says what the pixel
-started as, and its magnitude says how far it has moved. Pixels that started land (baseline
-conf + 1) land in [-2, -0.5] and pixels that started water (baseline conf - 1) land in
-(0.5, 2], so the two starting states never collide on an output value and 0 is never
-produced -- there is no reading of the output where "no change" and "started as water" or
-"started as land" are ambiguous.
+`lnd_conf_chng` is that confidence measured against the first year's: a plain difference
+between a year's confidence and the base year's, with no offset applied to either side. It
+runs [-1, 1] and its sign is the direction of change -- negative where the pixel has moved
+toward water since the base year, positive where it has moved toward land, and 0 where its
+confidence has not moved at all. Magnitude is how far it has moved, so a pixel that has
+gone from confidently land to confidently water reads -1 whatever its absolute confidence
+was.
 """
 
 import click
@@ -57,9 +56,6 @@ MODEL = "icm_v26.0.0"
 # reserved "no single scenario" id rather than one of the inputs'.
 OUTPUT_SCENARIO_ID = 0
 
-# Threshold separating land-like from water-like when building the baseline.
-LAND_THRESHOLD = 0.5
-
 NODATA = -9999
 
 
@@ -94,15 +90,6 @@ def confidence_array(scenario_paths, grid):
     conf = np.full(total.shape, np.nan, dtype=np.float32)
     np.divide(total, weight, out=conf, where=weight > 0)
     return conf
-
-
-def baseline_array(conf):
-    """Offset the baseline confidence by +1 where it reads as land, -1 where it reads as water.
-
-    NaN compares false against the threshold and stays NaN through the subtraction, so
-    pixels with no valid baseline propagate as nodata into every change year.
-    """
-    return np.where(conf >= LAND_THRESHOLD, conf + 1.0, conf - 1.0).astype(np.float32)
 
 
 def to_raster(arr):
@@ -159,9 +146,12 @@ def main(model_group_id, base_path):
             + ", ".join(f"{year} ({', '.join(str(s) for s in scenarios)})" for year, scenarios in partial.items())
         )
 
+    # The baseline is the base year's confidence as-is. A pixel with no valid baseline is
+    # NaN here and stays NaN through the subtraction, so it propagates as nodata into the
+    # change raster for every year.
     base_year = years[0]
     click.echo(f"Computing baseline from {base_year} ({len(by_year[base_year])} scenarios)...")
-    baseline = baseline_array(confidence_array(by_year[base_year], grid))
+    baseline = confidence_array(by_year[base_year], grid)
 
     output_dimensions = {
         "grid": GRID,

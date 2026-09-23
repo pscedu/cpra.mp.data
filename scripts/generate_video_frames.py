@@ -42,11 +42,11 @@ Data layers (--historic-data, the historic persistent-change raster):
 
 Confidence layers (--confidence-data, a directory of lnd_conf_chng rasters):
   1. Symbolize each raster at its own 30 m resolution by classifying the signed value
-     against CONFIDENCE_BREAKS. The sign of an lnd_conf_chng value is the pixel's starting
-     state rather than its direction of change, so the ramps read as "started as land"
-     (blue) and "started as water" (green), each running pale where the pixel still holds
-     that state to dark where it has flipped out of it. Every band is colored, so the layer
-     is opaque wherever the raster has data.
+     against CONFIDENCE_BREAKS. An lnd_conf_chng value is a plain difference against the
+     base year, so its sign is the direction of change and the ramps read as "moved toward
+     water" (blue) and "moved toward land" (green), each running pale where the pixel has
+     barely moved to dark where it has flipped outright. The two bands either side of zero
+     are transparent, so the layer covers only ground whose confidence has actually moved.
   2. Resample that image onto the target grid with bicubic interpolation, the same way the
      categorical layers are, and write confidence_<year>.png per raster.
 
@@ -171,8 +171,6 @@ LAND_TO_WATER_CLASS = 39
 WATER_TO_LAND_CLASS = 40
 
 # --- Color helpers ----------------------------------------------------------------
-# Defined here rather than with the other raster helpers below because the confidence
-# ramps are expanded at import time, just under this.
 
 
 def hex_to_rgb(color: str):
@@ -184,56 +182,39 @@ def hex_to_rgba(color: str):
     return (*hex_to_rgb(color), 255)
 
 
-def blend_hex(start: str, end: str, t: float):
-    """The color a fraction `t` of the way from `start` to `end`, interpolated per channel."""
-    return "#" + "".join(f"{round(s + (e - s) * t):02X}" for s, e in zip(hex_to_rgb(start), hex_to_rgb(end)))
-
-
-def expand_ramp(ramp):
-    """Resample a 3-stop color ramp to 4 evenly spaced stops.
-
-    The endpoints are kept exactly as given. The two new stops sit at 1/3 and 2/3 along the
-    ramp, which lands either side of the original middle color, so each is interpolated
-    from that middle color rather than from a straight endpoint-to-endpoint blend and the
-    expanded ramp keeps the original's character in the middle of its range.
-    """
-    pale, middle, dark = ramp
-    # 1/3 of the way along the whole ramp is 2/3 of the way through its first half, and
-    # 2/3 along is 1/3 through its second half.
-    return [pale, blend_hex(pale, middle, 2 / 3), blend_hex(middle, dark, 1 / 3), dark]
-
-
 # --- Land-change confidence layers -----------------------------------------------
 # Each confidence raster holds lnd_conf_chng (see scripts/calculate_land_change_confidence.py):
-# a year's land/water confidence measured against the base year's, offset by +/-1 according
-# to whether the base year read as land or water. That offset makes the value carry two
-# facts at once — its sign is the pixel's starting state and its distance from that sign's
-# +/-1 is how far the pixel has moved since — so the axis runs:
+# a year's land/water confidence minus the base year's, with no offset applied to either
+# side, so the value is a plain difference on [-1, 1] and its sign is the direction of
+# change:
 #
-#   -2  started land, now confidently water   (land lost)
-#   -1  started land, still land              (unchanged)
-#   +1  started water, still water            (unchanged)
-#   +2  started water, now confidently land   (land gained)
+#   -1  confidently land in the base year, confidently water now   (land lost)
+#    0  confidence unmoved since the base year                     (unchanged)
+#   +1  confidently water in the base year, confidently land now   (land gained)
 #
-# Values between -0.5 and +0.5 cannot occur, so nothing falls in the middle of the axis.
-#
-# The bins therefore classify the signed value directly, not its magnitude as the earlier
-# [-1, 1] difference did, and the ramps read as starting state rather than as direction of
-# change: blue for pixels that started as land, green for pixels that started as water,
-# each running pale where the pixel held that state to dark where it flipped out of it.
+# The bins classify that signed value, so the ramps read as direction of change: blue for
+# pixels that have moved toward water, green for pixels that have moved toward land, each
+# running pale where the pixel has barely moved to dark where it has flipped outright.
 # Each band runs from its own break up to the next, so the breaks are closed lower bounds
 # and the last band has no upper bound.
-CONFIDENCE_BREAKS = [-2, -1.67, -1.42, -1.09, 0, 1.17, 1.50, 1.75]
+CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
 
-# The 3-stop ramps the earlier symbology used (data-input/confidence_groups.png), pale to
-# dark, expanded to the 4 stops each half of the axis now needs.
-CONFIDENCE_LOSS_RAMP = expand_ramp(["#A0C7D4", "#4999B6", "#256B84"])
-CONFIDENCE_GAIN_RAMP = expand_ramp(["#ABCB9F", "#658859", "#1F4314"])
+# The 3-stop ramps from the earlier symbology (data-input/confidence_groups.png), pale to
+# dark, used as given rather than resampled to a longer ramp.
+CONFIDENCE_LOSS_RAMP = ["#A0C7D4", "#4999B6", "#256B84"]
+CONFIDENCE_GAIN_RAMP = ["#ABCB9F", "#658859", "#1F4314"]
+
+# The two bands either side of zero, [-0.09, 0) and [0, 0.17). A pixel this close to its
+# base-year confidence has not meaningfully moved, so it is left out of the layer rather
+# than given a color of its own.
+TRANSPARENT_BAND = None
 
 # One color per band, in break order. The loss ramp is reversed because the bands run from
 # the most negative value up: the first band is the far "now water" end and so takes the
-# darkest blue, and the fourth is "still land" and takes the palest.
-CONFIDENCE_BAND_COLORS = CONFIDENCE_LOSS_RAMP[::-1] + CONFIDENCE_GAIN_RAMP
+# darkest blue, and the third is the edge of the transparent middle and takes the palest.
+CONFIDENCE_BAND_COLORS = (
+    CONFIDENCE_LOSS_RAMP[::-1] + [TRANSPARENT_BAND, TRANSPARENT_BAND] + CONFIDENCE_GAIN_RAMP
+)
 
 assert len(CONFIDENCE_BAND_COLORS) == len(CONFIDENCE_BREAKS), (
     f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors "
@@ -659,13 +640,14 @@ def confidence_rgba(values: np.ndarray):
     """Symbolize an lnd_conf_chng array against CONFIDENCE_BREAKS, as (4,H,W) RGBA bands to
     match colorize().
 
-    Classifies the signed value, so each band takes one color from CONFIDENCE_BAND_COLORS
-    and no band is transparent — unlike the earlier magnitude binning, which left a
-    transparent band around zero, this covers the whole data range and the layer is opaque
-    wherever the raster has data. Each band includes its lower break and excludes the next.
+    Classifies the signed value, so each band takes one color from CONFIDENCE_BAND_COLORS.
+    Each band includes its lower break and excludes the next. The two bands either side of
+    zero are TRANSPARENT_BAND and are simply left at the array's transparent zeros, so the
+    layer drops out over ground whose confidence has barely moved and the frame beneath it
+    shows through there.
 
     The first band's lower bound is left open rather than closed at CONFIDENCE_BREAKS[0], so
-    that a value sitting exactly on the -2 floor cannot fall out of the classification on a
+    that a value sitting exactly on the -1 floor cannot fall out of the classification on a
     float comparison. Nodata arrives as NaN and stays transparent, since every comparison
     against NaN is False.
     """
@@ -673,6 +655,8 @@ def confidence_rgba(values: np.ndarray):
     lowers = [-np.inf] + CONFIDENCE_BREAKS[1:]
     uppers = CONFIDENCE_BREAKS[1:] + [np.inf]
     for lower, upper, color in zip(lowers, uppers, CONFIDENCE_BAND_COLORS):
+        if color is TRANSPARENT_BAND:
+            continue
         band = (values >= lower) & (values < upper)
         rgba[:, band] = np.array(hex_to_rgba(color), dtype=np.uint8)[:, None]
     return rgba
