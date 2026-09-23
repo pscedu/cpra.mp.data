@@ -1,7 +1,31 @@
+import warnings
+
 import polars as pl
 
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.structure import read_structure_csv
+
+
+def resolve_legend(variable_name, legend):
+    """Look up a legend by name, warning rather than failing when it isn't defined.
+
+    A variable naming a legend that legends.csv doesn't define is a structure-spreadsheet
+    mistake, but it is only a presentation one: it should not stop the package importing
+    and take every read and write path down with it. The variable renders with no legend
+    and the warning says which one to add.
+    """
+    if isinstance(legend, Legend):
+        return legend
+    if not legend:
+        return None
+    if legend not in LEGENDS:
+        warnings.warn(
+            f"Variable {variable_name!r} refers to legend {legend!r}, which is not defined "
+            f"in legends.csv. It will render without a legend.",
+            stacklevel=2,
+        )
+        return None
+    return LEGENDS[legend]
 
 
 class Variable:
@@ -27,7 +51,7 @@ class Variable:
         self.name = name
         self.label = label
         self.dtype = getattr(pl, dtype)
-        self.legend = legend if isinstance(legend, Legend) else (LEGENDS[legend] if legend else None)
+        self.legend = resolve_legend(name, legend)
         self.geographic_units = geographic_units
         self.time_units = time_units
         self.required_dimensions = required_dimensions
