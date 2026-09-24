@@ -16,8 +16,10 @@ from cpra.mp.data.api.models import MPDDimensionValue
 from cpra.mp.data.grids import GRIDS
 from tests.factories import (
     ANNUAL_KWARGS,
+    LND_TYPE_PLUS_SHAPE,
     RASTER_KWARGS,
     write_ffibs_coverage_dataset,
+    write_lnd_type_plus_datasets,
     write_raster_crosswalk,
     write_sal_annual_dataset,
 )
@@ -99,4 +101,43 @@ def salinity_veg_data(base_path, crosswalk_path, monkeypatch):
     grid = GRIDS["veg_grid_cell_v001"]
     zones = np.ones((grid.height, grid.width), dtype="int32")
     write_raster_crosswalk(crosswalk_path, "veg_grid_cell_v001", "hydro_compartment_v001", zones)
+    return base_path
+
+
+@pytest.fixture
+def morph_pixel_v002_shrunk(monkeypatch):
+    """Shrink the real `morph_pixel_v002` grid to `LND_TYPE_PLUS_SHAPE` for one test --
+    see the comment above that constant in `tests/factories.py`. `monkeypatch` restores
+    both attributes afterwards, so no other test sees the smaller grid.
+    """
+    grid = GRIDS["morph_pixel_v002"]
+    monkeypatch.setattr(grid, "height", LND_TYPE_PLUS_SHAPE[0])
+    monkeypatch.setattr(grid, "width", LND_TYPE_PLUS_SHAPE[1])
+    return grid
+
+
+@pytest.fixture
+def lnd_type_plus_data(morph_pixel_v002_shrunk, base_path, crosswalk_path, monkeypatch):
+    """The three hardcoded inputs of the `lnd-type-plus` named analysis, on disk -- one pixel
+    per reclassification rule over open water, plus one that shows the water restriction:
+    0.20 m -> 6, 0.70 m -> 7, 1.50 m -> 2 (the deep class is `0`, so the water shows
+    through), and 0.20 m over land type 1 -> 1 (a depth class may only overwrite water).
+    The remaining four pixels repeat the shallow case, so a uniform result would be visibly
+    wrong.
+
+    The depths are what the analysis COMPUTES, not what is stored: `write_lnd_type_plus_datasets`
+    writes the elevation that yields each one against a uniform stage, plus the one-zone stage
+    series and the crosswalk that carries it onto the pixel grid.
+
+    Lives here rather than in either module for the same reason `salinity_veg_data` does:
+    `test_analyses_registry.py` drives the analysis through `resolve_analysis`/`run_to_path`
+    directly, `test_analyses_endpoints.py` through the custom-analysis HTTP routes.
+    """
+    write_lnd_type_plus_datasets(
+        base_path,
+        crosswalk_path,
+        depths=[0.20, 0.70, 1.50, 0.20, 0.20, 0.20, 0.20, 0.20],
+        land_types=[2, 2, 2, 1, 2, 2, 2, 2],
+    )
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path

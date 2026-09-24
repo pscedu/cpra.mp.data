@@ -18,6 +18,7 @@ smallest real raster grid.
 """
 
 import gzip
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -25,6 +26,7 @@ import polars as pl
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
 from cpra.mp.data.tabular import write_parquet
+from cpra.mp.data.variables import VARIABLES
 
 # Annual vector dataset: ssf on ecoregion_v001, which requires `percentile`.
 ANNUAL_KWARGS = dict(
@@ -189,6 +191,156 @@ def write_ffibs_coverage_dataset(base_path, values_by_year, **overrides):
     for year, value in values_by_year.items():
         data = raster_array(fill=value, grid_name=kwargs["grid"], dtype="float32")
         write_cog(data, base_path=base_path, calendar_year=year, **kwargs)
+    return kwargs
+
+
+# The three hardcoded inputs of the `lnd-type-plus` named analysis, and the shape the
+# raster grid two of them share is shrunk to for it. Unlike every other grid here,
+# `morph_pixel_v002` is used at its REAL name: the analysis names it itself, so there is no
+# stand-in to substitute. At its real size it is 5,824 x 16,640 (~97 million pixels per
+# band), so the `morph_pixel_v002_shrunk` fixture in `tests/api/conftest.py` shrinks the
+# grid OBJECT instead. `raster_array` and `raster.write_cog`/`_cog_profile` derive shape,
+# transform and window geometry from `GRIDS[grid]` alone, so a smaller height/width is
+# self-consistent end to end; only the pixel SIZE changes (`bounds` is left alone).
+LND_TYPE_PLUS_SHAPE = (2, 4)
+LND_TYPE_PLUS_SELECTION = {"model_group_id": 705, "scenario_id": 7}
+
+# The analysis derives inundation depth as `stage - elevation/1000`, so the fixtures below
+# take DEPTHS and solve for the elevation that produces them against a uniform stage. That
+# subtraction is inexact for most stages -- with stage 1.0 m, a depth of 0.46 m becomes
+# elevation 540 mm and reads back as 0.45999999999999996, landing on the wrong side of the
+# class bound. A stage of exactly ZERO makes it exact: depth is then `-elevation/1000`, the
+# same integer-over-1000 division the class bounds are written as decimal literals of, so
+# `0.46` the value and `0.46` the literal are bit-for-bit the same double. Tests that need
+# to prove stage actually CONTRIBUTES (rather than being silently dropped) pass their own
+# `stage=` and stay off the bounds.
+LND_TYPE_PLUS_STAGE = 0.0
+# Stage is a vector series and `calendar_year` is a NONPARTITION dimension, so every year
+# lands in one Parquet file per (model group, scenario, aggregate type) -- a second call
+# with a different `year` would REPLACE the first rather than adding to it. So the stage
+# file is written for both years the raster fixtures use, every call, with the same value:
+# rewriting it is then idempotent, and a test that writes two years of rasters gets stage
+# for both without having to know that.
+LND_TYPE_PLUS_STAGE_YEARS = (2040, 2050)
+# Every `morph_pixel_v002` pixel maps to this one `hydro_compartment_v002` zone, so the
+# projected stage surface is uniform and each pixel's depth is its own elevation alone.
+LND_TYPE_PLUS_ZONE = 1
+
+
+def write_lnd_type_plus_datasets(
+    base_path,
+    crosswalk_path,
+    depths,
+    land_types,
+    year=2050,
+    stage=LND_TYPE_PLUS_STAGE,
+    **overrides,
+):
+    """The three hardcoded inputs of the ``lnd-type-plus`` named analysis, plus the one
+    crosswalk it needs, written so that each pixel's computed inundation depth is the
+    corresponding entry of ``depths``.
+
+    ``depths`` and ``land_types`` are flat sequences read row-major over
+    :data:`LND_TYPE_PLUS_SHAPE`; ``None`` in either means "write this variable's nodata
+    sentinel here", which the read path masks to null. A depth is not stored anywhere --
+    ``elev`` is written as the NAVD88 millimetres that yield it against ``stage``
+    (``(stage - depth) * 1000``, per that variable's real ``Int32``/mm declaration), and
+    ``stg`` as a one-zone annual vector series on ``hydro_compartment_v002`` with the
+    ``aggregate_type=mean`` the analysis selects. ``lnd_type`` is written directly.
+
+    The crosswalk is a raster one (``morph_pixel_v002__hydro_compartment_v002``), named
+    raster-source-first regardless of which way the ``project`` step runs -- the same
+    orientation ``salinity_veg_data`` writes its own.
+    """
+    selection = {**LND_TYPE_PLUS_SELECTION, **overrides}
+
+    elevations = [
+        VARIABLES["elev"].nodata if depth is None else round((stage - depth) * 1000)
+        for depth in depths
+    ]
+    land = [VARIABLES["lnd_type"].nodata if code is None else code for code in land_types]
+    for values, variable in ((elevations, "elev"), (land, "lnd_type")):
+        write_raster_dataset(
+            base_path,
+            years=(year,),
+            data_fn=lambda _year, values=values: np.array(values, dtype="int32").reshape(
+                LND_TYPE_PLUS_SHAPE
+            ),
+            variable=variable,
+            grid="morph_pixel_v002",
+            time_unit="annual",
+            **selection,
+        )
+
+    if not _stg_rows_exist(base_path, selection):
+        write_stg_annual_dataset(
+            base_path,
+            {stage_year: stage for stage_year in LND_TYPE_PLUS_STAGE_YEARS},
+            geo_ids=(LND_TYPE_PLUS_ZONE,),
+            **selection,
+        )
+
+    zones = np.full(LND_TYPE_PLUS_SHAPE, LND_TYPE_PLUS_ZONE, dtype="int32")
+    write_raster_crosswalk(crosswalk_path, "morph_pixel_v002", "hydro_compartment_v002", zones)
+    return selection
+
+
+def _stg_rows_exist(base_path, selection):
+    """Has this selection's stage series already been written under ``base_path``?
+
+    ``write_parquet`` names every output file after a fresh UUID and passes
+    ``existing_data_behavior="overwrite_or_ignore"``, so calling it twice for the same
+    selection ADDS a second file rather than replacing the first -- and the reader unions
+    them, which is two rows per (grid cell, year) and a pivot that fails with "expected no
+    or a single value". A test that writes two YEARS of rasters calls the factory twice, so
+    this makes the stage half idempotent: written once per selection, skipped after.
+
+    Only ``variable``/``time_unit``/``grid`` are Hive partition columns for annual data
+    (``Dimension.partition`` is `(time_unit == "daily").any()` for the partition-typed
+    dimensions), so every selection shares one directory and the rest is a row filter.
+    """
+    directory = (
+        Path(base_path) / "variable=stg" / "time_unit=annual" / "grid=hydro_compartment_v002"
+    )
+    if not directory.exists():
+        return False
+    matching = pl.scan_parquet(directory / "*.parquet").filter(
+        *(pl.col(name) == value for name, value in selection.items())
+    )
+    return matching.select(pl.len()).collect().item() > 0
+
+
+def write_stg_annual_dataset(base_path, values_by_year, geo_ids=(1,), **overrides):
+    """``stg`` / ``hydro_compartment_v002``, annual, one value per year per cell.
+
+    The vector input of ``lnd-type-plus``. ``hydro_compartment_v002`` has 1,878 columns, so
+    this writes only ``geo_ids`` and passes ``validate=False`` for the same reason
+    :func:`write_sal_annual_dataset` does. ``aggregate_type`` defaults to the ``mean`` that
+    analysis pins.
+    """
+    kwargs = {
+        **DAILY_KWARGS,
+        "variable": "stg",
+        "grid": "hydro_compartment_v002",
+        "time_unit": "annual",
+        "aggregate_type": "mean",
+        **overrides,
+    }
+    years = sorted(values_by_year)
+    columns = {
+        "variable": pl.Series([kwargs["variable"]] * len(years), dtype=pl.String),
+        "grid": pl.Series([kwargs["grid"]] * len(years), dtype=pl.String),
+        "time_unit": pl.Series([kwargs["time_unit"]] * len(years), dtype=pl.String),
+        "model_group_id": pl.Series([kwargs["model_group_id"]] * len(years), dtype=pl.Int32),
+        "scenario_id": pl.Series([kwargs["scenario_id"]] * len(years), dtype=pl.Int32),
+        "aggregate_type": pl.Series([kwargs["aggregate_type"]] * len(years), dtype=pl.String),
+        "calendar_year": pl.Series(years, dtype=pl.Int32),
+        "model": pl.Series([kwargs["model"]] * len(years), dtype=pl.String),
+    }
+    for geo_id in geo_ids:
+        columns[str(geo_id)] = pl.Series([values_by_year[y] for y in years], dtype=pl.Float32)
+
+    write_parquet(pl.DataFrame(columns), base_path=base_path, validate=False)
     return kwargs
 
 

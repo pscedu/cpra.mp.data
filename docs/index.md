@@ -498,6 +498,7 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
+| No structures | #00000000 | 0.0 |
 | 0 structures exposed | #d53e4f | 1.0 |
 | 1 structure exposed | #fc8d59 | 2.0 |
 | 2 structures exposed | #fee08b | 3.0 |
@@ -624,6 +625,20 @@ Legends determine the breakpoints and colors used to map a variable.
 | Bare/Unvegetated Wetland (value=3) | #8b4513 | 4.0 |
 | Upland/Developed Areas (value=4) | #999999 | 5.0 |
 | Flotant Marsh (value=5) | #afeeee |  |
+
+
+### `lnd_type_plus` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No Data | #00000000 | 1.0 |
+| Vegetated Wetland (value=1) | #008000 | 2.0 |
+| Water - Deep (value=2) | #6495ed | 3.0 |
+| Bare/Unvegetated Wetland (value=3) | #8b4513 | 4.0 |
+| Upland/Developed Areas (value=4) | #999999 | 5.0 |
+| Flotant Marsh (value=5) | #afeeee | 6.0 |
+| Water - Shallow Intertidal (value = 6) | #d1dffa | 7.0 |
+| Water - Shallow Subtidal (value = 7) | #93b5f2 |  |
 
 
 ### `mnrl_dep` Legend

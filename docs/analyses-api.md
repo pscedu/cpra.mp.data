@@ -27,9 +27,9 @@ Returns the full list of registered analyses, each with:
 | `legend` | A named legend/color-map hint for rendered output, or `null` |
 | `result_kind` | `"value"`, `"difference"`, or `"category"` -- a presentation hint for how to label the result |
 
-As of this writing, four analyses are registered: `difference`, `concatenate` and
-`land-type-confidence` (`type="dataset"`), and `salinity-veg-investigation`
-(`type="custom"`).
+As of this writing, five analyses are registered: `difference`, `concatenate` and
+`land-type-confidence` (`type="dataset"`), and `salinity-veg-investigation` and
+`lnd-type-plus` (`type="custom"`).
 
 ## Dataset-Scoped vs. Custom Routes
 
@@ -44,7 +44,7 @@ GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/tiles/{z
 GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/pipeline.json
 ```
 
-A `type="custom"` analysis (`salinity-veg-investigation`) fixes its own inputs inside
+A `type="custom"` analysis (`salinity-veg-investigation`, `lnd-type-plus`) fixes its own inputs inside
 its `pipeline()` method -- it isn't scoped to any one caller-chosen dataset, so its
 routes have no `/v1/datasets/...` prefix at all:
 
@@ -195,6 +195,102 @@ result is inherently one raster surface.
 ```
 GET /v1/analyses/salinity-veg-investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
 GET /v1/analyses/salinity-veg-investigation/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7
+```
+
+### `lnd-type-plus`
+
+`type="custom"`. The `lnd_type` categorical surface extended with two shallow-inundation
+classes the land types don't themselves distinguish.
+
+Inundation depth is **computed**, not read. Mean annual stage
+(`stg`/annual/`hydro_compartment_v002`, with `aggregate_type=mean` fixed by the analysis) is
+projected onto `morph_pixel_v002`, and topobathymetric elevation
+(`elev`/annual/`morph_pixel_v002`, stored in NAVD88 millimetres) is converted to metres and
+subtracted from it:
+
+```
+depth = stage - elevation / 1000
+```
+
+That depth is reclassified, spatially joined against annual land type
+(`lnd_type`/annual/`morph_pixel_v002`), and the two are reduced to the **max** of the pair at
+every pixel:
+
+| Inundation depth (m) | Code |
+|---|---|
+| deeper than `0`, up to and including `0.46` | `6` |
+| deeper than `0.46`, up to and including `1.0` | `7` |
+| deeper than `1.0` | `0` |
+
+Each interval excludes its lower bound and includes its upper one, so a bound belongs to
+the class below it. A depth of exactly `0` is not inundation and is masked.
+
+The codes are what make a single `max` express the whole rule. `lnd_type`'s own codes are
+`1`-`5`, so `6` and `7` outrank every one of them and either shallow class overrides the
+land type; `0` is below all of them, so at a cell inundated by a metre or more the land
+type shows through unchanged.
+
+**Only open water is reclassified.** The depth classes subdivide `lnd_type = 2`; they never
+overwrite land. That is enforced rather than assumed -- the depth class is masked wherever
+the land type underneath is anything but `2` before the max is taken, so a pixel where the
+independently-modelled elevation and land-type surfaces disagree reads as its land type
+rather than as shallow inundation over marsh or upland. A nodata land type is not water
+either, so a depth there is masked too and the pixel stays nodata.
+
+One consequence: `0` never reaches the output. It survives the mask only over water, where
+`max(0, 2)` is `2` -- so deep water reads as plain open water, and the result's value domain
+is `1`-`7`. The deep class is still what keeps deep water out of `6`/`7`.
+
+The analysis's `result_kind` is `"category"` and its `legend` is `lnd_type_plus`, an entry
+of its own in `structure/legends.csv` (rendered in full under "Legends" in the [data
+documentation](index.md)) rather than `lnd_type`'s, whose ramp stops at `5`:
+
+| Value | Label | Color |
+|---|---|---|
+| nodata | No Data | `#00000000` |
+| `1` | Vegetated Wetland | `#008000` |
+| `2` | Water - Deep | `#6495ed` |
+| `3` | Bare/Unvegetated Wetland | `#8b4513` |
+| `4` | Upland/Developed Areas | `#999999` |
+| `5` | Flotant Marsh | `#afeeee` |
+| `6` | Water - Shallow Intertidal | `#d1dffa` |
+| `7` | Water - Shallow Subtidal | `#93b5f2` |
+
+Codes `1`-`5` carry `lnd_type`'s own colors, so a pixel this analysis leaves alone renders
+the same as it does under plain `lnd_type`; `2` is relabelled "Water - Deep" because that is
+what it means here -- open water that is either not inundated by the depth surface or
+inundated by more than 1.0 m. There is no entry for `0`, which cannot occur.
+
+| Parameter | Description |
+|---|---|
+| `model_group_id` | Selects every input's `model_group_id` (required, no default) |
+| `scenario_id` | Selects every input's `scenario_id` (required, no default) |
+| `calendar_year` | Selects every input's year (optional; omitted means every year, one output band each) |
+
+`aggregate_type` is not a parameter: the class bounds only mean something against one
+reading of stage, so the analysis pins `mean` itself. It is reported in the analysis
+catalog's `collapsed_dimensions`.
+
+**Selection rule**: this analysis takes no `grid_cell`/`where` selection at all -- it names
+its own three inputs, across two different grids, so a `grid_cell` doesn't say which lattice
+it means; a spatial predicate would additionally turn the frame tabular and invalidate the
+raster output rather than narrow it, and a value `where` has no one operand to apply to.
+Supplying either is rejected with a 400. Its dimension values are parameters instead.
+
+A pixel is **masked** -- contributing nothing to the max, so the land type reads alone --
+wherever its depth is outside the reclassification's `> 0` domain, i.e. wherever the
+elevation stands at or above the water level (dry land). It is masked the same way wherever
+either half of the subtraction is missing: a pixel with stage but no elevation is dropped
+rather than reading as the bare stage. On the other side, a nodata `lnd_type` contributes
+nothing to the max -- and, per the water rule above, masks the depth as well, so such a cell
+has no contributor at all and stays nodata.
+
+Output is always a raster (`tif`, or `png`/`jpg` on the tile routes) -- the one `project`
+lands **on** the pixel grid and nothing projects off it, so a tabular output is rejected.
+
+```
+GET /v1/analyses/lnd-type-plus/data.tif?model_group_id=705&scenario_id=7&calendar_year=2050
+GET /v1/analyses/lnd-type-plus/data/{z}/{x}/{y}.png?model_group_id=705&scenario_id=7&calendar_year=2050
 ```
 
 ## Seeing the Expanded Pipeline: `pipeline.json`

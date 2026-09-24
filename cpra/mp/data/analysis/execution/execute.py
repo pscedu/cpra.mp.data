@@ -1116,19 +1116,31 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     band_wide_join_frames: dict[str, BandWideFrame] = {}
     zone_sources: dict[int, project.ZoneSource] = {}
+    opened_groups: set[tuple[tuple[str, ...], tuple[ZoneCrosswalk, ...]]] = set()
     for output, origins in plan.band_wide_join_scans.items():
+        group_crosswalks = plan.band_wide_join_zone_crosswalks.get(output, ())
+        # Two joins over the same origins are one read, not two: `compile_plan` has already
+        # fused every group sharing an origin (`_merge_shared_origin_groups`), so the joins
+        # of a chained pipeline arrive here naming the same group several times over.
+        # Opening it once is not just cheaper -- reopening would rebuild identical frames
+        # and discard the ones the walk is about to consume.
+        if (origins, group_crosswalks) in opened_groups:
+            continue
+        opened_groups.add((origins, group_crosswalks))
         opened, group_zone_sources = _open_band_wide_join_group(
-            origins, plan.inputs, plan.band_wide_join_zone_crosswalks.get(output, ())
+            origins, plan.inputs, group_crosswalks
         )
         for name, (frame, extra) in opened.items():
             band_wide_join_frames[name] = frame
             extra_columns[name] = extra
         # `setdefault`, not assignment: one `project` step can feed two band-wide joins
-        # over DIFFERENT raster origins (a fan-out), and it runs once, so only one of those
-        # two reads can be the one its pixels actually come from. Keeping the first makes
-        # which one deterministic; the second join then fails on `join_band_wide`'s own
-        # `assert_same_pixel_grid` precondition, which is the correct outcome -- those two
-        # joins genuinely cannot both align against a single projection.
+        # whose raster origins are wholly DISJOINT (a fan-out), which `_merge_shared_origin_
+        # groups` leaves as two groups because it fuses on shared origins alone. The
+        # project runs once, so only one of those two reads can be the one its pixels
+        # actually come from. Keeping the first makes which one deterministic; the second
+        # join then fails on `join_band_wide`'s own `assert_same_pixel_grid` precondition,
+        # which is the correct outcome -- those two joins genuinely cannot both align
+        # against a single projection.
         for step_no, zone_source in group_zone_sources.items():
             zone_sources.setdefault(step_no, zone_source)
 

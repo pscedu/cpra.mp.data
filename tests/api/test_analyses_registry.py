@@ -29,11 +29,27 @@ lives only on a raster grid and its `pipeline()` sinks to `tif`, so a vector sta
 not survive `validate_shapes`; it runs on `tests/factories.py`'s `vct`/`veg_grid_cell_v001`
 raster stand-in (`RASTER_KWARGS`) instead, through `run_to_path` rather than `_run`.
 
-**`salinity-veg-investigation` gets its own execution class.** The long-shaped registered
+`lnd-type-plus` is `type="custom"` too, with THREE hardcoded inputs across two grids
+(`elev` and `lnd_type` on `morph_pixel_v002`, `stg` on `hydro_compartment_v002`) -- and
+those are the one real, un-substituted grid pair in this module, because the analysis names
+them itself. At its real size `morph_pixel_v002` is ~97 million pixels per band, so the
+`morph_pixel_v002_shrunk` fixture in `tests/api/conftest.py` shrinks the grid OBJECT to 2x4
+instead of substituting a stand-in dataset; `tests/factories.py`'s
+`write_lnd_type_plus_datasets` then writes all three inputs and the crosswalk between the
+two grids. It does not store depths: the analysis COMPUTES depth as
+`stage - elevation/1000`, so the factory solves for the elevation that yields each depth a
+test asks for.
+
+**The band-wide entries get their own execution classes.** The long-shaped registered
 analyses run through `_run` below; `salinity-veg-investigation` is band-wide end to end and
 is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
 together with a `filter` naming that join's operand value columns, so
 `TestSalinityVegInvestigationExecution` runs it separately and pins the two halves apart.
+`lnd-type-plus` is band-wide end to end as well, and is the only entry that collapses a
+band-wide join with a `group` -- whose horizontal reduce IS both its subtraction (`sum`
+over a negated operand) and its "max of the two values" step -- so
+`TestLndTypePlusExecution` pins that against a raster small enough to assert pixel by
+pixel.
 """
 
 import pytest
@@ -47,9 +63,11 @@ from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from tests.factories import (
     ANNUAL_KWARGS,
+    LND_TYPE_PLUS_SELECTION,
     RASTER_KWARGS,
     write_annual_dataset,
     write_ffibs_coverage_dataset,
+    write_lnd_type_plus_datasets,
     write_raster_dataset,
 )
 
@@ -86,6 +104,12 @@ def _write_ensemble(base_path, code_by_scenario, years=(2050,)):
         )
 
 
+# `lnd-type-plus`'s parameters are its inputs' shared selection plus the one year the
+# fixtures write. All three inputs are named by the analysis itself, so none of this is a
+# filter -- and `aggregate_type`, which only `stg` carries, is pinned by the analysis too.
+LND_TYPE_PLUS_PARAMS = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
+
+
 def _run(resolved, base_path):
     """Take a `ResolvedAnalysis` all the way through the real request/execution path --
     `validate_shapes` -> `compile_plan` -> `execute` -> `.collect()` -- and return the
@@ -119,6 +143,7 @@ class TestRegistryDrift:
             "difference",
             "concatenate",
             "land-type-confidence",
+            "lnd-type-plus",
         }
 
     def test_difference_compiles(self, base_path):
@@ -192,6 +217,20 @@ class TestRegistryDrift:
         # Its own `output.format` is `tif`, unoverridden here -- which is exactly the form
         # `pipeline.json` publishes, so this also pins that a caller resubmitting that
         # pipeline verbatim gets a valid one rather than a tabular-sink rejection.
+        assert resolved.pipeline.output.format == "tif"
+        validate_shapes(resolved.pipeline)
+        assert compile_plan(resolved.pipeline, base_path=base_path) is not None
+
+    def test_lnd_type_plus_compiles(self, morph_pixel_v002_shrunk, base_path, crosswalk_path):
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[0.2] * 8, land_types=[1] * 8
+        )
+        resolved = resolve_analysis(
+            "lnd-type-plus", dataset=None, filters={}, params=LND_TYPE_PLUS_PARAMS
+        )
+        # Band-wide end to end (the one `project` lands ON the raster grid), so `tif` is
+        # the only sink `validate_shapes` accepts -- and it is what `pipeline.json`
+        # publishes.
         assert resolved.pipeline.output.format == "tif"
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
@@ -510,3 +549,229 @@ class TestSalinityVegInvestigationExecution:
 
         assert df.columns == ["b0"]
         assert df["b0"].unique().to_list() == [2040]
+
+
+class TestLndTypePlusExecution:
+    """`lnd-type-plus` is the only registered analysis that collapses a band-wide join with
+    a `group` rather than a `filter`, and it does so twice: once with `sum` over a negated
+    operand, which is how `stage - elevation/1000` is expressed at all, and once with `max`,
+    which is the "max of the two values" step. It also collapses two joins the other way,
+    with a paired `filter` -- the elevation presence guard and the water restriction, each
+    masking one operand by a predicate over the pair. All four are what these tests pin.
+    Every case is a single 2x4 raster whose eight pixels are independent, so one run covers
+    the whole reclassification table plus its edges.
+
+    Depths are never stored -- `write_lnd_type_plus_datasets` writes the elevation that
+    produces each one against a uniform projected stage, so a test that says `0.46` is
+    asserting on a computed value, not a read one.
+    """
+
+    def _run_plus(self, base_path, tmp_path, params=None):
+        resolved = resolve_analysis(
+            "lnd-type-plus", dataset=None, filters={}, params=params or LND_TYPE_PLUS_PARAMS
+        )
+        validate_shapes(resolved.pipeline)
+        out = tmp_path / "lnd_type_plus.tif"
+        run_to_path(resolved.pipeline, out, base_path=base_path)
+        return out
+
+    def test_every_reclassification_case_at_once(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """One pixel per rule. Every pixel is open water (`2`), which is the only land type
+        a depth class can reach at all -- `test_only_open_water_gets_a_shallow_class` is
+        where that restriction is pinned, and here it is held constant so the table is the
+        only variable:
+
+        | depth   | expected | why                                                    |
+        |---------|----------|---------------------------------------------------------|
+        | 0.20    | 6        | shallow class outranks the water it sits on            |
+        | 0.70    | 7        | mid class likewise                                     |
+        | 1.50    | 2        | deep class is `0`, so the water shows through          |
+        | 0.46    | 6        | the first bound belongs to the class BELOW it          |
+        | 0.47    | 7        | just past it, so the mid class                         |
+        | 1.00    | 7        | the second bound likewise belongs below                |
+        | 1.01    | 2        | just past it -- deep, so the water shows through       |
+        | 0.00    | 2        | zero is NOT inundation: the leading `value > 0` filter |
+        |         |          | masks it and the land type stands alone                |
+
+        Every interval is open at its lower bound and closed at its upper one, so each
+        bound is pinned from both sides. The bound rows are only meaningful at the
+        factory's default stage of zero, which is what makes `stage - elevation/1000`
+        reproduce a decimal literal exactly -- see `LND_TYPE_PLUS_STAGE`. A test that moves
+        the stage has to stay off the bounds.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[0.20, 0.70, 1.50, 0.46, 0.47, 1.00, 1.01, 0.00],
+            land_types=[2] * 8,
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert src.count == 1
+            assert src.read(1).ravel().tolist() == [6, 7, 2, 6, 7, 7, 2, 2]
+
+    def test_only_open_water_gets_a_shallow_class(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """The water restriction, across every land type at ONE shallow depth. `max` alone
+        would put a `6` over all eight pixels -- `6` outranks every `lnd_type` code -- so
+        anything but `[…, 6, …]` at the two water pixels and the land type everywhere else
+        means the mask ahead of the final join stopped doing its job.
+
+        Pixel 5's land type is nodata, which is not water either: there is nothing to call
+        water, so the depth is masked too and the pixel has no contributor left at all.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[0.20] * 8,
+            land_types=[1, 2, 3, 4, 5, None, 2, 1],
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            band = src.read(1, masked=True)
+            assert band.mask.ravel().tolist() == [False] * 5 + [True] + [False] * 2
+            assert band.ravel().tolist()[:5] == [1, 6, 3, 4, 5]
+            assert band.ravel().tolist()[6:] == [6, 1]
+
+    def test_the_projected_stage_is_what_makes_a_pixel_wet(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """Depth is COMPUTED, so the `project` that carries stage from the compartment grid
+        onto the pixel grid has to actually contribute. Here every elevation is ABOVE the
+        datum (+0.10 m, written as 100 mm), so the only way any pixel reads as inundated is
+        if the 0.30 m stage was added to it: dropped, each depth would be -0.10 m, masked by
+        the `value > 0` filter, and every pixel would read as its land type -- `2` here, not
+        `6`.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[0.20] * 8,
+            land_types=[2] * 8,
+            stage=0.30,
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert set(src.read(1).ravel().tolist()) == {6}
+
+    def test_a_pixel_with_stage_but_no_elevation_is_masked_rather_than_read_as_bare_stage(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """The presence guard. The band-wide `sum` SKIPS nulls rather than propagating them,
+        so without the paired `IS NOT NULL` filter ahead of it a pixel with stage and no
+        elevation would sum to the BARE STAGE -- 0.30 m here, a perfectly plausible shallow
+        depth -- and paint class 6 across whatever the elevation surface does not cover.
+        Guarded, pixel 0 contributes nothing and its land type stands alone.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[None, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20],
+            land_types=[2] * 8,
+            stage=0.30,
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert src.read(1).ravel().tolist() == [2] + [6] * 7
+
+    def test_a_pixel_that_is_not_inundated_falls_back_to_its_land_type(
+        self, morph_pixel_v002_shrunk, base_path, tmp_path, crosswalk_path
+    ):
+        """Where the depth half has nothing to say it is MASKED rather than defaulted -- a
+        masked operand contributes nothing to the max, so the land type stands alone.
+
+        Pixels 0-3 are DRY: the elevation stands above the water level (a negative depth) or
+        exactly at it (zero), which the `value > 0` filter masks, and each pixel's own land
+        type comes through -- including pixel 2, which is open water that simply is not
+        inundated this year and must read as `2` rather than as any depth class. Pixels 4-7
+        are real depths over water, so the depth class stands.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[-0.50, -2.00, -0.01, 0.00, 0.20, 0.70, 1.50, 0.47],
+            land_types=[4, 1, 2, 3, 2, 2, 2, 2],
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert src.read(1).ravel().tolist() == [4, 1, 2, 3, 6, 7, 2, 7]
+
+    def test_a_pixel_outside_both_domains_stays_nodata(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """The cases with no contributor at all: masking rather than defaulting is what keeps
+        them distinguishable from a real class. Pixel 0 has neither an elevation nor a land
+        type. Pixel 7 has a real depth but no land type -- which is not water, so the water
+        restriction masks the depth too and nothing is left; it is the one place the
+        restriction turns a pixel that used to carry a class into nodata.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[None, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 1.50],
+            land_types=[None, 2, 2, 2, 2, 2, 2, None],
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            band = src.read(1, masked=True)
+            assert band.mask.ravel().tolist() == [True] + [False] * 6 + [True]
+            assert band.ravel().tolist()[1:7] == [6] * 6
+
+    def test_an_unselected_year_is_excluded(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """`calendar_year` is a parameter rather than a filter here, but it still lands on
+        the same leading `filter` steps -- and the trailing `group` KEEPS the dimension, so a
+        leaked year would surface as a second band rather than corrupting 2050's.
+        """
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040
+        )
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[0.70] * 8, land_types=[2] * 8, year=2050
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert src.count == 1
+            assert "calendar_year=2050" in src.descriptions[0]
+            assert set(src.read(1).ravel().tolist()) == {7}
+
+    def test_omitting_calendar_year_keeps_every_year_as_its_own_band(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """`calendar_year` is the one optional parameter. Omitted, the leading filters pin
+        only the model group and scenario, and the `group.by` still carries the year -- so
+        each year is reduced against its OWN counterpart band rather than across years.
+        """
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040
+        )
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[1.50] * 8, land_types=[4] * 8, year=2050
+        )
+        params = {k: v for k, v in LND_TYPE_PLUS_PARAMS.items() if k != "calendar_year"}
+        with rio.open(self._run_plus(base_path, tmp_path, params=params)) as src:
+            assert src.count == 2
+            by_year = {
+                description: src.read(index).ravel().tolist()
+                for index, description in enumerate(src.descriptions, start=1)
+            }
+            # A grouped band is described by its whole `group.by` tuple, not the calendar
+            # dimension alone -- the year is the last conjunct of the three.
+            assert {d: set(v) for d, v in by_year.items()} == {
+                "model_group_id=705, scenario_id=7, calendar_year=2040": {6},
+                "model_group_id=705, scenario_id=7, calendar_year=2050": {4},
+            }
+
+    def test_another_scenario_on_disk_does_not_reach_the_join(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """`scenario_id` is pinned by the leading filters and kept by the `group`, so a
+        second scenario is neither reduced into 7's band nor added as a band of its own. It
+        is written with values that would be unmistakable either way.
+        """
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[4] * 8, scenario_id=8
+        )
+        write_lnd_type_plus_datasets(
+            base_path, crosswalk_path, depths=[1.50] * 8, land_types=[2] * 8
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            assert src.count == 1
+            assert set(src.read(1).ravel().tolist()) == {2}

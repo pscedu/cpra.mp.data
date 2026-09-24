@@ -244,6 +244,15 @@ forward pass (`zone_crosswalks_upstream_of`) rather than inside the main walk: u
 everything `states` carries, it cannot be invalidated by a pushdown decision, and it has
 to be complete before the first `JoinOp` consults it.
 
+**That shared read is per CONNECTED COMPONENT of origins, not per join.** A pipeline that
+chains joins -- `join [a, b]`, then `join [<something derived from a>, c]` -- puts origin
+`a` in two groups, and the two groups have different band counts, so reading `a` once per
+group would chunk the same pixels two different ways and the earlier join's operands could
+no longer be aligned positionally. `_merge_shared_origin_groups` therefore fuses (
+transitively) every group sharing an origin before the ceiling check runs, so both joins
+name one union and `execute` opens it once. The ceiling is checked against that union
+because the union is what one read actually costs.
+
 A band-wide join with NO raster origin at all -- every operand a separately-projected
 vector input -- is the one shape left out, since there are no data bands for a shared read
 to be built around and `scan_raster` has no zero-band answer to give (see the loose end
@@ -415,7 +424,10 @@ class ExecutionPlan:
     name's `request.ops.FrameType`, computed once here so `execute.py`'s walk never
     re-derives one. `band_wide_join_scans`: every band-wide `join` step's output name
     mapped to the RASTER origins whose bands were read as one shared union for its ceiling
-    check (see the module docstring) -- empty unless the pipeline has such a join.
+    check (see the module docstring) -- empty unless the pipeline has such a join. Two
+    joins sharing an origin carry the SAME tuple here, not their own: they are one read
+    (`_merge_shared_origin_groups`), so `execute` opens the group once and every operand
+    downstream of either join is chunked alike.
     `band_wide_join_zone_crosswalks`: the same join outputs mapped to the `ZoneCrosswalk`s
     that shared read must also carry, one per vector-to-raster `project` upstream of any
     of that join's operands -- empty for a join whose operands are all raster origins.
@@ -458,6 +470,60 @@ def _referenced_names(conjunct: str) -> frozenset[str]:
     classify_predicate_kind` itself classifies conjuncts by.
     """
     return frozenset(pl.sql_expr(conjunct).meta.root_names())
+
+
+def _merge_shared_origin_groups(
+    groups: dict[str, tuple[str, ...]], crosswalks: dict[str, tuple[ZoneCrosswalk, ...]]
+) -> None:
+    """Fuse, in place, every band-wide join group that shares a raster origin with another
+    into a single group carrying the union of their origins (and of their crosswalks).
+
+    Per-join groups are what the walk can see; they are not yet what a READ can be. An
+    origin appearing in two groups would be opened twice, once per group, and the two reads
+    have different band counts whenever the groups differ -- so they chunk differently
+    (`io.raster_io.raster_blocks_per_batch`) and their rows cannot be aligned positionally.
+    `execute` keeps one frame per origin, so the second read silently replaces the first
+    and the join that wanted the first fails `frame.assert_same_pixel_grid`. A chained
+    pipeline provokes this on sight: `join [a, b]` then `join [<derived from a>, c]` puts
+    `a` in both groups.
+
+    Merging is transitive -- two groups sharing nothing directly still land together if a
+    third bridges them -- because "same read" is an equivalence, not a pairwise favour.
+    The union is what the ceiling check must then sum over (it is one read's band count),
+    which is why this runs before it.
+
+    Order is first-seen throughout, so the merged scan order stays a deterministic function
+    of the pipeline rather than of set iteration.
+    """
+    parent: dict[str, str] = {}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for origins in groups.values():
+        for name in origins:
+            parent.setdefault(name, name)
+        root = find(origins[0])
+        for name in origins[1:]:
+            parent[find(name)] = root
+
+    # Accumulated only once every union above has settled, so `find` is stable and a
+    # component's contents cannot be split across two roots.
+    component_origins: dict[str, dict[str, None]] = {}
+    component_crosswalks: dict[str, dict[ZoneCrosswalk, None]] = {}
+    for output, origins in groups.items():
+        root = find(origins[0])
+        component_origins.setdefault(root, {}).update(dict.fromkeys(origins))
+        component_crosswalks.setdefault(root, {}).update(dict.fromkeys(crosswalks.get(output, ())))
+
+    for output, origins in groups.items():
+        root = find(origins[0])
+        groups[output] = tuple(component_origins[root])
+        if component_crosswalks[root]:
+            crosswalks[output] = tuple(component_crosswalks[root])
 
 
 def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None = None) -> ExecutionPlan:
@@ -652,6 +718,8 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         # Unreachable: the branches above are exhaustive over the `Op` union, which is why
         # this line is excluded from coverage rather than exercised by a test.
         raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")  # pragma: no cover
+
+    _merge_shared_origin_groups(band_wide_join_origin_groups, band_wide_join_zone_crosswalks)
 
     raster_band_metadata: dict[str, pl.DataFrame] = {}
     for name in raster_origins:

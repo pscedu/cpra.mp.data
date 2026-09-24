@@ -30,6 +30,13 @@ route disagreeing about what `filters`/`grid_cell`/`params` mean.
   alone and a caller-supplied `scenario_id` must 400. It rides the raster stand-in
   (`vct`/`veg_grid_cell_v001`), since its real variable is raster-only and its own
   `pipeline()` sinks to `tif` to match.
+* `lnd-type-plus` (`type="custom"`) likewise reuses the custom routes
+  `salinity-veg-investigation` carries, and is covered where it differs: all three of its
+  parameters are real dimension NAMES, which makes it the sharpest test of the custom
+  routes' dimension/parameter split, and it rejects any selection at all. It runs on the
+  real `morph_pixel_v002`/`hydro_compartment_v002` pair, with the former shrunk to 2x4 by
+  `conftest.py`'s `lnd_type_plus_data` -- the analysis names both grids itself, so there is
+  no stand-in to substitute.
 
 `grid_cell` is the one request parameter the registry deliberately cannot handle alone:
 resolving a coordinate against real geometry needs `io/`, which nothing under `request/`
@@ -54,6 +61,7 @@ from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from tests.factories import (
     ANNUAL_KWARGS,
+    LND_TYPE_PLUS_SELECTION,
     RASTER_KWARGS,
     write_annual_dataset,
     write_grid_geometry,
@@ -103,6 +111,11 @@ LAND_TYPE_CONFIDENCE_QUERY = {
     "calendar_year": [2050],
     "model_group_id": [RASTER_KWARGS["model_group_id"]],
 }
+
+# `lnd-type-plus` is `type="custom"` too, and every one of its three parameters is a real
+# dimension NAME -- which on the custom routes is exactly what must reach `Parameters`
+# rather than being bound as a dataset filter. See `TestLndTypePlusRoute`.
+LND_TYPE_PLUS_QUERY = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
 
 
 def _lng_lat(x, y):
@@ -601,6 +614,97 @@ class TestLandTypeConfidenceRoute:
         validate_shapes(parse_pipeline(response.json()))  # no raise
 
 
+class TestLndTypePlusRoute:
+    """`lnd-type-plus` on the custom routes. The custom-route machinery itself is already
+    carried by `salinity-veg-investigation` above; what these pin is the one thing that
+    differs -- ALL THREE of its parameters are real dimension names, so it is the sharpest
+    test of `_resolve_custom_analysis`'s dimension/parameter split. On these routes the
+    `FilterDimensions` half of the bound query model is subtracted from the known set
+    precisely so `model_group_id`/`scenario_id`/`calendar_year` reach the analysis's own
+    `Parameters`; were any of them bound as a filter instead, this analysis would reject
+    the request outright (it takes no selection at all).
+
+    What the pipeline itself computes is pinned at the engine level
+    (`test_analyses_registry.py::TestLndTypePlusExecution`); these pin that the route
+    delivers it.
+    """
+
+    def test_data_tif(self, client, lnd_type_plus_data):
+        response = client.get("/v1/analyses/lnd-type-plus/data.tif", params=LND_TYPE_PLUS_QUERY)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            data = src.read(1)
+        # The fixture's first four pixels are one per reclassification rule, by COMPUTED
+        # depth, plus the water restriction: 0.20 m over water -> 6, 0.70 m over water -> 7,
+        # 1.50 m over water -> 2 (deep is `0`, so the water wins the max), and 0.20 m over
+        # land type 1 -> 1 (only water may be overwritten). The rest repeat the shallow case.
+        assert data.ravel().tolist() == [6, 7, 2, 1, 6, 6, 6, 6]
+
+    def test_png_tile(self, client, lnd_type_plus_data):
+        tile = _tile_for_grid(lnd_type_plus_data)
+        response = client.get(
+            f"/v1/analyses/lnd-type-plus/data/{tile.z}/{tile.x}/{tile.y}.png",
+            params=LND_TYPE_PLUS_QUERY,
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "image/png"
+        assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_pipeline_json_publishes_a_resubmittable_pipeline(self, client, lnd_type_plus_data):
+        """The one `project` lands ON the pixel grid and nothing projects off it, so the
+        published `output.format` has to be the raster one -- a caller resubmitting this
+        verbatim gets a pipeline the request layer accepts rather than a tabular-sink
+        rejection.
+        """
+        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=LND_TYPE_PLUS_QUERY)
+        assert response.status_code == 200, response.text
+        expanded = parse_pipeline(response.json())
+        assert len(expanded.inputs) == 3
+        assert expanded.steps[-1].op == "group"
+        assert expanded.steps[-1].aggregate == "max"
+        assert response.json()["output"]["format"] == "tif"
+        validate_shapes(expanded)  # no raise
+
+    def test_calendar_year_is_optional(self, client, lnd_type_plus_data):
+        """The one optional parameter. Omitted, every year on disk is kept as its own band
+        -- and `calendar_year` stays in the `group.by` either way, which is what keeps each
+        year reduced against its OWN counterpart band.
+        """
+        params = {k: v for k, v in LND_TYPE_PLUS_QUERY.items() if k != "calendar_year"}
+        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=params)
+        assert response.status_code == 200, response.text
+        expanded = parse_pipeline(response.json())
+        assert not any(
+            "calendar_year" in (step.where or "")
+            for step in expanded.steps
+            if step.op == "filter" and step.input is not None
+        )
+        assert expanded.steps[-1].by == ["model_group_id", "scenario_id", "calendar_year"]
+
+    def test_a_missing_required_parameter_is_a_400(self, client, lnd_type_plus_data):
+        """`model_group_id` is a dimension name, so a route that bound it as a filter would
+        see it supplied and the analysis would see it missing -- `Parameters` validation is
+        what catches that, and `resolve_analysis` raises the 400.
+        """
+        params = {k: v for k, v in LND_TYPE_PLUS_QUERY.items() if k != "model_group_id"}
+        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=params)
+        assert response.status_code == 400
+        assert "model_group_id" in response.json()["detail"]
+
+    def test_a_grid_cell_selection_is_rejected(self, client, lnd_type_plus_data):
+        """`grid_cell` is one of the two reserved keys that DO reach a custom analysis as a
+        filter -- and this analysis rejects any selection, both because its inputs span two
+        grids (so a cell ID is ambiguous) and because a spatial predicate would turn its
+        band-wide frame long and invalidate the raster output rather than narrow it.
+        """
+        response = client.get(
+            "/v1/analyses/lnd-type-plus/pipeline.json",
+            params={**LND_TYPE_PLUS_QUERY, "grid_cell": "1,2"},
+        )
+        assert response.status_code == 400
+        assert "takes no selection" in response.json()["detail"]
+
+
 class TestAnalysesCatalog:
     def test_lists_every_registered_analysis(self, client):
         response = client.get("/v1/analyses.json")
@@ -610,4 +714,5 @@ class TestAnalysesCatalog:
             "concatenate",
             "salinity-veg-investigation",
             "land-type-confidence",
+            "lnd-type-plus",
         }

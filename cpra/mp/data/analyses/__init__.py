@@ -30,6 +30,7 @@ from cpra.mp.data.analyses.base import (
 from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
 from cpra.mp.data.analyses.land_type_confidence import LandTypeConfidence
+from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.errors import RequestError
 
@@ -39,7 +40,7 @@ from cpra.mp.data.analysis.request.errors import RequestError
 # -> class` dict, so registration order has no behavioral effect.
 ANALYSES = {
     cls.Meta.name: cls
-    for cls in [SalinityVegInvestigation, Difference, Concatenate, LandTypeConfidence]
+    for cls in [SalinityVegInvestigation, Difference, Concatenate, LandTypeConfidence, LndTypePlus]
 }
 
 __all__ = [

@@ -47,6 +47,7 @@ from cpra.mp.data.analyses.land_type_confidence import (
     WATER_VALUES,
     LandTypeConfidence,
 )
+from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
@@ -55,6 +56,7 @@ from cpra.mp.data.analysis.request.pipeline import (
     ProjectStep,
     pipeline_to_query,
 )
+from cpra.mp.data.legends import LEGENDS
 
 SSF_DATASET = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v001")
 SAL_DATASET = DatasetRef(variable="sal", time_unit="daily", grid="hydro_compartment_v001")
@@ -76,6 +78,7 @@ class TestRegistry:
             "difference",
             "concatenate",
             "land-type-confidence",
+            "lnd-type-plus",
         }
 
     def test_keyed_by_meta_name(self):
@@ -100,6 +103,20 @@ class TestRegistry:
         assert ANALYSES["land-type-confidence"].Meta.variables == ["lnd_type"]
         assert ANALYSES["land-type-confidence"].Meta.legend is None
         assert ANALYSES["land-type-confidence"].Meta.result_kind == "value"
+
+        assert ANALYSES["lnd-type-plus"].Meta.type == "custom"
+        assert ANALYSES["lnd-type-plus"].Meta.variables is None
+        assert ANALYSES["lnd-type-plus"].Meta.legend == "lnd_type_plus"
+        assert ANALYSES["lnd-type-plus"].Meta.result_kind == "category"
+
+    def test_every_declared_legend_is_a_real_one(self):
+        """A `Meta.legend` is a plain string, so a typo (or a legend removed from
+        `structure/legends.csv` out from under an analysis) would only surface as a catalog
+        entry naming a legend the `/v1/legends.json` route never serves.
+        """
+        for name, cls in ANALYSES.items():
+            if cls.Meta.legend is not None:
+                assert cls.Meta.legend in LEGENDS, name
 
 
 # ------------------------------------------------------------------------------------------
@@ -960,3 +977,301 @@ class TestLandTypeConfidencePipeline:
         query = pipeline_to_query(self._build()[1])
         assert query["step.10.op"] == "group"
         assert query["step.5.expression"] == "value * 0.085"
+
+
+# ------------------------------------------------------------------------------------------
+# `lnd-type-plus`
+# ------------------------------------------------------------------------------------------
+
+
+class TestLndTypePlusParameters:
+    def test_requires_model_group_id_and_scenario_id(self):
+        with pytest.raises(ValidationError):
+            LndTypePlus.Parameters(model_group_id=705)
+
+    def test_calendar_year_is_optional(self):
+        assert LndTypePlus.Parameters(model_group_id=705, scenario_id=7).calendar_year is None
+
+    def test_rejects_extra_fields(self):
+        with pytest.raises(ValidationError):
+            LndTypePlus.Parameters(model_group_id=705, scenario_id=7, dimension="calendar_year")
+
+
+class TestLndTypePlusSelection:
+    """It takes no `filters` at all -- see `LndTypePlus.validate_selection`: its three
+    inputs span two grids, so a `grid_cell` names a cell in a lattice the request does not
+    say which of, a bare `where` has no one operand to apply to, and a spatial predicate
+    would turn the join long and invalidate the raster sink rather than simply narrowing
+    the result.
+    """
+
+    params = LndTypePlus.Parameters(model_group_id=705, scenario_id=7)
+
+    def test_accepts_an_empty_selection(self):
+        LndTypePlus.validate_selection(self.params, {})  # no raise
+
+    def test_rejects_a_grid_cell(self):
+        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
+            LndTypePlus.validate_selection(self.params, {"grid_cell": "3,5"})
+
+    def test_rejects_a_where(self):
+        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
+            LndTypePlus.validate_selection(self.params, {"where": "value > 1"})
+
+
+class TestLndTypePlusPipeline:
+    def _build(self, **overrides):
+        params = {"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050, **overrides}
+        analysis = LndTypePlus(
+            dataset=None, filters={}, parameters=LndTypePlus.Parameters(**params)
+        )
+        return analysis, analysis.pipeline()
+
+    def test_the_three_inputs_are_fixed(self):
+        _, pipeline = self._build()
+        assert set(pipeline.inputs) == {"stage", "elevation", "land"}
+        stage = pipeline.inputs["stage"]
+        assert (stage.variable, stage.time_unit, stage.grid) == (
+            "stg",
+            "annual",
+            "hydro_compartment_v002",
+        )
+        elevation = pipeline.inputs["elevation"]
+        assert (elevation.variable, elevation.time_unit, elevation.grid) == (
+            "elev",
+            "annual",
+            "morph_pixel_v002",
+        )
+        land = pipeline.inputs["land"]
+        assert (land.variable, land.time_unit, land.grid) == ("lnd_type", "annual", "morph_pixel_v002")
+
+    def test_the_depth_half_of_the_step_shape(self):
+        """Steps 1-8: stage onto the pixel grid, elevation negated, the presence guard, and
+        the `sum` that IS the subtraction.
+        """
+        _, pipeline = self._build()
+        (
+            stage_filter,
+            project_step,
+            elevation_filter,
+            negate,
+            guard_join,
+            guard,
+            depth_join,
+            sum_step,
+        ) = pipeline.steps[:8]
+
+        assert isinstance(stage_filter, FilterStep)
+        assert stage_filter.input == "stage"
+        # `aggregate_type` is the analysis's own, not a caller's -- it sorts first.
+        assert stage_filter.where == (
+            "aggregate_type = 'mean' AND calendar_year = 2050 "
+            "AND model_group_id = 705 AND scenario_id = 7"
+        )
+
+        assert project_step.op == "project"
+        assert project_step.input == "selected_stage"
+        assert project_step.to == "morph_pixel_v002"
+        # Vector ONTO raster broadcasts rather than reduces, so no `aggregate`.
+        assert project_step.aggregate is None
+        assert project_step.as_ == "stage_m"
+
+        assert isinstance(elevation_filter, FilterStep)
+        assert elevation_filter.input == "elevation"
+        assert (
+            elevation_filter.where
+            == "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
+        )
+
+        # Millimetres to metres and the sign flip the `sum` below needs, in one pass.
+        assert isinstance(negate, CalculateStep)
+        assert (negate.expression, negate.where) == ("value / -1000", None)
+        assert negate.as_ == "neg_elevation_m"
+
+        # The presence guard: `sum` SKIPS nulls, so stage without elevation would otherwise
+        # sum to the bare stage and reclassify as a real inundation class.
+        assert guard_join.op == "join"
+        assert guard_join.inputs == ["stage_m", "neg_elevation_m"]
+        assert isinstance(guard, FilterStep)
+        assert guard.where == "stage_m IS NOT NULL AND neg_elevation_m IS NOT NULL"
+        assert guard.as_ == "stage_present"
+
+        assert depth_join.op == "join"
+        assert depth_join.type == "spatial"
+        assert depth_join.inputs == ["stage_present", "neg_elevation_m"]
+
+        assert isinstance(sum_step, GroupStep)
+        assert sum_step.aggregate == "sum"
+        assert sum_step.by == ["model_group_id", "scenario_id", "calendar_year"]
+
+    def test_the_reclassification_half_of_the_step_shape(self):
+        """Steps 9-18: the running value is now depth in metres."""
+        _, pipeline = self._build()
+        (
+            depth_domain,
+            shallow,
+            mid,
+            deep,
+            flip,
+            land_filter,
+            water_join,
+            water_mask,
+            join_step,
+            group_step,
+        ) = pipeline.steps[8:]
+
+        assert isinstance(depth_domain, FilterStep)
+        assert depth_domain.where == "value > 0"
+
+        for step in (shallow, mid, deep, flip):
+            assert isinstance(step, CalculateStep)
+        assert (shallow.expression, shallow.where) == ("-6", "value <= 0.46")
+        assert (mid.expression, mid.where) == ("-7", "value > 0.46 AND value <= 1.0")
+        assert (deep.expression, deep.where) == ("0", "value > 1.0")
+        assert (flip.expression, flip.where) == ("value * -1", "value < 0")
+        assert flip.as_ == "depth_class"
+
+        # No value-domain filter on land type: `lnd_type` tops out at `5`, and anything
+        # outside its domain is the `-9999` nodata sentinel, masked to null on read.
+        assert isinstance(land_filter, FilterStep)
+        assert land_filter.input == "land"
+        assert land_filter.where == pipeline.steps[2].where
+        assert land_filter.as_ == "land_type"
+
+        # The water restriction: `max` would otherwise let a shallow class override any
+        # land type at all, so the depth is masked everywhere the land type is not water
+        # BEFORE the join whose max produces the result.
+        assert water_join.op == "join"
+        assert water_join.inputs == ["depth_class", "land_type"]
+        assert isinstance(water_mask, FilterStep)
+        assert water_mask.where == "land_type = 2"
+        assert water_mask.as_ == "water_depth_class"
+
+        assert join_step.op == "join"
+        assert join_step.type == "spatial"
+        assert join_step.inputs == ["water_depth_class", "land_type"]
+
+        assert isinstance(group_step, GroupStep)
+        assert group_step.by == ["model_group_id", "scenario_id", "calendar_year"]
+        assert group_step.aggregate == "max"
+        assert group_step.of == "value"
+
+        assert pipeline.output.format == "tif"
+
+    def test_the_group_by_omits_the_dimension_only_stage_carries(self):
+        # `aggregate_type` is required by `stg` and by neither raster, so grouping on it
+        # would split every pair into two one-band groups that never reduce together.
+        _, pipeline = self._build()
+        for step in pipeline.steps:
+            if step.op == "group":
+                assert "aggregate_type" not in step.by
+
+    def test_no_reclassification_rule_can_re_match_what_an_earlier_one_wrote(self):
+        """The property the negative encoding exists for: applying the four `calculate`
+        entries in order to any depth in the filtered domain lands on the code the spec
+        names, with no rule re-matching a value an earlier rule already wrote.
+
+        Re-implemented here as a plain interpreter over the pipeline's own `where`
+        strings rather than against a second copy of the class table, so an edit to the
+        steps that reintroduces the collision fails this test.
+        """
+        _, pipeline = self._build()
+        entries = [(step.where, step.expression) for step in pipeline.steps[9:13]]
+
+        def run(depth):
+            value = depth
+            for where, expression in entries:
+                if all(_conjunct_holds(value, conjunct) for conjunct in where.split(" AND ")):
+                    value = -value if expression == "value * -1" else float(expression)
+            return value
+
+        # Every interval is closed at its upper bound, so each bound belongs to the class
+        # BELOW it -- the pair either side of each is what pins that.
+        assert run(0.01) == 6
+        assert run(0.46) == 6
+        assert run(0.47) == 7
+        assert run(1.0) == 7
+        assert run(1.01) == 0
+        assert run(12.5) == 0
+
+    def test_the_join_operand_names_do_not_collide_with_the_input_names(self):
+        # An `as` may not collide with an input name (`parse_pipeline` rejects it), and a
+        # join's operands are named by `as` -- so this is the constraint that fixes the
+        # `stage`/`stage_m` and `land`/`land_type` naming.
+        _, pipeline = self._build()
+        for join_step in (step for step in pipeline.steps if step.op == "join"):
+            assert set(join_step.inputs).isdisjoint(pipeline.inputs)
+
+    def test_an_omitted_calendar_year_drops_only_that_conjunct(self):
+        _, pipeline = self._build(calendar_year=None)
+        assert pipeline.steps[0].where == (
+            "aggregate_type = 'mean' AND model_group_id = 705 AND scenario_id = 7"
+        )
+        assert pipeline.steps[2].where == "model_group_id = 705 AND scenario_id = 7"
+        # ... and the year stays in the trailing group, so an unfiltered request returns
+        # one band per year rather than reducing the years together.
+        assert "calendar_year" in pipeline.steps[-1].by
+
+    def test_only_stages_aggregate_type_is_collapsed(self):
+        # The axis this analysis mainly collapses is the OPERAND axis (which input a band
+        # came from), which is not a dimension. The one real dimension that does go is
+        # `aggregate_type`: only `stg` carries it, the analysis pins it to `mean` itself,
+        # and the trailing `group.by` drops it -- so a caller can neither see nor vary it,
+        # which is what `collapsed_dimensions` exists to tell the visualization layer.
+        analysis, _ = self._build()
+        assert analysis.collapsed_dimensions == frozenset({"aggregate_type"})
+
+    def test_meta_and_presentation(self):
+        analysis, _ = self._build()
+        assert analysis.legend == "lnd_type_plus"
+        assert analysis.result_kind == "category"
+        assert analysis.title_suffix == ""
+
+    def test_resolves_through_resolve_analysis(self):
+        resolved = resolve_analysis(
+            "lnd-type-plus",
+            dataset=None,
+            filters={},
+            params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
+        )
+        assert isinstance(resolved, ResolvedAnalysis)
+        assert resolved.pipeline.steps[-1].aggregate == "max"
+
+    def test_string_parameters_off_a_query_string_are_coerced(self):
+        # Every parameter arrives as a string on the real routes (`_analysis_extra_params`
+        # reads the raw query string), so the `int` fields have to coerce.
+        resolved = resolve_analysis(
+            "lnd-type-plus",
+            dataset=None,
+            filters={},
+            params={"model_group_id": "705", "scenario_id": "7", "calendar_year": "2050"},
+        )
+        assert resolved.pipeline.steps[2].where == (
+            "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
+        )
+
+    def test_a_selection_is_rejected_by_resolve_analysis(self):
+        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
+            resolve_analysis(
+                "lnd-type-plus",
+                dataset=None,
+                filters={"grid_cell": "3,5"},
+                params={"model_group_id": 705, "scenario_id": 7},
+            )
+
+
+def _conjunct_holds(value, conjunct):
+    """Evaluate one `value <op> <literal>` conjunct of a reclassification `where` -- the
+    only operators those steps use. Deliberately narrow: it exists to interpret the
+    pipeline this analysis really builds, not to be a general SQL evaluator.
+    """
+    for operator, test in (
+        ("<=", lambda a, b: a <= b),
+        (">", lambda a, b: a > b),
+        ("<", lambda a, b: a < b),
+    ):
+        left, sep, right = conjunct.partition(f" {operator} ")
+        if sep:
+            assert left == "value", f"unexpected left-hand side in {conjunct!r}"
+            return test(value, float(right))
+    raise AssertionError(f"unrecognized conjunct {conjunct!r}")

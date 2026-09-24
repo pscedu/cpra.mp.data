@@ -776,9 +776,16 @@ class TestBandWideJoinCeiling:
         assert 2 * third_over <= ANALYSIS_BAND_CEILING < 3 * third_over
         with pytest.raises(BandLimitError) as caught:
             compile_plan(_pipeline(request))
-        assert "'j2'" in str(caught.value)
+        # Both joins are sized against the same union, so which of the two the check
+        # happens to reach first is not the point -- the three origins named are.
+        assert "('a', 'b', 'c')" in str(caught.value)
 
     def test_a_join_of_a_join_records_the_transitive_scan_union(self, monkeypatch):
+        """Both joins get the SAME union, not their own. `a` is an operand of each, and an
+        origin cannot be read twice with two different band counts and still have its rows
+        line up (`execution.frame.assert_same_pixel_grid`) -- so the inner join is read
+        out of the outer join's scan too.
+        """
         monkeypatch.setattr(
             plan_module,
             "resolve_raster_bands",
@@ -800,7 +807,35 @@ class TestBandWideJoinCeiling:
                 }
             )
         )
-        assert plan.band_wide_join_scans == {"j": ("a", "b"), "j2": ("a", "b", "c")}
+        assert plan.band_wide_join_scans == {"j": ("a", "b", "c"), "j2": ("a", "b", "c")}
+
+    def test_two_joins_sharing_no_origin_stay_separate_scans(self, monkeypatch):
+        """The fusion is per connected component, not global: joins over disjoint origins
+        have nothing to align against each other, so each keeps its own read.
+        """
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2035}]),
+        )
+        inputs = self._two_raster_inputs()
+        inputs["c"] = raster_input(variable="stg")
+        inputs["d"] = raster_input(variable="sal")
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": inputs,
+                    "steps": [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5"},
+                        {"op": "join", "type": "spatial", "inputs": ["c", "d"], "as": "j2"},
+                        {"op": "filter", "input": "j2", "where": "c > 0.5 AND d > 0.5"},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.band_wide_join_scans == {"j": ("a", "b"), "j2": ("c", "d")}
 
     def test_a_long_join_records_no_scan_union(self):
         pipeline = _pipeline(
