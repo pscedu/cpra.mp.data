@@ -16,10 +16,24 @@ The only entry exercising the `type="custom"` path, multiple named inputs, and a
 
 **Why the inputs are named `coverage`/`salinity` and the join operands `marsh`/`sal`.**
 A `join`'s output value columns are named after its OPERANDS (see `ops.validate_shapes`),
-so the trailing `filter`'s `where` -- `marsh > ... AND sal > ...` -- can only work if the
-two frames reaching the join carry exactly those names. An `as` may not collide with an
-input name, so the inputs take the two longer names and the per-input `filter`/`project`
-steps rename their outputs down to the two the threshold test reads.
+so the threshold test -- `marsh > ... AND sal > ...` -- can only work if the two frames
+reaching the join carry exactly those names. An `as` may not collide with an input name,
+so the inputs take the two longer names and the per-input `filter`/`project` steps rename
+their outputs down to the two the threshold test reads.
+
+**Why the threshold test is a `case` rather than a `filter`.** Band-wide, the joined frame
+holds both operands' bands side by side in one flat positional list, and the question being
+asked is about the PAIR. A `case` over a paired frame reconstitutes the pairs and reduces
+each to a single band (`execution.band_ops.case_band_wide`) -- 2N bands in, N out -- which
+is what leaves one band per year for the `group` to reduce over. A `filter` cannot: it
+restricts observations, and there is no observation here to drop that would not also drop
+the other operand's band at the same year.
+
+Nothing reads the surviving band's VALUE. The `group` is `min of=calendar_year`, so each
+band contributes its own year wherever it is non-null and withholds it where it is not --
+the band carries WHETHER, and `of` supplies WHICH. The arm names `marsh` anyway, because a
+band has to hold something and an arm has to say what: the analysis's answer is the year,
+and the value under it is the marsh coverage that cleared the threshold.
 """
 
 from pydantic import Field
@@ -124,9 +138,18 @@ class SalinityVegInvestigation(Analysis):
                     "as": "sal",
                 },
                 {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
+                # The threshold test, as a single-armed `case` over the pair -- see "Why
+                # the threshold test is a `case`" in the module docstring. No `else`, so a
+                # year failing either threshold comes out null and the `group` below skips
+                # it; `then` keeps `marsh`, the only determinate value on offer.
                 {
-                    "op": "filter",
-                    "where": f"marsh > {p.marsh_threshold} AND sal > {p.salinity_threshold}",
+                    "op": "case",
+                    "cases": [
+                        {
+                            "when": f"marsh > {p.marsh_threshold} AND sal > {p.salinity_threshold}",
+                            "then": "marsh",
+                        }
+                    ],
                 },
                 {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
             ],

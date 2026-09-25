@@ -69,6 +69,7 @@ step's output:
 | `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine frames cell-for-cell on a shared grid, naming each operand's measurement after the operand. |
 | `filter` | `input` (optional), `where`, `as` | A SQL-style predicate -- over dimensions, over the value, or over `grid_cell`. |
 | `calculate` | `input` (optional), `expression`, `where` (optional), `as` | Conditionally rewrite the running value: one expression/where pair per step (several pairs = repeated steps, applied sequentially -- step N+1 sees step N's output). Rows/bands not matching `where` flow through unchanged; `calculate` never drops data. |
+| `case` | `input` (optional), `cases` (a non-empty list of `{when, then}` arms), `else` (optional), `as` | Rewrite the running value by the **first matching** arm, SQL `CASE WHEN` style. Every `when` is read against the *incoming* value, so the arms are independent of one another and each row/pixel is written exactly once. Anything matching no arm takes `else`, which defaults to null -- i.e. masked. **Nodata is yours to state:** a null matches no `when` (every predicate reads null as false), so with no `else` it stays null, but `else 0` really does paint every nodata row/pixel `0`. Arms may test nullity directly (`x IS NULL`, `x IS NOT NULL`), and `coalesce` is available in a `then`/`else`. |
 | `group` | `input` (optional), `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate` (`sum`/`min`/`max`/`count`/`mean` -- the decomposable aggregates only; `count_by_value` is never valid here), `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held"), `as` | Collapse rows/bands. |
 
 Every op may name its input explicitly; when it doesn't, it consumes whatever the
@@ -89,8 +90,8 @@ Input names and step `as` names must match `[a-z_][a-z0-9_]*`, must not collide 
 other, and must not be `value`, `grid_cell`, `value_category`, a positional band name
 (`b0`, `b1`, ...), or any dimension the data structure already declares.
 
-The running measurement is spelled **`value`** in every `filter.where` and
-`calculate.expression`, in every single-input chain. The one exception is a frame
+The running measurement is spelled **`value`** in every `filter.where`,
+`calculate.expression`, and `case` arm, in every single-input chain. The one exception is a frame
 produced by a `join`: there, each operand's measurement is named after the operand, so a
 `join` of `marsh` and `sal` is filtered with `marsh > 0.5 AND sal > 5.5`. Referring to a
 single-input chain's measurement by the input's own name does *not* work -- that name is
@@ -140,9 +141,10 @@ The rules, in full:
 | `project` raster -> vector | band-wide -> long (`aggregate` required) |
 | `project` vector -> raster | long -> band-wide (a broadcast; `aggregate` forbidden) |
 | `project` raster -> raster | **never legal** -- there is no crosswalk between two raster lattices |
-| `filter` on a dimension or a value | shape unchanged |
+| `filter` on a dimension or a value | shape unchanged (and value columns unchanged -- a `filter` never changes a frame's pairing) |
 | `filter` on `grid_cell` (spatial) | band-wide -> long; long -> long |
 | `calculate` | shape unchanged |
+| `case` | shape unchanged (and always one value column out, so it collapses a pairing) |
 | `group` | shape unchanged |
 | `join` | shape unchanged; operands must agree on shape **and** grid |
 
@@ -153,7 +155,8 @@ the raster lattice, a later `project` from it is still raster-to-something.
 
 There is no longer any restriction on step *ordering* beyond the chaining rule: a `filter`
 after a `calculate` sees the post-calculate value, a `grid_cell` filter may appear anywhere
-and as many times as you like, and `filter`/`calculate`/`group` compose in any sequence.
+and as many times as you like, and `filter`/`calculate`/`case`/`group` compose in any
+sequence.
 Every combination this table permits has an executor -- nothing is accepted at parse time
 and then refused as unimplemented at run time.
 
@@ -176,11 +179,23 @@ Each of these is a 400 naming the specific problem:
   `join(join(a, b), c)` is not, until something collapses the pairing in between.
 - **A `calculate` over a paired band-wide frame** -- a band-wide frame's bands are
   positional, so there is no per-operand column for the expression to name. Collapse the
-  pairing with a value `filter` first.
+  pairing with a `case` first. (`case` is the one op that can: it pairs each operand's
+  band with its counterpart, and the matching arm's `then` says which value the single
+  surviving band carries.)
+- **A value `filter` naming an operand of a paired band-wide frame** -- for the same
+  reason, and with the same remedy. Evaluating `marsh > 0.5 AND sal > 5.5` over positional
+  bands means pairing them and emitting one band per pair, which reduces the frame and has
+  to pick which operand's value survives -- a choice the predicate never states. A `case`
+  states it, in `then`. (A value `filter` naming only a *carried* column, such as
+  `__domain__ > 0`, is fine over a paired frame: it is a per-pixel mask each band takes
+  independently, so nothing pairs and nothing is picked.)
+- **A `case` arm whose `when` is a dimension or a `grid_cell` predicate** -- an arm
+  rewrites the value at one row/pixel, while a dimension or spatial predicate selects
+  which rows/bands there are at all. State that as a `filter`, before or after the `case`.
 - **More than one value column reaching the sink** -- every output writes exactly one
   measured quantity. A `join`'s paired frame must therefore be collapsed before the
-  output: a value `filter` or a `group` over a band-wide frame, or a `calculate` over a
-  long one.
+  output: a `case` or a `group` over a band-wide frame, or a `calculate` or a `case` over
+  a long one.
 - **A long final frame under a raster output format** (`tif`/`png`/`jpg`), or **a
   band-wide final frame under a tabular one** (`csv`/`ndjson`/`parquet`). Add a `project`,
   or (from band-wide) a spatial `filter`.
@@ -214,7 +229,7 @@ once before the aggregate can drop most of it. Instead, the compiled plan reads 
 inputs' small metadata up front (file paths/bands for the raster input; the already
 row-ceiling-bounded vector table), then executes as a single pass over the raster's own
 block windows: for each window, it reads that window from every year's band plus the
-pairing crosswalk, looks up each pixel's paired vector value, applies the `filter`/`group`
+pairing crosswalk, looks up each pixel's paired vector value, applies the `case`/`group`
 collapse for just that window, and writes the collapsed window straight back at its own
 position -- never holding a full-extent array of any per-pixel intermediate.
 
@@ -536,8 +551,12 @@ exceeds 0.5 *and* paired salinity exceeds 5.5, and reports the earliest (`min`) 
 Note the shape of the chain: each input is narrowed by its own `filter` (named with `as`
 so the `join` can reference it), the vector input is projected onto the raster grid, the
 `join` pairs the two -- leaving a frame with two value columns, `marsh` and `sal` -- and
-the value `filter` naming both is what collapses that pairing back to a single measured
-quantity, which the output requires.
+the single-armed `case` naming both is what collapses that pairing back to a single
+measured quantity, which the output requires. It has no `else`, so a pixel-year failing
+either threshold comes out null and the `group` below skips it; its `then` keeps `marsh`,
+naming which of the two operands the surviving band carries. Nothing here reads that
+value: `min of=calendar_year` asks only *whether* the band is present, and `of` supplies
+*which* year to report.
 
 **As an explicit pipeline:**
 
@@ -553,7 +572,7 @@ POST /v1/analysis.tif
     {"op": "filter", "input": "salinity", "where": "aggregate_type = '2_wk_max' AND model_group_id = 500 AND scenario_id = 7", "as": "selected_salinity"},
     {"op": "project", "input": "selected_salinity", "to": "veg_grid_cell_v001", "as": "sal"},
     {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
-    {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
+    {"op": "case", "cases": [{"when": "marsh > 0.5 AND sal > 5.5", "then": "marsh"}]},
     {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"}
   ],
   "output": {"format": "tif"}
@@ -562,10 +581,12 @@ POST /v1/analysis.tif
 
 The same pipeline as a `GET` request, using the dotted query encoding (dot = nesting, an
 integer segment = a 1-based list position, comma = a list value -- never inside `where`,
-which is one opaque string):
+which is one opaque string). A list of objects rather than of scalars -- `case.cases` is
+the only one -- is spelled positionally instead of comma-joined, for the same reason:
+`step.3.cases.1.when=value%20%3E%201.0&step.3.cases.1.then=0&step.3.cases.2.when=...`.
 
 ```
-GET /v1/analysis.tif?input.coverage.variable=ffibs_coverage_ratio&input.coverage.time_unit=annual&input.coverage.grid=veg_grid_cell_v001&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&step.1.op=filter&step.1.input=coverage&step.1.where=ffibs_type%20%3D%20%27pl_fm%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.1.as=marsh&step.2.op=filter&step.2.input=salinity&step.2.where=aggregate_type%20%3D%20%272_wk_max%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.2.as=selected_salinity&step.3.op=project&step.3.input=selected_salinity&step.3.to=veg_grid_cell_v001&step.3.as=sal&step.4.op=join&step.4.type=spatial&step.4.inputs=marsh,sal&step.4.as=paired&step.5.op=filter&step.5.where=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.6.op=group&step.6.by=&step.6.aggregate=min&step.6.of=calendar_year&output.format=tif
+GET /v1/analysis.tif?input.coverage.variable=ffibs_coverage_ratio&input.coverage.time_unit=annual&input.coverage.grid=veg_grid_cell_v001&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&step.1.op=filter&step.1.input=coverage&step.1.where=ffibs_type%20%3D%20%27pl_fm%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.1.as=marsh&step.2.op=filter&step.2.input=salinity&step.2.where=aggregate_type%20%3D%20%272_wk_max%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.2.as=selected_salinity&step.3.op=project&step.3.input=selected_salinity&step.3.to=veg_grid_cell_v001&step.3.as=sal&step.4.op=join&step.4.type=spatial&step.4.inputs=marsh,sal&step.4.as=paired&step.5.op=case&step.5.cases.1.when=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.5.cases.1.then=marsh&step.6.op=group&step.6.by=&step.6.aggregate=min&step.6.of=calendar_year&output.format=tif
 ```
 
 And as map tiles, replacing `output.format=tif` with `output.format=png`:

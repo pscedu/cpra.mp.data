@@ -43,11 +43,11 @@ test asks for.
 **The band-wide entries get their own execution classes.** The long-shaped registered
 analyses run through `_run` below; `salinity-veg-investigation` is band-wide end to end and
 is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
-together with a `filter` naming that join's operand value columns, so
+together with a `case` naming that join's operand value columns, so
 `TestSalinityVegInvestigationExecution` runs it separately and pins the two halves apart.
 `lnd-type-plus` is band-wide end to end as well, and is the only entry that collapses a
-band-wide join with a `group` -- whose horizontal reduce IS both its subtraction (`sum`
-over a negated operand) and its "max of the two values" step -- so
+band-wide join of THREE operands with a single paired `case` -- arms that compute and
+reclassify a depth, and an `else` that hands back one of the operands untouched -- so
 `TestLndTypePlusExecution` pins that against a raster small enough to assert pixel by
 pixel.
 """
@@ -478,7 +478,7 @@ class TestSalinityVegInvestigationExecution:
     band-wide end to end, and the only one that exercises the two pieces of machinery a
     paired raster shape needs: a vector-to-raster `project` feeding a band-wide `join`
     (both operands read off ONE `scan_raster`, so their `batch_layout`s agree), and a
-    `filter` whose `where` names the join's OPERAND value columns rather than `value`.
+    `case` whose arm names the join's OPERAND value columns rather than `value`.
     Each is pinned here against the smallest pipeline that isolates it.
     """
 
@@ -501,12 +501,12 @@ class TestSalinityVegInvestigationExecution:
         with rio.open(out) as src:
             assert (src.read(1) == 2040).all()
 
-    def test_a_filter_on_a_band_wide_joins_operand_names_pairs_the_operands(self, base_path, monkeypatch):
+    def test_a_case_on_a_band_wide_joins_operand_names_pairs_the_operands(self, base_path, monkeypatch):
         """The other half, isolated: two RASTER operands (no `project` at all), so the
-        only thing under test is the trailing `filter where="marsh > ... AND sal > ..."`.
-        Both conjuncts name operand value columns, so the filter has to pair each
-        operand's band with its counterpart on the dimensions they share and mask the
-        pair, rather than reading `marsh`/`sal` as dimension names on the band metadata.
+        only thing under test is the trailing `case` on `marsh > ... AND sal > ...`.
+        Both conjuncts name operand value columns, so the arm has to pair each operand's
+        band with its counterpart on the dimensions they share and reduce the pair to one
+        band, rather than reading `marsh`/`sal` as dimension names on the band metadata.
         2030 is (0.3, 4.0) and fails both conjuncts; 2040 is (0.7, 6.0) and passes both,
         so the surviving `min of=calendar_year` is 2040.
         """
@@ -537,7 +537,7 @@ class TestSalinityVegInvestigationExecution:
                     {"op": "filter", "input": "coverage", "where": "ffibs_type = 'pl_fm'", "as": "marsh"},
                     {"op": "filter", "input": "veg_type", "where": "model_group_id = 500", "as": "sal"},
                     {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
-                    {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
+                    {"op": "case", "cases": [{"when": "marsh > 0.5 AND sal > 5.5", "then": "marsh"}]},
                     {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
                 ],
                 "output": {"format": "tif"},
@@ -552,14 +552,12 @@ class TestSalinityVegInvestigationExecution:
 
 
 class TestLndTypePlusExecution:
-    """`lnd-type-plus` is the only registered analysis that collapses a band-wide join with
-    a `group` rather than a `filter`, and it does so twice: once with `sum` over a negated
-    operand, which is how `stage - elevation/1000` is expressed at all, and once with `max`,
-    which is the "max of the two values" step. It also collapses two joins the other way,
-    with a paired `filter` -- the elevation presence guard and the water restriction, each
-    masking one operand by a predicate over the pair. All four are what these tests pin.
-    Every case is a single 2x4 raster whose eight pixels are independent, so one run covers
-    the whole reclassification table plus its edges.
+    """`lnd-type-plus` collapses a band-wide join exactly once, with a paired `case` over
+    all three inputs at once: the arms compute `stage - elevation/1000`, reclassify it, and
+    claim it only where the land type beneath it is open water, while the `else` hands back
+    that land type everywhere they do not. That one step IS the result, and it is what these
+    tests pin. Every case is a single 2x4 raster whose eight pixels are independent, so one
+    run covers the whole reclassification table plus its edges.
 
     Depths are never stored -- `write_lnd_type_plus_datasets` writes the elevation that
     produces each one against a uniform projected stage, so a test that says `0.46` is
@@ -592,8 +590,8 @@ class TestLndTypePlusExecution:
         | 0.47    | 7        | just past it, so the mid class                         |
         | 1.00    | 7        | the second bound likewise belongs below                |
         | 1.01    | 2        | just past it -- deep, so the water shows through       |
-        | 0.00    | 2        | zero is NOT inundation: the leading `value > 0` filter |
-        |         |          | masks it and the land type stands alone                |
+        | 0.00    | 2        | zero is NOT inundation: no arm claims it and the       |
+        |         |          | absent `else` masks it, so the land type stands alone  |
 
         Every interval is open at its lower bound and closed at its upper one, so each
         bound is pinned from both sides. The bound rows are only meaningful at the
@@ -617,7 +615,7 @@ class TestLndTypePlusExecution:
         """The water restriction, across every land type at ONE shallow depth. `max` alone
         would put a `6` over all eight pixels -- `6` outranks every `lnd_type` code -- so
         anything but `[…, 6, …]` at the two water pixels and the land type everywhere else
-        means the mask ahead of the final join stopped doing its job.
+        means the `land_type = 2` conjunct every arm carries stopped doing its job.
 
         Pixel 5's land type is nodata, which is not water either: there is nothing to call
         water, so the depth is masked too and the pixel has no contributor left at all.
@@ -640,9 +638,8 @@ class TestLndTypePlusExecution:
         """Depth is COMPUTED, so the `project` that carries stage from the compartment grid
         onto the pixel grid has to actually contribute. Here every elevation is ABOVE the
         datum (+0.10 m, written as 100 mm), so the only way any pixel reads as inundated is
-        if the 0.30 m stage was added to it: dropped, each depth would be -0.10 m, masked by
-        the `value > 0` filter, and every pixel would read as its land type -- `2` here, not
-        `6`.
+        if the 0.30 m stage was added to it: dropped, each depth would be -0.10 m, which no
+        arm claims, and every pixel would read as its land type -- `2` here, not `6`.
         """
         write_lnd_type_plus_datasets(
             base_path,
@@ -657,11 +654,13 @@ class TestLndTypePlusExecution:
     def test_a_pixel_with_stage_but_no_elevation_is_masked_rather_than_read_as_bare_stage(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
-        """The presence guard. The band-wide `sum` SKIPS nulls rather than propagating them,
-        so without the paired `IS NOT NULL` filter ahead of it a pixel with stage and no
-        elevation would sum to the BARE STAGE -- 0.30 m here, a perfectly plausible shallow
-        depth -- and paint class 6 across whatever the elevation surface does not cover.
-        Guarded, pixel 0 contributes nothing and its land type stands alone.
+        """The presence requirement, carried by the arms rather than by anything the engine
+        adds: `stage_m - elevation / 1000` is null when either term is null, a null predicate
+        is false, and so a pixel with stage and no elevation matches no arm and takes the
+        `else`. Stated the other way, the arithmetic never has to answer for a missing
+        operand -- and the formulation this replaced DID answer, with the BARE STAGE (0.30 m
+        here, a perfectly plausible shallow depth), painting class 6 across whatever the
+        elevation surface does not cover. Here pixel 0 reads as its land type alone.
         """
         write_lnd_type_plus_datasets(
             base_path,
@@ -676,12 +675,12 @@ class TestLndTypePlusExecution:
     def test_a_pixel_that_is_not_inundated_falls_back_to_its_land_type(
         self, morph_pixel_v002_shrunk, base_path, tmp_path, crosswalk_path
     ):
-        """Where the depth half has nothing to say it is MASKED rather than defaulted -- a
-        masked operand contributes nothing to the max, so the land type stands alone.
+        """Where the depth half has nothing to say, no arm claims the pixel and the `else`
+        hands back the land type unchanged.
 
         Pixels 0-3 are DRY: the elevation stands above the water level (a negative depth) or
-        exactly at it (zero), which the `value > 0` filter masks, and each pixel's own land
-        type comes through -- including pixel 2, which is open water that simply is not
+        exactly at it (zero), which the last arm's `> 0` leaves unclaimed, and each pixel's
+        own land type comes through -- including pixel 2, which is open water that simply is not
         inundated this year and must read as `2` rather than as any depth class. Pixels 4-7
         are real depths over water, so the depth class stands.
         """
@@ -697,11 +696,13 @@ class TestLndTypePlusExecution:
     def test_a_pixel_outside_both_domains_stays_nodata(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
-        """The cases with no contributor at all: masking rather than defaulting is what keeps
-        them distinguishable from a real class. Pixel 0 has neither an elevation nor a land
-        type. Pixel 7 has a real depth but no land type -- which is not water, so the water
-        restriction masks the depth too and nothing is left; it is the one place the
-        restriction turns a pixel that used to carry a class into nodata.
+        """The cases with nothing to report at all. `land_type` is on both sides of the
+        `case` -- every arm's water conjunct and the `else` -- so a pixel without one is
+        nodata whatever its depth says, which is what keeps "unknown" distinguishable from a
+        real class. Pixel 0 has neither an elevation nor a land type. Pixel 7 has a real
+        depth but no land type -- which is not water, so the restriction declines the depth
+        and the `else` has nothing to hand back; it is the one place the restriction turns a
+        pixel that used to carry a class into nodata.
         """
         write_lnd_type_plus_datasets(
             base_path,
@@ -718,7 +719,7 @@ class TestLndTypePlusExecution:
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
         """`calendar_year` is a parameter rather than a filter here, but it still lands on
-        the same leading `filter` steps -- and the trailing `group` KEEPS the dimension, so a
+        the same trailing `filter` step -- and the `group` past it KEEPS the dimension, so a
         leaked year would surface as a second band rather than corrupting 2050's.
         """
         write_lnd_type_plus_datasets(
@@ -735,9 +736,9 @@ class TestLndTypePlusExecution:
     def test_omitting_calendar_year_keeps_every_year_as_its_own_band(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
-        """`calendar_year` is the one optional parameter. Omitted, the leading filters pin
-        only the model group and scenario, and the `group.by` still carries the year -- so
-        each year is reduced against its OWN counterpart band rather than across years.
+        """`calendar_year` is the one optional parameter. Omitted, the filter pins only the
+        model group and scenario, and the `case`'s pairing still keys on the year -- so each
+        year is reclassified against its OWN counterpart bands rather than across years.
         """
         write_lnd_type_plus_datasets(
             base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040
@@ -752,7 +753,7 @@ class TestLndTypePlusExecution:
                 description: src.read(index).ravel().tolist()
                 for index, description in enumerate(src.descriptions, start=1)
             }
-            # A grouped band is described by its whole `group.by` tuple, not the calendar
+            # A paired band is described by its whole pairing key, not the calendar
             # dimension alone -- the year is the last conjunct of the three.
             assert {d: set(v) for d, v in by_year.items()} == {
                 "model_group_id=705, scenario_id=7, calendar_year=2040": {6},
@@ -762,9 +763,9 @@ class TestLndTypePlusExecution:
     def test_another_scenario_on_disk_does_not_reach_the_join(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
-        """`scenario_id` is pinned by the leading filters and kept by the `group`, so a
-        second scenario is neither reduced into 7's band nor added as a band of its own. It
-        is written with values that would be unmistakable either way.
+        """`scenario_id` is pinned by the filter and keyed on by the pairing, so a second
+        scenario is neither collapsed into 7's band nor added as a band of its own. It is
+        written with values that would be unmistakable either way.
         """
         write_lnd_type_plus_datasets(
             base_path, crosswalk_path, depths=[0.20] * 8, land_types=[4] * 8, scenario_id=8
@@ -775,3 +776,66 @@ class TestLndTypePlusExecution:
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
             assert src.count == 1
             assert set(src.read(1).ravel().tolist()) == {2}
+
+
+class TestLndTypePlusNarrowsItsReads:
+    """`lnd-type-plus` states the caller's selection ONCE, past the join, rather than as a
+    leading `filter` per input -- see "Why the selection is stated once, at the end" in
+    `analyses/lnd_type_plus.py`. That is only affordable because `execution.plan`'s dimension
+    passes push a post-join conjunct back to every origin's READ, so the cost of writing it
+    honestly is the cost of writing it at the front.
+
+    Nothing about the RESULT would change if that stopped working -- the `filter` step still
+    re-executes over the joined frame -- so the tests above would all still pass while the
+    analysis quietly read `elev` and `lnd_type` whole (178 and 179 bands at production size).
+    These two compile the pipeline and assert the band counts instead: one with the year
+    pinned, one with it omitted, so the narrowing is measured against what is actually on
+    disk rather than asserted in a vacuum.
+    """
+
+    @staticmethod
+    def _compile(base_path, crosswalk_path, params):
+        resolved = resolve_analysis("lnd-type-plus", dataset=None, filters={}, params=params)
+        validate_shapes(resolved.pipeline)
+        return compile_plan(resolved.pipeline, base_path=base_path)
+
+    @staticmethod
+    def _write_two_years(base_path, crosswalk_path):
+        for year in (2040, 2050):
+            write_lnd_type_plus_datasets(
+                base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=year
+            )
+
+    def test_a_selection_declared_after_the_join_still_narrows_both_raster_reads(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """Two years on disk, one selected: both raster origins resolve to the selected
+        band alone, even though the only `filter` naming `calendar_year` is written on the
+        fully joined frame, a join and a `project` downstream of either read.
+
+        The vector input narrows too, through the other pass -- a `scan_vector` predicate
+        rather than a band list -- so the projected stage surface is one band as well.
+        """
+        self._write_two_years(base_path, crosswalk_path)
+        plan = self._compile(base_path, crosswalk_path, LND_TYPE_PLUS_PARAMS)
+        for name in ("elevation", "land_type"):
+            assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2050]
+        assert [
+            metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()
+        ] == [[2050]]
+
+    def test_omitting_the_year_leaves_both_raster_reads_whole(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """The control for the test above: `calendar_year` is the one optional parameter, and
+        dropping it is the only difference between the two. Both years survive, which is what
+        makes the single-band result above a narrowing rather than an empty dataset.
+        """
+        self._write_two_years(base_path, crosswalk_path)
+        params = {k: v for k, v in LND_TYPE_PLUS_PARAMS.items() if k != "calendar_year"}
+        plan = self._compile(base_path, crosswalk_path, params)
+        for name in ("elevation", "land_type"):
+            assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2040, 2050]
+        assert [
+            metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()
+        ] == [[2040, 2050]]

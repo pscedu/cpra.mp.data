@@ -140,6 +140,13 @@ class TestLoweringTableAgreement:
         # unconditionally shape-preserving) -- the declared domain is `Shape` itself.
         assert self._registered("calculate") == set(Shape)
 
+    def test_case_shapes_are_fully_covered(self):
+        # Same reading as `calculate`: `_type_case` types a `case` unconditionally
+        # shape-preserving (its arms are value predicates, and only a spatial one could
+        # change shape -- which `_type_case` rejects outright), so there is no table to
+        # consult and the declared domain is `Shape` itself.
+        assert self._registered("case") == set(Shape)
+
     def test_group_shapes_are_fully_covered(self):
         assert self._registered("group") == set(Shape)
 
@@ -150,13 +157,14 @@ class TestLoweringTableAgreement:
         assert self._registered("project") == set(PROJECT_LOWERING_TABLE)
 
     def test_every_registered_lowering_is_named_by_a_table(self):
-        # The other direction, across all five ops at once: no entry may sit in
+        # The other direction, across all six ops at once: no entry may sit in
         # `_LOWERINGS` under an op kind the request layer does not type, or under a key
         # that op's own declared domain does not contain.
         domains = {
             "filter": {shape for (_kind, shape) in FILTER_LOWERING_TABLE},
             "join": set(JOIN_LOWERING_TABLE),
             "calculate": set(Shape),
+            "case": set(Shape),
             "group": set(Shape),
             "project": set(PROJECT_LOWERING_TABLE),
         }
@@ -291,6 +299,25 @@ class TestEndToEnd:
         assert df.height == 32
         expected = sorted(4070 + 2 * g / 100 for g in range(1, 33))
         assert sorted(df["value"].to_list()) == pytest.approx(expected, abs=1e-3)
+
+    def test_case_reclassifies_through_the_walk(self, annual_dataset):
+        # The two years straddle the one bound, so both branches are exercised in one
+        # result: 2040's 32 cells match the arm, 2030's 32 fall through to the `else`. A
+        # `case` never drops a row, so the height is the full 64 either way -- which is
+        # what separates it from the `filter` this replaces in `land-type-confidence`.
+        df = self._run(
+            annual_dataset,
+            [
+                {
+                    "op": "case",
+                    "input": "a",
+                    "cases": [{"when": "value > 2035", "then": "1"}],
+                    "else": "0",
+                }
+            ],
+        )
+        assert df.height == 64
+        assert sorted(df["value"].value_counts().rows()) == [(0.0, 32), (1.0, 32)]
 
     def test_execute_dispatches_join_through_the_walk(self, monkeypatch):
         # `join_long`'s own correctness (key computation, renaming) is already covered by
@@ -513,6 +540,41 @@ class TestBandWideEndToEnd:
         assert metadata_df.height == 1
         assert band_column_names(metadata_df) == ["b0"]
 
+    def test_case_reclassifies_band_wide_through_the_walk(self, base_path):
+        # b0 (2030) fills 30, b1 (2040) fills 40, and the two arms straddle 35 -- so the
+        # two bands take different branches and neither can be right by accident. The
+        # `group sum` afterwards is what proves the frame stayed BAND-WIDE across the
+        # `case`: 1 + 2 = 3 only if both bands survived it as bands.
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
+                "steps": [
+                    {
+                        "op": "case",
+                        "input": "a",
+                        "cases": [{"when": "value > 35", "then": "2"}, {"when": "value > 0", "then": "1"}],
+                        "as": "classed",
+                    },
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.frame_types["classed"].shape is Shape.band_wide
+
+        lf, metadata_df, _window = execute(plan, base_path=base_path)
+        df = lf.collect()
+
+        assert df.columns == ["b0"]
+        assert band_column_names(metadata_df) == ["b0"]
+        stats = df.select(
+            pl.col("b0").min().alias("min"), pl.col("b0").max().alias("max")
+        ).row(0, named=True)
+        assert stats["min"] == pytest.approx(3)
+        assert stats["max"] == pytest.approx(3)
+
     def test_spatial_filter_turns_the_frame_long_mid_walk(self, base_path):
         # Same two-band fixture as above. `grid_cell == 0` is a SPATIAL conjunct, so
         # `band_ops.filter_band_wide` dispatches to `sample_grid_cells_band_wide`, which
@@ -720,6 +782,117 @@ class TestBandWideEndToEnd:
         assert len(calls) == 1
         assert df.columns == ["b0"]
         assert df["b0"].unique().to_list() == pytest.approx([15.0])
+
+    def test_one_shared_scan_still_aligns_operands_narrowed_by_different_amounts(
+        self, base_path, monkeypatch
+    ):
+        # The shared scan above, with the symmetry that made it obviously safe taken away.
+        # `_merge_shared_origin_groups` fuses a join's origins into one `scan_raster` call
+        # because chunking follows band count and `join_band_wide` aligns positionally --
+        # both of which were easy to believe when every origin contributed its whole band
+        # list. The dimension pushdown narrows origins independently, so here `a` is down
+        # to one band (a filter on its own side) while `b` keeps both of its: one scan over
+        # three bands, and each origin's slice out of it a different width.
+        #
+        # `sum` is what checks that each slice landed on its OWN bands rather than on the
+        # first N of the combined scan: 20 (`a`'s 2040) + 5 (`b`'s 2030) + 7 (`b`'s 2040)
+        # is 32, and no other assignment of those three bands to those two origins reaches
+        # it.
+        write_raster_dataset(
+            base_path,
+            years=(2030, 2040),
+            variable="vct",
+            data_fn=lambda year: raster_array(
+                fill=10 if year == 2030 else 20, grid_name=RASTER_GRID, dtype="int32"
+            ),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030, 2040),
+            variable="ffibs_score",
+            data_fn=lambda year: raster_array(
+                fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"
+            ),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "fa"},
+                    {"op": "join", "type": "spatial", "inputs": ["fa", "b"], "as": "j"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2040]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+        from cpra.mp.data.analysis.io.raster import scan_raster as real_scan_raster
+
+        calls = []
+
+        def counting_scan_raster(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_scan_raster(*args, **kwargs)
+
+        monkeypatch.setattr(execute_module, "scan_raster", counting_scan_raster)
+
+        df = execute(plan, base_path=base_path)[0].collect()
+
+        assert len(calls) == 1
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == pytest.approx([32.0])
+
+    def test_a_post_join_conjunct_that_empties_one_operand_still_runs(self, base_path):
+        # `plan.py`'s join-sibling floor, end to end. `a` has only 2030, `b` has 2030 and
+        # 2040, and the conjunct -- declared AFTER the join, so it reads paired metadata --
+        # asks for 2040. `b`'s 2040 row pairs with no `a` row, so the narrowing leaves `a`
+        # with zero bands beside a one-band `b`: correct as an answer and unreadable as a
+        # plan, since `join_band_wide` needs both operands to hand it the same pixel row
+        # count. Without the floor this raises `partial zero-band mismatch` on a pipeline
+        # that is perfectly legal, and that used to work when nothing was pushed at all.
+        #
+        # 7.0 -- `b`'s 2040 fill alone -- is the answer with no pushdown whatsoever, which
+        # is the point: the band `a` keeps is read and then dropped again by the `filter`
+        # step re-executing over the joined frame, so it costs one band of I/O and changes
+        # nothing.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        write_raster_dataset(
+            base_path,
+            years=(2030, 2040),
+            variable="ffibs_score",
+            data_fn=lambda year: raster_array(
+                fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"
+            ),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "filter", "input": "j", "where": "calendar_year = 2040", "as": "d"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2040]
+
+        df = execute(plan, base_path=base_path)[0].collect()
+
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == pytest.approx([7.0])
 
     def test_raster_to_vector_project_runs_through_execute(self, base_path, crosswalk_path):
         # A constant-fill (10) raster and a crosswalk with ONE zone covering the whole

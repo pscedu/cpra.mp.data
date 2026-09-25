@@ -166,9 +166,14 @@ an observation dimension a band should be split on) become bands, sorted for a
 deterministic, re-run-stable band order (Polars offers no ordering guarantee for a plain
 `.unique()`/`.group_by()` otherwise -- `band_column_names`' positional-naming invariant
 requires SOME fixed order, and "whatever order the source file happened to store rows in"
-is not one). Each combination's per-source-cell values are pivoted into one column, then
-that small, per-source-cell-keyed wide table is joined onto the crosswalk's per-pixel zone
-column with `maintain_order="left"` -- broadcasting each pixel to the value of the polygon
+is not one). Each combination's per-source-cell values are pivoted into one column -- a
+LAZY pivot, declaring the band list it already settled as `on_columns`, so the whole
+direction is one unbroken `LazyFrame` chain rather than a Python round trip in the middle
+of one. That is a continuity win and not a memory one: a pivot is still a pipeline breaker,
+and the frame it materializes internally is the small per-source-cell table (one row per
+vector cell, one column per band), never the pixel frame. Then that small,
+per-source-cell-keyed wide table is joined onto the crosswalk's per-pixel zone column with
+`maintain_order="left"` -- broadcasting each pixel to the value of the polygon
 its zone id names, in one pass, with NO aggregation (`request.aggregates.
 validate_project_aggregate` already requires `op.aggregate is None` for this direction,
 enforced upstream; this function does not re-check it, matching this module's stance
@@ -215,6 +220,7 @@ import polars as pl
 from cpra.mp.data.analysis.execution.fold import fold_count_by_value, fold_group_by, should_fold_group_by
 from cpra.mp.data.analysis.execution.frame import (
     DOMAIN_COLUMN,
+    RESERVED_BAND_INDEX_COLUMN,
     BandWideFrame,
     LongFrame,
     ReadWindow,
@@ -223,11 +229,12 @@ from cpra.mp.data.analysis.execution.frame import (
     drop_reserved_band_index,
     has_no_bands,
 )
+from cpra.mp.data.analysis.io.catalog import band_dimension_columns
 from cpra.mp.data.analysis.io.crosswalk_read import read_vector_crosswalk, resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.request.aggregates import validate_count_by_value_cardinality
 from cpra.mp.data.analysis.request.ops import FrameType, ProjectOp
-from cpra.mp.data.analysis.request.pipeline import DATASET_SELECTION_COLUMNS
+from cpra.mp.data.analysis.request.pipeline import ZONE_COLUMN
 from cpra.mp.data.config import COUNT_BY_VALUE_MAX_DISTINCT
 
 __all__ = [
@@ -458,7 +465,11 @@ def project_vector_to_vector(
 #: this column at open time, on a raster origin `ResolvedInput.straddling_vector_grid`
 #: names, so it needs the same name this module reads by. Double-underscored regardless,
 #: so it still cannot collide with a dataset dimension riding along on `metadata_df`.
-ZONE_COLUMN = "__zone__"
+#:
+#: Defined in `request/pipeline.py` and re-exported here, for the same reason
+#: `frame.DOMAIN_COLUMN` is: `request.ops`' shape-typing walk records which frames carry it
+#: (`FrameType.extra_columns`) so a `where` naming it classifies as a per-pixel predicate
+#: rather than a band selection, and the request layer may not import this one.
 
 
 class ZoneSource(NamedTuple):
@@ -620,24 +631,25 @@ def project_raster_to_vector(
     return _readdress(with_metadata, op.to)
 
 
-def _pivot_dimension_columns(lf: pl.LazyFrame) -> list[str]:
-    """Every column of `lf` that should become a PIVOTED BAND dimension for
-    `project_vector_to_raster` -- everything except `grid_cell`/`value` (same exclusion
-    `_dimension_columns` above makes) and, in addition, `request.pipeline.
-    DATASET_SELECTION_COLUMNS` (`variable`, `time_unit`, `grid`): those three name WHICH
-    DATASET a row came from, not an observation dimension a band split should honor, the
-    same reasoning `execution.long_ops.join_long` already applies before computing its own
-    join key columns. Leaving them in would either pivot on a column that never varies
-    (harmless but wasteful) or, worse, leave a stale source-grid value sitting in
-    `metadata_out` once the frame addresses a raster grid instead of `lf`'s own vector one
-    -- the same stale-column problem `_readdress` exists to fix on the long side, avoided
-    here by never carrying the column onto a per-band identity in the first place.
+def _enumerate_bands(lf: pl.LazyFrame, dim_cols: list[str]) -> pl.DataFrame:
+    """`project_vector_to_raster`'s bands, derived from the DATA rather than from the plan
+    -- the fallback for a projection `execution.plan.compile_plan` could not enumerate (see
+    that function's `band_metadata` paragraph).
+
+    One row per distinct combination of `dim_cols`, sorted by them, which is the band order
+    the projection emits. `group_by` (never `select`) even in the `dim_cols == []` case, so
+    a frame with no pivot dimension at all still reports a height of 1 rather than hitting
+    the "zero columns loses the row count" Polars gap `execution/frame.py`'s module
+    docstring describes -- the identical move `execution.band_ops.group_band_wide` makes for
+    its own `by == []` branch, on a different frame.
+
+    Executes `lf`. That is the cost this exists to avoid paying, and why the planner
+    answers it instead wherever it can.
     """
-    return [
-        name
-        for name in lf.collect_schema().names()
-        if name not in ("grid_cell", "value") and name not in DATASET_SELECTION_COLUMNS
-    ]
+    combo_df = lf.group_by(dim_cols, maintain_order=True).agg(pl.len().alias("__n__")).collect()
+    if dim_cols:
+        return combo_df.sort(dim_cols).select(dim_cols)
+    return add_reserved_band_index(combo_df).drop("__n__")
 
 
 def project_vector_to_raster(
@@ -645,6 +657,7 @@ def project_vector_to_raster(
     op: ProjectOp,
     frame_types: dict[str, FrameType],
     zone_source: ZoneSource | None = None,
+    band_metadata: pl.DataFrame | None = None,
 ) -> BandWideFrame:
     """The `("project", ("vector", "raster"))` lowering: broadcast `frames[op.input]`'s
     rows onto `op.to`'s pixels via the raster-to-vector crosswalk between `op.to` (the
@@ -653,11 +666,32 @@ def project_vector_to_raster(
     for this direction and this function does not re-check it (aggregate legality is a
     request-layer concern, already enforced before a lowering ever runs).
 
-    Distinct combinations of `frames[op.input]`'s own dimension columns (via
-    `_pivot_dimension_columns`) become bands, sorted for a deterministic, re-run-stable
+    Distinct combinations of `frames[op.input]`'s own dimension columns (which columns
+    those are is `io.catalog.band_dimension_columns`' rule, shared with the plan-time
+    enumeration below) become bands, sorted for a deterministic, re-run-stable
     order; see the module docstring's "pivot to bands, then broadcast" note for the full
     reasoning, including why `DATASET_SELECTION_COLUMNS` is excluded and why the crosswalk
     join uses `maintain_order="left"`.
+
+    **`band_metadata` is that combination list, decided at PLAN time.** `execution.plan.
+    compile_plan` enumerates it with `io.catalog.resolve_vector_bands` -- the vector half of
+    the same question `resolve_raster_bands` answers for a raster input -- and hands it down
+    here, which is what lets this step's width be checked against `config.
+    ANALYSIS_BAND_CEILING` before anything is read, and what removes the `collect()` that
+    otherwise had to execute the frame just to learn how many columns it was about to have.
+    The enumeration is made against the SAME pushdown the scan gets, so in the ordinary case
+    it names exactly the combinations present; where a later step narrows the frame further
+    than the reader was told (a `filter` that fan-out made unsafe to push, say), a declared
+    combination can have no rows, and it comes back as an all-null band rather than silently
+    vanishing and shifting every later band index. That is deliberate: a band's identity is
+    a property of the request, as it already is on the raster side, not of which rows
+    happened to survive.
+
+    `band_metadata` is `None` for a direct call with no plan behind it, and is also ignored
+    -- falling back to the execution-time enumeration -- if its columns do not match the
+    incoming frame's pivot columns. The planner cannot always trace a projection back to a
+    single origin (a `join` or a fan-out upstream ends that), and a mismatch is how it says
+    so; the check is a schema comparison, so the fallback costs nothing to guard against.
 
     **Where the crosswalk read comes from: `zone_source`, when the walk has one to give.**
     There is no data raster on this direction's input side at all, so the crosswalk
@@ -711,31 +745,47 @@ def project_vector_to_raster(
         zone_band_wide_lf, _zone_metadata, window = scan_raster(crosswalk_metadata)
         zone_lf = zone_band_wide_lf.select(pl.col("b0").alias(ZONE_COLUMN))
 
-    dim_cols = _pivot_dimension_columns(lf)
-    # `group_by` (never `select`) even in the `dim_cols == []` case, so a frame with no
-    # pivot dimension at all still reports a height of 1 rather than hitting the "zero
-    # columns loses the row count" Polars gap `execution/frame.py`'s module docstring
-    # describes -- the identical move `execution.band_ops.group_band_wide` makes for its
-    # own `by == []` branch, on a different frame.
-    combo_df = lf.group_by(dim_cols, maintain_order=True).agg(pl.len().alias("__n__")).collect()
-    band_count = combo_df.height
+    schema = lf.collect_schema()
+    dim_cols = band_dimension_columns(schema.names())
+    # `[RESERVED_BAND_INDEX_COLUMN]` is what a no-dimension enumeration looks like -- see
+    # `_enumerate_bands`, and `execution/frame.py`'s module docstring for why the column
+    # has to be there at all.
+    if band_metadata is not None and band_metadata.columns == (dim_cols or [RESERVED_BAND_INDEX_COLUMN]):
+        metadata_out = band_metadata
+    else:
+        metadata_out = _enumerate_bands(lf, dim_cols)
+    band_count = metadata_out.height
 
     if dim_cols:
-        combo_df = combo_df.sort(dim_cols)
-        metadata_out = combo_df.select(dim_cols)
-        band_index_df = combo_df.select(dim_cols).with_row_index("__band_idx__")
+        band_index_df = metadata_out.with_row_index("__band_idx__")
         keyed = lf.join(band_index_df.lazy(), on=dim_cols, how="inner")
     else:
-        metadata_out = add_reserved_band_index(combo_df).drop("__n__")
         keyed = lf.with_columns(pl.lit(0, dtype=pl.UInt32).alias("__band_idx__"))
 
-    wide = keyed.select("grid_cell", "__band_idx__", "value").collect().pivot(
-        on="__band_idx__", index="grid_cell", values="value"
+    # `LazyFrame.pivot` takes `on_columns` as a REQUIRED argument where the eager form
+    # discovers them from the data: a lazy pivot cannot learn its own output schema by
+    # executing, so the caller has to declare it -- which is exactly the band list settled
+    # above. Declaring it is also what makes the absent-band rule fall out rather than be
+    # patched on afterwards: a declared index with no rows comes back as an all-null column
+    # of `value`'s own dtype, in declared position, instead of vanishing and shifting every
+    # later band (see the docstring's paragraph on `band_metadata`). `pivot` names its
+    # columns after the `on` VALUES, hence the `str(k)` -> `b{k}` rename.
+    #
+    # `maintain_order=False` (the lazy default, stated here because the eager default is
+    # the opposite): this frame is only ever the RIGHT side of the `maintain_order="left"`
+    # join below, so its own row order never reaches the result and there is no reason to
+    # pay for it.
+    wide = keyed.select("grid_cell", "__band_idx__", "value").pivot(
+        "__band_idx__",
+        on_columns=list(range(band_count)),
+        index="grid_cell",
+        values="value",
+        maintain_order=False,
     )
     wide = wide.rename({str(k): f"b{k}" for k in range(band_count)})
 
     broadcast = zone_lf.join(
-        wide.lazy(), left_on=ZONE_COLUMN, right_on="grid_cell", how="left", maintain_order="left"
+        wide, left_on=ZONE_COLUMN, right_on="grid_cell", how="left", maintain_order="left"
     )
     # The zone itself rides along as `DOMAIN_COLUMN` -- see that constant's own comment.
     # It is the zone COLUMN, not a derived boolean, because null-vs-not is the entire

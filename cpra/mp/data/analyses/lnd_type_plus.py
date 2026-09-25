@@ -2,83 +2,111 @@
 surface with two SHALLOW-INUNDATION classes the morphology model's land types do not
 themselves distinguish. Annual inundation depth is COMPUTED here rather than read: mean
 annual stage (`stg`/annual/`hydro_compartment_v002`, `aggregate_type=mean`) is projected
-onto `morph_pixel_v002` and topobathymetric elevation (`elev`/annual/`morph_pixel_v002`,
-stored in millimetres) is subtracted from it. That depth is reclassified to `6` (inundated,
-no deeper than 0.46 m), `7` (deeper than 0.46 m, no deeper than 1.0 m) or `0` (deeper than
-1.0 m), spatially joined against annual land type (`lnd_type`/annual/`morph_pixel_v002`),
-and the two are reduced to the MAX of the pair at every pixel.
+onto `morph_pixel_v002`, spatially joined against topobathymetric elevation
+(`elev`/annual/`morph_pixel_v002`, stored in millimetres) and annual land type
+(`lnd_type`/annual/`morph_pixel_v002`), and the difference of the first two is reclassified
+where the third says open water: `6` (inundated, no deeper than 0.46 m), `7` (deeper than
+0.46 m, no deeper than 1.0 m), and `2` -- plain open water -- deeper than that. Everything
+the reclassification does not claim is the land type, unchanged.
 
-**Why a max, and why `0` for deep water.** `lnd_type`'s own codes are `1`-`5` (see
-`structure/legends.csv`: vegetated wetland, open water, bare/unvegetated wetland,
-upland/developed, flotant marsh), so the two new codes sit ABOVE all of them and a
-`max` lets either shallow class override the land type the cell carries. The deep
-class is `0`, which is below every real land-type code and is therefore the identity
-element of that same `max`: at a cell inundated by a metre or more, the land type shows
-through unchanged. One aggregate expresses both halves of the rule because the code
-values were chosen to make it do so -- this analysis does not get to choose them, and
-picking a different reduction would silently change what `6`/`7`/`0` mean.
+The whole analysis is five steps and one join -- filter stage to its aggregate type,
+project it onto the pixel grid, join all three inputs, state the caller's selection, and
+reclassify with a single `case`. There is no reduce: the `case` is total, its `else` is
+`land_type`, and the result's domain is `lnd_type`'s own `1`-`5` plus the two new codes.
+
+**Why deep water has no code of its own.** The output domain is what
+`structure/legends.csv` publishes for the `lnd_type_plus` legend: values `1`-`7`, with `2`
+labelled "Water - Deep". Deep water is not reclassified at all -- it is simply water, and
+only the two shallow classes say something `lnd_type` could not. So the deepest class's
+`then` IS `WATER_LAND_TYPE`, and its arm returns exactly what the `else` would have. It is
+still load-bearing, and not because of its value: the arms are first-match-wins in
+DESCENDING order of bound, so the `> 1.0` arm is what stops a 1.5 m depth from falling
+through to the `> 0.46` arm and reporting `7`. It claims deep water in order to withhold it
+from the shallow classes, and hands back the land type when it does.
 
 **Why the shallow classes are confined to water.** The rule this analysis implements
 subdivides OPEN WATER (`lnd_type = 2`) by depth; it does not reclassify land. That the two
 should coincide -- a positive depth means the water level stands above the ground, which is
-water -- is a property of the two input surfaces agreeing, not something the `max` enforces:
-`max` takes `6` over any land-type code, so a single pixel where the elevation and land-type
-surfaces disagree (independently modelled, and at the coastline they do) would silently
-report shallow inundation over marsh or upland. So the restriction is stated rather than
-assumed. `depth_class` is joined against `land_type` once and masked by `land_type = 2`
-before the real join -- the same paired-filter idiom as the presence guard above, collapsing
-to the first-named operand (`depth_class`) masked wherever the land type underneath is
-anything else. A masked depth contributes nothing to the `max`, so a non-water pixel reads
-as its own land type no matter how deep the depth surface says it is.
+water -- is a property of the two input surfaces agreeing, and they are independently
+modelled, so at the coastline they disagree. A pixel where they do would otherwise report
+shallow inundation over marsh or upland. So the restriction is stated rather than assumed --
+as an `AND land_type = 2` conjunct on EVERY arm of the one `case` below, which is why
+`land_type` is an operand of the same join the depth's two operands arrive on. No arm
+matches off water, and the `else` hands back the land type, so a non-water pixel reads as
+its own land type no matter how deep the depth surface says it is.
 
-One consequence worth naming: `0` can no longer reach the output. It survives the mask only
-over water, where `max(0, 2)` is `2` -- so deep water reads as plain open water and the
-result's domain is `1`-`7`, not `0`-`7`. The deep class is still what keeps deep water OUT
-of `6`/`7` rather than a code that appears in its own right -- which is why the
-`lnd_type_plus` legend this analysis declares labels `2` "Water - Deep" and has no entry
-for `0` at all.
+**Why the depth is computed inside the `case` arms.** A `calculate` over a paired
+band-wide frame is rejected outright (a band-wide frame's bands are positional, so an
+expression has no per-operand column to name -- see `request.ops._type_calculate`), so
+`stage_m - elevation` cannot be written as a step of its own over the joined operands. A
+`case` CAN name them, because its arms are checked against the frame's value namespace and
+over a joined frame that namespace is the operand names themselves; band-wide, each group's
+names are rewritten to that group's own band columns before the expression is compiled
+(`execution.band_ops.case_band_wide`). So the subtraction is written where it is used,
+inside each arm's `when`, against operands one `join` brought together. Millimetres to
+metres rides along in the same expression (`elevation / 1000`), which is why there is no
+`calculate` on elevation's own branch either: one shared `depth` string says it once for
+all three arms, with no step and no intermediate name to carry it.
 
-**Why the depth is a `join` + `group sum` rather than one subtraction.** A `calculate`
-over a paired band-wide frame is rejected outright (a band-wide frame's bands are
-positional, so an expression has no per-operand column to name -- see
-`request.ops._type_calculate`), so `stage - elevation` cannot be written as an expression
-over the joined pair. The subtraction is instead the shape `difference` uses: NEGATE one
-operand with a `calculate` on its own branch (`value / -1000`, which converts millimetres
-to metres and flips the sign in one pass), then `join` and reduce with `{"aggregate":
-"sum"}`, whose band-wide lowering (`execution.band_ops.group_band_wide`) is a horizontal
-add across each group's bands. The same lowering, with `max`, is what the trailing group
-does for the land-type pairing.
+Neither the join nor the `case` is limited to two operands: `pipeline.JoinStep.inputs` is
+`min_length=2`, and `band_ops._pair_band_groups` keys on the dimensions the operands share
+and requires exactly one band per operand per group, for any number of them. That is what
+lets stage, elevation and land type arrive on ONE join and be reclassified by ONE `case`,
+instead of pairing the depth's two operands, collapsing them, and joining the land type in
+afterwards to restrict on it.
 
-**The presence guard before that sum.** A horizontal `sum` SKIPS nulls rather than
-propagating them -- it emits its `no_contributor` null only where EVERY contributing band
-is null. Left alone, a pixel carrying stage but no elevation would sum to the bare stage
-(a NAVD88 water level, typically a few tenths of a metre) and reclassify as a real shallow
-class, painting inundation across whatever the elevation surface does not cover. So the
-two operands are joined once before the arithmetic and filtered on `IS NOT NULL` on both
-sides: a value filter over a paired band-wide frame pairs each operand's band with its
-counterpart and masks the pair (`execution.band_ops.pair_and_mask_band_wide`), collapsing
-to the FIRST-named operand's value -- stage, here, masked wherever elevation is missing.
-That masked stage is what the real join then adds the negated elevation to, so a pixel
-missing either input contributes nothing and stays nodata.
+**The presence requirement is carried by the arms, and costs no step.** `case` adds no
+nodata guard of its own (see `execution.long_ops.case_expression` for why it no longer
+does), so what a pixel missing an operand does here is whatever the arms and the `else`
+SAY. Missing stage or elevation makes the depth null, a null predicate is `fill_null(False)`
+(`expressions.value_predicate_mask`), so no arm matches and the `else` reads the land type
+alone -- the right answer, since an unknown depth is not evidence of inundation. Missing
+LAND TYPE nulls both sides at once, the conjunct and the `else`, so such a pixel stays
+nodata. An older formulation said the first half with a `join` + `IS NOT NULL` filter +
+`join` + `{"aggregate": "sum"}`, and said it incompletely: a horizontal `sum` SKIPS nulls
+rather than propagating them, so a pixel with elevation but no stage summed to the bare
+negated elevation and reclassified as real inundation wherever the ground sits below the
+NAVD88 datum. Four steps became none, and none of them is stricter.
 
-**Why the reclassification is four `calculate` steps and not three.** A `calculate`
-rewrites the RUNNING value, so a later entry's `where` sees whatever an earlier one
-already wrote -- and the three target codes are not disjoint from the three source
-domains in any order: `6` and `7` both fall in the `> 1.0` domain, and `0` falls in the
-`<= 0.46` one. So the two positive classes are first written as their own NEGATIVES
-(`-6`/`-7`), which no later rule's domain can match, and a fourth step flips them back in
-one pass. What makes the negative encoding safe is the leading `value > 0` filter: it
-masks every non-positive depth -- an elevation standing at or above the water level, which
-is dry land rather than any inundation class -- before any rewrite happens, so a negative
-value at step four can only ever be one this analysis itself wrote.
+**Why the selection is stated once, at the end.** `model_group_id`/`scenario_id`/
+`calendar_year` are one `filter` on the fully joined frame, just before the `case`, rather
+than a leading `filter` repeated per input. Every step between the reads and that filter
+works one (model group, scenario, year) triple at a time -- the join groups band-for-band on
+exactly those three dimensions and the `case` collapses a pairing that agrees on them -- so
+narrowing at the end and narrowing at the front compute the same thing, and stating it once
+is the honest way to say it. It sits BEFORE the `case` rather than after because a dimension
+filter leaves the pairing standing while the `case` is what collapses it.
 
-A cell masked out that way contributes nothing to the `max` rather than a `0`, so a dry
-cell reads as its land type alone, and a cell with no depth and no land type stays nodata
-rather than becoming `0`. Nothing here filters `lnd_type` to its `1`-`5` value domain:
-every variable declares a nodata sentinel (`variables.py`'s `Variable.nodata`, `-9999`
-unless `variables.csv` names another -- `elev`'s `-9999000` is the one exception, its own
-sentinel in millimetres), `raster.write_cog` writes it into the COG profile, and the read
-path masks it to null before any step here sees it.
+What makes it cost the same is `execution.plan`'s two dimension passes: a dimension
+conjunct reaches every origin's READ no matter where in the pipeline it was declared,
+across joins and past the `project`, so all three inputs narrow to the selected bands
+before anything is opened. Without that this would be a catastrophic read -- `elev` and
+`lnd_type` are 178 and 179 bands across every model group and scenario on disk -- which is
+why `tests/api/test_analyses_registry.py`'s `TestLndTypePlusNarrowsItsReads` compiles this
+pipeline against two years on disk and asserts the band counts, rather than trusting the
+property: no RESULT would change if the pushdown stopped working, only the read.
+`aggregate_type` is the one filter that stays on its own input: it is definitional rather
+than a selection, and the pairing does not carry it (it is the one dimension the three
+inputs do not share), so there is no later frame to state it on.
+
+**Why the reclassification is one `case` step.** The target codes are not disjoint from the
+source domains in any order -- `6` and `7` both fall in the `> 1.0` domain -- so a chain of
+`calculate`s cannot state this at all without an encoding trick, since each one rewrites the
+RUNNING value and the next one's `where` then sees what it wrote. A `case` has no such
+hazard: every arm's `when` is evaluated against the INCOMING operands, the first match wins,
+and each pixel is written exactly once. The arms are therefore stated in DESCENDING order of
+bound, each as a single `>` test of the depth against the previous class's bound, `AND`ed
+with the water conjunct the paragraph above explains. The last one, `... > 0`, is the domain
+floor, and the `else` is what catches everything at or below it -- an elevation standing at
+or above the water level, which is dry land rather than any inundation class, and which
+therefore reads as its own land type.
+
+Nothing here filters `lnd_type` to its `1`-`5` value domain, and nothing needs to: every
+variable declares a nodata sentinel (`variables.py`'s `Variable.nodata`, `-9999` unless
+`variables.csv` names another -- `elev`'s `-9999000` is the one exception, its own sentinel
+in millimetres), `raster.write_cog` writes it into the COG profile, and the read path masks
+it to null before any step here sees it. So the `else` hands back a null rather than a
+`-9999`, and a sentinel can never be mistaken for a land-type code.
 """
 
 from typing import Any
@@ -118,20 +146,25 @@ WATER_LAND_TYPE = 2
 
 # The inundation-depth reclassification, as (upper bound in metres, code) in ascending
 # order of bound, with `None` standing for "no upper bound". Each interval is open at its
-# lower end and CLOSED at its upper one, with zero itself excluded by the domain filter
-# below: `(0, 0.46] -> 6`, `(0.46, 1.0] -> 7`, `(1.0, inf) -> 0`.
-DEPTH_CLASSES: tuple[tuple[float | None, int], ...] = ((0.46, 6), (1.0, 7), (None, 0))
+# lower end and CLOSED at its upper one, with zero itself excluded by the last `case` arm
+# below: `(0, 0.46] -> 6`, `(0.46, 1.0] -> 7`, `(1.0, inf) -> 2`.
+#
+# The deepest class reports the OPEN-WATER LAND TYPE rather than a code of its own, which
+# is what `structure/legends.csv` publishes: `lnd_type_plus` legend values run 1-7, and `2`
+# is labelled "Water - Deep". Deep water is not reclassified at all -- it is simply water,
+# and only the two shallow classes say something `lnd_type` could not.
+DEPTH_CLASSES: tuple[tuple[float | None, int], ...] = ((0.46, 6), (1.0, 7), (None, WATER_LAND_TYPE))
 
 
 def _ordered_intersection(*sequences: list[str]) -> list[str]:
     """The sequences' INTERSECTION, in first-seen order -- the dimensions every operand
-    named carries, which is what a `group.by` over a joined frame has to be. A dimension
-    only one operand carries (`aggregate_type`, which `stg` declares and the two rasters
-    do not) would split the pair into two one-band groups that never reduce together.
+    named carries, which is what a pairing over a joined frame keys on
+    (`execution.band_ops._pair_band_groups`). A dimension only one operand carries
+    (`aggregate_type`, which `stg` declares and the two rasters do not) cannot survive that
+    pairing, which is what `collapsed_dimensions` below reads this for.
 
-    Order matters only in that it should not depend on set iteration: the published
-    `pipeline.json` is a contract a caller may resubmit verbatim, so the same request must
-    always render the same `by`.
+    Order matters only in that it should not depend on set iteration: `collapsed_dimensions`
+    is published, and the same request must always render the same answer.
     """
     shared = set.intersection(*(set(sequence) for sequence in sequences))
     return [name for name in sequences[0] if name in shared]
@@ -165,8 +198,8 @@ class LndTypePlus(Analysis):
         # checked against.
         model_group_id: int
         scenario_id: int
-        # Optional: omitted means every year, one output band per year (the `group.by`
-        # below keeps `calendar_year`), which is a legitimate multi-band request and is
+        # Optional: omitted means every year, one output band per year (the `case`'s
+        # pairing keeps `calendar_year`), which is a legitimate multi-band request and is
         # also a large read -- three inputs' worth here. A single year is the common case.
         calendar_year: int | None = None
 
@@ -196,6 +229,35 @@ class LndTypePlus(Analysis):
                 f"parameters (model_group_id, scenario_id, calendar_year) instead"
             )
 
+    @property
+    def collapsed_dimensions(self) -> frozenset[str]:
+        """Stated here rather than derived, because `base.default_collapsed_dimensions`
+        reads a trailing `group.by` and this pipeline ends on a `case`.
+
+        The collapse is no less structural for that -- it is just carried by a different
+        mechanism. A paired `case` reduces each pairing GROUP to one band, and the groups
+        are keyed on the dimensions every operand shares
+        (`execution.band_ops._pair_band_groups`), so a dimension only one input declares
+        cannot survive it. Here that is exactly `aggregate_type`: `stg` requires it, neither
+        raster has it, and this analysis pins it to `mean` itself, so a caller can neither
+        see nor vary it -- which is what `collapsed_dimensions` exists to tell the
+        visualization layer. The same intersection the old trailing `group.by` was built
+        from, read for the same reason.
+        """
+        shared = set(
+            _ordered_intersection(
+                required_dataset_dimensions(ELEVATION_INPUT),
+                required_dataset_dimensions(STAGE_INPUT),
+                required_dataset_dimensions(LAND_TYPE_INPUT),
+            )
+        )
+        declared = {
+            dimension
+            for dataset in (STAGE_INPUT, ELEVATION_INPUT, LAND_TYPE_INPUT)
+            for dimension in required_dataset_dimensions(dataset)
+        }
+        return frozenset(declared - shared)
+
     def pipeline(self):
         assert self.dataset is None, "lnd-type-plus is a type='custom' analysis"
         p = self.parameters
@@ -206,22 +268,15 @@ class LndTypePlus(Analysis):
         }
         if p.calendar_year is not None:
             selection["calendar_year"] = p.calendar_year
-        # The two raster inputs carry the same dimensions and take the same selection, so
-        # one rendering serves both -- `selection_filter_where` sorts its conjuncts, so the
-        # two `where`s are identical strings rather than merely equivalent ones. Stage adds
-        # the one dimension only it declares.
+        # The caller's selection, written ONCE, at the end -- see "Why the selection is
+        # stated once, at the end" in the module docstring. `stage_where` is not a selection
+        # at all: `aggregate_type` is this analysis's own definitional choice, and it has to
+        # be applied on stage's own branch, because nothing downstream pairs or groups on a
+        # dimension only one input declares. Left unfiltered, stage would bring one band per
+        # aggregate type into a pairing that expects exactly one band per operand, and the
+        # whole year would pair-miss and drop.
         selection_where = selection_filter_where(selection)
-        stage_where = selection_filter_where(
-            {**selection, "aggregate_type": STAGE_AGGREGATE_TYPE}
-        )
-
-        # Every operand of both joins is grouped by the dimensions all three inputs share;
-        # `aggregate_type` is deliberately not among them (see `_ordered_intersection`).
-        group_by = _ordered_intersection(
-            required_dataset_dimensions(ELEVATION_INPUT),
-            required_dataset_dimensions(STAGE_INPUT),
-            required_dataset_dimensions(LAND_TYPE_INPUT),
-        )
+        stage_where = selection_filter_where({"aggregate_type": STAGE_AGGREGATE_TYPE})
 
         steps: list[dict] = [
             {"op": "filter", "input": "stage", "where": stage_where, "as": "selected_stage"},
@@ -229,105 +284,58 @@ class LndTypePlus(Analysis):
             # each polygon's value to its pixels rather than reducing many into one
             # (`request.ops._type_project`'s `direction_takes_aggregate`).
             {"op": "project", "input": "selected_stage", "to": ELEVATION_INPUT.grid, "as": "stage_m"},
-            {"op": "filter", "input": "elevation", "where": selection_where, "as": "selected_elevation"},
-            # Millimetres to metres AND the sign flip the sum below needs, in one pass.
-            {
-                "op": "calculate",
-                "expression": f"value / -{ELEVATION_MM_PER_M}",
-                "as": "neg_elevation_m",
-            },
-            # The presence guard -- see the module docstring. Collapses to `stage_m`'s own
-            # value (the first-named operand), masked wherever either side is missing.
+            # All three inputs at once -- a `join` takes N operands, not two
+            # (`pipeline.JoinStep.inputs` is `min_length=2`), and a `case` pairs N of them
+            # (`execution.band_ops._pair_band_groups` keys on the dimensions they share and
+            # requires exactly one band per operand per group, for any N). `elevation` and
+            # `land_type` are the INPUTS, read directly: nothing stands between either read
+            # and the join, and the operand names are what the arms below read -- see "Why
+            # the depth is computed inside the `case` arms" in the module docstring.
             {
                 "op": "join",
                 "type": "spatial",
-                "inputs": ["stage_m", "neg_elevation_m"],
-                "as": "paired_inputs",
+                "inputs": ["stage_m", "elevation", "land_type"],
+                "as": "paired",
             },
-            {
-                "op": "filter",
-                "where": "stage_m IS NOT NULL AND neg_elevation_m IS NOT NULL",
-                "as": "stage_present",
-            },
-            # The subtraction itself: stage + (-elevation), as a horizontal add.
-            {
-                "op": "join",
-                "type": "spatial",
-                "inputs": ["stage_present", "neg_elevation_m"],
-                "as": "paired_depth",
-            },
-            {"op": "group", "by": group_by, "aggregate": "sum"},
-            # The running value is now inundation depth in metres. Mask everything at or
-            # below zero -- elevation standing at or above the water level, which is dry
-            # land rather than any inundation class -- both because no class covers it and
-            # because the negative encoding below depends on it. A band-wide value filter
-            # masks the pixel rather than dropping its row, so a masked pixel stays null
-            # through every `calculate` (a null never matches a `where`) and contributes
-            # nothing to the trailing `max`.
-            {"op": "filter", "where": "value > 0"},
+            # The caller's selection, and the only one this pipeline states. Declared past
+            # the join, it is a dimension conjunct over a frame all three origins feed --
+            # exactly the case `execution.plan`'s two dimension passes exist for, so it
+            # narrows every origin's READ rather than only the frame it is written on. See
+            # the module docstring. It sits before the `case` because a dimension filter
+            # leaves the pairing standing and the `case` is what collapses it; nothing may
+            # follow that collapse which would want the pair back.
+            {"op": "filter", "where": selection_where, "as": "selected"},
         ]
-        # Each bound is only a `<=` test: the previous class's bound is the lower one and
-        # is EXCLUSIVE, and the `value > 0` filter above supplies the first. Written as the
-        # NEGATED code for the two positive classes so no later entry's domain can re-match
-        # a cell an earlier one already claimed -- see the module docstring.
-        lower: float | None = None
-        for upper, code in DEPTH_CLASSES:
-            conjuncts = []
-            if lower is not None:
-                conjuncts.append(f"value > {lower}")
-            if upper is not None:
-                conjuncts.append(f"value <= {upper}")
-            steps.append(
-                {
-                    "op": "calculate",
-                    "expression": str(-code if code > 0 else code),
-                    "where": " AND ".join(conjuncts),
-                }
-            )
-            lower = upper
-        # Flip the encoded classes back. `0` (the deep class) is untouched, and no depth
-        # can be negative here, so this matches exactly the cells the two entries above
-        # wrote.
+        # The depth, its reclassification, the water restriction AND the land type showing
+        # through, in one step -- see "Why the reclassification is one `case` step" in the
+        # module docstring. `DEPTH_CLASSES` is stated ascending by bound, each interval open
+        # at its lower end and closed at its upper one, so an arm's own lower bound is the
+        # PREVIOUS class's upper one and the first class's is the domain floor, zero.
+        # Reversed, those lower bounds become first-match-wins `>` tests. Nothing states the
+        # upper ends: an earlier arm already claimed everything above them. Every arm
+        # additionally carries the `land_type = 2` conjunct, which is the restriction stated
+        # rather than assumed.
+        #
+        # Millimetres to metres happens here rather than in a `calculate` of its own: `elev`
+        # is stored as NAVD88 millimetres and every arm needs the same metres-denominated
+        # depth, so one conversion written into the shared `depth` string says it once for
+        # all three without a step and an intermediate name to carry it.
+        depth = f"stage_m - elevation / {ELEVATION_MM_PER_M}"
+        lower_bounds: list[float] = [0, *(upper for upper, _ in DEPTH_CLASSES[:-1])]
         steps.append(
-            {"op": "calculate", "expression": "value * -1", "where": "value < 0", "as": "depth_class"}
-        )
-
-        steps.extend(
-            [
-                {"op": "filter", "input": "land", "where": selection_where, "as": "land_type"},
-                # The water restriction -- the same paired-filter idiom as the presence
-                # guard above, and the one place either join's operand value columns are
-                # named. Collapses to `depth_class` (the first-named operand), masked
-                # wherever the land type underneath is anything but open water.
-                {
-                    "op": "join",
-                    "type": "spatial",
-                    "inputs": ["depth_class", "land_type"],
-                    "as": "paired_water",
-                },
-                {
-                    "op": "filter",
-                    "where": f"land_type = {WATER_LAND_TYPE}",
-                    "as": "water_depth_class",
-                },
-                # The operands' own names become the joined frame's value column names
-                # (`ops._type_join`), but nothing downstream reads them: the `group` below
-                # collapses the pairing without naming either, which is the one way a
-                # paired BAND-WIDE frame can be collapsed other than a value filter.
-                {
-                    "op": "join",
-                    "type": "spatial",
-                    "inputs": ["water_depth_class", "land_type"],
-                    "as": "paired",
-                },
-                # Band-wide, this groups the joined frame's band METADATA and reduces each
-                # group's bands horizontally at every pixel: one group per (model group,
-                # scenario, year), holding that year's reclassified depth band and its
-                # land-type counterpart, reduced to their max. Grouping by every dimension
-                # the inputs share is what keeps the pairing one-year-to-one-year; the
-                # axis being collapsed is the operand axis, which is not a dimension.
-                {"op": "group", "by": group_by, "aggregate": "max"},
-            ]
+            {
+                "op": "case",
+                "cases": [
+                    {"when": f"land_type = {WATER_LAND_TYPE} AND {depth} > {lower}", "then": str(code)}
+                    for lower, (_, code) in reversed(list(zip(lower_bounds, DEPTH_CLASSES)))
+                ],
+                # Everything the arms do not claim is the land type, unchanged: dry land,
+                # water standing at or below the ground, and any pixel missing stage or
+                # elevation (a null term makes the depth null and a null predicate false).
+                # A pixel whose LAND TYPE is nodata comes out nodata, because `land_type`
+                # is then null on both sides -- the arms' conjunct and this `else`.
+                "else": "land_type",
+            }
         )
 
         data = {
@@ -336,7 +344,11 @@ class LndTypePlus(Analysis):
                 for name, ref in (
                     ("stage", STAGE_INPUT),
                     ("elevation", ELEVATION_INPUT),
-                    ("land", LAND_TYPE_INPUT),
+                    # Named `land_type` because the join above references it DIRECTLY --
+                    # nothing stands between this read and the join -- and a join operand's
+                    # name is the value column name the `land_type = 2` conjunct and the
+                    # `else` both read.
+                    ("land_type", LAND_TYPE_INPUT),
                 )
             },
             "steps": steps,

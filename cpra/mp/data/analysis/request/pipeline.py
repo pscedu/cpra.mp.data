@@ -76,6 +76,24 @@ RESERVED_NAMES = frozenset({"value", "grid_cell", "value_category"})
 BAND_NAME_RE = re.compile(r"^b[0-9]+$")
 RESERVED_BAND_INDEX_COLUMN = "_band"
 
+# The two CARRIED per-pixel columns a band-wide frame can pick up alongside its `b<i>`
+# bands -- `execution/frame.py`'s `extra_columns` contract. `ZONE_COLUMN` is a
+# raster-to-vector crosswalk's zone ids, attached to a raster origin's own read;
+# `DOMAIN_COLUMN` records whether a pixel is inside the crosswalk domain at all, attached
+# by a vector-to-raster `project`. Each constant's full reason for existing is at its
+# execution-layer use site (`execution/project.py` and `execution/frame.py` respectively,
+# which import these rather than defining their own).
+#
+# They live here, in the request layer, for the same reason `BAND_NAME_RE` does: the
+# shape-typing walk has to know these names before anything is opened. A `where` naming
+# one of them is a PER-PIXEL predicate (a value conjunct, masked per band) rather than a
+# dimension conjunct selecting bands out of metadata that carries no such column, and
+# `ops.FrameType.extra_columns` is what tells `ops._type_filter` which frames carry them.
+# Double-underscored so neither can collide with a dataset dimension or a user-chosen
+# name (`_validate_name` rejects both shapes independently).
+ZONE_COLUMN = "__zone__"
+DOMAIN_COLUMN = "__domain__"
+
 # Output formats that render to a single raster/image surface (a GeoTIFF band or a map
 # tile pixel) rather than a table -- these need a band-wide (not long) final frame; see
 # `ops.validate_shapes`'s sink-shape rule, which is what actually enforces this.
@@ -244,8 +262,59 @@ class GroupStep(BaseModel):
     as_: str | None = Field(default=None, alias="as")
 
 
+class CaseWhen(BaseModel):
+    """One arm of a `case`: rewrite the running value to `then` wherever `when` matches.
+    `when` is a predicate in the same SQL-flavored language a `filter`/`calculate` `where`
+    is written in, and `then` is a value expression in the same arithmetic language
+    `calculate.expression` is -- so `then` may name a column (`"land_type"`) as readily as
+    a constant (`"6"`), and needs nothing extra to do it.
+
+    Structurally validated here (non-empty `when`, well-formed `then`); that `when` names
+    only columns the frame actually carries, and only VALUE columns at that, is
+    `ops._type_case`'s check, since it needs the frame's namespace.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    when: str
+    then: str
+
+
+class CaseStep(BaseModel):
+    """Rewrite the running value by the FIRST matching arm of `cases`, falling through to
+    `else` (default null) where none match -- one op for what a reclassification would
+    otherwise need a chain of `calculate`s and a disjointness trick to say (see
+    `analyses/lnd_type_plus.py`'s depth classes, and `analyses/land_type_confidence.py`'s
+    land/water split).
+
+    **Why this is not a chain of `calculate`s.** A `calculate` rewrites the RUNNING value,
+    so a later entry's `where` sees whatever an earlier one already wrote: the entries are
+    only independent when the target codes happen to be disjoint from every later entry's
+    source domain, which is a property of the particular numbers chosen, not of the
+    request language. `case` evaluates every arm's `when` against the value the frame
+    arrived with and takes the first that matches, so the arms are independent by
+    construction and their ORDER is the only thing that decides precedence.
+
+    `input` is optional, mirroring `FilterStep.input`. Like `calculate`, `case` always
+    produces exactly one value column -- and unlike `calculate` it accepts a PAIRED
+    band-wide frame, reducing it to one (see `ops._type_case`); a row/band matching no arm
+    and given no `else` becomes null, which is the one way `case` can remove data that
+    `calculate` cannot.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    op: Literal["case"] = "case"
+    input: str | None = None
+    cases: list[CaseWhen] = Field(min_length=1)
+    # `else` is a Python keyword, so the field is `else_` and the alias is what a JSON body
+    # and a dotted query both actually spell -- the same split `as_`/`as` has.
+    else_: str | None = Field(default=None, alias="else")
+    as_: str | None = Field(default=None, alias="as")
+
+
 Step = Annotated[
-    ProjectStep | JoinStep | FilterStep | CalculateStep | GroupStep,
+    ProjectStep | JoinStep | FilterStep | CalculateStep | CaseStep | GroupStep,
     Field(discriminator="op"),
 ]
 
@@ -341,6 +410,11 @@ def validate_pipeline(pipeline: Pipeline) -> None:
       dimension or spatial conjunct);
     - `calculate.expression` is well-formed arithmetic over the whitelist
       (`expressions.parse_calculate_expression`, column-namespace check deferred);
+    - every `case` arm's `when` is a non-empty, structurally sound predicate and its
+      `then` -- and the step's `else`, when given -- is well-formed arithmetic, both by
+      the same two checks a `calculate`'s `where`/`expression` get. That a `when` names
+      only VALUE columns is `ops._type_case`'s check, not this one: it needs the frame's
+      namespace;
     - `output.sort`/`output.select` are syntactically sound comma-separated `[-]column`
       lists -- no empty component, no bare `-`, no `-`-prefixed `select` entry, no name
       repeated within one list (`_validate_output_sort_or_select`). Whether a named
@@ -416,6 +490,12 @@ def _validate_step_rules(i: int, step: Any) -> None:
             ) from exc
         if step.where is not None:
             _validate_where_structurally(i, step.where, op="calculate")
+    elif isinstance(step, CaseStep):
+        for position, case in enumerate(step.cases, start=1):
+            _validate_where_structurally(i, case.when, op=f"case arm {position}")
+            _validate_value_expression(i, case.then, f"arm {position} then")
+        if step.else_ is not None:
+            _validate_value_expression(i, step.else_, "else")
     elif isinstance(step, GroupStep):
         try:
             aggregates.validate_group_by(step.by)
@@ -455,6 +535,18 @@ def _validate_output_sort_or_select(value: str, field: str) -> None:
         if column in seen:
             raise RequestError(f"output.{field}={value!r} names column {column!r} more than once")
         seen.add(column)
+
+
+def _validate_value_expression(i: int, expression: str, what: str, op: str = "case") -> None:
+    """The same check `calculate.expression` gets -- well-formed arithmetic over the
+    whitelist, with the column-namespace half deferred (`allowed_columns=None`) because
+    parse time does not know what columns the frame will carry -- named after which part
+    of a multi-part step it applies to, since a `case` has several.
+    """
+    try:
+        parse_calculate_expression(expression, allowed_columns=None)
+    except ExpressionError as exc:
+        raise RequestError(f"step {i} ({op}) {what}={expression!r} is invalid: {exc}") from exc
 
 
 def _validate_where_structurally(i: int, where: str, op: str = "filter") -> None:
@@ -517,18 +609,42 @@ def _query_fields(model: type[BaseModel]) -> frozenset[str]:
 
 
 def _query_list_fields(model: type[BaseModel]) -> frozenset[str]:
-    """Those of `_query_fields(model)` whose value is a LIST, and which the decoder
-    therefore splits on commas.
+    """Those of `_query_fields(model)` whose value is a list of SCALARS, and which the
+    decoder therefore splits on commas.
 
     Read off each field's annotation rather than named by hand, which is what keeps
     `where`/`expression` out of it structurally rather than by remembering to: each is a
     single SQL-flavored/arithmetic `str` that may contain commas, spaces, and operators
     verbatim, and splitting one would corrupt it. A field can only be split here if its
     model says it holds a list.
+
+    A list of nested MODELS (`CaseStep.cases`) is excluded for the same reason from the
+    other direction: its elements hold exactly those comma-bearing strings, so it is
+    spelled positionally (`step.5.cases.2.when=...`) rather than comma-joined -- see
+    `_query_model_list_fields`, which is where such a field goes instead.
     """
     return frozenset(
-        info.alias or name for name, info in model.model_fields.items() if _is_list_annotation(info.annotation)
+        info.alias or name
+        for name, info in model.model_fields.items()
+        if _is_list_annotation(info.annotation) and _list_element_model(info.annotation) is None
     )
+
+
+def _query_model_list_fields(model: type[BaseModel]) -> dict[str, type[BaseModel]]:
+    """Those of `_query_fields(model)` that hold a list of nested models, mapped to the
+    ELEMENT model -- the decoder validates each element against its own field whitelist,
+    and the encoder recurses into it under a 1-based index.
+
+    One level deep, matching what the models declare: the only such field today is
+    `CaseStep.cases`, whose element (`CaseWhen`) holds two plain strings. An element model
+    that itself declared a model list would encode correctly (`_encode_model` recurses)
+    but would not decode, so adding one means extending `_decode_model_list` to recurse too.
+    """
+    return {
+        (info.alias or name): element
+        for name, info in model.model_fields.items()
+        if (element := _list_element_model(info.annotation)) is not None
+    }
 
 
 def _is_list_annotation(annotation: Any) -> bool:
@@ -541,6 +657,23 @@ def _is_list_annotation(annotation: Any) -> bool:
     if get_origin(annotation) in (Union, UnionType):
         return any(get_origin(arg) is list for arg in get_args(annotation))
     return False
+
+
+def _list_element_model(annotation: Any) -> type[BaseModel] | None:
+    """The `BaseModel` subclass `annotation`'s list elements are, or `None` if it is not a
+    list or its elements are scalars. Looks through a union the same way
+    `_is_list_annotation` does.
+    """
+    candidates = (
+        get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
+    )
+    for candidate in candidates:
+        if get_origin(candidate) is not list:
+            continue
+        args = get_args(candidate)
+        if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
+            return args[0]
+    return None
 
 
 # The step models the `op` discriminator chooses between, read back off `Step` itself so a
@@ -560,6 +693,9 @@ _STEP_FIELDS: dict[str, frozenset[str]] = {
 }
 _STEP_LIST_FIELDS: dict[str, frozenset[str]] = {
     model.model_fields["op"].default: _query_list_fields(model) for model in _STEP_MODELS
+}
+_STEP_MODEL_LIST_FIELDS: dict[str, dict[str, type[BaseModel]]] = {
+    model.model_fields["op"].default: _query_model_list_fields(model) for model in _STEP_MODELS
 }
 
 _OUTPUT_FIELDS = _query_fields(Output)
@@ -652,6 +788,7 @@ def _decode_step(index: int, raw: Any) -> dict[str, Any]:
 
     allowed = _STEP_FIELDS[op]
     list_fields = _STEP_LIST_FIELDS[op]
+    model_list_fields = _STEP_MODEL_LIST_FIELDS[op]
     unknown = set(raw) - allowed
     if unknown:
         raise RequestError(f"step {index} ({op}) has unknown field(s): {sorted(unknown)}")
@@ -660,6 +797,9 @@ def _decode_step(index: int, raw: Any) -> dict[str, Any]:
     for field, value in raw.items():
         if field == "op":
             continue
+        if field in model_list_fields:
+            data[field] = _decode_model_list(index, op, field, value, model_list_fields[field])
+            continue
         if not isinstance(value, str):
             raise RequestError(f"step {index} ({op}) field {field!r} must be a scalar query value")
         if field in list_fields:
@@ -667,6 +807,43 @@ def _decode_step(index: int, raw: Any) -> dict[str, Any]:
         else:
             data[field] = value
     return data
+
+
+def _decode_model_list(
+    index: int, op: str, field: str, raw: Any, element_model: type[BaseModel]
+) -> list[dict[str, Any]]:
+    """Decode a `step.<i>.<field>.<n>.<subfield>=...` group into the list of dicts the
+    nested model validates from. `_listify` has already turned the 1-based index segments
+    into a real list (and rejected a gap or a leading zero in them); what is left is per-
+    element: it must be a mapping of named sub-keys, those keys must be the element
+    model's own, and each value must still be a scalar query value.
+
+    This is where a nested model's strings escape comma-splitting. A `case` arm's `when`
+    is an ordinary SQL-flavored predicate and may contain commas; spelling the arms
+    positionally rather than as two parallel comma-joined lists is what lets it.
+    """
+    allowed = _query_fields(element_model)
+    if not isinstance(raw, list):
+        raise RequestError(
+            f"step {index} ({op}) field {field!r} must use 1-based list indices with named "
+            f"sub-keys, e.g. step.{index}.{field}.1.<{'|'.join(sorted(allowed))}>=..."
+        )
+    entries: list[dict[str, Any]] = []
+    for position, entry in enumerate(raw, start=1):
+        where = f"step {index} ({op}) {field}.{position}"
+        if not isinstance(entry, dict):
+            raise RequestError(
+                f"{where} must have named sub-keys, e.g. "
+                f"step.{index}.{field}.{position}.<{'|'.join(sorted(allowed))}>=..."
+            )
+        unknown = set(entry) - allowed
+        if unknown:
+            raise RequestError(f"{where} has unknown field(s): {sorted(unknown)}")
+        for key, value in entry.items():
+            if not isinstance(value, str):
+                raise RequestError(f"{where} field {key!r} must be a scalar query value")
+        entries.append(dict(entry))
+    return entries
 
 
 def _decode_output(raw: Any) -> dict[str, Any]:
@@ -686,8 +863,11 @@ def pipeline_from_query(params: Mapping[str, str]) -> Pipeline:
     Encoding rule (see `pipeline_to_query` for the inverse): dot = nesting, an integer
     path segment = a 1-based list position, comma = a list value (`join.inputs`,
     `group.by`) -- NEVER inside `filter.where`/`calculate.expression`, each one opaque
-    string. `params` is the already-decoded (no percent-encoding) mapping an HTTP
-    framework's query-parameter object would hand over.
+    string. A list whose elements are themselves models (`case.cases`) uses the index
+    segments rather than commas, for exactly that reason: its elements hold predicates,
+    which may contain commas (`step.5.cases.2.when=value > 0`). `params` is the
+    already-decoded (no percent-encoding) mapping an HTTP framework's query-parameter
+    object would hand over.
 
     Malformed input -- a gap in list indices, a leaf/nested conflict at the same path, an
     unrecognized top-level group, a missing top-level group, an unknown step op or field
@@ -756,7 +936,7 @@ def _encode_model(model: BaseModel, prefix: str, params: dict[str, str]) -> None
     and then re-serialize to something that no longer said what it said. Now both halves
     move when the model does.
 
-    Three rules, each the generalization of what the per-model branches did by hand:
+    Four rules, each the generalization of what the per-model branches did by hand:
 
     - The NAME is the field's alias where it declares one, its own name otherwise. `as_` is
       a Python spelling forced by the keyword; `as` is what a URL carries.
@@ -764,8 +944,12 @@ def _encode_model(model: BaseModel, prefix: str, params: dict[str, str]) -> None
       real default alike (`GroupStep.of == "value"`). A required field has no default to
       equal, so it is always written. See `pipeline_to_query` for why dropping -- rather
       than writing the default out explicitly -- is what makes the round trip stable.
-    - A LIST is comma-joined, which is the spelling `_query_list_fields` tells the decoder
-      to split back apart.
+    - A list of nested MODELS (`CaseStep.cases`) recurses, one element per 1-based index
+      segment, which is the spelling `_query_model_list_fields` tells the decoder to read
+      back. Recursion rather than a second flattening rule: a nested model's own fields
+      then get all four of these rules too, for free.
+    - Any other LIST is comma-joined, which is the spelling `_query_list_fields` tells the
+      decoder to split back apart.
 
     The discriminator falls out of the second rule rather than needing an exception to it:
     a step's `op` always equals its own default, so this drops it, and `pipeline_to_query`
@@ -775,8 +959,13 @@ def _encode_model(model: BaseModel, prefix: str, params: dict[str, str]) -> None
         value = getattr(model, name)
         if value == info.default:
             continue
+        key = info.alias or name
+        if _list_element_model(info.annotation) is not None:
+            for position, element in enumerate(value, start=1):
+                _encode_model(element, f"{prefix}.{key}.{position}", params)
+            continue
         encoded = ",".join(str(item) for item in value) if isinstance(value, list) else str(value)
-        params[f"{prefix}.{info.alias or name}"] = encoded
+        params[f"{prefix}.{key}"] = encoded
 
 
 def pipeline_to_query(pipeline: Pipeline) -> dict[str, str]:

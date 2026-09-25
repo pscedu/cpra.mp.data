@@ -67,11 +67,13 @@ instead of falling into that hole by accident:
   count some other way; see both functions.
 
 Everything in this module is pure Polars: no file is opened, no raster is read, no
-request is parsed. Three names it re-exports are defined elsewhere and imported rather
-than redefined. `BAND_NAME_RE` and `RESERVED_BAND_INDEX_COLUMN` come from
-`request/pipeline.py`, which checks a user's own names against the same two shapes --
-recomputing that pattern here as a second regex is exactly the drift a single source of
-truth is supposed to prevent. `ReadWindow` comes from `io/window.py`, because it
+request is parsed. Four names it re-exports are defined elsewhere and imported rather
+than redefined. `BAND_NAME_RE`, `RESERVED_BAND_INDEX_COLUMN` and `DOMAIN_COLUMN` come from
+`request/pipeline.py`, which checks a user's own names against the same shapes and types
+which frames carry the last one (`ops.FrameType.extra_columns`) -- recomputing any of them
+here as a second definition is exactly the drift a single source of truth is supposed to
+prevent, and the request layer may not import this module to reach them. `ReadWindow`
+comes from `io/window.py`, because it
 describes a read rather than an algebra: the scan constructs one and must be able to
 return a complete band-wide triple without importing this module, which sits a layer
 above it.
@@ -84,7 +86,11 @@ import polars as pl
 
 from cpra.mp.data.analysis.io.window import ReadWindow
 from cpra.mp.data.analysis.request.errors import ShapeError
-from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_INDEX_COLUMN
+from cpra.mp.data.analysis.request.pipeline import (
+    BAND_NAME_RE,
+    DOMAIN_COLUMN,
+    RESERVED_BAND_INDEX_COLUMN,
+)
 
 # `BAND_NAME_RE`/`RESERVED_BAND_INDEX_COLUMN` come from the request layer (the name-shape
 # rules a user's own names are checked against) and `ReadWindow` from the io layer (it
@@ -137,7 +143,11 @@ BandWideFrame = tuple[pl.LazyFrame, pl.DataFrame, ReadWindow]
 #: A reserved `extra_columns` name rather than a fourth element of `BandWideFrame`: it is
 #: carried, unread, through every intervening lowering exactly like a crosswalk zone id
 #: is, which is the contract `extra_columns` already exists for.
-DOMAIN_COLUMN = "__domain__"
+#:
+#: Defined in `request/pipeline.py` and re-exported here, for the same single-source-of-
+#: truth reason `BAND_NAME_RE` is: `request.ops`' shape-typing walk records which frames
+#: carry it (`FrameType.extra_columns`) so a `where` naming it classifies as the per-pixel
+#: predicate it is, and the request layer may not import this one.
 
 
 def band_column_names(metadata_df: pl.DataFrame) -> list[str]:

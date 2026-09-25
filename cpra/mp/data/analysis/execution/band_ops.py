@@ -1,19 +1,21 @@
 """The band-wide-shape lowerings: `mask_value_band_wide`/`select_dimension_band_wide`/
 `sample_grid_cells_band_wide` (the three `filter` predicate kinds), `calculate_band_wide`,
-`group_band_wide`, and `join_band_wide` -- the band-wide counterparts of
-`execution/long_ops.py`'s four long-shape lowerings, plus `filter_band_wide`, the
+`case_band_wide`, `group_band_wide`, and `join_band_wide` -- the band-wide counterparts of
+`execution/long_ops.py`'s long-shape lowerings, plus `filter_band_wide`, the
 dispatcher a `filter` op with a mixed-kind `where` runs through.
 
-**A fourth filter lowering for PAIRED frames.** The three kinds above assume a frame with
-one measured quantity. A frame a `join` left carrying one operand-named value column per
-operand (`request.ops.FrameType.value_columns`) has several, and a `where` over it
-(`marsh > 0.5 and sal > 5.5`) asks one question about a PAIR of bands rather than a
-question about each band separately -- so the value branch routes to
-`pair_and_mask_band_wide` instead, which reconstitutes the pairs from band metadata,
-collapses each to one band, and masks it. `filter_band_wide` picks between the two on
-`value_columns` alone; everything else about the dispatch is unchanged. See that
-function for what pairs with what, and why an unpairable band is dropped rather than
-raised on.
+**PAIRED frames are `case_band_wide`'s business alone.** The three filter kinds assume a
+frame with one measured quantity. A frame a `join` left carrying one operand-named value
+column per operand (`request.ops.FrameType.value_columns`) has several, and an expression
+over it (`marsh > 0.5 and sal > 5.5`) asks one question about a PAIR of bands rather than
+a question about each band separately. Answering it means reconstituting the pairs from
+band metadata and reducing each to one band -- and a reduce has to say which operand's
+value that band carries, which a predicate has no room to state and a `case` arm's `then`
+does. So `case_band_wide` reads `value_columns` the way `filter_band_wide` merely
+classifies against it: one value column makes it a per-band map, several make it a reduce
+over reconstituted pairs (`_pair_band_groups`, `_paired_metadata`). A value predicate over
+a paired frame never reaches `filter_band_wide` at all -- `request.ops._type_filter`
+rejects it, pointing at `case`.
 
 **Why a filter's three kinds are three functions, not one.** `request.expressions.
 PredicateKind`'s own docstring already says what each kind means for a band-wide frame:
@@ -71,16 +73,22 @@ namespace is passed to `compile_calculate_entries` as well, not only to the per-
 `allowed_columns` first, so widening only the later call would leave the wider namespace
 unreachable.
 
-**Known limitation: `extra_columns` are not part of the PREDICATE language.**
-`request.expressions` classifies a conjunct by NAME -- `value` (and `grid_cell`) are the
-only names that are not a dimension column -- so a `where` conjunct naming a carried column
-(`zone = 7`) classifies as a DIMENSION conjunct and gets evaluated against `metadata_df`,
-which has no such column, rather than against the pixel frame that does. Both the `filter`
-dispatcher and a `calculate`'s `where` inherit this. The band-wide side cannot fix it
-alone: whether a given name is a per-band dimension or a per-pixel carried column is
-knowable only where the carried column is introduced. Until then, `extra_columns` means
-"carry this column through unchanged", and the value namespaces above are reachable only by
-calling a lowering directly with an already-classified value conjunct.
+**`extra_columns` ARE part of the predicate language.** `request.expressions` classifies a
+conjunct by NAME, so a carried column has to be named for it to classify as anything but a
+dimension. `filter_band_wide` names them: it unions its own `extra_columns` into the
+`value_columns` it hands `classify_where_kinds`, so `__zone__ = 7` is the per-pixel mask it
+is rather than a band selection evaluated against a `metadata_df` that has no such column.
+That union is only for the classification -- `value_columns`' own count still decides
+whether a paired frame has a pairing to collapse, and a carried column is not an operand's
+measurement.
+
+Whether a name is a per-band dimension or a per-pixel carried column is knowable only where
+the carried column is introduced, which is why the band-wide side could not decide it alone:
+`request.ops.FrameType.extra_columns` is where it is decided, tracked forward by the
+shape-typing walk from the two places a carried column appears (a raster origin's crosswalk
+zone id, a vector-to-raster `project`'s domain column). `request.ops._type_filter`
+classifies against the identical union, so a `filter`'s TYPED output shape and the lowering
+that actually runs here always agree.
 
 **`group_band_wide`'s horizontal `count`.** A band-wide `group.aggregate == "count"`
 answers "how many of these bands contributed a non-null value at this pixel", the
@@ -180,6 +188,7 @@ from cpra.mp.data.analysis.execution.frame import (
     validate_extra_columns,
 )
 from cpra.mp.data.analysis.request.expressions import (
+    ExpressionError,
     PredicateKind,
     classify_where_kinds,
     combine_conjuncts,
@@ -189,19 +198,20 @@ from cpra.mp.data.analysis.request.expressions import (
     rewrite_value_columns,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp, calculate_label
+from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, calculate_label
 
 __all__ = [
     "JOIN_OPERAND_COLUMN",
     "PAIRING_KEY_EXCLUDED_COLUMNS",
     "calculate_band_wide",
+    "case_band_wide",
     "filter_band_wide",
     "group_band_wide",
     "join_band_wide",
     "mask_value_band_wide",
-    "pair_and_mask_band_wide",
     "sample_grid_cells_band_wide",
     "select_dimension_band_wide",
+    "unify_metadata_parts",
 ]
 
 # The metadata column `join_band_wide` adds recording which operand (step name)
@@ -210,7 +220,7 @@ __all__ = [
 # with either positional-name shape `execution/frame.py`'s invariants police.
 JOIN_OPERAND_COLUMN = "_join_operand"
 
-# Metadata columns `pair_and_mask_band_wide` never pairs on -- see its docstring.
+# Metadata columns `_pairing_key_columns` never pairs on -- see its docstring.
 # `variable`/`time_unit`/`grid` identify WHICH DATASET a band came from, and a spatial
 # join's whole premise is that its operands are different datasets; `path`/`band` name a
 # physical file and are per-band by construction; `JOIN_OPERAND_COLUMN` is the axis being
@@ -268,8 +278,8 @@ def mask_value_band_wide(band_wide: BandWideFrame, value_where: str, extra_colum
 
 
 def _pairing_key_columns(metadata_df: pl.DataFrame) -> list[str]:
-    """The metadata columns `pair_and_mask_band_wide` pairs bands on: every column that is
-    non-null in EVERY band's row, minus `PAIRING_KEY_EXCLUDED_COLUMNS`.
+    """The metadata columns `case_band_wide` pairs a joined frame's bands on: every column
+    that is non-null in EVERY band's row, minus `PAIRING_KEY_EXCLUDED_COLUMNS`.
 
     The non-null test is what makes this work without a schema: `join_band_wide` merges
     its operands' metadata with `how="diagonal_relaxed"`, so a column only one operand
@@ -285,53 +295,27 @@ def _pairing_key_columns(metadata_df: pl.DataFrame) -> list[str]:
     ]
 
 
-def pair_and_mask_band_wide(
-    band_wide: BandWideFrame, value_where: str, extra_columns: Sequence[str], value_columns: Sequence[str]
-) -> BandWideFrame:
-    """The band-wide lowering of a value predicate over a PAIRED frame -- one a `join` left
-    carrying one operand-named value column per operand (`request.ops.FrameType.
-    value_columns`), where `value_where` names those operands rather than the placeholder
-    `value`: `marsh > 0.5 and sal > 5.5`.
+def _pair_band_groups(
+    metadata_df: pl.DataFrame, value_columns: Sequence[str]
+) -> tuple[pl.DataFrame, list[str], list[tuple[int, list[int], dict[str, str]]]]:
+    """Reconstitute a PAIRED band-wide frame's pairs from its band metadata, returning
+    `(grouped, key_columns, pairs)`:
 
-    A paired frame's bands are not comparable as they stand. `marsh`'s 2030 band and
-    `sal`'s 2030 band are two measurements OF THE SAME THING, and the predicate is one
-    question about that pair -- but band-wide shape has no column to put a pair in, only a
-    flat positional list in which the two sit side by side with nothing saying they belong
-    together. So this lowering does what `mask_value_band_wide` cannot: it reconstitutes
-    the pairs, and COLLAPSES each one to a single band.
+    - `grouped` is `metadata_df` collapsed to one row per candidate pair, in band order;
+    - `key_columns` is what it was grouped on (`_pairing_key_columns`, possibly empty);
+    - `pairs` holds one `(row index into grouped, band positions, {operand -> band column
+      name})` per SURVIVING pair.
 
-    * Bands pair by `_pairing_key_columns` -- the dimensions every operand carries a real
-      value for (`calendar_year`, in practice, plus whatever scenario columns the operands
-      agree on). A group with anything other than exactly one band per operand is dropped,
-      not raised on: that is a pairing MISS (an operand has no counterpart at this
-      dimension combination), the same non-event as a pixel whose crosswalk finds no
-      vector cell, and an empty result for a request that pairs nothing is a legitimate
-      all-nodata answer rather than an error.
-    * Each surviving pair becomes ONE band, carrying the value of its LOWEST-POSITIONED
-      band -- which is the operand the request named first, since `join_band_wide` lays
-      its operands' bands out in `JoinOp.inputs` order. A pair has two measurements and
-      an output band has room for one; nothing in the request says which, and the
-      first-named operand is the only determinate choice available. (Read off the band
-      positions rather than off `value_columns`, whose order is not meaningful: it comes
-      from a `frozenset`.) It rarely matters -- band-wide `calculate` is rejected over a
-      paired frame, so the collapsed value's only consumer is a `group`, and a `group`
-      that means to reduce something else says so with `of` -- but it must be SOME value,
-      and it must be the same one every time.
-    * The predicate masks that band: `value_where` has every operand name rewritten to its
-      own band column in this pair (`request.expressions.rewrite_value_columns`, one pass
-      -- a conjunct may reference two operands at once, `marsh > sal`), then evaluates
-      once per pair as a single `pl.when(...)`. Null where the pair fails, exactly the
-      masking discipline `mask_value_band_wide` uses and for the same reason.
+    A group with anything other than exactly one band per operand is absent from `pairs`
+    -- a pairing MISS (an operand has no counterpart at this dimension combination), the
+    same non-event as a pixel whose crosswalk finds no vector cell, dropped rather than
+    raised on.
 
-    The returned `metadata_df` carries the pairing key columns alone, one row per
-    surviving pair -- the dimensions that still mean something once the operand axis is
-    gone. `add_reserved_band_index` covers the no-shared-dimension case for the same
-    "zero columns loses the row count" reason `group_band_wide`'s `by == []` branch does.
+    Split out from `case_band_wide` rather than inlined: the pairing is a fact about a
+    joined frame's METADATA, answerable with no reference to what the reduce then does to
+    the pixels. See `_paired_metadata` for the other half, the metadata the survivors leave
+    behind.
     """
-    validate_extra_columns(extra_columns)
-    lf, metadata_df, window = band_wide
-    if has_no_bands(metadata_df):
-        return empty_band_wide(window)
     names = band_column_names(metadata_df)
     operands = list(value_columns)
     key_columns = _pairing_key_columns(metadata_df)
@@ -346,8 +330,7 @@ def pair_and_mask_band_wide(
             pl.col("__pos").implode(), pl.col(JOIN_OPERAND_COLUMN).implode().alias("__operands")
         )
 
-    kept_rows = []
-    band_exprs = []
+    pairs: list[tuple[int, list[int], dict[str, str]]] = []
     for row_index, (positions, row_operands) in enumerate(
         zip(grouped.get_column("__pos").to_list(), grouped.get_column("__operands").to_list())
     ):
@@ -355,24 +338,129 @@ def pair_and_mask_band_wide(
         if len(by_operand) != len(positions) or set(by_operand) != set(operands):
             continue
         substitutions = {operand: names[position] for operand, position in by_operand.items()}
-        mask = value_predicate_mask(
-            rewrite_value_columns(value_where, substitutions),
-            allowed_columns=[*substitutions.values(), *extra_columns],
-        )
-        carried = pl.col(names[min(positions)])
-        band_exprs.append(pl.when(mask).then(carried).otherwise(None).alias(f"b{len(kept_rows)}"))
-        kept_rows.append(row_index)
+        pairs.append((row_index, list(positions), substitutions))
+    return grouped, key_columns, pairs
 
-    if not kept_rows:
-        return empty_band_wide(window)
 
+def _paired_metadata(grouped: pl.DataFrame, key_columns: list[str], kept_rows: list[int]) -> pl.DataFrame:
+    """The metadata a paired reduce's surviving pairs leave behind: the pairing key columns
+    alone, one row per surviving pair -- the dimensions that still mean something once the
+    operand axis is gone. `add_reserved_band_index` covers the no-shared-dimension case for
+    the same "zero columns loses the row count" reason `group_band_wide`'s `by == []`
+    branch does.
+    """
     kept = grouped[kept_rows]
-    metadata_out = (
+    return (
         kept.select(key_columns)
         if key_columns
         else add_reserved_band_index(kept).select(RESERVED_BAND_INDEX_COLUMN)
     )
-    return lf.select([*band_exprs, *extra_columns]), metadata_out, window
+
+
+# The row index `select_dimension_band_wide` carries through its join reconstruction --
+# one per operand, suffixed, so a joined frame can name them apart. Underscore-prefixed
+# and so not a legal band name, which keeps it clear of `BAND_NAME_RE`'s positional shape.
+_BAND_POSITION_COLUMN = "__band_position"
+
+
+def _joined_metadata_parts(metadata_df: pl.DataFrame) -> list[pl.DataFrame]:
+    """A joined `metadata_df` split back into one frame per operand, in the order
+    `join_band_wide` laid the operands out, each carrying that operand's own band positions
+    plus only the dimension columns it actually has values for.
+
+    "Actually has values for" is the same non-null test `_pairing_key_columns` uses, and
+    for the same reason: `join_band_wide` merges its operands' metadata with
+    `how="diagonal_relaxed"`, so a column only one operand carries is present but NULL on
+    the other side, and that null is the only record left of whose column it was.
+
+    `PAIRING_KEY_EXCLUDED_COLUMNS` is dropped here as it is there.
+    `variable`/`time_unit`/`grid`/`path`/`band` are non-null for every operand and differ
+    BETWEEN them, so keeping them would make them join keys that match nothing: they are
+    per-band identity, not a dimension two operands can be compared along.
+    """
+    indexed = metadata_df.with_row_index(_BAND_POSITION_COLUMN)
+    operands = metadata_df.get_column(JOIN_OPERAND_COLUMN).unique(maintain_order=True).to_list()
+    parts = []
+    for position, operand in enumerate(operands):
+        rows = indexed.filter(pl.col(JOIN_OPERAND_COLUMN) == operand)
+        carried = [
+            name
+            for name, nulls in zip(rows.columns, rows.null_count().row(0))
+            if nulls == 0 and name not in PAIRING_KEY_EXCLUDED_COLUMNS and name != _BAND_POSITION_COLUMN
+        ]
+        parts.append(
+            rows.select([pl.col(_BAND_POSITION_COLUMN).alias(f"{_BAND_POSITION_COLUMN}_{position}"), *carried])
+        )
+    return parts
+
+
+def unify_metadata_parts(parts: list[pl.DataFrame]) -> pl.DataFrame:
+    """One metadata frame per operand, recombined into the frame the equivalent LONG
+    pipeline would have filtered: one row per cross-operand combination, joined on the
+    dimensions the operands share.
+
+    This mirrors `long_ops.join_long`, which is the point -- metadata is the long frame
+    minus `value` and `grid_cell`, so the combination that reproduces long semantics is
+    the one long itself performs. The columns two parts have in common are exactly the
+    shared dimensions (each part's identity column is uniquely suffixed by its caller, and
+    a non-shared dimension by definition appears in one part only), so the join key needs
+    no separate computation.
+
+    Public, and deliberately not specific to this module's own `_joined_metadata_parts`:
+    `execution.plan.compile_plan` builds the same frame at COMPILE time out of each
+    origin's resolved band metadata, to decide which bands a dimension filter leaves worth
+    reading at all. The two must agree exactly -- plan-time narrowing is sound only because
+    the filter step re-executes over the narrowed read and reaches the same answer -- so
+    they share one function rather than one description of a function.
+
+    `how="full"` with coalesced keys, not `how="inner"`: an operand band with no
+    counterpart keeps a row here, with the other operand's columns null. Inner would drop
+    it, which would make a trivially-true `where` narrow the frame -- the filter quietly
+    finishing a job `join_band_wide` did not do. A predicate that actually tests the
+    missing operand's column still drops that row, since null fails `fill_null(False)`,
+    which is the narrowing long would have performed at the join. (That band-wide `join`
+    keeps unpaired bands where long's inner join does not is a property of
+    `join_band_wide`, not of this filter.)
+
+    No shared dimension at all means a cross join, which is the right degenerate answer:
+    with nothing to pair on, every combination is a combination.
+    """
+    unified = parts[0]
+    for right in parts[1:]:
+        on = [name for name in unified.columns if name in right.columns]
+        unified = unified.join(right, on=on, how="full", coalesce=True) if on else unified.join(right, how="cross")
+    return unified
+
+
+def _joined_dimension_positions(metadata_df: pl.DataFrame, dimension_where: str) -> list[int]:
+    """The band positions of a JOINED frame that survive `dimension_where`: the predicate
+    evaluated once against the unified frame, then read back per operand.
+
+    A band survives if it appears in any surviving combination. That is what makes this
+    agree with long: a conjunct on a dimension only one operand carries narrows THAT
+    operand directly and every other operand THROUGH the join, rather than -- as filtering
+    the `diagonal_relaxed` metadata directly does -- evaluating the conjunct against rows
+    where the column is null for no reason other than that they came from a different
+    operand, and discarding all of them.
+    """
+    referenced = set(pl.sql_expr(dimension_where).meta.root_names())
+    identity = sorted(referenced & PAIRING_KEY_EXCLUDED_COLUMNS & set(metadata_df.columns))
+    if identity:
+        raise ExpressionError(
+            f"where={dimension_where!r} references per-band identity column(s) {identity} over a "
+            "JOINED band-wide frame -- these name which dataset a band came from and differ "
+            "between operands, so they select no operand-independent set of bands; filter each "
+            "input before the join instead"
+        )
+
+    parts = _joined_metadata_parts(metadata_df)
+    unified = unify_metadata_parts(parts)
+    survivors = unified.filter(pl.sql_expr(dimension_where).fill_null(False))
+    kept: set[int] = set()
+    for position in range(len(parts)):
+        column = survivors.get_column(f"{_BAND_POSITION_COLUMN}_{position}")
+        kept.update(value for value in column.to_list() if value is not None)
+    return sorted(kept)
 
 
 def select_dimension_band_wide(
@@ -386,6 +474,22 @@ def select_dimension_band_wide(
     `b0..b{height-1}`; see that function's docstring), so the returned frame's band names
     are contiguous even though the metadata rows they describe may have come from anywhere
     in the original set.
+
+    Over a JOINED frame -- one whose metadata carries `JOIN_OPERAND_COLUMN` -- the
+    predicate is not evaluated against the metadata as it stands. `join_band_wide` stacks
+    its operands' metadata VERTICALLY (`how="diagonal_relaxed"`), one row per band, so a
+    dimension only one operand carries is null on every other operand's rows; evaluating
+    the conjunct there would fail `fill_null(False)` for reasons having nothing to do with
+    the predicate and discard those operands entirely. Instead the join is reconstructed
+    first (`_joined_metadata_parts`, `unify_metadata_parts`) and the predicate evaluated
+    against THAT, so a conjunct on a non-shared dimension narrows the operand carrying it
+    directly and the others through the join -- which is what the same pipeline means in
+    long shape, where the join is a real key-based join and the dimension is an ordinary
+    column of the joined frame. A `filter` must not mean two different things depending on
+    a lowering the request never asked for.
+
+    An unjoined frame takes the direct path unchanged: with one operand there is nothing
+    to reconstruct and no null to misread.
 
     Returns `empty_band_wide(window)` when no band survives -- the one lowering this
     module's height-preservation invariant does not cover, named as the exception rather
@@ -406,12 +510,15 @@ def select_dimension_band_wide(
     if has_no_bands(metadata_df):
         return empty_band_wide(window)
     names = band_column_names(metadata_df)
-    indexed = metadata_df.with_row_index("__pos")
-    kept = indexed.filter(pl.sql_expr(dimension_where).fill_null(False))
-    if kept.height == 0:
+    if JOIN_OPERAND_COLUMN in metadata_df.columns:
+        positions = _joined_dimension_positions(metadata_df, dimension_where)
+    else:
+        indexed = metadata_df.with_row_index(_BAND_POSITION_COLUMN)
+        kept = indexed.filter(pl.sql_expr(dimension_where).fill_null(False))
+        positions = kept.get_column(_BAND_POSITION_COLUMN).to_list()
+    if not positions:
         return empty_band_wide(window)
-    positions = kept.get_column("__pos").to_list()
-    kept_metadata = kept.drop("__pos")
+    kept_metadata = metadata_df[positions]
     new_names = band_column_names(kept_metadata)
     select_exprs = [pl.col(names[position]).alias(new_name) for position, new_name in zip(positions, new_names)]
     out_lf = lf.select([*select_exprs, *extra_columns])
@@ -472,13 +579,23 @@ def filter_band_wide(
     docstring for why that order is a non-observable choice rather than a requirement).
 
     `value_columns` is the incoming frame's value columns (`request.ops.FrameType.
-    value_columns`), and does two things. It is forwarded to `classify_where_kinds`, so a
-    PAIRED frame's operand-named conjuncts (`marsh > 0.5`) classify as VALUE rather than
-    falling through to dimension for not being spelled `value`. And when there is more
-    than one of them, the value branch runs `pair_and_mask_band_wide` instead of
-    `mask_value_band_wide`: a paired frame's bands have to be paired up before a predicate
-    naming two operands means anything. It defaults to the unpaired `("value",)`, which is
-    every frame that never went through a `join`.
+    value_columns`), and is forwarded to `classify_where_kinds` so that a PAIRED frame's
+    operand-named conjuncts (`marsh > 0.5`) classify as VALUE rather than falling through
+    to dimension for not being spelled `value`. It defaults to the unpaired `("value",)`,
+    which is every frame that never went through a `join`. A value conjunct over a frame
+    that really is paired never reaches here: `request.ops._type_filter` rejects it, since
+    evaluating it would mean pairing the bands and reducing each pair to one, and nothing
+    in a predicate says which operand's value that one band should carry. `case_band_wide`
+    is the lowering for that question, and its arms answer it.
+
+    `extra_columns` joins `value_columns` for the classification, and only for that: a
+    carried column is a real per-pixel column of `lf` (one value per pixel, no band axis),
+    so a `where` naming one is the per-pixel mask a value conjunct is -- `mask_value_band_
+    wide` already admits these names into its own namespace -- and not a band selection
+    evaluated against `metadata_df`, which carries no such column and would fail on it.
+    `request.ops._type_filter` classifies against the identical union, from
+    `FrameType.extra_columns`, so the shape this step was TYPED as and the lowering that
+    runs here cannot disagree.
 
     `grid_width` is only needed for the spatial branch (`sample_grid_cells_band_wide`
     requires it, to decode absolute pixel ids); left `None` for a `where` that turns out
@@ -493,7 +610,7 @@ def filter_band_wide(
     behind (nothing for a value mask to do to zero bands).
     """
     validate_extra_columns(extra_columns)
-    kinds = classify_where_kinds(where, value_columns)
+    kinds = classify_where_kinds(where, [*value_columns, *extra_columns])
     if kinds[PredicateKind.spatial]:
         if grid_width is None:
             raise ValueError(
@@ -508,11 +625,7 @@ def filter_band_wide(
         if has_no_bands(result[1]):
             return result
     if kinds[PredicateKind.value]:
-        value_where = combine_conjuncts(kinds[PredicateKind.value])
-        if len(value_columns) > 1:
-            result = pair_and_mask_band_wide(result, value_where, extra_columns, value_columns)
-        else:
-            result = mask_value_band_wide(result, value_where, extra_columns)
+        result = mask_value_band_wide(result, combine_conjuncts(kinds[PredicateKind.value]), extra_columns)
     return result
 
 
@@ -568,6 +681,80 @@ def calculate_band_wide(band_wide: BandWideFrame, op: CalculateOp, extra_columns
 
     out_lf = lf.with_columns(exprs).select([*names, *extra_columns]) if exprs else lf.select([*names, *extra_columns])
     return out_lf, metadata_df, window
+
+
+def case_band_wide(
+    band_wide: BandWideFrame,
+    op: CaseOp,
+    extra_columns: Sequence[str],
+    value_columns: Sequence[str] = ("value",),
+) -> BandWideFrame:
+    """The band-wide lowering of a `case`, in the two readings `value_columns` picks
+    between -- the same split `filter_band_wide` makes for a value predicate, and for the
+    same reason.
+
+    **Unpaired (one value column): a MAP.** One chained `pl.when(...)` per band, with the
+    placeholder `value` rewritten to that band's own column (`rewrite_value_column`). Band
+    count, band order and `metadata_df` are all unchanged -- this rewrites pixels, it does
+    not select bands, which is why `case` needs no per-band applicability pass the way
+    `calculate_band_wide` does: a `case` arm's `when` is a pure value predicate
+    (`request.ops._type_case` rejects the other two kinds), so there is no dimension half
+    to evaluate against metadata.
+
+    **Paired (a `join` left one value column per operand): a REDUCE.** Each pair of bands
+    becomes ONE band, with every operand name rewritten to its own band column within that
+    pair (`rewrite_value_columns`). 2N bands in, N out, `metadata_df` collapsed to the
+    pairing key. This is the ONLY way a band-wide pairing collapses without also collapsing
+    the bands, and the reason it is `case` that does it rather than `filter`: a reduce has
+    to pick which operand's value the one surviving band carries, and only an arm's `then`
+    says.
+
+    Neither reading adds a nodata guard of its own -- unlike `calculate_band_wide`, whose
+    `is_not_null()` seed is part of its pass-through contract. See `case_expression` for
+    why a `case` leaves nodata to the arms.
+
+    A `case` over zero bands is `band_wide` unchanged in either reading -- there is nothing
+    to rewrite and nothing to pair, and "nothing happens to zero bands" needs no expression
+    compiled to say it. (A frame whose pairs all MISS is a different matter, and answers
+    `empty_band_wide(window)`: there the pairing ran and left nothing.)
+    """
+    validate_extra_columns(extra_columns)
+    lf, metadata_df, window = band_wide
+    if has_no_bands(metadata_df):
+        return band_wide
+    names = band_column_names(metadata_df)
+
+    if len(value_columns) > 1:
+        grouped, key_columns, pairs = _pair_band_groups(metadata_df, value_columns)
+        kept_rows = []
+        band_exprs = []
+        for row_index, _positions, substitutions in pairs:
+            columns = list(substitutions.values())
+            band_exprs.append(
+                long_ops.case_expression(
+                    op,
+                    [*columns, *extra_columns],
+                    lambda text, subs=substitutions: rewrite_value_columns(text, subs),
+                ).alias(f"b{len(kept_rows)}")
+            )
+            kept_rows.append(row_index)
+        if not kept_rows:
+            return empty_band_wide(window)
+        return (
+            lf.select([*band_exprs, *extra_columns]),
+            _paired_metadata(grouped, key_columns, kept_rows),
+            window,
+        )
+
+    exprs = [
+        long_ops.case_expression(
+            op,
+            [name, *extra_columns],
+            lambda text, column=name: rewrite_value_column(text, column),
+        ).alias(name)
+        for name in names
+    ]
+    return lf.select([*exprs, *extra_columns]), metadata_df, window
 
 
 def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequence[str]) -> BandWideFrame:

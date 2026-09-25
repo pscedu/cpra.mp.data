@@ -47,10 +47,11 @@ from cpra.mp.data.analyses.land_type_confidence import (
     WATER_VALUES,
     LandTypeConfidence,
 )
-from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
+from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
+    CaseStep,
     FilterStep,
     GroupStep,
     ProjectStep,
@@ -755,7 +756,7 @@ class TestSalinityVegInvestigationPipeline:
             "hydro_compartment_v001",
         )
 
-        coverage_filter, salinity_filter, project_step, join_step, filter_step, group_step = (
+        coverage_filter, salinity_filter, project_step, join_step, case_step, group_step = (
             pipeline.steps
         )
 
@@ -782,8 +783,13 @@ class TestSalinityVegInvestigationPipeline:
         assert join_step.type == "spatial"
         assert set(join_step.inputs) == {"marsh", "sal"}
 
-        assert isinstance(filter_step, FilterStep)
-        assert filter_step.where == "marsh > 0.5 AND sal > 5.5"
+        # The threshold test collapses the pairing and says what survives it, which a
+        # `filter` has no way to state.
+        assert isinstance(case_step, CaseStep)
+        assert [(arm.when, arm.then) for arm in case_step.cases] == [
+            ("marsh > 0.5 AND sal > 5.5", "marsh")
+        ]
+        assert case_step.else_ is None
 
         assert isinstance(group_step, GroupStep)
         assert group_step.by == []
@@ -792,10 +798,10 @@ class TestSalinityVegInvestigationPipeline:
 
         assert pipeline.output.format == "tif"
 
-    def test_the_join_operands_are_named_for_what_the_threshold_filter_reads(self):
+    def test_the_join_operands_are_named_for_what_the_threshold_case_reads(self):
         """A join's output value columns are named after its OPERANDS, and an `as` may
         not collide with an input name -- so the two inputs take the longer names and the
-        per-input steps rename down to the `marsh`/`sal` the trailing `where` references.
+        per-input steps rename down to the `marsh`/`sal` the trailing arm references.
         """
         _, pipeline = self._build()
         join_step = next(step for step in pipeline.steps if step.op == "join")
@@ -804,8 +810,8 @@ class TestSalinityVegInvestigationPipeline:
 
     def test_custom_thresholds_are_interpolated(self):
         _, pipeline = self._build(marsh_threshold=0.75, salinity_threshold=3.0)
-        filter_step = pipeline.steps[4]
-        assert filter_step.where == "marsh > 0.75 AND sal > 3.0"
+        case_step = pipeline.steps[4]
+        assert case_step.cases[0].when == "marsh > 0.75 AND sal > 3.0"
 
     def test_collapsed_dimensions_union_both_inputs(self):
         analysis, _ = self._build()
@@ -890,19 +896,22 @@ class TestLandTypeConfidencePipeline:
         assert isinstance(domain, FilterStep)
         assert domain.where == "value = 1 OR value = 2 OR value = 3 OR value = 4 OR value = 5"
 
-    def test_the_mapping_calculates_come_before_the_weights(self):
+    def test_the_mapping_is_one_case_before_the_weights(self):
+        # Both arms read the INCOMING code, so unlike the two `calculate`s this replaced
+        # there is no ordering question to get wrong -- and no `else`, so a code neither
+        # arm names comes out null rather than as itself.
         _, pipeline = self._build()
-        land, water = pipeline.steps[2], pipeline.steps[3]
-        assert isinstance(land, CalculateStep)
-        assert land.expression == "1.0"
-        assert land.where == "value = 1 OR value = 3 OR value = 4"
-        assert isinstance(water, CalculateStep)
-        assert water.expression == "0.0"
-        assert water.where == "value = 2 OR value = 5"
+        mapping = pipeline.steps[2]
+        assert isinstance(mapping, CaseStep)
+        assert [(arm.when, arm.then) for arm in mapping.cases] == [
+            ("value = 1 OR value = 3 OR value = 4", "1.0"),
+            ("value = 2 OR value = 5", "0.0"),
+        ]
+        assert mapping.else_ is None
 
     def test_one_weight_calculate_per_member_in_ascending_order(self):
         _, pipeline = self._build()
-        weights = pipeline.steps[4:-1]
+        weights = pipeline.steps[3:-1]
         assert [step.where for step in weights] == [
             f"scenario_id = {scenario_id}" for scenario_id in sorted(SCENARIO_WEIGHTS)
         ]
@@ -920,8 +929,9 @@ class TestLandTypeConfidencePipeline:
         assert analysis.collapsed_dimensions == frozenset({"scenario_id"})
 
     def test_the_step_count_is_the_mapping_plus_one_per_member(self):
+        # Two filters and the one `case`, then a weight apiece, then the `group`.
         _, pipeline = self._build()
-        assert len(pipeline.steps) == 4 + len(SCENARIO_WEIGHTS) + 1
+        assert len(pipeline.steps) == 3 + len(SCENARIO_WEIGHTS) + 1
 
     def test_the_output_format_is_the_one_the_pipeline_can_actually_run_under(self):
         # `Output.format` is required, so `pipeline()` has to set something; every
@@ -971,12 +981,15 @@ class TestLandTypeConfidencePipeline:
                 params={},
             )
 
-    def test_the_get_encoding_numbers_all_ten_steps(self):
-        # The ten steps are positional in the GET encoding (`step.<n>.` is 1-based), so a
-        # caller can reproduce the analysis as a hand-authored pipeline URL.
+    def test_the_get_encoding_numbers_all_nine_steps(self):
+        # The nine steps are positional in the GET encoding (`step.<n>.` is 1-based), so a
+        # caller can reproduce the analysis as a hand-authored pipeline URL. The `case`'s
+        # arms nest one level further down, positionally in their own right.
         query = pipeline_to_query(self._build()[1])
-        assert query["step.10.op"] == "group"
-        assert query["step.5.expression"] == "value * 0.085"
+        assert query["step.9.op"] == "group"
+        assert query["step.4.expression"] == "value * 0.085"
+        assert query["step.3.cases.1.then"] == "1.0"
+        assert query["step.3.cases.2.when"] == "value = 2 OR value = 5"
 
 
 # ------------------------------------------------------------------------------------------
@@ -1029,7 +1042,7 @@ class TestLndTypePlusPipeline:
 
     def test_the_three_inputs_are_fixed(self):
         _, pipeline = self._build()
-        assert set(pipeline.inputs) == {"stage", "elevation", "land"}
+        assert set(pipeline.inputs) == {"stage", "elevation", "land_type"}
         stage = pipeline.inputs["stage"]
         assert (stage.variable, stage.time_unit, stage.grid) == (
             "stg",
@@ -1042,148 +1055,110 @@ class TestLndTypePlusPipeline:
             "annual",
             "morph_pixel_v002",
         )
-        land = pipeline.inputs["land"]
-        assert (land.variable, land.time_unit, land.grid) == ("lnd_type", "annual", "morph_pixel_v002")
-
-    def test_the_depth_half_of_the_step_shape(self):
-        """Steps 1-8: stage onto the pixel grid, elevation negated, the presence guard, and
-        the `sum` that IS the subtraction.
-        """
-        _, pipeline = self._build()
-        (
-            stage_filter,
-            project_step,
-            elevation_filter,
-            negate,
-            guard_join,
-            guard,
-            depth_join,
-            sum_step,
-        ) = pipeline.steps[:8]
-
-        assert isinstance(stage_filter, FilterStep)
-        assert stage_filter.input == "stage"
-        # `aggregate_type` is the analysis's own, not a caller's -- it sorts first.
-        assert stage_filter.where == (
-            "aggregate_type = 'mean' AND calendar_year = 2050 "
-            "AND model_group_id = 705 AND scenario_id = 7"
+        land_type = pipeline.inputs["land_type"]
+        assert (land_type.variable, land_type.time_unit, land_type.grid) == (
+            "lnd_type",
+            "annual",
+            "morph_pixel_v002",
         )
 
-        assert project_step.op == "project"
+    def test_the_whole_step_shape(self):
+        """Five steps, and the last of them does all the work: stage onto the pixel grid,
+        one join bringing all three inputs together, the caller's selection, and a single
+        total `case` that subtracts, converts, restricts to water, reclassifies and passes
+        the land type through -- with no reduce after it at all.
+        """
+        _, pipeline = self._build()
+        assert [step.op for step in pipeline.steps] == ["filter", "project", "join", "filter", "case"]
+        stage_filter, project_step, depth_join, selection, reclassify = pipeline.steps
+
+        # The ONE leading filter, and it carries no part of the caller's selection: only
+        # `aggregate_type`, which this analysis pins itself and which the `case`'s pairing
+        # drops, so there is no later frame it could be stated on.
+        assert isinstance(stage_filter, FilterStep)
+        assert stage_filter.input == "stage"
+        assert stage_filter.where == "aggregate_type = 'mean'"
+
         assert project_step.input == "selected_stage"
         assert project_step.to == "morph_pixel_v002"
         # Vector ONTO raster broadcasts rather than reduces, so no `aggregate`.
         assert project_step.aggregate is None
         assert project_step.as_ == "stage_m"
 
-        assert isinstance(elevation_filter, FilterStep)
-        assert elevation_filter.input == "elevation"
-        assert (
-            elevation_filter.where
-            == "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
-        )
-
-        # Millimetres to metres and the sign flip the `sum` below needs, in one pass.
-        assert isinstance(negate, CalculateStep)
-        assert (negate.expression, negate.where) == ("value / -1000", None)
-        assert negate.as_ == "neg_elevation_m"
-
-        # The presence guard: `sum` SKIPS nulls, so stage without elevation would otherwise
-        # sum to the bare stage and reclassify as a real inundation class.
-        assert guard_join.op == "join"
-        assert guard_join.inputs == ["stage_m", "neg_elevation_m"]
-        assert isinstance(guard, FilterStep)
-        assert guard.where == "stage_m IS NOT NULL AND neg_elevation_m IS NOT NULL"
-        assert guard.as_ == "stage_present"
-
-        assert depth_join.op == "join"
+        # ONE join for all three inputs, not a chain of two: `join` is N-ary, and the
+        # `case` below pairs N operands band-for-band just as readily as two. `elevation`
+        # and `land_type` are the INPUTS -- nothing stands between either read and the
+        # join, and no value-domain filter is wanted on the land type either, since
+        # `lnd_type` tops out at `5` and anything outside its domain is the `-9999` nodata
+        # sentinel, masked to null on read.
         assert depth_join.type == "spatial"
-        assert depth_join.inputs == ["stage_present", "neg_elevation_m"]
+        assert depth_join.inputs == ["stage_m", "elevation", "land_type"]
 
-        assert isinstance(sum_step, GroupStep)
-        assert sum_step.aggregate == "sum"
-        assert sum_step.by == ["model_group_id", "scenario_id", "calendar_year"]
+        # The caller's selection, stated once, on the frame all three inputs have reached.
+        assert isinstance(selection, FilterStep)
+        assert selection.input is None
+        assert selection.where == "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
+        assert selection.as_ == "selected"
 
-    def test_the_reclassification_half_of_the_step_shape(self):
-        """Steps 9-18: the running value is now depth in metres."""
-        _, pipeline = self._build()
-        (
-            depth_domain,
-            shallow,
-            mid,
-            deep,
-            flip,
-            land_filter,
-            water_join,
-            water_mask,
-            join_step,
-            group_step,
-        ) = pipeline.steps[8:]
-
-        assert isinstance(depth_domain, FilterStep)
-        assert depth_domain.where == "value > 0"
-
-        for step in (shallow, mid, deep, flip):
-            assert isinstance(step, CalculateStep)
-        assert (shallow.expression, shallow.where) == ("-6", "value <= 0.46")
-        assert (mid.expression, mid.where) == ("-7", "value > 0.46 AND value <= 1.0")
-        assert (deep.expression, deep.where) == ("0", "value > 1.0")
-        assert (flip.expression, flip.where) == ("value * -1", "value < 0")
-        assert flip.as_ == "depth_class"
-
-        # No value-domain filter on land type: `lnd_type` tops out at `5`, and anything
-        # outside its domain is the `-9999` nodata sentinel, masked to null on read.
-        assert isinstance(land_filter, FilterStep)
-        assert land_filter.input == "land"
-        assert land_filter.where == pipeline.steps[2].where
-        assert land_filter.as_ == "land_type"
-
-        # The water restriction: `max` would otherwise let a shallow class override any
-        # land type at all, so the depth is masked everywhere the land type is not water
-        # BEFORE the join whose max produces the result.
-        assert water_join.op == "join"
-        assert water_join.inputs == ["depth_class", "land_type"]
-        assert isinstance(water_mask, FilterStep)
-        assert water_mask.where == "land_type = 2"
-        assert water_mask.as_ == "water_depth_class"
-
-        assert join_step.op == "join"
-        assert join_step.type == "spatial"
-        assert join_step.inputs == ["water_depth_class", "land_type"]
-
-        assert isinstance(group_step, GroupStep)
-        assert group_step.by == ["model_group_id", "scenario_id", "calendar_year"]
-        assert group_step.aggregate == "max"
-        assert group_step.of == "value"
+        # Everything else, in one step, over the triple the join produced. Descending by
+        # bound, because the first matching arm wins; the last one is the domain floor. The
+        # millimetre-to-metre conversion is written into the shared depth rather than
+        # standing as a `calculate` of its own -- there is no `neg_elevation_m` any more.
+        #
+        # The water restriction rides on every arm rather than standing as a mask of its
+        # own, and the deepest class reports the open-water land type rather than a code of
+        # its own, which is what makes the `else` sufficient and a trailing `max` needless.
+        assert isinstance(reclassify, CaseStep)
+        assert [(arm.when, arm.then) for arm in reclassify.cases] == [
+            ("land_type = 2 AND stage_m - elevation / 1000 > 1.0", "2"),
+            ("land_type = 2 AND stage_m - elevation / 1000 > 0.46", "7"),
+            ("land_type = 2 AND stage_m - elevation / 1000 > 0", "6"),
+        ]
+        # The land type, unchanged, for everything no arm claims -- which is the whole
+        # reason nothing follows this step.
+        assert reclassify.else_ == "land_type"
+        assert reclassify.as_ is None
 
         assert pipeline.output.format == "tif"
 
-    def test_the_group_by_omits_the_dimension_only_stage_carries(self):
-        # `aggregate_type` is required by `stg` and by neither raster, so grouping on it
-        # would split every pair into two one-band groups that never reduce together.
+    def test_nothing_groups_on_the_dimension_only_stage_carries(self):
+        # `aggregate_type` is required by `stg` and by neither raster, so pairing or
+        # grouping on it would split every triple into one-band groups that never reduce
+        # together. The `case`'s pairing key is the shared dimensions, which excludes it by
+        # construction; this pins that no step reintroduces it.
         _, pipeline = self._build()
         for step in pipeline.steps:
-            if step.op == "group":
-                assert "aggregate_type" not in step.by
+            assert "aggregate_type" not in (getattr(step, "by", None) or [])
 
-    def test_no_reclassification_rule_can_re_match_what_an_earlier_one_wrote(self):
-        """The property the negative encoding exists for: applying the four `calculate`
-        entries in order to any depth in the filtered domain lands on the code the spec
-        names, with no rule re-matching a value an earlier rule already wrote.
+    def test_every_depth_lands_on_the_code_the_class_table_names(self):
+        """Applying the `case` arms in order to any depth lands on the code
+        `DEPTH_CLASSES` names, and everything at or below the domain floor falls through to
+        the land type.
 
-        Re-implemented here as a plain interpreter over the pipeline's own `where`
-        strings rather than against a second copy of the class table, so an edit to the
-        steps that reintroduces the collision fails this test.
+        Re-implemented here as a plain first-match-wins interpreter over the pipeline's
+        own `when` strings rather than against a second copy of the class table, so an
+        edit to the arms that gets an interval's open/closed end wrong fails this test.
+        The `else` is interpreted too, since with no reduce after the `case` it is the only
+        thing standing between an unclaimed pixel and nodata.
+
+        Every arm also carries the water conjunct, which is interpreted here too -- so a
+        land type that stops being tested, or stops being tested for water, fails below
+        rather than being quietly dropped from the interpreter.
         """
         _, pipeline = self._build()
-        entries = [(step.where, step.expression) for step in pipeline.steps[9:13]]
+        case_step = pipeline.steps[-1]
+        arms = [(arm.when, arm.then) for arm in case_step.cases]
+        assert case_step.else_ == "land_type"
 
-        def run(depth):
-            value = depth
-            for where, expression in entries:
-                if all(_conjunct_holds(value, conjunct) for conjunct in where.split(" AND ")):
-                    value = -value if expression == "value * -1" else float(expression)
-            return value
+        def run(depth, land_type=WATER_LAND_TYPE):
+            for when, then in arms:
+                water, _, depth_test = when.partition(" AND ")
+                assert water == "land_type = 2", f"unexpected water conjunct in {when!r}"
+                if land_type == WATER_LAND_TYPE and _conjunct_holds(
+                    depth, depth_test, measured="stage_m - elevation / 1000"
+                ):
+                    return float(then)
+            return land_type  # the `else`
 
         # Every interval is closed at its upper bound, so each bound belongs to the class
         # BELOW it -- the pair either side of each is what pins that.
@@ -1191,33 +1166,55 @@ class TestLndTypePlusPipeline:
         assert run(0.46) == 6
         assert run(0.47) == 7
         assert run(1.0) == 7
-        assert run(1.01) == 0
-        assert run(12.5) == 0
+        # Deeper than 1.0 m is not a class of its own: it reports the open-water land type,
+        # which is what the `lnd_type_plus` legend's relabelled `2` ("Water - Deep") means.
+        assert run(1.01) == 2
+        assert run(12.5) == 2
+        # The domain floor. Zero itself is dry land standing at the water level, not a
+        # depth of zero, and a negative is elevation above it -- neither is a class, so
+        # both fall through to the land type they already were.
+        assert run(0) == 2
+        assert run(-3.2) == 2
+        # ... and no depth is a class on a pixel that is not open water, however deeply the
+        # water surface stands above its ground: the land type passes straight through.
+        assert run(12.5, land_type=1) == 1
+        assert run(0.47, land_type=5) == 5
 
-    def test_the_join_operand_names_do_not_collide_with_the_input_names(self):
-        # An `as` may not collide with an input name (`parse_pipeline` rejects it), and a
-        # join's operands are named by `as` -- so this is the constraint that fixes the
-        # `stage`/`stage_m` and `land`/`land_type` naming.
+    def test_every_step_name_a_join_reads_is_something_the_pipeline_defines(self):
+        # A join operand is either an input or an earlier step's `as`, and the two
+        # namespaces are disjoint (`parse_pipeline` rejects an `as` colliding with an input
+        # name) -- which is what fixes the `stage`/`stage_m` naming: stage is filtered
+        # before it is projected, so the projection needs a name of its own. `land_type`
+        # needs no such split, because nothing stands between that read and the join, so
+        # the joins name the input directly.
         _, pipeline = self._build()
-        for join_step in (step for step in pipeline.steps if step.op == "join"):
-            assert set(join_step.inputs).isdisjoint(pipeline.inputs)
+        defined = set(pipeline.inputs)
+        for step in pipeline.steps:
+            for operand in getattr(step, "inputs", None) or []:
+                assert operand in defined
+            if step.as_ is not None:
+                assert step.as_ not in pipeline.inputs
+                defined.add(step.as_)
+        assert "land_type" in pipeline.inputs
 
     def test_an_omitted_calendar_year_drops_only_that_conjunct(self):
         _, pipeline = self._build(calendar_year=None)
-        assert pipeline.steps[0].where == (
-            "aggregate_type = 'mean' AND model_group_id = 705 AND scenario_id = 7"
-        )
-        assert pipeline.steps[2].where == "model_group_id = 705 AND scenario_id = 7"
-        # ... and the year stays in the trailing group, so an unfiltered request returns
-        # one band per year rather than reducing the years together.
-        assert "calendar_year" in pipeline.steps[-1].by
+        # The stage filter never carried the selection at all, so nothing changes there.
+        assert pipeline.steps[0].where == "aggregate_type = 'mean'"
+        assert pipeline.steps[-2].where == "model_group_id = 705 AND scenario_id = 7"
+        # ... and nothing reduces the years together: the `case`'s pairing is keyed on the
+        # dimensions the inputs share, `calendar_year` among them, so an unfiltered request
+        # returns one output band per year.
+        analysis, _ = self._build(calendar_year=None)
+        assert "calendar_year" not in analysis.collapsed_dimensions
 
     def test_only_stages_aggregate_type_is_collapsed(self):
         # The axis this analysis mainly collapses is the OPERAND axis (which input a band
         # came from), which is not a dimension. The one real dimension that does go is
         # `aggregate_type`: only `stg` carries it, the analysis pins it to `mean` itself,
-        # and the trailing `group.by` drops it -- so a caller can neither see nor vary it,
-        # which is what `collapsed_dimensions` exists to tell the visualization layer.
+        # and the `case`'s pairing key (the dimensions all three inputs share) cannot carry
+        # it -- so a caller can neither see nor vary it, which is what
+        # `collapsed_dimensions` exists to tell the visualization layer.
         analysis, _ = self._build()
         assert analysis.collapsed_dimensions == frozenset({"aggregate_type"})
 
@@ -1235,7 +1232,8 @@ class TestLndTypePlusPipeline:
             params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
         )
         assert isinstance(resolved, ResolvedAnalysis)
-        assert resolved.pipeline.steps[-1].aggregate == "max"
+        assert resolved.pipeline.steps[-1].else_ == "land_type"
+        assert resolved.collapsed_dimensions == frozenset({"aggregate_type"})
 
     def test_string_parameters_off_a_query_string_are_coerced(self):
         # Every parameter arrives as a string on the real routes (`_analysis_extra_params`
@@ -1246,7 +1244,7 @@ class TestLndTypePlusPipeline:
             filters={},
             params={"model_group_id": "705", "scenario_id": "7", "calendar_year": "2050"},
         )
-        assert resolved.pipeline.steps[2].where == (
+        assert resolved.pipeline.steps[-2].where == (
             "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
         )
 
@@ -1260,10 +1258,14 @@ class TestLndTypePlusPipeline:
             )
 
 
-def _conjunct_holds(value, conjunct):
-    """Evaluate one `value <op> <literal>` conjunct of a reclassification `where` -- the
-    only operators those steps use. Deliberately narrow: it exists to interpret the
-    pipeline this analysis really builds, not to be a general SQL evaluator.
+def _conjunct_holds(value, conjunct, measured="value"):
+    """Evaluate one `<measured> <op> <literal>` conjunct of a reclassification predicate --
+    the only operators those steps use. `measured` is whatever the step writes on the left,
+    the placeholder `value` unpaired and the operand arithmetic (`stage_m - elevation /
+    1000`) over a joined frame; it is asserted rather than parsed, so an arm that
+    starts measuring something else fails here instead of being silently interpreted.
+    Deliberately narrow: it exists to interpret the pipeline this analysis really builds,
+    not to be a general SQL evaluator.
     """
     for operator, test in (
         ("<=", lambda a, b: a <= b),
@@ -1272,6 +1274,6 @@ def _conjunct_holds(value, conjunct):
     ):
         left, sep, right = conjunct.partition(f" {operator} ")
         if sep:
-            assert left == "value", f"unexpected left-hand side in {conjunct!r}"
+            assert left == measured, f"unexpected left-hand side in {conjunct!r}"
             return test(value, float(right))
     raise AssertionError(f"unrecognized conjunct {conjunct!r}")

@@ -453,7 +453,7 @@ class TestCustomAnalysisPipelineJson:
             "filter",
             "project",
             "join",
-            "filter",
+            "case",
             "group",
         ]
 
@@ -636,8 +636,9 @@ class TestLndTypePlusRoute:
             data = src.read(1)
         # The fixture's first four pixels are one per reclassification rule, by COMPUTED
         # depth, plus the water restriction: 0.20 m over water -> 6, 0.70 m over water -> 7,
-        # 1.50 m over water -> 2 (deep is `0`, so the water wins the max), and 0.20 m over
-        # land type 1 -> 1 (only water may be overwritten). The rest repeat the shallow case.
+        # 1.50 m over water -> 2 (the deep class reports the open-water code itself), and
+        # 0.20 m over land type 1 -> 1 (no arm matches off water, so the `else` hands back
+        # the land type unchanged). The rest repeat the shallow case.
         assert data.ravel().tolist() == [6, 7, 2, 1, 6, 6, 6, 6]
 
     def test_png_tile(self, client, lnd_type_plus_data):
@@ -660,26 +661,25 @@ class TestLndTypePlusRoute:
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
         assert len(expanded.inputs) == 3
-        assert expanded.steps[-1].op == "group"
-        assert expanded.steps[-1].aggregate == "max"
+        assert expanded.steps[-1].op == "case"
+        assert expanded.steps[-1].else_ == "land_type"
         assert response.json()["output"]["format"] == "tif"
         validate_shapes(expanded)  # no raise
 
     def test_calendar_year_is_optional(self, client, lnd_type_plus_data):
-        """The one optional parameter. Omitted, every year on disk is kept as its own band
-        -- and `calendar_year` stays in the `group.by` either way, which is what keeps each
-        year reduced against its OWN counterpart band.
+        """The one optional parameter. Omitted, every year on disk is kept as its own band --
+        no `filter` anywhere names `calendar_year`, and nothing downstream reduces across it
+        either. There is no `group` in this pipeline at all; the one collapse is the `case`'s
+        own pairing, which keys on the dimensions all three operands SHARE
+        (`execution.band_ops._pair_band_groups`) and so can only ever pair a year with itself.
+        That is what keeps each year reclassified against its OWN counterpart bands.
         """
         params = {k: v for k, v in LND_TYPE_PLUS_QUERY.items() if k != "calendar_year"}
         response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=params)
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
-        assert not any(
-            "calendar_year" in (step.where or "")
-            for step in expanded.steps
-            if step.op == "filter" and step.input is not None
-        )
-        assert expanded.steps[-1].by == ["model_group_id", "scenario_id", "calendar_year"]
+        assert not any("calendar_year" in (step.where or "") for step in expanded.steps if step.op == "filter")
+        assert not any(step.op == "group" for step in expanded.steps)
 
     def test_a_missing_required_parameter_is_a_400(self, client, lnd_type_plus_data):
         """`model_group_id` is a dimension name, so a route that bound it as a filter would

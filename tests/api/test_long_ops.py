@@ -1,5 +1,5 @@
 """Tests for `cpra.mp.data.analysis.execution.long_ops` -- the long-shape lowerings for
-`filter`/`calculate`/`group`/`join`.
+`filter`/`calculate`/`case`/`group`/`join`.
 
 Every fixture here is a small in-memory `pl.LazyFrame` built directly, not read off disk:
 these functions are pure Polars transforms over whatever frame they are handed (see
@@ -11,9 +11,16 @@ is a more direct test than routing through a fixture file would be.
 import polars as pl
 import pytest
 
-from cpra.mp.data.analysis.execution.long_ops import calculate_long, filter_long, group_long, join_long
+from cpra.mp.data.analysis.execution.long_ops import (
+    calculate_long,
+    case_long,
+    filter_long,
+    group_long,
+    join_long,
+)
 from cpra.mp.data.analysis.request.expressions import ExpressionError
-from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
 def _frame():
@@ -59,6 +66,54 @@ class TestFilterLong:
         after = filter_long(_frame(), "value > 1000").collect().height
         assert after == 0
         assert after < before
+
+
+class TestFilterLongValueColumns:
+    """`value_columns` decides which bucket a conjunct lands in. Without it this lowering
+    classified by the literal name `value`, so a PAIRED frame's operand-named conjunct
+    fell through to the dimension bucket and took the unrestricted `lf.sql()` path --
+    disagreeing with `band_ops.filter_band_wide`, which has always had the parameter.
+    """
+
+    @staticmethod
+    def _paired():
+        return pl.LazyFrame(
+            {
+                "grid_cell": [1, 2, 3],
+                "calendar_year": [2030, 2030, 2030],
+                "marsh": [0.9, None, 0.2],
+                "sal": [6.0, 6.0, 6.0],
+            }
+        )
+
+    def test_operand_named_conjunct_drops_rows(self):
+        df = filter_long(self._paired(), "marsh > 0.5", ("marsh", "sal")).collect()
+        assert df["grid_cell"].to_list() == [1]
+
+    def test_operand_named_conjunct_goes_through_the_whitelist(self):
+        """The point of the correction: an operand-named conjunct is a VALUE conjunct, so
+        it is checked by `parse_value_expr` rather than handed whole to `lf.sql()`.
+        `exp` is not in `ALLOWED_FUNCTIONS`, and ran before.
+        """
+        with pytest.raises(ExpressionError, match="not in the allowed whitelist"):
+            filter_long(self._paired(), "exp(marsh) > 1", ("marsh", "sal")).collect()
+
+    def test_conjunct_naming_two_operands_is_one_value_predicate(self):
+        df = filter_long(self._paired(), "marsh < sal", ("marsh", "sal")).collect()
+        assert df["grid_cell"].to_list() == [1, 3]
+
+    def test_dimension_conjunct_still_sorts_apart_on_a_paired_frame(self):
+        df = filter_long(self._paired(), "calendar_year = 2030 AND marsh > 0.5", ("marsh", "sal")).collect()
+        assert df["grid_cell"].to_list() == [1]
+
+    def test_mixed_value_and_dimension_conjunct_is_rejected_as_it_is_band_wide(self):
+        """`value > calendar_year` has no lowering in either shape. It was rejected here
+        by `classify_where`'s own mixed-conjunct rule and is now rejected by the value
+        namespace, which is the same check band-wide shape already applied -- the two
+        shapes agree rather than one admitting what the other refuses.
+        """
+        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+            filter_long(_frame(), "value > calendar_year").collect()
 
 
 VALUE_ONLY = frozenset({"value"})
@@ -160,6 +215,142 @@ class TestCalculateLongAfterJoin:
         op = CalculateOp(step_no=2, input="j", expression="a * calendar_year", output="c")
         with pytest.raises(ExpressionError, match="not in the allowed namespace"):
             calculate_long(self._joined(), op, frozenset({"a", "b"})).collect()
+
+
+def _case(*arms, else_=None):
+    """A one-step `case` over `(when, then)` pairs. Always step 1, so the error-message
+    test below can spell the position it expects.
+    """
+    return CaseOp(
+        step_no=1,
+        input="a",
+        cases=[CaseWhen(when=when, then=then) for when, then in arms],
+        else_=else_,
+        output="b",
+    )
+
+
+class TestCaseLong:
+    def test_first_matching_arm_wins(self):
+        # The arms deliberately OVERLAP -- every value over 35 satisfies both -- so the
+        # result can only be right if later arms never see a cell an earlier one claimed.
+        op = _case(("value > 35", "1"), ("value > 15", "2"))
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [None, 2.0, 2.0, 1.0]
+
+    def test_every_arm_reads_the_incoming_value_not_the_running_one(self):
+        """The property `case` exists for. Written as a chain of `calculate`s these two
+        entries collide -- the first writes `30`, which the second's `where` then matches
+        -- so the 10.0 cell would come out `40`. Here each cell is written exactly once.
+        """
+        op = _case(("value = 10", "30"), ("value = 30", "40"))
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [30.0, None, 40.0, None]
+
+    def test_an_unmatched_value_is_null_by_default(self):
+        op = _case(("value > 1000", "1"))
+        df = case_long(_frame(), op, VALUE_ONLY).collect()
+        assert df["value"].to_list() == [None, None, None, None]
+        # Masked, not dropped -- a `case` is shape-preserving, so the rows stay.
+        assert df.height == 4
+
+    def test_else_supplies_the_fall_through(self):
+        op = _case(("value > 25", "1"), else_="0")
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [0.0, 0.0, 1.0, 1.0]
+
+    def test_then_and_else_are_value_expressions_not_just_constants(self):
+        op = _case(("value > 25", "value * 2"), else_="value + 1")
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [11.0, 21.0, 60.0, 80.0]
+
+    def test_an_else_catches_nodata_and_the_author_says_what_to_do_about_it(self):
+        """`case` adds no nodata guard of its own: a null matches no `when` (every
+        predicate is `fill_null(False)`), so it falls straight through to the `else` and
+        `else 0` really does paint every nodata cell `0`.
+
+        The second half is the trade that makes the first half acceptable -- the author
+        states the intent in one conjunct, and an arm that tests nullity WORKS, which it
+        could not while a blanket guard discarded its answer.
+        """
+        lf = pl.LazyFrame(
+            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]}
+        )
+        op = _case(("value > 25", "1"), else_="0")
+        df = case_long(lf, op, VALUE_ONLY).collect().sort("calendar_year")
+        assert df["value"].to_list() == [0.0, 0.0]
+
+        guarded = _case(("value > 25", "1"), ("value IS NULL", "value"), else_="0")
+        df = case_long(lf, guarded, VALUE_ONLY).collect().sort("calendar_year")
+        assert df["value"].to_list() == [0.0, None]
+
+    def test_an_expression_outside_the_value_namespace_is_rejected(self):
+        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+            case_long(_frame(), _case(("calendar_year > 2030", "1")), VALUE_ONLY).collect()
+        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+            case_long(_frame(), _case(("value > 1", "calendar_year")), VALUE_ONLY).collect()
+
+    def test_the_failing_part_of_a_multi_part_step_is_named(self):
+        # A `case` has many expressions, so "step 1 (case) is invalid" would leave the
+        # caller to find which one. Every part carries its own position and role.
+        op = _case(("value > 1", "1"), ("exp(value) > 1", "2"))
+        with pytest.raises(ExpressionError, match=r"^step\.1 arm 2 when: "):
+            case_long(_frame(), op, VALUE_ONLY).collect()
+        op = _case(("value > 1", "exp(value)"))
+        with pytest.raises(ExpressionError, match=r"^step\.1 arm 1 then: "):
+            case_long(_frame(), op, VALUE_ONLY).collect()
+        op = _case(("value > 1", "1"), else_="exp(value)")
+        with pytest.raises(ExpressionError, match=r"^step\.1 else: "):
+            case_long(_frame(), op, VALUE_ONLY).collect()
+
+
+class TestCaseLongAfterJoin:
+    """A `case` reading a joined frame, whose value columns are named after the join's
+    operands. Same collapse `calculate` makes: the arms may name any operand, and the
+    result is one column called `value` with the operand columns gone.
+    """
+
+    def _joined(self):
+        return pl.LazyFrame(
+            {
+                "calendar_year": [2030, 2040],
+                "grid_cell": [1, 1],
+                "a": [10.0, 30.0],
+                "b": [4.0, 5.0],
+            }
+        )
+
+    def test_arms_over_operand_columns_collapse_to_one_value(self):
+        op = _case(("a > b", "a - b"), else_="b")
+        df = case_long(self._joined(), op, frozenset({"a", "b"})).collect().sort("calendar_year")
+        assert df["value"].to_list() == [6.0, 25.0]
+        assert set(df.columns) == {"calendar_year", "grid_cell", "value"}
+
+    def test_an_operand_an_arm_does_not_name_does_not_null_the_arms_answer(self):
+        """The half-present pair, which is where the blanket guard was not merely a policy
+        but wrong: row 2's `b` is null and `a` is 30, and the only arm reads `a` alone. It
+        matched, on an operand that is fully present, and `30.0` is its answer -- the guard
+        used to return null there, on the strength of a column no part of the `case`
+        mentions.
+
+        A pipeline that really does want both operands present says so, and the second
+        half pins that it still can.
+        """
+        lf = pl.LazyFrame(
+            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, 30.0], "b": [4.0, None]}
+        )
+        op = _case(("a > 1", "a"), else_="0")
+        df = case_long(lf, op, frozenset({"a", "b"})).collect().sort("calendar_year")
+        assert df["value"].to_list() == [10.0, 30.0]
+
+        both = _case(("a > 1 AND b IS NOT NULL", "a"))
+        df = case_long(lf, both, frozenset({"a", "b"})).collect().sort("calendar_year")
+        assert df["value"].to_list() == [10.0, None]
+
+    def test_value_is_not_in_a_joined_frames_namespace(self):
+        op = _case(("value > 1", "1"))
+        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+            case_long(self._joined(), op, frozenset({"a", "b"})).collect()
 
 
 class TestGroupLong:

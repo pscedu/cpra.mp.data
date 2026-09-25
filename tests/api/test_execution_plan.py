@@ -3,21 +3,20 @@ already-validated `Pipeline` into the `ExecutionPlan` `execution.execute.execute
 consumes, including the pushdown decisions the module docstring describes.
 
 Like `test_request_ops.py` (whose grid/variable fixtures this file reuses), a pipeline
-with only vector inputs never opens a file or a crosswalk: `compile_plan` needs only the
-declared pipeline and each input's grid kind (`cpra.mp.data.grids.GRIDS[...].grid_type`),
-the same no-IO property `request.ops.validate_shapes` already has. A raster input is the
-one exception -- resolving its band list takes one real call to `io.catalog.
-resolve_raster_bands` -- so the raster-side tests below monkeypatch that function rather
-than touch a filesystem, the same "no IO in this test file" spirit applied to the seam that
-necessarily has some.
+that stays LONG never opens a file or a crosswalk: `compile_plan` needs only the declared
+pipeline and each input's grid kind (`cpra.mp.data.grids.GRIDS[...].grid_type`), the same
+no-IO property `request.ops.validate_shapes` already has. Anything that resolves to BANDS
+is the exception, in both directions -- a raster input's band list takes one real call to
+`io.catalog.resolve_raster_bands`, and a vector-to-raster `project` takes one to
+`resolve_vector_bands` -- so the tests below monkeypatch those two functions rather than
+touch a filesystem, the same "no IO in this test file" spirit applied to the seams that
+necessarily have some.
 
 `TestTileReadWindow` bends that once more, and only in its straddling-widening test: a
 window widened to cover whole features is a union with real polygon bounds, so a geometry
 file has to exist to read them from. Everything else about a tile-scoped compile -- the
 window itself included -- comes off the grid registry with nothing opened.
 """
-
-import dataclasses
 
 import mercantile
 import polars as pl
@@ -185,6 +184,96 @@ class TestVectorPredicatePushdown:
         resolved = compile_plan(pipeline).inputs["a"]
         df = pl.DataFrame({"calendar_year": [2030, 2035]})
         assert df.filter(resolved.predicate)["calendar_year"].to_list() == [2035]
+
+
+class TestCasePushdown:
+    """A `case` rewrites the running value, so it retires this origin's value validity
+    exactly as a `calculate` does -- and its arms' columns have to outlive a later
+    `group`'s column closure for the same reason a `calculate`'s `where` does.
+    """
+
+    def test_a_value_conjunct_after_a_case_does_not_push(self):
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {
+                        "op": "case",
+                        "input": "a",
+                        "cases": [{"when": "value > 0", "then": "1"}],
+                        "as": "c",
+                    },
+                    {"op": "filter", "input": "c", "where": "value > 1"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        assert compile_plan(pipeline).inputs["a"].predicate is None
+
+    def test_a_dimension_conjunct_survives_a_case(self):
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {
+                        "op": "case",
+                        "input": "a",
+                        "cases": [{"when": "value > 0", "then": "1"}],
+                        "as": "c",
+                    },
+                    {"op": "filter", "input": "c", "where": "calendar_year = 2035"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline).inputs["a"]
+        df = pl.DataFrame({"calendar_year": [2030, 2035]})
+        assert df.filter(resolved.predicate)["calendar_year"].to_list() == [2035]
+
+    def test_the_arms_add_nothing_to_a_later_groups_column_closure(self):
+        """Unlike a `calculate`'s `where`, a `case` arm can only ever name a column the
+        read already has: `request.ops._type_case` confines every `when` to the frame's
+        VALUE namespace, so there is no `scenario_id = 7` arm to keep alive across the
+        closure the way `test_a_calculate_wheres_columns_survive_a_later_group` has to.
+        The plan sweeps the arms anyway -- widening a vector read is only ever slow, never
+        wrong -- and this pins that the sweep does not somehow widen it here.
+        """
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {
+                        "op": "case",
+                        "input": "a",
+                        "cases": [
+                            {"when": "value > 0", "then": "1"},
+                            {"when": "value < 0", "then": "2"},
+                        ],
+                        "as": "c",
+                    },
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "mean", "of": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert resolved.columns == sorted({"grid_cell", "value", "calendar_year"})
+
+    def test_a_dimension_arm_is_refused_before_the_plan_is_ever_built(self):
+        with pytest.raises(ShapeError, match="state that as a filter instead"):
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input()},
+                    "steps": [
+                        {
+                            "op": "case",
+                            "input": "a",
+                            "cases": [{"when": "scenario_id = 7", "then": "1"}],
+                        }
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
 
 
 class TestGroupSemanticValidity:
@@ -370,10 +459,11 @@ class TestProjectPushdown:
                 "output": {"format": "csv"},
             }
         )
-        # A raster origin with no live state left has no `raster_dimension_parts`
-        # contributions either -- confirmed by the plan compiling at all despite "a"'s
-        # only dimension filter ever declared sitting after the project (there is none
-        # here to conflict with, this simply confirms nothing raises).
+        # A raster origin has no `predicate` to inspect at all -- its pushdown is band
+        # selection, which `TestRasterBandPushdown` covers, and which a `project` in this
+        # direction does NOT stop (a dimension conjunct declared after one still narrows
+        # the bands, since projecting aggregates over `grid_cell` and leaves every
+        # dimension alone). This just confirms the compile itself is unbothered.
         assert isinstance(compile_plan(pipeline), ExecutionPlan)
 
 
@@ -456,17 +546,21 @@ class TestShapeAnnotation:
 
 class TestCompileOpensNoDataFiles:
     def test_a_vector_only_pipeline_never_touches_the_filesystem(self, monkeypatch):
-        # True only for a pipeline with no raster input -- a raster input's band list can
-        # only be answered by one real `io.catalog.resolve_raster_bands` call (see
-        # `TestRasterBandPushdown` below, which monkeypatches exactly that seam). This
-        # test pins the vector side: `io.vector.scan_vector` is never even imported by way
-        # of being called at compile time.
+        # True only for a pipeline that stays LONG. A raster input's band list can only be
+        # answered by one real `io.catalog.resolve_raster_bands` call (see
+        # `TestRasterBandPushdown` below, which monkeypatches exactly that seam), and a
+        # vector-to-raster `project` needs `resolve_vector_bands`, which does scan
+        # (`TestVectorBandEnumeration`). Neither applies here, so nothing opens anything.
+        import cpra.mp.data.analysis.io.catalog as io_catalog
         import cpra.mp.data.analysis.io.vector as io_vector
 
         def _boom(*args, **kwargs):
             raise AssertionError("compile_plan must never call scan_vector")
 
         monkeypatch.setattr(io_vector, "scan_vector", _boom)
+        # `io/catalog.py` binds `scan_vector` at import, so patching the defining module
+        # alone would not intercept the call that actually happens -- patch both.
+        monkeypatch.setattr(io_catalog, "scan_vector", _boom)
 
         pipeline = _pipeline(
             {
@@ -660,6 +754,592 @@ class TestRasterBandPushdown:
         assert compile_plan(pipeline).inputs["a"].point_sample_step is None
 
 
+def _fake_raster_bands_per_variable(by_variable):
+    """`_fake_resolve_raster_bands` for a pipeline with more than one raster input: `rows`
+    per `selection.variable`, so two origins can be given genuinely different band lists.
+    """
+
+    def _fake(selection, *, base_path=None):
+        rows = by_variable[selection.variable]
+        keys = rows[0].keys() if rows else []
+        return pl.DataFrame(
+            {
+                "path": [f"/fake/{selection.variable}-{i}.tif" for i in range(len(rows))],
+                "band": list(range(1, len(rows) + 1)),
+                **{key: [row[key] for row in rows] for key in keys},
+            }
+        )
+
+    return _fake
+
+
+class TestDimensionPushdownAcrossJoinsAndFanOut:
+    """A dimension conjunct reaches an origin's read no matter where in the pipeline it was
+    declared -- across a join, across a fan-out, and from the other side of either.
+
+    `_Validity` stops at both, and for value and spatial conjuncts that is the right
+    answer. A dimension conjunct has two properties neither of those has: `join_long` is an
+    inner join, so pushing one back through a single operand cannot change what the other
+    operand's rows get matched against; and the `filter` step still re-executes over
+    whatever came back, so a narrowing that is too WIDE is slow and nothing worse. The two
+    passes these tests characterize are what turns that into band selection
+    (`raster_band_metadata`) and into a `scan_vector` predicate.
+    """
+
+    _YEARS = [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
+
+    def _join_pipeline(self, steps):
+        return {
+            "inputs": {"a": raster_input(variable="ffibs_coverage_ratio"), "b": raster_input(variable="vct")},
+            "steps": steps,
+            "output": {"format": "tif"},
+        }
+
+    def test_a_conjunct_declared_after_a_join_narrows_both_operands(self, monkeypatch):
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                self._join_pipeline(
+                    [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "calendar_year >= 2035", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
+                    ]
+                )
+            )
+        )
+        for name in ("a", "b"):
+            assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2035, 2040]
+
+    def test_a_conjunct_on_one_operands_own_dimension_narrows_the_other_through_a_shared_one(
+        self, monkeypatch
+    ):
+        # The case the symbolic pass cannot reach and the unified metadata frame exists
+        # for: `ffibs_type` is a dimension only `a`'s dataset has, so nothing about it can
+        # be handed to `b`'s read as a predicate. But the join pairs their bands on
+        # `calendar_year`, so once `a` is down to 2030 the `b` bands for 2035 and 2040 are
+        # bands nothing will ever look at.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_raster_bands_per_variable(
+                {
+                    "ffibs_coverage_ratio": [
+                        {"calendar_year": 2030, "ffibs_type": "fresh"},
+                        {"calendar_year": 2035, "ffibs_type": "saline"},
+                    ],
+                    "vct": self._YEARS,
+                }
+            ),
+        )
+        plan = compile_plan(
+            _pipeline(
+                self._join_pipeline(
+                    [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "ffibs_type = 'fresh'", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
+                    ]
+                )
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2030]
+
+    def test_a_band_with_no_counterpart_in_the_other_operand_is_not_dropped_by_the_pairing(
+        self, monkeypatch
+    ):
+        # The unified frame is a FULL outer join, not an inner one, and this is where that
+        # shows: `b`'s 2040 band pairs with no `a` band at all, so an inner join would drop
+        # it for that reason alone -- making a trivially-true conjunct narrow the read.
+        # `execution.band_ops.unify_metadata_parts` makes the same choice at execution, and
+        # the two HAVE to agree: the `filter` step re-executes over whatever was read, so a
+        # plan-time answer narrower than the execution-time one is simply wrong.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_raster_bands_per_variable(
+                {
+                    "ffibs_coverage_ratio": [{"calendar_year": 2030}, {"calendar_year": 2035}],
+                    "vct": self._YEARS,
+                }
+            ),
+        )
+        plan = compile_plan(
+            _pipeline(
+                self._join_pipeline(
+                    [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "calendar_year >= 2030", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
+                    ]
+                )
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030, 2035]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2030, 2035, 2040]
+
+    def test_a_fan_out_narrows_to_the_union_of_what_its_branches_need(self, monkeypatch):
+        # One read, two consumers wanting different years: it has to carry both, and 2035
+        # -- which neither asked for -- is still dropped. `_Validity` gives up here; a
+        # union does not have to.
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2030", "as": "f1"},
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "f2"},
+                        {"op": "join", "type": "spatial", "inputs": ["f1", "f2"], "as": "j"},
+                        {"op": "case", "input": "j", "cases": [{"when": "f1 > 0 AND f2 > 0", "then": "f1"}]},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030, 2040]
+
+    def test_branches_agreeing_on_a_predicate_narrow_to_that_predicate(self, monkeypatch):
+        # The `lnd-type-plus` shape: the same input read twice under the same selection.
+        # The union collapses to the one predicate rather than back to everything.
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "f1"},
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "f2"},
+                        {"op": "join", "type": "spatial", "inputs": ["f1", "f2"], "as": "j"},
+                        {"op": "case", "input": "j", "cases": [{"when": "f1 > 0 AND f2 > 0", "then": "f1"}]},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2040]
+
+    def test_a_conjunct_after_a_raster_to_vector_project_still_narrows_bands(self, monkeypatch):
+        # Projecting aggregates over `grid_cell` and leaves every dimension alone, so band
+        # *i* of the result is band *i* of the input -- a dimension conjunct declared after
+        # one is as good a band selection as one declared before it.
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [
+                        {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "mean", "as": "p"},
+                        {"op": "filter", "input": "p", "where": "calendar_year >= 2035"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2035, 2040]
+
+    def test_a_dimension_a_group_collapsed_narrows_nothing(self, monkeypatch):
+        # R2.4/R2.9: `by=[]` takes `calendar_year` out of the frame, so the conjunct below
+        # names a column that is not there. Narrowing on it anyway would drop bands the
+        # `group` was supposed to fold together -- a WRONG answer, not merely a slow one,
+        # which is the one direction this may never err in.
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [
+                        {"op": "group", "input": "a", "by": [], "aggregate": "sum", "as": "g"},
+                        {"op": "filter", "input": "g", "where": "calendar_year >= 2035"},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030, 2035, 2040]
+
+    def test_a_dimension_one_operands_group_collapsed_narrows_only_the_other(self, monkeypatch):
+        # Per-ORIGIN, not per-frame: the joined frame still carries `ffibs_type` -- from
+        # `b` -- while `a`'s own side grouped it away, so the conjunct is `b`'s to answer
+        # and `a` keeps every band.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_raster_bands_per_variable(
+                {
+                    "vct": self._YEARS,
+                    "ffibs_coverage_ratio": [
+                        {"calendar_year": 2030, "ffibs_type": "fresh"},
+                        {"calendar_year": 2035, "ffibs_type": "saline"},
+                    ],
+                }
+            ),
+        )
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {
+                        "a": raster_input(variable="vct"),
+                        "b": raster_input(variable="ffibs_coverage_ratio"),
+                    },
+                    "steps": [
+                        {"op": "group", "input": "a", "by": ["grid_cell"], "aggregate": "sum", "as": "g"},
+                        {"op": "join", "type": "spatial", "inputs": ["g", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "ffibs_type = 'fresh'", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "g > 0.5 AND b > 0.5", "then": "g"}]},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030, 2035, 2040]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2030]
+
+    def test_narrowing_to_no_bands_at_all_is_an_empty_result_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [{"op": "filter", "input": "a", "where": "calendar_year = 1900"}],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata.height == 0
+
+    def test_a_pairing_that_leaves_one_operand_with_no_bands_still_keeps_it_one(self, monkeypatch):
+        # The join-sibling floor. `a` has only 2030; `b` has 2030 and 2040; the conjunct
+        # asks for 2040. Against the full outer pairing that is exactly right and entirely
+        # unusable: `b`'s 2040 row pairs with no `a` row at all, so `a` survives with zero
+        # bands while `b` keeps one -- and `join_band_wide` aligns POSITIONALLY, so a
+        # zero-band operand beside a one-band one is the partial mismatch
+        # `execute._open_band_wide_join_group` raises on.
+        #
+        # Reading nothing for `a` is not an option, so `a` keeps one band. Nothing about
+        # the ANSWER changes: the `filter` step re-executes over the joined frame, where
+        # the same pairing drops that band again. The e2e counterpart is
+        # `test_execute.py::test_a_post_join_conjunct_that_empties_one_operand_still_runs`.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_raster_bands_per_variable(
+                {
+                    "ffibs_coverage_ratio": [{"calendar_year": 2030}],
+                    "vct": [{"calendar_year": 2030}, {"calendar_year": 2040}],
+                }
+            ),
+        )
+        plan = compile_plan(
+            _pipeline(
+                self._join_pipeline(
+                    [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "calendar_year = 2040", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
+                    ]
+                )
+            )
+        )
+        assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030]
+        assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2040]
+
+    def test_an_operand_emptied_before_the_join_is_left_empty(self, monkeypatch):
+        # The other side of that floor, and the reason it is conditioned on what the
+        # operand carries INTO the join rather than on the final count: here the conjunct
+        # is declared on `a`'s own side, so `a` genuinely enters the join with no bands.
+        # Restoring one would not help -- the `filter` step re-derives the emptiness from
+        # whatever was read -- and would only replace `_open_band_wide_join_group`'s named
+        # error with `join_band_wide`'s anonymous shape mismatch. Pinned end-to-end by
+        # `test_execute.py::test_a_partial_zero_band_join_operand_raises`.
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
+        plan = compile_plan(
+            _pipeline(
+                self._join_pipeline(
+                    [
+                        {"op": "filter", "input": "a", "where": "calendar_year = 1900", "as": "fa"},
+                        {"op": "join", "type": "spatial", "inputs": ["fa", "b"], "as": "j"},
+                        {"op": "case", "input": "j", "cases": [{"when": "fa > 0.5 AND b > 0.5", "then": "fa"}]},
+                    ]
+                )
+            )
+        )
+        assert plan.inputs["a"].band_metadata.height == 0
+        assert plan.inputs["b"].band_metadata.height == 3
+
+    def test_the_ceiling_is_checked_against_the_narrowed_count(self, monkeypatch):
+        # R2.8: an input with more bands than the ceiling, filtered down under it, is a
+        # plan that compiles -- the limit is on what gets READ, and the narrowing decided
+        # what that is.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING + 5)]),
+        )
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": raster_input()},
+                    "steps": [{"op": "filter", "input": "a", "where": "calendar_year < 2010"}],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["a"].band_metadata.height == 10
+
+
+class TestPostJoinNarrowingAtProductionScale:
+    """The size of the thing, on the shape `lnd-type-plus` actually has: an `elev` read and
+    a `lnd_type` read on the same raster grid, joined, with the caller's selection declared
+    ONCE after the join instead of repeated as a leading `filter` per input.
+
+    Before the two dimension passes that selection reached neither read -- `_Validity` dies
+    at the join -- so both origins were read whole and the narrowing happened in memory,
+    after the I/O. These numbers are why the pushdown was worth building rather than a
+    tidiness argument, and why an analysis no longer has to repeat its own selection per
+    input to get a narrow read.
+    """
+
+    _GRID = "morph_pixel_v002"
+
+    # 180 (model_group_id, scenario_id, calendar_year) combinations, sliced to the two
+    # datasets' real band counts: `elev` 178, `lnd_type` 179, 357 together.
+    _COMBINATIONS = [
+        {"model_group_id": model_group, "scenario_id": scenario, "calendar_year": year}
+        for model_group in (1, 2)
+        for scenario in (1, 2, 3)
+        for year in range(2025, 2055)
+    ]
+    _SELECTION = "model_group_id = 1 AND scenario_id = 1 AND calendar_year = 2030"
+
+    def _compile(self, monkeypatch, steps):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_raster_bands_per_variable(
+                {"elev": self._COMBINATIONS[:178], "lnd_type": self._COMBINATIONS[:179]}
+            ),
+        )
+        return compile_plan(
+            _pipeline(
+                {
+                    "inputs": {
+                        "elev": raster_input(grid=self._GRID, variable="elev"),
+                        "land": raster_input(grid=self._GRID, variable="lnd_type"),
+                    },
+                    "steps": steps,
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+
+    _JOIN = {"op": "join", "type": "spatial", "inputs": ["elev", "land"], "as": "j"}
+    _SINK = {"op": "group", "by": [], "aggregate": "sum"}
+
+    def test_with_nothing_declared_both_origins_are_read_whole(self, monkeypatch):
+        plan = self._compile(monkeypatch, [self._JOIN, self._SINK])
+        heights = {name: plan.inputs[name].band_metadata.height for name in ("elev", "land")}
+        assert heights == {"elev": 178, "land": 179}
+        assert sum(heights.values()) == 357
+
+    def test_one_selection_declared_after_the_join_narrows_both_origins_to_one_band(self, monkeypatch):
+        plan = self._compile(
+            monkeypatch,
+            [self._JOIN, {"op": "filter", "input": "j", "where": self._SELECTION, "as": "d"}, self._SINK],
+        )
+        heights = {name: plan.inputs[name].band_metadata.height for name in ("elev", "land")}
+        assert heights == {"elev": 1, "land": 1}
+        assert sum(heights.values()) == 2
+        for name in ("elev", "land"):
+            assert plan.inputs[name].band_metadata.row(0, named=True) == {
+                "path": plan.inputs[name].band_metadata["path"][0],
+                "band": 6,
+                "model_group_id": 1,
+                "scenario_id": 1,
+                "calendar_year": 2030,
+            }
+
+
+class TestVectorDimensionPushdownAcrossJoins:
+    """The same two rules on the vector side, where the pushdown is a `scan_vector`
+    predicate rather than a band list. Checked behaviorally: `pl.Expr` has no structural
+    equality, so what a predicate MEANS is the only thing there is to assert about it.
+    """
+
+    _YEARS = pl.DataFrame({"calendar_year": [2030, 2035, 2040]})
+
+    def test_a_conjunct_declared_after_a_join_reaches_both_operands_scans(self):
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input(variable="sal"), "b": vector_input(variable="stg")},
+                    "steps": [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "calendar_year >= 2035", "as": "d"},
+                        {"op": "calculate", "input": "d", "expression": "a + b"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        for name in ("a", "b"):
+            kept = self._YEARS.filter(plan.inputs[name].predicate)["calendar_year"].to_list()
+            assert kept == [2035, 2040]
+
+    def test_a_conjunct_naming_only_one_operands_dimension_reaches_only_that_one(self):
+        # `aggregate_type` is a dimension of `sal`'s dataset and not of `vct`'s. Pushing it
+        # to `b` would reach a column that is not in that scan at all.
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {
+                        "a": vector_input(variable="sal"),
+                        "b": vector_input(variable="vct", grid="veg_grid_cell_v001"),
+                    },
+                    "steps": [
+                        {"op": "project", "input": "b", "to": VECTOR_GRID, "aggregate": "mean", "as": "p"},
+                        {"op": "join", "type": "spatial", "inputs": ["a", "p"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "aggregate_type = 'mean'", "as": "d"},
+                        {"op": "calculate", "input": "d", "expression": "a + p"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        frame = pl.DataFrame({"aggregate_type": ["mean", "max"]})
+        assert frame.filter(plan.inputs["a"].predicate)["aggregate_type"].to_list() == ["mean"]
+        # And `b` got nothing at all -- not a predicate that happens to be satisfiable
+        # without the column, which would still fail the moment its scan resolved it.
+        assert plan.inputs["b"].predicate is None
+
+    def test_a_fan_out_pushes_the_disjunction_of_what_its_branches_need(self):
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input()},
+                    "steps": [
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2030", "as": "f1"},
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "f2"},
+                        {"op": "join", "type": "spatial", "inputs": ["f1", "f2"], "as": "j"},
+                        {"op": "calculate", "input": "j", "expression": "f1 + f2"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        # Both branches' years survive and the year neither asked for does not -- the
+        # disjunction, not "give up and read everything" and not either branch alone.
+        kept = self._YEARS.filter(plan.inputs["a"].predicate)["calendar_year"].to_list()
+        assert kept == [2030, 2040]
+
+    def test_a_value_conjunct_declared_after_a_join_is_still_not_pushed(self):
+        # R2.7: only DIMENSION conjuncts cross a join. A value conjunct on a joined frame
+        # names an operand's renamed value column, which is not a source column at all.
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input(variable="sal"), "b": vector_input(variable="stg")},
+                    "steps": [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}], "as": "d"},
+                        {"op": "calculate", "input": "d", "expression": "a + b"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        assert plan.inputs["a"].predicate is None
+        assert plan.inputs["b"].predicate is None
+
+    def test_a_branch_nothing_reads_still_widens_the_read_it_shares(self):
+        # `f2` feeds nothing -- but it is still a frame the plan will compute, off the one
+        # scan `a` gets. Its year has to survive the read alongside the branch that does
+        # reach the output; the union runs over every TERMINAL frame, not over the output's.
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input()},
+                    "steps": [
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2030", "as": "f1"},
+                        {"op": "filter", "input": "a", "where": "calendar_year = 2040", "as": "f2"},
+                        {"op": "calculate", "input": "f1", "expression": "value * 2"},
+                    ],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        kept = self._YEARS.filter(plan.inputs["a"].predicate)["calendar_year"].to_list()
+        assert kept == [2030, 2040]
+
+    def test_a_projections_bands_narrow_from_the_raster_it_is_joined_with(self, monkeypatch):
+        # The two passes meeting: `ffibs_type` is the raster's alone, so nothing about it
+        # can be handed to the vector scan as a predicate -- but the unified frame pairs
+        # the projection's bands with the raster's on `calendar_year`, and what survives
+        # there becomes BOTH a narrower declared band list and an `IN`-list on the scan.
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands(
+                [
+                    {"calendar_year": 2030, "ffibs_type": "fresh"},
+                    {"calendar_year": 2035, "ffibs_type": "saline"},
+                ]
+            ),
+        )
+        calls = []
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands(
+                [
+                    {"calendar_year": 2030, "aggregate_type": "mean"},
+                    {"calendar_year": 2035, "aggregate_type": "mean"},
+                    {"calendar_year": 2040, "aggregate_type": "mean"},
+                ],
+                calls,
+            ),
+        )
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"r": raster_input(), "v": vector_input()},
+                    "steps": [
+                        {"op": "project", "input": "v", "to": RASTER_GRID, "as": "p"},
+                        {"op": "join", "type": "spatial", "inputs": ["r", "p"], "as": "j"},
+                        {"op": "filter", "input": "j", "where": "ffibs_type = 'fresh'", "as": "d"},
+                        {"op": "case", "input": "d", "cases": [{"when": "r > 0.5 AND p > 0.5", "then": "r"}]},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        assert plan.inputs["r"].band_metadata["calendar_year"].to_list() == [2030]
+        assert plan.vector_band_metadata[1]["calendar_year"].to_list() == [2030]
+        # The enumeration itself ran BEFORE this narrowing was knowable -- it is what made
+        # it knowable -- so the predicate it was made under carries none of it.
+        assert calls[0]["predicate"] is None
+        frame = pl.DataFrame({"calendar_year": [2030, 2035, 2040], "aggregate_type": ["mean"] * 3})
+        narrowed = frame.filter(plan.inputs["v"].predicate)
+        assert narrowed["calendar_year"].to_list() == [2030]
+        # `aggregate_type` contributes no conjunct: every value it has survives, so an
+        # `IN`-list over it would be a tautology on this scan.
+        assert "aggregate_type" not in plan.inputs["v"].predicate.meta.root_names()
+
+    def test_a_long_only_pipeline_with_no_join_is_unchanged(self):
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input()},
+                    "steps": [{"op": "filter", "input": "a", "where": "calendar_year = 2035"}],
+                    "output": {"format": "csv"},
+                }
+            )
+        )
+        kept = self._YEARS.filter(plan.inputs["a"].predicate)["calendar_year"].to_list()
+        assert kept == [2035]
+
+
 class TestBandLimitError:
     def test_a_single_raster_input_over_the_ceiling_raises(self, monkeypatch):
         monkeypatch.setattr(
@@ -708,7 +1388,7 @@ class TestBandWideJoinCeiling:
             "inputs": self._two_raster_inputs(),
             "steps": [
                 {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5"},
+                {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
             ],
             "output": {"format": "tif"},
         }
@@ -766,9 +1446,9 @@ class TestBandWideJoinCeiling:
             "inputs": inputs,
             "steps": [
                 {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5", "as": "m"},
+                {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}], "as": "m"},
                 {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
-                {"op": "filter", "input": "j2", "where": "m > 0.5 AND c > 0.5"},
+                {"op": "case", "input": "j2", "cases": [{"when": "m > 0.5 AND c > 0.5", "then": "m"}]},
             ],
             "output": {"format": "tif"},
         }
@@ -799,9 +1479,9 @@ class TestBandWideJoinCeiling:
                     "inputs": inputs,
                     "steps": [
                         {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                        {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5", "as": "m"},
+                        {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}], "as": "m"},
                         {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
-                        {"op": "filter", "input": "j2", "where": "m > 0.5 AND c > 0.5"},
+                        {"op": "case", "input": "j2", "cases": [{"when": "m > 0.5 AND c > 0.5", "then": "m"}]},
                     ],
                     "output": {"format": "tif"},
                 }
@@ -827,9 +1507,9 @@ class TestBandWideJoinCeiling:
                     "inputs": inputs,
                     "steps": [
                         {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                        {"op": "filter", "input": "j", "where": "a > 0.5 AND b > 0.5"},
+                        {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}]},
                         {"op": "join", "type": "spatial", "inputs": ["c", "d"], "as": "j2"},
-                        {"op": "filter", "input": "j2", "where": "c > 0.5 AND d > 0.5"},
+                        {"op": "case", "input": "j2", "cases": [{"when": "c > 0.5 AND d > 0.5", "then": "c"}]},
                     ],
                     "output": {"format": "tif"},
                 }
@@ -849,6 +1529,320 @@ class TestBandWideJoinCeiling:
             }
         )
         assert compile_plan(pipeline).band_wide_join_scans == {}
+
+
+def _fake_resolve_vector_bands(rows, calls=None):
+    """A stand-in for `io.catalog.resolve_vector_bands`, monkeypatched onto
+    `plan_module.resolve_vector_bands` for exactly the reasons
+    `_fake_resolve_raster_bands` exists -- the vector half of the same seam.
+
+    `rows` is a list of `{dimension_name: value, ...}` dicts, one per enumerated band, or
+    `None` for "that dataset has nothing on disk", which the real function answers with
+    `None` too. `calls`, when given, is a list every call's keyword arguments are appended
+    to, so a test can assert the enumeration was made under the SAME pushdown the scan
+    gets -- the one property that cannot be checked from the returned frame.
+    """
+
+    def _fake(selection, *, base_path=None, columns=None, predicate=None, dimensions=None):
+        if calls is not None:
+            calls.append(
+                {
+                    "selection": selection,
+                    "base_path": base_path,
+                    "columns": columns,
+                    "predicate": predicate,
+                    "dimensions": dimensions,
+                }
+            )
+        if rows is None:
+            return None
+        keys = rows[0].keys() if rows else []
+        return pl.DataFrame({key: [row[key] for row in rows] for key in keys})
+
+    return _fake
+
+
+class TestVectorBandEnumeration:
+    """`ExecutionPlan.vector_band_metadata` -- the bands a `("project", ("vector",
+    "raster"))` step will produce, settled at compile time rather than discovered when the
+    pivot runs (`execution.project.project_vector_to_raster`). A vector origin's rows
+    become COLUMNS there, so its width is a plan-time fact for the same reason a raster
+    input's is: nothing downstream can be sized, and no ceiling checked, by waiting.
+    """
+
+    def _project_pipeline(self, steps=None):
+        return {
+            "inputs": {"a": vector_input()},
+            "steps": steps or [{"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"}],
+            "output": {"format": "tif"},
+        }
+
+    def test_a_projection_is_enumerated_and_keyed_by_its_step(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2030}, {"calendar_year": 2035}]),
+        )
+        plan = compile_plan(_pipeline(self._project_pipeline()))
+        # Keyed by STEP, not by input: it is the `project` that turns rows into bands, and
+        # the same input projected twice would resolve to two different widths.
+        assert set(plan.vector_band_metadata) == {1}
+        assert plan.vector_band_metadata[1]["calendar_year"].to_list() == [2030, 2035]
+
+    def test_a_long_only_pipeline_issues_no_enumeration_query(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([], calls))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "value > 1", "as": "f"},
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline)
+        # The gate is the presence of a vector-to-raster `project`, nothing subtler: a
+        # pipeline that stays long pays nothing for a facility it never uses.
+        assert calls == []
+        assert plan.vector_band_metadata == {}
+
+    def test_the_enumeration_is_made_under_the_scans_own_pushdown(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([{"calendar_year": 2030}], calls)
+        )
+        pipeline = _pipeline(
+            self._project_pipeline(
+                [
+                    {"op": "filter", "input": "a", "where": "calendar_year = 2030", "as": "f"},
+                    {"op": "project", "input": "f", "to": RASTER_GRID, "as": "p"},
+                    {"op": "filter", "input": "p", "where": "value > 1"},
+                ]
+            )
+        )
+        plan = compile_plan(pipeline)
+        resolved = plan.inputs["a"]
+
+        assert len(calls) == 1
+        assert calls[0]["selection"] is pipeline.inputs["a"]
+        assert calls[0]["columns"] == resolved.columns
+        # `pl.Expr` has no structural `==`, so the predicate is checked behaviorally, the
+        # same way `TestVectorPredicatePushdown` checks the one that reaches the scan --
+        # and against the same rows, since the point is that they are the same predicate.
+        df = pl.DataFrame({"calendar_year": [2030, 2035], "value": [2, 2]})
+        assert df.filter(calls[0]["predicate"])["calendar_year"].to_list() == [2030]
+        assert df.filter(resolved.predicate)["calendar_year"].to_list() == [2030]
+
+    def test_a_filter_declared_after_the_project_still_reaches_the_enumeration(self, monkeypatch):
+        # A vector-to-raster project preserves `value` (a pixel's value IS its zone's), so
+        # a value conjunct declared after it pushes back to the scan -- which is why the
+        # enumeration runs once the walk is over, not at the `project` itself.
+        calls = []
+        monkeypatch.setattr(
+            plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([{"calendar_year": 2030}], calls)
+        )
+        compile_plan(
+            _pipeline(
+                self._project_pipeline(
+                    [
+                        {"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"},
+                        {"op": "filter", "input": "p", "where": "value > 1"},
+                    ]
+                )
+            )
+        )
+        df = pl.DataFrame({"value": [0, 2]})
+        assert df.filter(calls[0]["predicate"])["value"].to_list() == [2]
+
+    def test_an_upstream_group_narrows_the_dimensions_passed(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([{"calendar_year": 2030}], calls)
+        )
+        compile_plan(
+            _pipeline(
+                self._project_pipeline(
+                    [
+                        {
+                            "op": "group",
+                            "input": "a",
+                            "by": ["grid_cell", "calendar_year"],
+                            "aggregate": "mean",
+                            "as": "g",
+                        },
+                        {"op": "project", "input": "g", "to": RASTER_GRID, "as": "p"},
+                    ]
+                )
+            )
+        )
+        # Everything the `group` collapsed is gone from the frame the pivot sees, so it
+        # cannot split bands either -- `dimensions` is what tells the enumeration that.
+        # `grid_cell` is not among them: what is passed is the frame's surviving DIMENSION
+        # columns (`by` intersected with the dataset's own), and `grid_cell` is the row's
+        # address, not one of them.
+        assert calls[0]["dimensions"] == frozenset({"calendar_year"})
+
+    def test_no_group_leaves_every_dimension_open(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([{"calendar_year": 2030}], calls)
+        )
+        compile_plan(_pipeline(self._project_pipeline()))
+        # `None`, not "all of them spelled out": only a `group` narrows this, and the plan
+        # does not otherwise enumerate what a dataset's dimensions are.
+        assert calls[0]["dimensions"] is None
+
+    def test_a_projection_off_a_join_is_not_enumerated(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(plan_module, "resolve_vector_bands", _fake_resolve_vector_bands([], calls))
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": vector_input(), "b": vector_input(variable="stg")},
+                    "steps": [
+                        {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                        {"op": "calculate", "expression": "a + b", "as": "c"},
+                        {"op": "project", "input": "c", "to": RASTER_GRID, "as": "p"},
+                    ],
+                    "output": {"format": "tif"},
+                }
+            )
+        )
+        # The join retires both origins' pushdown state, so there is no single input whose
+        # rows this projection's bands correspond to -- and no honest query to ask.
+        assert calls == []
+        assert plan.vector_band_metadata == {}
+
+    def test_a_dataset_with_nothing_on_disk_is_simply_absent(self, monkeypatch):
+        monkeypatch.setattr(plan_module, "resolve_vector_bands", _fake_resolve_vector_bands(None))
+        plan = compile_plan(_pipeline(self._project_pipeline()))
+        # Compiling a plan against a dataset that has not been written yet stays possible;
+        # the step is recorded as unenumerated rather than as zero bands wide.
+        assert plan.vector_band_metadata == {}
+
+
+class TestVectorBandCeiling:
+    """The band ceiling applied to the vector half. Projected bands are never READ -- they
+    are pivoted out of a long frame in memory -- but they are columns of the resulting
+    band-wide frame exactly like a raster input's are, so they are counted the same way.
+    """
+
+    def test_an_over_wide_standalone_projection_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING + 1)]),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"}],
+                "output": {"format": "tif"},
+            }
+        )
+        with pytest.raises(BandLimitError, match="when projected onto"):
+            compile_plan(pipeline)
+
+    def test_a_projection_at_the_ceiling_does_not_raise(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING)]),
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"}],
+                "output": {"format": "tif"},
+            }
+        )
+        assert compile_plan(pipeline).vector_band_metadata[1].height == ANALYSIS_BAND_CEILING
+
+    def _mixed_join_pipeline(self):
+        # The shape of `analyses/salinity_veg_investigation.py`: a raster input joined
+        # against a vector one projected onto the same grid.
+        return {
+            "inputs": {"r": raster_input(), "v": vector_input()},
+            "steps": [
+                {"op": "project", "input": "v", "to": RASTER_GRID, "as": "p"},
+                {"op": "join", "type": "spatial", "inputs": ["r", "p"], "as": "j"},
+                {"op": "case", "input": "j", "cases": [{"when": "r > 0.5 AND p > 0.5", "then": "r"}]},
+            ],
+            "output": {"format": "tif"},
+        }
+
+    def test_a_join_sums_the_raster_and_the_projected_halves(self, monkeypatch):
+        half_over = ANALYSIS_BAND_CEILING // 2 + 1
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(half_over)]),
+        )
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2000 + i} for i in range(half_over)]),
+        )
+        with pytest.raises(BandLimitError) as caught:
+            compile_plan(_pipeline(self._mixed_join_pipeline()))
+        message = str(caught.value)
+        # Neither half is over the ceiling alone; the message has to name both, and name
+        # the projection by the STEP that produces it, since it has no input name of its own.
+        assert "('r',)" in message
+        assert "step(s) (1,)" in message
+        assert f"{2 * half_over} bands" in message
+
+    def test_a_join_whose_halves_fit_together_does_not_raise(self, monkeypatch):
+        half = ANALYSIS_BAND_CEILING // 2
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(half)]),
+        )
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2000 + i} for i in range(half)]),
+        )
+        plan = compile_plan(_pipeline(self._mixed_join_pipeline()))
+        assert plan.vector_band_metadata[1].height == half
+
+    def test_a_projection_inside_a_join_is_not_also_checked_standalone(self, monkeypatch):
+        """The join already counted this step, alongside the raster bands it shares a
+        frame with. Checking it a second time on its own could only ever be redundant --
+        or, worse, blame the projection for a width the join is responsible for.
+        """
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2030}]),
+        )
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_vector_bands",
+            _fake_resolve_vector_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING)]),
+        )
+        with pytest.raises(BandLimitError) as caught:
+            compile_plan(_pipeline(self._mixed_join_pipeline()))
+        assert "(join)" in str(caught.value)
+        assert "when projected onto" not in str(caught.value)
+
+    def test_an_unenumerated_projection_contributes_nothing_to_the_join_total(self, monkeypatch):
+        """A step whose bands could not be resolved is an unknown, not a zero. Nothing
+        here can size it, so the check does what it can with the halves it does know --
+        and says so by naming no projection step at all.
+        """
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING + 1)]),
+        )
+        monkeypatch.setattr(plan_module, "resolve_vector_bands", _fake_resolve_vector_bands(None))
+        with pytest.raises(BandLimitError) as caught:
+            compile_plan(_pipeline(self._mixed_join_pipeline()))
+        assert "plus the vector projection" not in str(caught.value)
 
 
 class TestOverviewEligibility:
@@ -969,7 +1963,7 @@ class TestOverviewEligibility:
                 "steps": [
                     {"op": "project", "input": "a", "to": "ecoregion_v001", "aggregate": "sum", "as": "zp"},
                     {"op": "join", "type": "spatial", "inputs": ["b", "c"], "as": "j"},
-                    {"op": "filter", "input": "j", "where": "b > 0.5 AND c > 0.5"},
+                    {"op": "case", "input": "j", "cases": [{"when": "b > 0.5 AND c > 0.5", "then": "b"}]},
                 ],
                 "output": {"format": "tif"},
             }

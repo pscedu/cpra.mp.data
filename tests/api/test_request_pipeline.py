@@ -22,9 +22,11 @@ from cpra.mp.data.analysis.request.pipeline import (
     _OUTPUT_FIELDS,
     _STEP_FIELDS,
     _STEP_LIST_FIELDS,
+    _STEP_MODEL_LIST_FIELDS,
     _STEP_MODELS,
     _query_fields,
     _query_list_fields,
+    CaseWhen,
     InputSelection,
     Output,
     Pipeline,
@@ -339,6 +341,63 @@ class TestCalculateStep:
         parse_pipeline(data)
 
 
+class TestCaseStep:
+    """Structural validation only -- that an arm's `when` is a well-formed predicate and
+    its `then` a well-formed value expression. Whether those names exist on the frame, and
+    whether they are VALUE names, needs the frame's namespace and so belongs to
+    `ops._type_case` (`test_request_ops.py::TestCaseShapeTyping`).
+    """
+
+    @staticmethod
+    def _with(**overrides):
+        data = simple_pipeline()
+        data["steps"].append(
+            {"op": "case", "cases": [{"when": "value > 0", "then": "1"}], **overrides}
+        )
+        return data
+
+    def test_ordinary_case_accepted(self):
+        pipeline = parse_pipeline(self._with(**{"else": "0", "as": "classed"}))
+        step = pipeline.steps[-1]
+        assert [(arm.when, arm.then) for arm in step.cases] == [("value > 0", "1")]
+        assert (step.else_, step.as_) == ("0", "classed")
+
+    def test_an_absent_else_is_null_not_a_pass_through(self):
+        assert parse_pipeline(self._with()).steps[-1].else_ is None
+
+    def test_at_least_one_arm_is_required(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "case", "cases": []})
+        with pytest.raises(ValueError):
+            parse_pipeline(data)
+
+    def test_a_malformed_when_is_rejected_and_names_its_arm(self):
+        data = simple_pipeline()
+        data["steps"].append(
+            {"op": "case", "cases": [{"when": "value > 0", "then": "1"}, {"when": "value >", "then": "2"}]}
+        )
+        with pytest.raises(RequestError, match="case arm 2"):
+            parse_pipeline(data)
+
+    def test_a_then_that_is_a_predicate_rather_than_a_value_is_rejected(self):
+        # The same refusal `calculate.expression` gets: a `then` produces a value, and
+        # `value > 3` is a branch, not one.
+        data = simple_pipeline()
+        data["steps"].append({"op": "case", "cases": [{"when": "value > 0", "then": "value > 3"}]})
+        with pytest.raises(RequestError, match="arm 1 then"):
+            parse_pipeline(data)
+
+    def test_a_malformed_else_is_rejected(self):
+        with pytest.raises(RequestError, match="else="):
+            parse_pipeline(self._with(**{"else": "value > 3"}))
+
+    def test_an_unknown_arm_field_is_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "case", "cases": [{"when": "value > 0", "then": "1", "x": "2"}]})
+        with pytest.raises(ValueError):
+            parse_pipeline(data)
+
+
 class TestGroupStep:
     def test_count_by_value_rejected_as_group_aggregate(self):
         data = simple_pipeline()
@@ -566,6 +625,51 @@ class TestQueryCodec:
         # immediately precedes it, and chaining-by-position would quietly swap the two.
         assert pipeline_from_query(query).steps[2].input == "recent"
 
+    def test_round_trips_a_multi_arm_case_whose_conditions_contain_commas(self):
+        """`case.cases` is the one step field that is a list of MODELS, and it is spelled
+        positionally (`cases.<n>.<field>`) rather than comma-joined for exactly the reason
+        this test states: an arm's `when` and `then` are caller-written expressions, and
+        `IN (1, 2, 3)` puts a comma inside one. Comma-joining the list -- what the encoder
+        does for every other list field -- would split that arm in half on the way back.
+        """
+        data = simple_pipeline()
+        data["steps"] = [
+            {
+                "op": "case",
+                "input": "marsh",
+                "cases": [
+                    {"when": "calendar_year IN (2030, 2040)", "then": "round(value, 2)"},
+                    {"when": "value > 0.5", "then": "1"},
+                ],
+                "else": "0",
+                "as": "classed",
+            }
+        ]
+        query = pipeline_to_query(parse_pipeline(data))
+        assert query["step.1.cases.1.when"] == "calendar_year IN (2030, 2040)"
+        assert query["step.1.cases.1.then"] == "round(value, 2)"
+        assert query["step.1.cases.2.when"] == "value > 0.5"
+        assert query["step.1.else"] == "0"
+
+        decoded = pipeline_from_query(query)
+        assert [(arm.when, arm.then) for arm in decoded.steps[0].cases] == [
+            ("calendar_year IN (2030, 2040)", "round(value, 2)"),
+            ("value > 0.5", "1"),
+        ]
+        assert decoded.steps[0].else_ == "0"
+        assert pipeline_to_query(decoded) == query
+
+    def test_an_absent_else_survives_the_round_trip_as_absent(self):
+        # `else` defaults to null and null is what MASKS an unmatched cell, so an encoder
+        # that emitted an empty string would turn "leave it nodata" into `0` on decode.
+        data = simple_pipeline()
+        data["steps"] = [
+            {"op": "case", "input": "marsh", "cases": [{"when": "value > 0", "then": "1"}]}
+        ]
+        query = pipeline_to_query(parse_pipeline(data))
+        assert "step.1.else" not in query
+        assert pipeline_from_query(query).steps[0].else_ is None
+
     def test_default_of_is_omitted_from_the_encoding(self):
         data = simple_pipeline()
         data["steps"].append({"op": "group", "by": [], "aggregate": "sum", "of": "value"})
@@ -746,6 +850,7 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
             "join": {"op", "type", "inputs", "as"},
             "filter": {"op", "input", "where", "as"},
             "calculate": {"op", "input", "expression", "where", "as"},
+            "case": {"op", "input", "cases", "else", "as"},
             "group": {"op", "input", "by", "aggregate", "of", "as"},
         }
 
@@ -763,6 +868,18 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
             assert _STEP_LIST_FIELDS[op] == frozenset(), op
         for op, list_fields in _STEP_LIST_FIELDS.items():
             assert list_fields <= _STEP_FIELDS[op], op
+
+    def test_a_list_of_nested_models_is_positional_not_comma_split(self):
+        """`case.cases` IS a list, and must still not be comma-split: its elements hold
+        predicates, which carry commas verbatim. It goes in the model-list table instead,
+        spelled `cases.<n>.<field>` -- so the two tables have to stay disjoint, or a
+        `case` would be split apart by the very rule `where` is protected from.
+        """
+        assert _STEP_LIST_FIELDS["case"] == frozenset()
+        assert _STEP_MODEL_LIST_FIELDS["case"] == {"cases": CaseWhen}
+        for op, model_list_fields in _STEP_MODEL_LIST_FIELDS.items():
+            assert set(model_list_fields) <= _STEP_FIELDS[op], op
+            assert not (set(model_list_fields) & _STEP_LIST_FIELDS[op]), op
 
     def test_an_optional_list_field_would_still_be_comma_split(self):
         """No step declares `list[str] | None` today, so nothing in the real models
@@ -815,8 +932,15 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
                 {"op": "filter", "input": "paired", "where": "marsh > 0.5", "as": "recent"},
                 {"op": "calculate", "input": "recent", "expression": "marsh * 2", "where": "marsh > 0", "as": "big"},
                 {
-                    "op": "group",
+                    "op": "case",
                     "input": "big",
+                    "cases": [{"when": "value > 1", "then": "2"}, {"when": "value > 0", "then": "1"}],
+                    "else": "0",
+                    "as": "classed",
+                },
+                {
+                    "op": "group",
+                    "input": "classed",
                     "by": ["calendar_year"],
                     "aggregate": "min",
                     "of": "calendar_year",

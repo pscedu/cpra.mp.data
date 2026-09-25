@@ -196,8 +196,36 @@ class TestCompileCalculateEntries:
             )
 
     def test_mixed_conjunct_in_where_rejected(self):
-        with pytest.raises(ExpressionError, match="both a dimension column"):
+        """A single conjunct comparing a measurement to a dimension has no lowering, and
+        is still rejected -- but now by the namespace check rather than by a separate
+        rule. `classify_where_kinds` calls it a VALUE conjunct (it names a value column),
+        `parse_value_expr` then finds `calendar_year` outside the namespace, and the
+        message names the offending column rather than the category.
+        """
+        with pytest.raises(ExpressionError, match="'calendar_year' is not in the allowed namespace"):
             compile_calculate_entries([("calculate.1", "value * 2", "value > calendar_year")])
+
+    def test_separate_conjuncts_split_into_the_two_halves(self):
+        """The form the rejection above points at: written as separate AND-ed conjuncts,
+        the dimension half selects rows/bands and the value half masks cells.
+        """
+        (plan,) = compile_calculate_entries(
+            [("calculate.1", "value * 2", "value > 3 AND calendar_year = 2025")]
+        )
+        assert plan.dimension_where == "(calendar_year = 2025)"
+        assert plan.value_where == "(value > 3)"
+
+    def test_where_classifies_against_the_given_namespace(self):
+        """`allowed_columns` decides the split, so a post-`join` `where` naming an operand
+        is the value conjunct it looks like -- not a dimension one routed to an
+        unrestricted SQL path for want of being spelled `value`.
+        """
+        (plan,) = compile_calculate_entries(
+            [("calculate.1", "marsh - sal", "marsh > 0.5 AND calendar_year = 2025")],
+            allowed_columns=("marsh", "sal"),
+        )
+        assert plan.value_where == "(marsh > 0.5)"
+        assert plan.dimension_where == "(calendar_year = 2025)"
 
 
 class TestRewriteValueColumn:

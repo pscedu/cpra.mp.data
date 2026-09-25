@@ -482,6 +482,141 @@ class TestVectorToRasterMetadataDeterminism:
         assert out_1["b1"].to_list() == [140.0, 240.0]  # 2040
 
 
+class TestVectorToRasterPlannerSuppliedBands:
+    """`band_metadata` -- the bands `compile_plan` enumerated ahead of the read (see
+    `io/catalog.py`'s `resolve_vector_bands`). Same fixture as
+    `TestVectorToRasterBroadcastAndNodata`, so "identical to the data-derived path" is
+    checkable against a case whose expected values are already hand-computed there.
+
+    The interesting difference is the DECLARED band universe: a band the planner
+    enumerated but that no surviving row falls into is a real, all-null column here, not
+    an absent one. Dropping it would shift every later band's index, which is the whole
+    reason the width has to be a plan-time fact.
+    """
+
+    _ZONES = np.array([[10, 20], [-1, 10]], dtype="int32")
+
+    def _lf(self):
+        return pl.DataFrame(
+            {
+                "grid_cell": [10, 10, 20, 20],
+                "calendar_year": [2030, 2040, 2030, 2040],
+                "value": [1.0, 10.0, 2.0, 20.0],
+            }
+        ).lazy()
+
+    def _bands(self, years):
+        return pl.DataFrame({"calendar_year": pl.Series(years, dtype=pl.Int64)})
+
+    def test_matches_the_data_derived_path_exactly(self, crosswalk_path):
+        _write_crosswalk(crosswalk_path, self._ZONES)
+        frames = {"v": self._lf()}
+
+        derived_lf, derived_meta, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
+        supplied_lf, supplied_meta, _ = project_vector_to_raster(
+            frames, _vector_op(), _vector_frame_types(), None, self._bands([2030, 2040])
+        )
+
+        assert supplied_meta.equals(derived_meta)
+        assert supplied_lf.collect().equals(derived_lf.collect())
+
+    def test_a_declared_band_with_no_rows_is_an_all_null_column(self, crosswalk_path):
+        _write_crosswalk(crosswalk_path, self._ZONES)
+        frames = {"v": self._lf()}
+
+        # 2035 sits BETWEEN the two years that have rows, so an implementation that
+        # appended absent bands at the end rather than at their sorted position would put
+        # 2040's values on b2's column while the metadata still called b1 2040.
+        out_lf, metadata_out, _ = project_vector_to_raster(
+            frames, _vector_op(), _vector_frame_types(), None, self._bands([2030, 2035, 2040])
+        )
+        out = out_lf.collect()
+
+        assert metadata_out["calendar_year"].to_list() == [2030, 2035, 2040]
+        assert out["b0"].to_list() == [1.0, 2.0, None, 1.0]
+        assert out["b1"].to_list() == [None, None, None, None]
+        assert out["b2"].to_list() == [10.0, 20.0, None, 10.0]
+
+    def test_metadata_naming_different_columns_falls_back_to_the_data(self, crosswalk_path):
+        _write_crosswalk(crosswalk_path, self._ZONES)
+        frames = {"v": self._lf()}
+
+        # The planner models the pushdown, not the frame, so it can be wrong about which
+        # columns survive to the projection. Being wrong must cost a `collect`, not
+        # correctness.
+        out_lf, metadata_out, _ = project_vector_to_raster(
+            frames,
+            _vector_op(),
+            _vector_frame_types(),
+            None,
+            pl.DataFrame({"scenario_id": [7, 8]}),
+        )
+        out = out_lf.collect()
+
+        assert metadata_out.columns == ["calendar_year"]
+        assert metadata_out["calendar_year"].to_list() == [2030, 2040]
+        assert out["b0"].to_list() == [1.0, 2.0, None, 1.0]
+        assert out["b1"].to_list() == [10.0, 20.0, None, 10.0]
+
+    def test_the_reserved_index_frame_is_accepted_for_a_dimensionless_projection(self, crosswalk_path):
+        _write_crosswalk(crosswalk_path, np.array([[1, 2]], dtype="int32"))
+        frames = {"v": pl.DataFrame({"grid_cell": [1, 2], "value": [5.0, 6.0]}).lazy()}
+        bands = pl.DataFrame({RESERVED_BAND_INDEX_COLUMN: pl.Series([0], dtype=pl.UInt32)})
+
+        out_lf, metadata_out, _ = project_vector_to_raster(
+            frames, _vector_op(), _vector_frame_types(), None, bands
+        )
+        out = out_lf.collect()
+
+        assert metadata_out.equals(bands)
+        assert list(out.columns) == ["b0", DOMAIN_COLUMN]
+        assert out["b0"].to_list() == [5.0, 6.0]
+
+
+class TestVectorToRasterPivotStaysLazy:
+    """Nothing between the input frame and the returned one executes it: the pivot is
+    `LazyFrame.pivot`, whose `on_columns` is the band list the planner already settled, so
+    the whole direction is one unbroken chain.
+
+    Checked with a detonator rather than by counting `collect` calls -- a `map_batches`
+    whose Python function raises the moment any batch of `value` is actually produced.
+    Building the projection must not set it off; collecting what the projection returns
+    must, which is what proves the detonator was armed and reachable the whole time.
+    """
+
+    _ZONES = np.array([[10, 20], [-1, 10]], dtype="int32")
+
+    def _armed_lf(self):
+        def _detonate(_series):
+            raise AssertionError("the input frame was executed while building the projection")
+
+        lf = pl.DataFrame(
+            {
+                "grid_cell": [10, 10, 20, 20],
+                "calendar_year": [2030, 2040, 2030, 2040],
+                "value": [1.0, 10.0, 2.0, 20.0],
+            }
+        ).lazy()
+        return lf.with_columns(pl.col("value").map_batches(_detonate, return_dtype=pl.Float64))
+
+    def test_building_the_projection_never_executes_the_input(self, crosswalk_path):
+        _write_crosswalk(crosswalk_path, self._ZONES)
+        frames = {"v": self._armed_lf()}
+        bands = pl.DataFrame({"calendar_year": pl.Series([2030, 2040], dtype=pl.Int64)})
+
+        out_lf, metadata_out, _ = project_vector_to_raster(
+            frames, _vector_op(), _vector_frame_types(), None, bands
+        )
+
+        assert metadata_out["calendar_year"].to_list() == [2030, 2040]
+        # The output's own width and names are known without executing anything, which is
+        # the point: a data-derived pivot could not answer this without a `collect`.
+        assert out_lf.collect_schema().names() == ["b0", "b1", DOMAIN_COLUMN]
+
+        with pytest.raises(AssertionError, match="was executed while building"):
+            out_lf.collect()
+
+
 class TestVectorToRasterOrderPreservationLargeScale:
     """250,000 pixels, each assigned a globally UNIQUE zone id equal to its row-major
     position + 1 -- with every pixel's expected broadcast value distinct

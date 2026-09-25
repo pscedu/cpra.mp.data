@@ -14,52 +14,82 @@ all, which is why band selection (not a per-pixel row filter) is that shape's pu
 target; see the module-level note below on why a row predicate does NOT get the same
 treatment there.
 
+**Dimension conjuncts are pushed by a different mechanism from value and spatial ones,
+and the split is the main thing to hold onto about this module.** A `value` or `grid_cell`
+conjunct is pushed only along a line of computation that has stayed exclusive and
+value-preserving all the way back to one input -- the forward walk below tracks exactly
+that, and gives up at a join or a fan-out. A DIMENSION conjunct is pushed from anywhere in
+the pipeline to every origin it can possibly apply to, because it has two properties the
+other two do not:
+
+* `join_long` is an inner join, so `sigma_p(A join B) == sigma_p(A) join B` for a `p` over
+  A's own columns. Narrowing one operand's read cannot change what the other operand's
+  rows get matched against -- the rows it removes had no surviving match anyway.
+* Every `filter` step still re-executes over whatever came back. A dimension narrowing is
+  therefore ADDITIVE: getting it too wide costs time and nothing else, and the plan may
+  freely decline to narrow whenever it is not certain. Only narrowing too FAR is a wrong
+  answer, which is why every judgement below errs toward keeping a band.
+
+Two passes over the frame graph do that pushing, after the walk, carrying the same answer
+in two currencies -- see `compile_plan`'s own comments for each. The SYMBOLIC pass carries
+a predicate per (frame, origin) and produces the dimension half of a vector origin's
+`scan_vector` predicate. The BAND-IDENTITY pass carries surviving band positions per
+(frame, origin), narrowing them at each conjunct against the unified metadata frame
+(`execution.band_ops.unify_metadata_parts` -- the same function `join_band_wide`'s own
+post-join dimension filter uses, so plan time and execution time cannot disagree), and
+produces each raster origin's band list and each vector-to-raster projection's. The band
+pass is the only one that can see a conjunct on ONE origin's dimension narrowing ANOTHER's
+bands across a dimension they share; the symbolic one is the only one that reaches an
+origin whose bands are not a plan-time fact at all. Where both apply they agree, and
+applying both changes nothing.
+
+In both passes a join MERGES its operands' entries and a fan-out's branches merge at the
+terminal frames, in both cases by OR / set union: one physical read has to satisfy every
+branch that shares it, and the superset is the safe direction.
+
 **The forward walk.** `ops` (already fully resolved by `request.ops.compile_ops`, in
 declared order) is walked once, carrying one `_Validity` state per line of computation
 back to whichever named input it ultimately traces to (its "origin"). At each op, the
-state says whether a `value` predicate, a dimension predicate on some still-open set of
-dimension names, and a `grid_cell` (spatial) predicate could still be pushed all the way
-back to the origin's own read without changing what any downstream consumer -- including
-the final sink -- would see. This is the same table `request/ops.py`'s shape-typing walk
-already commits to per op, restated here as a validity question rather than a shape
-question:
+state says whether a `value` predicate and a `grid_cell` (spatial) predicate could still
+be pushed all the way back to the origin's own read without changing what any downstream
+consumer -- including the final sink -- would see. This is the same table `request/ops.py`'s
+shape-typing walk already commits to per op, restated here as a validity question rather
+than a shape question. It also records, unconditionally and regardless of that state, the
+structure the two dimension passes run over: each frame's parents, the dimension conjuncts
+declared on it, and which of each contributing ORIGIN's dimension columns it still carries.
 
 * `filter` never changes what is still pushable -- it only *consumes* validity (deciding,
   per conjunct, whether THIS filter's own predicate can be pushed), it does not reduce it
   for whatever comes after.
 * `calculate` invalidates `value` unconditionally (the running value is being replaced),
-  leaving dimension/spatial validity untouched.
-* `group` invalidates `value` unconditionally and narrows the open dimension set down to
-  exactly `by` (grouping away a dimension makes it disappear from the frame, so nothing
-  downstream can filter on it even in principle; a dimension that IS in `by` survives the
-  group under its own name and remains legitimately pushable afterward -- a dimension
-  filter declared after a `group` on a dimension that same `group` grouped by can still be
-  pushed all the way back to the origin's own read, since every row the origin's read
-  would drop is a row the `group` would have dropped from that dimension's bucket anyway).
-  `grid_cell` survives only if `"grid_cell" in by`; band identity does not survive a group
-  at all (a `group` collapses many pixels/rows into one), except that a dimension already
-  named in `by` is, per the same reasoning above, still a legitimate thing to narrow a
-  raster origin's band selection by afterward.
-* `project` invalidates everything EXCEPT the one direction whose own semantics preserve
-  `value` exactly: vector-to-raster (`project_direction` returns `("vector", "raster")`).
-  That direction takes no aggregate (`request.ops._type_project`'s
+  leaving spatial validity untouched.
+* `group` invalidates `value` unconditionally. `grid_cell` survives only if
+  `"grid_cell" in by`. Structurally, it is the only op that takes a dimension column AWAY
+  from a frame, which is what narrows the recorded per-origin dimension sets to `by`: a
+  conjunct naming a dimension this `group` collapsed has nothing to push back to, since
+  the frame it was declared on does not carry that column at all. A dimension that IS in
+  `by` survives under its own name and stays fully pushable -- every row the origin's read
+  would drop for it is a row the `group` would have dropped from that dimension's bucket
+  anyway.
+* `project` invalidates `value` and `grid_cell` EXCEPT in the one direction whose own
+  semantics preserve `value` exactly: vector-to-raster (`project_direction` returns
+  `("vector", "raster")`). That direction takes no aggregate (`request.ops._type_project`'s
   `direction_takes_aggregate` is `False` there), so a raster pixel's value after such a
   project is identically the value its containing vector zone already had -- meaning a
   `value` predicate declared AFTER this project is exactly as valid a filter on the
   original vector rows as it would be on the post-project pixels, and gets pushed all the
-  way back to that vector origin's own scan. Every other project direction, and every
-  other kind of validity (dimension, `grid_cell`), stops here regardless of direction:
+  way back to that vector origin's own scan. Every other project direction stops both:
   once rows have been redistributed onto a different grid, there is no single upstream row
-  a downstream dimension/spatial predicate corresponds to.
-* `join` stops everything, unconditionally, for both operands. Nothing in this pipeline
-  model chains an op backward THROUGH a join -- pushing a predicate declared after a join
-  back through only one operand would silently change what the other operand's rows get
-  matched against, so it is simplest and always correct to just not attempt it. A
-  band-wide `join` gets one piece of special handling despite this: since
+  a downstream value or spatial predicate corresponds to. Dimensions are untouched in
+  EVERY direction -- a project changes which grid a row addresses, not which observation
+  it is of -- so a dimension conjunct declared after one still narrows its origin.
+* `join` stops `value` and `grid_cell` for both operands. What a value conjunct on a
+  joined frame even names is an operand's renamed value column (`join_long`'s doing), not
+  a source column, and a spatial one addresses a grid neither operand's read is indexed by
+  on its own. A band-wide `join` gets one piece of special handling: since
   `execution.band_ops.join_band_wide` reads both operands through one shared VRT (see that
   module), the operands' resolved band metadata still needs to be sized as a UNION for the
-  `ANALYSIS_BAND_CEILING` check below, even though no predicate pushes through the join
-  itself.
+  `ANALYSIS_BAND_CEILING` check below.
 
 **Which origins a frame came from is tracked separately from whether pushdown is still
 valid, and the two must not be conflated.** They answer different questions, and the
@@ -88,6 +118,15 @@ already accumulated onto an origin from BEFORE such a branch point remains valid
 that part of the chain really was exclusive up to there -- but nothing past it is ever
 added.
 
+`reference_count` governs `_Validity` alone. The dimension passes answer the same question
+without giving up, by taking the UNION of what the branches need rather than the
+conjunction of it: a read narrowed to "2030 or 2040" satisfies the branch that asked for
+2030 and the one that asked for 2040 at once, and each branch's own `filter` step still
+runs. Branches that agree -- the same input read twice under the same selection, which is
+the common case -- collapse back to that one predicate. The union is taken over the
+TERMINAL frames, the ones nothing else reads, since every frame the plan computes is
+reachable from one of those or is one.
+
 **Column pushdown needs one more guard beyond validity/fan-out: a `group`.** A `filter`'s
 or `calculate.where`'s referenced dimension names get folded into an origin's candidate
 column set as they're encountered, but that set is only ever actually handed to
@@ -112,6 +151,13 @@ via a dimension predicate reproduces exactly what a real, executed dimension fil
 have done to that band-wide frame anyway (`execution.band_ops.select_dimension_band_wide`)
 -- nothing about the surviving bands' own columns changes, so there is nothing analogous
 to the vector "the sink still wants an untouched dimension column" risk to guard against.
+
+The one place the two dimension passes have to be reconciled into a single answer is a
+vector origin feeding a vector-to-raster `project`, where the band pass may narrow the
+projection's declared band list past what the symbolic pass narrowed the scan to. The scan
+has to return the rows those bands are made of and no more, or the projection would
+declare a band nothing fills, so the surviving band rows are turned back into a per-column
+`IN`-list predicate (`_surviving_value_predicate`) and conjoined onto that origin's scan.
 
 **A raster value predicate is never pushed to the read, on purpose, and this is enforced
 at both layers.** Per the table above, a `value` conjunct reaching a `filter` while its
@@ -275,11 +321,32 @@ already gets a window rather than a `ValueError`. What it does not settle is the
 above -- a join group with no raster origin AT ALL has no shared read to build in the
 first place, which is a different gap with a different answer.
 
-**Compile still opens no data file for a vector input** -- `io.vector.scan_vector` is
-never called here, matching the request layer's own "no IO at plan time" property. A
-raster input is the one exception: resolving its band list requires one catalog read
-(`io.catalog.resolve_raster_bands`, which in turn calls `cpra.mp.data.raster.read_cog`) --
-unavoidable, since which bands exist can only be answered by looking.
+**A vector-to-raster `project`'s bands are enumerated here too, for the same reasons.**
+That step turns a long frame's distinct dimension combinations INTO the columns of a
+band-wide one, so its width is settled by data, not by the request -- exactly the position
+a raster input is in. `io.catalog.resolve_vector_bands` answers it, once per such step,
+and the results land in `ExecutionPlan.vector_band_metadata` keyed by STEP NUMBER (a
+projection, not an input, is what creates the bands, and one input projected twice is two
+different widths). `execution.project.project_vector_to_raster` takes that frame as its
+declared band universe instead of deriving one by collecting the data, and the ceiling
+loops count those bands alongside the raster ones wherever the two meet in a band-wide
+join -- projected bands are never READ, but they are columns of the joined frame all the
+same.
+
+The enumeration deliberately runs AFTER the walk rather than at the `project` step: a
+value `filter` declared after a vector-to-raster project still pushes back to that vector
+origin (per the table above), so the predicate the scan will use is only final once every
+op has been seen -- and the enumeration must count the same rows the scan returns. A step
+whose origin could not be traced (fan-out, or an operand of a join), or whose dataset has
+nothing on disk yet, is simply absent from `vector_band_metadata`: its width is not a
+plan-time fact, and nothing may treat the absence as zero.
+
+**Compile opens no data file for a pipeline that stays LONG.** Anything resolving to BANDS
+is the exception, in both directions: a raster input's band list requires one catalog read
+(`io.catalog.resolve_raster_bands`, which in turn calls `cpra.mp.data.raster.read_cog`),
+and a vector-to-raster `project` requires one `resolve_vector_bands` scan. Both are
+unavoidable -- which bands exist can only be answered by looking -- and neither happens
+for a pipeline with no raster input and no such projection.
 """
 
 import dataclasses
@@ -289,7 +356,12 @@ import mercantile
 import polars as pl
 from rasterio.enums import Resampling
 
-from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
+from cpra.mp.data.analysis.execution.band_ops import PAIRING_KEY_EXCLUDED_COLUMNS, unify_metadata_parts
+from cpra.mp.data.analysis.io.catalog import (
+    dataset_dimension_columns,
+    resolve_raster_bands,
+    resolve_vector_bands,
+)
 from cpra.mp.data.analysis.io.raster_io import (
     raster_grid_geometry,
     resampling_buffer_px,
@@ -301,6 +373,7 @@ from cpra.mp.data.analysis.request.errors import BandLimitError, RequestError, S
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
     CalculateOp,
+    CaseOp,
     FilterOp,
     FrameType,
     GroupOp,
@@ -431,6 +504,17 @@ class ExecutionPlan:
     `band_wide_join_zone_crosswalks`: the same join outputs mapped to the `ZoneCrosswalk`s
     that shared read must also carry, one per vector-to-raster `project` upstream of any
     of that join's operands -- empty for a join whose operands are all raster origins.
+    `vector_band_metadata`: every vector-to-raster `project` step whose bands this compile
+    could enumerate ahead of the read, mapped to that enumeration (`io.catalog.
+    resolve_vector_bands`' frame -- one row per band, in band order). It is the vector
+    counterpart of `ResolvedInput.band_metadata`, keyed by STEP rather than by input
+    because a projection, not an input, is what turns vector rows into bands; it is what
+    the ceiling is checked against for those bands, and `execution.execute` hands each
+    entry to `execution.project.project_vector_to_raster` so the width is declared rather
+    than discovered. A `project` missing from this dict is one whose input `compile_plan`
+    could not trace back to a single origin -- a `join` or a fan-out upstream of it -- or
+    whose dataset has nothing on disk to enumerate yet; either way that step enumerates its
+    own bands at execution time instead.
     `tile`: the `TileRequest` this plan was compiled for, or `None` for a full-extent one;
     the sink needs it to warp the result onto the tile's own grid, and it is recorded here
     so that it comes from the same place the read windows were derived from rather than
@@ -444,6 +528,7 @@ class ExecutionPlan:
     band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = dataclasses.field(
         default_factory=dict
     )
+    vector_band_metadata: dict[int, pl.DataFrame] = dataclasses.field(default_factory=dict)
     tile: TileRequest | None = None
 
 
@@ -452,15 +537,20 @@ class _Validity:
     """Per-origin pushdown state carried forward through one line of computation while
     walking `ops` -- see the module docstring's table for what each op does to it.
 
-    `origin` is the named input this state still traces back to. `value`/`grid_cell` are
-    plain booleans: still pushable, or not. `dimensions` is `None` (every dimension still
-    open) or the exact `frozenset` of dimension names still open -- `group` is the only op
-    that ever narrows this, to exactly its own `by`.
+    `origin` is the named input this state still traces back to; `value`/`grid_cell` are
+    plain booleans: still pushable, or not.
+
+    **Dimension validity is deliberately NOT here.** A dimension conjunct is pushed back
+    through the band-identity pass below instead, which propagates per-origin surviving
+    BAND SETS rather than a per-origin yes/no -- so it survives the two things that retire
+    this state entirely, a join (both operands narrow, against the unified metadata frame)
+    and a fan-out (the origin keeps the union of what its branches need). Which dimension
+    names are still standing at a given frame is a structural fact about that frame, not a
+    validity one, and lives in `compile_plan`'s `frame_origin_dimensions`.
     """
 
     origin: str
     value: bool
-    dimensions: frozenset[str] | None
     grid_cell: bool
 
 
@@ -470,6 +560,108 @@ def _referenced_names(conjunct: str) -> frozenset[str]:
     classify_predicate_kind` itself classifies conjuncts by.
     """
     return frozenset(pl.sql_expr(conjunct).meta.root_names())
+
+
+# One column per participating origin in a unified metadata frame, carrying that origin's
+# own band positions. Named apart from anything a dataset can carry so it can never
+# collide with a real dimension and never become a join key.
+_ORIGIN_POSITION_PREFIX = "__origin_position_"
+
+
+def _dimension_survivors(
+    surviving: dict[str, frozenset[int]],
+    metadata: dict[str, pl.DataFrame],
+    standing: dict[str, frozenset[str]],
+    conjunct: str,
+) -> dict[str, frozenset[int]]:
+    """Which of each origin's still-surviving bands a single dimension `conjunct` leaves,
+    evaluated against the UNIFIED metadata frame of every origin feeding the frame the
+    conjunct was declared on.
+
+    `surviving` maps origin name to the band positions still standing there; `metadata`
+    holds each enumerable origin's full band frame (raster bands, or a vector-to-raster
+    projection's enumerated ones), positions indexing into it. `standing` says, per origin,
+    which of ITS dimensions the frame still carries -- per origin rather than per frame so
+    that a name one origin's upstream `group` collapsed cannot pair that origin's bands
+    against another's that still has the column on disk.
+
+    The unified frame is `execution.band_ops.unify_metadata_parts` -- the SAME function
+    `join_band_wide`'s own post-join dimension filter uses at execution time, and
+    deliberately not a local restatement of it. That is what makes narrowing here sound at
+    all: the `filter` step still runs over whatever was read, so a plan-time answer that
+    differs from the execution-time one can only be wrong. In particular it is a FULL outer
+    join on the shared dimensions, never an inner one -- an inner join would drop the rows
+    of an origin that shares no dimension with the conjunct's, making a trivially-true
+    conjunct narrow the frame.
+
+    Returns `surviving` unchanged -- too wide, which is always safe -- when the conjunct
+    cannot be evaluated here at all: no origin in this frame is enumerable, or the conjunct
+    names a column none of the enumerable ones carries (it belongs to a vector origin whose
+    bands are not a plan-time fact, and that origin's own scan predicate is where it gets
+    pushed instead).
+    """
+    parts: list[pl.DataFrame] = []
+    positions: list[tuple[str, str]] = []
+    available: set[str] = set()
+    # Indexed, not `.get`: `surviving` is seeded from `metadata` and only ever unioned
+    # afterward, so its keys are the enumerable origins and nothing else. A non-enumerable
+    # one is absent from BOTH, which is how it ends up contributing no narrowing.
+    for origin in sorted(surviving):
+        frame = metadata[origin]
+        carried = [
+            name
+            for name in frame.columns
+            if name in standing[origin] and name not in PAIRING_KEY_EXCLUDED_COLUMNS
+        ]
+        column = f"{_ORIGIN_POSITION_PREFIX}{len(positions)}"
+        positions.append((origin, column))
+        parts.append(
+            frame.with_row_index(column)
+            .filter(pl.col(column).is_in(sorted(surviving[origin])))
+            .select(column, *carried)
+        )
+        available |= set(carried)
+    if not parts or not _referenced_names(conjunct) <= available:
+        return surviving
+    # `fill_null(False)` for the same reason `_joined_dimension_positions` needs it: the
+    # full outer join leaves nulls wherever an origin has no row for a combination, and a
+    # null comparison is "unknown", which must not be read as "keep".
+    unified = unify_metadata_parts(parts).filter(pl.sql_expr(conjunct).fill_null(False))
+    narrowed = dict(surviving)
+    for origin, column in positions:
+        narrowed[origin] = frozenset(unified[column].drop_nulls().to_list())
+    return narrowed
+
+
+def _surviving_value_predicate(
+    metadata: pl.DataFrame, surviving: frozenset[int], dimension_columns: frozenset[str]
+) -> list[pl.Expr]:
+    """The scan predicate that narrows a vector origin's rows to the bands `surviving`
+    leaves: one `IN`-list per dimension column whose surviving values are a PROPER subset
+    of the ones the origin enumerated.
+
+    Not the exact row set -- a per-column conjunction admits combinations no surviving band
+    actually has -- but a superset of it, which is the safe direction, and one made of
+    plain per-column `IN`s, which is what Parquet row-group statistics can actually skip on.
+    The exact set is re-applied by the `filter` step itself over what comes back.
+
+    A column whose values all survive contributes nothing: it would be a tautology on this
+    scan, and leaving it out keeps the predicate readable on the plan.
+    """
+    parts: list[pl.Expr] = []
+    kept = sorted(surviving)
+    # `dimension_columns` is the origin's own dataset dimensions, which every column an
+    # enumeration can carry is one of -- except `request.pipeline.
+    # RESERVED_BAND_INDEX_COLUMN`, the stand-in for a projection that has no dimension at
+    # all. That frame is one row high, so it can never be narrowed and never reaches here;
+    # the guard is what says so rather than leaving it to that coincidence.
+    for name in [name for name in metadata.columns if name in dimension_columns]:
+        column = metadata[name]
+        values = column.gather(kept).unique()
+        if values.len() >= column.n_unique():
+            continue
+        parts.append(pl.col(name).is_in(values.sort().to_list()))
+    return parts
 
 
 def _merge_shared_origin_groups(
@@ -554,7 +746,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             reference_count[op.input] += 1
 
     states: dict[str, _Validity | None] = {
-        name: _Validity(origin=name, value=True, dimensions=None, grid_cell=True) for name in pipeline.inputs
+        name: _Validity(origin=name, value=True, grid_cell=True) for name in pipeline.inputs
     }
 
     vector_origins = [name for name, kind in origin_kind.items() if kind == "vector"]
@@ -562,10 +754,44 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     vector_predicate_parts: dict[str, list] = {name: [] for name in vector_origins}
     vector_columns: dict[str, set[str]] = {name: {"grid_cell", "value"} for name in vector_origins}
     vector_columns_ok: dict[str, bool] = {name: False for name in vector_origins}
-    raster_dimension_parts: dict[str, list] = {name: [] for name in raster_origins}
     point_sample_step: dict[str, int] = {}
+
+    # The two dimension-pushdown passes' structural inputs, all recorded UNCONDITIONALLY
+    # below -- before the `_incoming` gate, alongside `origin_sets` -- because none of them
+    # is a pushdown-validity question. Which frames a frame was built from, which dimension
+    # conjuncts were declared on it, and which of each contributing ORIGIN's dimensions are
+    # still standing in it are facts about the ops; what a fan-out or a join costs is
+    # answered later, by the passes themselves, as a union rather than as a refusal (see
+    # the module docstring).
+    #
+    # Per origin, not per frame, and that distinction is load-bearing. `join [g, h]` where
+    # `g` grouped `scenario_id` away and `h` kept it leaves the JOINED frame carrying
+    # `scenario_id` -- from `h` alone. Reading the frame's set as one would then make a
+    # `scenario_id` conjunct look pushable to `g`'s origin too, where it would narrow rows
+    # the `group` was supposed to fold together and change that side's answer.
+    origin_dimension_columns: dict[str, frozenset[str]] = {
+        name: dataset_dimension_columns(selection) for name, selection in pipeline.inputs.items()
+    }
+    frame_origin_dimensions: dict[str, dict[str, frozenset[str]]] = {
+        name: {name: columns} for name, columns in origin_dimension_columns.items()
+    }
+    frame_parents: dict[str, tuple[str, ...]] = {}
+    frame_dimension_conjuncts: dict[str, tuple[str, ...]] = {}
     band_wide_join_origin_groups: dict[str, tuple[str, ...]] = {}
     band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = {}
+    # Every vector-to-raster `project` whose bands can be enumerated before the read, mapped
+    # to the origin they come from and the dimension names still standing at that point --
+    # exactly what `io.catalog.resolve_vector_bands` needs. Recorded in the main walk rather
+    # than a pass of its own because it is a PUSHDOWN-VALIDITY question, not a structural
+    # one: `_incoming` returning `None` (a join or a fan-out upstream) is precisely the case
+    # where no single origin's catalog can answer how wide this step's output will be.
+    vector_band_projections: dict[int, tuple[str, frozenset[str] | None, str]] = {}
+    # Which vector-to-raster `project` steps' bands land in the same band-wide frame as a
+    # given join's -- the vector counterpart of `band_wide_join_origin_groups`. Recorded for
+    # EVERY band-wide join, including one with no raster operand at all (that dict skips
+    # those, having nothing to read), because two projections joined together still share
+    # one frame's width and the ceiling is about that width.
+    band_wide_join_vector_steps: dict[str, tuple[int, ...]] = {}
 
     # Which vector-to-raster `project` steps produced the pixels a given frame is made of
     # -- the vector-side counterpart of `origin_sets` below, and the input to the same
@@ -623,12 +849,28 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             # that doesn't exist, so a miss here is a broken invariant and should say so.
             union = tuple(dict.fromkeys(name for operand in op.inputs for name in origin_sets[operand]))
             origin_sets[op.output] = union
+            frame_parents[op.output] = op.inputs
+            # Intersected, not unioned, for an origin reaching this join down two operands
+            # at once (a self-join, or a fan-out that rejoins): only a dimension BOTH
+            # paths still carry can be narrowed at the one read they share.
+            standing: dict[str, frozenset[str]] = {}
+            for operand in op.inputs:
+                for name, columns in frame_origin_dimensions[operand].items():
+                    standing[name] = standing[name] & columns if name in standing else columns
+            frame_origin_dimensions[op.output] = standing
             if frame_types[op.output].shape is Shape.band_wide:
                 # Only the RASTER origins contribute bands to the shared read. A vector
                 # origin reaches a band-wide join solely by way of a vector-to-raster
                 # `project` (nothing else gives a vector input pixels), and that step's
                 # crosswalk -- not the origin -- is what has to ride along on the same
-                # read; `zone_crosswalks_upstream_of` is where it was recorded.
+                # read; `zone_crosswalks_upstream_of` is where it was recorded. Its bands
+                # are not read at all (they are pivoted out of the long frame in memory),
+                # but they are columns of the joined frame all the same, which is what
+                # `band_wide_join_vector_steps` records them for.
+                if zone_crosswalks_upstream_of[op.output]:
+                    band_wide_join_vector_steps[op.output] = tuple(
+                        crosswalk.step_no for crosswalk in zone_crosswalks_upstream_of[op.output]
+                    )
                 raster_union = tuple(name for name in union if origin_kind[name] == "raster")
                 if raster_union:
                     band_wide_join_origin_groups[op.output] = raster_union
@@ -637,6 +879,30 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             continue
 
         origin_sets[op.output] = origin_sets[op.input]
+        frame_parents[op.output] = (op.input,)
+        # A `group` is the only op that takes a dimension column AWAY from a frame; every
+        # other one -- including a `project` in any direction, which changes which grid the
+        # rows address, not which observation each row is of -- passes the sets through.
+        frame_origin_dimensions[op.output] = (
+            {
+                name: columns & frozenset(op.by)
+                for name, columns in frame_origin_dimensions[op.input].items()
+            }
+            if isinstance(op, GroupOp)
+            else frame_origin_dimensions[op.input]
+        )
+        # Classified against the INCOMING frame's value columns, not the default
+        # `("value",)`. On a paired frame an operand-named conjunct (`marsh > 0.5`) would
+        # otherwise land in the dimension bucket and become a candidate for pushdown to the
+        # reader -- where `marsh` is not a source column at all, but the name `join_long`
+        # gave that operand's `value`.
+        kinds = (
+            classify_where_kinds(op.where, frame_types[op.input].value_columns)
+            if isinstance(op, FilterOp)
+            else None
+        )
+        if kinds is not None:
+            frame_dimension_conjuncts[op.output] = tuple(kinds[PredicateKind.dimension])
 
         incoming = _incoming(op.input)
         if incoming is None:
@@ -646,8 +912,23 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         if isinstance(op, ProjectOp):
             from_kind, to_kind = project_direction(frame_types[op.input], op.to)
             if from_kind == "vector" and to_kind == "raster":
+                # The origin is necessarily a vector INPUT here, not merely a frame on a
+                # vector grid: the only other way to be on one is a raster-to-vector
+                # `project`, and that branch below has already retired this origin's state.
+                # `None` rather than the frame's own set whenever nothing has narrowed it:
+                # "every dimension this dataset has" is what `resolve_vector_bands` already
+                # does by default, and saying it as a set would make the plan's record of
+                # the enumeration depend on `dataset_dimension_columns` agreeing exactly
+                # with the scan's schema, rather than merely on the two agreeing about what
+                # a `group` took away.
+                open_dimensions = frame_origin_dimensions[op.input][incoming.origin]
+                vector_band_projections[op.step_no] = (
+                    incoming.origin,
+                    None if open_dimensions >= origin_dimension_columns[incoming.origin] else open_dimensions,
+                    op.to,
+                )
                 states[op.output] = _Validity(
-                    origin=incoming.origin, value=incoming.value, dimensions=frozenset(), grid_cell=False
+                    origin=incoming.origin, value=incoming.value, grid_cell=False
                 )
             else:
                 states[op.output] = None
@@ -657,15 +938,12 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         kind = origin_kind[origin]
 
         if isinstance(op, FilterOp):
-            kinds = classify_where_kinds(op.where)
             if kind == "vector":
                 for bucket in kinds.values():
                     for conjunct in bucket:
                         vector_columns[origin] |= _referenced_names(conjunct)
-                for conjunct in kinds[PredicateKind.dimension]:
-                    names = _referenced_names(conjunct)
-                    if incoming.dimensions is None or names <= incoming.dimensions:
-                        vector_predicate_parts[origin].append(pl.sql_expr(conjunct))
+                # Nothing to do for a dimension conjunct: the symbolic pass below pushes it
+                # for EVERY frame, including the ones this state does not survive to.
                 for conjunct in kinds[PredicateKind.value]:
                     if incoming.value:
                         vector_predicate_parts[origin].append(pl.sql_expr(conjunct))
@@ -677,10 +955,11 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 # non-value-preserving project (the only ways to leave band-wide shape for
                 # a raster origin) already sets this state to `None` at the point it
                 # happens, and nothing else changes a raster origin's shape.
-                for conjunct in kinds[PredicateKind.dimension]:
-                    names = _referenced_names(conjunct)
-                    if incoming.dimensions is None or names <= incoming.dimensions:
-                        raster_dimension_parts[origin].append(pl.sql_expr(conjunct))
+                #
+                # Nothing to do for a dimension conjunct: band selection is the
+                # band-identity pass's answer, recorded above and evaluated for every
+                # frame, not only the ones this state survived to.
+                #
                 # A value conjunct is never pushed to a band-wide read regardless of
                 # `incoming.value` -- see the module docstring.
                 if kinds[PredicateKind.spatial]:
@@ -692,9 +971,27 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
 
         if isinstance(op, CalculateOp):
             if kind == "vector" and op.where is not None:
-                for bucket in classify_where_kinds(op.where).values():
+                for bucket in classify_where_kinds(op.where, frame_types[op.input].value_columns).values():
                     for conjunct in bucket:
                         vector_columns[origin] |= _referenced_names(conjunct)
+            states[op.output] = dataclasses.replace(incoming, value=False)
+            continue
+
+        if isinstance(op, CaseOp):
+            # A `calculate`'s reading, arm by arm. Every `when` is a predicate over the
+            # frame's own value columns and every `then`/`else` a value expression over the
+            # same namespace (`request.ops._type_case` rejects a dimension or spatial arm
+            # outright), so -- exactly as for a `calculate`'s `expression` -- none of them
+            # can name a source column the read does not already have; the `when`s are swept
+            # for referenced names anyway, since widening a vector read is only ever slow.
+            # What the op DOES do is rewrite the value, which retires this origin's value
+            # validity the same way a `calculate` does.
+            if kind == "vector":
+                for arm in op.cases:
+                    kinds_by_arm = classify_where_kinds(arm.when, frame_types[op.input].value_columns)
+                    for bucket in kinds_by_arm.values():
+                        for conjunct in bucket:
+                            vector_columns[origin] |= _referenced_names(conjunct)
             states[op.output] = dataclasses.replace(incoming, value=False)
             continue
 
@@ -708,11 +1005,8 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 # why it is safe to narrow the source read to exactly what has been
                 # referenced so far, unioned with `by`/`of`, from this point on.
                 vector_columns_ok[origin] = True
-            new_dimensions = by_set if incoming.dimensions is None else (incoming.dimensions & by_set)
             new_grid_cell = incoming.grid_cell and ("grid_cell" in by_set)
-            states[op.output] = _Validity(
-                origin=origin, value=False, dimensions=new_dimensions, grid_cell=new_grid_cell
-            )
+            states[op.output] = _Validity(origin=origin, value=False, grid_cell=new_grid_cell)
             continue
 
         # Unreachable: the branches above are exhaustive over the `Op` union, which is why
@@ -720,19 +1014,226 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")  # pragma: no cover
 
     _merge_shared_origin_groups(band_wide_join_origin_groups, band_wide_join_zone_crosswalks)
+    # A merge fuses two joins' crosswalks along with their origins, so the vector steps a
+    # merged group covers are the merged tuple, not the one the walk recorded per join.
+    for output, crosswalks in band_wide_join_zone_crosswalks.items():
+        band_wide_join_vector_steps[output] = tuple(crosswalk.step_no for crosswalk in crosswalks)
 
-    raster_band_metadata: dict[str, pl.DataFrame] = {}
+    # **The symbolic dimension pass.** One forward sweep over the frame graph the walk
+    # recorded, carrying per (frame, origin) the predicate that origin's own read may be
+    # narrowed by. A conjunct declared on a frame ANDs into every origin of that frame
+    # still carrying all of its columns; two paths meeting -- a join reached down both
+    # sides, or a fan-out's branches recombined at the end -- OR, because one shared read
+    # has to satisfy both and the superset is the safe direction.
+    #
+    # This is where a join and a fan-out stop being walls. Neither is a reason a DIMENSION
+    # conjunct cannot reach an origin's read: `join_long` is an inner join, so
+    # sigma_p(A join B) == sigma_p(A) join B for a `p` over A's own columns, and every
+    # `filter` step still re-executes over whatever came back, so a narrowing that is
+    # merely too WIDE costs time and nothing else. `_Validity` keeps its walls because
+    # value and spatial pushdown do not have that second property in the same way (see
+    # the module docstring).
+    #
+    # `None` is "nothing to narrow by" -- true -- which is why it absorbs an OR and is
+    # replaced by an AND.
+    narrowing: dict[str, dict[str, object]] = {name: {name: None} for name in pipeline.inputs}
+    for op in ops:
+        merged: dict[str, object] = {}
+        for parent in frame_parents[op.output]:
+            for origin, expr in narrowing[parent].items():
+                if origin not in merged:
+                    merged[origin] = expr
+                elif merged[origin] is None or expr is None:
+                    merged[origin] = None
+                else:
+                    merged[origin] = merged[origin] | expr
+        for conjunct in frame_dimension_conjuncts.get(op.output, ()):
+            names = _referenced_names(conjunct)
+            for origin, standing in frame_origin_dimensions[op.output].items():
+                # R2.9's "narrow only when certain": a conjunct naming anything this origin
+                # does not still carry -- another operand's dimension, or one a `group`
+                # collapsed on this origin's own side -- contributes nothing here rather
+                # than being decomposed into the part that does apply.
+                if origin in merged and names <= standing:
+                    expr = pl.sql_expr(conjunct)
+                    merged[origin] = expr if merged[origin] is None else merged[origin] & expr
+        narrowing[op.output] = merged
+
+    # Unioned over the TERMINAL frames -- the ones nothing else reads, so the answer leaves
+    # through them. An origin that reaches none of them, or that reaches one having been
+    # narrowed by nothing, keeps `None`.
+    origin_dimension_predicate: dict[str, object] = {}
+    for frame, per_origin in narrowing.items():
+        if reference_count[frame]:
+            continue
+        for origin, expr in per_origin.items():
+            if origin not in origin_dimension_predicate:
+                origin_dimension_predicate[origin] = expr
+            elif origin_dimension_predicate[origin] is None or expr is None:
+                origin_dimension_predicate[origin] = None
+            else:
+                origin_dimension_predicate[origin] = origin_dimension_predicate[origin] | expr
+
+    # The vector pushdown as the two passes so far leave it: the walk's value and spatial
+    # conjuncts, plus the symbolic dimension predicate above. Resolved here rather than in
+    # the `inputs` loop below because the band enumeration has to be made against exactly
+    # what the scan will return -- the same predicate and the same projection, or it would
+    # count combinations the read never produces. What is not final yet is the narrowing
+    # one origin's bands take from ANOTHER origin's conjunct across a shared dimension;
+    # that is the band-identity pass's answer, appended below once this enumeration has
+    # given it something to answer with.
+    for name in vector_origins:
+        predicate = origin_dimension_predicate.get(name)
+        if predicate is not None:
+            vector_predicate_parts[name].append(predicate)
+    vector_predicate_parts_final: dict[str, list] = {
+        name: list(vector_predicate_parts[name]) for name in vector_origins
+    }
+    vector_projection: dict[str, list[str] | None] = {
+        name: sorted(vector_columns[name]) if vector_columns_ok[name] else None for name in vector_origins
+    }
+
+    def _conjoined(parts: list) -> object:
+        predicate = None
+        for part in parts:
+            predicate = part if predicate is None else predicate & part
+        return predicate
+
+    raster_band_metadata: dict[str, pl.DataFrame] = {
+        name: resolve_raster_bands(pipeline.inputs[name], base_path=base_path) for name in raster_origins
+    }
+
+    # One query per projection that will actually become bands, and none at all for a
+    # pipeline that stays long -- the gate is `vector_band_projections` itself, which is
+    # only ever written at a vector-to-raster `project` step.
+    vector_band_metadata: dict[int, pl.DataFrame] = {}
+    projection_step_of: dict[str, int] = {}
+    for step_no, (origin, dimensions, _to) in vector_band_projections.items():
+        enumerated = resolve_vector_bands(
+            pipeline.inputs[origin],
+            base_path=base_path,
+            columns=vector_projection[origin],
+            predicate=_conjoined(vector_predicate_parts[origin]),
+            dimensions=dimensions,
+        )
+        # `None` is "that dataset has nothing on disk to enumerate" -- see that function.
+        # It joins the untraceable projections in meaning the same thing here: this step's
+        # width is not a plan-time fact, so nothing below may treat it as one.
+        if enumerated is not None:
+            vector_band_metadata[step_no] = enumerated
+            projection_step_of[origin] = step_no
+
+    # **The band-identity pass.** The same sweep as the symbolic one, in the other
+    # currency: per (frame, origin) BAND POSITIONS rather than a predicate, narrowed at
+    # each dimension conjunct against the UNIFIED METADATA FRAME of every enumerable origin
+    # feeding that frame. Two paths meeting union, for the same reason they OR above.
+    #
+    # It exists because the symbolic pass cannot express the thing this one is for: a
+    # conjunct on ONE origin's dimension narrowing ANOTHER origin's bands, across a
+    # dimension they share. `aggregate_type = 'mean'` names a column only `lnd_type` has,
+    # yet the join pairs its bands with `elev`'s on `calendar_year`, so the `elev` bands
+    # whose year no surviving `lnd_type` band matches are bands nothing will ever read.
+    # That answer is only visible once both metadata frames are in hand, which is why this
+    # runs after the enumeration and the symbolic one runs before it.
+    origin_band_metadata: dict[str, pl.DataFrame] = {
+        **raster_band_metadata,
+        **{origin: vector_band_metadata[step] for origin, step in projection_step_of.items()},
+    }
+    surviving: dict[str, dict[str, frozenset[int]]] = {
+        name: ({name: frozenset(range(origin_band_metadata[name].height))} if name in origin_band_metadata else {})
+        for name in pipeline.inputs
+    }
+    for op in ops:
+        united: dict[str, set[int]] = {}
+        for parent in frame_parents[op.output]:
+            for origin, positions in surviving[parent].items():
+                united.setdefault(origin, set()).update(positions)
+        carried = {origin: frozenset(positions) for origin, positions in united.items()}
+        for conjunct in frame_dimension_conjuncts.get(op.output, ()):
+            carried = _dimension_survivors(
+                carried, origin_band_metadata, frame_origin_dimensions[op.output], conjunct
+            )
+        surviving[op.output] = carried
+
+    # What each origin's read must actually cover: the union over every TERMINAL frame --
+    # one nothing else reads, so the answer leaves through it. An origin that reaches no
+    # terminal frame at all keeps every band it has; an origin that reaches one having
+    # legitimately narrowed to nothing keeps nothing, which is an empty result, not an
+    # error (`execution.band_ops.empty_band_wide` is what executes over it).
+    required_bands: dict[str, frozenset[int]] = {}
+    for frame, per_origin in surviving.items():
+        if reference_count[frame]:
+            continue
+        for origin, positions in per_origin.items():
+            required_bands[origin] = required_bands.get(origin, frozenset()) | positions
+    for origin, metadata in origin_band_metadata.items():
+        required_bands.setdefault(origin, frozenset(range(metadata.height)))
+
+    # **The join-sibling floor.** `join_band_wide` aligns its operands POSITIONALLY, so
+    # every operand has to hand it the same pixel row count -- and a zero-band operand
+    # cannot, because "the original pixel count, zero bands" is the shape Polars has no
+    # representation for (`execution/frame.py`'s module docstring). So an origin that
+    # enters a band-wide join carrying bands, and would leave this pass carrying none, is
+    # given one band back.
+    #
+    # That emptiness is this pass's own doing rather than the pipeline's. The conjunct
+    # that caused it was declared AFTER the join, where it reads PAIRED metadata, and a
+    # pairing can leave one operand with no surviving row while its sibling keeps some --
+    # ask for a year only one operand's dataset has and that operand's rows are the only
+    # ones the predicate keeps. Narrowing to exactly that is correct as an answer and
+    # unreadable as a plan. The restored band costs one band of I/O and changes nothing
+    # else: the `filter` step still re-executes over the joined frame and drops it there,
+    # which is the same "too WIDE is slow and nothing worse" every other narrowing in this
+    # pass rests on.
+    #
+    # An operand that reaches the join ALREADY empty -- a `filter` declared on its own
+    # side, before the join -- is left alone. Execution re-derives that emptiness from
+    # whatever is read, so restoring a band would only move the failure; `execute.
+    # _open_band_wide_join_group`'s partial zero-band error is the right answer there and
+    # says which operand was empty.
+    for op in ops:
+        if not isinstance(op, JoinOp) or frame_types[op.output].shape is not Shape.band_wide:
+            continue
+        for operand in op.inputs:
+            for origin, positions in surviving[operand].items():
+                if positions and not required_bands[origin]:
+                    required_bands[origin] = frozenset({min(positions)})
+
     for name in raster_origins:
-        metadata = resolve_raster_bands(pipeline.inputs[name], base_path=base_path)
-        for expr in raster_dimension_parts[name]:
-            metadata = metadata.filter(expr)
-        raster_band_metadata[name] = metadata
+        raster_band_metadata[name] = raster_band_metadata[name][sorted(required_bands[name])]
+    for origin, step_no in projection_step_of.items():
+        metadata = vector_band_metadata[step_no]
+        positions = required_bands[origin]
+        if len(positions) < metadata.height:
+            vector_band_metadata[step_no] = metadata[sorted(positions)]
+            # The scan has to return the rows those bands are made of and no more, or the
+            # projection would declare a band the data no longer fills. Derived from the
+            # surviving positions rather than from the conjuncts, because the conjuncts
+            # that got us here may have been declared past a join, where their own text is
+            # not a predicate on this origin's rows at all.
+            vector_predicate_parts_final[origin].extend(
+                _surviving_value_predicate(metadata, positions, origin_dimension_columns[origin])
+            )
 
-    for join_output, origins in band_wide_join_origin_groups.items():
-        total = sum(raster_band_metadata[name].height for name in origins)
+    vector_predicate: dict[str, object] = {
+        name: _conjoined(vector_predicate_parts_final[name]) for name in vector_origins
+    }
+
+    for join_output in dict.fromkeys([*band_wide_join_origin_groups, *band_wide_join_vector_steps]):
+        origins = band_wide_join_origin_groups.get(join_output, ())
+        # A step absent from `vector_band_metadata` contributes an unknown number of bands
+        # rather than zero; nothing here can size it, which is the cost of the fan-out or
+        # join that made it unenumerable, not something to pretend away with a guess.
+        steps = tuple(
+            step for step in band_wide_join_vector_steps.get(join_output, ()) if step in vector_band_metadata
+        )
+        total = sum(raster_band_metadata[name].height for name in origins) + sum(
+            vector_band_metadata[step].height for step in steps
+        )
         if total > ANALYSIS_BAND_CEILING:
+            projected = f", plus the vector projection(s) at step(s) {steps}," if steps else ""
             raise BandLimitError(
-                f"step {join_output!r} (join): the shared union of {origins} resolves to "
+                f"step {join_output!r} (join): the shared union of {origins}{projected} resolves to "
                 f"{total} bands, over the limit of {ANALYSIS_BAND_CEILING} -- see "
                 "cpra.mp.data.config.ANALYSIS_BAND_CEILING"
             )
@@ -745,6 +1246,18 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         if height > ANALYSIS_BAND_CEILING:
             raise BandLimitError(
                 f"input {name!r} resolves to {height} bands, over the limit of "
+                f"{ANALYSIS_BAND_CEILING} -- see cpra.mp.data.config.ANALYSIS_BAND_CEILING"
+            )
+
+    joined_steps = {step for steps in band_wide_join_vector_steps.values() for step in steps}
+    for step_no, metadata in vector_band_metadata.items():
+        if step_no in joined_steps:
+            continue
+        if metadata.height > ANALYSIS_BAND_CEILING:
+            origin, _dimensions, to = vector_band_projections[step_no]
+            raise BandLimitError(
+                f"step {step_no} (project): input {origin!r} resolves to {metadata.height} "
+                f"bands when projected onto {to!r}, over the limit of "
                 f"{ANALYSIS_BAND_CEILING} -- see cpra.mp.data.config.ANALYSIS_BAND_CEILING"
             )
 
@@ -795,11 +1308,11 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 decimation=decimation,
             )
         else:
-            predicate = None
-            for part in vector_predicate_parts[name]:
-                predicate = part if predicate is None else predicate & part
-            columns = sorted(vector_columns[name]) if vector_columns_ok[name] else None
-            inputs[name] = ResolvedInput(selection=selection, columns=columns, predicate=predicate)
+            inputs[name] = ResolvedInput(
+                selection=selection,
+                columns=vector_projection[name],
+                predicate=vector_predicate[name],
+            )
 
     return ExecutionPlan(
         inputs=inputs,
@@ -809,6 +1322,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         band_wide_join_zone_crosswalks={
             output: crosswalks for output, crosswalks in band_wide_join_zone_crosswalks.items() if crosswalks
         },
+        vector_band_metadata=vector_band_metadata,
         tile=tile,
     )
 

@@ -14,12 +14,12 @@ reason; every other dimension filter (`model_group_id`, `calendar_year`, `grid_c
 `where`) is the caller's, and composes into the leading `filter` step exactly as it does
 for any other dataset-scoped analysis.
 
-The land/water mapping is expressed as two `calculate` steps rather than one conditional
-expression, because a `calculate` expression is a pure value expression -- the branch
-belongs in its `where`. The two are safe in either order: once `1/3/4` have become `1.0`,
-no remapped cell equals `2` or `5`, so the water branch cannot re-match a cell the land
-branch already claimed. The leading value-domain `filter` drops anything outside
-`1`-`5` (nodata included) so an unmapped code can never reach the weighted sum as itself.
+The land/water mapping is one `case` step, whose two arms are read against the INCOMING
+code rather than the running value -- so the mapping states itself directly, with no
+question of one branch re-matching a cell the other already claimed. The leading
+value-domain `filter` drops anything outside `1`-`5` (nodata included) so an unmapped code
+can never reach the weighted sum as itself; the `case` has no `else` for the same reason,
+and the two agree on which codes mean anything here.
 
 A cell that is nodata in only SOME members is summed over the members it has, so its
 weights no longer total `1.0` and its confidence reads low rather than being rescaled to
@@ -100,8 +100,16 @@ class LandTypeConfidence(Analysis):
         steps: list[dict] = [
             {"op": "filter", "where": selection_filter_where(filters, grid_cell_where=self.grid_cell_where)},
             {"op": "filter", "where": _value_in(LAND_VALUES + WATER_VALUES)},
-            {"op": "calculate", "expression": "1.0", "where": _value_in(LAND_VALUES)},
-            {"op": "calculate", "expression": "0.0", "where": _value_in(WATER_VALUES)},
+            # The land/water indicator, in one pass over the incoming code -- see the
+            # module docstring. No `else`: the filter above has already dropped everything
+            # neither arm names.
+            {
+                "op": "case",
+                "cases": [
+                    {"when": _value_in(LAND_VALUES), "then": "1.0"},
+                    {"when": _value_in(WATER_VALUES), "then": "0.0"},
+                ],
+            },
         ]
         steps.extend(
             {

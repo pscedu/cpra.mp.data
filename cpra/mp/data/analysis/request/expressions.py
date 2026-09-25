@@ -303,12 +303,18 @@ def classify_where(where_str):
     """Split `where` into top-level AND conjuncts (`split_top_level_and`) and sort each
     into a DIMENSION conjunct (references no `value` column) or a VALUE conjunct
     (references `value`, and nothing outside `value` plus literals/whitelisted
-    functions) -- the seam this module's two existing surfaces are unified across: a
-    dimension conjunct is recombined by the caller (`execution.long_ops.filter_long`, and
-    its band-wide counterpart) into an unrestricted `lf.sql()`/`pl.sql_expr` path, and a
-    value conjunct is recombined and handed to
-    `parse_value_expr`'s restricted whitelist, exactly the two mechanisms that
-    already existed for `where` and the former `value_where` respectively.
+    functions): a dimension conjunct is recombined by the caller into an unrestricted
+    `lf.sql()`/`pl.sql_expr` path, and a value conjunct is recombined and handed to
+    `parse_value_expr`'s restricted whitelist -- the two mechanisms that already existed
+    for `where` and the former `value_where` respectively.
+
+    **The analysis engine does not use this function; `classify_where_kinds` is what it
+    calls.** The remaining caller is `cpra.mp.data.read_data`, which applies a `where`
+    directly to one frame without going through a pipeline at all. Two-way is the right
+    split there and cannot drift: `read_data` never joins, so no frame it handles carries
+    an operand-named value column, and `value` spelled literally is the whole of the value
+    namespace -- which is exactly the assumption this function makes and
+    `classify_where_kinds` takes a `value_columns` parameter to avoid.
 
     Classification is by NAME (`pl.sql_expr(conjunct).meta.root_names()`), not by
     guessing from the string: a conjunct is parsed once, here, purely to answer "which
@@ -462,9 +468,11 @@ class CalculatePlan(NamedTuple):
     `Expr`) because the raster paths re-parse it once per band with `value` rewritten to
     that band's own synthetic column (`rewrite_value_column`), exactly like a `where`
     value condition. `dimension_where`/`value_where` are the entry's `where` split by
-    `classify_where` into its two conjunct kinds and recombined (`None` when that kind
-    was absent): the dimension half selects rows (vector) or bands (raster metadata); the
-    value half is a per-cell/per-pixel elementwise mask.
+    `classify_where_kinds` and recombined (`None` when that kind was absent): the
+    dimension half selects rows (vector) or bands (raster metadata); the value half is a
+    per-cell/per-pixel elementwise mask. Two fields for three predicate kinds -- a spatial
+    conjunct rides with the dimension half, which is what it is in long shape; see
+    `compile_calculate_entries`.
     """
 
     label: str
@@ -478,12 +486,20 @@ def compile_calculate_entries(entries, allowed_columns=("value",)):
     order -- into `CalculatePlan`s, before any file is opened.
 
     `expression` goes through `parse_calculate_expression` against `allowed_columns`.
-    `where` (optional) gets exactly a `FilterOp`'s treatment: split and
-    classified by `classify_where` (so a conjunct mixing a dimension column and `value`,
-    an aggregate call, or a subquery is rejected with the same messages `where` gives),
-    dimension conjuncts recombined into `dimension_where` -- their column NAMES are
-    grid-dependent and are checked where the plan is applied -- and value conjuncts
-    recombined into `value_where` and validated here against the same namespace.
+    `where` (optional) gets exactly a `FilterOp`'s treatment: split and classified by
+    `classify_where_kinds` against the SAME `allowed_columns` (so an aggregate call or a
+    subquery is rejected with the same messages `where` gives), dimension conjuncts
+    recombined into `dimension_where` -- their column NAMES are grid-dependent and are
+    checked where the plan is applied -- and value conjuncts recombined into `value_where`
+    and validated here against the same namespace.
+
+    Classifying against `allowed_columns` rather than against the literal name `value` is
+    what makes the two halves agree with the namespace `expression` is already checked
+    against. It matters in both directions: a post-`join` `where` naming an operand
+    (`marsh > 0.5`) is the VALUE conjunct it looks like rather than a dimension one, and a
+    band-wide `where` naming a carried column (`zone = 7`, an `extra_columns` entry) is a
+    per-pixel mask rather than a band selection evaluated against metadata that has no
+    such column.
 
     `allowed_columns` defaults to the `value` placeholder alone, which is what every
     single-value-column caller wants and what this function accepted before the parameter
@@ -507,9 +523,16 @@ def compile_calculate_entries(entries, allowed_columns=("value",)):
         value_where = None
         if where is not None:
             try:
-                dimension_conjuncts, value_conjuncts = classify_where(where)
+                kinds = classify_where_kinds(where, allowed_columns)
             except ExpressionError as exc:
                 raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
+            # A spatial conjunct joins the dimension half rather than getting a third
+            # field: `CalculatePlan`'s two halves are "selects rows/bands" and "masks
+            # cells", and `grid_cell` is the former in long shape (an ordinary column
+            # there). Band-wide has no per-pixel band metadata for it to select against,
+            # which is a gap in the band-wide calculate, not a reason for a third bucket.
+            dimension_conjuncts = [*kinds[PredicateKind.dimension], *kinds[PredicateKind.spatial]]
+            value_conjuncts = kinds[PredicateKind.value]
             if dimension_conjuncts:
                 dimension_where = combine_conjuncts(dimension_conjuncts)
             if value_conjuncts:

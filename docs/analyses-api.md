@@ -212,34 +212,33 @@ subtracted from it:
 depth = stage - elevation / 1000
 ```
 
-That depth is reclassified, spatially joined against annual land type
-(`lnd_type`/annual/`morph_pixel_v002`), and the two are reduced to the **max** of the pair at
-every pixel:
+Stage, elevation and annual land type (`lnd_type`/annual/`morph_pixel_v002`) arrive on **one
+spatial join**, and a single `case` step both computes the depth in its arms and
+reclassifies it:
 
-| Inundation depth (m) | Code |
+| Inundation depth (m), over `lnd_type = 2` | Code |
 |---|---|
 | deeper than `0`, up to and including `0.46` | `6` |
 | deeper than `0.46`, up to and including `1.0` | `7` |
-| deeper than `1.0` | `0` |
+| deeper than `1.0` | `2` (plain open water) |
+| anything else | the pixel's own `lnd_type`, unchanged |
 
 Each interval excludes its lower bound and includes its upper one, so a bound belongs to
-the class below it. A depth of exactly `0` is not inundation and is masked.
+the class below it. A depth of exactly `0` is not inundation -- no arm claims it and the
+`else` hands back the land type.
 
-The codes are what make a single `max` express the whole rule. `lnd_type`'s own codes are
-`1`-`5`, so `6` and `7` outrank every one of them and either shallow class overrides the
-land type; `0` is below all of them, so at a cell inundated by a metre or more the land
-type shows through unchanged.
+Deep water has no code of its own. The result's value domain is `1`-`7`, `2` is labelled
+"Water - Deep", and water deeper than 1.0 m is simply water: only the two shallow classes
+say something `lnd_type` could not. The deepest arm still earns its place, because the arms
+are first-match-wins in descending order of bound -- it is what stops a 1.5 m depth from
+falling through to the `> 0.46` arm and reporting `7`.
 
 **Only open water is reclassified.** The depth classes subdivide `lnd_type = 2`; they never
-overwrite land. That is enforced rather than assumed -- the depth class is masked wherever
-the land type underneath is anything but `2` before the max is taken, so a pixel where the
-independently-modelled elevation and land-type surfaces disagree reads as its land type
-rather than as shallow inundation over marsh or upland. A nodata land type is not water
-either, so a depth there is masked too and the pixel stays nodata.
-
-One consequence: `0` never reaches the output. It survives the mask only over water, where
-`max(0, 2)` is `2` -- so deep water reads as plain open water, and the result's value domain
-is `1`-`7`. The deep class is still what keeps deep water out of `6`/`7`.
+overwrite land. That is enforced rather than assumed -- every arm carries an
+`AND land_type = 2` conjunct, so a pixel where the independently-modelled elevation and
+land-type surfaces disagree reads as its land type rather than as shallow inundation over
+marsh or upland. A nodata land type is not water either, and it is also what the `else`
+would hand back, so such a pixel stays nodata.
 
 The analysis's `result_kind` is `"category"` and its `legend` is `lnd_type_plus`, an entry
 of its own in `structure/legends.csv` (rendered in full under "Legends" in the [data
@@ -259,7 +258,7 @@ documentation](index.md)) rather than `lnd_type`'s, whose ramp stops at `5`:
 Codes `1`-`5` carry `lnd_type`'s own colors, so a pixel this analysis leaves alone renders
 the same as it does under plain `lnd_type`; `2` is relabelled "Water - Deep" because that is
 what it means here -- open water that is either not inundated by the depth surface or
-inundated by more than 1.0 m. There is no entry for `0`, which cannot occur.
+inundated by more than 1.0 m.
 
 | Parameter | Description |
 |---|---|
@@ -277,13 +276,13 @@ it means; a spatial predicate would additionally turn the frame tabular and inva
 raster output rather than narrow it, and a value `where` has no one operand to apply to.
 Supplying either is rejected with a 400. Its dimension values are parameters instead.
 
-A pixel is **masked** -- contributing nothing to the max, so the land type reads alone --
-wherever its depth is outside the reclassification's `> 0` domain, i.e. wherever the
-elevation stands at or above the water level (dry land). It is masked the same way wherever
-either half of the subtraction is missing: a pixel with stage but no elevation is dropped
-rather than reading as the bare stage. On the other side, a nodata `lnd_type` contributes
-nothing to the max -- and, per the water rule above, masks the depth as well, so such a cell
-has no contributor at all and stays nodata.
+A pixel **falls through to the `else`** -- reading as its own land type -- wherever its
+depth is outside the reclassification's `> 0` domain, i.e. wherever the elevation stands at
+or above the water level (dry land). The same happens wherever either half of the
+subtraction is missing: a null term makes the depth null, a null predicate matches nothing,
+so a pixel with stage but no elevation reads as its land type rather than as the bare stage.
+A nodata `lnd_type` is the one case that stays nodata, because `land_type` is on both sides
+of the `case` -- every arm's water conjunct and the `else`.
 
 Output is always a raster (`tif`, or `png`/`jpg` on the tile routes) -- the one `project`
 lands **on** the pixel grid and nothing projects off it, so a tabular output is rejected.

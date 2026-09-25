@@ -55,9 +55,9 @@ from tests.factories import (
 NODATA = -9999
 
 # The `salinity-veg-investigation` analysis's own shape, spelled as a raw pipeline body:
-# two inputs on different grids, one `project`ed onto the other's grid, joined, filtered
-# on both value columns, and collapsed to the earliest calendar year that satisfies the
-# filter.
+# two inputs on different grids, one `project`ed onto the other's grid, joined, tested
+# against both value columns by a single-armed `case`, and collapsed to the earliest
+# calendar year that satisfies the test.
 #
 # An input here names a dataset and nothing else -- `request.pipeline.InputSelection` is
 # `extra="forbid"` with only `variable`/`time_unit`/`grid`, by design (see its own
@@ -80,7 +80,7 @@ NOTEBOOK_QUERY = {
     "steps": [
         {"op": "project", "input": "salinity", "to": "veg_grid_cell_v001", "as": "sal"},
         {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
-        {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
+        {"op": "case", "cases": [{"when": "marsh > 0.5 AND sal > 5.5", "then": "marsh"}]},
         {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
     ],
     "output": {"format": "tif"},

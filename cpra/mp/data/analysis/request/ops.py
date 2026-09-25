@@ -1,8 +1,8 @@
 """The op IR: a small typed `Op` per pipeline step -- `ProjectOp`/`JoinOp`/`FilterOp`/
-`CalculateOp`/`GroupOp`, exactly the five ops `pipeline.py`'s `Step` union already names
--- plus `compile_ops`, which turns an already-validated `Pipeline` into `list[Op]` **in
-declared order**, and `validate_shapes`, which types every input/step's shape (`long` or
-`band_wide`) and rejects the combinations that have no meaning (enumerated below).
+`CalculateOp`/`CaseOp`/`GroupOp`, exactly the six ops `pipeline.py`'s `Step` union already
+names -- plus `compile_ops`, which turns an already-validated `Pipeline` into `list[Op]`
+**in declared order**, and `validate_shapes`, which types every input/step's shape (`long`
+or `band_wide`) and rejects the combinations that have no meaning (enumerated below).
 
 **Shape-agnostic at the interface.** An `Op` carries only what the pipeline DECLARED: a
 `project`'s target grid, a `filter`'s predicate, a `calculate`'s expression, a `group`'s
@@ -40,10 +40,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cpra.mp.data.analysis.request import aggregates
 from cpra.mp.data.analysis.request.errors import AggregateError, RequestError, ShapeError
-from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
+from cpra.mp.data.analysis.request.expressions import (
+    PredicateKind,
+    classify_predicate_kind,
+    classify_where_kinds,
+)
 from cpra.mp.data.analysis.request.pipeline import (
+    DOMAIN_COLUMN,
     RASTER_OUTPUT_FORMATS,
+    ZONE_COLUMN,
     CalculateStep,
+    CaseStep,
+    CaseWhen,
     FilterStep,
     GroupStep,
     InputSelection,
@@ -119,6 +127,27 @@ class CalculateOp(BaseModel):
     label: str | None = None
 
 
+class CaseOp(BaseModel):
+    """Rewrite `input`'s running value by the first matching arm of `cases`, else `else_`
+    (null when unset). `CaseWhen` is `pipeline.py`'s own model, reused rather than
+    redeclared: an arm carries nothing an `Op` would need to resolve, so a second copy
+    would only be a second thing to keep in step.
+
+    `label`, like `CalculateOp.label`, is what an error raised while compiling one of the
+    expressions calls this entry -- diagnostic only.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    op: Literal["case"] = "case"
+    step_no: int
+    input: str
+    cases: list[CaseWhen]
+    else_: str | None = None
+    output: str
+    label: str | None = None
+
+
 class GroupOp(BaseModel):
     """Collapse `by` (empty means "one row per `grid_cell`") with `aggregate` applied to
     `of`.
@@ -136,15 +165,15 @@ class GroupOp(BaseModel):
 
 
 Op = Annotated[
-    ProjectOp | JoinOp | FilterOp | CalculateOp | GroupOp,
+    ProjectOp | JoinOp | FilterOp | CalculateOp | CaseOp | GroupOp,
     Field(discriminator="op"),
 ]
 
 
-def calculate_label(op: CalculateOp) -> str:
-    """What an error raised while compiling `op`'s expression should call it: the
-    explicit `CalculateOp.label`, else `step.<step_no>`, the pipeline step's own
-    position.
+def calculate_label(op: CalculateOp | CaseOp) -> str:
+    """What an error raised while compiling `op`'s expression(s) should call it: the
+    explicit `label`, else `step.<step_no>`, the pipeline step's own position. Shared by
+    the two ops that carry a caller-written value expression.
     """
     return op.label if op.label is not None else f"step.{op.step_no}"
 
@@ -257,6 +286,14 @@ def compile_ops(pipeline: Pipeline) -> list[Op]:
             op = CalculateOp(
                 step_no=step_no, input=input_name, expression=step.expression, where=step.where, output=output
             )
+        elif isinstance(step, CaseStep):
+            op = CaseOp(
+                step_no=step_no,
+                input=input_name,
+                cases=list(step.cases),
+                else_=step.else_,
+                output=output,
+            )
         elif isinstance(step, GroupStep):
             op = GroupOp(
                 step_no=step_no,
@@ -294,12 +331,34 @@ class FrameType:
     whether a `count_by_value` aggregate has already run somewhere in this frame's
     history (at most one per chain), and how many distinct value columns this frame
     currently carries (exactly one is required at the sink).
+
+    `extra_columns` is the CARRIED per-pixel columns a band-wide frame picks up alongside
+    its `b<i>` bands -- `execution/frame.py`'s `extra_columns` contract, mirrored here so
+    the typing walk knows about them before anything is opened. Only two names ever appear
+    (`pipeline.ZONE_COLUMN`, `pipeline.DOMAIN_COLUMN`; see `_carried_columns` for where
+    each is introduced), and it is empty for every long frame, since a carried column has
+    no meaning once the frame is rows rather than pixels.
+
+    It exists for `_type_filter`: a carried column is a real column of the DATA, one value
+    per pixel, so a `where` naming it is a per-pixel mask -- the same lowering a value
+    conjunct gets -- and not a dimension conjunct evaluated once per band against metadata
+    that carries no such column. Classification is not cosmetic there: it picks the
+    lowering AND the output shape (`FILTER_LOWERING_TABLE`), so getting it wrong is a
+    typing error, not only a runtime one. `extra_columns` is deliberately kept separate
+    from `value_columns` rather than folded into it: the two are unioned for the
+    classification question alone, while `value_columns`' own count is what decides whether
+    a band-wide frame has a PAIRING at all, and a carried column is not an operand's
+    measurement.
+
+    Defaults to empty, the answer for every long frame and every raster input no
+    raster-to-vector `project` reaches -- which is to say, almost all of them.
     """
 
     shape: Shape
     grid: str
     has_count_by_value: bool
     value_columns: frozenset[str]
+    extra_columns: frozenset[str] = frozenset()
 
 
 def project_direction(current: FrameType, to_grid: str) -> tuple[str, str]:
@@ -321,11 +380,58 @@ def project_direction(current: FrameType, to_grid: str) -> tuple[str, str]:
     return GRIDS[current.grid].grid_type, GRIDS[to_grid].grid_type
 
 
-def _initial_state(selection: InputSelection) -> FrameType:
+def _zone_carrying_inputs(pipeline: Pipeline, ops: list[Op]) -> frozenset[str]:
+    """Which declared inputs OPEN with `pipeline.ZONE_COLUMN` already attached: the raster
+    ones a raster-to-vector `project` is reachable from.
+
+    `DOMAIN_COLUMN` needs no pre-pass -- the step that introduces it is the step whose
+    output carries it, so the forward walk sees it the moment it appears. A zone id is the
+    opposite: it is attached to an ORIGIN's own read because of a `project` declared
+    somewhere later (`execution.execute._open_band_wide_input` passes `crosswalks=` for
+    exactly the origins `execution.plan.ResolvedInput.straddling_vector_grid` names, and
+    that field is itself a reachability fact), so a forward walk one op at a time cannot
+    know it yet. This computes the same reachability `compile_plan` does -- origin sets
+    carried forward, unioned at a fan-in, every raster origin reaching such a `project`
+    marked -- and does it here so both layers agree about which frames carry the column.
+
+    Reachability is over ALL ops, not just the chain a frame flows down to the sink: the
+    column is attached at the READ, so a fan-out's other branches carry it whether or not
+    they ever reach the `project` that asked for it (`execution/execute.py`'s closing
+    paragraph makes the same point from the other end, about stripping it again).
+
+    Grid kinds are recomputed here rather than read off `frame_types`, which does not exist
+    yet: a frame's grid is its input's or the last `project`'s `to`, and nothing about
+    carried columns can change that, so the two passes cannot disagree. Everything this
+    pass would reject -- a project with no lowering, a mixed-shape join -- it simply
+    carries past, leaving `annotate_frame_types`' own walk to raise the real error.
+    """
+    grids = {name: selection.grid for name, selection in pipeline.inputs.items()}
+    origins = {name: frozenset({name}) for name in pipeline.inputs}
+    carrying: set[str] = set()
+    for op in ops:
+        operands = list(op.inputs) if isinstance(op, JoinOp) else [op.input]
+        reachable = frozenset().union(*(origins[name] for name in operands))
+        origins[op.output] = reachable
+        if isinstance(op, ProjectOp):
+            grids[op.output] = op.to
+            if GRIDS[grids[op.input]].grid_type == "raster" and GRIDS[op.to].grid_type == "vector":
+                carrying |= {name for name in reachable if GRIDS[grids[name]].grid_type == "raster"}
+        else:
+            grids[op.output] = grids[operands[0]]
+    return frozenset(carrying)
+
+
+def _initial_state(selection: InputSelection, extra_columns: frozenset[str]) -> FrameType:
     grid_name = selection.grid
     kind = GRIDS[grid_name].grid_type
     shape = Shape.band_wide if kind == "raster" else Shape.long
-    return FrameType(shape=shape, grid=grid_name, has_count_by_value=False, value_columns=frozenset({"value"}))
+    return FrameType(
+        shape=shape,
+        grid=grid_name,
+        has_count_by_value=False,
+        value_columns=frozenset({"value"}),
+        extra_columns=extra_columns,
+    )
 
 
 def _type_project(step_no: int, step: ProjectStep | ProjectOp, current: FrameType) -> FrameType:
@@ -356,37 +462,81 @@ def _type_project(step_no: int, step: ProjectStep | ProjectOp, current: FrameTyp
             )
         has_count_by_value = True
 
+    # A vector-to-raster project INTRODUCES `DOMAIN_COLUMN` and carries nothing in (its
+    # input is long); every other direction leaves a LONG frame, which carries nothing at
+    # all -- a zone id the input was carrying is consumed by the projection itself. Either
+    # way the incoming frame's own set is never inherited, which is why this is the one
+    # place that cannot spell the answer as "whatever came in".
+    extra_columns = frozenset({DOMAIN_COLUMN}) if (from_kind, to_kind) == ("vector", "raster") else frozenset()
     return FrameType(
-        shape=out_shape, grid=step.to, has_count_by_value=has_count_by_value, value_columns=frozenset({"value"})
+        shape=out_shape,
+        grid=step.to,
+        has_count_by_value=has_count_by_value,
+        value_columns=frozenset({"value"}),
+        extra_columns=extra_columns,
     )
 
 
-def _type_filter(step: FilterStep | FilterOp, current: FrameType) -> FrameType:
+def _type_filter(step_no: int, step: FilterStep | FilterOp, current: FrameType) -> FrameType:
     """`current.value_columns`, not the bare `value` default, is what the conjuncts are
     classified against -- on a PAIRED frame (one a `join` left carrying one operand-named
     value column per operand) `marsh > 0.5` is a value conjunct, and classifying it as a
     dimension one would send it to a lowering that evaluates it against band metadata,
     where no such column exists.
 
-    A value conjunct over a paired BAND-WIDE frame also collapses the pairing: the
-    lowering (`execution.band_ops.pair_and_mask_band_wide`) pairs each operand's band with
-    its counterpart on the dimensions they share and emits ONE band per pair, so the
-    result carries one value column again. Long shape does not collapse -- a long value
-    filter is an ordinary row filter that leaves every operand column standing -- so the
-    collapse is conditioned on the shape, not on the predicate kind alone.
+    Shape-preserving in `value_columns` as well as in `shape`: a `filter` RESTRICTS, in
+    every one of its lowering positions, and restricting never changes how many operands a
+    frame carries. That is why a value conjunct over a paired BAND-WIDE frame is rejected
+    here rather than lowered. A band-wide frame's bands are positional, so a predicate
+    naming two operands cannot be evaluated band by band; the only way to run it at all is
+    to pair the bands up and emit one band per pair, which is a REDUCE, and a reduce has to
+    pick which operand's value survives -- a choice nothing in the request states. `case`
+    is the op that states it (`_type_case`), and a paired `case` is the same reduce with
+    the answer written down. Long shape is unaffected: a long value filter is an ordinary
+    row filter, every operand column left standing, nothing to pick between.
+
+    `current.extra_columns` joins the value columns for the CLASSIFICATION only. A carried
+    column is a real per-pixel column of the data (see `FrameType`), so `__zone__ = 7` is
+    the per-pixel mask a value conjunct is, not a band selection evaluated against metadata
+    that has no such column -- and `execution.band_ops.filter_band_wide` classifies the
+    identical way, against the identical union, so the typed shape and the lowering that
+    actually runs cannot disagree. It stays OUT of the pairing test below: that test asks
+    how many operands a `join` left behind, and a carried column is not one of them.
     """
-    kinds = classify_where_kinds(step.where, current.value_columns)
+    kinds = classify_where_kinds(step.where, current.value_columns | current.extra_columns)
     if kinds[PredicateKind.spatial]:
         kind = PredicateKind.spatial
     elif kinds[PredicateKind.value]:
         kind = PredicateKind.value
     else:
         kind = PredicateKind.dimension
+    if kind is PredicateKind.value and current.shape is Shape.band_wide and len(current.value_columns) > 1:
+        # Re-classified against the OPERAND names alone: a value conjunct that comes back
+        # `dimension` under that narrower namespace named only carried columns, and one of
+        # those (`__domain__ > 0`) is a per-pixel mask every band takes independently --
+        # nothing to pair, nothing to pick between. It is only an operand-named conjunct
+        # that forces the pairing, so it is only that one this rejects.
+        operand_named = [
+            conjunct
+            for conjunct in kinds[PredicateKind.value]
+            if classify_predicate_kind(conjunct, current.value_columns) is PredicateKind.value
+        ]
+        if operand_named:
+            raise ShapeError(
+                f"step {step_no} (filter): conjunct(s) {operand_named} name a value column "
+                f"of a paired band-wide frame (value columns "
+                f"{sorted(current.value_columns)}), which is not something a filter can do "
+                "-- a band-wide frame's bands are positional, so the only way to evaluate a "
+                "predicate naming an operand is to pair the bands and emit one per pair, "
+                "which reduces the frame and has to pick which operand's value survives. "
+                "State it as a case instead, whose then= says which"
+            )
     new_shape = FILTER_LOWERING_TABLE[(kind, current.shape)]
-    value_columns = current.value_columns
-    if kind is PredicateKind.value and current.shape is Shape.band_wide and len(value_columns) > 1:
-        value_columns = frozenset({"value"})
-    return dataclasses.replace(current, shape=new_shape, value_columns=value_columns)
+    # A spatial filter unpivots to long, and `execution.execute._run_filter_band_wide`
+    # drops the carried columns from the result the moment it does -- there is no per-pixel
+    # column once the frame is rows.
+    extra_columns = current.extra_columns if new_shape is Shape.band_wide else frozenset()
+    return dataclasses.replace(current, shape=new_shape, extra_columns=extra_columns)
 
 
 def _type_calculate(step_no: int, current: FrameType) -> FrameType:
@@ -395,8 +545,49 @@ def _type_calculate(step_no: int, current: FrameType) -> FrameType:
             f"step {step_no} (calculate): a calculate over a paired band-wide frame "
             f"(value columns {sorted(current.value_columns)}) is not yet supported -- a "
             "band-wide frame's bands are positional, so there is no per-operand column "
-            "for an expression to name; collapse the pairing with a value filter first"
+            "for an expression to name; collapse the pairing with a case first"
         )
+    return dataclasses.replace(current, value_columns=frozenset({"value"}))
+
+
+def _type_case(step_no: int, step: CaseStep | CaseOp, current: FrameType) -> FrameType:
+    """Shape-preserving, and always one value column out -- the same collapse
+    `_type_calculate` performs, but WITHOUT its paired-band-wide rejection, and it is the
+    only op that collapses a band-wide pairing without also collapsing the bands. Over a
+    paired frame each operand's band is paired with its counterpart and the pair reduced to
+    one band (`execution.band_ops.case_band_wide`), with the surviving value named by the
+    matching arm's `then` -- which is exactly what `_type_filter` rejects a paired value
+    predicate for not having. The pairing is something `case` consumes rather than
+    something it cannot express.
+
+    Every arm's `when` must be a pure VALUE predicate. A `case` arm chooses among values
+    at one row/pixel; a dimension conjunct selects BANDS and a spatial one resamples the
+    frame to points, and neither is a thing an arm of an otherwise shape-preserving op
+    could do to half its input. Both are `filter`'s job, and writing one as a `filter`
+    around or before the `case` says the same thing with the lowering it actually has --
+    which is also what lets `case` need no lowering table at all: it is unconditionally
+    shape-preserving, so there is no (kind, shape) combination to tabulate.
+
+    Classified against `value_columns | extra_columns`, the identical union `_type_filter`
+    uses: a carried column (`__zone__`, `__domain__`) is a real per-pixel column, so an
+    arm may name one, and the execution lowerings classify the same way.
+    """
+    columns = current.value_columns | current.extra_columns
+    for position, case in enumerate(step.cases, start=1):
+        kinds = classify_where_kinds(case.when, columns)
+        offending = [
+            conjunct
+            for kind in (PredicateKind.spatial, PredicateKind.dimension)
+            for conjunct in kinds[kind]
+        ]
+        if offending:
+            raise ShapeError(
+                f"step {step_no} (case): arm {position}'s when={case.when!r} contains "
+                f"conjunct(s) {offending} that name no value column "
+                f"({sorted(columns)}) -- a case arm is a predicate over the frame's "
+                "values at one row/pixel, and a dimension or grid_cell conjunct selects "
+                "which bands/rows there are at all; state that as a filter instead"
+            )
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
 
@@ -424,8 +615,8 @@ def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[Frame
     (`value_columns = frozenset(step.inputs)` below), and an operand that already carries
     several -- because it is itself a join's output -- has no single measurement for that
     name to refer to. So `join(a, b)` is fine and `join(join(a, b), c)` is not, until
-    something in between collapses the pairing back to one value column (a value `filter`
-    over a band-wide frame does exactly that; see `_type_filter`). Rejecting here rather
+    something in between collapses the pairing back to one value column (a `case` or a
+    `group` does exactly that; see `_type_case`). Rejecting here rather
     than at execution is the point: left alone, the chained form reaches the sink and
     fails on a `value` column that no longer exists, which tells the caller nothing about
     what they actually asked for.
@@ -458,12 +649,24 @@ def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[Frame
             "one value column, and joining one of those is not yet supported -- a join "
             "names each operand's measurement after the operand, so an operand with "
             "several measurements has no single one for that name to mean; collapse it "
-            "to one value column first (a value filter over a band-wide frame does)"
+            "to one value column first (a case or a group over a band-wide frame does)"
         )
 
     has_count_by_value = any(s.has_count_by_value for s in operand_states)
     value_columns = frozenset(step.inputs)
-    return FrameType(shape=out_shape, grid=grid, has_count_by_value=has_count_by_value, value_columns=value_columns)
+    # UNIONED, matching `execution.band_ops.join_band_wide`, which takes each named carried
+    # column from the first operand that has it: an operand can carry one the others never
+    # had (a vector-to-raster `project` operand brings `DOMAIN_COLUMN` to a join with
+    # rasters that have none). Long operands carry nothing, so a long join unions to empty
+    # without needing to say so.
+    extra_columns = frozenset().union(*(s.extra_columns for s in operand_states))
+    return FrameType(
+        shape=out_shape,
+        grid=grid,
+        has_count_by_value=has_count_by_value,
+        value_columns=value_columns,
+        extra_columns=extra_columns,
+    )
 
 
 def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameType]:
@@ -482,9 +685,15 @@ def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameTy
     Raises `ShapeError` for every shape-dependent rejection decidable from the declared
     ops and each input's grid kind alone; see `validate_shapes` for the list. Opens
     nothing.
+
+    One pre-pass runs before the walk: `_zone_carrying_inputs`, which is the only part of
+    `FrameType.extra_columns` a forward walk cannot see coming (see there). Everything else
+    about carried columns is decided op by op, by the `_type_*` functions themselves.
     """
+    zone_inputs = _zone_carrying_inputs(pipeline, ops)
     frame_types: dict[str, FrameType] = {
-        name: _initial_state(selection) for name, selection in pipeline.inputs.items()
+        name: _initial_state(selection, frozenset({ZONE_COLUMN}) if name in zone_inputs else frozenset())
+        for name, selection in pipeline.inputs.items()
     }
     for op in ops:
         if isinstance(op, JoinOp):
@@ -492,9 +701,11 @@ def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameTy
         elif isinstance(op, ProjectOp):
             new_type = _type_project(op.step_no, op, frame_types[op.input])
         elif isinstance(op, FilterOp):
-            new_type = _type_filter(op, frame_types[op.input])
+            new_type = _type_filter(op.step_no, op, frame_types[op.input])
         elif isinstance(op, CalculateOp):
             new_type = _type_calculate(op.step_no, frame_types[op.input])
+        elif isinstance(op, CaseOp):
+            new_type = _type_case(op.step_no, op, frame_types[op.input])
         elif isinstance(op, GroupOp):
             new_type = _type_group(frame_types[op.input])
         else:  # pragma: no cover -- exhaustive over the Op union
@@ -516,6 +727,8 @@ def validate_shapes(pipeline: Pipeline) -> None:
       (`_type_project`, via `request.aggregates.validate_project_aggregate`);
     - a second `count_by_value` in one chain (`_type_project`);
     - a `calculate` over a paired band-wide frame (`_type_calculate`);
+    - a value `filter` over a paired band-wide frame (`_type_filter`);
+    - a `case` arm whose `when` is a dimension or spatial predicate (`_type_case`);
     - a `join` mixing a long frame with a band-wide one (`_type_join`);
     - a band-wide `join` whose operands sit on two different grids (`_type_join`);
     - a `join` over an operand that is itself an uncollapsed join's output (`_type_join`);
@@ -537,8 +750,8 @@ def validate_shapes(pipeline: Pipeline) -> None:
             f"pipeline's final frame carries {len(final.value_columns)} value columns "
             f"{sorted(final.value_columns)} -- every output writes exactly one measured "
             "quantity; collapse them into one first: a calculate over a long (vector) "
-            "frame, or a value filter or a group over a band-wide (raster) one, where a "
-            "calculate has no per-operand column to name (see _type_calculate)"
+            "frame, or a case or a group over a band-wide (raster) one, where a calculate "
+            "has no per-operand column to name (see _type_calculate)"
         )
 
     if final.shape == Shape.long and pipeline.output.format in RASTER_OUTPUT_FORMATS:

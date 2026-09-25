@@ -1,4 +1,4 @@
-"""Tests for `execution/band_ops.py`'s six band-wide lowerings.
+"""Tests for `execution/band_ops.py`'s band-wide lowerings.
 
 Every fixture below is a `BandWideFrame` built by hand -- `pl.LazyFrame` +
 `pl.DataFrame` + `ReadWindow` -- rather than read off a real raster, so each test's
@@ -17,12 +17,14 @@ from rasterio.transform import Affine
 from cpra.mp.data.analysis.execution.band_ops import (
     JOIN_OPERAND_COLUMN,
     calculate_band_wide,
+    case_band_wide,
     filter_band_wide,
     group_band_wide,
     join_band_wide,
     mask_value_band_wide,
     sample_grid_cells_band_wide,
     select_dimension_band_wide,
+    unify_metadata_parts,
 )
 from cpra.mp.data.analysis.execution.frame import (
     DOMAIN_COLUMN,
@@ -30,7 +32,10 @@ from cpra.mp.data.analysis.execution.frame import (
     ReadWindow,
     row_major_grid_cell,
 )
-from cpra.mp.data.analysis.request.ops import CalculateOp, GroupOp
+from cpra.mp.data.analysis.execution.long_ops import filter_long, join_long
+from cpra.mp.data.analysis.request.expressions import ExpressionError
+from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
 def _window(**overrides):
@@ -148,6 +153,232 @@ class TestSelectDimensionBandWide:
 
         assert out_metadata["label"].to_list() == ["keep"]
         assert out_lf.collect()["b0"].to_list() == [1, 2]
+
+
+def _joined_fixture():
+    """Two operands over one pixel grid, sharing `calendar_year` and disagreeing about
+    `aggregate_type` -- the shape `lnd-type-plus` actually has, where `stg` declares
+    `aggregate_type` and the rasters it joins against do not.
+
+    `elev` has a 2045 band `stg` has no counterpart for, so the fixture also covers the
+    unpaired band `join_band_wide` keeps and `join_long` would not.
+    """
+    window = _window(height=2)
+    elev = (
+        pl.LazyFrame({"b0": [10, 11], "b1": [20, 21], "b2": [30, 31]}),
+        pl.DataFrame({"variable": ["elev"] * 3, "calendar_year": [2025, 2035, 2045]}),
+        window,
+    )
+    stg = (
+        pl.LazyFrame({"b0": [1, 2], "b1": [3, 4], "b2": [5, 6]}),
+        pl.DataFrame(
+            {
+                "variable": ["stg"] * 3,
+                "calendar_year": [2025, 2035, 2045],
+                "aggregate_type": ["mean", "mean", "max"],
+            }
+        ),
+        window,
+    )
+    return elev, stg
+
+
+def _long_equivalent_survivors(where: str) -> set[tuple[str, int]]:
+    """The same two datasets as `_joined_fixture`, joined and filtered in LONG shape, as a
+    set of surviving `(variable, calendar_year)` pairs -- the ground truth the band-wide
+    lowering has to reproduce. Built with the real `join_long`/`filter_long`, not a
+    hand-written expectation, so the two shapes are compared against each other rather
+    than both against my reading of the semantics.
+    """
+    elev = pl.LazyFrame(
+        {"grid_cell": [1, 1, 1], "calendar_year": [2025, 2035, 2045], "value": [10.0, 20.0, 30.0]}
+    )
+    stg = pl.LazyFrame(
+        {
+            "grid_cell": [1, 1, 1],
+            "calendar_year": [2025, 2035, 2045],
+            "aggregate_type": ["mean", "mean", "max"],
+            "value": [1.0, 3.0, 5.0],
+        }
+    )
+    joined = join_long(
+        [elev, stg], JoinOp(step_no=0, type="spatial", inputs=["elev", "stg"], output="joined")
+    )
+    rows = filter_long(joined, where).collect()
+    survivors: set[tuple[str, int]] = set()
+    for year in rows["calendar_year"].to_list():
+        survivors.add(("elev", year))
+        survivors.add(("stg", year))
+    return survivors
+
+
+class TestUnifiedMetadataGrowth:
+    """How big the unified frame gets, since nothing bounds it. `ANALYSIS_BAND_CEILING`
+    limits the bands a plan may READ; the pairing this builds is a product over the
+    dimensions the operands do NOT share, and no ceiling counts those rows.
+
+    That is survivable only because the shared set is never empty in practice -- every
+    input carries `model_group_id` and `scenario_id`, and operands agreeing on most of
+    their dimensions pair near `max(band counts)` rather than near the product. These two
+    tests are what keeps that a measured fact rather than an assumption; the second one is
+    the shape `lnd-type-plus` actually has, at its real band counts.
+    """
+
+    @staticmethod
+    def _part(column, dimensions):
+        """One origin's contribution: the position column `_dimension_survivors` names it
+        by, plus the dimensions it carries."""
+        height = len(next(iter(dimensions.values())))
+        return pl.DataFrame({column: list(range(height)), **dimensions})
+
+    def test_operands_agreeing_on_their_dimensions_pair_near_the_larger_band_count(self):
+        years = list(range(2025, 2025 + 178))
+        elev = self._part("__pos0", {"calendar_year": years})
+        land = self._part("__pos1", {"calendar_year": [*years, 2203]})
+
+        unified = unify_metadata_parts([elev, land])
+
+        # 178 + 179 = 357 bands, and 179 pairing rows -- `max`, plus nothing, because the
+        # one dimension they share pairs them off. 178 * 179 = 31862 is what a cross join
+        # would have cost for the same two reads.
+        assert elev.height + land.height == 357
+        assert unified.height == 179
+
+    def test_an_empty_shared_set_is_the_cross_join_it_has_to_be(self):
+        # The degenerate case: with no dimension in common there is no pairing to make, so
+        # every combination IS a combination. Correct, and the growth this class exists to
+        # bound -- which is why "the shared set is never empty" is a property of the
+        # datasets rather than something enforced here.
+        left = self._part("__pos0", {"calendar_year": [2025, 2035]})
+        right = self._part("__pos1", {"aggregate_type": ["mean", "max", "min"]})
+
+        unified = unify_metadata_parts([left, right])
+
+        assert unified.height == 6
+        assert sorted(unified.columns) == ["__pos0", "__pos1", "aggregate_type", "calendar_year"]
+
+
+class TestSelectDimensionBandWideOverAJoin:
+    """A dimension filter after a `join` must mean what it means in long shape. The
+    metadata `join_band_wide` hands over is a VERTICAL concat, so a dimension only one
+    operand carries is null on the other's rows for reasons having nothing to do with the
+    predicate; filtering it directly discarded that operand wholesale.
+    """
+
+    def test_non_shared_dimension_narrows_both_operands(self):
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        _out_lf, out_metadata, _window_out = select_dimension_band_wide(
+            joined, "aggregate_type = 'mean'", extra_columns=[]
+        )
+
+        survivors = set(zip(out_metadata["variable"].to_list(), out_metadata["calendar_year"].to_list()))
+        # `elev` carries no `aggregate_type` at all, and keeps exactly the years whose
+        # `stg` counterpart survived -- it is narrowed THROUGH the join, not discarded.
+        assert survivors == {("elev", 2025), ("elev", 2035), ("stg", 2025), ("stg", 2035)}
+        assert survivors == _long_equivalent_survivors("aggregate_type = 'mean'")
+
+    def test_surviving_bands_carry_their_own_operands_values(self):
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        out_lf, _metadata, _window_out = select_dimension_band_wide(
+            joined, "aggregate_type = 'mean'", extra_columns=[]
+        )
+        result = out_lf.collect()
+
+        # Renumbered contiguously, and each surviving band still holds the pixels of the
+        # band it came from -- elev's 2025/2035, then stg's.
+        assert list(result.columns) == ["b0", "b1", "b2", "b3"]
+        assert result["b0"].to_list() == [10, 11]
+        assert result["b1"].to_list() == [20, 21]
+        assert result["b2"].to_list() == [1, 2]
+        assert result["b3"].to_list() == [3, 4]
+
+    def test_shared_dimension_narrows_both_operands(self):
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        _out_lf, out_metadata, _window_out = select_dimension_band_wide(
+            joined, "calendar_year = 2035", extra_columns=[]
+        )
+
+        survivors = set(zip(out_metadata["variable"].to_list(), out_metadata["calendar_year"].to_list()))
+        assert survivors == {("elev", 2035), ("stg", 2035)}
+        assert survivors == _long_equivalent_survivors("calendar_year = 2035")
+
+    def test_trivially_true_predicate_keeps_every_band(self):
+        """A filter removes what its predicate excludes and nothing else. The unified
+        frame is a FULL outer join for exactly this: an inner one would drop `elev`'s
+        unpaired 2045 band here, making the filter quietly finish a job `join_band_wide`
+        did not do.
+        """
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        _out_lf, out_metadata, _window_out = select_dimension_band_wide(
+            joined, "calendar_year > 1900", extra_columns=[]
+        )
+
+        assert out_metadata.height == joined[1].height == 6
+
+    def test_no_surviving_combination_returns_empty_band_wide(self):
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        out_lf, out_metadata, out_window = select_dimension_band_wide(
+            joined, "aggregate_type = 'nonesuch'", extra_columns=[]
+        )
+
+        assert out_lf.collect().is_empty()
+        assert out_metadata.is_empty()
+        assert out_window == joined[2]
+
+    def test_per_band_identity_column_is_rejected(self):
+        elev, stg = _joined_fixture()
+        joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
+
+        with pytest.raises(ExpressionError, match="per-band identity column"):
+            select_dimension_band_wide(joined, "variable = 'elev'", extra_columns=[])
+
+    def test_three_operands_narrow_together(self):
+        elev, stg = _joined_fixture()
+        lnd = (
+            pl.LazyFrame({"b0": [7, 8], "b1": [9, 10], "b2": [11, 12]}),
+            pl.DataFrame({"variable": ["lnd_type"] * 3, "calendar_year": [2025, 2035, 2045]}),
+            _window(height=2),
+        )
+        joined = join_band_wide([elev, stg, lnd], ["elev", "stg", "lnd"], extra_columns=[])
+
+        _out_lf, out_metadata, _window_out = select_dimension_band_wide(
+            joined, "aggregate_type = 'mean'", extra_columns=[]
+        )
+
+        survivors = set(zip(out_metadata["variable"].to_list(), out_metadata["calendar_year"].to_list()))
+        assert survivors == {
+            ("elev", 2025),
+            ("elev", 2035),
+            ("stg", 2025),
+            ("stg", 2035),
+            ("lnd_type", 2025),
+            ("lnd_type", 2035),
+        }
+
+    def test_operand_contributing_no_bands_does_not_block_the_others(self):
+        """`join_band_wide` guards the zero-band operand by contributing zero metadata
+        rows, so it is simply absent from the reconstruction rather than joining nothing
+        to everything.
+        """
+        elev, _stg = _joined_fixture()
+        empty = (pl.LazyFrame({}), pl.DataFrame(), _window(height=2))
+        joined = join_band_wide([elev, empty], ["elev", "empty"], extra_columns=[])
+
+        _out_lf, out_metadata, _window_out = select_dimension_band_wide(
+            joined, "calendar_year >= 2035", extra_columns=[]
+        )
+
+        assert out_metadata["calendar_year"].to_list() == [2035, 2045]
 
 
 class TestHeightAndWindowPreserved:
@@ -270,20 +501,43 @@ class TestFilterBandWide:
         assert result["b0"].to_list() == [None, 20]
         assert result["b1"].to_list() == [None, 30]
 
-    def test_a_carried_column_in_a_where_is_classified_as_a_dimension_and_fails_loudly(self):
-        """Pins the limitation `band_ops`' module docstring names: predicate classification
-        is by name, and every name that is not `value`/`grid_cell` is a dimension column,
-        so a conjunct naming a carried per-pixel column is routed to the metadata side and
-        raises there. Pinned because the failure is the honest one (it names the columns
-        the metadata actually has) and because whoever teaches the classifier about
-        carried columns should have to come here and say so.
+    def test_a_carried_column_in_a_where_is_a_per_pixel_mask_not_a_band_selection(self):
+        """A conjunct naming a carried per-pixel column classifies as a VALUE conjunct, so
+        it masks each band's own pixel where it fails rather than being evaluated once per
+        band against a `metadata_df` that has no such column.
+
+        The band set is untouched -- `zone` says nothing about which bands exist -- and the
+        carried column itself rides through, same as it does past every other band-wide
+        lowering.
         """
-        lf = pl.LazyFrame({"b0": [1, 10], "zone": [7, 7]})
-        metadata_df = pl.DataFrame({"calendar_year": [2020]})
+        lf = pl.LazyFrame({"b0": [1, 10], "b1": [2, 20], "__zone__": [7, 9]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         band_wide = (lf, metadata_df, _window(height=2))
 
-        with pytest.raises(pl.exceptions.ColumnNotFoundError, match="zone"):
-            filter_band_wide(band_wide, "zone = 7", extra_columns=["zone"])
+        out_lf, out_metadata, _window_out = filter_band_wide(
+            band_wide, "__zone__ = 7", extra_columns=["__zone__"]
+        )
+        result = out_lf.collect()
+        assert out_metadata["calendar_year"].to_list() == [2020, 2021]
+        assert result["b0"].to_list() == [1, None]
+        assert result["b1"].to_list() == [2, None]
+        assert result["__zone__"].to_list() == [7, 9]
+
+    def test_a_carried_column_and_a_dimension_conjunct_still_split_by_kind(self):
+        """The two halves route independently: `calendar_year` still selects bands off the
+        metadata, `__zone__` still masks pixels on what survives. Pins that widening the
+        classifier's namespace did not swallow the dimension side with it.
+        """
+        lf = pl.LazyFrame({"b0": [1, 10], "b1": [2, 20], "__zone__": [7, 9]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
+        band_wide = (lf, metadata_df, _window(height=2))
+
+        out_lf, out_metadata, _window_out = filter_band_wide(
+            band_wide, "calendar_year = 2021 and __zone__ = 7", extra_columns=["__zone__"]
+        )
+        result = out_lf.collect()
+        assert out_metadata["calendar_year"].to_list() == [2021]
+        assert result["b0"].to_list() == [2, None]
 
     def test_dimension_half_empty_short_circuits_before_value_mask(self):
         lf = pl.LazyFrame({"b0": [1, 2]})
@@ -340,6 +594,262 @@ class TestCalculateBandWide:
         op = CalculateOp(step_no=1, input="x", expression="value + 1", output="y")
         out_lf, _metadata, _window_out = calculate_band_wide(band_wide, op, extra_columns=[])
         assert out_lf.collect()["b0"].to_list() == [2, None]
+
+
+def _case_op(*arms, else_=None):
+    return CaseOp(
+        step_no=1,
+        input="x",
+        cases=[CaseWhen(when=when, then=then) for when, then in arms],
+        else_=else_,
+        output="y",
+    )
+
+
+class TestCaseBandWideUnpaired:
+    """One value column, so a `case` is a MAP: every band is reclassified independently
+    and the band count is unchanged. `value` in an arm means whichever band is being
+    written, exactly as it does in a `calculate`.
+    """
+
+    def test_every_band_is_reclassified_independently(self):
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [3.0, 4.0]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
+        op = _case_op(("value > 3", "100"), ("value > 1", "10"))
+
+        out_lf, out_metadata, out_window = case_band_wide(
+            (lf, metadata_df, _window(height=2)), op, extra_columns=[]
+        )
+        result = out_lf.collect()
+
+        assert result["b0"].to_list() == [None, 10.0]
+        assert result["b1"].to_list() == [10.0, 100.0]
+        # A map, not a reduce: the band axis is untouched, metadata included.
+        assert out_metadata.equals(metadata_df)
+        assert out_window == _window(height=2)
+
+    def test_an_else_reaches_nodata_and_an_arm_can_take_it_back(self):
+        # No guard wraps the chain, so `else 0` paints every nodata pixel a real class --
+        # band-wide, a whole raster of them. That is the stated cost of leaving nodata to
+        # the author, and the second half is the author stating it: an arm that tests
+        # nullity is reachable now, and one conjunct restores the masking.
+        lf = pl.LazyFrame({"b0": [1.0, None]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020]})
+        op = _case_op(("value > 5", "1"), else_="0")
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=2)), op, extra_columns=[]
+        )
+        assert out_lf.collect()["b0"].to_list() == [0.0, 0.0]
+
+        guarded = _case_op(("value IS NULL", "value"), ("value > 5", "1"), else_="0")
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=2)), guarded, extra_columns=[]
+        )
+        assert out_lf.collect()["b0"].to_list() == [0.0, None]
+
+    def test_extra_columns_are_reachable_from_both_the_when_and_the_then(self):
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "zone_factor": [10.0, 100.0]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020]})
+        op = _case_op(("value * zone_factor > 50", "value * zone_factor"), else_="0")
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=2)), op, extra_columns=["zone_factor"]
+        )
+        result = out_lf.collect()
+        assert result["b0"].to_list() == [0.0, 200.0]
+        assert result["zone_factor"].to_list() == [10.0, 100.0]
+
+    def test_no_bands_is_the_frame_unchanged(self):
+        window = _window(height=2)
+        band_wide = (pl.LazyFrame(), pl.DataFrame(), window)
+        assert case_band_wide(band_wide, _case_op(("value > 0", "1")), extra_columns=[]) is band_wide
+
+
+class TestCaseAgreesWithTheCalculateChainItReplaced:
+    """`lnd-type-plus` stated its depth reclassification as a value `filter` plus four
+    `calculate`s, the middle two writing NEGATIVE codes so no later entry's domain could
+    re-match a cell an earlier one had claimed, and the fourth flipping them back. That is
+    now one `case`. Both formulations are built here and run against the same band, so
+    this test independently confirms they agree -- sign trick included -- rather than
+    pinning whatever the new one happens to produce.
+    """
+
+    # The depths either side of each class bound, plus the domain floor and a nodata
+    # pixel. `DEPTH_CLASSES` is `((0.46, 6), (1.0, 7), (None, 0))`, every interval closed
+    # at its upper bound.
+    DEPTHS = [0.01, 0.46, 0.47, 1.0, 1.01, 12.5, 0.0, -3.2, None]
+
+    def _band_wide(self):
+        lf = pl.LazyFrame({"b0": self.DEPTHS}, schema={"b0": pl.Float64})
+        metadata_df = pl.DataFrame({"calendar_year": [2030]})
+        return lf, metadata_df, _window(height=len(self.DEPTHS))
+
+    def _old(self):
+        band_wide = filter_band_wide(self._band_wide(), "value > 0", extra_columns=[])
+        entries = [
+            ("-6", "value <= 0.46"),
+            ("-7", "value > 0.46 AND value <= 1.0"),
+            ("0", "value > 1.0"),
+            ("value * -1", "value < 0"),
+        ]
+        for step_no, (expression, where) in enumerate(entries, start=2):
+            op = CalculateOp(
+                step_no=step_no, input="x", expression=expression, where=where, output="y"
+            )
+            band_wide = calculate_band_wide(band_wide, op, extra_columns=[])
+        return band_wide[0].collect()["b0"].to_list()
+
+    def _new(self):
+        op = _case_op(("value > 1.0", "0"), ("value > 0.46", "7"), ("value > 0", "6"))
+        out_lf, _metadata, _window_out = case_band_wide(self._band_wide(), op, extra_columns=[])
+        return out_lf.collect()["b0"].to_list()
+
+    def test_the_two_formulations_produce_the_same_band(self):
+        assert self._new() == self._old()
+
+    def test_and_that_band_is_the_one_the_class_table_names(self):
+        # Stated independently of both implementations, so the test above cannot pass by
+        # the two agreeing on a wrong answer.
+        assert self._new() == [6.0, 6.0, 7.0, 7.0, 0.0, 0.0, None, None, None]
+
+
+class TestCaseBandWidePaired:
+    """More than one value column, so a `case` is a REDUCE, not a map: each operand's band
+    is paired with its counterpart on the dimensions they share, and 2N bands come back as
+    N. This is the only lowering that collapses a band-wide pairing without also collapsing
+    the bands -- `filter` used to do it too, and no longer does.
+    """
+
+    def _paired_fixture(self):
+        # The same layout `join_band_wide` produces: all of `marsh`'s bands, then all of
+        # `sal`'s. Two years, two operands, two pixels. `variable` differs per operand and
+        # must NOT be paired on -- a spatial join's whole premise is that its operands are
+        # different datasets -- so it drops out of the paired metadata entirely.
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [3.0, 4.0], "b2": [10.0, 20.0], "b3": [30.0, 40.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2040, 2030, 2040],
+                "variable": ["marsh_var", "marsh_var", "sal_var", "sal_var"],
+                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal", "sal"],
+            }
+        )
+        return lf, metadata_df, _window(height=2)
+
+    def test_arms_naming_both_operands_reduce_each_pair_to_one_band(self):
+        op = _case_op(("sal > 25", "marsh * 2"), ("marsh > 1.5", "marsh"), else_="0")
+        out_lf, out_metadata, _window_out = case_band_wide(
+            self._paired_fixture(), op, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        result = out_lf.collect()
+
+        # One band per calendar_year, down from four, and the operand axis is gone.
+        assert out_metadata.columns == ["calendar_year"]
+        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert list(result.columns) == ["b0", "b1"]
+        # 2030 pairs marsh b0 (1.0, 2.0) with sal b2 (10.0, 20.0): neither pixel's sal is
+        # over 25, pixel0's marsh fails `> 1.5` and falls to the `else`, pixel1's passes.
+        assert result["b0"].to_list() == [0.0, 2.0]
+        # 2040 pairs marsh b1 (3.0, 4.0) with sal b3 (30.0, 40.0): both sals clear 25, so
+        # the first arm claims both pixels.
+        assert result["b1"].to_list() == [6.0, 8.0]
+
+    def test_an_operand_no_arm_names_does_not_null_the_pair(self):
+        """Pixel 1 has no `sal`, and no part of this `case` mentions `sal`: the arm reads
+        `marsh`, which is present, and `2.0` is its answer. The pair being half present is
+        not by itself a reason to withhold one -- the arms decide, and an author who wants
+        the whole pair says `AND sal IS NOT NULL`.
+        """
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [10.0, None]})
+        metadata_df = pl.DataFrame(
+            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "sal"]}
+        )
+        op = _case_op(("marsh > 0", "marsh"), else_="0")
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=2)), op, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        assert out_lf.collect()["b0"].to_list() == [1.0, 2.0]
+
+        both = _case_op(("marsh > 0 AND sal IS NOT NULL", "marsh"))
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=2)), both, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        assert out_lf.collect()["b0"].to_list() == [1.0, None]
+
+    def test_a_band_with_no_counterpart_is_dropped(self):
+        """An incomplete pair has no answer to give: the arms name both operands, and one
+        of them has nothing at this dimension. Dropping the band is the only honest option
+        -- evaluating it would silently answer as if the missing operand had been read.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0], "b2": [3.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2040, 2030],
+                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal"],
+            }
+        )
+        out_lf, out_metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            _case_op(("marsh > sal", "marsh"), else_="sal"),
+            extra_columns=[],
+            value_columns=("marsh", "sal"),
+        )
+        assert out_metadata["calendar_year"].to_list() == [2030]
+        assert out_lf.collect().columns == ["b0"]
+
+    def test_no_pair_survives_is_an_empty_frame(self):
+        """A pairing group holding the SAME operand twice is not a pair either -- which of
+        the two would `marsh` mean? Distinguished from the missing-counterpart case above
+        because the group is the right SIZE here, just not the right shape.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0]})
+        metadata_df = pl.DataFrame(
+            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "marsh"]}
+        )
+        out_lf, out_metadata, out_window = case_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            _case_op(("marsh > sal", "marsh")),
+            extra_columns=[],
+            value_columns=("marsh", "sal"),
+        )
+        assert out_metadata.is_empty()
+        assert out_lf.collect().is_empty()
+        assert out_window == _window(height=1)
+
+    def test_no_shared_dimension_pairs_every_band_into_one_group(self):
+        """When the operands share no non-null dimension at all there is nothing to key on,
+        so the whole frame is one pairing group. It still has to be a well-formed pair, and
+        the surviving band is indexed by `RESERVED_BAND_INDEX_COLUMN` -- the same fallback
+        `group_band_wide` uses for `by == []`.
+        """
+        lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
+        metadata_df = pl.DataFrame(
+            {
+                # Every pairable column is null in at least one row, so none qualifies.
+                "calendar_year": [2030, None],
+                JOIN_OPERAND_COLUMN: ["marsh", "sal"],
+            }
+        )
+        out_lf, out_metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            _case_op(("marsh > 1 AND sal > 1", "marsh")),
+            extra_columns=[],
+            value_columns=("marsh", "sal"),
+        )
+
+        assert out_metadata.columns == [RESERVED_BAND_INDEX_COLUMN]
+        assert out_metadata[RESERVED_BAND_INDEX_COLUMN].to_list() == [0]
+        assert out_lf.collect()["b0"].to_list() == [5.0]
+
+    def test_no_bands_returns_empty(self):
+        window = _window(height=2)
+        out_lf, out_metadata, out_window = case_band_wide(
+            (pl.LazyFrame(), pl.DataFrame(), window),
+            _case_op(("marsh > 0 AND sal > 0", "marsh")),
+            extra_columns=[],
+            value_columns=("marsh", "sal"),
+        )
+        assert out_lf.collect().is_empty()
+        assert out_metadata.is_empty()
+        assert out_window == window
 
 
 class TestGroupBandWide:
@@ -425,129 +935,6 @@ class TestGroupBandWide:
         result = group_band_wide(band_wide, op, extra_columns=[DOMAIN_COLUMN])[0].collect()
 
         assert result["b0"].to_list() == [0, None]
-
-
-class TestPairAndMaskBandWide:
-    """The fourth `filter` lowering: a value `where` over a frame whose value columns are
-    a join's operand names. Each operand's band is paired with its counterpart on the
-    dimensions they share, the pair is masked as one, and what comes back carries one
-    value column again.
-    """
-
-    def _paired_fixture(self):
-        """Two operands, two years each, laid out the way `join_band_wide` lays them out
-        (all of `left`'s bands, then all of `right`'s). `variable` differs per operand and
-        must NOT be paired on -- a spatial join's whole premise is that its operands are
-        different datasets.
-        """
-        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [3.0, 4.0], "b2": [10.0, 20.0], "b3": [30.0, 40.0]})
-        metadata_df = pl.DataFrame(
-            {
-                "calendar_year": [2030, 2040, 2030, 2040],
-                "variable": ["marsh_var", "marsh_var", "sal_var", "sal_var"],
-                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal", "sal"],
-            }
-        )
-        return lf, metadata_df, _window(height=2)
-
-    def test_pairs_on_the_shared_dimension_and_collapses_to_one_band_per_pair(self):
-        band_wide = self._paired_fixture()
-        out_lf, out_metadata, _window_out = filter_band_wide(
-            band_wide, "marsh > 1.5 AND sal > 15.0", extra_columns=[], value_columns=["marsh", "sal"]
-        )
-        result = out_lf.collect()
-
-        # One band per calendar_year, down from four, and the operand axis is gone.
-        assert out_metadata.columns == ["calendar_year"]
-        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
-        assert list(result.columns) == ["b0", "b1"]
-        # The carried value is the lower-positioned operand's band -- `marsh`'s, here.
-        # 2030 pairs b0 (marsh) with b2 (sal): pixel0's marsh 1.0 fails `> 1.5`; pixel1
-        # passes both (2.0, 20.0) and carries marsh's 2.0.
-        assert result["b0"].to_list() == [None, 2.0]
-        # 2040 pairs b1 (marsh 3.0/4.0) with b3 (sal 30.0/40.0) -- both pixels pass.
-        assert result["b1"].to_list() == [3.0, 4.0]
-
-    def test_a_band_with_no_counterpart_is_dropped(self):
-        """An incomplete pair has no answer to give: the predicate names both operands,
-        and one of them has nothing at this dimension. Dropping the band is the only
-        honest option -- masking it would silently answer as if the missing operand had
-        passed.
-        """
-        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0], "b2": [3.0]})
-        metadata_df = pl.DataFrame(
-            {
-                "calendar_year": [2030, 2040, 2030],
-                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal"],
-            }
-        )
-        out_lf, out_metadata, _window_out = filter_band_wide(
-            (lf, metadata_df, _window(height=1)),
-            "marsh > 0 AND sal > 0",
-            extra_columns=[],
-            value_columns=["marsh", "sal"],
-        )
-
-        # 2040 has a `marsh` band and no `sal` one, so only 2030 survives.
-        assert out_metadata["calendar_year"].to_list() == [2030]
-        assert out_lf.collect().columns == ["b0"]
-
-    def test_two_bands_from_one_operand_at_the_same_dimension_are_dropped(self):
-        """A pairing group holding the SAME operand twice is not a pair either -- which
-        of the two would `marsh` mean? Distinguished from the missing-counterpart case
-        above because the group is the right SIZE here, just not the right shape.
-        """
-        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0]})
-        metadata_df = pl.DataFrame(
-            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "marsh"]}
-        )
-        out_lf, out_metadata, out_window = filter_band_wide(
-            (lf, metadata_df, _window(height=1)),
-            "marsh > 0 AND sal > 0",
-            extra_columns=[],
-            value_columns=["marsh", "sal"],
-        )
-
-        assert out_metadata.is_empty()
-        assert out_lf.collect().is_empty()
-        assert out_window == _window(height=1)
-
-    def test_no_shared_dimension_pairs_every_band_into_one_group(self):
-        """When the operands share no non-null dimension at all there is nothing to key
-        on, so the whole frame is one pairing group. It still has to be a well-formed
-        pair, and the surviving band is indexed by `RESERVED_BAND_INDEX_COLUMN` -- the
-        same fallback `group_band_wide` uses for `by == []`.
-        """
-        lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
-        metadata_df = pl.DataFrame(
-            {
-                # Every pairable column is null in at least one row, so none qualifies.
-                "calendar_year": [2030, None],
-                JOIN_OPERAND_COLUMN: ["marsh", "sal"],
-            }
-        )
-        out_lf, out_metadata, _window_out = filter_band_wide(
-            (lf, metadata_df, _window(height=1)),
-            "marsh > 1 AND sal > 1",
-            extra_columns=[],
-            value_columns=["marsh", "sal"],
-        )
-
-        assert out_metadata.columns == [RESERVED_BAND_INDEX_COLUMN]
-        assert out_metadata[RESERVED_BAND_INDEX_COLUMN].to_list() == [0]
-        assert out_lf.collect()["b0"].to_list() == [5.0]
-
-    def test_no_bands_returns_empty(self):
-        window = _window(height=2)
-        out_lf, out_metadata, out_window = filter_band_wide(
-            (pl.LazyFrame(), pl.DataFrame(), window),
-            "marsh > 0 AND sal > 0",
-            extra_columns=[],
-            value_columns=["marsh", "sal"],
-        )
-        assert out_lf.collect().is_empty()
-        assert out_metadata.is_empty()
-        assert out_window == window
 
 
 class TestJoinBandWide:

@@ -242,11 +242,15 @@ class LoweringNotImplementedError(NotImplementedError):
 
 
 def _run_filter(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
-    return long_ops.filter_long(frames[op.input], op.where)
+    return long_ops.filter_long(frames[op.input], op.where, frame_types[op.input].value_columns)
 
 
 def _run_calculate(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
     return long_ops.calculate_long(frames[op.input], op, frame_types[op.input].value_columns)
+
+
+def _run_case(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
+    return long_ops.case_long(frames[op.input], op, frame_types[op.input].value_columns)
 
 
 def _run_group(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
@@ -310,6 +314,22 @@ def _run_calculate_band_wide(
     frames: dict[str, BandWideFrame], op, frame_types, extra_columns: tuple[str, ...]
 ) -> BandWideFrame:
     return band_ops.calculate_band_wide(frames[op.input], op, extra_columns=extra_columns)
+
+
+def _run_case_band_wide(
+    frames: dict[str, BandWideFrame], op, frame_types, extra_columns: tuple[str, ...]
+) -> BandWideFrame:
+    # `value_columns` is what picks between `case_band_wide`'s two readings -- a per-band
+    # map, or a reduce over reconstituted pairs -- exactly as it does for a band-wide
+    # `filter`, and it is read off the plan's recorded frame type for the same reason: a
+    # band-wide frame's bands are positional, so nothing about the frame itself says how
+    # many operands its bands came from.
+    return band_ops.case_band_wide(
+        frames[op.input],
+        op,
+        extra_columns=extra_columns,
+        value_columns=sorted(frame_types[op.input].value_columns),
+    )
 
 
 def _run_group_band_wide(
@@ -379,12 +399,12 @@ def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_ty
 # what keeps this a registry rather than differently-shaped callables the loop would have
 # to tell apart.
 #
-# The four `Shape.band_wide` non-project entries below are placeholders in THIS module-
+# The five `Shape.band_wide` non-project entries below are placeholders in THIS module-
 # level dict -- `execute` never calls them directly. They also need `extra_columns` (the
 # non-band columns, a crosswalk zone id notably, `op.input`'s frame is carrying; see the
 # module docstring), which is per-EXECUTION state, not something a module-level constant
 # dict can hold. `_bind_band_wide_lowerings` below builds the real, per-`execute()`-call
-# registry by overriding just these four entries with closures bound over that call's own
+# registry by overriding just these five entries with closures bound over that call's own
 # `extra_columns` dict. It overrides the vector-to-raster `project` entry too, over a
 # second piece of the same per-execution state (that call's crosswalk reads, keyed by step
 # number -- see that function), which is why the value registered here for it is likewise a
@@ -396,6 +416,8 @@ _LOWERINGS: dict[tuple[str, object], object] = {
     ("filter", Shape.band_wide): _run_filter_band_wide,
     ("calculate", Shape.long): _run_calculate,
     ("calculate", Shape.band_wide): _run_calculate_band_wide,
+    ("case", Shape.long): _run_case,
+    ("case", Shape.band_wide): _run_case_band_wide,
     ("group", Shape.long): _run_group,
     ("group", Shape.band_wide): _run_group_band_wide,
     ("join", Shape.long): _run_join,
@@ -407,9 +429,11 @@ _LOWERINGS: dict[tuple[str, object], object] = {
 
 
 def _bind_band_wide_lowerings(
-    extra_columns: dict[str, tuple[str, ...]], zone_sources: dict[int, project.ZoneSource]
+    extra_columns: dict[str, tuple[str, ...]],
+    zone_sources: dict[int, project.ZoneSource],
+    vector_band_metadata: dict[int, pl.DataFrame],
 ) -> dict[tuple[str, object], object]:
-    """The real registry for one `execute()` call: `_LOWERINGS` with its four
+    """The real registry for one `execute()` call: `_LOWERINGS` with its five
     `Shape.band_wide` non-project entries overridden by closures bound over this call's own
     `extra_columns` -- see `_LOWERINGS`'s own comment for why they cannot simply be module-
     level constants the way every other entry is.
@@ -425,17 +449,23 @@ def _bind_band_wide_lowerings(
     project step number that asked for one. `.get(op.step_no)` returns `None` for a step
     whose output is never joined against a separately-read raster, which is exactly the
     argument that tells `project.project_vector_to_raster` to read the crosswalk itself.
+    `vector_band_metadata` is bound over the same way and keyed the same, and its `None`
+    means the complementary thing: `compile_plan` could not enumerate this projection's
+    bands ahead of the read, so the lowering enumerates them from the data itself.
     """
     lowerings = dict(_LOWERINGS)
     lowerings[("project", ("vector", "raster"))] = (
         lambda frames, op, frame_types: project.project_vector_to_raster(
-            frames, op, frame_types, zone_sources.get(op.step_no)
+            frames, op, frame_types, zone_sources.get(op.step_no), vector_band_metadata.get(op.step_no)
         )
     )
     lowerings[("filter", Shape.band_wide)] = lambda frames, op, frame_types: _run_filter_band_wide(
         frames, op, frame_types, extra_columns.get(op.input, ())
     )
     lowerings[("calculate", Shape.band_wide)] = lambda frames, op, frame_types: _run_calculate_band_wide(
+        frames, op, frame_types, extra_columns.get(op.input, ())
+    )
+    lowerings[("case", Shape.band_wide)] = lambda frames, op, frame_types: _run_case_band_wide(
         frames, op, frame_types, extra_columns.get(op.input, ())
     )
     lowerings[("group", Shape.band_wide)] = lambda frames, op, frame_types: _run_group_band_wide(
@@ -1166,7 +1196,7 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
                 resolved, point_sample_window=point_sample_windows.get(name)
             )
 
-    lowerings = _bind_band_wide_lowerings(extra_columns, zone_sources)
+    lowerings = _bind_band_wide_lowerings(extra_columns, zone_sources, plan.vector_band_metadata)
 
     last_output: str | None = None
     for op in plan.ops:
