@@ -492,6 +492,56 @@ class TestRasterData:
         with rio.open(io.BytesIO(response.content)) as src:
             assert src.read(1)[0, 0] == 30
 
+    def test_a_value_where_masks_failing_pixels_rather_than_dropping_them(self, client, gradient_raster_with_zones):
+        """A value conjunct in `where` is meaningful on a raster grid, and what it does is
+        MASK: the failing pixel becomes nodata in place, the image keeps its full shape,
+        and the passing pixels keep their own values untouched
+        (`execution.band_ops.mask_value_band_wide`). Pinned here because `docs/data-api.md`
+        states the rule and nothing else on the flat data route exercises it -- the
+        conditional-count tests below reach the same lowering through the `/v1/analysis`
+        pipeline route instead.
+
+        The gradient fixture is what makes this SELECTIVE rather than all-or-nothing: its
+        pixels are `arange(height * width)`, so a threshold at the midpoint splits the
+        image into exactly the two halves asserted below. A uniformly-filled raster would
+        pass a "masking happened" assertion just as well as a "the whole request was
+        dropped" one.
+        """
+        _base_path, grid, _zones = gradient_raster_with_zones
+        threshold = (grid.height * grid.width) // 2
+
+        response = client.get(f"{RASTER_URL}/data.tif", params={"where": f"value >= {threshold}"})
+        assert response.status_code == 200
+        with rio.open(io.BytesIO(response.content)) as src:
+            band = src.read(1, masked=True)
+
+        assert band.shape == (grid.height, grid.width)
+        assert np.ma.getmaskarray(band).sum() == threshold
+        assert band.compressed().min() == threshold
+        assert band.compressed().max() == grid.height * grid.width - 1
+
+    def test_a_value_where_masks_each_band_independently(self, client, two_year_raster_data):
+        """The reason the lowering masks instead of filtering, made visible: a pixel's row
+        is shared by every band, so dropping it would drop the pixel from the bands the
+        predicate HOLDS for as well. Here 2030 is filled with 30 and 2040 with 40, so
+        `value > 35` fails everywhere in one band and holds everywhere in the other -- a
+        row drop would have emptied both, and masking empties exactly one.
+
+        Asserted by band CONTENT rather than by index, since which COG lands in band 1 is
+        the read's business, not this test's.
+        """
+        response = client.get(f"{RASTER_URL}/data.tif", params={"where": "value > 35"})
+        assert response.status_code == 200
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 2
+            bands = [src.read(i, masked=True) for i in (1, 2)]
+
+        masked = [b for b in bands if np.ma.getmaskarray(b).all()]
+        untouched = [b for b in bands if not np.ma.getmaskarray(b).any()]
+        assert len(masked) == 1, "the band the predicate fails for should be entirely nodata"
+        assert len(untouched) == 1, "the band the predicate holds for should be untouched"
+        assert set(untouched[0].compressed().tolist()) == {40}
+
     def test_csv_is_rejected_for_a_raster_grid(self, client, raster_data):
         """The converse of `test_tif_is_rejected_for_a_vector_grid`, and the same 400:
         with no `grid_cell` to sample at, a raster grid's result stays band-wide, which
