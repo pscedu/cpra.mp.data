@@ -145,9 +145,11 @@ class Analysis(BaseModel):
     name: str
     label: str
     type: str
+    kind: str | None = None
     variables: list[str] | None = None
     legend: str | None = None
     result_kind: str | None = None
+    subsumed_dimensions: list[str] = []
 
 
 class AnalysisQuery(DataOptions, FilterDimensions):
@@ -181,7 +183,7 @@ class AnalysisDataQuery(AnalysisQuery, Compression):
 
 class VisualizationQuery(DataQuery):
     # A named analysis (`cpra.mp.data.analyses.ANALYSES`), e.g. `difference` or
-    # `concatenate`. Deliberately the ONLY field this model declares for the analysis --
+    # `land-change`. Deliberately the ONLY field this model declares for the analysis --
     # its own parameters (`dimension`/`order`/...) have no fixed field set (see
     # `AnalysisQuery`'s docstring above) and are instead read directly off the raw request
     # query string by the visualization layer itself (`DatasetVisualization.

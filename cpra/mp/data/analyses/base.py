@@ -1,7 +1,7 @@
 """Shared machinery for `cpra.mp.data.analyses`'s registry entries: the exception family
 the registry (`cpra/mp/data/analyses/__init__.py`) raises, the `DatasetRef`/`ResolvedAnalysis`
 value objects the interface contract with the API route layer names explicitly, the
-`Analysis` base class every entry (`difference.py`, `concatenate.py`,
+`Analysis` base class every entry (`difference.py`, `land_change.py`,
 `salinity_veg_investigation.py`) subclasses, and a handful of small pure helpers
 (SQL-literal quoting, structural
 `collapsed_dimensions` derivation) those entries share.
@@ -55,9 +55,10 @@ class UnknownAnalysisError(AnalysisRegistryError):
 
 class InvalidAnalysisParametersError(AnalysisRegistryError):
     """An analysis's `Parameters` model, its cardinality rule against `filters` (e.g.
-    `difference`/`concatenate`'s "exactly 2 selected values of `dimension`" rule -- see
-    each module's `validate_selection`), or the `Pipeline` its `pipeline()` method builds
-    from those values, was rejected. Maps to a 400 at the route layer.
+    `difference`'s "exactly 2 selected values of `dimension`" rule, or `land-change`'s
+    `calendar_year`/`model_group_id` cardinality rule -- see each module's
+    `validate_selection`), or the `Pipeline` its `pipeline()` method builds from those
+    values, was rejected. Maps to a 400 at the route layer.
     """
 
 
@@ -91,7 +92,7 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
     Pure/in-memory: `get_input_data_frame` only cross-joins tiny literal `pl.DataFrame`s
     and never reads a file, so this needs no `base_path` -- the same pattern
     `visualizations.base.get_data_uri` already uses. Used to build a `difference`/
-    `concatenate` pipeline's trailing `group.by` (every required dimension except the one
+    `land-change` pipeline's trailing `group.by` (every required dimension except the one
     the analysis operates over), and by `default_collapsed_dimensions` below.
     """
     return required_columns(
@@ -129,7 +130,7 @@ def cast_dimension_value(dimension: str, value: Any) -> Any:
 def normalized_filter_values(dimension: str, raw: Any) -> list[Any]:
     """A `filters[dimension]` value -- a scalar or a list, straight off the request --
     normalized to a de-duplicated list of `dimension`-typed values, preserving first-seen
-    order. Shared by every cardinality check (`difference`/`concatenate`'s
+    order. Shared by every cardinality check (`difference`/`land-change`'s
     `validate_selection`) and every derivation (their `pipeline()` methods), so the two
     never disagree about how many distinct values were actually selected.
     """
@@ -258,6 +259,27 @@ def selection_filter_where(
     return " AND ".join(conjuncts) if conjuncts else None
 
 
+def pipeline_input_dimensions(pipeline: Pipeline) -> list[str]:
+    """Every real, non-dataset, non-metadata dimension any of `pipeline`'s inputs
+    carries -- an ordered, deduplicated union (first-seen order over `pipeline.inputs`'s
+    own order), rather than the `frozenset` `default_collapsed_dimensions` returns, so a
+    caller deriving a `group.by` from it (e.g. `resolve_analysis_chain`) gets a
+    deterministic column order matching this codebase's convention of deriving one from
+    `required_dataset_dimensions`'s own list order.
+    """
+    seen: dict[str, None] = {}
+    for selection in pipeline.inputs.values():
+        for dim in required_columns(
+            get_input_data_frame(
+                variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
+            ),
+            include_dataset=False,
+            include_metadata=False,
+        ):
+            seen.setdefault(dim, None)
+    return list(seen)
+
+
 def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     """The dimensions a pipeline's result no longer varies over: every dimension any of
     its inputs carries, minus whatever the pipeline's OWN trailing `group.by` still keeps
@@ -270,19 +292,7 @@ def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     last_step = pipeline.steps[-1]
     if not isinstance(last_step, GroupStep):
         return frozenset()
-
-    all_dims: set[str] = set()
-    for selection in pipeline.inputs.values():
-        all_dims.update(
-            required_columns(
-                get_input_data_frame(
-                    variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
-                ),
-                include_dataset=False,
-                include_metadata=False,
-            )
-        )
-    return frozenset(all_dims) - set(last_step.by)
+    return frozenset(pipeline_input_dimensions(pipeline)) - set(last_step.by)
 
 
 class AnalysisParameters(BaseModel):
@@ -328,6 +338,19 @@ class Analysis:
         variables: ClassVar[list[str] | None] = None
         legend: ClassVar[str | None] = None
         result_kind: ClassVar[str] = "value"
+        # "variable": stands in for one (or several) input variable(s) in the portal's
+        # variable dropdown, e.g. `land-type-confidence`. "dimension": operates across one
+        # dimension of whatever it's given -- a plain dataset or the output of a
+        # `kind="variable"` analysis it's chained after, e.g. `difference`. `None` (the
+        # default) is neither -- `salinity-veg-investigation`'s reading, a `type="custom"`
+        # analysis with no variable-dropdown role and nothing to chain onto it.
+        kind: ClassVar[str | None] = None
+        # The dimensions this analysis removes from the caller's view, for the portal's
+        # `subsumedFor(dataset)` lookup -- advisory catalog metadata only. It plays no role
+        # in resolution or chaining, both of which read the runtime `collapsed_dimensions`
+        # instead (see `default_collapsed_dimensions` below and each `Analysis` subclass's
+        # own `collapsed_dimensions` property/override).
+        subsumed_dimensions: ClassVar[list[str]] = []
 
     class Parameters(AnalysisParameters):
         pass
@@ -358,6 +381,14 @@ class Analysis:
         """
 
     def pipeline(self) -> Pipeline:
+        raise NotImplementedError
+
+    def _dimension_steps(self, group_by: list[str]) -> list[dict]:
+        """The steps a `kind="dimension"` analysis contributes when chained after
+        another analysis's output (see `analyses.resolve_analysis_chain`). Only a
+        `kind="dimension"` analysis needs to implement this -- every other analysis is
+        chain-terminal and never reaches this call.
+        """
         raise NotImplementedError
 
     @property

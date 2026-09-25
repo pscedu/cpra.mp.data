@@ -389,13 +389,13 @@ class DatasetVisualization(BaseVisualization):
         # from this package at module level, so importing it back from here at module
         # level would be a circular import -- see `map.py`'s `feature_colors`, which
         # already does the same thing for its own model imports.
-        from cpra.mp.data.analyses import DatasetRef, resolve_analysis
+        from cpra.mp.data.analyses import DatasetRef, resolve_analysis_chain
         from cpra.mp.data.api.data_query import resolve_grid_cell_sync
 
         grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, self.params.get("grid_cell"))
         dataset = DatasetRef(variable=self.variable.name, time_unit=self.time_unit, grid=self.grid.name)
-        return resolve_analysis(
-            name,
+        return resolve_analysis_chain(
+            name.split(","),
             dataset=dataset,
             filters=self._analysis_filters,
             params=self._analysis_params,

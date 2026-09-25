@@ -13,7 +13,7 @@ from cpra.mp.data.visualizations import VISUALIZATIONS
 # the package exists but this exact name set is wrong (e.g. a rename during
 # reconciliation), that must fail loudly rather than silently fall back to this stub.
 try:
-    from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis
+    from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis, resolve_analysis_chain
     from cpra.mp.data.analyses.base import (
         AnalysisRegistryError,
         AnalysisTypeMismatchError,
@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover -- exercised once the registry p
     ANALYSES = {}
     DatasetRef = None
     resolve_analysis = None
+    resolve_analysis_chain = None
 
     class AnalysisRegistryError(ValueError):
         """Stand-in for `cpra.mp.data.analyses.base.AnalysisRegistryError`, used only so

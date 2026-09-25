@@ -31,6 +31,7 @@ class Difference(Analysis):
         variables = None
         legend = None
         result_kind = "difference"
+        kind = "dimension"
 
     class Parameters(Analysis.Parameters):
         dimension: str
@@ -59,13 +60,22 @@ class Difference(Analysis):
                 f"values, got {len(values)}: {raw!r}"
             )
 
-    def pipeline(self):
-        assert self.dataset is not None, "difference is a type='dataset' analysis"
+    def _dimension_steps(self, group_by: list[str]) -> list[dict]:
+        """The two steps this analysis contributes, independent of whether it leads a
+        pipeline or is appended after another analysis's output (see
+        `analyses.resolve_analysis_chain`): negate whichever of the two selected values is
+        later (`order="asc"`) or earlier (`order="desc"`), then sum across `group_by`.
+        Chaining omits `input` on the first of these, so it consumes whatever step
+        precedes it -- `validate_pipeline`'s ordinary chaining rule, the same one every
+        other multi-step analysis already relies on.
+
+        `validate_selection` (called by `resolve_analysis`/`resolve_analysis_chain` before
+        this is ever reached) already guarantees `filters[dim]` normalizes to exactly 2
+        distinct values -- re-derive here rather than trust a caller who skipped that
+        step, since a direct `Difference(...).pipeline()` call (e.g. a test) has no such
+        guarantee.
+        """
         dim = self.parameters.dimension
-        # `validate_selection` (called by `resolve_analysis` before `pipeline()` is ever
-        # reached) already guarantees `filters[dim]` normalizes to exactly 2 distinct
-        # values -- re-derive here rather than trust a caller who skipped that step, since
-        # a direct `Difference(...).pipeline()` call (e.g. a test) has no such guarantee.
         values = normalized_filter_values(dim, self.filters[dim])
         if len(values) != 2:
             raise InvalidAnalysisParametersError(
@@ -75,18 +85,11 @@ class Difference(Analysis):
         earlier, later = sorted(values)
         negate_value = later if self.parameters.order == "asc" else earlier
 
-        required = required_dataset_dimensions(self.dataset)
-        group_by = [d for d in required if d != dim]
-
-        steps: list[dict] = []
-        where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
-        if where is not None:
-            steps.append({"op": "filter", "where": where})
         # Negate one of the two values and sum: `later - earlier` said as `(-later) +
         # earlier`, which is what lets the subtraction ride on `group`'s existing `sum`.
         # `else: "value"` is the pass-through the other value needs -- without it the
         # non-negated rows would go null and the sum would have nothing to add.
-        steps.append(
+        return [
             {
                 "op": "case",
                 "cases": [
@@ -96,9 +99,21 @@ class Difference(Analysis):
                     }
                 ],
                 "else": "value",
-            }
-        )
-        steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
+            },
+            {"op": "group", "by": group_by, "aggregate": "sum"},
+        ]
+
+    def pipeline(self):
+        assert self.dataset is not None, "difference is a type='dataset' analysis"
+        dim = self.parameters.dimension
+        required = required_dataset_dimensions(self.dataset)
+        group_by = [d for d in required if d != dim]
+
+        steps: list[dict] = []
+        where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
+        if where is not None:
+            steps.append({"op": "filter", "where": where})
+        steps.extend(self._dimension_steps(group_by))
         # A pipeline's FIRST step must name its input explicitly; every later step chains
         # from the one before it. The leading `filter` normally carries that name, but a
         # caller invoking `pipeline()` directly with no filters at all (the API path

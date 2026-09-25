@@ -8,11 +8,11 @@ path any hand-authored pipeline goes through. Everything here drives
 `validate_shapes`/`compile_plan`/`execute`/`run_to_path` directly, exactly as
 `tests/api/test_execute.py` does for hand-authored pipelines.
 
-**Representative datasets.** `difference`/`concatenate` are `type="dataset"` and take
+**Representative datasets.** `difference`/`land-change` are `type="dataset"` and take
 whatever `DatasetRef` a route resolves for them; `tests/factories.py`'s `ssf`/
 `ecoregion_v001` (`ANNUAL_KWARGS`) is used here as that representative dataset, per that
 module's own documented convention ("the compiler cares about grid TYPES and SHAPES, not
-real-world variable semantics") -- `concatenate`'s real `Meta.variables = ["lnd_type"]`
+real-world variable semantics") -- `land-change`'s real `Meta.variables = ["lnd_type"]`
 lives on `morph_pixel_v001` (8265x20674 pixels), far too large to write as a test fixture;
 the `Meta.variables` declaration itself is unaffected by this substitution, only which
 dataset proves the pipeline-construction MACHINERY works.
@@ -56,7 +56,14 @@ import pytest
 import rasterio as rio
 
 from cpra.mp.data import config
-from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis
+from cpra.mp.data.analyses import (
+    ANALYSES,
+    DatasetRef,
+    InvalidAnalysisParametersError,
+    resolve_analysis,
+    resolve_analysis_chain,
+)
+from cpra.mp.data.analyses.land_change import EARLY_BASELINE_YEAR
 from cpra.mp.data.analyses.land_type_confidence import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import compile_plan
@@ -93,14 +100,18 @@ RASTER_DATASET = DatasetRef(
 ENSEMBLE_FILTERS = {"model_group_id": RASTER_KWARGS["model_group_id"], "calendar_year": 2050}
 
 
-def _write_ensemble(base_path, code_by_scenario, years=(2050,)):
+def _write_ensemble(base_path, code_by_scenario, years=(2050,), **overrides):
     """Write one COG per `scenario_id`, each uniformly filled with a `lnd_type` code. The
     stand-in variable's own semantics never come into it -- the analysis only ever
     compares `value` against `1`-`5`.
     """
     for scenario_id, code in code_by_scenario.items():
         write_raster_dataset(
-            base_path, years=years, scenario_id=scenario_id, fill_fn=lambda year, code=code: code
+            base_path,
+            years=years,
+            scenario_id=scenario_id,
+            fill_fn=lambda year, code=code: code,
+            **overrides,
         )
 
 
@@ -141,7 +152,7 @@ class TestRegistryDrift:
         assert set(ANALYSES) == {
             "salinity-veg-investigation",
             "difference",
-            "concatenate",
+            "land-change",
             "land-type-confidence",
             "lnd-type-plus",
         }
@@ -157,50 +168,50 @@ class TestRegistryDrift:
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
-    def test_concatenate_two_image_compiles(self, base_path):
-        write_annual_dataset(base_path, years=(2030, 2040))
+    def test_land_change_two_image_compiles(self, base_path):
+        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=SSF_DATASET,
-            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
-            params={"dimension": "calendar_year"},
+            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": 2040},
+            params={},
         )
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
-    def test_concatenate_three_image_compiles(self, base_path):
-        write_annual_dataset(base_path, years=(2030, 2040), model_group_id=500)
-        write_annual_dataset(base_path, years=(2030, 2040), model_group_id=520)
+    def test_land_change_three_image_compiles(self, base_path):
+        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=500)
+        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=520)
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
                 "percentile": ANNUAL_KWARGS["percentile"],
-                "calendar_year": [2030, 2040],
+                "calendar_year": 2040,
                 "model_group_id": [500, 520],
             },
-            params={"dimension": "calendar_year"},
+            params={},
         )
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
-    def test_concatenate_compiles_on_a_raster_grid_too(self, base_path):
-        """`concatenate`'s own `Meta.variables` (`lnd_type`) is raster-only, so the raster
+    def test_land_change_compiles_on_a_raster_grid_too(self, base_path):
+        """`land-change`'s own `Meta.variables` (`lnd_type`) is raster-only, so the raster
         selection is the one it really runs under -- and its `output.format` is derived
         from the grid kind, which `validate_shapes` then checks against the final frame.
         The two-image case above proves the vector half of the same derivation.
         """
-        write_raster_dataset(base_path, years=(2030, 2040))
+        write_raster_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=RASTER_DATASET,
             filters={
                 "model_group_id": RASTER_KWARGS["model_group_id"],
                 "scenario_id": RASTER_KWARGS["scenario_id"],
-                "calendar_year": [2030, 2040],
+                "calendar_year": 2040,
             },
-            params={"dimension": "calendar_year"},
+            params={},
         )
         assert resolved.pipeline.output.format == "tif"
         validate_shapes(resolved.pipeline)
@@ -314,71 +325,82 @@ class TestDifferenceExecution:
         assert sorted(df["grid_cell"].to_list()) == [3, 5]
 
 
-class TestConcatenateExecution:
+class TestLandChangeExecution:
     def test_two_image_mode_multiplies_t0_by_ten(self, base_path):
-        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 1.0)
+        write_annual_dataset(
+            base_path, years=(EARLY_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0
+        )
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=SSF_DATASET,
-            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
-            params={"dimension": "calendar_year"},
+            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": 2040},
+            params={},
         )
         df = _run(resolved, base_path)
-        # t0 (2030) is multiplied by 10 (-> 10), t1 (2040) is untouched (-> 1); summed
-        # per geography across the two years -> 11.
+        # t0 (the baseline year) is multiplied by 10 (-> 10), t1 (2040) is untouched (->
+        # 1); summed per geography across the two years -> 11.
         assert set(df["value"].to_list()) == {11.0}
 
     def test_three_image_mode_encodes_all_three_corners(self, base_path):
         write_annual_dataset(
-            base_path, years=(2030, 2040), model_group_id=500, value_fn=lambda year, geo_id: 1.0
+            base_path,
+            years=(EARLY_BASELINE_YEAR, 2040),
+            model_group_id=500,
+            value_fn=lambda year, geo_id: 1.0,
         )
         write_annual_dataset(
-            base_path, years=(2030, 2040), model_group_id=520, value_fn=lambda year, geo_id: 1.0
+            base_path,
+            years=(EARLY_BASELINE_YEAR, 2040),
+            model_group_id=520,
+            value_fn=lambda year, geo_id: 1.0,
         )
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
                 "percentile": ANNUAL_KWARGS["percentile"],
-                "calendar_year": [2030, 2040],
+                "calendar_year": 2040,
                 "model_group_id": [500, 520],
             },
-            params={"dimension": "calendar_year"},
+            params={},
         )
         df = _run(resolved, base_path)
-        # Surviving corners after the `NOT (mg=520 AND year=2030)` conjunct:
-        # (500, 2030) -> *100 -> 100; (500, 2040) -> *10 -> 10; (520, 2040) -> untouched -> 1.
+        # Surviving corners after the `NOT (mg=520 AND year=t0)` conjunct:
+        # (500, t0) -> *100 -> 100; (500, 2040) -> *10 -> 10; (520, 2040) -> untouched -> 1.
         # Grouped (summed) over model_group_id/calendar_year per geography: 100 + 10 + 1 = 111.
         assert set(df["value"].to_list()) == {111.0}
 
     def test_the_three_image_corner_conjunct_really_drops_that_corner(self, base_path):
         """The redundant corner is dropped by a `NOT (... AND ...)` conjunct on the
-        leading `filter` step. Give (520, 2030) a value no other corner has, so its
+        leading `filter` step. Give (520, t0) a value no other corner has, so its
         survival would be visible in the sum rather than hidden by uniform values.
         """
         write_annual_dataset(
-            base_path, years=(2030, 2040), model_group_id=500, value_fn=lambda year, geo_id: 1.0
+            base_path,
+            years=(EARLY_BASELINE_YEAR, 2040),
+            model_group_id=500,
+            value_fn=lambda year, geo_id: 1.0,
         )
         write_annual_dataset(
             base_path,
-            years=(2030, 2040),
+            years=(EARLY_BASELINE_YEAR, 2040),
             model_group_id=520,
-            value_fn=lambda year, geo_id: 1000.0 if year == 2030 else 1.0,
+            value_fn=lambda year, geo_id: 1000.0 if year == EARLY_BASELINE_YEAR else 1.0,
         )
         resolved = resolve_analysis(
-            "concatenate",
+            "land-change",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
                 "percentile": ANNUAL_KWARGS["percentile"],
-                "calendar_year": [2030, 2040],
+                "calendar_year": 2040,
                 "model_group_id": [500, 520],
             },
-            params={"dimension": "calendar_year"},
+            params={},
         )
         df = _run(resolved, base_path)
-        # Still 111: the 1000.0 corner is (520, 2030), which the NOT conjunct drops. Had
+        # Still 111: the 1000.0 corner is (520, t0), which the NOT conjunct drops. Had
         # it survived it would have been multiplied by 100 and added 100000 to the sum.
         assert set(df["value"].to_list()) == {111.0}
 
@@ -471,6 +493,111 @@ class TestLandTypeConfidenceExecution:
             assert src.count == 1
             assert "calendar_year=2050" in src.descriptions[0]
             assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
+
+
+class TestChainedAnalysisExecution:
+    """`resolve_analysis_chain`'s own exception contract (unknown later stage, pairwise
+    parameter collisions, single-name delegation) is pure/in-memory and lives in
+    `tests/test_analyses.py`; these run the chains that DO reach disk, through the same
+    `validate_shapes` -> `run_to_path` -> rasterio path `TestLandTypeConfidenceExecution`
+    uses -- plus a test documenting the one combination the plan's own §5 anticipated
+    might not survive ("write it and see").
+    """
+
+    def _run_chain(self, base_path, tmp_path, filters, dimension, order="asc"):
+        resolved = resolve_analysis_chain(
+            ["land-type-confidence", "difference"],
+            dataset=RASTER_DATASET,
+            filters=filters,
+            params={"dimension": dimension, "order": order},
+        )
+        validate_shapes(resolved.pipeline)
+        out = tmp_path / "chained.tif"
+        run_to_path(resolved.pipeline, out, base_path=base_path)
+        return out
+
+    def test_calendar_year_worked_example(self, base_path, tmp_path):
+        """The plan's own worked example (§3.7): `land-type-confidence` reduces each of
+        two years' ensembles to a confidence value, then `difference` -- chained rather
+        than standalone -- subtracts one year from the other. All-land at 2040
+        (confidence 1.0) and all-water at 2050 (confidence 0.0) makes the expected
+        difference readable straight off the two confidences, with no extra arithmetic.
+        """
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2040,))
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2050,))
+        out = self._run_chain(
+            base_path,
+            tmp_path,
+            {"model_group_id": RASTER_KWARGS["model_group_id"], "calendar_year": [2040, 2050]},
+            "calendar_year",
+            order="asc",
+        )
+        with rio.open(out) as src:
+            # asc negates the later year (2050, confidence 0.0): 1.0 - 0.0 == 1.0.
+            assert src.count == 1
+            assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
+
+    def test_calendar_year_worked_example_desc_negates_the_other_year(self, base_path, tmp_path):
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2040,))
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2050,))
+        out = self._run_chain(
+            base_path,
+            tmp_path,
+            {"model_group_id": RASTER_KWARGS["model_group_id"], "calendar_year": [2040, 2050]},
+            "calendar_year",
+            order="desc",
+        )
+        with rio.open(out) as src:
+            # desc negates the earlier year (2040, confidence 1.0): -1.0 + 0.0 == -1.0.
+            assert src.read(1, masked=True).compressed() == pytest.approx(-1.0)
+
+    def test_model_group_id_mirror_case(self, base_path, tmp_path):
+        """Mirrors the calendar_year worked example, chaining over `model_group_id`
+        instead -- proof the chain generalizes to whichever remaining dimension the
+        caller names, not just the one the plan happened to illustrate with.
+        """
+        _write_ensemble(
+            base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2050,), model_group_id=700
+        )
+        _write_ensemble(
+            base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2050,), model_group_id=720
+        )
+        out = self._run_chain(
+            base_path,
+            tmp_path,
+            {"model_group_id": [700, 720], "calendar_year": 2050},
+            "model_group_id",
+            order="asc",
+        )
+        with rio.open(out) as src:
+            # asc negates the later (larger) model_group_id, 720 (confidence 0.0):
+            # 1.0 - 0.0 == 1.0.
+            assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
+
+    def test_lnd_type_plus_cannot_chain_with_difference(self):
+        """`lnd-type-plus,difference` is the one combination the plan's own §5
+        anticipated might not survive contact with the chain mechanism -- and it doesn't,
+        for a structural reason rather than an oversight: `filters` is shared
+        UNPARTITIONED across every stage (only `params` is split per stage), but
+        `LndTypePlus.validate_selection` requires `filters == {}` while `Difference`'s
+        (run against that SAME dict) requires the differencing dimension's 2 values to be
+        IN `filters`. No `filters` value satisfies both, so the chain always fails --
+        just on whichever stage's requirement it hits first.
+        """
+        with pytest.raises(InvalidAnalysisParametersError, match="calendar_year"):
+            resolve_analysis_chain(
+                ["lnd-type-plus", "difference"],
+                dataset=None,
+                filters={},
+                params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
+            )
+        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
+            resolve_analysis_chain(
+                ["lnd-type-plus", "difference"],
+                dataset=None,
+                filters={"calendar_year": [2040, 2050]},
+                params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
+            )
 
 
 class TestSalinityVegInvestigationExecution:

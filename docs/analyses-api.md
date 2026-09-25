@@ -1,7 +1,7 @@
 # Named Analyses (Registry API)
 
 A named analysis is a pre-built [pipeline](analysis-api.md) with its own request-shaped
-parameters -- a `difference` between two scenarios, a `concatenate` land-type-change
+parameters -- a `difference` between two scenarios, a `land-change` land-type-change
 code, a `salinity-veg-investigation` earliest-crossing-year surface -- registered under a
 short name so a caller never has to hand-author the equivalent pipeline JSON. Every named
 analysis is **sugar over the same pipeline grammar** documented in the
@@ -20,20 +20,20 @@ Returns the full list of registered analyses, each with:
 
 | Field | Description |
 |---|---|
-| `name` | The analysis's route name (e.g. `difference`, `concatenate`, `salinity-veg-investigation`) |
+| `name` | The analysis's route name (e.g. `difference`, `land-change`, `salinity-veg-investigation`) |
 | `label` | A human-readable display label |
 | `type` | `"dataset"` (operates on one caller-chosen dataset) or `"custom"` (its inputs are fixed by the analysis itself) |
 | `variables` | The variable(s) it's meaningful for, or `null` for any |
 | `legend` | A named legend/color-map hint for rendered output, or `null` |
 | `result_kind` | `"value"`, `"difference"`, or `"category"` -- a presentation hint for how to label the result |
 
-As of this writing, five analyses are registered: `difference`, `concatenate` and
+As of this writing, five analyses are registered: `difference`, `land-change` and
 `land-type-confidence` (`type="dataset"`), and `salinity-veg-investigation` and
 `lnd-type-plus` (`type="custom"`).
 
 ## Dataset-Scoped vs. Custom Routes
 
-A `type="dataset"` analysis (`difference`, `concatenate`) runs against a caller-chosen
+A `type="dataset"` analysis (`difference`, `land-change`) runs against a caller-chosen
 dataset, so its routes are nested under that dataset the same way the flat Data API's
 routes are:
 
@@ -97,34 +97,38 @@ distinct values -- fewer or more is rejected with a 400 before a pipeline is eve
 GET /v1/datasets/sal/annual/hydro_compartment_v001/analyses/difference/data.csv?model_group_id=520&scenario_id=7,8&aggregate_type=2_wk_max&calendar_year=2030&dimension=scenario_id&order=asc
 ```
 
-### `concatenate`
+### `land-change`
 
 `type="dataset"`. Produces a categorical land-type-change code (`variables=["lnd_type"]`,
-`legend="lnd_chng"`) from two selected values of one dimension. Two modes, selected by how
-many `model_group_id` values are also selected (not by `dimension`'s own cardinality,
-which is always exactly 2 for both modes):
+`legend="lnd_chng"`) between an automatically-derived baseline year and a caller-selected
+comparison year -- the caller supplies only the comparison `calendar_year`, the same
+single-value shape selecting `calendar_year` already has for every other variable. It
+declares no parameters of its own; the comparison year and the mode below both come from
+ordinary filters.
 
-- **Two-image** (`model_group_id` absent, or selected to exactly 1 value): the earlier
-  selected value is multiplied by 10, then summed with the later.
-- **Three-image** (`model_group_id` selected to exactly 2 values): a redundant
-  model-group/dimension corner is dropped, the earlier dimension value is multiplied by
-  100, the later dimension value (for the lower of the two model groups) is multiplied by
-  10, then all three are summed.
+The baseline year is derived from the selected `model_group_id`: values below `700`
+belong to an earlier model era whose baseline year is `2019`; at or above it, the
+baseline year is `2025`. Two modes, selected by how many `model_group_id` values are
+selected:
 
-| Parameter | Description |
-|---|---|
-| `dimension` | The dimension to concatenate across (must select exactly 2 distinct values) |
+- **Two-image** (`model_group_id` selected to exactly 1 value): the baseline year is
+  multiplied by 10, then summed with the comparison year.
+- **Three-image** (`model_group_id` selected to exactly 2 values, whichever is lower
+  decides the baseline era): a redundant model-group/year corner is dropped, the baseline
+  year is multiplied by 100, the comparison year (for the lower of the two model groups) is
+  multiplied by 10, then all three are summed.
 
-**Cardinality rule**: `dimension`'s own filter must select exactly 2 distinct values;
-`model_group_id`, if given, must select exactly 1 (two-image) or exactly 2 (three-image)
--- any other count is rejected with a 400.
+**Cardinality rule**: the filter on `calendar_year` must select exactly 1 value (the
+comparison year -- the baseline year is derived automatically, never supplied);
+`model_group_id` must select exactly 1 (two-image) or exactly 2 (three-image) -- any
+other count is rejected with a 400.
 
 `lnd_type` lives only on the `morph_pixel` pixel grid, so the result is a raster surface
 and a tabular `data.{format}` is rejected -- ask for `tif` (or `png`/`jpg` on the tile
 routes).
 
 ```
-GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/concatenate/data.tif?model_group_id=500,510&scenario_id=7&calendar_year=2040,2050&dimension=calendar_year
+GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/land-change/data.tif?model_group_id=500&scenario_id=7&calendar_year=2050
 ```
 
 ### `land-type-confidence`

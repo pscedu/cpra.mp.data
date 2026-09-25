@@ -157,8 +157,8 @@ class TestResolvedAnalysisMetadataHooks:
         assert m._legend_name() is None
         assert m.difference_suffix == " Difference"
 
-    def test_concatenate_result_kind_is_not_a_difference_and_uses_the_lnd_chng_legend(self):
-        m = Map(analysis="concatenate", dimension="calendar_year", calendar_year=[2030, 2040], **self.ANNUAL)
+    def test_land_change_result_kind_is_not_a_difference_and_uses_the_lnd_chng_legend(self):
+        m = Map(analysis="land-change", calendar_year=[2040], **self.ANNUAL)
         assert m._is_difference() is False
         assert m._legend_name() == "lnd_chng"
         assert m.difference_suffix == ""
@@ -201,15 +201,14 @@ class TestCompareDimensionsExclusion:
         assert "calendar_year" not in sb.compare_dimensions
         assert sb.compare_dimensions == {"model_group_id": [500, 520]}
 
-    def test_three_image_concatenate_excludes_both_of_its_collapsed_dimensions(self):
+    def test_three_image_land_change_excludes_both_of_its_collapsed_dimensions(self):
         sb = StackedBar(
             variable="ssf",
             grid="ecoregion_v001",
             time_unit="annual",
             grid_cell="1,2",
-            analysis="concatenate",
-            dimension="calendar_year",
-            calendar_year=[2030, 2040],
+            analysis="land-change",
+            calendar_year=[2040],
             model_group_id=[500, 520],
             scenario_id=[7],
             percentile=[50],

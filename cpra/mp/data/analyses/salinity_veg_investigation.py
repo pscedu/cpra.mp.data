@@ -12,7 +12,7 @@ exceeds the given salinity threshold"), served as one request instead.
 
 The only entry exercising the `type="custom"` path, multiple named inputs, and a
 `project` + spatial `join`, and the only one with no existing consumer (unlike
-`difference`/`concatenate`, which replace real portal catalog entries).
+`difference`/`land-change`, which replace real portal catalog entries).
 
 **Why the inputs are named `coverage`/`salinity` and the join operands `marsh`/`sal`.**
 A `join`'s output value columns are named after its OPERANDS (see `ops.validate_shapes`),

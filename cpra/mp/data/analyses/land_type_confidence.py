@@ -76,6 +76,8 @@ class LandTypeConfidence(Analysis):
         variables = ["lnd_type"]
         legend = None
         result_kind = "value"
+        kind = "variable"
+        subsumed_dimensions = ["scenario_id"]
 
     class Parameters(Analysis.Parameters):
         pass

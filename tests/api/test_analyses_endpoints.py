@@ -521,20 +521,21 @@ class TestCustomAnalysisExecution:
 
 
 class TestAnalysisRegistryErrorMapping:
-    """`resolve_analysis` raising each of the three `AnalysisRegistryError` subclasses,
-    monkeypatched directly so the mapping is checked independently of which real analysis
-    happens to raise which -- `api/__init__.py`'s `analysis_registry_error_handler` is the
-    single translation point, and the `404` case in particular is unreachable through the
-    real registry (`get_analysis_class` catches an unknown name first).
+    """`resolve_analysis_chain` raising each of the three `AnalysisRegistryError`
+    subclasses, monkeypatched directly so the mapping is checked independently of which
+    real analysis happens to raise which -- `api/__init__.py`'s
+    `analysis_registry_error_handler` is the single translation point, and the `404` case
+    in particular is unreachable through the real registry (`get_analysis_class` catches
+    an unknown name first).
     """
 
     def _patch(self, monkeypatch, exception):
         import cpra.mp.data.api as api_module
 
-        def _raise(name, *, dataset=None, filters=None, params=None, grid_cell_where=None):
+        def _raise(names, *, dataset=None, filters=None, params=None, grid_cell_where=None):
             raise exception
 
-        monkeypatch.setattr(api_module, "resolve_analysis", _raise)
+        monkeypatch.setattr(api_module, "resolve_analysis_chain", _raise)
 
     def test_invalid_parameters_maps_to_400(self, client, monkeypatch):
         from cpra.mp.data.analyses.base import InvalidAnalysisParametersError
@@ -711,7 +712,7 @@ class TestAnalysesCatalog:
         assert response.status_code == 200, response.text
         assert {entry["name"] for entry in response.json()} == {
             "difference",
-            "concatenate",
+            "land-change",
             "salinity-veg-investigation",
             "land-type-confidence",
             "lnd-type-plus",

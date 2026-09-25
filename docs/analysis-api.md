@@ -17,7 +17,7 @@ access to the data (notebooks, scripts): `analyze_data` runs a pipeline with no 
 round trip. See the
 [README's Analyzing Data section](../README.md#analyzing-data) for usage.
 
-A small, fixed set of named, pre-built pipelines (`difference`, `concatenate`,
+A small, fixed set of named, pre-built pipelines (`difference`, `land-change`,
 `salinity-veg-investigation`) is also available without hand-authoring pipeline JSON at
 all -- see [the named-analysis registry](analyses-api.md).
 

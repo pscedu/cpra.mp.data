@@ -29,6 +29,7 @@ from cpra.mp.data.analyses import (
     ResolvedAnalysis,
     UnknownAnalysisError,
     resolve_analysis,
+    resolve_analysis_chain,
 )
 from cpra.mp.data.analyses.base import (
     cast_dimension_value,
@@ -39,8 +40,13 @@ from cpra.mp.data.analyses.base import (
     normalized_filter_values,
     selection_filter_where,
 )
-from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
+from cpra.mp.data.analyses.land_change import (
+    BASELINE_ERA_BREAKPOINT,
+    EARLY_BASELINE_YEAR,
+    LATE_BASELINE_YEAR,
+    LandChange,
+)
 from cpra.mp.data.analyses.land_type_confidence import (
     LAND_VALUES,
     SCENARIO_WEIGHTS,
@@ -76,7 +82,7 @@ class TestRegistry:
         assert set(ANALYSES) == {
             "salinity-veg-investigation",
             "difference",
-            "concatenate",
+            "land-change",
             "land-type-confidence",
             "lnd-type-plus",
         }
@@ -91,10 +97,12 @@ class TestRegistry:
         assert ANALYSES["difference"].Meta.legend is None
         assert ANALYSES["difference"].Meta.result_kind == "difference"
 
-        assert ANALYSES["concatenate"].Meta.type == "dataset"
-        assert ANALYSES["concatenate"].Meta.variables == ["lnd_type"]
-        assert ANALYSES["concatenate"].Meta.legend == "lnd_chng"
-        assert ANALYSES["concatenate"].Meta.result_kind == "category"
+        assert ANALYSES["land-change"].Meta.type == "dataset"
+        assert ANALYSES["land-change"].Meta.kind == "variable"
+        assert ANALYSES["land-change"].Meta.variables == ["lnd_type"]
+        assert ANALYSES["land-change"].Meta.legend == "lnd_chng"
+        assert ANALYSES["land-change"].Meta.result_kind == "category"
+        assert ANALYSES["land-change"].Meta.subsumed_dimensions == ["calendar_year"]
 
         assert ANALYSES["salinity-veg-investigation"].Meta.type == "custom"
         assert ANALYSES["salinity-veg-investigation"].Meta.result_kind == "value"
@@ -267,6 +275,74 @@ class TestResolveOverADateDimension:
             "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)"
             in dumped["steps"][0]["where"]
         )
+
+
+# ------------------------------------------------------------------------------------------
+# `resolve_analysis_chain`'s own exception contract
+# ------------------------------------------------------------------------------------------
+
+
+class TestResolveAnalysisChainContract:
+    """Pure/in-memory coverage of the chain-specific error paths --
+    `tests/api/test_analyses_registry.py`'s chain tests cover the successful,
+    disk-touching end-to-end case (`land-type-confidence,difference`, §3.7 of the plan).
+    """
+
+    def test_differencing_a_dimension_the_leading_analysis_already_subsumes_is_caught_upstream(
+        self,
+    ):
+        """`land-type-confidence` subsumes `scenario_id` -- but that's not what fires here.
+        Its OWN `validate_selection` rejects any caller-supplied `scenario_id` filter
+        outright (it fixes the whole ensemble itself), and that runs before the chain
+        mechanism's own "is this dimension already collapsed" guard ever gets a chance to.
+        The `match` pins that it's the fixed-ensemble message, not a generic chain-level one.
+        """
+        with pytest.raises(InvalidAnalysisParametersError, match="fixed ensemble"):
+            resolve_analysis_chain(
+                ["land-type-confidence", "difference"],
+                dataset=LND_TYPE_DATASET,
+                filters={"model_group_id": 705, "calendar_year": 2050, "scenario_id": [34, 35]},
+                params={"dimension": "scenario_id", "order": "asc"},
+            )
+
+    def test_an_unknown_later_stage_raises_unknown_analysis_error(self):
+        with pytest.raises(UnknownAnalysisError):
+            resolve_analysis_chain(
+                ["land-type-confidence", "not-a-real-analysis"],
+                dataset=LND_TYPE_DATASET,
+                filters={"model_group_id": 705, "calendar_year": 2050},
+                params={},
+            )
+
+    def test_a_three_stage_chain_with_a_stage_2_vs_3_collision_is_rejected(self):
+        """The pairwise collision guard has to check every pair, not just stage 1 vs. 2:
+        here stage 1 (`land-type-confidence`) collides with neither later stage (it
+        declares no parameters of its own), but stage 2 and stage 3 -- both `difference`
+        -- collide with EACH OTHER on `dimension`/`order`.
+        """
+        with pytest.raises(InvalidAnalysisParametersError, match="difference"):
+            resolve_analysis_chain(
+                ["land-type-confidence", "difference", "difference"],
+                dataset=LND_TYPE_DATASET,
+                filters={"model_group_id": 705, "calendar_year": [2040, 2050]},
+                params={"dimension": "calendar_year", "order": "asc"},
+            )
+
+    def test_a_single_name_chain_delegates_straight_to_resolve_analysis(self):
+        chained = resolve_analysis_chain(
+            ["land-type-confidence"],
+            dataset=LND_TYPE_DATASET,
+            filters={"model_group_id": 705, "calendar_year": 2050},
+            params={},
+        )
+        plain = resolve_analysis(
+            "land-type-confidence",
+            dataset=LND_TYPE_DATASET,
+            filters={"model_group_id": 705, "calendar_year": 2050},
+            params={},
+        )
+        assert chained.pipeline == plain.pipeline
+        assert chained.collapsed_dimensions == plain.collapsed_dimensions
 
 
 # ------------------------------------------------------------------------------------------
@@ -556,80 +632,113 @@ class TestDifferencePipeline:
 
 
 # ------------------------------------------------------------------------------------------
-# `concatenate`
+# `land-change`
 # ------------------------------------------------------------------------------------------
 
 
-class TestConcatenateParameters:
+class TestLandChangeParameters:
+    def test_declares_no_parameters_of_its_own(self):
+        LandChange.Parameters()  # no raise
+
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
-            Concatenate.Parameters(dimension="calendar_year", extra="nope")
-
-    def test_rejects_non_filterable_dimension(self):
-        with pytest.raises(ValidationError):
-            Concatenate.Parameters(dimension="grid")
+            LandChange.Parameters(dimension="calendar_year")
 
 
-class TestConcatenateCardinality:
-    params = Concatenate.Parameters(dimension="calendar_year")
+class TestLandChangeCardinality:
+    params = LandChange.Parameters()
 
-    def test_rejects_missing_dimension_filter(self):
+    def test_rejects_missing_calendar_year(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            Concatenate.validate_selection(self.params, {})
+            LandChange.validate_selection(self.params, {"model_group_id": 500})
 
-    def test_rejects_one_dimension_value(self):
+    def test_rejects_two_calendar_years(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            Concatenate.validate_selection(self.params, {"calendar_year": [2030]})
+            LandChange.validate_selection(
+                self.params, {"calendar_year": [2030, 2040], "model_group_id": 500}
+            )
 
-    def test_rejects_three_dimension_values(self):
+    def test_rejects_missing_model_group_id(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            Concatenate.validate_selection(self.params, {"calendar_year": [2030, 2040, 2050]})
+            LandChange.validate_selection(self.params, {"calendar_year": 2040})
 
-    def test_accepts_two_dimension_values_with_no_model_group_filter(self):
-        Concatenate.validate_selection(self.params, {"calendar_year": [2030, 2040]})  # no raise
-
-    def test_accepts_two_dimension_values_with_one_model_group(self):
-        Concatenate.validate_selection(
-            self.params, {"calendar_year": [2030, 2040], "model_group_id": 500}
+    def test_accepts_one_calendar_year_with_one_model_group(self):
+        LandChange.validate_selection(
+            self.params, {"calendar_year": 2040, "model_group_id": 500}
         )  # no raise
 
-    def test_accepts_two_dimension_values_with_two_model_groups(self):
-        Concatenate.validate_selection(
-            self.params, {"calendar_year": [2030, 2040], "model_group_id": [500, 520]}
+    def test_accepts_one_calendar_year_with_two_model_groups(self):
+        LandChange.validate_selection(
+            self.params, {"calendar_year": 2040, "model_group_id": [500, 520]}
         )  # no raise
 
     def test_rejects_three_model_groups(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            Concatenate.validate_selection(
-                self.params, {"calendar_year": [2030, 2040], "model_group_id": [500, 510, 520]}
+            LandChange.validate_selection(
+                self.params, {"calendar_year": 2040, "model_group_id": [500, 510, 520]}
             )
 
 
-class TestConcatenatePipeline:
+class TestLandChangeBaselineYear:
+    """The `BASELINE_ERA_BREAKPOINT`/`EARLY_BASELINE_YEAR`/`LATE_BASELINE_YEAR` business
+    rule: `min()` of the selected `model_group_id` values decides the baseline era, even
+    when a straddling pair is selected together (e.g. 650 and 900 together still resolve
+    to the early baseline, since 650 is the lower one).
+    """
+
+    def _leading_filter(self, model_group_id):
+        analysis = LandChange(
+            dataset=SSF_DATASET,
+            filters={
+                "calendar_year": 2040,
+                "model_group_id": model_group_id,
+                "scenario_id": 7,
+                "percentile": 50,
+            },
+            parameters=LandChange.Parameters(),
+        )
+        leading = analysis.pipeline().steps[0]
+        assert isinstance(leading, FilterStep)
+        return leading
+
+    def test_below_breakpoint_uses_the_early_baseline(self):
+        leading = self._leading_filter(BASELINE_ERA_BREAKPOINT - 50)
+        assert f"calendar_year IN ({EARLY_BASELINE_YEAR}, 2040)" in leading.where
+
+    def test_at_the_breakpoint_uses_the_late_baseline(self):
+        leading = self._leading_filter(BASELINE_ERA_BREAKPOINT)
+        assert f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040)" in leading.where
+
+    def test_a_straddling_pair_still_uses_the_lower_ones_era(self):
+        leading = self._leading_filter([650, 900])
+        assert f"calendar_year IN ({EARLY_BASELINE_YEAR}, 2040)" in leading.where
+
+
+class TestLandChangePipeline:
     def _build(self, filters, dataset=SSF_DATASET):
-        analysis = Concatenate(
+        analysis = LandChange(
             dataset=dataset,
             filters=filters,
-            parameters=Concatenate.Parameters(dimension="calendar_year"),
+            parameters=LandChange.Parameters(),
         )
         return analysis, analysis.pipeline()
 
     def test_two_image_mode(self):
         analysis, pipeline = self._build(
-            {"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50}
+            {"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50}
         )
         assert len(pipeline.steps) == 3
         leading = pipeline.steps[0]
         assert isinstance(leading, FilterStep)
         assert leading.input == "x"
         assert leading.where == (
-            "calendar_year IN (2030, 2040) AND model_group_id = 500 AND percentile = 50 "
-            "AND scenario_id = 7"
+            f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040) AND model_group_id = 705 "
+            "AND percentile = 50 AND scenario_id = 7"
         )
         case = pipeline.steps[1]
         assert isinstance(case, CaseStep)
         assert [(arm.when, arm.then) for arm in case.cases] == [
-            ("calendar_year = 2030", "value * 10")
+            (f"calendar_year = {LATE_BASELINE_YEAR}", "value * 10")
         ]
         # The ones digit: the year no arm names keeps its value through the `sum`.
         assert case.else_ == "value"
@@ -641,14 +750,14 @@ class TestConcatenatePipeline:
     def test_two_image_mode_with_exactly_one_model_group_selected(self):
         # model_group_id present but pinned to a single value: still two-image.
         analysis, pipeline = self._build(
-            {"calendar_year": [2030, 2040], "model_group_id": [500], "scenario_id": 7, "percentile": 50}
+            {"calendar_year": 2040, "model_group_id": [705], "scenario_id": 7, "percentile": 50}
         )
         assert len(pipeline.steps) == 3
         assert pipeline.steps[1].cases[0].then == "value * 10"
 
     def test_three_image_mode(self):
         analysis, pipeline = self._build(
-            {"calendar_year": [2030, 2040], "model_group_id": [520, 500], "scenario_id": 7, "percentile": 50}
+            {"calendar_year": 2040, "model_group_id": [720, 705], "scenario_id": 7, "percentile": 50}
         )
         assert len(pipeline.steps) == 3
 
@@ -659,12 +768,12 @@ class TestConcatenatePipeline:
         assert isinstance(filter_step, FilterStep)
         assert filter_step.input == "x"
         # Dimension NAMES are sorted (so the string doesn't depend on dict order), but
-        # each dimension's own VALUES keep the caller's order -- `[520, 500]` in, `(520,
-        # 500)` out, matching `request.data_query`'s own conjunct assembly.
+        # each dimension's own VALUES keep the caller's order -- `[720, 705]` in, `(720,
+        # 705)` out, matching `request.data_query`'s own conjunct assembly.
         assert filter_step.where == (
-            "calendar_year IN (2030, 2040) AND model_group_id IN (520, 500) "
+            f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040) AND model_group_id IN (720, 705) "
             "AND percentile = 50 AND scenario_id = 7 "
-            "AND NOT (model_group_id = 520 AND calendar_year = 2030)"
+            f"AND NOT (model_group_id = 720 AND calendar_year = {LATE_BASELINE_YEAR})"
         )
 
         # Both digits in ONE step, as arms: read against the value the frame arrived with,
@@ -674,8 +783,8 @@ class TestConcatenatePipeline:
         case = pipeline.steps[1]
         assert isinstance(case, CaseStep)
         assert [(arm.when, arm.then) for arm in case.cases] == [
-            ("calendar_year = 2030", "value * 100"),
-            ("model_group_id = 500 AND calendar_year = 2040", "value * 10"),
+            (f"calendar_year = {LATE_BASELINE_YEAR}", "value * 100"),
+            ("model_group_id = 705 AND calendar_year = 2040", "value * 10"),
         ]
         assert case.else_ == "value"
 
@@ -687,22 +796,40 @@ class TestConcatenatePipeline:
         assert analysis.collapsed_dimensions == frozenset({"calendar_year", "model_group_id"})
 
     def test_meta_and_legend(self):
-        analysis, _ = self._build({"calendar_year": [2030, 2040], "model_group_id": 500})
+        analysis, _ = self._build({"calendar_year": 2040, "model_group_id": 705})
         assert analysis.legend == "lnd_chng"
         assert analysis.result_kind == "category"
 
     def test_the_output_format_follows_the_selected_dataset(self):
-        """`concatenate` neither projects nor changes shape, so its final frame's kind is
+        """`land-change` neither projects nor changes shape, so its final frame's kind is
         the input grid's -- and `pipeline.json`, the only route that does not overwrite
         this value from a URL segment, has to publish a pipeline that would still validate
         on resubmission. `Meta.variables` is `lnd_type`, which lives only on a raster grid,
         so the real-world answer is `tif`.
         """
-        filters = {"calendar_year": [2030, 2040], "model_group_id": 500}
+        filters = {"calendar_year": 2040, "model_group_id": 705}
         _, vector = self._build({**filters, "scenario_id": 7, "percentile": 50})
         assert vector.output.format == "csv"
         _, raster = self._build({**filters, "scenario_id": 7}, dataset=LND_TYPE_DATASET)
         assert raster.output.format == "tif"
+
+    def test_resolves_through_resolve_analysis(self):
+        resolved = resolve_analysis(
+            "land-change",
+            dataset=SSF_DATASET,
+            filters={"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50},
+            params={},
+        )
+        assert isinstance(resolved, ResolvedAnalysis)
+        assert resolved.legend == "lnd_chng"
+        assert resolved.result_kind == "category"
+        assert resolved.collapsed_dimensions == frozenset({"calendar_year"})
+
+    def test_missing_model_group_id_is_rejected_by_resolve_analysis(self):
+        with pytest.raises(InvalidAnalysisParametersError):
+            resolve_analysis(
+                "land-change", dataset=SSF_DATASET, filters={"calendar_year": 2040}, params={}
+            )
 
 
 # ------------------------------------------------------------------------------------------
@@ -1294,3 +1421,84 @@ def _conjunct_holds(value, conjunct, measured="value"):
             assert left == measured, f"unexpected left-hand side in {conjunct!r}"
             return test(value, float(right))
     raise AssertionError(f"unrecognized conjunct {conjunct!r}")
+
+
+# ------------------------------------------------------------------------------------------
+# `Meta.subsumed_dimensions` drift: portal-facing metadata vs. the runtime truth
+# ------------------------------------------------------------------------------------------
+
+
+class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
+    """`Meta.subsumed_dimensions` is what `/v1/analyses.json` publishes for the portal to
+    hide/not-send (`dimensions-select.tsx`, §4.4 of the plan); `collapsed_dimensions` is
+    what a given resolved selection actually collapses. The declared set must never OVERSTATE
+    the runtime one -- a dimension the portal hides as "already handled" that still shows up
+    in a real response would silently mislead the caller. It MAY be a strict subset
+    (`land-change`'s three-image mode additionally subsumes `model_group_id`, which `Meta`
+    does not declare, since only that mode does), so the check is subset, not equality.
+
+    Each test is mutation-checked: asserting the same subset relationship against a
+    dimension the selection does NOT actually collapse must fail, so a `Meta` that
+    overstates its own declaration would be caught rather than passed vacuously.
+    """
+
+    def _assert_subset_with_teeth(self, declared, collapsed, an_uncollapsed_dimension):
+        assert an_uncollapsed_dimension not in collapsed  # test setup sanity
+        assert set(declared) <= collapsed
+        with pytest.raises(AssertionError):
+            assert set(declared) | {an_uncollapsed_dimension} <= collapsed
+
+    def test_land_type_confidence(self):
+        resolved = resolve_analysis(
+            "land-type-confidence",
+            dataset=LND_TYPE_DATASET,
+            filters={"model_group_id": 705, "calendar_year": 2050},
+            params={},
+        )
+        self._assert_subset_with_teeth(
+            LandTypeConfidence.Meta.subsumed_dimensions,
+            resolved.collapsed_dimensions,
+            "calendar_year",
+        )
+
+    def test_land_change_two_image_mode(self):
+        resolved = resolve_analysis(
+            "land-change",
+            dataset=SSF_DATASET,
+            filters={"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50},
+            params={},
+        )
+        self._assert_subset_with_teeth(
+            LandChange.Meta.subsumed_dimensions, resolved.collapsed_dimensions, "scenario_id"
+        )
+
+    def test_land_change_three_image_mode_still_holds_even_though_it_subsumes_more(self):
+        resolved = resolve_analysis(
+            "land-change",
+            dataset=SSF_DATASET,
+            filters={
+                "calendar_year": 2040,
+                "model_group_id": [720, 705],
+                "scenario_id": 7,
+                "percentile": 50,
+            },
+            params={},
+        )
+        # The extra thing three-image mode subsumes beyond what `Meta` declares -- proof
+        # this mode is the strict-subset case the class docstring calls out, not equality.
+        assert resolved.collapsed_dimensions == frozenset({"calendar_year", "model_group_id"})
+        assert set(LandChange.Meta.subsumed_dimensions) < resolved.collapsed_dimensions
+        self._assert_subset_with_teeth(
+            LandChange.Meta.subsumed_dimensions, resolved.collapsed_dimensions, "scenario_id"
+        )
+
+    def test_lnd_type_plus(self):
+        resolved = resolve_analysis(
+            "lnd-type-plus",
+            dataset=None,
+            filters={},
+            params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
+        )
+        self._assert_subset_with_teeth(
+            LndTypePlus.Meta.subsumed_dimensions, resolved.collapsed_dimensions, "calendar_year"
+        )

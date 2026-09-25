@@ -189,6 +189,8 @@ class LndTypePlus(Analysis):
         # means -- open water that either carries no depth or is deeper than 1.0 m.
         legend = "lnd_type_plus"
         result_kind = "category"
+        kind = "variable"
+        subsumed_dimensions = ["aggregate_type"]
 
     class Parameters(Analysis.Parameters):
         # Required, and for the same reason `salinity-veg-investigation`'s are: with no

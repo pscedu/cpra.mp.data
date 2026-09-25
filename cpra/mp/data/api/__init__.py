@@ -3,7 +3,7 @@ from functools import lru_cache
 from typing import Annotated, Any
 
 import polars.selectors as cs
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, create_engine, select
@@ -55,7 +55,7 @@ from cpra.mp.data.api.utils import (
     UnknownAnalysisError,
     get_analysis_class,
     get_visualization_class,
-    resolve_analysis,
+    resolve_analysis_chain,
     validate_compression,
     validate_format,
 )
@@ -665,17 +665,26 @@ def _dataset_ref(dataset_dimensions: DatasetDimensions):
 async def _resolve_dataset_analysis(analysis_name, request, query, dataset_dimensions):
     """The four dataset-scoped named-analysis routes' shared prologue: reject the name up
     front if it is unknown or `type="custom"`, resolve `grid_cell` against the dataset's
-    own grid exactly as the flat data routes do, and resolve the analysis itself.
+    own grid exactly as the flat data routes do, and resolve the analysis (or chain --
+    `analysis_name` may be a comma-separated pair, e.g. `land-type-confidence,difference`,
+    see `analyses.resolve_analysis_chain`) itself.
+
+    `get_analysis_class` only gates `names[0]`, the PRIMARY name -- the exact 404/400
+    behavior an unchained request gets today is unchanged. Everything about any LATER name
+    (unknown, wrong kind, parameter collision, differencing an already-subsumed dimension)
+    raises through the `AnalysisRegistryError` family, which the exception handler above
+    already translates (404 for `UnknownAnalysisError`, 400 for everything else).
 
     Returns `(resolved, relabel)`. `relabel` is `api.data_query.resolve_grid_cell`'s
     absolute-id -> coordinate-string map for a raster point query and `None` otherwise;
     only the `data.{format}` route forwards it, for the same reason `get_model_tile`
     doesn't (a tile response has no `grid_cell` column to relabel).
     """
-    get_analysis_class(analysis_name, "dataset")
+    names = analysis_name.split(",")
+    get_analysis_class(names[0], "dataset")
     grid_cell_where, relabel = await resolve_grid_cell(dataset_dimensions.grid, query.grid_cell)
-    resolved = resolve_analysis(
-        analysis_name,
+    resolved = resolve_analysis_chain(
+        names,
         dataset=_dataset_ref(dataset_dimensions),
         filters=_analysis_filters(query),
         params=_analysis_extra_params(request, frozenset(type(query).model_fields)),
@@ -701,11 +710,15 @@ def _resolve_custom_analysis(analysis_name, request, query):
     the analysis's own `Parameters` instead. `salinity-veg-investigation` needs exactly
     that -- it declares `model_group_id`/`scenario_id`, both real dimension names, and
     would otherwise see them bound as filters it has no dataset to apply them to.
+
+    `analysis_name` may be a comma-separated chain, exactly as `_resolve_dataset_analysis`
+    accepts -- see that function's docstring for the 404/400 split across chain positions.
     """
-    get_analysis_class(analysis_name, "custom")
+    names = analysis_name.split(",")
+    get_analysis_class(names[0], "custom")
     known = frozenset(type(query).model_fields) - frozenset(FilterDimensions.model_fields)
-    return resolve_analysis(
-        analysis_name,
+    return resolve_analysis_chain(
+        names,
         dataset=None,
         filters=_analysis_filters(query, dimensions=False),
         params=_analysis_extra_params(request, known),
@@ -717,13 +730,20 @@ def analyses_catalog() -> list[Analysis]:
     return [analysis.Meta.__dict__ for analysis in ANALYSES.values()]
 
 
+# A single registered name, or a comma-separated chain (e.g.
+# `land-type-confidence,difference`) -- see `analyses.resolve_analysis_chain`. Every
+# route below splits this on `,` before resolving it; the path segment itself accepts
+# either form unchanged, since a comma is not `/` and needs no extra URL-encoding.
+AnalysisName = Annotated[str, Path(description="A registered analysis name, or a comma-separated chain of them (e.g. `land-type-confidence,difference`).")]
+
+
 @app.get(
     "/v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/data.{format}",
     tags=["Analyses"],
 )
 async def get_dataset_analysis_data(
     format: DataFormat,
-    analysis_name: str,
+    analysis_name: AnalysisName,
     request: Request,
     query: Annotated[AnalysisDataQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
@@ -747,7 +767,7 @@ async def get_dataset_analysis_data(
 )
 async def get_dataset_analysis_tile(
     format: TileFormat,
-    analysis_name: str,
+    analysis_name: AnalysisName,
     z: int,
     x: int,
     y: int,
@@ -769,7 +789,7 @@ async def get_dataset_analysis_tile(
     tags=["Analyses"],
 )
 async def get_dataset_analysis_vector_tile(
-    analysis_name: str,
+    analysis_name: AnalysisName,
     z: int,
     x: int,
     y: int,
@@ -791,7 +811,7 @@ async def get_dataset_analysis_vector_tile(
     tags=["Analyses"],
 )
 async def get_dataset_analysis_pipeline(
-    analysis_name: str,
+    analysis_name: AnalysisName,
     request: Request,
     query: Annotated[AnalysisQuery, Query()],
     dataset_dimensions: DatasetDimensions = Depends(),
@@ -807,7 +827,7 @@ async def get_dataset_analysis_pipeline(
 @app.get("/v1/analyses/{analysis_name}/data.{format}", tags=["Analyses"])
 async def get_custom_analysis_data(
     format: DataFormat,
-    analysis_name: str,
+    analysis_name: AnalysisName,
     request: Request,
     query: Annotated[AnalysisDataQuery, Query()],
 ):
@@ -823,7 +843,7 @@ async def get_custom_analysis_data(
 @app.get("/v1/analyses/{analysis_name}/data/{z}/{x}/{y}.{format}", tags=["Analyses"])
 async def get_custom_analysis_tile(
     format: TileFormat,
-    analysis_name: str,
+    analysis_name: AnalysisName,
     z: int,
     x: int,
     y: int,
@@ -839,7 +859,7 @@ async def get_custom_analysis_tile(
 
 @app.get("/v1/analyses/{analysis_name}/tiles/{z}/{x}/{y}.pbf", tags=["Analyses"])
 async def get_custom_analysis_vector_tile(
-    analysis_name: str,
+    analysis_name: AnalysisName,
     z: int,
     x: int,
     y: int,
@@ -855,7 +875,7 @@ async def get_custom_analysis_vector_tile(
 
 @app.get("/v1/analyses/{analysis_name}/pipeline.json", tags=["Analyses"])
 async def get_custom_analysis_pipeline(
-    analysis_name: str,
+    analysis_name: AnalysisName,
     request: Request,
     query: Annotated[AnalysisQuery, Query()],
 ):

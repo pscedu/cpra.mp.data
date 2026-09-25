@@ -26,13 +26,16 @@ from cpra.mp.data.analyses.base import (
     InvalidAnalysisParametersError,
     ResolvedAnalysis,
     UnknownAnalysisError,
+    default_collapsed_dimensions,
+    pipeline_input_dimensions,
 )
-from cpra.mp.data.analyses.concatenate import Concatenate
 from cpra.mp.data.analyses.difference import Difference
+from cpra.mp.data.analyses.land_change import LandChange
 from cpra.mp.data.analyses.land_type_confidence import LandTypeConfidence
 from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.pipeline import append_steps
 
 # Landed in this order (`salinity-veg-investigation` first -- the only entry exercising
 # the `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and
@@ -40,7 +43,7 @@ from cpra.mp.data.analysis.request.errors import RequestError
 # -> class` dict, so registration order has no behavioral effect.
 ANALYSES = {
     cls.Meta.name: cls
-    for cls in [SalinityVegInvestigation, Difference, Concatenate, LandTypeConfidence, LndTypePlus]
+    for cls in [SalinityVegInvestigation, Difference, LandChange, LandTypeConfidence, LndTypePlus]
 }
 
 __all__ = [
@@ -53,6 +56,7 @@ __all__ = [
     "ResolvedAnalysis",
     "UnknownAnalysisError",
     "resolve_analysis",
+    "resolve_analysis_chain",
 ]
 
 
@@ -81,10 +85,9 @@ def resolve_analysis(
     to the RESOLVED `Pipeline`'s `.output`/response at the route layer, after this
     function returns, the same way they would for a hand-authored pipeline.) `params` is
     the analysis's own declared parameters (`dimension`/`order` for `difference`,
-    `dimension` for `concatenate`, `model_group_id`/`scenario_id`/`marsh_threshold`/
-    `salinity_threshold` for `salinity-veg-investigation`, none at all for
-    `land-type-confidence`, whose selection is entirely `filters`), raw and unvalidated
-    until this call.
+    `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold` for
+    `salinity-veg-investigation`, none at all for `land-type-confidence` or `land-change`,
+    whose selections are entirely `filters`), raw and unvalidated until this call.
 
     `grid_cell_where` is an already-resolved spatial conjunct (`"grid_cell IN (1, 2)"`)
     for a caller that had to turn coordinates into IDs itself -- resolving coordinates
@@ -146,4 +149,138 @@ def resolve_analysis(
         result_kind=analysis.result_kind,
         collapsed_dimensions=analysis.collapsed_dimensions,
         title_suffix=analysis.title_suffix,
+    )
+
+
+def resolve_analysis_chain(
+    names: list[str],
+    *,
+    dataset: DatasetRef | None = None,
+    filters: dict | None = None,
+    params: dict | None = None,
+    grid_cell_where: str | None = None,
+) -> ResolvedAnalysis:
+    """Resolve a comma-separated chain of named analyses, e.g.
+    `["land-type-confidence", "difference"]`: stage 1 resolves exactly as `resolve_analysis`
+    would alone; each later stage must be `kind="dimension"` (checked against `Meta.kind`
+    before anything else runs) and contributes its own steps (`_dimension_steps`), appended
+    to the running pipeline via `analysis.request.pipeline.append_steps` -- the same
+    stored-pipeline-plus-extra-steps mechanism a narrowing request already uses, so a chain
+    is re-validated as an ordinary `Pipeline` rather than trusted to have skipped a check a
+    standalone one would have been subject to.
+
+    `len(names) == 1` delegates straight to `resolve_analysis` -- every existing
+    single-name call site (`pipeline.json`'s resubmission contract, every pre-chain test)
+    behaves identically.
+
+    A later stage's `dimension` parameter must name a dimension the chain has not already
+    collapsed. "Already collapsed" is tracked in a running `collapsed` set seeded from
+    stage 1's own AUTHORITATIVE `resolved.collapsed_dimensions` -- NOT recomputed
+    structurally from the intermediate pipeline via `default_collapsed_dimensions` at each
+    step, because that would be wrong for a chain led by an analysis (e.g. `lnd-type-plus`)
+    whose `collapsed_dimensions` is a hand-written override rather than the structural
+    default: `default_collapsed_dimensions` reports `frozenset()` whenever the pipeline's
+    last step isn't a `group`, which is exactly `lnd-type-plus`'s own case (it ends in a
+    `case`), so recomputing structurally after stage 1 would silently forget that
+    `aggregate_type` is already gone. The FINAL published `collapsed_dimensions` (below)
+    doesn't have this problem and is recomputed structurally on purpose: the combined
+    pipeline by then always ends in a real trailing `group` (every `_dimension_steps`
+    appends one), so the union of everything every stage subsumed falls out on its own.
+
+    Every stage's `Parameters` fields are checked pairwise for a name collision before any
+    parameter is partitioned out of `params` -- today's registry has exactly one
+    `kind="dimension"` analysis (`difference`), so this never actually fires yet, but it
+    turns "two stages silently overwrite each other's parameter" into an explicit 400
+    naming the field, for the day a second one is added or the same one is named twice.
+
+    Raises the same three `AnalysisRegistryError` subclasses `resolve_analysis` does (see
+    its docstring) -- an unknown name anywhere in `names`, a non-`type="dataset"`/wrong-
+    `kind` analysis in a chain position that requires one, a parameter collision, an
+    unrecognized parameter, a `dimension` that names an already-collapsed dimension, or a
+    `Pipeline`-construction failure at any stage.
+    """
+    if len(names) == 1:
+        return resolve_analysis(
+            names[0], dataset=dataset, filters=filters, params=params, grid_cell_where=grid_cell_where
+        )
+
+    classes = []
+    for name in names:
+        cls = ANALYSES.get(name)
+        if cls is None:
+            raise UnknownAnalysisError(f"unknown analysis name {name!r} -- known: {sorted(ANALYSES)}")
+        classes.append(cls)
+    for cls in classes[1:]:
+        if cls.Meta.kind != "dimension":
+            raise AnalysisTypeMismatchError(
+                f"analysis {cls.Meta.name!r} is kind={cls.Meta.kind!r}, but only a "
+                "kind='dimension' analysis may follow the first stage of a chain"
+            )
+
+    # Pairwise collision across every stage's Parameters fields, not just stage 1 vs. 2 --
+    # a 3+-stage chain can collide on stage 2 vs. stage 3 just as easily.
+    field_sets = [set(cls.Parameters.model_fields) for cls in classes]
+    for i in range(len(field_sets)):
+        for j in range(i + 1, len(field_sets)):
+            overlap = field_sets[i] & field_sets[j]
+            if overlap:
+                raise InvalidAnalysisParametersError(
+                    f"{names[i]!r} and {names[j]!r} both declare parameter(s) "
+                    f"{sorted(overlap)} -- this chain is ambiguous and is not supported"
+                )
+
+    filters = dict(filters or {})
+    params = dict(params or {})
+    partitioned = [{k: v for k, v in params.items() if k in fields} for fields in field_sets]
+    claimed = {k for stage_params in partitioned for k in stage_params}
+    unknown = set(params) - claimed
+    if unknown:
+        raise InvalidAnalysisParametersError(f"unrecognized parameter(s): {sorted(unknown)}")
+
+    resolved = resolve_analysis(
+        names[0], dataset=dataset, filters=filters, params=partitioned[0], grid_cell_where=grid_cell_where
+    )
+    pipeline = resolved.pipeline
+    title_suffix = resolved.title_suffix
+    legend = resolved.legend
+    result_kind = resolved.result_kind
+    collapsed = set(resolved.collapsed_dimensions)
+    all_dims = pipeline_input_dimensions(pipeline)
+
+    for cls, own_params in zip(classes[1:], partitioned[1:]):
+        try:
+            parameters = cls.Parameters.model_validate(own_params)
+        except ValidationError as exc:
+            raise InvalidAnalysisParametersError(f"analysis {cls.Meta.name!r} parameters: {exc}") from exc
+        cls.validate_selection(parameters, filters)
+
+        remaining = [d for d in all_dims if d not in collapsed]
+        dim = parameters.dimension
+        if dim not in remaining:
+            raise InvalidAnalysisParametersError(
+                f"{cls.Meta.name!r} cannot operate over {dim!r}: it is already subsumed "
+                f"upstream (remaining dimensions: {remaining})"
+            )
+        group_by = [d for d in remaining if d != dim]
+
+        stage = cls(dataset=None, filters=filters, parameters=parameters, grid_cell_where=None)
+        appended_steps = stage._dimension_steps(group_by)
+        try:
+            pipeline = append_steps(pipeline, appended_steps, pipeline.output)
+        except RequestError as exc:
+            raise InvalidAnalysisParametersError(
+                f"chained analysis could not build a pipeline at stage {cls.Meta.name!r}: {exc}"
+            ) from exc
+        collapsed.add(dim)
+        title_suffix += stage.title_suffix
+        legend = stage.legend or legend
+        result_kind = stage.result_kind
+
+    return ResolvedAnalysis(
+        pipeline=pipeline,
+        meta=resolved.meta,
+        legend=legend,
+        result_kind=result_kind,
+        collapsed_dimensions=default_collapsed_dimensions(pipeline),
+        title_suffix=title_suffix,
     )

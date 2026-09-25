@@ -1095,7 +1095,7 @@ class Map(DatasetVisualization):
         default legend" (see `_get_legend`, which does exactly that).
 
         Reads the resolved analysis's own declared `legend` when `analysis=` is selected
-        (`concatenate`'s `Meta.legend = "lnd_chng"`; `difference` declares none); a map
+        (`land-change`'s `Meta.legend = "lnd_chng"`; `difference` declares none); a map
         with no analysis selected has no override.
         """
         resolved = self.resolved_analysis
@@ -1156,8 +1156,10 @@ class Map(DatasetVisualization):
                 step["value"] = to_display(var, row["upper_bound"])
             steps.append(step)
 
+        resolved = self.resolved_analysis
+        title = resolved.meta.label if resolved is not None and resolved.meta.kind == "variable" else var.label
         return {
-            "title": "Land Change" if self._legend_name() == "lnd_chng" else var.label,
+            "title": title,
             "subtitle": display_unit(var),
             "type": legend.type,
             "steps": steps,

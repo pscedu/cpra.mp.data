@@ -161,12 +161,14 @@ class TestVisualizations:
 
 
 class _FakeCatalogAnalysisMeta:
-    name = "concatenate"
-    label = "Concatenate"
+    name = "land-change"
+    label = "Land Change"
     type = "dataset"
     variables = ["ssf"]
     legend = None
     result_kind = "vector"
+    kind = "variable"
+    subsumed_dimensions = ["scenario_id"]
 
 
 class _FakeCatalogAnalysis:
@@ -194,18 +196,57 @@ class TestAnalyses:
         import cpra.mp.data.api as api_module
         import cpra.mp.data.api.utils as api_utils
 
-        fake = {"concatenate": _FakeCatalogAnalysis}
+        fake = {"land-change": _FakeCatalogAnalysis}
         monkeypatch.setattr(api_utils, "ANALYSES", fake)
         monkeypatch.setattr(api_module, "ANALYSES", fake)
 
     def test_returns_analysis_metadata(self, client):
         response = client.get("/v1/analyses.json")
         assert response.status_code == 200
-        assert {a["name"] for a in response.json()} == {"concatenate"}
+        assert {a["name"] for a in response.json()} == {"land-change"}
 
     def test_each_entry_declares_a_type(self, client):
         for analysis in client.get("/v1/analyses.json").json():
             assert analysis["type"] in ("dataset", "custom")
+
+    def test_kind_and_subsumed_dimensions_are_published(self, client):
+        """The portal's dimension picker (`dimensions-select.tsx`, plan §4.4) hides/strips
+        a dimension a selected analysis already subsumes, so it needs both fields off the
+        wire -- not just present on `Meta` server-side.
+        """
+        by_name = {a["name"]: a for a in client.get("/v1/analyses.json").json()}
+        assert by_name["land-change"]["kind"] == "variable"
+        assert by_name["land-change"]["subsumed_dimensions"] == ["scenario_id"]
+
+    def test_kind_and_subsumed_dimensions_fall_back_when_a_meta_declares_neither(
+        self, client, monkeypatch
+    ):
+        """`difference`/`salinity-veg-investigation` (`kind="dimension"`/`None`) declare no
+        `subsumed_dimensions` at all -- the model's own defaults (`None`/`[]`) must survive
+        the round trip rather than raising or silently omitting the fields. Re-patches over
+        the class-level `_fake_registry` fixture's own fake for this one test.
+        """
+        import cpra.mp.data.api as api_module
+        import cpra.mp.data.api.utils as api_utils
+
+        class _BareMeta:
+            name = "difference"
+            label = "Difference"
+            type = "dataset"
+            variables = None
+            legend = None
+            result_kind = "difference"
+
+        class _BareAnalysis:
+            Meta = _BareMeta
+
+        fake = {"difference": _BareAnalysis}
+        monkeypatch.setattr(api_utils, "ANALYSES", fake)
+        monkeypatch.setattr(api_module, "ANALYSES", fake)
+
+        by_name = {a["name"]: a for a in client.get("/v1/analyses.json").json()}
+        assert by_name["difference"]["kind"] is None
+        assert by_name["difference"]["subsumed_dimensions"] == []
 
 
 class TestDatasetsIndex:
