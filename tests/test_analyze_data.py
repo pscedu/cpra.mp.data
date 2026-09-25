@@ -265,19 +265,39 @@ class TestPipelineOnlySurface:
 
 class TestCalculate:
     async def test_pipeline_calculate_op(self, two_scenario_annual_data):
-        """`calculate` rewrites the running `value` column wherever its `where` matches and
-        passes every other row through untouched -- never dropping data, unlike `filter`."""
+        """`calculate` rewrites the running `value` column on EVERY row -- it has no `where`
+        of its own, being sugar for a `case` with only an `else`."""
         pipeline = eco_pipeline(
             {"op": "filter", "input": "eco", "where": "scenario_id = 7"},
-            {"op": "calculate", "expression": "value * 0.5", "where": "calendar_year = 2030"},
+            {"op": "calculate", "expression": "value * 0.5"},
             {"op": "group", "by": [], "aggregate": "sum"},
         )
 
         df = await analyze_data(pipeline, base_path=two_scenario_annual_data)
 
-        # calculate halves only the calendar_year=2030 row (2030.01 -> 1015.005);
-        # calendar_year=2040 (2040.01) passes through unchanged. group sums both rows for
-        # grid_cell=1 across the collapsed calendar_year axis.
+        # Both of grid_cell=1's rows are halved, then `group` sums them across the collapsed
+        # calendar_year axis.
+        cell_1 = df.filter(pl.col("grid_cell") == 1)
+        assert cell_1["value"][0] == pytest.approx((2030.01 + 2040.01) * 0.5, rel=1e-5)
+
+    async def test_a_conditional_rewrite_is_a_case_with_an_else_of_value(self, two_scenario_annual_data):
+        """The rewrite-some-rows shape `calculate` used to spell with a `where`: an arm for
+        the rows to rewrite, and `else: "value"` for the pass-through -- which is now the
+        author's to write, since a `case` without one nulls what no arm matched."""
+        pipeline = eco_pipeline(
+            {"op": "filter", "input": "eco", "where": "scenario_id = 7"},
+            {
+                "op": "case",
+                "cases": [{"when": "calendar_year = 2030", "then": "value * 0.5"}],
+                "else": "value",
+            },
+            {"op": "group", "by": [], "aggregate": "sum"},
+        )
+
+        df = await analyze_data(pipeline, base_path=two_scenario_annual_data)
+
+        # The arm halves only the calendar_year=2030 row (2030.01 -> 1015.005); the `else`
+        # carries calendar_year=2040 (2040.01) through unchanged.
         cell_1 = df.filter(pl.col("grid_cell") == 1)
         assert cell_1["value"][0] == pytest.approx(2030.01 * 0.5 + 2040.01, rel=1e-5)
 

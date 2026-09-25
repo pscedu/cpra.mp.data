@@ -219,14 +219,20 @@ class FilterStep(BaseModel):
 
 
 class CalculateStep(BaseModel):
-    """Conditionally rewrite the running value: `expression` (arithmetic over the running
-    value and numeric literals) applied wherever `where` matches (an omitted `where`
-    applies it everywhere). Rows/bands not matching `where` pass through unchanged --
-    `calculate` never drops data; use `filter` for that. `input` is optional, mirroring
-    `FilterStep.input`. `calculate` always produces exactly one value column, whatever it
-    had going in -- the mechanism the single-value-column sink rule relies on to
-    collapse a `join`'s several named value columns back to one; see
-    `ops.validate_shapes`.
+    """UNCONDITIONALLY rewrite the running value: `expression` (arithmetic over the running
+    value and numeric literals, or over a `join`'s operand names) applied to every
+    row/band. `input` is optional, mirroring `FilterStep.input`. `calculate` always produces
+    exactly one value column, whatever it had going in -- the mechanism the
+    single-value-column sink rule relies on to collapse a `join`'s several named value
+    columns back to one; see `ops.validate_shapes`.
+
+    **`calculate` is sugar for a `case` with only an `else`**, and carries no `where` of its
+    own: `ops.compile_ops` lowers it to `CaseOp(cases=[], else_=expression)`, which is the
+    same thing said in the op that already means it. A rewrite that applies only SOMETIMES
+    is a `case` with an arm, and the `else` that case writes is the pass-through it wants --
+    `else: "value"` to leave unmatched rows alone, or no `else` to null them. Spelling it
+    that way is what makes "which rows does this touch" one question with one answer,
+    instead of a `where` and an arm's `when` that would have to be read together.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -234,7 +240,6 @@ class CalculateStep(BaseModel):
     op: Literal["calculate"] = "calculate"
     input: str | None = None
     expression: str
-    where: str | None = None
     as_: str | None = Field(default=None, alias="as")
 
 
@@ -264,14 +269,23 @@ class GroupStep(BaseModel):
 
 class CaseWhen(BaseModel):
     """One arm of a `case`: rewrite the running value to `then` wherever `when` matches.
-    `when` is a predicate in the same SQL-flavored language a `filter`/`calculate` `where`
-    is written in, and `then` is a value expression in the same arithmetic language
+    `when` is a predicate in the same SQL-flavored language a `filter`'s `where` is written
+    in, and `then` is a value expression in the same arithmetic language
     `calculate.expression` is -- so `then` may name a column (`"land_type"`) as readily as
     a constant (`"6"`), and needs nothing extra to do it.
 
-    Structurally validated here (non-empty `when`, well-formed `then`); that `when` names
-    only columns the frame actually carries, and only VALUE columns at that, is
-    `ops._type_case`'s check, since it needs the frame's namespace.
+    `when` may mix VALUE conjuncts (`"value > 0"`) with DIMENSION ones (`"year = 2070"`),
+    and the two halves mean different things: a value conjunct is a per-pixel mask, while a
+    dimension conjunct selects which BANDS (or which rows, in the long shape) this arm
+    applies to at all. An arm whose dimension half excludes a band is simply not in that
+    band's chain -- the band falls to whichever later arm does apply, or to the `else`. An
+    arm whose `when` is PURELY dimensional therefore matches its applicable bands entirely.
+
+    Structurally validated here (non-empty `when`, well-formed `then`). That the value half
+    names only value columns the frame carries is checked when the arm is compiled; that
+    the dimension half names real metadata columns is checked at execution, where the band
+    metadata (or the long frame's schema) is in hand. `ops._type_case` rejects only a
+    `grid_cell` conjunct, which would resample half the frame to points.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -283,23 +297,27 @@ class CaseWhen(BaseModel):
 class CaseStep(BaseModel):
     """Rewrite the running value by the FIRST matching arm of `cases`, falling through to
     `else` (default null) where none match -- one op for what a reclassification would
-    otherwise need a chain of `calculate`s and a disjointness trick to say (see
+    otherwise need a chain of steps and a disjointness trick to say (see
     `analyses/lnd_type_plus.py`'s depth classes, and `analyses/land_type_confidence.py`'s
-    land/water split).
+    per-scenario weights).
 
-    **Why this is not a chain of `calculate`s.** A `calculate` rewrites the RUNNING value,
-    so a later entry's `where` sees whatever an earlier one already wrote: the entries are
-    only independent when the target codes happen to be disjoint from every later entry's
-    source domain, which is a property of the particular numbers chosen, not of the
-    request language. `case` evaluates every arm's `when` against the value the frame
-    arrived with and takes the first that matches, so the arms are independent by
-    construction and their ORDER is the only thing that decides precedence.
+    **Why this is not a chain of conditional rewrites.** A step that rewrites the RUNNING
+    value sees whatever an earlier one already wrote, so a chain of them is only
+    independent when each target code happens to be disjoint from every later step's source
+    domain -- a property of the particular numbers chosen, not of the request language.
+    `case` evaluates every arm's `when` against the value the frame arrived with and takes
+    the first that matches, so the arms are independent by construction and their ORDER is
+    the only thing that decides precedence.
 
-    `input` is optional, mirroring `FilterStep.input`. Like `calculate`, `case` always
-    produces exactly one value column -- and unlike `calculate` it accepts a PAIRED
-    band-wide frame, reducing it to one (see `ops._type_case`); a row/band matching no arm
-    and given no `else` becomes null, which is the one way `case` can remove data that
-    `calculate` cannot.
+    `input` is optional, mirroring `FilterStep.input`. `case` always produces exactly one
+    value column, and accepts a PAIRED band-wide frame, reducing it to one (see
+    `ops._type_case`). A row/band matching no arm and given no `else` becomes null, which is
+    how `case` removes data; `else: "value"` is the pass-through to write when it should
+    not.
+
+    `calculate` is this op with no arms at all -- see `CalculateStep`, which lowers to
+    exactly that. The surface `cases` here keeps `min_length=1` because a `case` written
+    with no arms is a `calculate` the author should have spelled as one.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -404,17 +422,17 @@ def validate_pipeline(pipeline: Pipeline) -> None:
       `value` (`request.aggregates`);
     - `join.type == "attribute"` is rejected as reserved/not-yet-supported; `join.inputs`
       has no duplicate name;
-    - `filter.where`/`calculate.where` are non-empty and, so far as is possible without
-      knowing the column namespace, structurally sound
-      (`expressions.classify_where_kinds` rejects an aggregate call or a subquery in any
-      dimension or spatial conjunct);
+    - `filter.where` is non-empty and, so far as is possible without knowing the column
+      namespace, structurally sound (`expressions.classify_where_kinds` rejects an
+      aggregate call or a subquery in any dimension or spatial conjunct);
     - `calculate.expression` is well-formed arithmetic over the whitelist
       (`expressions.parse_calculate_expression`, column-namespace check deferred);
     - every `case` arm's `when` is a non-empty, structurally sound predicate and its
       `then` -- and the step's `else`, when given -- is well-formed arithmetic, both by
-      the same two checks a `calculate`'s `where`/`expression` get. That a `when` names
-      only VALUE columns is `ops._type_case`'s check, not this one: it needs the frame's
-      namespace;
+      the same two checks a `filter`'s `where` and a `calculate`'s `expression` get. That
+      a `when`'s conjuncts name columns the frame actually carries is checked downstream --
+      `ops._type_case` rejects a `grid_cell` one, and the rest resolve at execution, where
+      the band metadata is in hand;
     - `output.sort`/`output.select` are syntactically sound comma-separated `[-]column`
       lists -- no empty component, no bare `-`, no `-`-prefixed `select` entry, no name
       repeated within one list (`_validate_output_sort_or_select`). Whether a named
@@ -488,8 +506,6 @@ def _validate_step_rules(i: int, step: Any) -> None:
             raise RequestError(
                 f"step {i} (calculate) expression {step.expression!r} is invalid: {exc}"
             ) from exc
-        if step.where is not None:
-            _validate_where_structurally(i, step.where, op="calculate")
     elif isinstance(step, CaseStep):
         for position, case in enumerate(step.cases, start=1):
             _validate_where_structurally(i, case.when, op=f"case arm {position}")

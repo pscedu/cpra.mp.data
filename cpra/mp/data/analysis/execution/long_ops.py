@@ -1,6 +1,8 @@
-"""The long-shape lowerings: `filter_long`/`calculate_long`/`case_long`/`group_long`/
-`join_long`, one free function per op this vertical slice executes, each taking what it
-reads as arguments and returning a new `LongFrame` rather than mutating anything.
+"""The long-shape lowerings: `filter_long`/`case_long`/`group_long`/`join_long`, one free
+function per op this vertical slice executes, each taking what it reads as arguments and
+returning a new `LongFrame` rather than mutating anything. `calculate` has no lowering of
+its own in either shape -- `request.ops.compile_ops` lowers it to an arm-less `case`, whose
+`else` is the calculate's expression.
 
 Plus `case_expression`, the one piece here that is NOT long-shaped: it builds the chained
 `pl.when(...).then(...)` a `case` op compiles to, and both shapes' lowerings call it --
@@ -36,14 +38,14 @@ from cpra.mp.data.analysis.request.expressions import (
     PredicateKind,
     classify_where_kinds,
     combine_conjuncts,
-    compile_calculate_entries,
     parse_value_expr,
+    split_where_halves,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, JoinOp, calculate_label
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp, calculate_label
 from cpra.mp.data.analysis.request.pipeline import DATASET_SELECTION_COLUMNS
 
-__all__ = ["calculate_long", "case_expression", "case_long", "filter_long", "group_long", "join_long"]
+__all__ = ["case_expression", "case_long", "filter_long", "group_long", "join_long"]
 
 
 def filter_long(lf: LongFrame, where: str, value_columns: Sequence[str] = ("value",)) -> LongFrame:
@@ -66,8 +68,9 @@ def filter_long(lf: LongFrame, where: str, value_columns: Sequence[str] = ("valu
     plan recorded -- `{"value"}` for anything that has not been through a `join`, and the
     operand names (`{"marsh", "sal"}`) for a frame that has. It is what decides which
     bucket a conjunct lands in, and it is a parameter for the same reason
-    `calculate_long`'s is: a long frame's schema cannot distinguish a value column from a
-    dimension column by inspection, so only the typing walk knows. Without it this
+    `case_long`'s is: a long frame's schema cannot distinguish a value column from a
+    dimension column by inspection, so only the typing walk knows (`case_long` takes it for
+    the same reason). Without it this
     lowering classified by the literal name `value` and sorted a PAIRED frame's
     operand-named conjunct (`marsh > 0.5`) into the dimension bucket, where it took the
     unrestricted `lf.sql()` path rather than the whitelist -- and disagreed with
@@ -95,72 +98,12 @@ def filter_long(lf: LongFrame, where: str, value_columns: Sequence[str] = ("valu
     return lf
 
 
-def calculate_long(lf: LongFrame, op: CalculateOp, value_columns: frozenset[str]) -> LongFrame:
-    """The long-shape lowering of a `calculate`: compute a new `value` from
-    `op.expression` wherever `op.where` matches (everywhere, when `op.where` is `None`).
-
-    `value_columns` is the incoming frame's value columns, straight off the frame type the
-    plan recorded -- `{"value"}` for anything that has not been through a `join`, and the
-    operand names (`{"a", "b"}`) for a frame that has. It is a parameter rather than
-    something derived here because a long frame's schema cannot distinguish a value column
-    from a dimension column by inspection; only the typing walk knows.
-
-    It decides three things, all of which collapse to the old `value`-only behaviour when
-    it is `{"value"}`:
-
-    - **The expression namespace.** `op.expression` is validated against exactly these
-      names, which is what lets the `a - b` a post-`join` `calculate` exists to run parse
-      at all. A name outside them raises `ExpressionError` naming the namespace.
-    - **The null guard.** The rewrite applies only where EVERY value column is non-null,
-      so a null measurement stays null instead of silently becoming whatever the
-      expression makes of it.
-    - **What the result carries.** The computed column is always named `value` and the
-      operand columns are dropped, because that is what `request.ops` types a `calculate`
-      as producing -- one value column called `value`, whatever it read. Dropping them is
-      what makes the joined frame legal at the sink.
-
-    A row `op.where` does not match passes through UNCHANGED rather than being dropped --
-    dropping is `filter`'s job, never `calculate`'s. "Unchanged" needs the incoming `value`
-    to fall back to, though, and a joined frame has none: for that frame an unmatched row's
-    `value` is null, which is the honest answer (nothing computed it) and the same thing
-    every downstream aggregate already skips.
-
-    `op.expression`/`op.where` go through the same `compile_calculate_entries` the request
-    layer uses at parse time, so an expression that parses at validation is the one that
-    runs here. Raises `request.expressions.ExpressionError`.
-    """
-    namespace = sorted(value_columns)
-    (plan,) = compile_calculate_entries(
-        [(calculate_label(op), op.expression, op.where)], namespace
-    )
-    schema_names = set(lf.collect_schema().names())
-    condition = pl.all_horizontal([pl.col(column).is_not_null() for column in namespace])
-    if plan.dimension_where is not None:
-        dimension_expr = pl.sql_expr(plan.dimension_where)
-        missing = set(dimension_expr.meta.root_names()) - schema_names
-        if missing:
-            raise ExpressionError(
-                f"{plan.label}: where references column(s) not present in this dataset: "
-                f"{sorted(missing)} -- available columns: {sorted(schema_names)}"
-            )
-        condition = condition & dimension_expr.fill_null(False)
-    if plan.value_where is not None:
-        condition = condition & value_predicate_mask(plan.value_where, namespace)
-    new_value = parse_value_expr(plan.expression, namespace)
-    unchanged = pl.col("value") if "value" in value_columns else pl.lit(None)
-    return lf.with_columns(
-        pl.when(condition).then(new_value).otherwise(unchanged).alias("value")
-    ).drop([column for column in namespace if column != "value"])
-
-
 def _compile_case_part(
     what: str, compile_fn: Callable[[str, Sequence[str]], pl.Expr], text: str, allowed_columns: Sequence[str]
 ) -> pl.Expr:
     """Compile one of a `case`'s several expressions, re-raising with `what` (`step.5 arm
-    2 when`) in front of whatever the grammar said. A `calculate` carries one expression
-    and one `where`, so `compile_calculate_entries` can label the whole entry at once; a
-    `case` carries `2n + 1` of them and an unlabelled "invalid expression" would leave the
-    caller counting arms.
+    2 when`) in front of whatever the grammar said. A `case` carries `2n + 1` of them and
+    an unlabelled "invalid expression" would leave the caller counting arms.
     """
     try:
         return compile_fn(text, allowed_columns)
@@ -172,23 +115,28 @@ def case_expression(
     op: CaseOp,
     allowed_columns: Sequence[str],
     rewrite: Callable[[str], str] = lambda text: text,
+    predicate_columns: Sequence[str] | None = None,
+    resolve_dimension: Callable[[str], pl.Expr | bool] | None = None,
 ) -> pl.Expr:
     """The single `pl.Expr` a `case` op compiles to, in either shape: a chained
     `pl.when(...).then(...)` over `op.cases` in DECLARED ORDER, falling through to
-    `op.else_` (null when unset).
+    `op.else_` (null when unset). A `case` with NO arms is `op.else_` everywhere, which is
+    exactly what a `calculate` is -- `request.ops.compile_ops` lowers one to the other, so
+    this function is the whole of both ops' expression semantics.
 
     Two things this builds in, each the reason `case` exists as its own op rather than as
-    sugar over a chain of `calculate`s:
+    a chain of value rewrites:
 
     - **First match wins, over the INCOMING value.** Polars evaluates a `when/then` chain
       top-down and every arm's condition reads the frame's own columns, not the chain's
       partial result -- so arm 2 sees what arrived, never what arm 1 wrote. A chain of
-      `calculate`s cannot say that: each one rewrites the running value, so the next one's
-      `where` sees the rewrite.
+      independent rewrite steps cannot say that: each one rewrites the running value, so
+      the next one's predicate sees the rewrite.
     - **No pass-through.** A row/pixel matching no arm takes `else_`, which defaults to
-      null. That is the one thing `calculate` cannot do (it passes unmatched data through
-      unchanged, by contract), and it is what makes `case` a total reclassification rather
-      than a patch over one.
+      null. Pass-through is something the AUTHOR asks for, by writing `else: "value"`, and
+      is the shape every migrated `calculate` takes; it is not a default, so a total
+      reclassification and a patch over one are told apart by what the request says rather
+      than by which op it used.
 
     **Nodata is the author's to state, and nothing is added here.** This chain used to be
     wrapped in `pl.when(all operands non-null).then(...).otherwise(None)`, on the reasoning
@@ -209,34 +157,84 @@ def case_expression(
     `AND x IS NOT NULL` on an arm, or `coalesce(...)` (whitelisted) in a `then`/`else`, to
     say what nodata should do. An `else` now means what it says.
 
-    `allowed_columns` is the namespace every arm's `when`/`then` and the `else` are checked
-    against -- the frame's value columns in long shape, one band's column (plus any carried
-    columns) in band-wide. `rewrite` is applied to each expression's TEXT first, which is
-    how the band-wide lowerings substitute the placeholder `value` (or each operand name)
-    for the actual band column; it defaults to the identity, which is what long shape
-    needs since its columns are already named what the request calls them.
+    `allowed_columns` is the namespace every arm's `then` and the `else` are checked
+    against, and the namespace its `when`'s VALUE half is compiled against -- the frame's
+    value columns in long shape, one band's column (plus any carried columns) in band-wide.
+    `rewrite` is applied to each expression's TEXT first, which is how the band-wide
+    lowerings substitute the placeholder `value` (or each operand name) for the actual band
+    column; it defaults to the identity, which is what long shape needs since its columns
+    are already named what the request calls them.
+
+    **The dimension half of an arm, and why it takes two more parameters.** An arm's `when`
+    is split by `request.expressions.split_where_halves`, whose classification has to run
+    against the names the REQUEST wrote (`value`, or the operand names), not against the
+    band columns `rewrite` maps them to -- classifying `value > 3` against `["b0"]` would
+    call it a dimension conjunct. `predicate_columns` is those request-level names,
+    defaulting to `allowed_columns` because long shape is already written in them.
+
+    `resolve_dimension` turns a dimension half into a gate, and is what each shape's
+    lowering supplies out of the band metadata only it has:
+
+    - a `pl.Expr` (long shape: dimension columns are ordinary columns there, so the half
+      compiles to a per-row mask) -- ANDed with the arm's value half;
+    - `True`/`False` (band-wide: the half selects which BANDS the arm applies to, one
+      answer per band or per pair, evaluated against `metadata_df`). `False` DROPS that arm
+      from this band's chain rather than skipping the band -- the band still gets every
+      other arm and the `else`, which is the difference between an arm not applying and a
+      band not being touched.
+
+    Omitting `resolve_dimension` means "this caller has no metadata to resolve against",
+    and an arm carrying a dimension conjunct then raises rather than being silently read as
+    a value predicate over a column the frame does not have.
 
     Raises `request.expressions.ExpressionError`, labelled with which arm and which half
     of it failed.
     """
     label = calculate_label(op)
+    names = list(allowed_columns if predicate_columns is None else predicate_columns)
     chain = None
     for position, arm in enumerate(op.cases, start=1):
-        mask = _compile_case_part(
-            f"{label} arm {position} when", value_predicate_mask, rewrite(arm.when), allowed_columns
-        )
+        what = f"{label} arm {position} when"
+        dimension_where, value_where = split_where_halves(arm.when, names, what)
+        mask: pl.Expr | None = None
+        if dimension_where is not None:
+            if resolve_dimension is None:
+                raise ExpressionError(
+                    f"{what}: conjunct(s) {dimension_where!r} name no value column "
+                    f"({sorted(names)}), and this frame carries no band metadata for them "
+                    "to select against"
+                )
+            gate = resolve_dimension(dimension_where)
+            if gate is False:
+                continue
+            if gate is not True:
+                mask = gate
+        if value_where is not None:
+            value_mask = _compile_case_part(what, value_predicate_mask, rewrite(value_where), allowed_columns)
+            mask = value_mask if mask is None else mask & value_mask
         then = _compile_case_part(
             f"{label} arm {position} then", parse_value_expr, rewrite(arm.then), allowed_columns
         )
-        chain = pl.when(mask).then(then) if chain is None else chain.when(mask).then(then)
+        # `mask is None` is an arm whose `when` was PURELY dimensional and applies to this
+        # band: nothing per-pixel is left to test, so the arm matches the whole band -- and
+        # every later arm is then unreachable, which is what first-match-wins means.
+        condition = pl.lit(True) if mask is None else mask
+        chain = pl.when(condition).then(then) if chain is None else chain.when(condition).then(then)
     otherwise = (
         pl.lit(None)
         if op.else_ is None
-        else _compile_case_part(f"{label} else", parse_value_expr, rewrite(op.else_), allowed_columns)
+        # A `case` with no arms IS a `calculate` (see above), so the half that failed is
+        # that request's `expression`, not an `else` it never wrote.
+        else _compile_case_part(
+            f"{label} {'else' if op.cases else 'expression'}",
+            parse_value_expr,
+            rewrite(op.else_),
+            allowed_columns,
+        )
     )
-    # `chain is None` only for a `case` with no arms, which `pipeline.CaseStep` forbids
-    # (`min_length=1`); handled rather than asserted so a `CaseOp` built directly degrades
-    # to "the else, everywhere" instead of raising something unrelated.
+    # `chain is None` for a `case` with no arms -- a lowered `calculate` (`pipeline.
+    # CaseStep` itself still requires `min_length=1`) -- and also for one whose every arm
+    # this band's metadata dropped. Both mean the same thing: the else, everywhere.
     return otherwise if chain is None else chain.otherwise(otherwise)
 
 
@@ -244,18 +242,41 @@ def case_long(lf: LongFrame, op: CaseOp, value_columns: frozenset[str]) -> LongF
     """The long-shape lowering of a `case`: one `with_columns`, writing the chained
     expression `case_expression` builds into `value` and dropping the operand columns.
 
-    `value_columns` plays exactly the role it plays in `calculate_long` -- the frame's own
+    `value_columns` plays exactly the role it plays in `filter_long` -- the frame's own
     value columns off the recorded frame type, since a long frame's schema cannot tell a
     value column from a dimension column by inspection. It is the expression namespace, and
     the operand columns are dropped afterwards because `request.ops._type_case` types a
     `case` as producing exactly one value column called `value`, whatever it read.
 
-    Unlike `calculate_long` there is no `unchanged` fallback to thread: an unmatched row
-    takes the `else`, not the value it arrived with, so the paired case (where there is no
-    incoming `value` column to fall back TO) needs no special reading here.
+    There is no `unchanged` fallback to thread: an unmatched row takes the `else`, not the
+    value it arrived with, so the paired case (where there is no incoming `value` column to
+    fall back TO) needs no special reading here. A request that wants pass-through says so
+    with `else: "value"`, which a joined frame's namespace correctly rejects.
+
+    **An arm's dimension half is an ordinary row mask here.** Long shape carries its
+    dimension columns as real columns, so the half `split_where_halves` peels off compiles
+    straight to a `pl.Expr` -- no band metadata, no per-band answer, just a narrower mask
+    ANDed with the arm's value half. What it cannot know until the frame is in hand is
+    whether the columns it names EXIST, so that is checked against the schema here and
+    raised with the frame's own column list, the same execution-time error an unknown
+    dimension column in a `where` has always given.
     """
     namespace = sorted(value_columns)
-    value = case_expression(op, namespace)
+    schema_names = set(lf.collect_schema().names())
+
+    def resolve_dimension(text: str) -> pl.Expr:
+        expr = pl.sql_expr(text)
+        missing = set(expr.meta.root_names()) - schema_names
+        if missing:
+            raise ExpressionError(
+                f"{calculate_label(op)}: when references column(s) not present in this "
+                f"dataset: {sorted(missing)} -- available columns: {sorted(schema_names)}"
+            )
+        # `fill_null(False)` so a null dimension value fails the arm rather than making its
+        # condition null, which Polars treats as "not matched" anyway but only by accident.
+        return expr.fill_null(False)
+
+    value = case_expression(op, namespace, resolve_dimension=resolve_dimension)
     return lf.with_columns(value.alias("value")).drop(
         [column for column in namespace if column != "value"]
     )

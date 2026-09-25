@@ -68,8 +68,8 @@ step's output:
 | `project` | `input` (optional, chains from the previous step if omitted), `to` (target grid), `aggregate` (required whenever the target may draw from several source cells -- there is no default; forbidden only when broadcasting a vector grid onto a raster one; `sum`/`max`/`min`/`mean`/`count`/`count_by_value`), `as` | Move a frame onto a different grid via a crosswalk. |
 | `join` | `type` (`"spatial"`), `inputs` (two or more names), `as` | Combine frames cell-for-cell on a shared grid, naming each operand's measurement after the operand. |
 | `filter` | `input` (optional), `where`, `as` | A SQL-style predicate -- over dimensions, over the value, or over `grid_cell`. |
-| `calculate` | `input` (optional), `expression`, `where` (optional), `as` | Conditionally rewrite the running value: one expression/where pair per step (several pairs = repeated steps, applied sequentially -- step N+1 sees step N's output). Rows/bands not matching `where` flow through unchanged; `calculate` never drops data. |
-| `case` | `input` (optional), `cases` (a non-empty list of `{when, then}` arms), `else` (optional), `as` | Rewrite the running value by the **first matching** arm, SQL `CASE WHEN` style. Every `when` is read against the *incoming* value, so the arms are independent of one another and each row/pixel is written exactly once. Anything matching no arm takes `else`, which defaults to null -- i.e. masked. **Nodata is yours to state:** a null matches no `when` (every predicate reads null as false), so with no `else` it stays null, but `else 0` really does paint every nodata row/pixel `0`. Arms may test nullity directly (`x IS NULL`, `x IS NOT NULL`), and `coalesce` is available in a `then`/`else`. |
+| `calculate` | `input` (optional), `expression`, `as` | **Unconditionally** rewrite the running value: `expression` is applied to every row/band. It carries no `where` of its own -- it is exactly a `case` with only an `else`, and is lowered to one. A rewrite that should apply only *sometimes* is a `case` with an arm. |
+| `case` | `input` (optional), `cases` (a non-empty list of `{when, then}` arms), `else` (optional), `as` | Rewrite the running value by the **first matching** arm, SQL `CASE WHEN` style. Every `when` is read against the *incoming* value, so the arms are independent of one another and each row/pixel is written exactly once. Anything matching no arm takes `else`, which defaults to null -- i.e. masked, so **a pass-through is `else: "value"`**, written out rather than assumed. **Nodata is yours to state:** a null matches no `when` (every predicate reads null as false), so with no `else` it stays null, but `else 0` really does paint every nodata row/pixel `0`. Arms may test nullity directly (`x IS NULL`, `x IS NOT NULL`), and `coalesce` is available in a `then`/`else`. An arm's `when` may also be a **dimension** predicate, or mix dimension and value conjuncts (`scenario_id = 8 AND value > 0`); the dimension half picks which *bands* (or rows) the arm applies to, and an arm excluded from a band simply isn't in that band's chain, leaving the remaining arms and the `else` to write it. |
 | `group` | `input` (optional), `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate` (`sum`/`min`/`max`/`count`/`mean` -- the decomposable aggregates only; `count_by_value` is never valid here), `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held"), `as` | Collapse rows/bands. |
 
 Every op may name its input explicitly; when it doesn't, it consumes whatever the
@@ -143,7 +143,7 @@ The rules, in full:
 | `project` raster -> raster | **never legal** -- there is no crosswalk between two raster lattices |
 | `filter` on a dimension or a value | shape unchanged (and value columns unchanged -- a `filter` never changes a frame's pairing) |
 | `filter` on `grid_cell` (spatial) | band-wide -> long; long -> long |
-| `calculate` | shape unchanged |
+| `calculate` | shape unchanged (it lowers to a `case`, so the row below applies to it too) |
 | `case` | shape unchanged (and always one value column out, so it collapses a pairing) |
 | `group` | shape unchanged |
 | `join` | shape unchanged; operands must agree on shape **and** grid |
@@ -177,25 +177,21 @@ Each of these is a 400 naming the specific problem:
   names each operand's measurement after the operand, and an operand carrying several
   measurements has no single one for that name to mean. `join(a, b)` is fine;
   `join(join(a, b), c)` is not, until something collapses the pairing in between.
-- **A `calculate` over a paired band-wide frame** -- a band-wide frame's bands are
-  positional, so there is no per-operand column for the expression to name. Collapse the
-  pairing with a `case` first. (`case` is the one op that can: it pairs each operand's
-  band with its counterpart, and the matching arm's `then` says which value the single
-  surviving band carries.)
-- **A value `filter` naming an operand of a paired band-wide frame** -- for the same
-  reason, and with the same remedy. Evaluating `marsh > 0.5 AND sal > 5.5` over positional
+- **A value `filter` naming an operand of a paired band-wide frame** -- a band-wide frame's
+  bands are positional, so there is no per-operand column to name. Evaluating
+  `marsh > 0.5 AND sal > 5.5` over positional
   bands means pairing them and emitting one band per pair, which reduces the frame and has
-  to pick which operand's value survives -- a choice the predicate never states. A `case`
-  states it, in `then`. (A value `filter` naming only a *carried* column, such as
-  `__domain__ > 0`, is fine over a paired frame: it is a per-pixel mask each band takes
-  independently, so nothing pairs and nothing is picked.)
-- **A `case` arm whose `when` is a dimension or a `grid_cell` predicate** -- an arm
-  rewrites the value at one row/pixel, while a dimension or spatial predicate selects
-  which rows/bands there are at all. State that as a `filter`, before or after the `case`.
+  to pick which operand's value survives -- a choice the predicate never states. A
+  `case`/`calculate` states it, in `then`/`expression`. (A value `filter` naming only a
+  *carried* column, such as `__domain__ > 0`, is fine over a paired frame: it is a
+  per-pixel mask each band takes independently, so nothing pairs and nothing is picked.)
+- **A `case` arm whose `when` is a `grid_cell` predicate** -- an arm rewrites the value at
+  a row/pixel it is already looking at, while a spatial predicate selects which cells there
+  are at all. State that as a `filter`, before or after the `case`. (A *dimension*
+  predicate in a `when` is fine -- see the `case` row of the ops table.)
 - **More than one value column reaching the sink** -- every output writes exactly one
   measured quantity. A `join`'s paired frame must therefore be collapsed before the
-  output: a `case` or a `group` over a band-wide frame, or a `calculate` or a `case` over
-  a long one.
+  output, by a `case`, a `calculate`, or a `group`.
 - **A long final frame under a raster output format** (`tif`/`png`/`jpg`), or **a
   band-wide final frame under a tabular one** (`csv`/`ndjson`/`parquet`). Add a `project`,
   or (from band-wide) a spatial `filter`.
@@ -241,8 +237,10 @@ position -- never holding a full-extent array of any per-pixel intermediate.
 
 This pipeline returns the difference in annual salinity (two-week-max aggregate) between
 two scenarios in one year (scenario 7 minus scenario 8): a `filter` selecting the two
-scenarios, a `calculate` step negating scenario 8's rows, then a `group` collapsing the
-two scenarios into one value per grid cell. `model_group_id`, `aggregate_type`, and
+scenarios, a `case` step negating scenario 8's rows, then a `group` collapsing the
+two scenarios into one value per grid cell. The `case`'s `else` is `"value"` -- scenario
+7's rows have to reach the `sum` as themselves, and a `case` nulls whatever no arm matched
+unless the pass-through is written out. `model_group_id`, `aggregate_type`, and
 `calendar_year` are each pinned to one value here (so listing them in `group.by` alongside
 the truly-varying `scenario_id` is a no-op on this particular request), because `sal`
 always carries an `aggregate_type` dimension at every time granularity -- pin it
@@ -256,14 +254,14 @@ POST /v1/analysis.csv
   },
   "steps": [
     {"op": "filter", "input": "sal", "where": "model_group_id = 520 AND scenario_id IN (7, 8) AND aggregate_type = '2_wk_max' AND calendar_year = 2030"},
-    {"op": "calculate", "expression": "value * -1", "where": "scenario_id = 8"},
+    {"op": "case", "cases": [{"when": "scenario_id = 8", "then": "value * -1"}], "else": "value"},
     {"op": "group", "by": ["model_group_id", "aggregate_type", "calendar_year"], "aggregate": "sum"}
   ],
   "output": {"format": "csv"}
 }
 ```
 
-This exact `calculate`(negate)+`group`(sum) idiom is also available as the `difference`
+This exact `case`(negate)+`group`(sum) idiom is also available as the `difference`
 named analysis (`dimension=scenario_id`, `order=asc` negates the later of the two
 selected values, here `8`) -- see [the registry doc](analyses-api.md#difference) for the
 equivalent request with no hand-authored pipeline. The named analysis derives its own
@@ -347,10 +345,13 @@ POST /v1/analysis.csv
 }
 ```
 
-#### Single-Input Pipeline with Calculate Steps: a Confidence-Weighted Collapse
+#### Single-Input Pipeline with a Weighting Case: a Confidence-Weighted Collapse
 
-Two model groups weighted 0.6/0.4 via two sequential `calculate` steps (each selecting its
-model group's rows with a dimension `where`), collapsed with `group`/`sum`:
+Two model groups weighted 0.6/0.4 by one `case` -- an arm apiece, each `when` a dimension
+predicate picking out that group's rows -- collapsed with `group`/`sum`. One step rather
+than two sequential rewrites: the arms all read the *incoming* value, so each row is
+written exactly once and there is no ordering to get wrong. No `else`, because the leading
+`filter` already pinned `model_group_id` to exactly these two and nothing reaches it:
 
 ```json
 POST /v1/analysis.csv
@@ -360,17 +361,19 @@ POST /v1/analysis.csv
   },
   "steps": [
     {"op": "filter", "input": "sal", "where": "model_group_id IN (500, 510) AND scenario_id = 7 AND aggregate_type = '2_wk_max'"},
-    {"op": "calculate", "expression": "value * 0.6", "where": "model_group_id = 500"},
-    {"op": "calculate", "expression": "value * 0.4", "where": "model_group_id = 510"},
+    {"op": "case", "cases": [
+      {"when": "model_group_id = 500", "then": "value * 0.6"},
+      {"when": "model_group_id = 510", "then": "value * 0.4"}
+    ]},
     {"op": "group", "by": ["calendar_year"], "aggregate": "sum"}
   ],
   "output": {"format": "csv"}
 }
 ```
 
-The same pipeline in the dotted `GET` encoding spells each step as
-`step.2.op=calculate&step.2.expression=value%20*%200.6&step.2.where=model_group_id%20%3D%20500`,
-and works on the tile route the same way.
+The same pipeline in the dotted `GET` encoding spells the arms positionally --
+`step.2.op=case&step.2.cases.1.when=model_group_id%20%3D%20500&step.2.cases.1.then=value%20*%200.6`
+-- and works on the tile route the same way.
 
 ### Raster-Grid Pipelines
 
@@ -386,9 +389,12 @@ GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_i
 #### Map Query Comparing Two Years
 
 This pipeline returns the colorized elevation difference between two years (2050 minus
-2045): a `filter` selecting the two years, a `calculate` step negating 2045's band, then a
+2045): a `filter` selecting the two years, a `case` step negating 2045's band, then a
 `group` collapsing the two bands into one per pixel, rendered on the analysis tile route.
-Each step here leaves the frame band-wide, which is what the `png` output requires.
+Each step here leaves the frame band-wide, which is what the `png` output requires. The
+arm's `when` is purely dimensional, so it picks out the 2045 band and negates all of it;
+`else: "value"` leaves 2050's band as itself, which is what the `sum` needs to subtract
+from.
 
 ```json
 {
@@ -397,7 +403,7 @@ Each step here leaves the frame band-wide, which is what the `png` output requir
   },
   "steps": [
     {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id = 7 AND calendar_year IN (2045, 2050)"},
-    {"op": "calculate", "expression": "value * -1", "where": "calendar_year = 2045"},
+    {"op": "case", "cases": [{"when": "calendar_year = 2045", "then": "value * -1"}], "else": "value"},
     {"op": "group", "by": [], "aggregate": "sum"}
   ],
   "output": {"format": "png", "color_map": "elevation_difference"}
@@ -412,11 +418,13 @@ there is no `POST` form for the tile route.
 #### Confidence-Weighted Surface Across Model Groups
 
 This pipeline builds a confidence-weighted elevation surface: three model groups are each
-multiplied by their own confidence coefficient (0.6, 0.3, 0.1) via three `calculate`
-steps -- a dimension condition in each step's `where` selecting that model group's band
--- then collapsed to one band per pixel with `group`/`sum`. The steps are independent
-(each matches a different model group), so this is a per-band weighting; a pixel that is
-NoData in one group's band simply contributes nothing from that group.
+multiplied by their own confidence coefficient (0.6, 0.3, 0.1) by one `case` with three
+arms -- each `when` a dimension predicate selecting that model group's band -- then
+collapsed to one band per pixel with `group`/`sum`. The arms are independent (each matches
+a different model group), so this is a per-band weighting; a pixel that is NoData in one
+group's band simply contributes nothing from that group. No `else`: the leading `filter`
+pinned `model_group_id` to exactly these three, so there is no unweighted band to pass
+through.
 
 ```json
 {
@@ -425,9 +433,11 @@ NoData in one group's band simply contributes nothing from that group.
   },
   "steps": [
     {"op": "filter", "input": "elev", "where": "model_group_id IN (500, 510, 520) AND scenario_id = 7 AND calendar_year = 2050"},
-    {"op": "calculate", "expression": "value * 0.6", "where": "model_group_id = 500"},
-    {"op": "calculate", "expression": "value * 0.3", "where": "model_group_id = 510"},
-    {"op": "calculate", "expression": "value * 0.1", "where": "model_group_id = 520"},
+    {"op": "case", "cases": [
+      {"when": "model_group_id = 500", "then": "value * 0.6"},
+      {"when": "model_group_id = 510", "then": "value * 0.3"},
+      {"when": "model_group_id = 520", "then": "value * 0.1"}
+    ]},
     {"op": "group", "by": [], "aggregate": "sum"}
   ],
   "output": {"format": "png", "color_map": "elevation"}

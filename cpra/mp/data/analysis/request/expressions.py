@@ -1,6 +1,7 @@
 """A restricted expression surface for value-level predicates and conditional aggregates.
 
-A `filter`/`calculate` step's `where` accepts a single SQL-flavored boolean expression
+A `filter` step's `where` -- and a `case` arm's `when` -- accepts a single SQL-flavored
+boolean expression
 that may mix two kinds of AND-ed conditions: DIMENSION conditions (against the raster
 metadata table --
 path/band/dimensions -- or a vector frame's dimension columns) and VALUE conditions
@@ -35,7 +36,6 @@ outside the API (the `read_data()` entry point in `cpra/mp/data/__init__.py` doe
 import re
 from collections.abc import Iterable
 from enum import Enum
-from typing import NamedTuple
 
 import polars as pl
 
@@ -459,91 +459,51 @@ def parse_calculate_expression(expr_str, allowed_columns=("value",)):
     return expr
 
 
-class CalculatePlan(NamedTuple):
-    """One validated calculate entry, split the way the two grid types consume it.
+def split_where_halves(where, allowed_columns=("value",), label="where"):
+    """Split a `where`/`when` into the two halves the lowerings consume separately,
+    returning `(dimension_where, value_where)` -- each `None` when that kind was absent.
 
-    `label` names the entry in errors (`calculate.1`, `calculate.2`, ...). `expression`
-    is the validated arithmetic string,
-    still written against the `value` placeholder -- kept as a STRING (not the parsed
-    `Expr`) because the raster paths re-parse it once per band with `value` rewritten to
-    that band's own synthetic column (`rewrite_value_column`), exactly like a `where`
-    value condition. `dimension_where`/`value_where` are the entry's `where` split by
-    `classify_where_kinds` and recombined (`None` when that kind was absent): the
-    dimension half selects rows (vector) or bands (raster metadata); the value half is a
-    per-cell/per-pixel elementwise mask. Two fields for three predicate kinds -- a spatial
-    conjunct rides with the dimension half, which is what it is in long shape; see
-    `compile_calculate_entries`.
-    """
-
-    label: str
-    expression: str
-    dimension_where: str | None
-    value_where: str | None
-
-
-def compile_calculate_entries(entries, allowed_columns=("value",)):
-    """Validate calculate entries -- `(label, expression, where)` triples, in application
-    order -- into `CalculatePlan`s, before any file is opened.
-
-    `expression` goes through `parse_calculate_expression` against `allowed_columns`.
-    `where` (optional) gets exactly a `FilterOp`'s treatment: split and classified by
-    `classify_where_kinds` against the SAME `allowed_columns` (so an aggregate call or a
-    subquery is rejected with the same messages `where` gives), dimension conjuncts
-    recombined into `dimension_where` -- their column NAMES are grid-dependent and are
-    checked where the plan is applied -- and value conjuncts recombined into `value_where`
-    and validated here against the same namespace.
+    The dimension half selects ROWS (long shape, where a dimension is an ordinary column)
+    or BANDS (band-wide, where it is a row of `metadata_df`); the value half is a
+    per-cell/per-pixel elementwise mask. Two halves for three predicate kinds -- a spatial
+    conjunct rides with the dimension half, which is what it is in long shape. Band-wide
+    has no per-pixel band metadata for it to select against; `request.ops._type_case` is
+    what keeps a spatial conjunct out of a `case` arm, so no lowering here has to.
 
     Classifying against `allowed_columns` rather than against the literal name `value` is
-    what makes the two halves agree with the namespace `expression` is already checked
-    against. It matters in both directions: a post-`join` `where` naming an operand
+    what makes the halves agree with the namespace the surrounding expressions are checked
+    against. It matters in both directions: a post-`join` conjunct naming an operand
     (`marsh > 0.5`) is the VALUE conjunct it looks like rather than a dimension one, and a
-    band-wide `where` naming a carried column (`zone = 7`, an `extra_columns` entry) is a
-    per-pixel mask rather than a band selection evaluated against metadata that has no
-    such column.
+    band-wide conjunct naming a carried column (`zone = 7`, an `extra_columns` entry) is a
+    per-pixel mask rather than a band selection evaluated against metadata that has no such
+    column.
 
     `allowed_columns` defaults to the `value` placeholder alone, which is what every
-    single-value-column caller wants and what this function accepted before the parameter
-    existed. It is a parameter because a frame does not always carry its measurement in a
-    column called `value`: a `join`'s output names each operand's measurement after the
-    operand (`a`, `b`, ...), and the whole point of the `calculate` that follows is to
-    compute one `value` from them, so that caller passes those names instead. Both uses
-    below take the same namespace, since `expression` and `where`'s value conjuncts read
-    the same columns of the same frame.
+    single-value-column caller wants. It is a parameter because a frame does not always
+    carry its measurement in a column called `value`: a `join`'s output names each
+    operand's measurement after the operand (`a`, `b`, ...).
 
-    Every rejection is an `ExpressionError` prefixed with the offending entry's label.
+    Only the VALUE half is parsed here (against `allowed_columns`); the dimension half's
+    column names are grid- and frame-dependent, so they are checked where the half is
+    applied. Every rejection is an `ExpressionError` prefixed with `label`.
     """
-    plans = []
-    for label, expression, where in entries:
+    try:
+        kinds = classify_where_kinds(where, allowed_columns)
+    except ExpressionError as exc:
+        raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
+
+    dimension_conjuncts = [*kinds[PredicateKind.dimension], *kinds[PredicateKind.spatial]]
+    dimension_where = combine_conjuncts(dimension_conjuncts) if dimension_conjuncts else None
+
+    value_where = None
+    if kinds[PredicateKind.value]:
+        value_where = combine_conjuncts(kinds[PredicateKind.value])
         try:
-            parse_calculate_expression(expression, allowed_columns)
+            parse_value_expr(value_where, allowed_columns)
         except ExpressionError as exc:
-            raise ExpressionError(f"{label}: {exc}") from exc
+            raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
 
-        dimension_where = None
-        value_where = None
-        if where is not None:
-            try:
-                kinds = classify_where_kinds(where, allowed_columns)
-            except ExpressionError as exc:
-                raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
-            # A spatial conjunct joins the dimension half rather than getting a third
-            # field: `CalculatePlan`'s two halves are "selects rows/bands" and "masks
-            # cells", and `grid_cell` is the former in long shape (an ordinary column
-            # there). Band-wide has no per-pixel band metadata for it to select against,
-            # which is a gap in the band-wide calculate, not a reason for a third bucket.
-            dimension_conjuncts = [*kinds[PredicateKind.dimension], *kinds[PredicateKind.spatial]]
-            value_conjuncts = kinds[PredicateKind.value]
-            if dimension_conjuncts:
-                dimension_where = combine_conjuncts(dimension_conjuncts)
-            if value_conjuncts:
-                value_where = combine_conjuncts(value_conjuncts)
-                try:
-                    parse_value_expr(value_where, allowed_columns)
-                except ExpressionError as exc:
-                    raise ExpressionError(f"{label}: invalid where {where!r}: {exc}") from exc
-
-        plans.append(CalculatePlan(label, expression, dimension_where, value_where))
-    return plans
+    return dimension_where, value_where
 
 
 def rewrite_value_column(expr_str, column_name):
@@ -609,7 +569,7 @@ def value_predicate_mask(expr_str, allowed_columns):
 
 
 class PredicateKind(str, Enum):
-    """The three kinds a pipeline `filter`/`calculate.where` conjunct can be, by which
+    """The three kinds a pipeline `filter.where`/`case` arm `when` conjunct can be, by which
     reserved column it references: `value` (the measured quantity), `grid_cell` (a
     spatial predicate -- the one kind `classify_where` above does not distinguish, since
     it predates the pipeline request layer and only ever needed the dimension/value

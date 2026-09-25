@@ -16,12 +16,12 @@ from cpra.mp.data.analysis.request.expressions import (
     classify_where,
     classify_where_kinds,
     combine_conjuncts,
-    compile_calculate_entries,
     parse_calculate_expression,
     parse_value_expr,
     rewrite_value_column,
     rewrite_value_columns,
     split_top_level_and,
+    split_where_halves,
     value_predicate_mask,
 )
 
@@ -169,63 +169,63 @@ class TestParseCalculateExpression:
             parse_calculate_expression("max(marsh)", allowed_columns=None)
 
 
-class TestCompileCalculateEntries:
+class TestSplitWhereHalves:
+    """`split_where_halves` is what both `case` lowerings call to separate an arm's `when`
+    into the half that selects bands/rows (dimensions, and a spatial conjunct riding along
+    with them) and the half that masks cells (values). Only the value half is parsed here:
+    the dimension half's column names are grid- and frame-dependent, so they resolve at
+    execution, where the band metadata is in hand.
+    """
+
     def test_splits_where_into_dimension_and_value_halves(self):
-        (plan,) = compile_calculate_entries(
-            [("calculate.1", "value * 0.6", "model_group_id = 500 AND value > 2")]
-        )
-        assert plan.label == "calculate.1"
-        assert plan.expression == "value * 0.6"
-        assert plan.dimension_where == "(model_group_id = 500)"
-        assert plan.value_where == "(value > 2)"
+        dimension_where, value_where = split_where_halves("model_group_id = 500 AND value > 2")
+        assert dimension_where == "(model_group_id = 500)"
+        assert value_where == "(value > 2)"
 
-    def test_no_where_leaves_both_halves_none(self):
-        (plan,) = compile_calculate_entries([("calculate.1", "value * 0.6", None)])
-        assert plan.dimension_where is None
-        assert plan.value_where is None
+    def test_a_single_kind_leaves_the_other_half_none(self):
+        assert split_where_halves("value > 2") == (None, "(value > 2)")
+        assert split_where_halves("calendar_year = 2025") == ("(calendar_year = 2025)", None)
 
-    def test_rejections_name_the_entry_label(self):
-        with pytest.raises(ExpressionError, match="negate"):
-            compile_calculate_entries([("negate", "value >< 1", None)])
-        with pytest.raises(ExpressionError, match="calculate.2"):
-            compile_calculate_entries(
-                [
-                    ("calculate.1", "value * 2", None),
-                    ("calculate.2", "value * 2", "value > max(value)"),
-                ]
-            )
+    def test_a_spatial_conjunct_rides_with_the_dimension_half(self):
+        """There is no third return value: a `grid_cell` conjunct is a row/band selection
+        like a dimension one, and the only place the distinction matters is
+        `request.ops._type_case`, which rejects it before a `case` arm ever gets here.
+        """
+        dimension_where, value_where = split_where_halves("grid_cell = 7 AND value > 2")
+        assert dimension_where == "(grid_cell = 7)"
+        assert value_where == "(value > 2)"
+
+    def test_rejections_are_prefixed_with_the_label(self):
+        with pytest.raises(ExpressionError, match="arm 2 when"):
+            split_where_halves("value > max(value)", label="arm 2 when")
 
     def test_mixed_conjunct_in_where_rejected(self):
         """A single conjunct comparing a measurement to a dimension has no lowering, and
-        is still rejected -- but now by the namespace check rather than by a separate
-        rule. `classify_where_kinds` calls it a VALUE conjunct (it names a value column),
+        is rejected by the namespace check rather than by a rule of its own.
+        `classify_where_kinds` calls it a VALUE conjunct (it names a value column),
         `parse_value_expr` then finds `calendar_year` outside the namespace, and the
         message names the offending column rather than the category.
         """
         with pytest.raises(ExpressionError, match="'calendar_year' is not in the allowed namespace"):
-            compile_calculate_entries([("calculate.1", "value * 2", "value > calendar_year")])
+            split_where_halves("value > calendar_year")
 
     def test_separate_conjuncts_split_into_the_two_halves(self):
         """The form the rejection above points at: written as separate AND-ed conjuncts,
         the dimension half selects rows/bands and the value half masks cells.
         """
-        (plan,) = compile_calculate_entries(
-            [("calculate.1", "value * 2", "value > 3 AND calendar_year = 2025")]
+        assert split_where_halves("value > 3 AND calendar_year = 2025") == (
+            "(calendar_year = 2025)",
+            "(value > 3)",
         )
-        assert plan.dimension_where == "(calendar_year = 2025)"
-        assert plan.value_where == "(value > 3)"
 
     def test_where_classifies_against_the_given_namespace(self):
-        """`allowed_columns` decides the split, so a post-`join` `where` naming an operand
+        """`allowed_columns` decides the split, so a post-`join` `when` naming an operand
         is the value conjunct it looks like -- not a dimension one routed to an
         unrestricted SQL path for want of being spelled `value`.
         """
-        (plan,) = compile_calculate_entries(
-            [("calculate.1", "marsh - sal", "marsh > 0.5 AND calendar_year = 2025")],
-            allowed_columns=("marsh", "sal"),
-        )
-        assert plan.value_where == "(marsh > 0.5)"
-        assert plan.dimension_where == "(calendar_year = 2025)"
+        assert split_where_halves(
+            "marsh > 0.5 AND calendar_year = 2025", allowed_columns=("marsh", "sal")
+        ) == ("(calendar_year = 2025)", "(marsh > 0.5)")
 
 
 class TestRewriteValueColumn:

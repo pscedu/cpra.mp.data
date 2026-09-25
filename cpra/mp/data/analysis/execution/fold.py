@@ -147,8 +147,8 @@ def should_fold_group_by(
     Given that asymmetry, this function is intentionally simple rather than clever: it
     does not attempt to estimate actual cardinality (which would need a scan of its own,
     defeating the point of a cheap plan-time check) or account for every way a filter
-    might shrink row count (e.g. a `calculate`'s own `where`, which MASKS a row's value
-    rather than dropping the row -- see `long_ops.calculate_long` -- is deliberately not
+    might shrink row count (e.g. a `case` arm's `when`, which selects which rows a rewrite
+    APPLIES to rather than dropping any -- see `long_ops.case_long` -- is deliberately not
     treated as selective here: it doesn't change how many rows reach the group-by at all).
     """
     if has_selective_filter:

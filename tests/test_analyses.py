@@ -50,7 +50,6 @@ from cpra.mp.data.analyses.land_type_confidence import (
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
-    CalculateStep,
     CaseStep,
     FilterStep,
     GroupStep,
@@ -242,8 +241,8 @@ class TestResolveOverADateDimension:
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
         )
-        calculate = next(step for step in result.pipeline.steps if isinstance(step, CalculateStep))
-        assert calculate.where == "calendar_day = '2070-12-31'::date"
+        case = next(step for step in result.pipeline.steps if isinstance(step, CaseStep))
+        assert case.cases[0].when == "calendar_day = '2070-12-31'::date"
 
     def test_both_encodings_round_trip_the_dates(self):
         """The pipeline has to survive being written back out both ways: `pipeline_to_query`
@@ -430,15 +429,20 @@ class TestDifferencePipeline:
 
     def test_negates_the_later_value_for_order_asc(self):
         _, pipeline = self._build("asc")
-        calc = pipeline.steps[1]
-        assert isinstance(calc, CalculateStep)
-        assert calc.expression == "value * -1"
-        assert calc.where == "calendar_year = 2040"
+        case = pipeline.steps[1]
+        assert isinstance(case, CaseStep)
+        assert [(arm.when, arm.then) for arm in case.cases] == [
+            ("calendar_year = 2040", "value * -1")
+        ]
+        # The un-negated side has to reach the `sum` unchanged for the subtraction to come
+        # out, so the pass-through is written rather than left implicit.
+        assert case.else_ == "value"
 
     def test_negates_the_earlier_value_for_order_desc(self):
         _, pipeline = self._build("desc")
-        calc = pipeline.steps[1]
-        assert calc.where == "calendar_year = 2030"
+        case = pipeline.steps[1]
+        assert case.cases[0].when == "calendar_year = 2030"
+        assert case.else_ == "value"
 
     def test_step_shape(self):
         _, pipeline = self._build("asc")
@@ -454,7 +458,7 @@ class TestDifferencePipeline:
 
         assert isinstance(pipeline.steps[0], FilterStep)
         assert pipeline.steps[0].input == "x"
-        assert isinstance(pipeline.steps[1], CalculateStep)
+        assert isinstance(pipeline.steps[1], CaseStep)
         group = pipeline.steps[2]
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["model_group_id", "scenario_id", "percentile"])
@@ -622,10 +626,13 @@ class TestConcatenatePipeline:
             "calendar_year IN (2030, 2040) AND model_group_id = 500 AND percentile = 50 "
             "AND scenario_id = 7"
         )
-        calc = pipeline.steps[1]
-        assert isinstance(calc, CalculateStep)
-        assert calc.expression == "value * 10"
-        assert calc.where == "calendar_year = 2030"
+        case = pipeline.steps[1]
+        assert isinstance(case, CaseStep)
+        assert [(arm.when, arm.then) for arm in case.cases] == [
+            ("calendar_year = 2030", "value * 10")
+        ]
+        # The ones digit: the year no arm names keeps its value through the `sum`.
+        assert case.else_ == "value"
         group = pipeline.steps[2]
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["model_group_id", "scenario_id", "percentile"])
@@ -637,13 +644,13 @@ class TestConcatenatePipeline:
             {"calendar_year": [2030, 2040], "model_group_id": [500], "scenario_id": 7, "percentile": 50}
         )
         assert len(pipeline.steps) == 3
-        assert pipeline.steps[1].expression == "value * 10"
+        assert pipeline.steps[1].cases[0].then == "value * 10"
 
     def test_three_image_mode(self):
         analysis, pipeline = self._build(
             {"calendar_year": [2030, 2040], "model_group_id": [520, 500], "scenario_id": 7, "percentile": 50}
         )
-        assert len(pipeline.steps) == 4
+        assert len(pipeline.steps) == 3
 
         # The redundant corner is AND-ed onto the same leading `filter` the caller's own
         # dimension filters compose into -- both are dimension conditions at the same
@@ -660,17 +667,19 @@ class TestConcatenatePipeline:
             "AND NOT (model_group_id = 520 AND calendar_year = 2030)"
         )
 
-        calc1 = pipeline.steps[1]
-        assert isinstance(calc1, CalculateStep)
-        assert calc1.expression == "value * 100"
-        assert calc1.where == "calendar_year = 2030"
+        # Both digits in ONE step, as arms: read against the value the frame arrived with,
+        # so the hundreds arm cannot re-match what the tens arm wrote. As two successive
+        # rewrites they were independent only because their conditions happened to be
+        # disjoint.
+        case = pipeline.steps[1]
+        assert isinstance(case, CaseStep)
+        assert [(arm.when, arm.then) for arm in case.cases] == [
+            ("calendar_year = 2030", "value * 100"),
+            ("model_group_id = 500 AND calendar_year = 2040", "value * 10"),
+        ]
+        assert case.else_ == "value"
 
-        calc2 = pipeline.steps[2]
-        assert isinstance(calc2, CalculateStep)
-        assert calc2.expression == "value * 10"
-        assert calc2.where == "model_group_id = 500 AND calendar_year = 2040"
-
-        group = pipeline.steps[3]
+        group = pipeline.steps[2]
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["scenario_id", "percentile"])
         assert "model_group_id" not in group.by
@@ -909,15 +918,20 @@ class TestLandTypeConfidencePipeline:
         ]
         assert mapping.else_ is None
 
-    def test_one_weight_calculate_per_member_in_ascending_order(self):
+    def test_one_weight_arm_per_member_in_ascending_order(self):
+        # One `case` with an arm apiece, not N successive rewrites: each arm's `when` is
+        # purely dimensional, so it picks out that member's bands and scales them, and the
+        # five arms partition the frame the leading `filter` pinned to exactly these five.
         _, pipeline = self._build()
-        weights = pipeline.steps[3:-1]
-        assert [step.where for step in weights] == [
-            f"scenario_id = {scenario_id}" for scenario_id in sorted(SCENARIO_WEIGHTS)
+        weights = pipeline.steps[3]
+        assert isinstance(weights, CaseStep)
+        assert [(arm.when, arm.then) for arm in weights.cases] == [
+            (f"scenario_id = {scenario_id}", f"value * {SCENARIO_WEIGHTS[scenario_id]}")
+            for scenario_id in sorted(SCENARIO_WEIGHTS)
         ]
-        assert [step.expression for step in weights] == [
-            f"value * {SCENARIO_WEIGHTS[scenario_id]}" for scenario_id in sorted(SCENARIO_WEIGHTS)
-        ]
+        # No pass-through: nothing reaches the `else`, and writing one would be claiming
+        # there is an unweighted sixth member.
+        assert weights.else_ is None
 
     def test_the_group_sums_over_every_dimension_but_scenario_id(self):
         analysis, pipeline = self._build()
@@ -928,10 +942,12 @@ class TestLandTypeConfidencePipeline:
         assert "scenario_id" not in group.by
         assert analysis.collapsed_dimensions == frozenset({"scenario_id"})
 
-    def test_the_step_count_is_the_mapping_plus_one_per_member(self):
-        # Two filters and the one `case`, then a weight apiece, then the `group`.
+    def test_the_step_count_does_not_grow_with_the_member_count(self):
+        # Two filters, the mapping `case`, the weighting `case`, the `group` -- five, no
+        # matter how many members `SCENARIO_WEIGHTS` names, because the members are arms of
+        # one step rather than steps of their own.
         _, pipeline = self._build()
-        assert len(pipeline.steps) == 3 + len(SCENARIO_WEIGHTS) + 1
+        assert len(pipeline.steps) == 5
 
     def test_the_output_format_is_the_one_the_pipeline_can_actually_run_under(self):
         # `Output.format` is required, so `pipeline()` has to set something; every
@@ -981,15 +997,16 @@ class TestLandTypeConfidencePipeline:
                 params={},
             )
 
-    def test_the_get_encoding_numbers_all_nine_steps(self):
-        # The nine steps are positional in the GET encoding (`step.<n>.` is 1-based), so a
-        # caller can reproduce the analysis as a hand-authored pipeline URL. The `case`'s
+    def test_the_get_encoding_numbers_all_five_steps(self):
+        # The five steps are positional in the GET encoding (`step.<n>.` is 1-based), so a
+        # caller can reproduce the analysis as a hand-authored pipeline URL. Both `case`s'
         # arms nest one level further down, positionally in their own right.
         query = pipeline_to_query(self._build()[1])
-        assert query["step.9.op"] == "group"
-        assert query["step.4.expression"] == "value * 0.085"
+        assert query["step.5.op"] == "group"
         assert query["step.3.cases.1.then"] == "1.0"
         assert query["step.3.cases.2.when"] == "value = 2 OR value = 5"
+        assert query["step.4.cases.1.when"] == "scenario_id = 34"
+        assert query["step.4.cases.1.then"] == "value * 0.085"
 
 
 # ------------------------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from cpra.mp.data.analysis.request.expressions import PredicateKind
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
     PROJECT_LOWERING_TABLE,
-    CalculateOp,
+    CaseOp,
     FilterOp,
     GroupOp,
     JoinOp,
@@ -434,7 +434,9 @@ class TestCompileOps:
             }
         )
         ops = compile_ops(pipeline)
-        assert [type(op) for op in ops] == [ProjectOp, FilterOp, CalculateOp, GroupOp]
+        # `calculate` has no op of its own: `compile_ops` lowers it to an arm-less `CaseOp`.
+        assert [type(op) for op in ops] == [ProjectOp, FilterOp, CaseOp, GroupOp]
+        assert ops[2].cases == [] and ops[2].else_ == "value * 2"
         assert ops[0].output == "p"
         assert ops[0].input == "a"
         # steps 2-4 gave no `as` -- default output names are the step's own position.
@@ -689,15 +691,21 @@ class TestCaseShapeTyping:
         types = self._types(self._spec(f"{DOMAIN_COLUMN} > 0", paired=True))
         assert types["c"].value_columns == frozenset({"value"})
 
-    def test_a_dimension_arm_is_rejected(self):
-        with pytest.raises(ShapeError, match="state that as a filter instead"):
-            self._types(self._spec("calendar_year = 2030"))
+    def test_a_dimension_arm_is_accepted_and_still_collapses_to_one_value_column(self):
+        """A dimension conjunct selects which BANDS the arm applies to, which is a
+        selection the execution layer makes against the band metadata -- shape typing has
+        no metadata and so has nothing to say about it beyond the one value column every
+        `case` produces. That the named column exists is checked at execution.
+        """
+        types = self._types(self._spec("calendar_year = 2030"))
+        assert types["c"].shape is Shape.band_wide
+        assert types["c"].value_columns == frozenset({"value"})
 
     def test_a_spatial_arm_is_rejected(self):
         with pytest.raises(ShapeError, match="state that as a filter instead"):
             self._types(self._spec("grid_cell = 7"))
 
-    def test_the_rejection_names_the_arm_and_the_namespace_it_missed(self):
+    def test_the_spatial_rejection_names_the_arm_and_the_conjunct(self):
         spec = {
             "inputs": {"r": raster_input()},
             "steps": [
@@ -706,7 +714,7 @@ class TestCaseShapeTyping:
                     "input": "r",
                     "cases": [
                         {"when": "value > 1", "then": "1"},
-                        {"when": "value > 0 AND calendar_year = 2030", "then": "2"},
+                        {"when": "value > 0 AND grid_cell = 7", "then": "2"},
                     ],
                 }
             ],
@@ -714,7 +722,7 @@ class TestCaseShapeTyping:
         }
         # The second arm, and only its offending conjunct -- the `value > 0` half of the
         # same `when` is fine and is not reported.
-        with pytest.raises(ShapeError, match=r"arm 2's when=.*\['calendar_year = 2030'\]"):
+        with pytest.raises(ShapeError, match=r"arm 2's when=.*\['grid_cell = 7'\]"):
             self._types(spec)
 
 

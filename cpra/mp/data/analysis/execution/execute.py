@@ -29,7 +29,7 @@ a table names that the walk cannot run. That equality is what makes a lowering t
 widening (a new grid kind, a new predicate combination) a test failure rather than a
 run-time surprise -- whoever widens the table has to wire the executor in the same change.
 
-`calculate` and `group` have no lowering table of their own -- `request/ops.py` types both
+`case` and `group` have no lowering table of their own -- `request/ops.py` types both
 as unconditionally shape-preserving, in code rather than as data -- so their entries below
 are declared directly against `Shape`'s two members. There is no table for them to drift
 from.
@@ -114,7 +114,7 @@ SAME read the data bands come from, under `project.ZONE_COLUMN`. That is what le
 `project.project_raster_to_vector` read the crosswalk off the identical, already-processed
 `lf` every other band-wide lowering between the origin and the `project` step has been
 reading and writing, rather than re-scanning raw pixels from disk on its own and silently
-discarding whatever an upstream `filter`/`calculate` did (`project.py`'s module docstring
+discarding whatever an upstream `filter`/`case` did (`project.py`'s module docstring
 gives the measured cost of combining two independently-chunked reads positionally, which
 applies here just the same, plus the correctness cost of a second, independent read simply
 not reflecting upstream work at all). `extra_columns`, threaded through every band-wide
@@ -245,10 +245,6 @@ def _run_filter(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
     return long_ops.filter_long(frames[op.input], op.where, frame_types[op.input].value_columns)
 
 
-def _run_calculate(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
-    return long_ops.calculate_long(frames[op.input], op, frame_types[op.input].value_columns)
-
-
 def _run_case(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
     return long_ops.case_long(frames[op.input], op, frame_types[op.input].value_columns)
 
@@ -308,12 +304,6 @@ def _run_filter_band_wide(
     if extra_columns and frame_types[op.output].shape is Shape.long:
         return result.drop(list(extra_columns))
     return result
-
-
-def _run_calculate_band_wide(
-    frames: dict[str, BandWideFrame], op, frame_types, extra_columns: tuple[str, ...]
-) -> BandWideFrame:
-    return band_ops.calculate_band_wide(frames[op.input], op, extra_columns=extra_columns)
 
 
 def _run_case_band_wide(
@@ -390,21 +380,21 @@ def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_ty
 #
 # `frame_types` is the plan's whole name -> `FrameType` map rather than just the incoming
 # operand's, so that the signature stays the same for `join` (several operands) as for the
-# rest. `_run_calculate`/`_run_calculate_band_wide` read it for the incoming frame's value
-# columns (long) or to know which bands a `where` applies to (band-wide, via the frame
-# itself rather than `frame_types`); the two `project` entries read it for the incoming
+# rest. `_run_case`/`_run_case_band_wide` read it for the incoming frame's value columns,
+# which is what picks between a per-row/per-band map and a reduce over a join's pairs; the
+# two `project` entries read it for the incoming
 # frame's CURRENT grid (`current.grid`, not the pipeline input's own declared grid --
 # `request.ops.FrameType`'s own docstring is where that distinction is spelled out), which
 # is the other half of which crosswalk to open. Handing `frame_types` to every entry is
 # what keeps this a registry rather than differently-shaped callables the loop would have
 # to tell apart.
 #
-# The five `Shape.band_wide` non-project entries below are placeholders in THIS module-
+# The four `Shape.band_wide` non-project entries below are placeholders in THIS module-
 # level dict -- `execute` never calls them directly. They also need `extra_columns` (the
 # non-band columns, a crosswalk zone id notably, `op.input`'s frame is carrying; see the
 # module docstring), which is per-EXECUTION state, not something a module-level constant
 # dict can hold. `_bind_band_wide_lowerings` below builds the real, per-`execute()`-call
-# registry by overriding just these five entries with closures bound over that call's own
+# registry by overriding just these four entries with closures bound over that call's own
 # `extra_columns` dict. It overrides the vector-to-raster `project` entry too, over a
 # second piece of the same per-execution state (that call's crosswalk reads, keyed by step
 # number -- see that function), which is why the value registered here for it is likewise a
@@ -414,8 +404,6 @@ def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_ty
 _LOWERINGS: dict[tuple[str, object], object] = {
     ("filter", Shape.long): _run_filter,
     ("filter", Shape.band_wide): _run_filter_band_wide,
-    ("calculate", Shape.long): _run_calculate,
-    ("calculate", Shape.band_wide): _run_calculate_band_wide,
     ("case", Shape.long): _run_case,
     ("case", Shape.band_wide): _run_case_band_wide,
     ("group", Shape.long): _run_group,
@@ -433,7 +421,7 @@ def _bind_band_wide_lowerings(
     zone_sources: dict[int, project.ZoneSource],
     vector_band_metadata: dict[int, pl.DataFrame],
 ) -> dict[tuple[str, object], object]:
-    """The real registry for one `execute()` call: `_LOWERINGS` with its five
+    """The real registry for one `execute()` call: `_LOWERINGS` with its four
     `Shape.band_wide` non-project entries overridden by closures bound over this call's own
     `extra_columns` -- see `_LOWERINGS`'s own comment for why they cannot simply be module-
     level constants the way every other entry is.
@@ -460,9 +448,6 @@ def _bind_band_wide_lowerings(
         )
     )
     lowerings[("filter", Shape.band_wide)] = lambda frames, op, frame_types: _run_filter_band_wide(
-        frames, op, frame_types, extra_columns.get(op.input, ())
-    )
-    lowerings[("calculate", Shape.band_wide)] = lambda frames, op, frame_types: _run_calculate_band_wide(
         frames, op, frame_types, extra_columns.get(op.input, ())
     )
     lowerings[("case", Shape.band_wide)] = lambda frames, op, frame_types: _run_case_band_wide(
@@ -502,7 +487,7 @@ def _output_extra_columns(
     each named column from the first operand that has it. Order follows `op.inputs` so the
     result is deterministic.
 
-    Everything else INHERITS its first operand's, unchanged -- a `filter`/`calculate`/
+    Everything else INHERITS its first operand's, unchanged -- a `filter`/`case`/
     `group` passes its carried columns through, and none of them invents one.
     """
     if isinstance(op, ProjectOp) and project_direction(frame_types[op.input], op.to) == ("vector", "raster"):
@@ -637,7 +622,7 @@ def _point_sample_reads(plan: ExecutionPlan) -> dict[str, list[int]]:
       approximate. The long lowering the walk will dispatch to applies `op.where` to
       whatever frame it is handed; the point reader's frame holds only the named pixels.
       Those two agree only if nothing ran in between -- an intervening
-      `calculate`/`group`/`join` would have run against every pixel of the bounding box on
+      `case`/`group`/`join` would have run against every pixel of the bounding box on
       the old path and against three on this one, and for a `group` in particular those are
       different answers. `point_sample_step` is recorded through a chain of ops that left
       the origin's pixels alone, so it can point at a filter one or more steps downstream;

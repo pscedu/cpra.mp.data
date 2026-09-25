@@ -189,7 +189,7 @@ def _resolve_write_dtype(df: pl.DataFrame, band_names: list[str], dtype: str | N
     caller did not pass one explicitly.
 
     A `BandWideFrame`'s band columns are not guaranteed to share one Polars dtype -- a
-    `calculate` can rewrite one band's values to a type the others never touch, and
+    `case` arm can rewrite one band's values to a type the others never touch, and
     `execution.band_ops`'s own module docstring notes this directly. A single GeoTIFF, by
     contrast, has exactly one dtype for every band in the file (`rasterio`'s `dtype=`
     profile key is scalar, not per-band). When every surviving band happens to still

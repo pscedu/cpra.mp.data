@@ -102,7 +102,7 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
 
 
 def is_filterable_dimension(name: str) -> bool:
-    """Is `name` a real dimension a pipeline's `filter`/`calculate` `where` may reference
+    """Is `name` a real dimension a pipeline's `filter.where`/`case` arm `when` may reference
     -- i.e. neither `dataset`-typed (`variable`/`time_unit`/`grid` themselves, which
     select the input rather than filter it) nor `metadata`-typed. Mirrors
     `request.parameters.BaseFilterDimensions`'s own field set, but reads `DIMENSIONS`
@@ -140,7 +140,7 @@ def normalized_filter_values(dimension: str, raw: Any) -> list[Any]:
 
 def format_dimension_literal(dimension: str, value: Any) -> str:
     """Render `value` as a SQL literal for `dimension`, for interpolating into a pipeline
-    step's `where`/`calculate.where` string -- the Python equivalent of the portal's own
+    step's `where`/`when` string -- the Python equivalent of the portal's own
     `sqlValue()` helper (`cpra-mp-ui/src/helpers/utils.ts`): a numeric dimension's value is
     unquoted, `calendar_day` gets a `'...'::date` cast, and every other (string) dimension
     is single-quoted (with `'` doubled, defensively, even though no real dimension value

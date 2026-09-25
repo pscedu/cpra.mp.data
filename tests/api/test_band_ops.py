@@ -16,7 +16,6 @@ from rasterio.transform import Affine
 
 from cpra.mp.data.analysis.execution.band_ops import (
     JOIN_OPERAND_COLUMN,
-    calculate_band_wide,
     case_band_wide,
     filter_band_wide,
     group_band_wide,
@@ -34,7 +33,7 @@ from cpra.mp.data.analysis.execution.frame import (
 )
 from cpra.mp.data.analysis.execution.long_ops import filter_long, join_long
 from cpra.mp.data.analysis.request.expressions import ExpressionError
-from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp
 from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
@@ -386,7 +385,7 @@ class TestHeightAndWindowPreserved:
     unchanged. No lowering asserts this on itself -- `assert_height_preserved` collects
     both frames, so an inline call would be two full raster reads per op (see its
     docstring) -- which makes this class the only place the invariant is checked at all,
-    for value filter, dimension filter (the non-empty case), calculate, group (the
+    for value filter, dimension filter (the non-empty case), case, group (the
     non-empty case), and join. The dimension filter's empty-result case and the spatial
     filter are the two lowerings this invariant does not apply to -- see
     `TestSelectDimensionBandWide.test_no_matching_band_returns_empty_band_wide` and
@@ -407,10 +406,32 @@ class TestHeightAndWindowPreserved:
         assert out_lf.collect().height == 2
         assert window == band_wide[2]
 
-    def test_calculate(self):
+    def test_case(self):
         band_wide = _two_band_fixture()
-        op = CalculateOp(step_no=1, input="x", expression="value * 2", output="y")
-        out_lf, _metadata, window = calculate_band_wide(band_wide, op, extra_columns=[])
+        op = CaseOp(step_no=1, input="x", cases=[], else_="value * 2", output="y")
+        out_lf, _metadata, window = case_band_wide(band_wide, op, extra_columns=[])
+        assert out_lf.collect().height == 3
+        assert window == band_wide[2]
+
+    def test_case_whose_every_band_compiles_to_a_scalar(self):
+        """The one shape that can lose the row count without anyone noticing: a `when` that
+        is purely dimensional and a `then`/`else` that are constants leave an expression
+        with no column reference in it, whose natural length is one. `_select_band_exprs`
+        broadcasts it back to the window's height; a plain `select` would answer one row.
+        """
+        band_wide = _two_band_fixture()
+        op = _case_op(("calendar_year = 2035", "6"), else_="0")
+        out_lf, _metadata, window = case_band_wide(band_wide, op, extra_columns=[])
+        assert out_lf.collect().height == 3
+        assert window == band_wide[2]
+
+    def test_case_with_no_matching_band_and_no_else(self):
+        # The same hazard at its emptiest: every arm dropped out and there is no `else`, so
+        # the expression is a bare `pl.lit(None)`.
+        band_wide = _two_band_fixture()
+        out_lf, _metadata, window = case_band_wide(
+            band_wide, _case_op(("calendar_year = 1900", "6")), extra_columns=[]
+        )
         assert out_lf.collect().height == 3
         assert window == band_wide[2]
 
@@ -550,49 +571,46 @@ class TestFilterBandWide:
         assert out_metadata.is_empty()
 
 
-class TestCalculateBandWide:
-    def test_applies_where_matched_bands_only_and_passes_through_others(self):
+class TestLoweredCalculateBandWide:
+    """What `compile_ops` turns a `calculate` into band-wide: a `case` with no arms, whose
+    `else` is the expression. Every band gets it, unconditionally -- there is no `where`
+    to make it selective, which is the whole of the difference from what `calculate`
+    used to be.
+    """
+
+    def _calculate(self, expression):
+        return CaseOp(step_no=1, input="x", cases=[], else_=expression, output="y")
+
+    def test_applies_to_every_band(self):
         lf = pl.LazyFrame({"b0": [1, 2], "b1": [3, 4]})
         metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         band_wide = (lf, metadata_df, _window(height=2))
-        op = CalculateOp(
-            step_no=1, input="x", expression="value * 10", where="calendar_year = 2021", output="y"
-        )
 
-        out_lf, out_metadata, _window_out = calculate_band_wide(band_wide, op, extra_columns=[])
+        out_lf, out_metadata, _window_out = case_band_wide(
+            band_wide, self._calculate("value * 10"), extra_columns=[]
+        )
         result = out_lf.collect()
 
-        assert result["b0"].to_list() == [1, 2]  # band for 2020: entry does not apply, unchanged
-        assert result["b1"].to_list() == [30, 40]  # band for 2021: rewritten
+        assert result["b0"].to_list() == [10, 20]
+        assert result["b1"].to_list() == [30, 40]
         assert out_metadata.equals(metadata_df)
 
-    def test_value_where_masks_within_an_applicable_band(self):
-        lf = pl.LazyFrame({"b0": [1, 10]})
-        metadata_df = pl.DataFrame({"calendar_year": [2020]})
-        band_wide = (lf, metadata_df, _window(height=2))
-        op = CalculateOp(
-            step_no=1, input="x", expression="value * 10", where="value > 5", output="y"
-        )
-        out_lf, _metadata, _window_out = calculate_band_wide(band_wide, op, extra_columns=[])
-        result = out_lf.collect()
-        assert result["b0"].to_list() == [1, 100]  # only the pixel satisfying value > 5 is rewritten
-
-    def test_extra_columns_reachable_from_the_expression_not_only_the_mask(self):
-        # The mask and the rewritten value share one namespace; a version that widened
-        # only the mask's would raise here rather than produce a number.
+    def test_extra_columns_reachable_from_the_expression(self):
         lf = pl.LazyFrame({"b0": [1, 2], "zone_factor": [10, 100]})
         metadata_df = pl.DataFrame({"calendar_year": [2020]})
         band_wide = (lf, metadata_df, _window(height=2))
-        op = CalculateOp(step_no=1, input="x", expression="value * zone_factor", output="y")
-        out_lf, _metadata, _window_out = calculate_band_wide(band_wide, op, extra_columns=["zone_factor"])
+        out_lf, _metadata, _window_out = case_band_wide(
+            band_wide, self._calculate("value * zone_factor"), extra_columns=["zone_factor"]
+        )
         assert out_lf.collect()["b0"].to_list() == [10, 200]
 
     def test_nodata_stays_nodata(self):
         lf = pl.LazyFrame({"b0": [1, None]})
         metadata_df = pl.DataFrame({"calendar_year": [2020]})
         band_wide = (lf, metadata_df, _window(height=2))
-        op = CalculateOp(step_no=1, input="x", expression="value + 1", output="y")
-        out_lf, _metadata, _window_out = calculate_band_wide(band_wide, op, extra_columns=[])
+        out_lf, _metadata, _window_out = case_band_wide(
+            band_wide, self._calculate("value + 1"), extra_columns=[]
+        )
         assert out_lf.collect()["b0"].to_list() == [2, None]
 
 
@@ -664,13 +682,17 @@ class TestCaseBandWideUnpaired:
         assert case_band_wide(band_wide, _case_op(("value > 0", "1")), extra_columns=[]) is band_wide
 
 
-class TestCaseAgreesWithTheCalculateChainItReplaced:
+class TestCaseAgreesWithTheRewriteChainItReplaced:
     """`lnd-type-plus` stated its depth reclassification as a value `filter` plus four
-    `calculate`s, the middle two writing NEGATIVE codes so no later entry's domain could
-    re-match a cell an earlier one had claimed, and the fourth flipping them back. That is
-    now one `case`. Both formulations are built here and run against the same band, so
-    this test independently confirms they agree -- sign trick included -- rather than
-    pinning whatever the new one happens to produce.
+    successive conditional rewrites, the middle two writing NEGATIVE codes so no later
+    entry's domain could re-match a cell an earlier one had claimed, and the fourth
+    flipping them back. That is now one `case`. Both formulations are built here and run
+    against the same band, so this test independently confirms they agree -- sign trick
+    included -- rather than pinning whatever the new one happens to produce.
+
+    The chain is spelled as four one-arm `case`s (`else: "value"` for the pass-through
+    each rewrite left implicit), which is the only spelling left for it: a `calculate` is
+    unconditional now, so a chain of `calculate`s could not state this at all.
     """
 
     # The depths either side of each class bound, plus the domain floor and a nodata
@@ -692,10 +714,14 @@ class TestCaseAgreesWithTheCalculateChainItReplaced:
             ("value * -1", "value < 0"),
         ]
         for step_no, (expression, where) in enumerate(entries, start=2):
-            op = CalculateOp(
-                step_no=step_no, input="x", expression=expression, where=where, output="y"
+            op = CaseOp(
+                step_no=step_no,
+                input="x",
+                cases=[CaseWhen(when=where, then=expression)],
+                else_="value",
+                output="y",
             )
-            band_wide = calculate_band_wide(band_wide, op, extra_columns=[])
+            band_wide = case_band_wide(band_wide, op, extra_columns=[])
         return band_wide[0].collect()["b0"].to_list()
 
     def _new(self):
@@ -710,6 +736,165 @@ class TestCaseAgreesWithTheCalculateChainItReplaced:
         # Stated independently of both implementations, so the test above cannot pass by
         # the two agreeing on a wrong answer.
         assert self._new() == [6.0, 6.0, 7.0, 7.0, 0.0, 0.0, None, None, None]
+
+
+class TestCaseBandWideDimensionArms:
+    """The band-wide reading of a dimension conjunct in a `when`, which is where it means
+    something a value conjunct cannot: it selects which BANDS the arm applies to. An arm a
+    band's metadata excludes is not in that band's chain at all -- the band falls to
+    whichever later arm does apply, or to the `else`. So the arms may disagree about which
+    bands they claim, which no per-pixel mask could express, since band identity is
+    metadata and not a column of the data.
+    """
+
+    def _fixture(self):
+        # b0 is 2020's band, b1 is 2021's. Two pixels each.
+        lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [3.0, 4.0]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
+        return lf, metadata_df, _window(height=2)
+
+    def test_a_dimension_only_arm_claims_its_bands_entirely(self):
+        # Nothing per-pixel is left to test once the band is selected, so the arm matches
+        # the whole band -- and 2020's band, which the arm excludes, takes the `else`.
+        op = _case_op(("calendar_year = 2021", "value * 10"), else_="value")
+        out_lf, out_metadata, _window_out = case_band_wide(self._fixture(), op, extra_columns=[])
+        result = out_lf.collect()
+        assert result["b0"].to_list() == [1.0, 2.0]
+        assert result["b1"].to_list() == [30.0, 40.0]
+        # A `case` is a map here, not a reduce: the band count and the metadata are the
+        # frame's own, unchanged.
+        assert out_metadata["calendar_year"].to_list() == [2020, 2021]
+
+    def test_an_excluded_arm_leaves_a_later_arm_reachable(self):
+        """The behavior an arm-level rule buys that a band-level one could not. `filter`'s
+        band selection drops the BAND; an arm's drops only the arm, so 2020's band goes on
+        to the second arm rather than skipping the step.
+        """
+        op = _case_op(("calendar_year = 2021", "1"), ("value > 1", "2"), else_="0")
+        result = case_band_wide(self._fixture(), op, extra_columns=[])[0].collect()
+        assert result["b0"].to_list() == [0.0, 2.0]  # 2020: arm 1 excluded, arm 2 applies
+        assert result["b1"].to_list() == [1.0, 1.0]  # 2021: arm 1 claims the whole band
+
+    def test_a_mixed_arm_ands_the_band_selection_with_the_pixel_mask(self):
+        op = _case_op(("calendar_year = 2021 AND value > 3", "1"), else_="0")
+        result = case_band_wide(self._fixture(), op, extra_columns=[])[0].collect()
+        assert result["b0"].to_list() == [0.0, 0.0]
+        assert result["b1"].to_list() == [0.0, 1.0]
+
+    def test_a_band_every_arm_excludes_falls_to_the_else(self):
+        op = _case_op(("calendar_year = 2021", "1"))
+        result = case_band_wide(self._fixture(), op, extra_columns=[])[0].collect()
+        # No `else` either, so what is left is the null an unmatched cell always gets.
+        assert result["b0"].to_list() == [None, None]
+        assert result["b1"].to_list() == [1.0, 1.0]
+
+    def test_arms_partition_the_bands(self):
+        """The ensemble-weighting shape (`analyses/land_type_confidence.py`): one arm per
+        member, each naming only its own dimension value, and no `else` because between
+        them the arms name every band the frame has.
+        """
+        op = _case_op(("calendar_year = 2020", "value * 0.25"), ("calendar_year = 2021", "value * 0.75"))
+        result = case_band_wide(self._fixture(), op, extra_columns=[])[0].collect()
+        assert result["b0"].to_list() == [0.25, 0.5]
+        assert result["b1"].to_list() == [2.25, 3.0]
+
+    def test_a_band_that_does_not_carry_the_dimension_fails_the_arm(self):
+        """A null in the metadata is `fill_null(False)`, so the arm does not apply --
+        rather than the comparison going null and the band matching by accident.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0]})
+        metadata_df = pl.DataFrame({"calendar_year": [2020, None]}, schema={"calendar_year": pl.Int64})
+        op = _case_op(("calendar_year = 2020", "10"), else_="0")
+        result = case_band_wide((lf, metadata_df, _window(height=1)), op, extra_columns=[])[0].collect()
+        assert result["b0"].to_list() == [10.0]
+        assert result["b1"].to_list() == [0.0]
+
+    def test_a_dimension_the_metadata_does_not_carry_is_an_error(self):
+        op = _case_op(("scenario_id = 34", "1"))
+        with pytest.raises(Exception, match="scenario_id"):
+            case_band_wide(self._fixture(), op, extra_columns=[])[0].collect()
+
+
+class TestCaseBandWidePairedDimensionArms:
+    """A dimension arm over a PAIRED frame. The pairing has already reduced 2N bands to N,
+    so the arm is evaluated against one metadata row per PAIR -- built by coalescing the
+    pair's own operand rows, since a band-wide pair has no single metadata row of its own.
+    """
+
+    def _fixture(self):
+        # marsh b0/b1 and sal b2/b3, paired on calendar_year. `variable` differs per
+        # operand and so is not a pairing key.
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0], "b2": [10.0], "b3": [20.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2040, 2030, 2040],
+                "variable": ["marsh_var", "marsh_var", "sal_var", "sal_var"],
+                JOIN_OPERAND_COLUMN: ["marsh", "marsh", "sal", "sal"],
+            }
+        )
+        return lf, metadata_df, _window(height=1)
+
+    def test_a_pairing_key_selects_the_pair_it_names(self):
+        op = _case_op(("calendar_year = 2030", "marsh + sal"), else_="marsh")
+        out_lf, out_metadata, _window_out = case_band_wide(
+            self._fixture(), op, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        result = out_lf.collect()
+        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert result["b0"].to_list() == [11.0]  # 2030's pair: the arm applies
+        assert result["b1"].to_list() == [2.0]  # 2040's pair: the `else`, marsh alone
+
+    def test_a_non_key_column_is_coalesced_from_whichever_operand_carries_it(self):
+        """`variable` is not a pairing key -- the operands disagree on it by construction.
+        An arm may still name it when only ONE operand's row carries it, since then there
+        is exactly one value for the pair to have.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [10.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2030],
+                "aggregate_type": ["mean", None],
+                JOIN_OPERAND_COLUMN: ["marsh", "sal"],
+            }
+        )
+        op = _case_op(("aggregate_type = 'mean'", "marsh + sal"), else_="marsh")
+        out_lf, _metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=1)), op, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        assert out_lf.collect()["b0"].to_list() == [11.0]
+
+    def test_operands_disagreeing_on_a_non_key_column_is_an_error(self):
+        """Three operands, two of which carry `aggregate_type` DIFFERENTLY: the pair has no
+        single value, so an arm naming it would mean two things at once. Refused rather
+        than resolved by operand order, which would be an answer that depended on the
+        join's argument order.
+        """
+        lf = pl.LazyFrame({"b0": [1.0], "b1": [10.0], "b2": [100.0]})
+        metadata_df = pl.DataFrame(
+            {
+                "calendar_year": [2030, 2030, 2030],
+                "aggregate_type": ["mean", "max", None],
+                JOIN_OPERAND_COLUMN: ["marsh", "sal", "elev"],
+            }
+        )
+        op = _case_op(("aggregate_type = 'mean'", "marsh"), else_="sal")
+        with pytest.raises(ExpressionError, match="conflicting values.*aggregate_type|aggregate_type.*conflicting"):
+            case_band_wide(
+                (lf, metadata_df, _window(height=1)),
+                op,
+                extra_columns=[],
+                value_columns=("marsh", "sal", "elev"),
+            )
+
+    def test_a_pair_every_arm_excludes_still_produces_its_band(self):
+        # Arm-level, not band-level: the pair survives the reduce and takes the `else`,
+        # rather than being dropped the way a `filter` would drop it.
+        op = _case_op(("calendar_year = 2050", "marsh + sal"), else_="sal")
+        out_lf, out_metadata, _window_out = case_band_wide(
+            self._fixture(), op, extra_columns=[], value_columns=("marsh", "sal")
+        )
+        assert out_metadata["calendar_year"].to_list() == [2030, 2040]
+        assert out_lf.collect().row(0) == (10.0, 20.0)
 
 
 class TestCaseBandWidePaired:
@@ -1059,23 +1244,24 @@ class TestJoinBandWide:
             join_band_wide([a, b], ["a"], extra_columns=[])
 
 
-class TestSpatialFilterCommutesWithCalculateAndGroup:
-    """A spatial (`grid_cell`) conjunct, sitting after a `calculate` and a `group` in the
+class TestSpatialFilterCommutesWithCaseAndGroup:
+    """A spatial (`grid_cell`) conjunct, sitting after a `case` and a `group` in the
     same band-wide chain, is a candidate for a compile-time pushdown marker that names the
     conjunct's own step rather than one nearer the read -- but only if restricting the
-    frame to one pixel BEFORE running the `calculate`/`group` in front of it would produce
+    frame to one pixel BEFORE running the `case`/`group` in front of it would produce
     the identical answer running them over the whole window and picking that pixel out
-    afterward does. `calculate_band_wide` acts one pixel at a time (nothing about its
+    afterward does. `case_band_wide` acts one pixel at a time (nothing about its
     `pl.when(...).then(...)` reads across rows) and `group_band_wide` reduces HORIZONTALLY
     across a row's own bands (nothing about `sum_horizontal` reads across rows either) --
     so neither op has any way to make one pixel's output depend on another pixel's input,
     which is exactly the property this test checks with concrete, hand-computed numbers
     rather than assuming it from the two lowerings' docstrings alone.
 
-    2 pixels, 2 bands, no nulls: `b0 = [10, 100]`, `b1 = [1, 5]`. `calculate` adds 1 to
-    every band unconditionally (`value + 1`); `group` collapses both bands into one via an
-    unweighted horizontal sum (`by=[]`, `aggregate="sum"`). Worked by hand for pixel 1
-    (`grid_cell = 1`, the second row): post-calculate `b0 = 101`, `b1 = 6`; post-group
+    2 pixels, 2 bands, no nulls: `b0 = [10, 100]`, `b1 = [1, 5]`. The `case` is a lowered
+    `calculate` -- no arms, `else` `value + 1` -- so it adds 1 to every band
+    unconditionally; `group` collapses both bands into one via an unweighted horizontal
+    sum (`by=[]`, `aggregate="sum"`). Worked by hand for pixel 1 (`grid_cell = 1`, the
+    second row): post-`case` `b0 = 101`, `b1 = 6`; post-group
     `b0 = 101 + 6 = 107`.
     """
 
@@ -1086,10 +1272,10 @@ class TestSpatialFilterCommutesWithCalculateAndGroup:
 
     def test_full_window_then_pick_one_pixel_matches_hand_computed_value(self):
         band_wide = self._fixture()
-        calculate_op = CalculateOp(step_no=1, input="x", expression="value + 1", output="c")
+        calculate_op = CaseOp(step_no=1, input="x", cases=[], else_="value + 1", output="c")
         group_op = GroupOp(step_no=2, input="c", by=[], aggregate="sum", output="g")
 
-        calculated = calculate_band_wide(band_wide, calculate_op, extra_columns=[])
+        calculated = case_band_wide(band_wide, calculate_op, extra_columns=[])
         grouped = group_band_wide(calculated, group_op, extra_columns=[])
         long_result = sample_grid_cells_band_wide(
             grouped, "grid_cell = 1", extra_columns=[], grid_width=grouped[2].width
@@ -1101,7 +1287,7 @@ class TestSpatialFilterCommutesWithCalculateAndGroup:
     def test_picking_the_pixel_first_matches_the_same_hand_computed_value(self):
         """The pushdown candidate itself: restrict to `grid_cell = 1` FIRST -- as compile-
         time pushdown would, if it read only that one pixel from disk -- then run the
-        identical `calculate`/`group` over just that one-row frame. No executor wires this
+        identical `case`/`group` over just that one-row frame. No executor wires this
         up (this module composes the lowerings by hand, exactly as a real one eventually
         would), but the two results below being equal is the concrete fact that justifies
         marking the spatial conjunct's own step as pushable rather than forcing the read
@@ -1111,10 +1297,10 @@ class TestSpatialFilterCommutesWithCalculateAndGroup:
         one_pixel_lf = row_major_grid_cell(lf, window).filter(pl.col("grid_cell") == 1).drop("grid_cell")
         one_pixel = (one_pixel_lf, metadata_df, dataclasses.replace(window, height=1))
 
-        calculate_op = CalculateOp(step_no=1, input="x", expression="value + 1", output="c")
+        calculate_op = CaseOp(step_no=1, input="x", cases=[], else_="value + 1", output="c")
         group_op = GroupOp(step_no=2, input="c", by=[], aggregate="sum", output="g")
 
-        calculated = calculate_band_wide(one_pixel, calculate_op, extra_columns=[])
+        calculated = case_band_wide(one_pixel, calculate_op, extra_columns=[])
         grouped = group_band_wide(calculated, group_op, extra_columns=[])
         result = grouped[0].collect()
 

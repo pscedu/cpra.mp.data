@@ -21,6 +21,12 @@ value-domain `filter` drops anything outside `1`-`5` (nodata included) so an unm
 can never reach the weighted sum as itself; the `case` has no `else` for the same reason,
 and the two agree on which codes mean anything here.
 
+The weighting is a second `case`, one arm per member, each arm's `when` naming only that
+member's `scenario_id`. A dimension-only `when` selects which bands (or rows) the arm
+applies to, so the five arms partition the frame the way `SCENARIO_WEIGHTS` does and the
+whole ensemble is scaled in one step; it too has no `else`, since the leading `filter`
+pinned `scenario_id` to exactly these five and there is no sixth member to pass through.
+
 A cell that is nodata in only SOME members is summed over the members it has, so its
 weights no longer total `1.0` and its confidence reads low rather than being rescaled to
 the members that actually reported. That is the arithmetic `group`/`sum` gives; a
@@ -111,13 +117,25 @@ class LandTypeConfidence(Analysis):
                 ],
             },
         ]
-        steps.extend(
+        # The ensemble weights, one arm per member: each arm's `when` is purely dimensional,
+        # so it picks out that member's bands (or rows) and scales all of them. One `case`
+        # rather than N successive rewrites because the members partition the frame -- the
+        # leading `filter` pinned `scenario_id` to exactly `SCENARIO_WEIGHTS`' keys -- and
+        # arms say that directly, where a chain would only be correct because each step's
+        # `where` happened to miss what the ones before it had already written. No `else`
+        # for the same reason: nothing reaches it, and writing a pass-through would be
+        # claiming there is an unweighted member.
+        steps.append(
             {
-                "op": "calculate",
-                "expression": f"value * {weight}",
-                "where": f"scenario_id = {format_dimension_literal('scenario_id', scenario_id)}",
+                "op": "case",
+                "cases": [
+                    {
+                        "when": f"scenario_id = {format_dimension_literal('scenario_id', scenario_id)}",
+                        "then": f"value * {weight}",
+                    }
+                    for scenario_id, weight in sorted(SCENARIO_WEIGHTS.items())
+                ],
             }
-            for scenario_id, weight in sorted(SCENARIO_WEIGHTS.items())
         )
         steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
         # A pipeline's first step must name its input explicitly; every later step chains

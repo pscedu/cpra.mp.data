@@ -918,9 +918,11 @@ class TestProjectOnlyReaggregation:
 # --------------------------------------------------------------------------------------
 
 
-class TestCalculateStepEndToEnd:
-    """The `calculate` op through all three request encodings (POST JSON, dotted GET,
-    tile route), plus the flat-request equivalence.
+class TestWeightedCaseEndToEnd:
+    """The per-dimension weighting idiom -- one `case` arm per year -- through all three
+    request encodings (POST JSON, dotted GET, tile route), plus the flat-request
+    equivalence. This is the shape `analyses/land_type_confidence.py` uses, and the one a
+    chain of `calculate`s used to spell before `calculate` became unconditional.
 
     A raw input's value column is always literally `"value"`, never its own dict key, so
     every expression below references `"value"`.
@@ -929,8 +931,14 @@ class TestCalculateStepEndToEnd:
     WEIGHTED_PIPELINE = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
         "steps": [
-            {"op": "calculate", "input": "eco", "expression": "value * 0.5", "where": "calendar_year = 2030"},
-            {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+            {
+                "op": "case",
+                "input": "eco",
+                "cases": [
+                    {"when": "calendar_year = 2030", "then": "value * 0.5"},
+                    {"when": "calendar_year = 2040", "then": "value * 0.25"},
+                ],
+            },
             {"op": "group", "by": [], "aggregate": "sum"},
         ],
         "output": {"format": "csv"},
@@ -962,17 +970,23 @@ class TestCalculateStepEndToEnd:
         assert get_df.equals(post_df)
 
     def test_tile_route(self, client, base_path, monkeypatch):
-        """A raster single-input chain with calculate steps, rendered on the analysis
-        tile route: bands weighted 0.5/0.25 and collapsed to the single band a tile
-        requires."""
+        """A raster single-input chain with a weighting `case`, rendered on the analysis
+        tile route: each arm selects the BAND its year names, and the two weighted bands
+        collapse to the single band a tile requires."""
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
         pipeline = {
             "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
             "steps": [
-                {"op": "calculate", "input": "vct", "expression": "value * 0.5", "where": "calendar_year = 2030"},
-                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {
+                    "op": "case",
+                    "input": "vct",
+                    "cases": [
+                        {"when": "calendar_year = 2030", "then": "value * 0.5"},
+                        {"when": "calendar_year = 2040", "then": "value * 0.25"},
+                    ],
+                },
                 {"op": "group", "by": [], "aggregate": "sum"},
             ],
             "output": {"format": "png"},
@@ -989,9 +1003,9 @@ class TestCalculateStepEndToEnd:
 
     def test_weighted_sum_with_a_grid_cell_filter(self, client, base_path, monkeypatch):
         """The confidence-weighting idiom combined with a `grid_cell` filter. The filter is
-        an ordinary `filter` step (there is no flat spelling for `calculate` anymore, and an
-        input names a dataset rather than filtering one), which doubles as this pipeline's
-        opening step.
+        an ordinary `filter` step (there is no flat spelling for a value rewrite anymore,
+        and an input names a dataset rather than filtering one), which doubles as this
+        pipeline's opening step.
         """
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
@@ -1000,8 +1014,13 @@ class TestCalculateStepEndToEnd:
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
                 {"op": "filter", "input": "ssf", "where": "grid_cell = 1"},
-                {"op": "calculate", "expression": "value * 0.5", "where": "calendar_year = 2030"},
-                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {
+                    "op": "case",
+                    "cases": [
+                        {"when": "calendar_year = 2030", "then": "value * 0.5"},
+                        {"when": "calendar_year = 2040", "then": "value * 0.25"},
+                    ],
+                },
                 {"op": "group", "by": [], "aggregate": "sum"},
             ],
             "output": {"format": "csv"},
@@ -1013,9 +1032,11 @@ class TestCalculateStepEndToEnd:
             2030.01 * 0.5 + 2040.01 * 0.25, rel=1e-5
         )
 
-    def test_non_matching_rows_pass_through_with_no_group_step(self, client, base_path, monkeypatch):
-        """Rows/bands not matching a `calculate` step's `where` pass through unchanged --
-        `calculate` never drops data, unlike `filter`."""
+    def test_an_else_of_value_passes_the_unnamed_rows_through(self, client, base_path, monkeypatch):
+        """The pass-through a `calculate`'s `where` used to leave implicit, now written:
+        rows no arm names take `else: "value"` and keep what they arrived with. The step
+        still drops nothing -- that is `filter`'s job -- so both years come back.
+        """
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
@@ -1023,7 +1044,11 @@ class TestCalculateStepEndToEnd:
             "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
             "steps": [
                 {"op": "filter", "input": "ssf", "where": "grid_cell = 1"},
-                {"op": "calculate", "expression": "value * 0", "where": "calendar_year = 2030"},
+                {
+                    "op": "case",
+                    "cases": [{"when": "calendar_year = 2030", "then": "value * 0"}],
+                    "else": "value",
+                },
             ],
             "output": {"format": "csv", "sort": "calendar_year"},
         }
@@ -1031,6 +1056,26 @@ class TestCalculateStepEndToEnd:
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["value"].to_list() == pytest.approx([0.0, 2040.01], rel=1e-5)
+
+    def test_without_an_else_the_unnamed_rows_go_null(self, client, base_path, monkeypatch):
+        """The other half of the same choice, and the reason the pass-through has to be
+        written: omitting `else` is not "leave them alone", it is "they have no answer".
+        """
+        write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"ssf": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+            "steps": [
+                {"op": "filter", "input": "ssf", "where": "grid_cell = 1"},
+                {"op": "case", "cases": [{"when": "calendar_year = 2030", "then": "value * 0"}]},
+            ],
+            "output": {"format": "csv", "sort": "calendar_year"},
+        }
+        response = client.post("/v1/analysis.csv", json=pipeline)
+        assert response.status_code == 200, response.text
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df["value"].to_list() == [0.0, None]
 
     def test_weighted_band_sum_on_the_data_route(self, client, base_path, monkeypatch):
         """The same weighted band-sum idiom rendered through the plain (non-tile) `.tif`
@@ -1041,8 +1086,14 @@ class TestCalculateStepEndToEnd:
         pipeline = {
             "inputs": {"vct": {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
             "steps": [
-                {"op": "calculate", "input": "vct", "expression": "value * 0.5", "where": "calendar_year = 2030"},
-                {"op": "calculate", "expression": "value * 0.25", "where": "calendar_year = 2040"},
+                {
+                    "op": "case",
+                    "input": "vct",
+                    "cases": [
+                        {"when": "calendar_year = 2030", "then": "value * 0.5"},
+                        {"when": "calendar_year = 2040", "then": "value * 0.25"},
+                    ],
+                },
                 {"op": "group", "by": [], "aggregate": "sum"},
             ],
             "output": {"format": "tif"},
@@ -1076,14 +1127,19 @@ class TestCalculateStepEndToEnd:
         assert "calculate" in detail
         assert "group_aggregate" in detail
 
-    def test_paired_shape_rejects_calculate(self, client, notebook_query_data):
+    def test_a_calculate_collapses_a_paired_frame(self, client, notebook_query_data):
+        """A `calculate` over a joined frame names the OPERANDS, not `value` -- it is an
+        arm-less `case`, and a `case` over a paired frame is the reduce that collapses the
+        pairing. Inserted ahead of the `case` step, it makes that step's own arms
+        unsatisfiable (`marsh`/`sal` are gone), so what this asserts is the collapse and
+        the 200, not the numbers.
+        """
         pipeline = copy.deepcopy(NOTEBOOK_QUERY)
-        pipeline["steps"].insert(2, {"op": "calculate", "expression": "sal * 0.5"})
+        pipeline["steps"][2] = {"op": "calculate", "expression": "marsh - sal * 0.5"}
         response = client.post("/v1/analysis.tif", json=pipeline)
-        assert response.status_code == 400
-        detail = response.json()["detail"]
-        assert "not yet supported" in detail
-        assert "paired" in detail
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 1
 
 
 # --------------------------------------------------------------------------------------

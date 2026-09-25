@@ -82,11 +82,20 @@ class Difference(Analysis):
         where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
         if where is not None:
             steps.append({"op": "filter", "where": where})
+        # Negate one of the two values and sum: `later - earlier` said as `(-later) +
+        # earlier`, which is what lets the subtraction ride on `group`'s existing `sum`.
+        # `else: "value"` is the pass-through the other value needs -- without it the
+        # non-negated rows would go null and the sum would have nothing to add.
         steps.append(
             {
-                "op": "calculate",
-                "expression": "value * -1",
-                "where": f"{dim} = {format_dimension_literal(dim, negate_value)}",
+                "op": "case",
+                "cases": [
+                    {
+                        "when": f"{dim} = {format_dimension_literal(dim, negate_value)}",
+                        "then": "value * -1",
+                    }
+                ],
+                "else": "value",
             }
         )
         steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
@@ -94,7 +103,7 @@ class Difference(Analysis):
         # from the one before it. The leading `filter` normally carries that name, but a
         # caller invoking `pipeline()` directly with no filters at all (the API path
         # always supplies the two-value `dimension` filter `validate_selection` demands)
-        # leaves the `calculate` first, so the name goes there instead.
+        # leaves the `case` first, so the name goes there instead.
         steps[0]["input"] = "x"
 
         data = {

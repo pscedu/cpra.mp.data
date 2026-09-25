@@ -7,14 +7,18 @@ Two modes, selected by how many `model_group_id` values are selected alongside
 `dimension`'s own two values (see `catalog.ts`'s `threeImage = modelGroupValues.length ===
 2`, NOT `dimension`'s own cardinality -- `dimension` is always exactly 2 for both modes):
 
-* **two-image** (`model_group_id` absent, or selected to exactly 1 value): `calculate`
-  `value * 10` where `dimension = t0` (the earlier of the two selected values), then
-  `group`/`sum` over every other required dimension.
+* **two-image** (`model_group_id` absent, or selected to exactly 1 value): a `case` whose
+  one arm is `value * 10` when `dimension = t0` (the earlier of the two selected values),
+  with `else` `value`, then `group`/`sum` over every other required dimension.
 * **three-image** (`model_group_id` selected to exactly 2 values, `mg0 < mg1`): a `filter`
-  dropping `model_group_id = mg1 AND dimension = t0` (the redundant corner), then
-  `calculate` `value * 100` where `dimension = t0`, then `calculate` `value * 10` where
-  `model_group_id = mg0 AND dimension = t1`, then `group`/`sum` over every other required
-  dimension (excluding `model_group_id`, which the calculates above have folded away).
+  dropping `model_group_id = mg1 AND dimension = t0` (the redundant corner), then a `case`
+  whose arms are `value * 100` when `dimension = t0` and `value * 10` when
+  `model_group_id = mg0 AND dimension = t1`, with `else` `value`, then `group`/`sum` over
+  every other required dimension (excluding `model_group_id`, which the `case` above has
+  folded away).
+
+Both modes' `else` is `value`, not omitted: the cell the arms do not name is the ones
+digit, and it has to arrive at the `sum` unchanged rather than null.
 
 Both modes' leading `filter` step is the one the caller's own dimension filters/
 `grid_cell`/`where` compose into (`base.selection_filter_where`); in three-image mode the
@@ -117,7 +121,7 @@ class Concatenate(Analysis):
             conjuncts.append(selection_where)
         if three_image:
             # Drop the redundant corner of the 2x2 (model_group_id, dim) grid, so the
-            # three surviving cells are what the two calculates below encode.
+            # three surviving cells are what the `case` below encodes.
             conjuncts.append(
                 f"NOT (model_group_id = {format_dimension_literal('model_group_id', mg1)} "
                 f"AND {dim} = {format_dimension_literal(dim, t0)})"
@@ -126,36 +130,31 @@ class Concatenate(Analysis):
         steps: list[dict] = []
         if conjuncts:
             steps.append({"op": "filter", "where": " AND ".join(conjuncts)})
+        # Place each surviving cell in its own decimal digit, then let `group sum` pack
+        # them into one number. The arms are ARMS rather than successive rewrites for a
+        # reason: `case` tests every `when` against the value the frame arrived with, so
+        # the `* 10` arm cannot see what the `* 100` arm wrote. As sequential rewrites the
+        # two were only independent because their `where`s happened to be disjoint.
+        # `else: "value"` is the pass-through for the third cell, which keeps its ones
+        # digit unscaled.
         if three_image:
-            steps.append(
+            cases = [
+                {"when": f"{dim} = {format_dimension_literal(dim, t0)}", "then": "value * 100"},
                 {
-                    "op": "calculate",
-                    "expression": "value * 100",
-                    "where": f"{dim} = {format_dimension_literal(dim, t0)}",
-                }
-            )
-            steps.append(
-                {
-                    "op": "calculate",
-                    "expression": "value * 10",
-                    "where": (
+                    "when": (
                         f"model_group_id = {format_dimension_literal('model_group_id', mg0)} "
                         f"AND {dim} = {format_dimension_literal(dim, t1)}"
                     ),
-                }
-            )
+                    "then": "value * 10",
+                },
+            ]
         else:
-            steps.append(
-                {
-                    "op": "calculate",
-                    "expression": "value * 10",
-                    "where": f"{dim} = {format_dimension_literal(dim, t0)}",
-                }
-            )
+            cases = [{"when": f"{dim} = {format_dimension_literal(dim, t0)}", "then": "value * 10"}]
+        steps.append({"op": "case", "cases": cases, "else": "value"})
         steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
         # A pipeline's first step must name its input explicitly; every later step chains
         # from the one before it. That is normally the leading `filter`, but falls to the
-        # first `calculate` when there was nothing to filter on.
+        # `case` when there was nothing to filter on.
         steps[0]["input"] = "x"
 
         data = {

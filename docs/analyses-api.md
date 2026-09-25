@@ -312,7 +312,7 @@ returns:
   },
   "steps": [
     {"op": "filter", "input": "x", "where": "aggregate_type = '2_wk_max' AND calendar_year = 2030 AND model_group_id = 520 AND scenario_id IN (7, 8)"},
-    {"op": "calculate", "expression": "value * -1", "where": "scenario_id = 8"},
+    {"op": "case", "cases": [{"when": "scenario_id = 8", "then": "value * -1"}], "else": "value"},
     {"op": "group", "by": ["model_group_id", "aggregate_type", "calendar_year"], "aggregate": "sum", "of": "value"}
   ],
   "output": {"format": "csv"}

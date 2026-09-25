@@ -107,13 +107,17 @@ MPDSession = Annotated[Session, Depends(get_mpd_session)]
 # explicitly, naming the pipeline equivalent that replaces it.
 _RETIRED_PARAMS = {
     "value_where": "'where', which now accepts both dimension and value conditions (e.g. 'calendar_year > 2040 AND value > 3')",
-    "negate": "a 'difference' named analysis (see /v1/analyses.json), or the 'calculate' pipeline step directly (negate=X is calculate expression 'value * -1' with where=X)",
-    "multiply10": "the 'calculate' pipeline step directly (multiply10=X is calculate expression 'value * 10' with where=X)",
-    "multiply100": "the 'calculate' pipeline step directly (multiply100=X is calculate expression 'value * 100' with where=X)",
+    # `negate`/`multiply10`/`multiply100` were all CONDITIONAL rewrites -- scale where X,
+    # pass through everywhere else -- so their replacement is a `case` arm, not a
+    # `calculate`: `calculate` applies its expression to everything. The pass-through the
+    # old parameters left implicit is the `else: "value"` these hints spell out.
+    "negate": "a 'difference' named analysis (see /v1/analyses.json), or a 'case' pipeline step directly (negate=X is a case with one arm when=X then='value * -1' and else='value')",
+    "multiply10": "a 'case' pipeline step directly (multiply10=X is a case with one arm when=X then='value * 10' and else='value')",
+    "multiply100": "a 'case' pipeline step directly (multiply100=X is a case with one arm when=X then='value * 100' and else='value')",
     "group_by": "the 'group' pipeline step (see /v1/analysis.json or a named analysis)",
     "group_aggregate": "the 'group' pipeline step (see /v1/analysis.json or a named analysis)",
-    # There is no `summarize` op in the pipeline grammar -- the ops are project/join/
-    # filter/calculate/group. A `project` step's `to`/`aggregate` is what `summarize_by`/
+    # There is no `summarize` op in the pipeline grammar -- the steps are project/join/
+    # filter/calculate/case/group. A `project` step's `to`/`aggregate` is what `summarize_by`/
     # `summarize_aggregate` used to spell, and a `grid_cell` `filter` placed AFTER that
     # project is what `summarize_grid_cell` used to spell. Name those, not a step that
     # does not exist -- a 400 that points at nothing is worse than no hint.

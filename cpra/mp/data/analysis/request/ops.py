@@ -1,11 +1,12 @@
 """The op IR: a small typed `Op` per pipeline step -- `ProjectOp`/`JoinOp`/`FilterOp`/
-`CalculateOp`/`CaseOp`/`GroupOp`, exactly the six ops `pipeline.py`'s `Step` union already
-names -- plus `compile_ops`, which turns an already-validated `Pipeline` into `list[Op]`
-**in declared order**, and `validate_shapes`, which types every input/step's shape (`long`
-or `band_wide`) and rejects the combinations that have no meaning (enumerated below).
+`CaseOp`/`GroupOp`, five ops for the six `pipeline.py`'s `Step` union names, since a
+`calculate` lowers to an arm-less `CaseOp` rather than getting one of its own -- plus
+`compile_ops`, which turns an already-validated `Pipeline` into `list[Op]` **in declared
+order**, and `validate_shapes`, which types every input/step's shape (`long` or
+`band_wide`) and rejects the combinations that have no meaning (enumerated below).
 
 **Shape-agnostic at the interface.** An `Op` carries only what the pipeline DECLARED: a
-`project`'s target grid, a `filter`'s predicate, a `calculate`'s expression, a `group`'s
+`project`'s target grid, a `filter`'s predicate, a `case`'s arms, a `group`'s
 aggregate -- never whether the frame it will eventually run against is `long` (vector: one
 row per (dimensions, `grid_cell`, `value`) observation) or `band_wide` (raster: one row per
 pixel, one column per band). The `*_LOWERING_TABLE`s below are where shape is consulted,
@@ -110,31 +111,20 @@ class FilterOp(BaseModel):
     output: str
 
 
-class CalculateOp(BaseModel):
-    """Conditionally (`where`, optional) rewrite `input`'s running value by
-    `expression`. `label` is what an error raised while compiling `expression` calls
-    this entry -- diagnostic only, defaults to `None`, meaning "name me after my step".
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    op: Literal["calculate"] = "calculate"
-    step_no: int
-    input: str
-    expression: str
-    where: str | None = None
-    output: str
-    label: str | None = None
-
-
 class CaseOp(BaseModel):
     """Rewrite `input`'s running value by the first matching arm of `cases`, else `else_`
     (null when unset). `CaseWhen` is `pipeline.py`'s own model, reused rather than
     redeclared: an arm carries nothing an `Op` would need to resolve, so a second copy
     would only be a second thing to keep in step.
 
-    `label`, like `CalculateOp.label`, is what an error raised while compiling one of the
-    expressions calls this entry -- diagnostic only.
+    **There is no `CalculateOp`.** A `calculate` compiles to this op with `cases == []` and
+    `else_` its expression -- "the else, everywhere", which is what a `calculate` is once it
+    no longer carries a `where` of its own. That is why `cases` takes no `min_length` here
+    while `pipeline.CaseStep.cases` does: the arm-less form is a lowering target, not
+    something a request spells `case`.
+
+    `label` is what an error raised while compiling one of the expressions calls this entry
+    -- diagnostic only, defaults to `None`, meaning "name me after my step".
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -165,15 +155,14 @@ class GroupOp(BaseModel):
 
 
 Op = Annotated[
-    ProjectOp | JoinOp | FilterOp | CalculateOp | CaseOp | GroupOp,
+    ProjectOp | JoinOp | FilterOp | CaseOp | GroupOp,
     Field(discriminator="op"),
 ]
 
 
-def calculate_label(op: CalculateOp | CaseOp) -> str:
+def calculate_label(op: CaseOp) -> str:
     """What an error raised while compiling `op`'s expression(s) should call it: the
-    explicit `label`, else `step.<step_no>`, the pipeline step's own position. Shared by
-    the two ops that carry a caller-written value expression.
+    explicit `label`, else `step.<step_no>`, the pipeline step's own position.
     """
     return op.label if op.label is not None else f"step.{op.step_no}"
 
@@ -283,9 +272,11 @@ def compile_ops(pipeline: Pipeline) -> list[Op]:
         elif isinstance(step, FilterStep):
             op = FilterOp(step_no=step_no, input=input_name, where=step.where, output=output)
         elif isinstance(step, CalculateStep):
-            op = CalculateOp(
-                step_no=step_no, input=input_name, expression=step.expression, where=step.where, output=output
-            )
+            # The desugaring: a `calculate` is a `case` with no arms, whose `else` is the
+            # expression. Nothing downstream of here knows the difference -- there is one
+            # set of shape rules, one set of lowerings, and one expression semantics for
+            # both spellings, which is the whole point of lowering rather than duplicating.
+            op = CaseOp(step_no=step_no, input=input_name, cases=[], else_=step.expression, output=output)
         elif isinstance(step, CaseStep):
             op = CaseOp(
                 step_no=step_no,
@@ -539,54 +530,51 @@ def _type_filter(step_no: int, step: FilterStep | FilterOp, current: FrameType) 
     return dataclasses.replace(current, shape=new_shape, extra_columns=extra_columns)
 
 
-def _type_calculate(step_no: int, current: FrameType) -> FrameType:
-    if current.shape is Shape.band_wide and len(current.value_columns) > 1:
-        raise ShapeError(
-            f"step {step_no} (calculate): a calculate over a paired band-wide frame "
-            f"(value columns {sorted(current.value_columns)}) is not yet supported -- a "
-            "band-wide frame's bands are positional, so there is no per-operand column "
-            "for an expression to name; collapse the pairing with a case first"
-        )
-    return dataclasses.replace(current, value_columns=frozenset({"value"}))
-
-
 def _type_case(step_no: int, step: CaseStep | CaseOp, current: FrameType) -> FrameType:
-    """Shape-preserving, and always one value column out -- the same collapse
-    `_type_calculate` performs, but WITHOUT its paired-band-wide rejection, and it is the
-    only op that collapses a band-wide pairing without also collapsing the bands. Over a
-    paired frame each operand's band is paired with its counterpart and the pair reduced to
-    one band (`execution.band_ops.case_band_wide`), with the surviving value named by the
-    matching arm's `then` -- which is exactly what `_type_filter` rejects a paired value
-    predicate for not having. The pairing is something `case` consumes rather than
-    something it cannot express.
+    """Shape-preserving, and always one value column out. It is the only op that collapses
+    a band-wide pairing without also collapsing the bands: over a paired frame each
+    operand's band is paired with its counterpart and the pair reduced to one band
+    (`execution.band_ops.case_band_wide`), with the surviving value named by the matching
+    arm's `then` -- which is exactly what `_type_filter` rejects a paired value predicate
+    for not having. The pairing is something `case` consumes rather than something it
+    cannot express. A `calculate` is this op with no arms (`compile_ops`), so it reaches
+    that reduce through its `else` and needs no rule of its own.
 
-    Every arm's `when` must be a pure VALUE predicate. A `case` arm chooses among values
-    at one row/pixel; a dimension conjunct selects BANDS and a spatial one resamples the
-    frame to points, and neither is a thing an arm of an otherwise shape-preserving op
-    could do to half its input. Both are `filter`'s job, and writing one as a `filter`
-    around or before the `case` says the same thing with the lowering it actually has --
-    which is also what lets `case` need no lowering table at all: it is unconditionally
-    shape-preserving, so there is no (kind, shape) combination to tabulate.
+    **An arm's `when` may be a value predicate, a dimension predicate, or both.** A
+    dimension conjunct says WHICH ROWS/BANDS the arm applies to -- rows in long shape,
+    where a dimension is an ordinary column, and bands in band-wide shape, where it is a
+    row of `metadata_df`. Neither is a shape change: an arm that does not apply drops out
+    of that row/band's chain and the remaining arms and the `else` still do, so the frame
+    coming out has exactly the rows and bands that went in. That is what lets `case` need
+    no lowering table at all -- it is unconditionally shape-preserving, so there is no
+    (kind, shape) combination to tabulate.
+
+    Whether the columns a dimension conjunct names EXIST is deliberately not checked here:
+    `FrameType` records shapes and value columns, not dimension names, so this walk has
+    nothing to check them against. `execution.long_ops.case_long` raises against the
+    frame's real schema, and band-wide a conjunct naming an absent column is simply false
+    for every band -- the same execution-time treatment a `filter`'s dimension half has
+    always had.
+
+    **A SPATIAL conjunct is still rejected.** It resamples the frame to points, which is a
+    shape change, and an arm cannot do that to half its input. It is `filter`'s job, and
+    writing it as a `filter` around or before the `case` says the same thing with the
+    lowering it actually has.
 
     Classified against `value_columns | extra_columns`, the identical union `_type_filter`
     uses: a carried column (`__zone__`, `__domain__`) is a real per-pixel column, so an
-    arm may name one, and the execution lowerings classify the same way.
+    arm naming one is making a value predicate rather than a band selection, and the
+    execution lowerings classify the same way.
     """
     columns = current.value_columns | current.extra_columns
     for position, case in enumerate(step.cases, start=1):
-        kinds = classify_where_kinds(case.when, columns)
-        offending = [
-            conjunct
-            for kind in (PredicateKind.spatial, PredicateKind.dimension)
-            for conjunct in kinds[kind]
-        ]
-        if offending:
+        spatial = classify_where_kinds(case.when, columns)[PredicateKind.spatial]
+        if spatial:
             raise ShapeError(
                 f"step {step_no} (case): arm {position}'s when={case.when!r} contains "
-                f"conjunct(s) {offending} that name no value column "
-                f"({sorted(columns)}) -- a case arm is a predicate over the frame's "
-                "values at one row/pixel, and a dimension or grid_cell conjunct selects "
-                "which bands/rows there are at all; state that as a filter instead"
+                f"grid_cell conjunct(s) {spatial} -- a spatial predicate resamples the "
+                "frame to points, which is a shape change an arm cannot make to half its "
+                "input; state that as a filter instead"
             )
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
@@ -702,8 +690,6 @@ def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameTy
             new_type = _type_project(op.step_no, op, frame_types[op.input])
         elif isinstance(op, FilterOp):
             new_type = _type_filter(op.step_no, op, frame_types[op.input])
-        elif isinstance(op, CalculateOp):
-            new_type = _type_calculate(op.step_no, frame_types[op.input])
         elif isinstance(op, CaseOp):
             new_type = _type_case(op.step_no, op, frame_types[op.input])
         elif isinstance(op, GroupOp):
@@ -726,9 +712,8 @@ def validate_shapes(pipeline: Pipeline) -> None:
     - `project.aggregate` missing where required, or supplied where forbidden
       (`_type_project`, via `request.aggregates.validate_project_aggregate`);
     - a second `count_by_value` in one chain (`_type_project`);
-    - a `calculate` over a paired band-wide frame (`_type_calculate`);
     - a value `filter` over a paired band-wide frame (`_type_filter`);
-    - a `case` arm whose `when` is a dimension or spatial predicate (`_type_case`);
+    - a `case` arm whose `when` carries a spatial predicate (`_type_case`);
     - a `join` mixing a long frame with a band-wide one (`_type_join`);
     - a band-wide `join` whose operands sit on two different grids (`_type_join`);
     - a `join` over an operand that is itself an uncollapsed join's output (`_type_join`);
@@ -749,9 +734,8 @@ def validate_shapes(pipeline: Pipeline) -> None:
         raise ShapeError(
             f"pipeline's final frame carries {len(final.value_columns)} value columns "
             f"{sorted(final.value_columns)} -- every output writes exactly one measured "
-            "quantity; collapse them into one first: a calculate over a long (vector) "
-            "frame, or a case or a group over a band-wide (raster) one, where a calculate "
-            "has no per-operand column to name (see _type_calculate)"
+            "quantity; collapse them into one first with a case or a group, whose arms "
+            "(or whose aggregate) say which operand the one surviving value comes from"
         )
 
     if final.shape == Shape.long and pipeline.output.format in RASTER_OUTPUT_FORMATS:

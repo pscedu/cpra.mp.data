@@ -61,8 +61,9 @@ declared on it, and which of each contributing ORIGIN's dimension columns it sti
 * `filter` never changes what is still pushable -- it only *consumes* validity (deciding,
   per conjunct, whether THIS filter's own predicate can be pushed), it does not reduce it
   for whatever comes after.
-* `calculate` invalidates `value` unconditionally (the running value is being replaced),
-  leaving spatial validity untouched.
+* `case` invalidates `value` unconditionally (the running value is being replaced),
+  leaving spatial validity untouched. A `calculate` is an arm-less `case`
+  (`request.ops.compile_ops`), so it is the same entry rather than a second one.
 * `group` invalidates `value` unconditionally. `grid_cell` survives only if
   `"grid_cell" in by`. Structurally, it is the only op that takes a dimension column AWAY
   from a frame, which is what narrows the recorded per-origin dimension sets to `by`: a
@@ -128,13 +129,13 @@ TERMINAL frames, the ones nothing else reads, since every frame the plan compute
 reachable from one of those or is one.
 
 **Column pushdown needs one more guard beyond validity/fan-out: a `group`.** A `filter`'s
-or `calculate.where`'s referenced dimension names get folded into an origin's candidate
+or a `case` arm's referenced dimension names get folded into an origin's candidate
 column set as they're encountered, but that set is only ever actually handed to
 `io.vector.scan_vector` as a real narrowing (`ResolvedInput.columns`) once the origin's
 chain has passed through at least one `group`. Before that point, narrowing the source
 read's columns to "only what's been referenced so far" would be wrong even though every
-individual predicate pushed so far is fine: a `filter`/`calculate`-only chain does not
-touch which COLUMNS the frame carries (a filter drops rows, a calculate replaces `value`,
+individual predicate pushed so far is fine: a `filter`/`case`-only chain does not
+touch which COLUMNS the frame carries (a filter drops rows, a case replaces `value`,
 neither drops a dimension column), so if the chain reaches the sink without ever grouping,
 the sink is still entitled to see every dimension column the raw scan has -- narrowing
 would silently make some of them disappear. A `group`, by contrast, is a hard closure: its
@@ -372,7 +373,6 @@ from cpra.mp.data.analysis.io.raster_io import (
 from cpra.mp.data.analysis.request.errors import BandLimitError, RequestError, ShapeError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
-    CalculateOp,
     CaseOp,
     FilterOp,
     FrameType,
@@ -969,23 +969,15 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                     states[op.output] = incoming
             continue
 
-        if isinstance(op, CalculateOp):
-            if kind == "vector" and op.where is not None:
-                for bucket in classify_where_kinds(op.where, frame_types[op.input].value_columns).values():
-                    for conjunct in bucket:
-                        vector_columns[origin] |= _referenced_names(conjunct)
-            states[op.output] = dataclasses.replace(incoming, value=False)
-            continue
-
         if isinstance(op, CaseOp):
-            # A `calculate`'s reading, arm by arm. Every `when` is a predicate over the
-            # frame's own value columns and every `then`/`else` a value expression over the
-            # same namespace (`request.ops._type_case` rejects a dimension or spatial arm
-            # outright), so -- exactly as for a `calculate`'s `expression` -- none of them
-            # can name a source column the read does not already have; the `when`s are swept
-            # for referenced names anyway, since widening a vector read is only ever slow.
-            # What the op DOES do is rewrite the value, which retires this origin's value
-            # validity the same way a `calculate` does.
+            # Arm by arm (a `calculate` is this op with no arms, so it takes the same
+            # branch and simply has none to sweep). An arm's `when` may name a dimension
+            # column as well as a value one, so the names it references are swept into the
+            # origin's candidate column set exactly as a `filter`'s are -- what is NOT done
+            # is pushing the conjunct itself down as a row predicate: an arm selects which
+            # rows get REWRITTEN, not which rows exist, and pushing it to the reader would
+            # drop the rows the arm does not apply to. What the op does do is rewrite the
+            # value, which retires this origin's value validity.
             if kind == "vector":
                 for arm in op.cases:
                     kinds_by_arm = classify_where_kinds(arm.when, frame_types[op.input].value_columns)

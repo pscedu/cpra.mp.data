@@ -1,5 +1,6 @@
 """Tests for `cpra.mp.data.analysis.execution.long_ops` -- the long-shape lowerings for
-`filter`/`calculate`/`case`/`group`/`join`.
+`filter`/`case`/`group`/`join`. There is no `calculate` lowering: `request.ops.compile_ops`
+lowers a `calculate` to an arm-less `case`, so it is tested here as one.
 
 Every fixture here is a small in-memory `pl.LazyFrame` built directly, not read off disk:
 these functions are pure Polars transforms over whatever frame they are handed (see
@@ -12,14 +13,13 @@ import polars as pl
 import pytest
 
 from cpra.mp.data.analysis.execution.long_ops import (
-    calculate_long,
     case_long,
     filter_long,
     group_long,
     join_long,
 )
 from cpra.mp.data.analysis.request.expressions import ExpressionError
-from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp
 from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
@@ -119,34 +119,41 @@ class TestFilterLongValueColumns:
 VALUE_ONLY = frozenset({"value"})
 
 
-class TestCalculateLong:
-    def test_rewrites_value_everywhere_when_where_is_none(self):
-        op = CalculateOp(step_no=1, input="a", expression="value * 2", output="b")
-        df = calculate_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
-        assert df["value"].to_list() == [20.0, 40.0, 60.0, 80.0]
+class TestLoweredCalculateLong:
+    """What `compile_ops` turns a `calculate` into: a `case` with NO arms, whose `else` is
+    the calculate's expression. `case_expression` degrades to "the else, everywhere" for
+    that shape, so the whole of `calculate`'s semantics is one corner of `case`'s.
+    """
 
-    def test_rewrites_only_rows_matching_where(self):
-        op = CalculateOp(
-            step_no=1, input="a", expression="value * 2", where="calendar_year = 2030", output="b"
+    def _calculate(self, expression):
+        return CaseOp(step_no=1, input="a", cases=[], else_=expression, output="b")
+
+    def test_rewrites_value_everywhere(self):
+        df = (
+            case_long(_frame(), self._calculate("value * 2"), VALUE_ONLY)
+            .collect()
+            .sort(["calendar_year", "grid_cell"])
         )
-        df = calculate_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
-        # 2030 rows doubled (10->20, 20->40); 2040 rows pass through unchanged (30, 40) --
-        # a non-matching row is left alone, never dropped (dropping is `filter`'s job).
-        assert df["value"].to_list() == [20.0, 40.0, 30.0, 40.0]
+        assert df["value"].to_list() == [20.0, 40.0, 60.0, 80.0]
         assert df.height == 4
 
     def test_null_value_is_left_null(self):
         lf = pl.LazyFrame(
             {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]}
         )
-        op = CalculateOp(step_no=1, input="a", expression="value * 2", output="b")
-        df = calculate_long(lf, op, VALUE_ONLY).collect().sort("calendar_year")
+        df = case_long(lf, self._calculate("value * 2"), VALUE_ONLY).collect().sort("calendar_year")
         assert df["value"].to_list() == [20.0, None]
 
+    def test_the_failing_expression_is_named_as_an_expression_not_an_else(self):
+        # An arm-less `case` is a `calculate`, so the message has to name the half the
+        # AUTHOR wrote -- an `else` they never typed would send them looking for it.
+        with pytest.raises(ExpressionError, match=r"^step\.1 expression: "):
+            case_long(_frame(), self._calculate("exp(value)"), VALUE_ONLY).collect()
 
-class TestCalculateLongAfterJoin:
-    """A `calculate` reading a joined frame, whose value columns are named after the
-    join's operands rather than `value`. This is the step the single-value-column sink
+
+class TestLoweredCalculateLongAfterJoin:
+    """The lowered `calculate` reading a joined frame, whose value columns are named after
+    the join's operands rather than `value`. This is the step the single-value-column sink
     rule relies on to make a join's output writable at all, so every assertion here is
     about the collapse: the operand names parse, the result is one column called `value`,
     and the operand columns are gone.
@@ -164,57 +171,44 @@ class TestCalculateLongAfterJoin:
             }
         )
 
+    def _calculate(self, expression):
+        return CaseOp(step_no=2, input="j", cases=[], else_=expression, output="c")
+
     def test_expression_over_operand_columns_collapses_to_one_value(self):
-        op = CalculateOp(step_no=2, input="j", expression="a - b", output="c")
         df = (
-            calculate_long(self._joined(), op, frozenset({"a", "b"}))
+            case_long(self._joined(), self._calculate("a - b"), frozenset({"a", "b"}))
             .collect()
             .sort("calendar_year")
         )
         assert df["value"].to_list() == [6.0, 25.0]
         assert set(df.columns) == {"calendar_year", "grid_cell", "value"}
 
-    def test_operand_columns_are_dropped_even_where_the_where_does_not_match(self):
-        # The result's COLUMNS must not depend on which rows matched: `value_columns` is
-        # what a downstream step and the sink rule were typed against, and a frame that
-        # still carried `a`/`b` for the unmatched rows would carry three value columns.
-        op = CalculateOp(
-            step_no=2, input="j", expression="a - b", where="calendar_year = 2030", output="c"
-        )
-        df = (
-            calculate_long(self._joined(), op, frozenset({"a", "b"}))
-            .collect()
-            .sort("calendar_year")
-        )
-        assert set(df.columns) == {"calendar_year", "grid_cell", "value"}
-        # The unmatched row keeps its place (a `calculate` never drops rows) with a null
-        # `value`: there is no incoming `value` for it to pass through unchanged.
-        assert df["value"].to_list() == [6.0, None]
-        assert df.height == 2
-
     def test_null_in_either_operand_leaves_value_null(self):
         lf = pl.LazyFrame(
             {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, None], "b": [4.0, 5.0]}
         )
-        op = CalculateOp(step_no=2, input="j", expression="a - b", output="c")
-        df = calculate_long(lf, op, frozenset({"a", "b"})).collect().sort("calendar_year")
+        df = (
+            case_long(lf, self._calculate("a - b"), frozenset({"a", "b"}))
+            .collect()
+            .sort("calendar_year")
+        )
         assert df["value"].to_list() == [6.0, None]
 
     def test_expression_naming_a_column_outside_the_value_namespace_is_rejected(self):
         # `value` is exactly the name that is NOT available on a joined frame, which makes
         # it the sharpest check that the namespace really is the frame's value columns and
         # not a superset that happens to include the old default.
-        op = CalculateOp(step_no=2, input="j", expression="value * 2", output="c")
         with pytest.raises(ExpressionError, match="not in the allowed namespace"):
-            calculate_long(self._joined(), op, frozenset({"a", "b"})).collect()
+            case_long(self._joined(), self._calculate("value * 2"), frozenset({"a", "b"})).collect()
 
     def test_dimension_column_is_still_outside_the_expression_namespace(self):
         # Widening the namespace to the frame's value columns must not widen it to every
         # column the frame has -- a dimension inside an expression is rejected here for
         # the same reason it always was.
-        op = CalculateOp(step_no=2, input="j", expression="a * calendar_year", output="c")
         with pytest.raises(ExpressionError, match="not in the allowed namespace"):
-            calculate_long(self._joined(), op, frozenset({"a", "b"})).collect()
+            case_long(
+                self._joined(), self._calculate("a * calendar_year"), frozenset({"a", "b"})
+            ).collect()
 
 
 def _case(*arms, else_=None):
@@ -285,8 +279,8 @@ class TestCaseLong:
         assert df["value"].to_list() == [0.0, None]
 
     def test_an_expression_outside_the_value_namespace_is_rejected(self):
-        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
-            case_long(_frame(), _case(("calendar_year > 2030", "1")), VALUE_ONLY).collect()
+        # A `then`/`else` is arithmetic over the frame's VALUE columns only -- unlike a
+        # `when`, which may also name dimensions (see `TestCaseLongDimensionArms`).
         with pytest.raises(ExpressionError, match="not in the allowed namespace"):
             case_long(_frame(), _case(("value > 1", "calendar_year")), VALUE_ONLY).collect()
 
@@ -302,6 +296,67 @@ class TestCaseLong:
         op = _case(("value > 1", "1"), else_="exp(value)")
         with pytest.raises(ExpressionError, match=r"^step\.1 else: "):
             case_long(_frame(), op, VALUE_ONLY).collect()
+
+
+class TestCaseLongDimensionArms:
+    """An arm's `when` may mix VALUE conjuncts with DIMENSION ones. In the long shape a
+    dimension is a real column, so both halves are per-row masks and the split is barely
+    visible -- but it is the same split `case_band_wide` uses to decide which BANDS an arm
+    applies to at all, and the two shapes have to agree on the answer.
+    """
+
+    def test_a_dimension_only_arm_selects_the_rows_it_rewrites(self):
+        op = _case(("calendar_year = 2030", "value * 2"), else_="value")
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        # 2030 doubled; 2040 handed back by the `else`, which is where the pass-through a
+        # `calculate`'s `where` used to leave implicit now has to be written.
+        assert df["value"].to_list() == [20.0, 40.0, 30.0, 40.0]
+        assert df.height == 4
+
+    def test_a_mixed_arm_ands_the_two_halves(self):
+        op = _case(("calendar_year = 2040 AND value > 30", "1"), else_="0")
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [0.0, 0.0, 0.0, 1.0]
+
+    def test_arms_partition_the_frame_by_dimension(self):
+        """The ensemble-weighting shape (`analyses/land_type_confidence.py`): one arm per
+        member, each naming only its own dimension value, no `else` because the arms cover
+        everything the upstream filter left.
+        """
+        op = _case(("calendar_year = 2030", "value * 0.25"), ("calendar_year = 2040", "value * 0.75"))
+        df = case_long(_frame(), op, VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
+        assert df["value"].to_list() == [2.5, 5.0, 22.5, 30.0]
+
+    def test_a_null_dimension_fails_the_arm_rather_than_nulling_the_condition(self):
+        lf = pl.LazyFrame(
+            {"calendar_year": [2030, None], "grid_cell": [1, 2], "value": [10.0, 20.0]}
+        )
+        op = _case(("calendar_year = 2030", "1"), else_="0")
+        df = case_long(lf, op, VALUE_ONLY).collect().sort("grid_cell")
+        assert df["value"].to_list() == [1.0, 0.0]
+
+    def test_a_dimension_the_frame_does_not_carry_is_rejected_at_execution(self):
+        """Deferred from shape typing on purpose: which dimension columns a frame carries
+        is a property of the data, not of the request, so `request.ops._type_case` cannot
+        know it and the check lands here instead. The message names the missing column and
+        what was available.
+        """
+        with pytest.raises(ExpressionError, match=r"\['scenario_id'\].*available columns"):
+            case_long(_frame(), _case(("scenario_id = 34", "1")), VALUE_ONLY).collect()
+
+    def test_a_dimension_arm_on_a_joined_frame_names_the_shared_dimension(self):
+        lf = pl.LazyFrame(
+            {
+                "calendar_year": [2030, 2040],
+                "grid_cell": [1, 1],
+                "a": [10.0, 30.0],
+                "b": [4.0, 5.0],
+            }
+        )
+        op = _case(("calendar_year = 2030", "a - b"), else_="a + b")
+        df = case_long(lf, op, frozenset({"a", "b"})).collect().sort("calendar_year")
+        assert df["value"].to_list() == [6.0, 35.0]
+        assert set(df.columns) == {"calendar_year", "grid_cell", "value"}
 
 
 class TestCaseLongAfterJoin:
@@ -348,9 +403,22 @@ class TestCaseLongAfterJoin:
         assert df["value"].to_list() == [10.0, None]
 
     def test_value_is_not_in_a_joined_frames_namespace(self):
+        """A joined frame has no `value` column, so `value > 1` names nothing it carries.
+        The rejection comes from the DIMENSION half, not the value one: with `value`
+        outside the value namespace, `classify_where_kinds` can only read it as a
+        dimension name, and a `when`'s dimension names are resolved against the frame's
+        schema. The message still names `value` and lists what the frame does have, which
+        is what the author needs either way.
+        """
         op = _case(("value > 1", "1"))
-        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+        with pytest.raises(ExpressionError, match=r"\['value'\] -- available columns"):
             case_long(self._joined(), op, frozenset({"a", "b"})).collect()
+
+    def test_then_and_else_still_reject_value_by_namespace(self):
+        # The other half of the same point: a `then` is arithmetic, never a dimension
+        # reference, so there is no second reading for it to fall into.
+        with pytest.raises(ExpressionError, match="not in the allowed namespace"):
+            case_long(self._joined(), _case(("a > 1", "value")), frozenset({"a", "b"})).collect()
 
 
 class TestGroupLong:

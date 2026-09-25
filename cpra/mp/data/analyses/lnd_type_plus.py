@@ -35,18 +35,19 @@ as an `AND land_type = 2` conjunct on EVERY arm of the one `case` below, which i
 matches off water, and the `else` hands back the land type, so a non-water pixel reads as
 its own land type no matter how deep the depth surface says it is.
 
-**Why the depth is computed inside the `case` arms.** A `calculate` over a paired
-band-wide frame is rejected outright (a band-wide frame's bands are positional, so an
-expression has no per-operand column to name -- see `request.ops._type_calculate`), so
-`stage_m - elevation` cannot be written as a step of its own over the joined operands. A
-`case` CAN name them, because its arms are checked against the frame's value namespace and
-over a joined frame that namespace is the operand names themselves; band-wide, each group's
-names are rewritten to that group's own band columns before the expression is compiled
-(`execution.band_ops.case_band_wide`). So the subtraction is written where it is used,
-inside each arm's `when`, against operands one `join` brought together. Millimetres to
-metres rides along in the same expression (`elevation / 1000`), which is why there is no
-`calculate` on elevation's own branch either: one shared `depth` string says it once for
-all three arms, with no step and no intermediate name to carry it.
+**Why the depth is computed inside the `case` arms.** `stage_m - elevation` could be a
+`calculate` of its own over the joined operands -- a `calculate` is an arm-less `case`, and
+both name a joined frame's operands directly, because over such a frame the value namespace
+IS the operand names (band-wide, each group's names are rewritten to that group's own band
+columns before the expression is compiled -- `execution.band_ops.case_band_wide`). What
+that step would cost is the rest of the join: any step that writes the running value
+collapses the frame to ONE value column, so a depth computed separately arrives with
+`land_type` already gone, and the water restriction below would have nothing left to test.
+Computing the depth inside the arms keeps all three operands live until the single step
+that consumes them. Millimetres to metres rides along in the same expression
+(`elevation / 1000`), which is why there is no separate conversion on elevation's own
+branch either: one shared `depth` string says it once for all three arms, with no step and
+no intermediate name to carry it.
 
 Neither the join nor the `case` is limited to two operands: `pipeline.JoinStep.inputs` is
 `min_length=2`, and `band_ops._pair_band_groups` keys on the dimensions the operands share
@@ -91,8 +92,8 @@ inputs do not share), so there is no later frame to state it on.
 
 **Why the reclassification is one `case` step.** The target codes are not disjoint from the
 source domains in any order -- `6` and `7` both fall in the `> 1.0` domain -- so a chain of
-`calculate`s cannot state this at all without an encoding trick, since each one rewrites the
-RUNNING value and the next one's `where` then sees what it wrote. A `case` has no such
+successive rewrites cannot state this at all without an encoding trick, since each one
+rewrites the RUNNING value and the next one's test then sees what it wrote. A `case` has no such
 hazard: every arm's `when` is evaluated against the INCOMING operands, the first match wins,
 and each pixel is written exactly once. The arms are therefore stated in DESCENDING order of
 bound, each as a single `>` test of the depth against the previous class's bound, `AND`ed
@@ -136,7 +137,7 @@ STAGE_AGGREGATE_TYPE = "mean"
 
 # `elev` is stored as Int32 NAVD88 MILLIMETRES (`variables.csv`'s `unit`), and everything
 # else here is metres. Folded into the negation below rather than applied separately, so
-# the conversion and the sign flip are one `calculate` instead of two.
+# the conversion and the sign flip are one expression instead of two steps.
 ELEVATION_MM_PER_M = 1000
 
 # The one `lnd_type` code the reclassification is allowed to overwrite -- Open Water, per
@@ -316,7 +317,7 @@ class LndTypePlus(Analysis):
         # additionally carries the `land_type = 2` conjunct, which is the restriction stated
         # rather than assumed.
         #
-        # Millimetres to metres happens here rather than in a `calculate` of its own: `elev`
+        # Millimetres to metres happens here rather than in a step of its own: `elev`
         # is stored as NAVD88 millimetres and every arm needs the same metres-denominated
         # depth, so one conversion written into the shared `depth` string says it once for
         # all three without a step and an intermediate name to carry it.

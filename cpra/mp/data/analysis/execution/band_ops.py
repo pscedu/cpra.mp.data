@@ -1,5 +1,5 @@
 """The band-wide-shape lowerings: `mask_value_band_wide`/`select_dimension_band_wide`/
-`sample_grid_cells_band_wide` (the three `filter` predicate kinds), `calculate_band_wide`,
+`sample_grid_cells_band_wide` (the three `filter` predicate kinds),
 `case_band_wide`, `group_band_wide`, and `join_band_wide` -- the band-wide counterparts of
 `execution/long_ops.py`'s long-shape lowerings, plus `filter_band_wide`, the
 dispatcher a `filter` op with a mixed-kind `where` runs through.
@@ -54,24 +54,22 @@ documentation gap worth flagging rather than a contradiction to paper over: a lo
 whose contract is "return long" cannot be checked by a function whose signature compares
 two band-wide row counts.
 
-**`calculate_band_wide`'s per-band applicability.** A `CalculateOp.where`'s dimension half
-selects which bands the entry applies to, evaluated once against `metadata_df` (one row
-per band) rather than once per pixel -- the same
-`(label, expression, where) -> CalculatePlan` compilation `execution.long_ops.
-calculate_long` uses, applied per band. This module's version handles exactly one
-`CalculateOp` at a time (a `calculate` step is always one entry here, never a list), and
-extends the value mask's namespace to `extra_columns` in addition to the band's own
-column, matching
-`masked_value_predicate_exprs`' own `extra_columns` convention (a value condition scoped
-by, say, a crosswalk zone id) rather than the narrower one `band_calculate_passes` had no
-occasion to need. The REWRITTEN VALUE gets the same namespace as the mask that gates it: a
-carried column good enough to decide WHETHER a pixel is rewritten is good enough to appear
-in WHAT it is rewritten to (`value * zone_factor`), and a namespace admitting a column on
-one side of `pl.when(...).then(...)` but not the other would be an arbitrary line. That
-namespace is passed to `compile_calculate_entries` as well, not only to the per-band
-`parse_value_expr`; compilation validates the expression against its own
-`allowed_columns` first, so widening only the later call would leave the wider namespace
-unreachable.
+**`case_band_wide`'s per-band arm applicability.** A `case` arm's `when` may carry a
+dimension conjunct, and band-wide shape keeps its dimension values in `metadata_df` (one
+row per band) rather than per pixel -- so that half of the `when` has a per-BAND answer,
+evaluated once across the whole metadata frame by `_band_applicability` and indexed by
+band, never once per pixel. What the answer decides is which ARMS enter a given band's
+chain, not whether the band is touched at all: an arm a band fails drops out of that band's
+`pl.when` chain and every other arm and the `else` still apply. The paired reading asks the
+same question of a pair, against `_coalesced_pair_metadata`.
+
+The value half of a `when`, the `then`, and the `else` all take the band's own column PLUS
+`extra_columns` as their namespace, matching `masked_value_predicate_exprs`' own
+`extra_columns` convention (a value condition scoped by, say, a crosswalk zone id). The
+rewritten value gets the same namespace as the mask that gates it: a carried column good
+enough to decide WHETHER a pixel is rewritten is good enough to appear in WHAT it is
+rewritten to (`value * zone_factor`), and a namespace admitting a column on one side of
+`pl.when(...).then(...)` but not the other would be an arbitrary line.
 
 **`extra_columns` ARE part of the predicate language.** `request.expressions` classifies a
 conjunct by NAME, so a carried column has to be named for it to classify as anything but a
@@ -168,7 +166,7 @@ which can change a row count. The invariant is checked from the outside, in the 
 (`assert_height_preserved`'s docstring now says so).
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import polars as pl
 
@@ -192,18 +190,15 @@ from cpra.mp.data.analysis.request.expressions import (
     PredicateKind,
     classify_where_kinds,
     combine_conjuncts,
-    compile_calculate_entries,
-    parse_value_expr,
     rewrite_value_column,
     rewrite_value_columns,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.request.ops import CalculateOp, CaseOp, GroupOp, calculate_label
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp
 
 __all__ = [
     "JOIN_OPERAND_COLUMN",
     "PAIRING_KEY_EXCLUDED_COLUMNS",
-    "calculate_band_wide",
     "case_band_wide",
     "filter_band_wide",
     "group_band_wide",
@@ -629,58 +624,101 @@ def filter_band_wide(
     return result
 
 
-def calculate_band_wide(band_wide: BandWideFrame, op: CalculateOp, extra_columns: Sequence[str]) -> BandWideFrame:
-    """The band-wide lowering of a `calculate`: per band, wherever `op.where` matches (the
-    dimension half decides WHICH BANDS the entry applies to at all, evaluated once against
-    `metadata_df`; the value half is folded into that band's own per-pixel mask), rewrite
-    the pixel to `op.expression`; elsewhere -- a band the entry does not apply to, or a
-    pixel the value half rejects -- pass through unchanged, never dropped (`calculate`
-    never drops data; that is `filter`'s job).
+def _band_applicability(metadata_df: pl.DataFrame) -> Callable[[str], list[bool]]:
+    """A memoized "which bands does this dimension predicate hold for" over `metadata_df`
+    -- one `list[bool]`, in band order, per distinct predicate TEXT.
 
-    Handles exactly one entry (a `CalculateOp` is always one, never a list -- see the
-    module docstring), including the `is_not_null()` guard (nodata in, nodata out, as a
-    structural property rather than a per-expression obligation).
+    Memoized because `case_band_wide` asks the same question once per (arm, band) while
+    the answer only ever varies by arm: evaluating each arm's dimension half once across
+    the whole metadata frame, then indexing by band, is the same work `calculate`'s
+    band-wide lowering used to do for its single `where`, generalized to n arms.
 
-    Returns `band_wide` unchanged, without evaluating `op.where`'s dimension half at all,
-    when it is ALREADY the empty triple -- same redundant-re-application situation
-    `select_dimension_band_wide` documents: zero bands means no dimension columns to
-    evaluate a `where` against, and "nothing happens to zero bands" is already the correct
-    answer without asking.
+    `fill_null(False)` is what makes a band that simply does not CARRY the dimension (a
+    joined frame merges its operands' metadata with `how="diagonal_relaxed"`, so one
+    operand's column is null on the other's rows) fail the arm rather than match it.
     """
-    validate_extra_columns(extra_columns)
-    lf, metadata_df, window = band_wide
-    if has_no_bands(metadata_df):
-        return band_wide
-    names = band_column_names(metadata_df)
-    (plan,) = compile_calculate_entries(
-        [(calculate_label(op), op.expression, op.where)], allowed_columns=["value", *extra_columns]
-    )
+    cache: dict[str, list[bool]] = {}
 
-    if plan.dimension_where is not None:
-        applicable = (
-            metadata_df.select(pl.sql_expr(plan.dimension_where).fill_null(False).alias("__ok"))
-            .get_column("__ok")
-            .to_list()
-        )
-    else:
-        applicable = [True] * len(names)
-
-    exprs = []
-    for name, applies in zip(names, applicable):
-        if not applies:
-            continue
-        condition = pl.col(name).is_not_null()
-        if plan.value_where is not None:
-            condition = condition & value_predicate_mask(
-                rewrite_value_column(plan.value_where, name), allowed_columns=[name, *extra_columns]
+    def applicable(text: str) -> list[bool]:
+        if text not in cache:
+            cache[text] = (
+                metadata_df.select(pl.sql_expr(text).fill_null(False).alias("__ok"))
+                .get_column("__ok")
+                .to_list()
             )
-        new_value = parse_value_expr(
-            rewrite_value_column(plan.expression, name), allowed_columns=[name, *extra_columns]
-        )
-        exprs.append(pl.when(condition).then(new_value).otherwise(pl.col(name)).alias(name))
+        return cache[text]
 
-    out_lf = lf.with_columns(exprs).select([*names, *extra_columns]) if exprs else lf.select([*names, *extra_columns])
-    return out_lf, metadata_df, window
+    return applicable
+
+
+def _coalesced_pair_metadata(metadata_df: pl.DataFrame, pairs: Sequence[tuple[int, list[int], dict]]) -> pl.DataFrame:
+    """One metadata row per surviving pair, built by coalescing the pair's own operand rows
+    column by column -- what an arm's dimension half is evaluated against on a PAIRED
+    band-wide frame.
+
+    A pair's operands do not share a metadata row, so "does `calendar_year = 2050` hold for
+    this pair" has to be asked of the pair rather than of a band. Coalescing answers it
+    without needing a combining rule for the common cases:
+
+    - a PAIRING KEY column (`_pairing_key_columns`) is the same in every operand's row by
+      construction -- the pair was formed by grouping on it -- so there is one value and
+      nothing to choose between;
+    - a non-key column is, by that function's own definition, null for at least one
+      operand, which with two operands leaves exactly one real value.
+
+    That leaves one genuinely ambiguous case: three or more operands, two of which both
+    carry the same non-key column with DIFFERENT values. There is no answer to give there
+    -- an arm naming that column means two things at once -- so it raises rather than
+    picking. `PAIRING_KEY_EXCLUDED_COLUMNS` is dropped first: those columns (`variable`,
+    `path`, the operand tag) differ per operand by design, so including them would make
+    every pair a conflict.
+    """
+    columns = [name for name in metadata_df.columns if name not in PAIRING_KEY_EXCLUDED_COLUMNS]
+    rows = []
+    for _row_index, positions, substitutions in pairs:
+        pair_rows = metadata_df[list(positions)].select(columns).rows(named=True)
+        coalesced = {}
+        for column in columns:
+            values = {row[column] for row in pair_rows if row[column] is not None}
+            if len(values) > 1:
+                raise ExpressionError(
+                    f"metadata column {column!r} has conflicting values {sorted(map(str, values))} "
+                    f"across the operands {sorted(substitutions)} of one pair -- a case arm "
+                    "naming it would mean two things at once; filter the operand branch that "
+                    "should not carry it before the join"
+                )
+            coalesced[column] = next(iter(values)) if values else None
+        rows.append(coalesced)
+    # The original schema, not one inferred from `rows`: a column every pair coalesced to
+    # null would otherwise come back as Polars' Null dtype, and a comparison against it is
+    # a type error rather than the `False` `_band_applicability` means it to be.
+    return pl.DataFrame(rows, schema={name: metadata_df.schema[name] for name in columns})
+
+
+def _select_band_exprs(
+    lf: pl.LazyFrame,
+    exprs: Sequence[pl.Expr],
+    names: Sequence[str],
+    extra_columns: Sequence[str],
+) -> pl.LazyFrame:
+    """`lf.select(exprs + extra_columns)`, except via `with_columns` so that a band
+    expression which happens to be a SCALAR still comes back one value per pixel.
+
+    A `case` whose arms are all purely dimensional and whose `then`/`else` are constants
+    compiles to an expression with no column reference in it at all -- `pl.when(lit(True)).
+    then(lit(6))`, or just `pl.lit(None)` for a band every arm dropped out of with no
+    `else`. `select` gives such an expression its literal length of ONE, and a select whose
+    every column is unit-length yields a one-row frame: the window's row count, which the
+    band-wide contract says this lowering preserves, silently gone. `with_columns`
+    broadcasts a unit-length expression to the frame's height instead, and because it
+    evaluates every expression against the INCOMING frame, a paired reduce writing `b0`
+    from `b0` and `b2` still reads the originals.
+
+    `names` is what to keep afterwards, in order -- for the paired reduce that is a PREFIX
+    of the incoming band columns (N pairs out of 2N bands), so the trailing ones have to be
+    dropped by the select rather than left standing.
+    """
+    return lf.with_columns(exprs).select([*names, *extra_columns])
 
 
 def case_band_wide(
@@ -695,11 +733,8 @@ def case_band_wide(
 
     **Unpaired (one value column): a MAP.** One chained `pl.when(...)` per band, with the
     placeholder `value` rewritten to that band's own column (`rewrite_value_column`). Band
-    count, band order and `metadata_df` are all unchanged -- this rewrites pixels, it does
-    not select bands, which is why `case` needs no per-band applicability pass the way
-    `calculate_band_wide` does: a `case` arm's `when` is a pure value predicate
-    (`request.ops._type_case` rejects the other two kinds), so there is no dimension half
-    to evaluate against metadata.
+    count, band order and `metadata_df` are all unchanged -- this rewrites pixels, it never
+    selects bands.
 
     **Paired (a `join` left one value column per operand): a REDUCE.** Each pair of bands
     becomes ONE band, with every operand name rewritten to its own band column within that
@@ -709,9 +744,21 @@ def case_band_wide(
     to pick which operand's value the one surviving band carries, and only an arm's `then`
     says.
 
-    Neither reading adds a nodata guard of its own -- unlike `calculate_band_wide`, whose
-    `is_not_null()` seed is part of its pass-through contract. See `case_expression` for
-    why a `case` leaves nodata to the arms.
+    **An arm's dimension half selects which bands the ARM applies to.** Band-wide shape
+    keeps its dimension values in `metadata_df`, one row per band, so a conjunct naming one
+    has a per-band answer rather than a per-pixel one: `_band_applicability` evaluates each
+    arm's dimension half once across the whole metadata frame, and the band-by-band result
+    decides which arms enter that band's chain. A band an arm does not apply to still gets
+    every OTHER arm and the `else` -- the arm drops out, the band does not. A band every arm
+    drops out of is the `else` alone, which for a migrated `calculate` (`else: "value"`) is
+    the identity, exactly the pass-through that lowering used to get by skipping the band.
+
+    On the paired side the same question is asked of the PAIR, against
+    `_coalesced_pair_metadata` -- the operands of one pair do not share a metadata row, so
+    there is no single row to evaluate against until one is built.
+
+    Neither reading adds a nodata guard of its own. See `case_expression` for why a `case`
+    leaves nodata to the arms.
 
     A `case` over zero bands is `band_wide` unchanged in either reading -- there is nothing
     to rewrite and nothing to pair, and "nothing happens to zero bands" needs no expression
@@ -726,35 +773,41 @@ def case_band_wide(
 
     if len(value_columns) > 1:
         grouped, key_columns, pairs = _pair_band_groups(metadata_df, value_columns)
+        if not pairs:
+            return empty_band_wide(window)
+        applicable = _band_applicability(_coalesced_pair_metadata(metadata_df, pairs))
         kept_rows = []
         band_exprs = []
-        for row_index, _positions, substitutions in pairs:
+        for pair_index, (row_index, _positions, substitutions) in enumerate(pairs):
             columns = list(substitutions.values())
             band_exprs.append(
                 long_ops.case_expression(
                     op,
                     [*columns, *extra_columns],
                     lambda text, subs=substitutions: rewrite_value_columns(text, subs),
+                    predicate_columns=[*substitutions, *extra_columns],
+                    resolve_dimension=lambda text, i=pair_index: applicable(text)[i],
                 ).alias(f"b{len(kept_rows)}")
             )
             kept_rows.append(row_index)
-        if not kept_rows:
-            return empty_band_wide(window)
         return (
-            lf.select([*band_exprs, *extra_columns]),
+            _select_band_exprs(lf, band_exprs, [f"b{i}" for i in range(len(kept_rows))], extra_columns),
             _paired_metadata(grouped, key_columns, kept_rows),
             window,
         )
 
+    applicable = _band_applicability(metadata_df)
     exprs = [
         long_ops.case_expression(
             op,
             [name, *extra_columns],
             lambda text, column=name: rewrite_value_column(text, column),
+            predicate_columns=["value", *extra_columns],
+            resolve_dimension=lambda text, i=position: applicable(text)[i],
         ).alias(name)
-        for name in names
+        for position, name in enumerate(names)
     ]
-    return lf.select([*exprs, *extra_columns]), metadata_df, window
+    return _select_band_exprs(lf, exprs, names, extra_columns), metadata_df, window
 
 
 def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequence[str]) -> BandWideFrame:

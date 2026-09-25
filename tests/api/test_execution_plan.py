@@ -259,7 +259,36 @@ class TestCasePushdown:
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.columns == sorted({"grid_cell", "value", "calendar_year"})
 
-    def test_a_dimension_arm_is_refused_before_the_plan_is_ever_built(self):
+    def test_a_dimension_arms_columns_are_kept_but_the_conjunct_is_not_pushed(self):
+        """An arm's dimension conjunct decides which rows get REWRITTEN, not which exist,
+        so pushing it to the read as a row predicate would delete the rows the `else` was
+        supposed to hand back. What the plan takes from the arm is only its column names:
+        `scenario_id` has to be read for the arm to be evaluable at all, even though
+        nothing else in the pipeline mentions it.
+        """
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {
+                        "op": "case",
+                        "input": "a",
+                        "cases": [{"when": "scenario_id = 7", "then": "1"}],
+                        "else": "value",
+                        "as": "c",
+                    },
+                    {"op": "group", "by": ["calendar_year"], "aggregate": "mean", "of": "value"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        resolved = compile_plan(pipeline).inputs["a"]
+        assert "scenario_id" in resolved.columns
+        # Named, not pushed: nothing narrows the read, since every row still has to arrive
+        # for the `else` to hand it back.
+        assert resolved.predicate is None
+
+    def test_a_spatial_arm_is_refused_before_the_plan_is_ever_built(self):
         with pytest.raises(ShapeError, match="state that as a filter instead"):
             _pipeline(
                 {
@@ -268,7 +297,7 @@ class TestCasePushdown:
                         {
                             "op": "case",
                             "input": "a",
-                            "cases": [{"when": "scenario_id = 7", "then": "1"}],
+                            "cases": [{"when": "grid_cell = 7", "then": "1"}],
                         }
                     ],
                     "output": {"format": "csv"},
@@ -367,8 +396,8 @@ class TestVectorColumnPushdown:
         resolved = compile_plan(pipeline).inputs["a"]
         assert "grid_cell" in resolved.columns
 
-    def test_a_calculate_wheres_columns_survive_a_later_group(self):
-        # The `where` is evaluated against the scanned frame, so every column it names has
+    def test_a_case_arms_columns_survive_a_later_group(self):
+        # The `when` is evaluated against the scanned frame, so every column it names has
         # to outlive the narrowing a later `group` closes -- even though `scenario_id` is
         # neither grouped by nor aggregated, and nothing else in the pipeline mentions it.
         pipeline = _pipeline(
@@ -376,10 +405,10 @@ class TestVectorColumnPushdown:
                 "inputs": {"a": vector_input()},
                 "steps": [
                     {
-                        "op": "calculate",
+                        "op": "case",
                         "input": "a",
-                        "expression": "value * 2",
-                        "where": "scenario_id = 7",
+                        "cases": [{"when": "scenario_id = 7", "then": "value * 2"}],
+                        "else": "value",
                         "as": "c",
                     },
                     {"op": "group", "by": ["calendar_year"], "aggregate": "mean", "of": "value"},

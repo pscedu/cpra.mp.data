@@ -135,16 +135,17 @@ class TestLoweringTableAgreement:
     def test_join_shapes_are_fully_covered(self):
         assert self._registered("join") == set(JOIN_LOWERING_TABLE)
 
-    def test_calculate_shapes_are_fully_covered(self):
-        # `calculate` has no lowering table of its own (`_type_calculate` types it
-        # unconditionally shape-preserving) -- the declared domain is `Shape` itself.
-        assert self._registered("calculate") == set(Shape)
+    def test_calculate_has_no_lowering_of_its_own(self):
+        # `compile_ops` lowers a `calculate` to an arm-less `CaseOp`, so nothing downstream
+        # of the request layer ever dispatches on the kind -- an entry registered for it
+        # would be dead code that looked like coverage.
+        assert self._registered("calculate") == set()
 
     def test_case_shapes_are_fully_covered(self):
-        # Same reading as `calculate`: `_type_case` types a `case` unconditionally
-        # shape-preserving (its arms are value predicates, and only a spatial one could
-        # change shape -- which `_type_case` rejects outright), so there is no table to
-        # consult and the declared domain is `Shape` itself.
+        # `case` has no lowering TABLE: `_type_case` types it unconditionally
+        # shape-preserving (only a spatial arm could change shape, and that is rejected
+        # outright), so there is nothing to consult and the declared domain is `Shape`
+        # itself. This is the entry a `calculate` reaches too.
         assert self._registered("case") == set(Shape)
 
     def test_group_shapes_are_fully_covered(self):

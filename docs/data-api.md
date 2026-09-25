@@ -166,10 +166,10 @@ Every one of these has a pipeline equivalent on the [Analysis API](analysis-api.
 | Removed Parameter | Replacement |
 |---|---|
 | `value_where` | Fold the condition into `where`, which now accepts both dimension and value conditions in one string (e.g. `calendar_year > 2040 AND value > 3`) |
-| `negate` | A `difference` named analysis (see [the registry doc](analyses-api.md)), or a pipeline `calculate` step directly: `negate=X` is `calculate` expression `value * -1` with `where=X` |
-| `multiply10` | A pipeline `calculate` step: `multiply10=X` is `calculate` expression `value * 10` with `where=X` |
-| `multiply100` | A pipeline `calculate` step: `multiply100=X` is `calculate` expression `value * 100` with `where=X` |
-| `calculate.N.expression` / `calculate.N.where` | A pipeline `calculate` step directly, in the same order |
+| `negate` | A `difference` named analysis (see [the registry doc](analyses-api.md)), or a pipeline `case` step directly: `negate=X` is one arm `{"when": X, "then": "value * -1"}` with `"else": "value"` for the rows it doesn't match |
+| `multiply10` | A pipeline `case` step: `multiply10=X` is one arm `{"when": X, "then": "value * 10"}` with `"else": "value"` |
+| `multiply100` | A pipeline `case` step: `multiply100=X` is one arm `{"when": X, "then": "value * 100"}` with `"else": "value"` |
+| `calculate.N.expression` / `calculate.N.where` | A pipeline `calculate` step for the unconditional form; where a `where` was given, one `case` step whose arms are the N `where`/`expression` pairs in order, plus `"else": "value"` |
 | `group_by` / `group_aggregate` | A pipeline `group` step |
 | `summarize_by` / `summarize_aggregate` | A pipeline `project` step's `to`/`aggregate` fields |
 | `summarize_grid_cell` | A pipeline `filter` step naming `grid_cell`, placed after the `project` that produced the zones (a `grid_cell` filter before the `project` selects source cells instead) |

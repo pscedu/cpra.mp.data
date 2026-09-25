@@ -584,7 +584,7 @@ class TestQueryCodec:
             },
             "steps": [
                 {"op": "filter", "input": "marsh", "where": "calendar_year > 2040", "as": "recent"},
-                {"op": "calculate", "expression": "value * 2", "where": "value > 0", "as": "doubled"},
+                {"op": "calculate", "expression": "value * 2", "as": "doubled"},
                 {"op": "project", "to": VECTOR_GRID_2, "aggregate": "mean", "as": "projected"},
                 {"op": "group", "by": ["calendar_year"], "aggregate": "min", "of": "calendar_year", "as": "earliest"},
             ],
@@ -598,7 +598,8 @@ class TestQueryCodec:
         pipeline = parse_pipeline(data)
         query = pipeline_to_query(pipeline)
         assert query["step.1.as"] == "recent"
-        assert query["step.2.where"] == "value > 0"
+        assert query["step.1.where"] == "calendar_year > 2040"
+        assert query["step.2.expression"] == "value * 2"
         assert query["step.4.of"] == "calendar_year"
         assert query["output.color_map"] == "viridis"
         assert query["output.select"] == "grid_cell,value"
@@ -849,7 +850,9 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
             "project": {"op", "input", "to", "aggregate", "as"},
             "join": {"op", "type", "inputs", "as"},
             "filter": {"op", "input", "where", "as"},
-            "calculate": {"op", "input", "expression", "where", "as"},
+            # No `where`: `calculate` is unconditional, and the conditional form it used
+            # to spell is a `case` arm.
+            "calculate": {"op", "input", "expression", "as"},
             "case": {"op", "input", "cases", "else", "as"},
             "group": {"op", "input", "by", "aggregate", "of", "as"},
         }
@@ -930,7 +933,7 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
                 {"op": "project", "input": "salinity", "to": RASTER_GRID, "aggregate": "mean", "as": "sal_r"},
                 {"op": "join", "type": "spatial", "inputs": ["marsh", "sal_r"], "as": "paired"},
                 {"op": "filter", "input": "paired", "where": "marsh > 0.5", "as": "recent"},
-                {"op": "calculate", "input": "recent", "expression": "marsh * 2", "where": "marsh > 0", "as": "big"},
+                {"op": "calculate", "input": "recent", "expression": "marsh * 2", "as": "big"},
                 {
                     "op": "case",
                     "input": "big",
