@@ -302,14 +302,13 @@ class TestShouldFoldGroupBy:
         assert should_fold_group_by(["calendar_year"], has_selective_filter=True) is False
 
     def test_a_non_string_key_is_harmless_alongside_grid_cell(self):
-        """`stages.resolve_group_by_columns` no longer produces a non-string key --
-        the group_aggregate-without-group_by case is an empty list now, not a `[True]`
-        literal sentinel (see its docstring for why: grouping by `True` leaked a
-        meaningless "literal" column into every such response) -- but `group_by_keys`
-        is a plain `Sequence[Any]` here, so a non-string key from some other future
-        caller must still not break the rule: it can never match a high-cardinality
-        column name, but its presence in the key list must not stop `grid_cell` (also
-        in the list) from tripping it."""
+        """No caller in this package produces a non-string key any more -- a `group` step
+        collapsing to a single row spells it `by: []`, not with the `[True]` literal
+        sentinel Polars also accepts (which leaked a meaningless "literal" column into
+        every such response) -- but `group_by_keys` is a plain `Sequence[Any]` here, so a
+        non-string key from some other future caller must still not break the rule: it can
+        never match a high-cardinality column name, but its presence in the key list must
+        not stop `grid_cell` (also in the list) from tripping it."""
         assert should_fold_group_by([True, "grid_cell"], has_selective_filter=False) is True
 
     def test_a_custom_high_cardinality_set_is_honored(self):

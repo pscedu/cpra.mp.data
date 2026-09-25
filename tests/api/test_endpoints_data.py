@@ -604,9 +604,8 @@ class TestRasterData:
         `/v1/analysis.csv` pipeline request: a LEADING `filter` step
         (naming its `input` explicitly, since it is step 1 -- see `FilterStep.input`'s
         docstring) followed by a `project`-to-a-coarser-grid step with `aggregate=count`.
-        `summarize_by`/`summarize_aggregate` have no flat spelling, so
-        this goes through the pipeline route whose `project`+`aggregate` step compiles onto
-        those `Options` fields rather than the plain data route.
+        `summarize_by`/`summarize_aggregate` have no flat spelling any more, so this goes
+        through the pipeline route's `project` step rather than the plain data route.
 
         The filter is declared exactly where it executes: each step runs at its own
         position in the walk, with no reordering, so a `filter` declared BEFORE the

@@ -4,12 +4,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
 
-from cpra.mp.data.analysis.request.parameters import (  # noqa: F401
-    CalculateEntry,
+from cpra.mp.data.analysis.request.parameters import (
     DataOptions,
-    DatasetDimensions,
+    DatasetDimensions,  # noqa: F401 -- re-exported; imported from here by cli/, visualizations/ and tests
     FilterDimensions,
-    Options,
 )
 from cpra.mp.data.analysis.request.types import (
     CompressionAlgorithm,
@@ -23,12 +21,15 @@ class Compression(BaseModel):
 
 
 class TileQuery(DataOptions, FilterDimensions):
-    """Inherits `DataOptions`, not `Options`: the data/tile HTTP endpoints accept exactly
-    dimension filters plus `grid_cell`/`where`/`sort`/`select`/`color_map` (and
-    compression, on `DataQuery` below) -- `Options`'s pipeline-execution fields
-    (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) are engine-internal and are
-    rejected explicitly if sent on the query string (see
-    `api.__init__.reject_retired_params`) rather than silently ignored.
+    """The data/tile HTTP endpoints accept exactly dimension filters plus
+    `grid_cell`/`where`/`sort`/`select`/`color_map` (and compression, on `DataQuery`
+    below). The pipeline-execution parameters that used to sit alongside them
+    (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) are pipeline steps now, and
+    sending one is rejected explicitly with the step to use instead
+    (`api.__init__.reject_retired_params`) rather than silently ignored.
+
+    The two properties below split a flat query back into the two halves it was assembled
+    from, which is what `api.data_query.build_data_query` takes.
     """
 
     model_config = ConfigDict(use_enum_values=True)
@@ -39,7 +40,7 @@ class TileQuery(DataOptions, FilterDimensions):
 
     @property
     def options(self):
-        return Options(**dict(self))
+        return DataOptions(**dict(self))
 
 
 class DataQuery(TileQuery, Compression):
@@ -152,10 +153,9 @@ class Analysis(BaseModel):
 class AnalysisQuery(DataOptions, FilterDimensions):
     """Accepted request parameters for the named-analysis routes: the
     dataset's dimension filters (from `FilterDimensions`) plus `DataOptions`'s
-    `grid_cell`/`where`/`sort`/`select`/`color_map`. Deliberately NOT `Options` -- that
-    also carries the `calculate`/`group_by`/`summarize_*` pipeline-execution fields,
-    none of which a named analysis accepts directly: a named analysis's transformation
-    is entirely its own declared parameters plus its `Meta`-fixed pipeline shape.
+    `grid_cell`/`where`/`sort`/`select`/`color_map`. Nothing here describes a
+    TRANSFORMATION, because a named analysis's transformation is entirely its own declared
+    parameters plus its `Meta`-fixed pipeline shape.
 
     A named analysis's own declared parameters (`dimension`, `order`,
     `marsh_threshold`, ...) have no fixed field set here -- they vary per analysis and

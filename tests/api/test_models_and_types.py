@@ -3,8 +3,6 @@
 from datetime import date
 from enum import Enum
 
-import pytest
-
 from cpra.mp.data.analysis.request.types import (
     AggregateFunction,
     CompressionAlgorithm,
@@ -16,10 +14,10 @@ from cpra.mp.data.analysis.request.types import (
 )
 from cpra.mp.data.api.models import (
     Compression,
+    DataOptions,
     DataQuery,
     DatasetDimensions,
     FilterDimensions,
-    Options,
     TileQuery,
 )
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
@@ -58,12 +56,13 @@ class TestEnums:
         assert {member.value for member in VectorGrid} == expected
 
     def test_aggregate_functions(self):
-        # `count` is included as a valid `summarize_aggregate`/`group_by`-aggregate value
-        # on both grid types (see the `AggregateFunction` docstring in types.py) even
-        # though it is explicitly rejected as a raster `group_aggregate` -- that
-        # rejection is enforced by `Dataset`, not by the enum's membership. `count_by_value`
-        # is similarly a member here but rejected by `Dataset` as a `group_aggregate` on
-        # either grid type -- see the comment on it in types.py.
+        # Membership here is the enum's whole job: it is the closed vocabulary a
+        # `project`/`group` step may NAME, not a statement that every member is legal in
+        # every step. `count_by_value` is the case that makes the distinction visible --
+        # a member of this enum, accepted by `project`, and rejected by `group`, because
+        # it collapses to one row per (group, distinct value) and only `project` has
+        # somewhere to put the extra rows. That rejection lives in
+        # `request/aggregates.py::validate_group_aggregate`, not in this set.
         assert {m.value for m in AggregateFunction} == {
             "count", "count_by_value", "max", "mean", "min", "sum"
         }
@@ -115,40 +114,35 @@ class TestFilterDimensions:
         assert set(FilterDimensions.model_fields) == expected
 
 
-class TestOptions:
+class TestDataOptions:
+    """`DataOptions` is the WHOLE options vocabulary a flat request has. The five fields
+    below are it -- every parameter that used to describe how a request TRANSFORMED its
+    data (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) is a pipeline step now,
+    and the `Options` superset that carried them has been deleted rather than kept as a
+    shape nothing reads. `TestRetiredParams` in `test_endpoints_data.py` pins the 400s
+    those names get; this pins that nothing here quietly grew one back.
+    """
+
     def test_defaults(self):
-        options = Options()
+        options = DataOptions()
         assert options.grid_cell is None
-        assert options.group_aggregate is None
-        assert options.calculate is None
+        assert options.where is None
 
-    def test_aggregate_enum_is_unwrapped(self):
-        assert Options(group_aggregate="sum").group_aggregate == "sum"
-
-    def test_summarize_by_accepts_a_vector_grid(self):
-        assert Options(summarize_by="hydro_compartment_v001").summarize_by == "hydro_compartment_v001"
-
-    def test_summarize_by_rejects_a_raster_grid(self):
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError):
-            Options(summarize_by="morph_pixel_v001")
+    def test_the_field_set_is_exactly_the_five_data_access_options(self):
+        assert set(DataOptions.model_fields) == {"grid_cell", "where", "sort", "select", "color_map"}
 
 
 class TestQuerySplitting:
     """TileQuery and DataQuery arrive flat from the query string and are split apart."""
 
     def test_tile_query_splits_filters_from_options(self):
-        # `group_by`/`group_aggregate`/`calculate`/... are `Options`-only fields, not
-        # `TileQuery`'s (`TileQuery` inherits `DataOptions`, not `Options` --
-        # see `TileQuery`'s docstring) -- so only a `DataOptions` field (`where`) is
-        # exercised here; `query.options` still reports `Options` defaults for the
-        # fields `TileQuery` itself doesn't carry.
+        # The two halves `TileQuery` is assembled from, taken back apart: a dimension
+        # filter goes one way, a `DataOptions` field the other, and neither property
+        # reports a field belonging to the other half (the two tests below).
         query = TileQuery(model_group_id=[500], where="calendar_year > 2035", grid_cell="1,2")
         assert query.filter_dimensions.model_group_id == [500]
         assert query.options.where == "calendar_year > 2035"
         assert query.options.grid_cell == "1,2"
-        assert query.options.group_aggregate is None
 
     def test_filter_dimensions_drops_option_fields(self):
         query = TileQuery(model_group_id=[500], where="calendar_year > 2035")

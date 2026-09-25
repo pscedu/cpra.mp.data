@@ -73,15 +73,13 @@ A single SQL-style `where` parameter accepts two kinds of conditions, joined wit
 - **Dimension** conditions, against dimension columns, using SQL where-clause syntax
   without restriction on the expression (aside from the aggregate/subquery rule below).
 - **Value** conditions, against the data values themselves, written using the placeholder
-  column `value` (e.g. `value > 3`) -- **vector-grid data only** on this data API. A
-  value condition is parsed against a restricted whitelist of comparison operators and
-  elementwise functions. On these plain (non-aggregating) endpoints, a row failing a
-  value condition is dropped. A raster-grid `where` value condition has no meaning here:
-  it is only meaningful once pixels are being summarized into zones or bands, which is a
-  pipeline `project`/`group` operation now (see [Analysis API](analysis-api.md)) -- a
-  raster request on this data API that includes a value condition in `where` is rejected
-  with an error naming `summarize_by`/`summarize_aggregate` as the reason, rather than
-  silently doing nothing.
+  column `value` (e.g. `value > 3`). A value condition is parsed against a restricted
+  whitelist of comparison operators and elementwise functions. What a failing value
+  condition *does* depends on the grid: on a **vector** grid the row is dropped, since a
+  row carries exactly one measurement and there is nothing else in it to preserve; on a
+  **raster** grid the pixel is masked to nodata **in that band alone**, because dropping
+  its row would drop the same pixel from every other band too, including the bands the
+  condition holds for.
 
 Every `AND`-joined term in `where` must be entirely one kind or the other -- a single
 comparison cannot mix a dimension column and `value` (e.g. `value > calendar_year` is
@@ -95,7 +93,7 @@ test.
 |---|---|---|---|---|
 | Partition and Non-Partition Dimensions | Any dimension from the partition and non-partition tables above | ✅ | ✅ | `aep=0.2` |
 | `grid_cell` | Grid cells to include, as IDs (vector grids only) or as `x,y` coordinate pairs | ✅ | ✅ | `grid_cell=24,81` or `grid_cell=-90.49,30.01` |
-| `where` | Dimension filters (both grids) and/or value filters (vector-grid only), in SQL where-clause format | ✅ | dimension conditions only | `where=calendar_year%3E2040` or `where=value%20%3E%203` |
+| `where` | Dimension and/or value conditions, in SQL where-clause format; a failing value condition drops the row on a vector grid and masks the pixel to nodata on a raster grid | ✅ | ✅ | `where=calendar_year%3E2040` or `where=value%20%3E%203` |
 
 ## Sort, Select, and Color Map
 
@@ -180,10 +178,3 @@ Every one of these has a pipeline equivalent on the [Analysis API](analysis-api.
 See [Analysis API](analysis-api.md) for the full pipeline grammar, and
 [the named-analysis registry](analyses-api.md) for pre-built pipelines like `difference`
 that need no hand-authored pipeline JSON at all.
-
-> **Note on `summarize_grid_cell`/`summarize_by`/`summarize_aggregate`'s replacement.**
-> The server's own 400 message for these three names currently describes the replacement
-> as "the `summarize` pipeline step," but the pipeline grammar (see
-> [Analysis API](analysis-api.md)) has no operation literally named `summarize` -- the
-> table above names the actual replacement (`project`'s `to`/`aggregate`, plus a
-> post-project `filter` naming `grid_cell`).

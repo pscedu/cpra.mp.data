@@ -6,7 +6,7 @@ Covers what `tests/api/test_analyses_registry.py` and `tests/test_visualizations
   to silently return `{}` for EVERY caller (a `cs.matches(r"^[0-9]")` selector that assumed
   a wide, one-column-per-grid-cell shape against data stored long). Proven here by asserting
   a non-empty result on both the resolved-analysis branch and the no-analysis-selected
-  branch (`group_by`/`group_aggregate` alone, still real `Options` fields today).
+  branch (dimension filters alone, no `analysis=`).
 * **Pure presentation-hook coverage** (`TestResolvedAnalysisMetadataHooks`,
   `TestCompareDimensionsExclusion`) -- `_is_difference`/`_legend_name`/`difference_suffix`/
   `compare_dimensions`/`chart()`'s compare channels, on the resolved-analysis path and the
@@ -82,8 +82,8 @@ class TestFeatureColorsBugFix:
     def test_no_analysis_branch_also_returns_real_colors(self, base_path, monkeypatch):
         """The bug affected the no-`analysis=`-selected path exactly as much as the
         resolved one -- both branches used to share the same broken `cs.matches`
-        selector. `group_by`/`group_aggregate` (still real `Options` fields today, unlike
-        the deleted `negate`/`multiply10`/`multiply100`) are enough to exercise it."""
+        selector. Reaching that branch takes nothing but leaving `analysis=` unset, so
+        the ordinary dimension filters below are the whole setup."""
         write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
@@ -91,8 +91,6 @@ class TestFeatureColorsBugFix:
             variable=ANNUAL_KWARGS["variable"],
             grid=ANNUAL_KWARGS["grid"],
             time_unit=ANNUAL_KWARGS["time_unit"],
-            group_by="model_group_id,scenario_id,percentile",
-            group_aggregate="sum",
             calendar_year=[2030, 2040],
             **COMMON_ANNUAL_FILTER_LISTS,
         )

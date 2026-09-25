@@ -115,7 +115,7 @@ class Map(DatasetVisualization):
         """
         from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
         from cpra.mp.data.api.data_query import resolve_grid_cell_sync
-        from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+        from cpra.mp.data.api.models import DataOptions, DatasetDimensions, FilterDimensions
 
         def bind(model):
             fields = set(model.model_fields)
@@ -124,7 +124,7 @@ class Map(DatasetVisualization):
         dataset_dimensions = DatasetDimensions(
             variable=self.variable.name, grid=self.grid.name, time_unit=self.time_unit
         )
-        options = bind(Options)
+        options = bind(DataOptions)
         grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, options.grid_cell)
         return build_data_query_pipeline(
             dataset_dimensions,

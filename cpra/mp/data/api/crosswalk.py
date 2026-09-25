@@ -2,7 +2,7 @@
 
 The conversions come from the crosswalk files in `config.CROSSWALKS_PATH`: a Parquet table
 of `src_id`/`dst_id`/`scale_factor` rows for each vector-to-vector pair, and a zone-ID
-GeoTIFF for each raster-to-vector pair (the same files `Dataset`'s `summarize_by` uses).
+GeoTIFF for each raster-to-vector pair (the same files a pipeline `project` step uses).
 The two conversions those files don't cover are derived from the grids themselves —
 vector to raster from the source polygon's point on surface, and raster to raster from the
 coordinate itself, which names a location rather than a cell and so needs no translation.
@@ -113,7 +113,7 @@ class Crosswalk:
 
     def _crosswalk_path(self, dst_grid_name, extension):
         """Locate the crosswalk file to a destination grid, reporting a missing one as a
-        400 the way `summarize_by` does."""
+        400 rather than letting the read fail deeper in."""
         crosswalk_path = config.CROSSWALKS_PATH / f"{self.grid.name}__{dst_grid_name}.{extension}"
         if not crosswalk_path.exists():
             msg = f"No crosswalk from {self.grid.name} to {dst_grid_name}"

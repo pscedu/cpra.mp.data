@@ -31,7 +31,7 @@ plan_version,variable,geographic_unit,time_unit
 GET /v1/grids/<source_grid>/crosswalk.<format>?geography=<geographies>&to_grid=<grid>
 ```
 
-Converts one or more geographies from a source grid into the equivalent geographies in one or more destination grids, using the crosswalk files that back the data API's `summarize_by` parameter. The result is a table in any of the tabular formats above (`csv`, `ndjson`, or `parquet`), always with the same columns and the same column types:
+Converts one or more geographies from a source grid into the equivalent geographies in one or more destination grids, using the same crosswalk files a pipeline `project` step reads. The result is a table in any of the tabular formats above (`csv`, `ndjson`, or `parquet`), always with the same columns and the same column types:
 
 | Column | Type | Description |
 |---|---|---|

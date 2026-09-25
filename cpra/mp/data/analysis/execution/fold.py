@@ -120,11 +120,15 @@ def should_fold_group_by(
     - `has_selective_filter`: whether the request already carries something that shrinks
       the row count reaching this group_by well below "the whole dataset" -- a pushed-down
       dimension filter (Hive-partition-level: `calendar_year=[...]`, `scenario_id=[...]`,
-      ...) or a specific `summarize_grid_cell` destination selection (narrows the
-      crosswalk before `apply_summarize`'s own group_by runs). `grid_cell` itself is
-      deliberately NOT one of these any more: it narrows the OUTPUT, applied terminally
-      after every group_by in the walk has already run, so by the time any group_by
-      reaches this function it has not dropped a single row yet. Measured case: the
+      ...), or anything else that has already dropped rows by the time this collapse runs.
+      No caller passes `True` today -- every call site (`execution/project.py`,
+      `execution/long_ops.py`) passes `False`, because a step being lowered has no view of
+      what ran upstream of it; the parameter exists so that a caller that DOES know can
+      say so, and so the conservative default stays visible at each site rather than
+      hidden in a default argument. A `grid_cell` filter is deliberately NOT one of these:
+      it narrows the OUTPUT, applied terminally after every group_by in the walk has
+      already run, so by the time any group_by reaches this function it has not dropped a
+      single row yet. Measured case: the
       identical high-cardinality group-by with a genuinely selective filter already runs
       in 0.1 s / 285 MB, so folding it too would only add overhead for no benefit.
 
