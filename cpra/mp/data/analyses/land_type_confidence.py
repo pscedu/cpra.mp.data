@@ -32,6 +32,18 @@ weights no longer total `1.0` and its confidence reads low rather than being res
 the members that actually reported. That is the arithmetic `group`/`sum` gives; a
 mean-over-valid-members would need a matching count, which this shape has no way to
 carry.
+
+`legend = "lnd_conf"` colorizes that fraction directly: five even bands over `[0, 1]`,
+diverging about the `0.4`-`0.6` band that straddles an evenly-split ensemble, water-colored
+below it and land-colored above.
+
+Not to be confused with `legends.csv`'s neighboring `lnd_conf_diff`, whose break points are
+`scripts/generate_video_frames.py`'s `CONFIDENCE_BREAKS`: those classify a SIGNED `[-1, 1]`
+difference of this fraction between two years ("likely land gain", "high confidence no
+change", ...), which is the reading of a `land-type-confidence,difference` chain's output
+rather than of this analysis's own. This analysis declares only the undifferenced legend --
+see `analyses.resolve_analysis_chain`, where a chained stage's own `legend` (today
+`difference` declares none) is what would override it.
 """
 
 from typing import Any
@@ -74,7 +86,7 @@ class LandTypeConfidence(Analysis):
         label = "Land Type Confidence"
         type = "dataset"
         variables = ["lnd_type"]
-        legend = None
+        legend = "lnd_conf"
         result_kind = "value"
         kind = "variable"
         subsumed_dimensions = ["scenario_id"]

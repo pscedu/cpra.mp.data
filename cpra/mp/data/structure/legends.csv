@@ -283,3 +283,15 @@ lnd_type_plus,Upland/Developed Areas (value=4),#999999,5.0
 lnd_type_plus,Flotant Marsh (value=5),#afeeee,6.0
 lnd_type_plus,Water - Shallow Intertidal (value = 6),#d1dffa,7.0
 lnd_type_plus,Water - Shallow Subtidal (value = 7),#93b5f2,
+lnd_conf,0 to < 0.2,#018571,0.2
+lnd_conf,0.2 to < 0.4,#80cdc1,0.4
+lnd_conf,0.4 to < 0.6,#f5f5f5,0.6
+lnd_conf,0.6 to < 0.8,#dfc27d,0.8
+lnd_conf,0.8 to 1.0,#a6611a,
+lnd_conf_diff,Likely Land Loss,#256B84,-0.67
+lnd_conf_diff,Possible Land Loss,#4999B6,-0.42
+lnd_conf_diff,Likely Stays Land,#A0C7D4,-0.09
+lnd_conf_diff,High Confidence No Change,#00000000,0.17
+lnd_conf_diff,Likely Stays Water,#ABCB9F,0.50
+lnd_conf_diff,Possible Land Gain,#658859,0.75
+lnd_conf_diff,Likely Land Gain,#1F4314,

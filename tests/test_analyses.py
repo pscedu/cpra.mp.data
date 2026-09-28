@@ -109,7 +109,7 @@ class TestRegistry:
 
         assert ANALYSES["land-type-confidence"].Meta.type == "dataset"
         assert ANALYSES["land-type-confidence"].Meta.variables == ["lnd_type"]
-        assert ANALYSES["land-type-confidence"].Meta.legend is None
+        assert ANALYSES["land-type-confidence"].Meta.legend == "lnd_conf"
         assert ANALYSES["land-type-confidence"].Meta.result_kind == "value"
 
         assert ANALYSES["lnd-type-plus"].Meta.type == "custom"
@@ -125,6 +125,26 @@ class TestRegistry:
         for name, cls in ANALYSES.items():
             if cls.Meta.legend is not None:
                 assert cls.Meta.legend in LEGENDS, name
+
+    def test_land_type_confidence_declares_the_undifferenced_legend(self):
+        """`land-type-confidence` outputs a weighted FRACTION on `[0, 1]`, so the legend it
+        declares has to classify that domain. `legends.csv` also carries `lnd_conf_diff`,
+        whose break points are signed (`scripts/generate_video_frames.py`'s
+        `CONFIDENCE_BREAKS`) because they classify a DIFFERENCE of that fraction between two
+        years. The two are one `Meta.legend` string apart, and neither
+        `test_every_declared_legend_is_a_real_one` (both names are real) nor
+        `test_structure.TestLegendsCsv`'s structural checks (both are well-formed) can tell
+        them apart -- picking the wrong one is silently wrong colors, never an error, so the
+        domain is asserted directly here.
+        """
+
+        def bounds(legend_name):
+            return [b for b in LEGENDS[legend_name].break_points["upper_bound"].to_list() if b is not None]
+
+        declared = bounds(ANALYSES["land-type-confidence"].Meta.legend)
+        assert all(0.0 <= b <= 1.0 for b in declared), declared
+        # The other one, for contrast: signed, and so not a reading of the fraction itself.
+        assert any(b < 0.0 for b in bounds("lnd_conf_diff"))
 
 
 # ------------------------------------------------------------------------------------------
@@ -1100,7 +1120,7 @@ class TestLandTypeConfidencePipeline:
 
     def test_meta_and_presentation(self):
         analysis, _ = self._build()
-        assert analysis.legend is None
+        assert analysis.legend == "lnd_conf"
         assert analysis.result_kind == "value"
         assert analysis.title_suffix == " Confidence"
 
