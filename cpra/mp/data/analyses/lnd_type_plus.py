@@ -5,9 +5,35 @@ annual stage (`stg`/annual/`hydro_compartment_v002`, `aggregate_type=mean`) is p
 onto `morph_pixel_v002`, spatially joined against topobathymetric elevation
 (`elev`/annual/`morph_pixel_v002`, stored in millimetres) and annual land type
 (`lnd_type`/annual/`morph_pixel_v002`), and the difference of the first two is reclassified
-where the third says open water: `6` (inundated, no deeper than 0.46 m), `7` (deeper than
-0.46 m, no deeper than 1.0 m), and `2` -- plain open water -- deeper than that. Everything
-the reclassification does not claim is the land type, unchanged.
+where the third says open water: `6` (no deeper than 0.46 m), `7` (deeper than 0.46 m, no
+deeper than 1.0 m), and `2` -- plain open water -- deeper than that. Everything the
+reclassification does not claim is the land type, unchanged, and everything the STAGE
+surface never reached is nodata.
+
+The shallowest class has NO lower bound: open water is open water, so a pixel `lnd_type`
+calls water reads as `6` however little of it the depth surface finds -- zero or negative.
+The two surfaces are independently modelled and disagree at the coastline (see "Why the
+shallow classes are confined to water" below), and where they do it is the LAND TYPE that is
+authoritative about what is water; the depth's job is only to subdivide it. An earlier
+formulation put a `> 0` floor on that arm and sent everything at or below it to the `else`,
+which reported such a pixel as `2` -- deep water -- on the strength of a non-positive depth,
+which is the one reading the depth rules out. `land_type_plus.ipynb`, the notebook this
+analysis was derived from, has never had that floor.
+
+**Where the stage surface does not reach, the result is nodata** -- the leading arm of the
+`case`, and the reason this analysis's extent is the hydro-compartment crosswalk's rather
+than the morphology grid's. `morph_pixel_v002` carries land types past the last compartment
+`hydro_compartment_v002` covers, and for those pixels `project` has nothing to broadcast, so
+`stage_m` is null and no depth exists in either direction. Handing back the bare land type
+there would publish a `lnd_type_plus` surface over ground this analysis never evaluated:
+the two shallow classes would be absent not because the depth ruled them out but because
+nothing was asked, and a `2` would be indistinguishable from real deep water. `case` removes
+data by writing null (see `request.pipeline.CaseStep`), so the guard is one arm -- `when:
+stage_m IS NULL`, `then: NULL` -- stated FIRST, because the arms are first-match-wins and the
+unbounded shallow arm below would otherwise claim every such water pixel as `6`. It carries
+no land-type conjunct: an unevaluated pixel is unevaluated whatever its land type says, which
+is also what `land_type_plus.ipynb` does, with the outermost `np.where` of its reclassifying
+expression keyed on the crosswalk's own nodata.
 
 The whole analysis is five steps and one join -- filter stage to its aggregate type,
 project it onto the pixel grid, join all three inputs, state the caller's selection, and
@@ -56,18 +82,34 @@ lets stage, elevation and land type arrive on ONE join and be reclassified by ON
 instead of pairing the depth's two operands, collapsing them, and joining the land type in
 afterwards to restrict on it.
 
-**The presence requirement is carried by the arms, and costs no step.** `case` adds no
+**What a missing operand does is carried by the arms, and costs no step.** `case` adds no
 nodata guard of its own (see `execution.long_ops.case_expression` for why it no longer
 does), so what a pixel missing an operand does here is whatever the arms and the `else`
-SAY. Missing stage or elevation makes the depth null, a null predicate is `fill_null(False)`
-(`expressions.value_predicate_mask`), so no arm matches and the `else` reads the land type
-alone -- the right answer, since an unknown depth is not evidence of inundation. Missing
-LAND TYPE nulls both sides at once, the conjunct and the `else`, so such a pixel stays
-nodata. An older formulation said the first half with a `join` + `IS NOT NULL` filter +
-`join` + `{"aggregate": "sum"}`, and said it incompletely: a horizontal `sum` SKIPS nulls
-rather than propagating them, so a pixel with elevation but no stage summed to the bare
-negated elevation and reclassified as real inundation wherever the ground sits below the
-NAVD88 datum. Four steps became none, and none of them is stricter.
+SAY, and each of the three inputs is missing differently. Missing STAGE is the leading arm
+above: nodata, because nothing was evaluated. Missing LAND TYPE nulls both sides at once,
+the water conjunct and the `else`, so such a pixel is nodata too -- and stays nodata even
+where a stage and an elevation would have made a perfectly good depth, which is the one
+place the water restriction turns a pixel that could carry a class into nothing.
+
+Missing ELEVATION is the only one the arms decide by falling through. It makes the depth
+null, a null predicate is `fill_null(False)` (`expressions.value_predicate_mask`), so the
+two BOUNDED arms cannot match; the shallowest one has no depth test left to fail, and an
+open-water pixel with a stage but no elevation therefore reads as `6`. That is the answer
+claiming least: the land type already settles that the pixel is water, and the alternative
+the `else` offers is `2`, the positive claim that the water is deeper than a metre. Off
+water the depth is moot either way and the `else` hands the land type back. (The notebook
+reports such a pixel as `2` instead, but only as an artifact of reading `elev`'s nodata
+sentinel as a real elevation and differencing against it; no pixel in the model output
+carries a land type and no elevation, so the two have never disagreed here in practice.)
+
+`elev`'s absence is a null here and not a number, which is the part that has to keep
+holding: every variable declares a nodata sentinel and the read path masks it (see the
+closing paragraph), so a missing elevation cannot arrive as `-9999000` and be differenced
+into a 9999-metre depth. An older formulation of the same requirement said it with a `join`
++ `IS NOT NULL` filter + `join` + `{"aggregate": "sum"}`, and said it incompletely: a
+horizontal `sum` SKIPS nulls rather than propagating them, so a pixel with elevation but no
+stage summed to the bare negated elevation and reclassified as real inundation wherever the
+ground sits below the NAVD88 datum. Four steps became none.
 
 **Why the selection is stated once, at the end.** `model_group_id`/`scenario_id`/
 `calendar_year` are one `filter` on the fully joined frame, just before the `case`, rather
@@ -95,12 +137,16 @@ source domains in any order -- `6` and `7` both fall in the `> 1.0` domain -- so
 successive rewrites cannot state this at all without an encoding trick, since each one
 rewrites the RUNNING value and the next one's test then sees what it wrote. A `case` has no such
 hazard: every arm's `when` is evaluated against the INCOMING operands, the first match wins,
-and each pixel is written exactly once. The arms are therefore stated in DESCENDING order of
-bound, each as a single `>` test of the depth against the previous class's bound, `AND`ed
-with the water conjunct the paragraph above explains. The last one, `... > 0`, is the domain
-floor, and the `else` is what catches everything at or below it -- an elevation standing at
-or above the water level, which is dry land rather than any inundation class, and which
-therefore reads as its own land type.
+and each pixel is written exactly once. The depth arms are therefore stated in DESCENDING
+order of bound, each as a single `>` test of the depth against the previous class's bound,
+`AND`ed with the water conjunct the paragraph above explains. The LAST of them has no `>`
+test at all -- the shallowest class has no lower bound, so its `when` is the bare water
+conjunct, and it is what catches every open-water pixel the two bounded arms left. Ahead of
+all three stands the stage guard, which is why first-match-wins is doing real work in two
+directions here rather than one: it orders the depth classes against each other, AND it puts
+"nothing was evaluated" ahead of every class that would otherwise claim the pixel. The `else`
+is therefore reached only where a stage exists and the land type is not water, which is what
+makes "the land type, unchanged" its whole meaning.
 
 Nothing here filters `lnd_type` to its `1`-`5` value domain, and nothing needs to: every
 variable declares a nodata sentinel (`variables.py`'s `Variable.nodata`, `-9999` unless
@@ -147,8 +193,11 @@ WATER_LAND_TYPE = 2
 
 # The inundation-depth reclassification, as (upper bound in metres, code) in ascending
 # order of bound, with `None` standing for "no upper bound". Each interval is open at its
-# lower end and CLOSED at its upper one, with zero itself excluded by the last `case` arm
-# below: `(0, 0.46] -> 6`, `(0.46, 1.0] -> 7`, `(1.0, inf) -> 2`.
+# lower end and CLOSED at its upper one, and the shallowest has no lower end to be open at:
+# `(-inf, 0.46] -> 6`, `(0.46, 1.0] -> 7`, `(1.0, inf) -> 2`. The first interval covers a
+# zero and a negative depth, and the `case` arm built from it covers a null one too -- open
+# water is open water however little of it the depth surface finds. See the second paragraph
+# of the module docstring.
 #
 # The deepest class reports the OPEN-WATER LAND TYPE rather than a code of its own, which
 # is what `structure/legends.csv` publishes: `lnd_type_plus` legend values run 1-7, and `2`
@@ -313,30 +362,45 @@ class LndTypePlus(Analysis):
         # through, in one step -- see "Why the reclassification is one `case` step" in the
         # module docstring. `DEPTH_CLASSES` is stated ascending by bound, each interval open
         # at its lower end and closed at its upper one, so an arm's own lower bound is the
-        # PREVIOUS class's upper one and the first class's is the domain floor, zero.
-        # Reversed, those lower bounds become first-match-wins `>` tests. Nothing states the
-        # upper ends: an earlier arm already claimed everything above them. Every arm
-        # additionally carries the `land_type = 2` conjunct, which is the restriction stated
-        # rather than assumed.
+        # PREVIOUS class's upper one -- and the shallowest class has no previous one, hence
+        # the leading `None`. Reversed, those lower bounds become first-match-wins `>` tests,
+        # and the `None` becomes an arm with no depth test at all: the bare water conjunct,
+        # claiming every open-water pixel the two bounded arms left, whatever its depth says
+        # and whether or not it has one. Nothing states the upper ends: an earlier arm
+        # already claimed everything above them. Every arm carries the `land_type = 2`
+        # conjunct, which is the restriction stated rather than assumed -- and on the last
+        # arm it is the whole `when`.
         #
         # Millimetres to metres happens here rather than in a step of its own: `elev`
         # is stored as NAVD88 millimetres and every arm needs the same metres-denominated
         # depth, so one conversion written into the shared `depth` string says it once for
         # all three without a step and an intermediate name to carry it.
         depth = f"stage_m - elevation / {ELEVATION_MM_PER_M}"
-        lower_bounds: list[float] = [0, *(upper for upper, _ in DEPTH_CLASSES[:-1])]
+        water = f"land_type = {WATER_LAND_TYPE}"
+        lower_bounds: list[float | None] = [None, *(upper for upper, _ in DEPTH_CLASSES[:-1])]
+        depth_arms = [
+            {
+                "when": water if lower is None else f"{water} AND {depth} > {lower}",
+                "then": str(code),
+            }
+            for lower, (_, code) in reversed(list(zip(lower_bounds, DEPTH_CLASSES)))
+        ]
         steps.append(
             {
                 "op": "case",
-                "cases": [
-                    {"when": f"land_type = {WATER_LAND_TYPE} AND {depth} > {lower}", "then": str(code)}
-                    for lower, (_, code) in reversed(list(zip(lower_bounds, DEPTH_CLASSES)))
-                ],
-                # Everything the arms do not claim is the land type, unchanged: dry land,
-                # water standing at or below the ground, and any pixel missing stage or
-                # elevation (a null term makes the depth null and a null predicate false).
-                # A pixel whose LAND TYPE is nodata comes out nodata, because `land_type`
-                # is then null on both sides -- the arms' conjunct and this `else`.
+                # The stage guard leads, and the order is the whole mechanism -- see "Where
+                # the stage surface does not reach, the result is nodata" in the module
+                # docstring. Past the last hydro compartment there is no stage to broadcast
+                # and so no depth in either direction, and the unbounded arm of `depth_arms`
+                # would read that absence as shallow water. Stated first, it claims the pixel
+                # before any class can, and writes null -- which is how `case` removes data
+                # (`request.pipeline.CaseStep`). No land-type conjunct: a pixel this analysis
+                # never evaluated is unevaluated whatever its land type says.
+                "cases": [{"when": "stage_m IS NULL", "then": "NULL"}, *depth_arms],
+                # Reached only where a stage exists and the land type is not water: the land
+                # type, unchanged, for every pixel this analysis has nothing to add to. A
+                # pixel whose LAND TYPE is nodata comes out nodata, because `land_type` is
+                # then null on both sides -- the arms' conjunct and this `else`.
                 "else": "land_type",
             }
         )

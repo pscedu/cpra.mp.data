@@ -234,6 +234,7 @@ def write_lnd_type_plus_datasets(
     land_types,
     year=2050,
     stage=LND_TYPE_PLUS_STAGE,
+    zones=None,
     **overrides,
 ):
     """The three hardcoded inputs of the ``lnd-type-plus`` named analysis, plus the one
@@ -250,7 +251,12 @@ def write_lnd_type_plus_datasets(
 
     The crosswalk is a raster one (``morph_pixel_v002__hydro_compartment_v002``), named
     raster-source-first regardless of which way the ``project`` step runs -- the same
-    orientation ``salinity_veg_data`` writes its own.
+    orientation ``salinity_veg_data`` writes its own. It maps every pixel to
+    :data:`LND_TYPE_PLUS_ZONE` unless ``zones`` overrides it: a flat sequence read the same
+    way ``depths`` is, in which ``None`` means "this pixel has no hydro compartment",
+    written as the crosswalk's own ``0`` nodata. That is the only way to give a pixel no
+    STAGE, since the projection has a value for exactly the pixels the crosswalk maps --
+    and a pixel with no stage is what the ``case``'s leading guard exists to null out.
     """
     selection = {**LND_TYPE_PLUS_SELECTION, **overrides}
 
@@ -280,8 +286,13 @@ def write_lnd_type_plus_datasets(
             **selection,
         )
 
-    zones = np.full(LND_TYPE_PLUS_SHAPE, LND_TYPE_PLUS_ZONE, dtype="int32")
-    write_raster_crosswalk(crosswalk_path, "morph_pixel_v002", "hydro_compartment_v002", zones)
+    if zones is None:
+        zone_ids = np.full(LND_TYPE_PLUS_SHAPE, LND_TYPE_PLUS_ZONE, dtype="int32")
+    else:
+        zone_ids = np.array([0 if zone is None else zone for zone in zones], dtype="int32").reshape(
+            LND_TYPE_PLUS_SHAPE
+        )
+    write_raster_crosswalk(crosswalk_path, "morph_pixel_v002", "hydro_compartment_v002", zone_ids)
     return selection
 
 

@@ -717,11 +717,11 @@ class TestLndTypePlusExecution:
         | 0.47    | 7        | just past it, so the mid class                         |
         | 1.00    | 7        | the second bound likewise belongs below                |
         | 1.01    | 2        | just past it -- deep, so the water shows through       |
-        | 0.00    | 2        | zero is NOT inundation: no arm claims it and the       |
-        |         |          | absent `else` masks it, so the land type stands alone  |
+        | 0.00    | 6        | the shallowest class has no lower bound, so water      |
+        |         |          | with no depth to it is still shallow water             |
 
-        Every interval is open at its lower bound and closed at its upper one, so each
-        bound is pinned from both sides. The bound rows are only meaningful at the
+        Every bounded interval is open at its lower bound and closed at its upper one, so
+        each bound is pinned from both sides. The bound rows are only meaningful at the
         factory's default stage of zero, which is what makes `stage - elevation/1000`
         reproduce a decimal literal exactly -- see `LND_TYPE_PLUS_STAGE`. A test that moves
         the stage has to stay off the bounds.
@@ -734,7 +734,7 @@ class TestLndTypePlusExecution:
         )
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
             assert src.count == 1
-            assert src.read(1).ravel().tolist() == [6, 7, 2, 6, 7, 7, 2, 2]
+            assert src.read(1).ravel().tolist() == [6, 7, 2, 6, 7, 7, 2, 6]
 
     def test_only_open_water_gets_a_shallow_class(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
@@ -778,16 +778,21 @@ class TestLndTypePlusExecution:
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
             assert set(src.read(1).ravel().tolist()) == {6}
 
-    def test_a_pixel_with_stage_but_no_elevation_is_masked_rather_than_read_as_bare_stage(
+    def test_a_pixel_with_stage_but_no_elevation_never_reads_as_a_DEEPER_class(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
     ):
-        """The presence requirement, carried by the arms rather than by anything the engine
-        adds: `stage_m - elevation / 1000` is null when either term is null, a null predicate
-        is false, and so a pixel with stage and no elevation matches no arm and takes the
-        `else`. Stated the other way, the arithmetic never has to answer for a missing
-        operand -- and the formulation this replaced DID answer, with the BARE STAGE (0.30 m
-        here, a perfectly plausible shallow depth), painting class 6 across whatever the
-        elevation surface does not cover. Here pixel 0 reads as its land type alone.
+        """A missing elevation is a null and not a number, which is what the two BOUNDED
+        arms rest on: `stage_m - elevation / 1000` is null when either term is null and a
+        null predicate is false, so neither `> 1.0` nor `> 0.46` can match on a pixel with
+        no elevation. It falls to the shallowest arm, which has no depth test, and reads as
+        `6` -- pixel 0 here.
+
+        `6` is the answer that claims the least: the land type already says this pixel is
+        open water, and the two things a depthless pixel must never be reported as are the
+        deeper classes. The formulation this replaced could produce one, differencing
+        against the BARE STAGE (0.30 m here) wherever the elevation surface had no cover;
+        the sentinel masking that prevents `-9999000` from arriving as an elevation at all
+        is what keeps it from producing the other.
         """
         write_lnd_type_plus_datasets(
             base_path,
@@ -797,19 +802,20 @@ class TestLndTypePlusExecution:
             stage=0.30,
         )
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
-            assert src.read(1).ravel().tolist() == [2] + [6] * 7
+            assert src.read(1).ravel().tolist() == [6] * 8
 
-    def test_a_pixel_that_is_not_inundated_falls_back_to_its_land_type(
+    def test_a_pixel_that_is_not_open_water_falls_back_to_its_land_type(
         self, morph_pixel_v002_shrunk, base_path, tmp_path, crosswalk_path
     ):
-        """Where the depth half has nothing to say, no arm claims the pixel and the `else`
-        hands back the land type unchanged.
+        """Off water, no arm claims the pixel and the `else` hands back the land type
+        unchanged -- however deeply the stage surface stands above its ground.
 
-        Pixels 0-3 are DRY: the elevation stands above the water level (a negative depth) or
-        exactly at it (zero), which the last arm's `> 0` leaves unclaimed, and each pixel's
-        own land type comes through -- including pixel 2, which is open water that simply is not
-        inundated this year and must read as `2` rather than as any depth class. Pixels 4-7
-        are real depths over water, so the depth class stands.
+        Pixels 0, 1 and 3 are not open water, so their own land type comes through whatever
+        the depth says: `4`, `1` and `3`. Pixel 2 IS open water, with the elevation standing
+        above the water level (a depth of -0.01 m), and it reads as `6` rather than `2`: the
+        shallowest class has no lower bound, and `2` would be the positive claim that this
+        pixel is deeper than a metre. Pixels 4-7 are real depths over water, so the depth
+        class stands.
         """
         write_lnd_type_plus_datasets(
             base_path,
@@ -818,7 +824,33 @@ class TestLndTypePlusExecution:
             land_types=[4, 1, 2, 3, 2, 2, 2, 2],
         )
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
-            assert src.read(1).ravel().tolist() == [4, 1, 2, 3, 6, 7, 2, 7]
+            assert src.read(1).ravel().tolist() == [4, 1, 6, 3, 6, 7, 2, 7]
+
+    def test_a_pixel_the_stage_surface_never_reached_is_nodata(
+        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
+    ):
+        """The leading guard, which is what bounds this analysis's extent to the
+        hydro-compartment crosswalk's rather than the morphology grid's.
+
+        Pixels 0-3 have no compartment, so `project` has nothing to broadcast onto them and
+        `stage_m` is null: no depth exists in either direction, and the result is nodata
+        whatever the land type says. Without the guard every one of them would carry a
+        class -- `6` for the two water pixels, since the unbounded arm tests no depth, and
+        `1`/`4` for the other two off the `else` -- publishing a `lnd_type_plus` surface
+        over ground this analysis never evaluated. Pixels 4-7 are mapped and reclassify
+        normally, which is what keeps this a test of the guard rather than of an empty read.
+        """
+        write_lnd_type_plus_datasets(
+            base_path,
+            crosswalk_path,
+            depths=[0.20] * 8,
+            land_types=[2, 1, 2, 4, 2, 2, 1, 2],
+            zones=[None, None, None, None, 1, 1, 1, 1],
+        )
+        with rio.open(self._run_plus(base_path, tmp_path)) as src:
+            band = src.read(1, masked=True)
+            assert band.mask.ravel().tolist() == [True] * 4 + [False] * 4
+            assert band.ravel().tolist()[4:] == [6, 6, 1, 6]
 
     def test_a_pixel_outside_both_domains_stays_nodata(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path

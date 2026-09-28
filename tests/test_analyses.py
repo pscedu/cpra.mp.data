@@ -1252,14 +1252,21 @@ class TestLndTypePlusPipeline:
         # The water restriction rides on every arm rather than standing as a mask of its
         # own, and the deepest class reports the open-water land type rather than a code of
         # its own, which is what makes the `else` sufficient and a trailing `max` needless.
+        # The stage guard FIRST -- past the last hydro compartment there is no stage to
+        # broadcast, and the unbounded arm below would read that absence as shallow water --
+        # then the depth classes descending. The shallowest has no lower bound, so its arm
+        # is the bare water conjunct with no depth test: every open-water pixel the two
+        # bounded arms leave is `6`, whatever its depth says.
         assert isinstance(reclassify, CaseStep)
         assert [(arm.when, arm.then) for arm in reclassify.cases] == [
+            ("stage_m IS NULL", "NULL"),
             ("land_type = 2 AND stage_m - elevation / 1000 > 1.0", "2"),
             ("land_type = 2 AND stage_m - elevation / 1000 > 0.46", "7"),
-            ("land_type = 2 AND stage_m - elevation / 1000 > 0", "6"),
+            ("land_type = 2", "6"),
         ]
-        # The land type, unchanged, for everything no arm claims -- which is the whole
-        # reason nothing follows this step.
+        # The land type, unchanged, for everything no arm claims -- which is now exactly
+        # the pixels that have a stage and are not open water, and is the whole reason
+        # nothing follows this step.
         assert reclassify.else_ == "land_type"
         assert reclassify.as_ is None
 
@@ -1276,8 +1283,8 @@ class TestLndTypePlusPipeline:
 
     def test_every_depth_lands_on_the_code_the_class_table_names(self):
         """Applying the `case` arms in order to any depth lands on the code
-        `DEPTH_CLASSES` names, and everything at or below the domain floor falls through to
-        the land type.
+        `DEPTH_CLASSES` names, and only a pixel that is not open water falls through to the
+        land type.
 
         Re-implemented here as a plain first-match-wins interpreter over the pipeline's
         own `when` strings rather than against a second copy of the class table, so an
@@ -1285,22 +1292,32 @@ class TestLndTypePlusPipeline:
         The `else` is interpreted too, since with no reduce after the `case` it is the only
         thing standing between an unclaimed pixel and nodata.
 
-        Every arm also carries the water conjunct, which is interpreted here too -- so a
-        land type that stops being tested, or stops being tested for water, fails below
-        rather than being quietly dropped from the interpreter.
+        Every depth arm also carries the water conjunct, which is interpreted here too -- so
+        a land type that stops being tested, or stops being tested for water, fails below
+        rather than being quietly dropped from the interpreter. The leading STAGE GUARD is
+        interpreted as well, and `None` stands for the null it writes.
         """
         _, pipeline = self._build()
         case_step = pipeline.steps[-1]
-        arms = [(arm.when, arm.then) for arm in case_step.cases]
+        guard, *arms = [(arm.when, arm.then) for arm in case_step.cases]
         assert case_step.else_ == "land_type"
+        # The guard is an arm like any other, and being FIRST is the whole of how it works:
+        # every arm below it would claim a stageless water pixel for a depth class.
+        assert guard == ("stage_m IS NULL", "NULL")
 
-        def run(depth, land_type=WATER_LAND_TYPE):
+        def run(depth, land_type=WATER_LAND_TYPE, stage=True):
+            if not stage:
+                return None  # the guard, which writes null -- i.e. nodata
             for when, then in arms:
                 water, _, depth_test = when.partition(" AND ")
                 assert water == "land_type = 2", f"unexpected water conjunct in {when!r}"
-                if land_type == WATER_LAND_TYPE and _conjunct_holds(
-                    depth, depth_test, measured="stage_m - elevation / 1000"
-                ):
+                if land_type != WATER_LAND_TYPE:
+                    continue
+                # The shallowest arm has no depth test -- `partition` leaves `depth_test`
+                # empty -- and claims the pixel on the water conjunct alone.
+                if not depth_test:
+                    return float(then)
+                if _conjunct_holds(depth, depth_test, measured="stage_m - elevation / 1000"):
                     return float(then)
             return land_type  # the `else`
 
@@ -1314,15 +1331,21 @@ class TestLndTypePlusPipeline:
         # which is what the `lnd_type_plus` legend's relabelled `2` ("Water - Deep") means.
         assert run(1.01) == 2
         assert run(12.5) == 2
-        # The domain floor. Zero itself is dry land standing at the water level, not a
-        # depth of zero, and a negative is elevation above it -- neither is a class, so
-        # both fall through to the land type they already were.
-        assert run(0) == 2
-        assert run(-3.2) == 2
+        # The shallowest class has NO lower bound. Zero is the water level standing exactly
+        # at the ground and a negative is the ground above it, but the LAND TYPE is what
+        # says this pixel is water, and open water however shallow is `6` -- never `2`,
+        # which would be the positive claim that it is deeper than a metre.
+        assert run(0) == 6
+        assert run(-3.2) == 6
         # ... and no depth is a class on a pixel that is not open water, however deeply the
         # water surface stands above its ground: the land type passes straight through.
         assert run(12.5, land_type=1) == 1
         assert run(0.47, land_type=5) == 5
+        # With no stage the guard claims the pixel ahead of all of them, whatever the land
+        # type and whatever a depth would have been -- nothing was evaluated, so nothing is
+        # reported. Without it, the first of these would read `6` and the second `4`.
+        assert run(0.20, stage=False) is None
+        assert run(0.20, land_type=4, stage=False) is None
 
     def test_every_step_name_a_join_reads_is_something_the_pipeline_defines(self):
         # A join operand is either an input or an earlier step's `as`, and the two
