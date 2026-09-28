@@ -81,7 +81,7 @@ def raster_dimensions():
 
 @pytest.fixture
 def salinity_veg_data(base_path, crosswalk_path, monkeypatch):
-    """The two hardcoded inputs of the `salinity-veg-investigation` named analysis, on disk.
+    """The two hardcoded inputs of the `sal_veg_investigation` named analysis, on disk.
 
     Marsh (raster) 0.3->2030, 0.7->2040 (crosses `marsh > 0.5` only in 2040); salinity
     (vector, one zone) 4.0->2030, 6.0->2040 (crosses `sal > 5.5` only in 2040) -- and
@@ -118,7 +118,7 @@ def morph_pixel_v002_shrunk(monkeypatch):
 
 @pytest.fixture
 def lnd_type_plus_data(morph_pixel_v002_shrunk, base_path, crosswalk_path, monkeypatch):
-    """The three hardcoded inputs of the `lnd-type-plus` named analysis, on disk -- one pixel
+    """The three hardcoded inputs of the `lnd_type_plus` named analysis, on disk -- one pixel
     per reclassification rule over open water, plus one that shows the water restriction:
     0.20 m -> 6, 0.70 m -> 7, 1.50 m -> 2 (the deep class is `0`, so the water shows
     through), and 0.20 m over land type 1 -> 1 (a depth class may only overwrite water).

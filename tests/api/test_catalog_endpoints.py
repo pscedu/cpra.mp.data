@@ -161,7 +161,7 @@ class TestVisualizations:
 
 
 class _FakeCatalogAnalysisMeta:
-    name = "land-change"
+    name = "lnd_chng"
     label = "Land Change"
     type = "dataset"
     variables = ["ssf"]
@@ -196,14 +196,14 @@ class TestAnalyses:
         import cpra.mp.data.api as api_module
         import cpra.mp.data.api.utils as api_utils
 
-        fake = {"land-change": _FakeCatalogAnalysis}
+        fake = {"lnd_chng": _FakeCatalogAnalysis}
         monkeypatch.setattr(api_utils, "ANALYSES", fake)
         monkeypatch.setattr(api_module, "ANALYSES", fake)
 
     def test_returns_analysis_metadata(self, client):
         response = client.get("/v1/analyses.json")
         assert response.status_code == 200
-        assert {a["name"] for a in response.json()} == {"land-change"}
+        assert {a["name"] for a in response.json()} == {"lnd_chng"}
 
     def test_each_entry_declares_a_type(self, client):
         for analysis in client.get("/v1/analyses.json").json():
@@ -215,13 +215,13 @@ class TestAnalyses:
         wire -- not just present on `Meta` server-side.
         """
         by_name = {a["name"]: a for a in client.get("/v1/analyses.json").json()}
-        assert by_name["land-change"]["kind"] == "variable"
-        assert by_name["land-change"]["subsumed_dimensions"] == ["scenario_id"]
+        assert by_name["lnd_chng"]["kind"] == "variable"
+        assert by_name["lnd_chng"]["subsumed_dimensions"] == ["scenario_id"]
 
     def test_kind_and_subsumed_dimensions_fall_back_when_a_meta_declares_neither(
         self, client, monkeypatch
     ):
-        """`difference`/`salinity-veg-investigation` (`kind="dimension"`/`None`) declare no
+        """`diff`/`sal_veg_investigation` (`kind="dimension"`/`None`) declare no
         `subsumed_dimensions` at all -- the model's own defaults (`None`/`[]`) must survive
         the round trip rather than raising or silently omitting the fields. Re-patches over
         the class-level `_fake_registry` fixture's own fake for this one test.
@@ -230,7 +230,7 @@ class TestAnalyses:
         import cpra.mp.data.api.utils as api_utils
 
         class _BareMeta:
-            name = "difference"
+            name = "diff"
             label = "Difference"
             type = "dataset"
             variables = None
@@ -240,13 +240,13 @@ class TestAnalyses:
         class _BareAnalysis:
             Meta = _BareMeta
 
-        fake = {"difference": _BareAnalysis}
+        fake = {"diff": _BareAnalysis}
         monkeypatch.setattr(api_utils, "ANALYSES", fake)
         monkeypatch.setattr(api_module, "ANALYSES", fake)
 
         by_name = {a["name"]: a for a in client.get("/v1/analyses.json").json()}
-        assert by_name["difference"]["kind"] is None
-        assert by_name["difference"]["subsumed_dimensions"] == []
+        assert by_name["diff"]["kind"] is None
+        assert by_name["diff"]["subsumed_dimensions"] == []
 
 
 class TestDatasetsIndex:

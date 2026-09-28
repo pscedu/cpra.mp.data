@@ -69,7 +69,7 @@ class TestFeatureColorsBugFix:
             variable=ANNUAL_KWARGS["variable"],
             grid=ANNUAL_KWARGS["grid"],
             time_unit=ANNUAL_KWARGS["time_unit"],
-            analysis="difference",
+            analysis="diff",
             dimension="calendar_year",
             order="asc",
             calendar_year=[2030, 2040],
@@ -112,7 +112,7 @@ class TestFeatureColorsBugFix:
             variable=ANNUAL_KWARGS["variable"],
             grid=ANNUAL_KWARGS["grid"],
             time_unit=ANNUAL_KWARGS["time_unit"],
-            analysis="difference",
+            analysis="diff",
             dimension="calendar_year",
             order="asc",
             calendar_year=[2030, 2040],
@@ -152,13 +152,13 @@ class TestResolvedAnalysisMetadataHooks:
     ANNUAL = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", **COMMON_ANNUAL_FILTER_LISTS)
 
     def test_difference_result_kind_is_reported_as_a_difference(self):
-        m = Map(analysis="difference", dimension="calendar_year", order="asc", calendar_year=[2030, 2040], **self.ANNUAL)
+        m = Map(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2030, 2040], **self.ANNUAL)
         assert m._is_difference() is True
         assert m._legend_name() is None
         assert m.difference_suffix == " Difference"
 
     def test_land_change_result_kind_is_not_a_difference_and_uses_the_lnd_chng_legend(self):
-        m = Map(analysis="land-change", calendar_year=[2040], **self.ANNUAL)
+        m = Map(analysis="lnd_chng", calendar_year=[2040], **self.ANNUAL)
         assert m._is_difference() is False
         assert m._legend_name() == "lnd_chng"
         assert m.difference_suffix == ""
@@ -190,7 +190,7 @@ class TestCompareDimensionsExclusion:
             grid="ecoregion_v001",
             time_unit="annual",
             grid_cell="1,2",
-            analysis="difference",
+            analysis="diff",
             dimension="calendar_year",
             order="asc",
             calendar_year=[2030, 2040],
@@ -207,7 +207,7 @@ class TestCompareDimensionsExclusion:
             grid="ecoregion_v001",
             time_unit="annual",
             grid_cell="1,2",
-            analysis="land-change",
+            analysis="lnd_chng",
             calendar_year=[2040],
             model_group_id=[500, 520],
             scenario_id=[7],
@@ -222,7 +222,7 @@ class TestCompareDimensionsExclusion:
             grid="ecoregion_v001",
             time_unit="annual",
             grid_cell="1",
-            analysis="difference",
+            analysis="diff",
             dimension="calendar_year",
             order="asc",
             calendar_year=[2030, 2040],

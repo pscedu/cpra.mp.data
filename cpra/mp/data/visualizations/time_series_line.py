@@ -30,7 +30,7 @@ class TimeSeriesLine(DatasetVisualization):
         is_daily = self.time_column == "calendar_day"
 
         # Which dimensions the resolved analysis's own pipeline already collapsed away
-        # (e.g. `difference`'s two selected values of its own `dimension` param). A
+        # (e.g. `diff`'s two selected values of its own `dimension` param). A
         # collapsed dimension has nothing left to compare across; with no analysis
         # selected, nothing is collapsed.
         resolved = self.resolved_analysis

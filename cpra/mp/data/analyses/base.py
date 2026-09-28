@@ -1,8 +1,8 @@
 """Shared machinery for `cpra.mp.data.analyses`'s registry entries: the exception family
 the registry (`cpra/mp/data/analyses/__init__.py`) raises, the `DatasetRef`/`ResolvedAnalysis`
 value objects the interface contract with the API route layer names explicitly, the
-`Analysis` base class every entry (`difference.py`, `land_change.py`,
-`salinity_veg_investigation.py`) subclasses, and a handful of small pure helpers
+`Analysis` base class every entry (`diff.py`, `lnd_chng.py`,
+`sal_veg_investigation.py`) subclasses, and a handful of small pure helpers
 (SQL-literal quoting, structural
 `collapsed_dimensions` derivation) those entries share.
 
@@ -55,7 +55,7 @@ class UnknownAnalysisError(AnalysisRegistryError):
 
 class InvalidAnalysisParametersError(AnalysisRegistryError):
     """An analysis's `Parameters` model, its cardinality rule against `filters` (e.g.
-    `difference`'s "exactly 2 selected values of `dimension`" rule, or `land-change`'s
+    `diff`'s "exactly 2 selected values of `dimension`" rule, or `lnd_chng`'s
     `calendar_year`/`model_group_id` cardinality rule -- see each module's
     `validate_selection`), or the `Pipeline` its `pipeline()` method builds from those
     values, was rejected. Maps to a 400 at the route layer.
@@ -91,8 +91,8 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
     and any variable-specific `required_dimensions` (`aggregate_type`, `ffibs_type`, ...).
     Pure/in-memory: `get_input_data_frame` only cross-joins tiny literal `pl.DataFrame`s
     and never reads a file, so this needs no `base_path` -- the same pattern
-    `visualizations.base.get_data_uri` already uses. Used to build a `difference`/
-    `land-change` pipeline's trailing `group.by` (every required dimension except the one
+    `visualizations.base.get_data_uri` already uses. Used to build a `diff`/
+    `lnd_chng` pipeline's trailing `group.by` (every required dimension except the one
     the analysis operates over), and by `default_collapsed_dimensions` below.
     """
     return required_columns(
@@ -130,7 +130,7 @@ def cast_dimension_value(dimension: str, value: Any) -> Any:
 def normalized_filter_values(dimension: str, raw: Any) -> list[Any]:
     """A `filters[dimension]` value -- a scalar or a list, straight off the request --
     normalized to a de-duplicated list of `dimension`-typed values, preserving first-seen
-    order. Shared by every cardinality check (`difference`/`land-change`'s
+    order. Shared by every cardinality check (`diff`/`lnd_chng`'s
     `validate_selection`) and every derivation (their `pipeline()` methods), so the two
     never disagree about how many distinct values were actually selected.
     """
@@ -285,7 +285,7 @@ def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     its inputs carries, minus whatever the pipeline's OWN trailing `group.by` still keeps
     (derived structurally, rather than each analysis hand-declaring it) --
     `frozenset()` when the last step isn't a `group` at all (nothing has been collapsed).
-    For `salinity-veg-investigation`, whose trailing `group.by` is always `[]`, this is
+    For `sal_veg_investigation`, whose trailing `group.by` is always `[]`, this is
     simply every dimension either input carries (both are pinned single-valued dataset
     selections, so nothing meaningful varies in the output either way).
     """
@@ -339,10 +339,10 @@ class Analysis:
         legend: ClassVar[str | None] = None
         result_kind: ClassVar[str] = "value"
         # "variable": stands in for one (or several) input variable(s) in the portal's
-        # variable dropdown, e.g. `land-type-confidence`. "dimension": operates across one
+        # variable dropdown, e.g. `lnd_conf`. "dimension": operates across one
         # dimension of whatever it's given -- a plain dataset or the output of a
-        # `kind="variable"` analysis it's chained after, e.g. `difference`. `None` (the
-        # default) is neither -- `salinity-veg-investigation`'s reading, a `type="custom"`
+        # `kind="variable"` analysis it's chained after, e.g. `diff`. `None` (the
+        # default) is neither -- `sal_veg_investigation`'s reading, a `type="custom"`
         # analysis with no variable-dropdown role and nothing to chain onto it.
         kind: ClassVar[str | None] = None
         # The dimensions this analysis removes from the caller's view, for the portal's
@@ -377,7 +377,7 @@ class Analysis:
         """A cardinality/consistency rule that needs `filters` alongside `parameters` --
         raise `InvalidAnalysisParametersError` to reject. The default performs no extra
         check (an analysis whose `Parameters` model alone is a sufficient validity check,
-        e.g. `salinity-veg-investigation`, does not need to override this).
+        e.g. `sal_veg_investigation`, does not need to override this).
         """
 
     def pipeline(self) -> Pipeline:

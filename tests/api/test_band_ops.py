@@ -156,7 +156,7 @@ class TestSelectDimensionBandWide:
 
 def _joined_fixture():
     """Two operands over one pixel grid, sharing `calendar_year` and disagreeing about
-    `aggregate_type` -- the shape `lnd-type-plus` actually has, where `stg` declares
+    `aggregate_type` -- the shape `lnd_type_plus` actually has, where `stg` declares
     `aggregate_type` and the rasters it joins against do not.
 
     `elev` has a 2045 band `stg` has no counterpart for, so the fixture also covers the
@@ -220,7 +220,7 @@ class TestUnifiedMetadataGrowth:
     input carries `model_group_id` and `scenario_id`, and operands agreeing on most of
     their dimensions pair near `max(band counts)` rather than near the product. These two
     tests are what keeps that a measured fact rather than an assumption; the second one is
-    the shape `lnd-type-plus` actually has, at its real band counts.
+    the shape `lnd_type_plus` actually has, at its real band counts.
     """
 
     @staticmethod
@@ -683,7 +683,7 @@ class TestCaseBandWideUnpaired:
 
 
 class TestCaseAgreesWithTheRewriteChainItReplaced:
-    """`lnd-type-plus` stated its depth reclassification as a value `filter` plus four
+    """`lnd_type_plus` stated its depth reclassification as a value `filter` plus four
     successive conditional rewrites, the middle two writing NEGATIVE codes so no later
     entry's domain could re-match a cell an earlier one had claimed, and the fourth
     flipping them back. That is now one `case`. Both formulations are built here and run
@@ -789,7 +789,7 @@ class TestCaseBandWideDimensionArms:
         assert result["b1"].to_list() == [1.0, 1.0]
 
     def test_arms_partition_the_bands(self):
-        """The ensemble-weighting shape (`analyses/land_type_confidence.py`): one arm per
+        """The ensemble-weighting shape (`analyses/lnd_conf.py`): one arm per
         member, each naming only its own dimension value, and no `else` because between
         them the arms name every band the frame has.
         """

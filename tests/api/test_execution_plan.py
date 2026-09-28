@@ -930,7 +930,7 @@ class TestDimensionPushdownAcrossJoinsAndFanOut:
         assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030, 2040]
 
     def test_branches_agreeing_on_a_predicate_narrow_to_that_predicate(self, monkeypatch):
-        # The `lnd-type-plus` shape: the same input read twice under the same selection.
+        # The `lnd_type_plus` shape: the same input read twice under the same selection.
         # The union collapses to the one predicate rather than back to everything.
         monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(self._YEARS))
         plan = compile_plan(
@@ -1119,7 +1119,7 @@ class TestDimensionPushdownAcrossJoinsAndFanOut:
 
 
 class TestPostJoinNarrowingAtProductionScale:
-    """The size of the thing, on the shape `lnd-type-plus` actually has: an `elev` read and
+    """The size of the thing, on the shape `lnd_type_plus` actually has: an `elev` read and
     a `lnd_type` read on the same raster grid, joined, with the caller's selection declared
     ONCE after the join instead of repeated as a leading `filter` per input.
 
@@ -1790,7 +1790,7 @@ class TestVectorBandCeiling:
         assert compile_plan(pipeline).vector_band_metadata[1].height == ANALYSIS_BAND_CEILING
 
     def _mixed_join_pipeline(self):
-        # The shape of `analyses/salinity_veg_investigation.py`: a raster input joined
+        # The shape of `analyses/sal_veg_investigation.py`: a raster input joined
         # against a vector one projected onto the same grid.
         return {
             "inputs": {"r": raster_input(), "v": vector_input()},

@@ -11,7 +11,7 @@ and that a rejection reaches the caller as a 4xx with a message naming the probl
 
 **On variable/grid choices below.** The paired shape's fixtures (`notebook_query_data` and
 its two siblings) use the variable/grid/dimension names from the
-`salinity-veg-investigation` named analysis (`ffibs_coverage_ratio`/`veg_grid_cell_v001`
+`sal_veg_investigation` named analysis (`ffibs_coverage_ratio`/`veg_grid_cell_v001`
 paired against `sal`/`hydro_compartment_v001`). `tests/factories.py` has no ready-made
 builder for either (its `annual_frame`/`write_raster_dataset` helpers are hardcoded to
 `ssf`/`vct`), so this module writes them directly with `write_parquet`/`write_cog`,
@@ -54,7 +54,7 @@ from tests.factories import (
 # same number is used regardless of the band dtype.
 NODATA = -9999
 
-# The `salinity-veg-investigation` analysis's own shape, spelled as a raw pipeline body:
+# The `sal_veg_investigation` analysis's own shape, spelled as a raw pipeline body:
 # two inputs on different grids, one `project`ed onto the other's grid, joined, tested
 # against both value columns by a single-armed `case`, and collapsed to the earliest
 # calendar year that satisfies the test.
@@ -921,7 +921,7 @@ class TestProjectOnlyReaggregation:
 class TestWeightedCaseEndToEnd:
     """The per-dimension weighting idiom -- one `case` arm per year -- through all three
     request encodings (POST JSON, dotted GET, tile route), plus the flat-request
-    equivalence. This is the shape `analyses/land_type_confidence.py` uses, and the one a
+    equivalence. This is the shape `analyses/lnd_conf.py` uses, and the one a
     chain of `calculate`s used to spell before `calculate` became unconditional.
 
     A raw input's value column is always literally `"value"`, never its own dict key, so

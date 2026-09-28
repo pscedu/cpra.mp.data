@@ -1,4 +1,4 @@
-"""`land-type-confidence` -- a dataset-scoped analysis producing a confidence-weighted
+"""`lnd_conf` -- a dataset-scoped analysis producing a confidence-weighted
 land/water surface from the `lnd_type` categorical variable: each of the five ensemble
 members (`scenario_id` 34-38) is reduced to a land (`1.0`) / water (`0.0`) indicator, then
 the five are combined as a weighted sum whose weights (`SCENARIO_WEIGHTS`) sum to exactly
@@ -40,10 +40,10 @@ below it and land-colored above.
 Not to be confused with `legends.csv`'s neighboring `lnd_conf_diff`, whose break points are
 `scripts/generate_video_frames.py`'s `CONFIDENCE_BREAKS`: those classify a SIGNED `[-1, 1]`
 difference of this fraction between two years ("likely land gain", "high confidence no
-change", ...), which is the reading of a `land-type-confidence,difference` chain's output
+change", ...), which is the reading of a `lnd_conf,diff` chain's output
 rather than of this analysis's own. This analysis declares only the undifferenced legend --
 see `analyses.resolve_analysis_chain`, where a chained stage's own `legend` (today
-`difference` declares none) is what would override it.
+`diff` declares none) is what would override it.
 """
 
 from typing import Any
@@ -80,10 +80,10 @@ def _value_in(values: tuple[int, ...]) -> str:
     return " OR ".join(f"value = {v}" for v in sorted(values))
 
 
-class LandTypeConfidence(Analysis):
+class LandConfidence(Analysis):
     class Meta:
-        name = "land-type-confidence"
-        label = "Land Type Confidence"
+        name = "lnd_conf"
+        label = "Land Confidence"
         type = "dataset"
         variables = ["lnd_type"]
         legend = "lnd_conf"
@@ -96,18 +96,18 @@ class LandTypeConfidence(Analysis):
 
     @classmethod
     def validate_selection(
-        cls, parameters: "LandTypeConfidence.Parameters", filters: dict[str, Any]
+        cls, parameters: "LandConfidence.Parameters", filters: dict[str, Any]
     ) -> None:
         if filters.get("scenario_id") is not None:
             raise InvalidAnalysisParametersError(
-                "land-type-confidence combines a fixed ensemble "
+                "lnd_conf combines a fixed ensemble "
                 f"(scenario_id {', '.join(str(s) for s in sorted(SCENARIO_WEIGHTS))}) whose "
                 "weights sum to 1.0, so it cannot be scoped to a caller-selected "
                 f"scenario_id (got {filters['scenario_id']!r})"
             )
 
     def pipeline(self):
-        assert self.dataset is not None, "land-type-confidence is a type='dataset' analysis"
+        assert self.dataset is not None, "lnd_conf is a type='dataset' analysis"
         required = required_dataset_dimensions(self.dataset)
         group_by = [d for d in required if d != "scenario_id"]
 

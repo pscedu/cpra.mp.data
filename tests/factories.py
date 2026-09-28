@@ -182,7 +182,7 @@ def write_ffibs_coverage_dataset(base_path, values_by_year, **overrides):
     ``values_by_year`` entry.
 
     The raster half of the marsh-coverage-plus-salinity pair: the two variables the
-    ``salinity-veg-investigation`` named analysis hardcodes, and the smallest real dataset
+    ``sal_veg_investigation`` named analysis hardcodes, and the smallest real dataset
     that puts a raster grid and a vector grid on the same pair of years. ``ffibs_type`` is
     required by ``variables.csv`` and defaults to the ``pl_fm`` value that analysis
     selects.
@@ -194,7 +194,7 @@ def write_ffibs_coverage_dataset(base_path, values_by_year, **overrides):
     return kwargs
 
 
-# The three hardcoded inputs of the `lnd-type-plus` named analysis, and the shape the
+# The three hardcoded inputs of the `lnd_type_plus` named analysis, and the shape the
 # raster grid two of them share is shrunk to for it. Unlike every other grid here,
 # `morph_pixel_v002` is used at its REAL name: the analysis names it itself, so there is no
 # stand-in to substitute. At its real size it is 5,824 x 16,640 (~97 million pixels per
@@ -237,7 +237,7 @@ def write_lnd_type_plus_datasets(
     zones=None,
     **overrides,
 ):
-    """The three hardcoded inputs of the ``lnd-type-plus`` named analysis, plus the one
+    """The three hardcoded inputs of the ``lnd_type_plus`` named analysis, plus the one
     crosswalk it needs, written so that each pixel's computed inundation depth is the
     corresponding entry of ``depths``.
 
@@ -324,7 +324,7 @@ def _stg_rows_exist(base_path, selection):
 def write_stg_annual_dataset(base_path, values_by_year, geo_ids=(1,), **overrides):
     """``stg`` / ``hydro_compartment_v002``, annual, one value per year per cell.
 
-    The vector input of ``lnd-type-plus``. ``hydro_compartment_v002`` has 1,878 columns, so
+    The vector input of ``lnd_type_plus``. ``hydro_compartment_v002`` has 1,878 columns, so
     this writes only ``geo_ids`` and passes ``validate=False`` for the same reason
     :func:`write_sal_annual_dataset` does. ``aggregate_type`` defaults to the ``mean`` that
     analysis pins.

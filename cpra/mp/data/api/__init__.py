@@ -111,7 +111,7 @@ _RETIRED_PARAMS = {
     # pass through everywhere else -- so their replacement is a `case` arm, not a
     # `calculate`: `calculate` applies its expression to everything. The pass-through the
     # old parameters left implicit is the `else: "value"` these hints spell out.
-    "negate": "a 'difference' named analysis (see /v1/analyses.json), or a 'case' pipeline step directly (negate=X is a case with one arm when=X then='value * -1' and else='value')",
+    "negate": "a 'diff' named analysis (see /v1/analyses.json), or a 'case' pipeline step directly (negate=X is a case with one arm when=X then='value * -1' and else='value')",
     "multiply10": "a 'case' pipeline step directly (multiply10=X is a case with one arm when=X then='value * 10' and else='value')",
     "multiply100": "a 'case' pipeline step directly (multiply100=X is a case with one arm when=X then='value * 100' and else='value')",
     "group_by": "the 'group' pipeline step (see /v1/analysis.json or a named analysis)",
@@ -586,7 +586,7 @@ def _analysis_filters(query: AnalysisQuery, *, dimensions: bool = True) -> dict:
     `dimensions=False` for a `type="custom"` analysis, which has no `{variable}/
     {time_unit}/{grid}` URL segment: with no dataset in the request there is nothing for
     a dimension filter to narrow, so a dimension-NAMED query parameter on one of those
-    routes is the analysis's own parameter instead (`salinity-veg-investigation` declares
+    routes is the analysis's own parameter instead (`sal_veg_investigation` declares
     `model_group_id`/`scenario_id`, which are also real dimension names) and is routed to
     `params` by `_analysis_extra_params`'s matching `known` set. Only the two reserved
     keys below survive here.
@@ -625,8 +625,8 @@ def _analysis_filters(query: AnalysisQuery, *, dimensions: bool = True) -> dict:
 def _analysis_extra_params(request: Request, known: frozenset) -> dict:
     """Everything in the query string besides `known` (the bound query model's own
     fields) is the named analysis's own declared parameter set -- `dimension`/`order` for
-    `difference`, `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold`
-    for `salinity-veg-investigation`, etc. There is no fixed field set for these at the
+    `diff`, `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold`
+    for `sal_veg_investigation`, etc. There is no fixed field set for these at the
     route level (it varies per analysis), so they are read directly off the raw query
     string and handed to `resolve_analysis(params=...)` for the registry itself to
     validate --
@@ -666,7 +666,7 @@ async def _resolve_dataset_analysis(analysis_name, request, query, dataset_dimen
     """The four dataset-scoped named-analysis routes' shared prologue: reject the name up
     front if it is unknown or `type="custom"`, resolve `grid_cell` against the dataset's
     own grid exactly as the flat data routes do, and resolve the analysis (or chain --
-    `analysis_name` may be a comma-separated pair, e.g. `land-type-confidence,difference`,
+    `analysis_name` may be a comma-separated pair, e.g. `lnd_conf,diff`,
     see `analyses.resolve_analysis_chain`) itself.
 
     `get_analysis_class` only gates `names[0]`, the PRIMARY name -- the exact 404/400
@@ -698,7 +698,7 @@ def _resolve_custom_analysis(analysis_name, request, query):
 
     No `grid_cell` resolution counterpart to `_resolve_dataset_analysis`'s: a custom
     analysis names its own inputs (there is no `{grid}` URL segment, and
-    `salinity-veg-investigation` reads two different grids), so there is no single grid to
+    `sal_veg_investigation` reads two different grids), so there is no single grid to
     resolve a coordinate against. `grid_cell` on these routes therefore means literal ids,
     and a coordinate value is rejected by `request.data_query.grid_cell_conjunct` with a
     message saying so.
@@ -707,7 +707,7 @@ def _resolve_custom_analysis(analysis_name, request, query):
     dataset in the URL there is nothing for a dimension filter to narrow, so the
     `FilterDimensions` half of the bound query model is subtracted from
     `_analysis_extra_params`'s `known` set and a dimension-named query parameter reaches
-    the analysis's own `Parameters` instead. `salinity-veg-investigation` needs exactly
+    the analysis's own `Parameters` instead. `sal_veg_investigation` needs exactly
     that -- it declares `model_group_id`/`scenario_id`, both real dimension names, and
     would otherwise see them bound as filters it has no dataset to apply them to.
 
@@ -731,10 +731,10 @@ def analyses_catalog() -> list[Analysis]:
 
 
 # A single registered name, or a comma-separated chain (e.g.
-# `land-type-confidence,difference`) -- see `analyses.resolve_analysis_chain`. Every
+# `lnd_conf,diff`) -- see `analyses.resolve_analysis_chain`. Every
 # route below splits this on `,` before resolving it; the path segment itself accepts
 # either form unchanged, since a comma is not `/` and needs no extra URL-encoding.
-AnalysisName = Annotated[str, Path(description="A registered analysis name, or a comma-separated chain of them (e.g. `land-type-confidence,difference`).")]
+AnalysisName = Annotated[str, Path(description="A registered analysis name, or a comma-separated chain of them (e.g. `lnd_conf,diff`).")]
 
 
 @app.get(

@@ -656,7 +656,7 @@ def write_png(path: Path, rgba_bands: np.ndarray):
 @click.option(
     "--confidence-data",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="path to a directory of land-change confidence rasters; emits one confidence_<year>.png per "
+    help="path to a directory of lnd_chng confidence rasters; emits one confidence_<year>.png per "
     ".tif in it. Omit to skip the confidence layers.",
 )
 @click.option("--output", help="output directory for the layer PNGs", required=True)

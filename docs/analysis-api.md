@@ -17,8 +17,8 @@ access to the data (notebooks, scripts): `analyze_data` runs a pipeline with no 
 round trip. See the
 [README's Analyzing Data section](../README.md#analyzing-data) for usage.
 
-A small, fixed set of named, pre-built pipelines (`difference`, `land-change`,
-`salinity-veg-investigation`) is also available without hand-authoring pipeline JSON at
+A small, fixed set of named, pre-built pipelines (`diff`, `lnd_chng`,
+`sal_veg_investigation`) is also available without hand-authoring pipeline JSON at
 all -- see [the named-analysis registry](analyses-api.md).
 
 Four endpoints accept a pipeline, sharing one request model:
@@ -261,9 +261,9 @@ POST /v1/analysis.csv
 }
 ```
 
-This exact `case`(negate)+`group`(sum) idiom is also available as the `difference`
+This exact `case`(negate)+`group`(sum) idiom is also available as the `diff`
 named analysis (`dimension=scenario_id`, `order=asc` negates the later of the two
-selected values, here `8`) -- see [the registry doc](analyses-api.md#difference) for the
+selected values, here `8`) -- see [the registry doc](analyses-api.md#diff) for the
 equivalent request with no hand-authored pipeline. The named analysis derives its own
 `group.by` as "every required dimension of the dataset except the one being differenced,"
 which is why it lists `model_group_id`/`aggregate_type`/`calendar_year` explicitly rather
@@ -411,7 +411,7 @@ from.
 ```
 
 As a `GET` request to `/v1/analysis/{z}/{x}/{y}.png`, this pipeline is flattened into the
-same dotted query encoding shown in the salinity-veg-investigation example below
+same dotted query encoding shown in the sal_veg_investigation example below
 (`input.elev.variable=elev&...&step.1.op=filter&...&output.format=png&output.color_map=elevation_difference`);
 there is no `POST` form for the tile route.
 
@@ -605,18 +605,18 @@ And as map tiles, replacing `output.format=tif` with `output.format=png`:
 GET /v1/analysis/{z}/{x}/{y}.png?...same query as above, with output.format=png
 ```
 
-**As the `salinity-veg-investigation` named analysis** -- the same request, with the
+**As the `sal_veg_investigation` named analysis** -- the same request, with the
 `Pipeline` above built by the registry rather than hand-authored:
 
 ```
-GET /v1/analyses/salinity-veg-investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
+GET /v1/analyses/sal_veg_investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
 ```
 
-`salinity-veg-investigation` is a `type="custom"` analysis (its two inputs are fixed by its own
+`sal_veg_investigation` is a `type="custom"` analysis (its two inputs are fixed by its own
 `pipeline()` method, not supplied by a dataset in the URL -- see
-[the registry doc](analyses-api.md#salinity-veg-investigation)), so this route has no
+[the registry doc](analyses-api.md#sal_veg_investigation)), so this route has no
 `/v1/datasets/{variable}/{time_unit}/{grid}/` prefix. Fetching
-`GET /v1/analyses/salinity-veg-investigation/pipeline.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
+`GET /v1/analyses/sal_veg_investigation/pipeline.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
 returns exactly the explicit `Pipeline` JSON shown at the top of this section (with
 `model_group_id`/`scenario_id` substituted from the request) -- proving the named
 analysis is sugar over the same pipeline grammar, never a second engine.

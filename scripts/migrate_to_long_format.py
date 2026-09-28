@@ -358,7 +358,7 @@ def _elev_mm_vrt(vrt_text: str, dtype: str) -> tuple[str, str]:
       millimeters, while -9999000 mm stays impossible. -9999000 is also what
       ``Variable.nodata`` declares for elev, so migrated and freshly written rasters
       agree. (``raster.scale_vrt_bands``, the other scaling path, deliberately excludes
-      nothing -- it preserves an older quirk for the land-change multiply. Don't merge them.)
+      nothing -- it preserves an older quirk for the lnd_chng multiply. Don't merge them.)
 
     A non-float source is left alone and reported unchanged, so re-running or resuming a
     migration over already-converted Int32 rasters can't scale them a second time.

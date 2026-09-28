@@ -29,21 +29,21 @@ from cpra.mp.data.analyses.base import (
     default_collapsed_dimensions,
     pipeline_input_dimensions,
 )
-from cpra.mp.data.analyses.difference import Difference
-from cpra.mp.data.analyses.land_change import LandChange
-from cpra.mp.data.analyses.land_type_confidence import LandTypeConfidence
+from cpra.mp.data.analyses.diff import Difference
+from cpra.mp.data.analyses.lnd_chng import LandChange
+from cpra.mp.data.analyses.lnd_conf import LandConfidence
 from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
-from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
+from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.pipeline import append_steps
 
-# Landed in this order (`salinity-veg-investigation` first -- the only entry exercising
+# Landed in this order (`sal_veg_investigation` first -- the only entry exercising
 # the `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and
 # the only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name
 # -> class` dict, so registration order has no behavioral effect.
 ANALYSES = {
     cls.Meta.name: cls
-    for cls in [SalinityVegInvestigation, Difference, LandChange, LandTypeConfidence, LndTypePlus]
+    for cls in [SalinityVegInvestigation, Difference, LandChange, LandConfidence, LndTypePlus]
 }
 
 __all__ = [
@@ -76,7 +76,7 @@ def resolve_analysis(
     against `filters`, then build and return its `pipeline()`.
 
     `dataset` is `None` for a `type="custom"` analysis (its inputs are hardcoded in its
-    own `pipeline()` method -- see `salinity_veg_investigation.py`); `filters` is the dataset's
+    own `pipeline()` method -- see `sal_veg_investigation.py`); `filters` is the dataset's
     dimension filters plus the two reserved keys `grid_cell` and `where`, which the
     analysis composes into its pipeline's leading `filter` STEP (see
     `base.selection_filter_where`) rather than onto its input selection -- an
@@ -84,9 +84,9 @@ def resolve_analysis(
     `.select`/`.color_map`/compression parameters are NOT part of `filters` -- those apply
     to the RESOLVED `Pipeline`'s `.output`/response at the route layer, after this
     function returns, the same way they would for a hand-authored pipeline.) `params` is
-    the analysis's own declared parameters (`dimension`/`order` for `difference`,
+    the analysis's own declared parameters (`dimension`/`order` for `diff`,
     `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold` for
-    `salinity-veg-investigation`, none at all for `land-type-confidence` or `land-change`,
+    `sal_veg_investigation`, none at all for `lnd_conf` or `lnd_chng`,
     whose selections are entirely `filters`), raw and unvalidated until this call.
 
     `grid_cell_where` is an already-resolved spatial conjunct (`"grid_cell IN (1, 2)"`)
@@ -161,7 +161,7 @@ def resolve_analysis_chain(
     grid_cell_where: str | None = None,
 ) -> ResolvedAnalysis:
     """Resolve a comma-separated chain of named analyses, e.g.
-    `["land-type-confidence", "difference"]`: stage 1 resolves exactly as `resolve_analysis`
+    `["lnd_conf", "diff"]`: stage 1 resolves exactly as `resolve_analysis`
     would alone; each later stage must be `kind="dimension"` (checked against `Meta.kind`
     before anything else runs) and contributes its own steps (`_dimension_steps`), appended
     to the running pipeline via `analysis.request.pipeline.append_steps` -- the same
@@ -177,10 +177,10 @@ def resolve_analysis_chain(
     collapsed. "Already collapsed" is tracked in a running `collapsed` set seeded from
     stage 1's own AUTHORITATIVE `resolved.collapsed_dimensions` -- NOT recomputed
     structurally from the intermediate pipeline via `default_collapsed_dimensions` at each
-    step, because that would be wrong for a chain led by an analysis (e.g. `lnd-type-plus`)
+    step, because that would be wrong for a chain led by an analysis (e.g. `lnd_type_plus`)
     whose `collapsed_dimensions` is a hand-written override rather than the structural
     default: `default_collapsed_dimensions` reports `frozenset()` whenever the pipeline's
-    last step isn't a `group`, which is exactly `lnd-type-plus`'s own case (it ends in a
+    last step isn't a `group`, which is exactly `lnd_type_plus`'s own case (it ends in a
     `case`), so recomputing structurally after stage 1 would silently forget that
     `aggregate_type` is already gone. The FINAL published `collapsed_dimensions` (below)
     doesn't have this problem and is recomputed structurally on purpose: the combined
@@ -189,7 +189,7 @@ def resolve_analysis_chain(
 
     Every stage's `Parameters` fields are checked pairwise for a name collision before any
     parameter is partitioned out of `params` -- today's registry has exactly one
-    `kind="dimension"` analysis (`difference`), so this never actually fires yet, but it
+    `kind="dimension"` analysis (`diff`), so this never actually fires yet, but it
     turns "two stages silently overwrite each other's parameter" into an explicit 400
     naming the field, for the day a second one is added or the same one is named twice.
 

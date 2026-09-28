@@ -83,7 +83,7 @@ def salinity_data(base_path, monkeypatch):
 
 @pytest.fixture
 def two_model_group_salinity_data(base_path, monkeypatch):
-    """Two model groups of daily sal, the shape a `difference` over `model_group_id` needs.
+    """Two model groups of daily sal, the shape a `diff` over `model_group_id` needs.
 
     ``validate=False`` for the same reason as ``salinity_data``: three grid cell columns
     rather than the grid's full 1,657.
@@ -1023,12 +1023,12 @@ class TestMapAnalysisTileRouting:
     def test_raster_map_routes_to_the_analysis_tile_endpoint(self, client, two_year_raster_data):
         response = client.get(
             f"{RASTER_URL}/visualization/map.json"
-            "?analysis=difference&dimension=calendar_year&order=asc"
+            "?analysis=diff&dimension=calendar_year&order=asc"
             "&calendar_year=2030&calendar_year=2040"
         )
         assert response.status_code == 200
         tile_url = response.json()["sources"]["data"]["tiles"][0]
-        assert "/analyses/difference/data/" in tile_url
+        assert "/analyses/diff/data/" in tile_url
         assert "dimension=calendar_year" in tile_url
         assert "order=asc" in tile_url
         assert "calendar_year=2030" in tile_url
@@ -1046,12 +1046,12 @@ class TestMapAnalysisTileRouting:
     def test_vector_map_routes_to_the_analysis_vector_tile_endpoint(self, client, vector_data):
         response = client.get(
             f"{VECTOR_URL}/visualization/map.json"
-            "?analysis=difference&dimension=calendar_year&order=asc"
+            "?analysis=diff&dimension=calendar_year&order=asc"
             "&calendar_year=2030&calendar_year=2040"
         )
         assert response.status_code == 200
         tile_url = response.json()["sources"]["data"]["tiles"][0]
-        assert "/analyses/difference/tiles/" in tile_url
+        assert "/analyses/diff/tiles/" in tile_url
         assert "dimension=calendar_year" in tile_url
         assert "order=asc" in tile_url
 
@@ -1064,13 +1064,13 @@ class TestMapAnalysisTileRouting:
         """
         response = client.get(
             f"{SALINITY_URL}/visualization/map.json"
-            "?analysis=difference&dimension=calendar_day&order=asc"
+            "?analysis=diff&dimension=calendar_day&order=asc"
             "&calendar_day=2030-01-01&calendar_day=2030-01-02"
             "&model_group_id=500&scenario_id=7&aggregate_type=mean"
         )
         assert response.status_code == 200
         tile_url = response.json()["sources"]["data"]["tiles"][0]
-        assert "/analyses/difference/tiles/" in tile_url
+        assert "/analyses/diff/tiles/" in tile_url
         assert "dimension=calendar_day" in tile_url
         assert "calendar_day=2030-01-01" in tile_url
         assert "calendar_day=2030-01-02" in tile_url
@@ -1095,12 +1095,12 @@ class TestMapAnalysisTileRouting:
         instead)."""
         response = client.get(
             f"{VECTOR_URL}/visualization/time-series-line.json"
-            "?analysis=difference&dimension=calendar_year&order=asc"
+            "?analysis=diff&dimension=calendar_year&order=asc"
             "&calendar_year=2030&calendar_year=2040&grid_cell=1"
         )
         assert response.status_code == 200
         data_url = response.json()["data"]["url"]
-        assert "/analyses/difference/data.csv" in data_url
+        assert "/analyses/diff/data.csv" in data_url
         assert "dimension=calendar_year" in data_url
         assert "order=asc" in data_url
 
@@ -1124,11 +1124,11 @@ class TestChartDataUrlIsFetchable:
     def test_difference_over_model_group_id_is_fetchable(self, client, two_model_group_salinity_data):
         data_url = self._data_url(
             client,
-            "analysis=difference&dimension=model_group_id&order=asc"
+            "analysis=diff&dimension=model_group_id&order=asc"
             "&model_group_id=500&model_group_id=521"
             "&scenario_id=7&aggregate_type=mean&grid_cell=1",
         )
-        assert "/analyses/difference/data.csv" in data_url
+        assert "/analyses/diff/data.csv" in data_url
         assert client.get(data_url).status_code == 200
 
     def test_the_collapsed_dimension_is_not_selected_back(
@@ -1138,7 +1138,7 @@ class TestChartDataUrlIsFetchable:
         between -- so this pins the asymmetry, not just the absence."""
         data_url = self._data_url(
             client,
-            "analysis=difference&dimension=model_group_id&order=asc"
+            "analysis=diff&dimension=model_group_id&order=asc"
             "&model_group_id=500&model_group_id=521"
             "&scenario_id=7&aggregate_type=mean&grid_cell=1",
         )
@@ -1148,7 +1148,7 @@ class TestChartDataUrlIsFetchable:
 
     def test_a_collapsed_time_column_is_also_dropped(self, client, two_model_group_salinity_data):
         """The time column reaches `select` by a DIFFERENT path than the multi-value
-        dimensions -- it goes in unconditionally -- so a `difference` over `calendar_day`
+        dimensions -- it goes in unconditionally -- so a `diff` over `calendar_day`
         hit the identical "unable to find column" failure even once the multi-value path was
         guarded. Guarding the finished list instead of each append is what covers both.
 
@@ -1158,7 +1158,7 @@ class TestChartDataUrlIsFetchable:
         """
         data_url = self._data_url(
             client,
-            "analysis=difference&dimension=calendar_day&order=asc"
+            "analysis=diff&dimension=calendar_day&order=asc"
             "&calendar_day=2030-01-01&calendar_day=2030-01-02"
             "&model_group_id=500&model_group_id=521"
             "&scenario_id=7&aggregate_type=mean&grid_cell=1",
@@ -1176,7 +1176,7 @@ class TestChartDataUrlIsFetchable:
         `calendar_day`, so `model_group_id` survives the analysis and must come back."""
         data_url = self._data_url(
             client,
-            "analysis=difference&dimension=calendar_day&order=asc"
+            "analysis=diff&dimension=calendar_day&order=asc"
             "&calendar_day=2030-01-01&calendar_day=2030-01-02"
             "&model_group_id=500&model_group_id=521"
             "&scenario_id=7&aggregate_type=mean&grid_cell=1",

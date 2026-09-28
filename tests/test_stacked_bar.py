@@ -132,7 +132,7 @@ class TestSharedSkeleton:
         """Vega-Lite stacks negative segments below zero, so without this the baseline a
         difference is read against is wherever the axis happens to start."""
         spec = (
-            viz(analysis="difference", dimension="model_group_id", order="asc", model_group_id=[500, 520])
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
             .chart()
             .to_dict()
         )
@@ -144,7 +144,7 @@ class TestSharedSkeleton:
     def test_the_zero_rule_is_drawn_under_the_bars(self, viz):
         """It's a reference line, not an annotation on top of the data."""
         spec = (
-            viz(analysis="difference", dimension="model_group_id", order="asc", model_group_id=[500, 520])
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
             .chart()
             .to_dict()
         )
@@ -189,7 +189,7 @@ class TestCompareDimensions:
         which pinned that property directly, were deleted rather than converted, since
         there is nothing left on `StackedBar` for them to call."""
         viz = stacked_bar(
-            model_group_id=[500, 520], analysis="difference", dimension="model_group_id", order="asc"
+            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
         )
         assert viz.compare_dimensions == {}
 
@@ -197,7 +197,7 @@ class TestCompareDimensions:
         viz = stacked_bar(
             model_group_id=[500, 520],
             scenario_id=[7, 8],
-            analysis="difference",
+            analysis="diff",
             dimension="model_group_id",
             order="asc",
         )
@@ -457,12 +457,12 @@ class TestSpeciesStackedBarDataSource:
     def test_a_dimension_the_analysis_collapsed_is_dropped_from_the_explicit_select(self):
         """This chart is the one place that hands `get_data_uri` a ready-made `select`, which
         is exactly what let it keep asking for a column a named analysis had collapsed away:
-        a `difference` over `calendar_year` groups that column out of its output, so naming
+        a `diff` over `calendar_year` groups that column out of its output, so naming
         it here 400s the read ("unable to find column"). The two years still have to be SENT
         -- they are what the difference is taken between -- so only the `select` entry goes.
         """
         params = self._params(
-            analysis="difference",
+            analysis="diff",
             dimension="calendar_year",
             order="asc",
             calendar_year=[2030, 2040],
@@ -581,7 +581,7 @@ class TestSpeciesStackedBarChart:
         """The word belongs to the variable, so it goes in front of the suffix -- appending it
         to `variable_label` would read "... Species Difference Coverage"."""
         viz = species_bar(
-            model_group_id=[500, 520], analysis="difference", dimension="model_group_id", order="asc"
+            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
         )
         assert viz.variable_label == "Vegetation Type: Species Coverage Difference"
 

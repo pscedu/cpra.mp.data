@@ -40,21 +40,21 @@ from cpra.mp.data.analyses.base import (
     normalized_filter_values,
     selection_filter_where,
 )
-from cpra.mp.data.analyses.difference import Difference
-from cpra.mp.data.analyses.land_change import (
+from cpra.mp.data.analyses.diff import Difference
+from cpra.mp.data.analyses.lnd_chng import (
     BASELINE_ERA_BREAKPOINT,
     EARLY_BASELINE_YEAR,
     LATE_BASELINE_YEAR,
     LandChange,
 )
-from cpra.mp.data.analyses.land_type_confidence import (
+from cpra.mp.data.analyses.lnd_conf import (
     LAND_VALUES,
     SCENARIO_WEIGHTS,
     WATER_VALUES,
-    LandTypeConfidence,
+    LandConfidence,
 )
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
-from cpra.mp.data.analyses.salinity_veg_investigation import SalinityVegInvestigation
+from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
     CaseStep,
     FilterStep,
@@ -66,7 +66,7 @@ from cpra.mp.data.legends import LEGENDS
 
 SSF_DATASET = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v001")
 SAL_DATASET = DatasetRef(variable="sal", time_unit="daily", grid="hydro_compartment_v001")
-# `land-type-confidence`'s real dataset. Nothing here reads from disk -- these tests build
+# `lnd_conf`'s real dataset. Nothing here reads from disk -- these tests build
 # pipelines and inspect them -- so the real variable/grid can be named directly rather than
 # through the small stand-ins the execution tests need.
 LND_TYPE_DATASET = DatasetRef(variable="lnd_type", time_unit="annual", grid="morph_pixel_v002")
@@ -80,11 +80,11 @@ LND_TYPE_DATASET = DatasetRef(variable="lnd_type", time_unit="annual", grid="mor
 class TestRegistry:
     def test_contains_exactly_the_registered_entries(self):
         assert set(ANALYSES) == {
-            "salinity-veg-investigation",
-            "difference",
-            "land-change",
-            "land-type-confidence",
-            "lnd-type-plus",
+            "sal_veg_investigation",
+            "diff",
+            "lnd_chng",
+            "lnd_conf",
+            "lnd_type_plus",
         }
 
     def test_keyed_by_meta_name(self):
@@ -92,30 +92,30 @@ class TestRegistry:
             assert cls.Meta.name == name
 
     def test_meta_shape(self):
-        assert ANALYSES["difference"].Meta.type == "dataset"
-        assert ANALYSES["difference"].Meta.variables is None
-        assert ANALYSES["difference"].Meta.legend is None
-        assert ANALYSES["difference"].Meta.result_kind == "difference"
+        assert ANALYSES["diff"].Meta.type == "dataset"
+        assert ANALYSES["diff"].Meta.variables is None
+        assert ANALYSES["diff"].Meta.legend is None
+        assert ANALYSES["diff"].Meta.result_kind == "difference"
 
-        assert ANALYSES["land-change"].Meta.type == "dataset"
-        assert ANALYSES["land-change"].Meta.kind == "variable"
-        assert ANALYSES["land-change"].Meta.variables == ["lnd_type"]
-        assert ANALYSES["land-change"].Meta.legend == "lnd_chng"
-        assert ANALYSES["land-change"].Meta.result_kind == "category"
-        assert ANALYSES["land-change"].Meta.subsumed_dimensions == ["calendar_year"]
+        assert ANALYSES["lnd_chng"].Meta.type == "dataset"
+        assert ANALYSES["lnd_chng"].Meta.kind == "variable"
+        assert ANALYSES["lnd_chng"].Meta.variables == ["lnd_type"]
+        assert ANALYSES["lnd_chng"].Meta.legend == "lnd_chng"
+        assert ANALYSES["lnd_chng"].Meta.result_kind == "category"
+        assert ANALYSES["lnd_chng"].Meta.subsumed_dimensions == ["calendar_year"]
 
-        assert ANALYSES["salinity-veg-investigation"].Meta.type == "custom"
-        assert ANALYSES["salinity-veg-investigation"].Meta.result_kind == "value"
+        assert ANALYSES["sal_veg_investigation"].Meta.type == "custom"
+        assert ANALYSES["sal_veg_investigation"].Meta.result_kind == "value"
 
-        assert ANALYSES["land-type-confidence"].Meta.type == "dataset"
-        assert ANALYSES["land-type-confidence"].Meta.variables == ["lnd_type"]
-        assert ANALYSES["land-type-confidence"].Meta.legend == "lnd_conf"
-        assert ANALYSES["land-type-confidence"].Meta.result_kind == "value"
+        assert ANALYSES["lnd_conf"].Meta.type == "dataset"
+        assert ANALYSES["lnd_conf"].Meta.variables == ["lnd_type"]
+        assert ANALYSES["lnd_conf"].Meta.legend == "lnd_conf"
+        assert ANALYSES["lnd_conf"].Meta.result_kind == "value"
 
-        assert ANALYSES["lnd-type-plus"].Meta.type == "custom"
-        assert ANALYSES["lnd-type-plus"].Meta.variables is None
-        assert ANALYSES["lnd-type-plus"].Meta.legend == "lnd_type_plus"
-        assert ANALYSES["lnd-type-plus"].Meta.result_kind == "category"
+        assert ANALYSES["lnd_type_plus"].Meta.type == "custom"
+        assert ANALYSES["lnd_type_plus"].Meta.variables is None
+        assert ANALYSES["lnd_type_plus"].Meta.legend == "lnd_type_plus"
+        assert ANALYSES["lnd_type_plus"].Meta.result_kind == "category"
 
     def test_every_declared_legend_is_a_real_one(self):
         """A `Meta.legend` is a plain string, so a typo (or a legend removed from
@@ -127,7 +127,7 @@ class TestRegistry:
                 assert cls.Meta.legend in LEGENDS, name
 
     def test_land_type_confidence_declares_the_undifferenced_legend(self):
-        """`land-type-confidence` outputs a weighted FRACTION on `[0, 1]`, so the legend it
+        """`lnd_conf` outputs a weighted FRACTION on `[0, 1]`, so the legend it
         declares has to classify that domain. `legends.csv` also carries `lnd_conf_diff`,
         whose break points are signed (`scripts/generate_video_frames.py`'s
         `CONFIDENCE_BREAKS`) because they classify a DIFFERENCE of that fraction between two
@@ -141,7 +141,7 @@ class TestRegistry:
         def bounds(legend_name):
             return [b for b in LEGENDS[legend_name].break_points["upper_bound"].to_list() if b is not None]
 
-        declared = bounds(ANALYSES["land-type-confidence"].Meta.legend)
+        declared = bounds(ANALYSES["lnd_conf"].Meta.legend)
         assert all(0.0 <= b <= 1.0 for b in declared), declared
         # The other one, for contrast: signed, and so not a reading of the fraction itself.
         assert any(b < 0.0 for b in bounds("lnd_conf_diff"))
@@ -160,13 +160,13 @@ class TestResolveAnalysisContract:
     def test_dataset_analysis_without_dataset_raises_type_mismatch(self):
         with pytest.raises(AnalysisTypeMismatchError):
             resolve_analysis(
-                "difference", dataset=None, filters={}, params={"dimension": "calendar_year", "order": "asc"}
+                "diff", dataset=None, filters={}, params={"dimension": "calendar_year", "order": "asc"}
             )
 
     def test_custom_analysis_with_dataset_raises_type_mismatch(self):
         with pytest.raises(AnalysisTypeMismatchError):
             resolve_analysis(
-                "salinity-veg-investigation",
+                "sal_veg_investigation",
                 dataset=SSF_DATASET,
                 filters={},
                 params={"model_group_id": 500, "scenario_id": 7},
@@ -175,7 +175,7 @@ class TestResolveAnalysisContract:
     def test_missing_required_parameter_raises_invalid_parameters(self):
         with pytest.raises(InvalidAnalysisParametersError):
             resolve_analysis(
-                "difference",
+                "diff",
                 dataset=SSF_DATASET,
                 filters={"calendar_year": [2030, 2040]},
                 params={"dimension": "calendar_year"},  # missing `order`
@@ -184,7 +184,7 @@ class TestResolveAnalysisContract:
     def test_unknown_parameter_raises_invalid_parameters(self):
         with pytest.raises(InvalidAnalysisParametersError):
             resolve_analysis(
-                "difference",
+                "diff",
                 dataset=SSF_DATASET,
                 filters={"calendar_year": [2030, 2040]},
                 params={"dimension": "calendar_year", "order": "asc", "bogus": 1},
@@ -193,7 +193,7 @@ class TestResolveAnalysisContract:
     def test_invalid_literal_raises_invalid_parameters(self):
         with pytest.raises(InvalidAnalysisParametersError):
             resolve_analysis(
-                "difference",
+                "diff",
                 dataset=SSF_DATASET,
                 filters={"calendar_year": [2030, 2040]},
                 params={"dimension": "calendar_year", "order": "sideways"},
@@ -201,7 +201,7 @@ class TestResolveAnalysisContract:
 
     def test_successful_resolve_returns_resolved_analysis(self):
         result = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50},
             params={"dimension": "calendar_year", "order": "asc"},
@@ -239,7 +239,7 @@ class TestResolveOverADateDimension:
 
     def test_difference_over_calendar_day_resolves(self):
         result = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SAL_DATASET,
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
@@ -249,7 +249,7 @@ class TestResolveOverADateDimension:
 
     def test_the_dates_survive_into_the_leading_filter_step(self):
         result = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SAL_DATASET,
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
@@ -264,7 +264,7 @@ class TestResolveOverADateDimension:
         2017 -- so the emitted literal must carry its quotes and its `::date` cast.
         """
         result = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SAL_DATASET,
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
@@ -281,7 +281,7 @@ class TestResolveOverADateDimension:
         this pins that the composed literal itself round-trips intact.
         """
         result = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SAL_DATASET,
             filters=self.FILTERS,
             params={"dimension": "calendar_day", "order": "asc"},
@@ -305,13 +305,13 @@ class TestResolveOverADateDimension:
 class TestResolveAnalysisChainContract:
     """Pure/in-memory coverage of the chain-specific error paths --
     `tests/api/test_analyses_registry.py`'s chain tests cover the successful,
-    disk-touching end-to-end case (`land-type-confidence,difference`, §3.7 of the plan).
+    disk-touching end-to-end case (`lnd_conf,diff`, §3.7 of the plan).
     """
 
     def test_differencing_a_dimension_the_leading_analysis_already_subsumes_is_caught_upstream(
         self,
     ):
-        """`land-type-confidence` subsumes `scenario_id` -- but that's not what fires here.
+        """`lnd_conf` subsumes `scenario_id` -- but that's not what fires here.
         Its OWN `validate_selection` rejects any caller-supplied `scenario_id` filter
         outright (it fixes the whole ensemble itself), and that runs before the chain
         mechanism's own "is this dimension already collapsed" guard ever gets a chance to.
@@ -319,7 +319,7 @@ class TestResolveAnalysisChainContract:
         """
         with pytest.raises(InvalidAnalysisParametersError, match="fixed ensemble"):
             resolve_analysis_chain(
-                ["land-type-confidence", "difference"],
+                ["lnd_conf", "diff"],
                 dataset=LND_TYPE_DATASET,
                 filters={"model_group_id": 705, "calendar_year": 2050, "scenario_id": [34, 35]},
                 params={"dimension": "scenario_id", "order": "asc"},
@@ -328,7 +328,7 @@ class TestResolveAnalysisChainContract:
     def test_an_unknown_later_stage_raises_unknown_analysis_error(self):
         with pytest.raises(UnknownAnalysisError):
             resolve_analysis_chain(
-                ["land-type-confidence", "not-a-real-analysis"],
+                ["lnd_conf", "not-a-real-analysis"],
                 dataset=LND_TYPE_DATASET,
                 filters={"model_group_id": 705, "calendar_year": 2050},
                 params={},
@@ -336,13 +336,13 @@ class TestResolveAnalysisChainContract:
 
     def test_a_three_stage_chain_with_a_stage_2_vs_3_collision_is_rejected(self):
         """The pairwise collision guard has to check every pair, not just stage 1 vs. 2:
-        here stage 1 (`land-type-confidence`) collides with neither later stage (it
-        declares no parameters of its own), but stage 2 and stage 3 -- both `difference`
+        here stage 1 (`lnd_conf`) collides with neither later stage (it
+        declares no parameters of its own), but stage 2 and stage 3 -- both `diff`
         -- collide with EACH OTHER on `dimension`/`order`.
         """
-        with pytest.raises(InvalidAnalysisParametersError, match="difference"):
+        with pytest.raises(InvalidAnalysisParametersError, match="diff"):
             resolve_analysis_chain(
-                ["land-type-confidence", "difference", "difference"],
+                ["lnd_conf", "diff", "diff"],
                 dataset=LND_TYPE_DATASET,
                 filters={"model_group_id": 705, "calendar_year": [2040, 2050]},
                 params={"dimension": "calendar_year", "order": "asc"},
@@ -350,13 +350,13 @@ class TestResolveAnalysisChainContract:
 
     def test_a_single_name_chain_delegates_straight_to_resolve_analysis(self):
         chained = resolve_analysis_chain(
-            ["land-type-confidence"],
+            ["lnd_conf"],
             dataset=LND_TYPE_DATASET,
             filters={"model_group_id": 705, "calendar_year": 2050},
             params={},
         )
         plain = resolve_analysis(
-            "land-type-confidence",
+            "lnd_conf",
             dataset=LND_TYPE_DATASET,
             filters={"model_group_id": 705, "calendar_year": 2050},
             params={},
@@ -468,7 +468,7 @@ class TestSharedHelpers:
 
 
 # ------------------------------------------------------------------------------------------
-# `difference`
+# `diff`
 # ------------------------------------------------------------------------------------------
 
 
@@ -577,7 +577,7 @@ class TestDifferencePipeline:
         assert analysis.result_kind == "difference"
 
     def test_the_output_format_follows_the_selected_dataset(self):
-        """`difference` declares `Meta.variables = None`, so it genuinely runs on both grid
+        """`diff` declares `Meta.variables = None`, so it genuinely runs on both grid
         kinds, and it never changes shape -- its final frame is long on a vector grid and
         band-wide on a raster one. `pipeline.json` is the one route that publishes this
         value rather than overwriting it from a URL segment, so a fixed format would hand
@@ -652,7 +652,7 @@ class TestDifferencePipeline:
 
 
 # ------------------------------------------------------------------------------------------
-# `land-change`
+# `lnd_chng`
 # ------------------------------------------------------------------------------------------
 
 
@@ -821,7 +821,7 @@ class TestLandChangePipeline:
         assert analysis.result_kind == "category"
 
     def test_the_output_format_follows_the_selected_dataset(self):
-        """`land-change` neither projects nor changes shape, so its final frame's kind is
+        """`lnd_chng` neither projects nor changes shape, so its final frame's kind is
         the input grid's -- and `pipeline.json`, the only route that does not overwrite
         this value from a URL segment, has to publish a pipeline that would still validate
         on resubmission. `Meta.variables` is `lnd_type`, which lives only on a raster grid,
@@ -835,7 +835,7 @@ class TestLandChangePipeline:
 
     def test_resolves_through_resolve_analysis(self):
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50},
             params={},
@@ -848,12 +848,12 @@ class TestLandChangePipeline:
     def test_missing_model_group_id_is_rejected_by_resolve_analysis(self):
         with pytest.raises(InvalidAnalysisParametersError):
             resolve_analysis(
-                "land-change", dataset=SSF_DATASET, filters={"calendar_year": 2040}, params={}
+                "lnd_chng", dataset=SSF_DATASET, filters={"calendar_year": 2040}, params={}
             )
 
 
 # ------------------------------------------------------------------------------------------
-# `salinity-veg-investigation`
+# `sal_veg_investigation`
 # ------------------------------------------------------------------------------------------
 
 
@@ -983,41 +983,41 @@ class TestSalinityVegInvestigationPipeline:
 
 
 # ------------------------------------------------------------------------------------------
-# `land-type-confidence`
+# `lnd_conf`
 # ------------------------------------------------------------------------------------------
 
 
-class TestLandTypeConfidenceParameters:
+class TestLandConfidenceParameters:
     def test_declares_no_parameters_of_its_own(self):
-        LandTypeConfidence.Parameters()  # no raise
+        LandConfidence.Parameters()  # no raise
 
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
-            LandTypeConfidence.Parameters(dimension="calendar_year")
+            LandConfidence.Parameters(dimension="calendar_year")
 
 
-class TestLandTypeConfidenceSelection:
-    params = LandTypeConfidence.Parameters()
+class TestLandConfidenceSelection:
+    params = LandConfidence.Parameters()
 
     def test_accepts_filters_that_do_not_name_scenario_id(self):
-        LandTypeConfidence.validate_selection(
+        LandConfidence.validate_selection(
             self.params, {"model_group_id": 705, "calendar_year": 2050}
         )  # no raise
 
     def test_rejects_a_caller_selected_scenario_id(self):
         with pytest.raises(InvalidAnalysisParametersError, match="fixed ensemble"):
-            LandTypeConfidence.validate_selection(self.params, {"scenario_id": 34})
+            LandConfidence.validate_selection(self.params, {"scenario_id": 34})
 
     def test_rejects_a_scenario_id_selecting_the_whole_ensemble_too(self):
         # Even the exact member set is rejected: the analysis supplies it itself, and
         # accepting it here would mean accepting a SUBSET next.
         with pytest.raises(InvalidAnalysisParametersError):
-            LandTypeConfidence.validate_selection(
+            LandConfidence.validate_selection(
                 self.params, {"scenario_id": sorted(SCENARIO_WEIGHTS)}
             )
 
 
-class TestLandTypeConfidenceWeights:
+class TestLandConfidenceWeights:
     def test_the_weights_sum_to_one(self):
         # What makes the trailing `group`/`sum` a weighted MEAN rather than an
         # unnormalized total -- a result outside 0..1 would not be a confidence.
@@ -1028,12 +1028,12 @@ class TestLandTypeConfidenceWeights:
         assert set(LAND_VALUES) | set(WATER_VALUES) == {1, 2, 3, 4, 5}
 
 
-class TestLandTypeConfidencePipeline:
+class TestLandConfidencePipeline:
     def _build(self, filters=None, dataset=LND_TYPE_DATASET):
-        analysis = LandTypeConfidence(
+        analysis = LandConfidence(
             dataset=dataset,
             filters={"model_group_id": 705, "calendar_year": 2050} if filters is None else filters,
-            parameters=LandTypeConfidence.Parameters(),
+            parameters=LandConfidence.Parameters(),
         )
         return analysis, analysis.pipeline()
 
@@ -1126,7 +1126,7 @@ class TestLandTypeConfidencePipeline:
 
     def test_resolves_through_resolve_analysis(self):
         resolved = resolve_analysis(
-            "land-type-confidence",
+            "lnd_conf",
             dataset=LND_TYPE_DATASET,
             filters={"model_group_id": 705, "calendar_year": 2050},
             params={},
@@ -1138,7 +1138,7 @@ class TestLandTypeConfidencePipeline:
     def test_a_scenario_id_filter_is_rejected_by_resolve_analysis(self):
         with pytest.raises(InvalidAnalysisParametersError):
             resolve_analysis(
-                "land-type-confidence",
+                "lnd_conf",
                 dataset=LND_TYPE_DATASET,
                 filters={"model_group_id": 705, "scenario_id": [34, 35]},
                 params={},
@@ -1157,7 +1157,7 @@ class TestLandTypeConfidencePipeline:
 
 
 # ------------------------------------------------------------------------------------------
-# `lnd-type-plus`
+# `lnd_type_plus`
 # ------------------------------------------------------------------------------------------
 
 
@@ -1413,7 +1413,7 @@ class TestLndTypePlusPipeline:
 
     def test_resolves_through_resolve_analysis(self):
         resolved = resolve_analysis(
-            "lnd-type-plus",
+            "lnd_type_plus",
             dataset=None,
             filters={},
             params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
@@ -1426,7 +1426,7 @@ class TestLndTypePlusPipeline:
         # Every parameter arrives as a string on the real routes (`_analysis_extra_params`
         # reads the raw query string), so the `int` fields have to coerce.
         resolved = resolve_analysis(
-            "lnd-type-plus",
+            "lnd_type_plus",
             dataset=None,
             filters={},
             params={"model_group_id": "705", "scenario_id": "7", "calendar_year": "2050"},
@@ -1438,7 +1438,7 @@ class TestLndTypePlusPipeline:
     def test_a_selection_is_rejected_by_resolve_analysis(self):
         with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
             resolve_analysis(
-                "lnd-type-plus",
+                "lnd_type_plus",
                 dataset=None,
                 filters={"grid_cell": "3,5"},
                 params={"model_group_id": 705, "scenario_id": 7},
@@ -1477,7 +1477,7 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
     what a given resolved selection actually collapses. The declared set must never OVERSTATE
     the runtime one -- a dimension the portal hides as "already handled" that still shows up
     in a real response would silently mislead the caller. It MAY be a strict subset
-    (`land-change`'s three-image mode additionally subsumes `model_group_id`, which `Meta`
+    (`lnd_chng`'s three-image mode additionally subsumes `model_group_id`, which `Meta`
     does not declare, since only that mode does), so the check is subset, not equality.
 
     Each test is mutation-checked: asserting the same subset relationship against a
@@ -1493,20 +1493,20 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
 
     def test_land_type_confidence(self):
         resolved = resolve_analysis(
-            "land-type-confidence",
+            "lnd_conf",
             dataset=LND_TYPE_DATASET,
             filters={"model_group_id": 705, "calendar_year": 2050},
             params={},
         )
         self._assert_subset_with_teeth(
-            LandTypeConfidence.Meta.subsumed_dimensions,
+            LandConfidence.Meta.subsumed_dimensions,
             resolved.collapsed_dimensions,
             "calendar_year",
         )
 
     def test_land_change_two_image_mode(self):
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50},
             params={},
@@ -1517,7 +1517,7 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
 
     def test_land_change_three_image_mode_still_holds_even_though_it_subsumes_more(self):
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={
                 "calendar_year": 2040,
@@ -1537,7 +1537,7 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
 
     def test_lnd_type_plus(self):
         resolved = resolve_analysis(
-            "lnd-type-plus",
+            "lnd_type_plus",
             dataset=None,
             filters={},
             params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},

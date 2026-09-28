@@ -1,4 +1,4 @@
-"""`lnd-type-plus` -- a `type="custom"` analysis that extends the `lnd_type` categorical
+"""`lnd_type_plus` -- a `type="custom"` analysis that extends the `lnd_type` categorical
 surface with two SHALLOW-INUNDATION classes the morphology model's land types do not
 themselves distinguish. Annual inundation depth is COMPUTED here rather than read: mean
 annual stage (`stg`/annual/`hydro_compartment_v002`, `aggregate_type=mean`) is projected
@@ -176,7 +176,7 @@ LAND_TYPE_INPUT = DatasetRef(variable="lnd_type", time_unit="annual", grid="morp
 
 # `stg` declares `aggregate_type` required, and the choice is DEFINITIONAL rather than a
 # selection: the class bounds below only mean something against one reading of stage, so
-# fixing it here is the same call `salinity-veg-investigation` makes for its own
+# fixing it here is the same call `sal_veg_investigation` makes for its own
 # `aggregate_type=2_wk_max`. Mean annual stage is the reading that pairs with an annual
 # morphology elevation surface.
 STAGE_AGGREGATE_TYPE = "mean"
@@ -222,13 +222,13 @@ def _ordered_intersection(*sequences: list[str]) -> list[str]:
 
 class LndTypePlus(Analysis):
     class Meta:
-        name = "lnd-type-plus"
+        name = "lnd_type_plus"
         label = "Land Type Plus"
         type = "custom"
         # `None`, not a variable list: this field says which dataset a `type="dataset"`
         # analysis is meaningful for, and a custom analysis has no caller-chosen dataset
         # to qualify -- its inputs are fixed in `pipeline()` below. Same reading as
-        # `salinity-veg-investigation`'s.
+        # `sal_veg_investigation`'s.
         variables = None
         # `structure/legends.csv`'s own `lnd_type_plus` entry, which covers the full `1`-`7`
         # result domain. NOT `lnd_type`: its ramp stops at `5`, so both shallow classes
@@ -242,7 +242,7 @@ class LndTypePlus(Analysis):
         subsumed_dimensions = ["aggregate_type"]
 
     class Parameters(Analysis.Parameters):
-        # Required, and for the same reason `salinity-veg-investigation`'s are: with no
+        # Required, and for the same reason `sal_veg_investigation`'s are: with no
         # dataset in the URL these arrive as the analysis's own parameters rather than as
         # dimension filters (see `api.__init__._resolve_custom_analysis`), and leaving
         # either unpinned would read every model group / scenario on disk into one
@@ -258,7 +258,7 @@ class LndTypePlus(Analysis):
     @classmethod
     def validate_selection(cls, parameters: "LndTypePlus.Parameters", filters: dict[str, Any]) -> None:
         """Reject a selection outright rather than accepting one `pipeline()` silently
-        drops -- the same contract `salinity-veg-investigation` has, and now for the same
+        drops -- the same contract `sal_veg_investigation` has, and now for the same
         reason as well: with stage on `hydro_compartment_v002` and the other two inputs on
         `morph_pixel_v002`, a `grid_cell` names a cell in a lattice the request does not
         say which of.
@@ -273,7 +273,7 @@ class LndTypePlus(Analysis):
         """
         if filters:
             raise InvalidAnalysisParametersError(
-                f"analysis 'lnd-type-plus' takes no selection, but got: "
+                f"analysis 'lnd_type_plus' takes no selection, but got: "
                 f"{', '.join(sorted(filters))} -- it names its own three inputs, across "
                 f"two different grids, and joins them as raster surfaces, so a "
                 f"grid_cell/where has no single frame to narrow and would change the "
@@ -311,7 +311,7 @@ class LndTypePlus(Analysis):
         return frozenset(declared - shared)
 
     def pipeline(self):
-        assert self.dataset is None, "lnd-type-plus is a type='custom' analysis"
+        assert self.dataset is None, "lnd_type_plus is a type='custom' analysis"
         p = self.parameters
 
         selection: dict[str, Any] = {

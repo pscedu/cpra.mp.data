@@ -11,27 +11,27 @@ route disagreeing about what `filters`/`grid_cell`/`params` mean.
 
 **Which registered analysis stands in for what.**
 
-* `difference` (`type="dataset"`) carries the four dataset-scoped routes. It is exercised
+* `diff` (`type="dataset"`) carries the four dataset-scoped routes. It is exercised
   over BOTH grid kinds: `tests/factories.py`'s `ssf`/`ecoregion_v001` (vector) for the
   tabular and `.pbf` routes, and its `vct`/`veg_grid_cell_v001` (raster) for the `png`
   tile route, which needs a band-wide final frame. Substituting these for
   `Meta.variables`' real-world datasets follows that module's own documented convention
   (the engine cares about grid TYPES and SHAPES, not variable semantics).
-* `salinity-veg-investigation` (`type="custom"`) carries the custom routes. It is the one
+* `sal_veg_investigation` (`type="custom"`) carries the custom routes. It is the one
   registered analysis that is band-wide end to end -- a vector-to-raster `project` feeding
   a band-wide `join`, then a `filter` naming that join's operand value columns -- so the
   two routes that execute it are also this module's only coverage of that shape reaching
   a client. What the shape itself does is pinned at the engine level
   (`tests/api/test_analyses_registry.py::TestSalinityVegInvestigationExecution`); what
   these pin is that the custom routes deliver its bytes.
-* `land-type-confidence` (`type="dataset"`) reuses the routes `difference` already
+* `lnd_conf` (`type="dataset"`) reuses the routes `diff` already
   carries, and is covered only where it DIFFERS from them: it declares no parameters of
   its own and supplies its own `scenario_id`, so its query string is dimension filters
   alone and a caller-supplied `scenario_id` must 400. It rides the raster stand-in
   (`vct`/`veg_grid_cell_v001`), since its real variable is raster-only and its own
   `pipeline()` sinks to `tif` to match.
-* `lnd-type-plus` (`type="custom"`) likewise reuses the custom routes
-  `salinity-veg-investigation` carries, and is covered where it differs: all three of its
+* `lnd_type_plus` (`type="custom"`) likewise reuses the custom routes
+  `sal_veg_investigation` carries, and is covered where it differs: all three of its
   parameters are real dimension NAMES, which makes it the sharpest test of the custom
   routes' dimension/parameter split, and it rejects any selection at all. It runs on the
   real `morph_pixel_v002`/`hydro_compartment_v002` pair, with the former shrunk to 2x4 by
@@ -56,7 +56,7 @@ from rasterio.warp import transform, transform_bounds
 from shapely.geometry import box
 
 from cpra.mp.data import config
-from cpra.mp.data.analyses.land_type_confidence import SCENARIO_WEIGHTS
+from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from tests.factories import (
@@ -74,10 +74,10 @@ TILE = mercantile.Tile(x=1, y=2, z=3)
 V, T, G = ANNUAL_KWARGS["variable"], ANNUAL_KWARGS["time_unit"], ANNUAL_KWARGS["grid"]
 RV, RT, RG = RASTER_KWARGS["variable"], RASTER_KWARGS["time_unit"], RASTER_KWARGS["grid"]
 
-DATASET_URL = f"/v1/datasets/{V}/{T}/{G}/analyses/difference"
-RASTER_DATASET_URL = f"/v1/datasets/{RV}/{RT}/{RG}/analyses/difference"
+DATASET_URL = f"/v1/datasets/{V}/{T}/{G}/analyses/diff"
+RASTER_DATASET_URL = f"/v1/datasets/{RV}/{RT}/{RG}/analyses/diff"
 
-# `difference` needs its own `dimension`/`order` parameters plus a two-valued filter on
+# `diff` needs its own `dimension`/`order` parameters plus a two-valued filter on
 # that dimension; the remaining three are `ssf`'s other required dimensions, which
 # `required_dataset_dimensions` puts in the `group` step's `by` list.
 DIFFERENCE_QUERY = {
@@ -98,21 +98,21 @@ RASTER_DIFFERENCE_QUERY = {
     "scenario_id": [RASTER_KWARGS["scenario_id"]],
 }
 
-# `salinity-veg-investigation` is `type="custom"`: no dataset and no dimension filters,
+# `sal_veg_investigation` is `type="custom"`: no dataset and no dimension filters,
 # just its own two required parameters.
 SALINITY_VEG_QUERY = {"model_group_id": 500, "scenario_id": 7}
 
-# `land-type-confidence` declares no parameters at all, and supplies `scenario_id` itself
+# `lnd_conf` declares no parameters at all, and supplies `scenario_id` itself
 # -- so its query is `vct`'s other required dimensions and nothing else. It rides the raster
 # stand-in rather than the vector one: its real variable (`lnd_type`) is raster-only, and
 # its own `pipeline()` sinks to `tif` accordingly.
-LAND_TYPE_CONFIDENCE_URL = f"/v1/datasets/{RV}/{RT}/{RG}/analyses/land-type-confidence"
+LAND_TYPE_CONFIDENCE_URL = f"/v1/datasets/{RV}/{RT}/{RG}/analyses/lnd_conf"
 LAND_TYPE_CONFIDENCE_QUERY = {
     "calendar_year": [2050],
     "model_group_id": [RASTER_KWARGS["model_group_id"]],
 }
 
-# `lnd-type-plus` is `type="custom"` too, and every one of its three parameters is a real
+# `lnd_type_plus` is `type="custom"` too, and every one of its three parameters is a real
 # dimension NAME -- which on the custom routes is exactly what must reach `Parameters`
 # rather than being bound as a dataset filter. See `TestLndTypePlusRoute`.
 LND_TYPE_PLUS_QUERY = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
@@ -134,7 +134,7 @@ def _tile_for_grid(base_path, zoom=8):
 @pytest.fixture
 def vector_dataset(base_path, monkeypatch):
     """Two years of `ssf`/`ecoregion_v001`, both holding the SAME value per geography --
-    so `difference`'s asc order (negate the later year, then sum) leaves exactly 0
+    so `diff`'s asc order (negate the later year, then sum) leaves exactly 0
     everywhere, a result no unfiltered passthrough could produce by accident.
     """
     write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id)
@@ -164,12 +164,12 @@ class TestRouteKindRejection:
     """
 
     def test_dataset_analysis_rejected_on_custom_route(self, client):
-        response = client.get("/v1/analyses/difference/data.csv")
+        response = client.get("/v1/analyses/diff/data.csv")
         assert response.status_code == 400
         assert "Invalid analysis type" in response.json()["detail"]
 
     def test_custom_analysis_rejected_on_dataset_route(self, client):
-        response = client.get(f"/v1/datasets/{V}/{T}/{G}/analyses/salinity-veg-investigation/data.csv")
+        response = client.get(f"/v1/datasets/{V}/{T}/{G}/analyses/sal_veg_investigation/data.csv")
         assert response.status_code == 400
         assert "Invalid analysis type" in response.json()["detail"]
 
@@ -185,7 +185,7 @@ class TestRouteKindRejection:
 
 
 class TestDatasetAnalysisData:
-    """The dataset-scoped `data.{format}` route, running the real `difference` analysis."""
+    """The dataset-scoped `data.{format}` route, running the real `diff` analysis."""
 
     def test_returns_the_analysis_result(self, client, vector_dataset):
         response = client.get(f"{DATASET_URL}/data.csv", params=DIFFERENCE_QUERY)
@@ -251,7 +251,7 @@ class TestDatasetAnalysisData:
         assert "must be one of" in response.json()["detail"]
 
     def test_a_selection_the_analysis_rejects_400s(self, client, vector_dataset):
-        """`difference`'s own `validate_selection` cardinality rule ("exactly 2 selected
+        """`diff`'s own `validate_selection` cardinality rule ("exactly 2 selected
         values of `dimension`") is what rejects this, inside `resolve_analysis` -- the one
         rejection path `get_analysis_class` cannot pre-empt, since both the name and the
         `Meta.type` are fine.
@@ -298,14 +298,14 @@ class TestDatasetAnalysisGridCell:
 
     def test_a_grid_cell_on_a_custom_route_is_rejected_rather_than_ignored(self, client):
         """A custom analysis names its own inputs -- two, on two different grids for
-        `salinity-veg-investigation` -- so the route cannot resolve a coordinate against
+        `sal_veg_investigation` -- so the route cannot resolve a coordinate against
         "the" grid, and `SalinityVegInvestigation.validate_selection` rejects the whole
         selection rather than letting it be silently dropped. The distinction matters:
         silently ignoring a `grid_cell` would return a whole-extent raster to a point
         query.
         """
         response = client.get(
-            "/v1/analyses/salinity-veg-investigation/data.tif",
+            "/v1/analyses/sal_veg_investigation/data.tif",
             params={**SALINITY_VEG_QUERY, "grid_cell": "-91.5,29.5"},
         )
         assert response.status_code == 400
@@ -420,7 +420,7 @@ class TestDatasetAnalysisPipelineJson:
 
     def test_format_is_not_overridden_by_the_route(self, client, vector_dataset):
         """There is no `{format}`/`.pbf` URL segment on this route to source an override
-        from, so the pipeline's own `output.format` -- `csv`, for `difference` over this
+        from, so the pipeline's own `output.format` -- `csv`, for `diff` over this
         vector dataset -- is left untouched.
         """
         response = client.get(f"{DATASET_URL}/pipeline.json", params=DIFFERENCE_QUERY)
@@ -439,12 +439,12 @@ class TestDatasetAnalysisPipelineJson:
 
 
 class TestCustomAnalysisPipelineJson:
-    """`salinity-veg-investigation`'s expansion -- the one registered `type="custom"`
+    """`sal_veg_investigation`'s expansion -- the one registered `type="custom"`
     entry, and the only one with multiple named inputs and a `project` + spatial `join`.
     """
 
     def test_expands_to_the_paired_shape(self, client):
-        response = client.get("/v1/analyses/salinity-veg-investigation/pipeline.json", params=SALINITY_VEG_QUERY)
+        response = client.get("/v1/analyses/sal_veg_investigation/pipeline.json", params=SALINITY_VEG_QUERY)
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
         assert len(expanded.inputs) == 2
@@ -459,7 +459,7 @@ class TestCustomAnalysisPipelineJson:
 
     def test_color_map_override_is_reflected(self, client):
         response = client.get(
-            "/v1/analyses/salinity-veg-investigation/pipeline.json",
+            "/v1/analyses/sal_veg_investigation/pipeline.json",
             params={**SALINITY_VEG_QUERY, "color_map": "ffibs"},
         )
         assert response.json()["output"]["color_map"] == "ffibs"
@@ -470,7 +470,7 @@ class TestCustomAnalysisPipelineJson:
         `InvalidAnalysisParametersError`, which `api/__init__` maps to 400.
         """
         response = client.get(
-            "/v1/analyses/salinity-veg-investigation/pipeline.json",
+            "/v1/analyses/sal_veg_investigation/pipeline.json",
             params={**SALINITY_VEG_QUERY, "marsh_threshold": 42},
         )
         assert response.status_code == 400
@@ -478,7 +478,7 @@ class TestCustomAnalysisPipelineJson:
 
 
 class TestCustomAnalysisVectorTileRejection:
-    """`salinity-veg-investigation`'s final frame is band-wide on a raster grid, so it can
+    """`sal_veg_investigation`'s final frame is band-wide on a raster grid, so it can
     never serve a `.pbf` tile. Unaffected by the execution gap the class below pins: a
     `.pbf` request never reaches `execute()` at all --
     `api.pipeline._require_vector_final_frame` reads the plan's `frame_types` and rejects
@@ -487,7 +487,7 @@ class TestCustomAnalysisVectorTileRejection:
 
     def test_rejects_a_raster_output_grid(self, client):
         response = client.get(
-            "/v1/analyses/salinity-veg-investigation/tiles/3/1/2.pbf", params=SALINITY_VEG_QUERY
+            "/v1/analyses/sal_veg_investigation/tiles/3/1/2.pbf", params=SALINITY_VEG_QUERY
         )
         assert response.status_code == 400
         assert "not a long frame on a vector grid" in response.json()["detail"]
@@ -503,7 +503,7 @@ class TestCustomAnalysisExecution:
     """
 
     def test_data_tif(self, client, salinity_veg_data):
-        response = client.get("/v1/analyses/salinity-veg-investigation/data.tif", params=SALINITY_VEG_QUERY)
+        response = client.get("/v1/analyses/sal_veg_investigation/data.tif", params=SALINITY_VEG_QUERY)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -512,7 +512,7 @@ class TestCustomAnalysisExecution:
     def test_png_tile(self, client, salinity_veg_data):
         tile = _tile_for_grid(salinity_veg_data)
         response = client.get(
-            f"/v1/analyses/salinity-veg-investigation/data/{tile.z}/{tile.x}/{tile.y}.png",
+            f"/v1/analyses/sal_veg_investigation/data/{tile.z}/{tile.x}/{tile.y}.png",
             params=SALINITY_VEG_QUERY,
         )
         assert response.status_code == 200, response.text
@@ -541,7 +541,7 @@ class TestAnalysisRegistryErrorMapping:
         from cpra.mp.data.analyses.base import InvalidAnalysisParametersError
 
         self._patch(monkeypatch, InvalidAnalysisParametersError("dimension must select exactly 2 values"))
-        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
+        response = client.get("/v1/analyses/sal_veg_investigation/data.csv")
         assert response.status_code == 400
         assert "exactly 2 values" in response.json()["detail"]
 
@@ -549,24 +549,24 @@ class TestAnalysisRegistryErrorMapping:
         from cpra.mp.data.analyses.base import UnknownAnalysisError
 
         self._patch(monkeypatch, UnknownAnalysisError("unknown analysis name"))
-        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
+        response = client.get("/v1/analyses/sal_veg_investigation/data.csv")
         assert response.status_code == 404
 
     def test_type_mismatch_error_maps_to_400(self, client, monkeypatch):
         from cpra.mp.data.analyses.base import AnalysisTypeMismatchError
 
         self._patch(monkeypatch, AnalysisTypeMismatchError("type mismatch"))
-        response = client.get("/v1/analyses/salinity-veg-investigation/data.csv")
+        response = client.get("/v1/analyses/sal_veg_investigation/data.csv")
         assert response.status_code == 400
 
 
-class TestLandTypeConfidenceRoute:
-    """`land-type-confidence` on the dataset-scoped routes. The route machinery itself is
-    already carried by `difference` above; what these pin is the one thing that differs --
+class TestLandConfidenceRoute:
+    """`lnd_conf` on the dataset-scoped routes. The route machinery itself is
+    already carried by `diff` above; what these pin is the one thing that differs --
     it declares NO parameters of its own and supplies its own `scenario_id`, so its query
     string is dimension filters alone and a caller-supplied `scenario_id` has to come back
     as a 400 rather than silently narrowing the ensemble. What the pipeline computes is
-    pinned at the engine level (`test_analyses_registry.py::TestLandTypeConfidenceExecution`).
+    pinned at the engine level (`test_analyses_registry.py::TestLandConfidenceExecution`).
     """
 
     @pytest.fixture
@@ -616,8 +616,8 @@ class TestLandTypeConfidenceRoute:
 
 
 class TestLndTypePlusRoute:
-    """`lnd-type-plus` on the custom routes. The custom-route machinery itself is already
-    carried by `salinity-veg-investigation` above; what these pin is the one thing that
+    """`lnd_type_plus` on the custom routes. The custom-route machinery itself is already
+    carried by `sal_veg_investigation` above; what these pin is the one thing that
     differs -- ALL THREE of its parameters are real dimension names, so it is the sharpest
     test of `_resolve_custom_analysis`'s dimension/parameter split. On these routes the
     `FilterDimensions` half of the bound query model is subtracted from the known set
@@ -631,7 +631,7 @@ class TestLndTypePlusRoute:
     """
 
     def test_data_tif(self, client, lnd_type_plus_data):
-        response = client.get("/v1/analyses/lnd-type-plus/data.tif", params=LND_TYPE_PLUS_QUERY)
+        response = client.get("/v1/analyses/lnd_type_plus/data.tif", params=LND_TYPE_PLUS_QUERY)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -645,7 +645,7 @@ class TestLndTypePlusRoute:
     def test_png_tile(self, client, lnd_type_plus_data):
         tile = _tile_for_grid(lnd_type_plus_data)
         response = client.get(
-            f"/v1/analyses/lnd-type-plus/data/{tile.z}/{tile.x}/{tile.y}.png",
+            f"/v1/analyses/lnd_type_plus/data/{tile.z}/{tile.x}/{tile.y}.png",
             params=LND_TYPE_PLUS_QUERY,
         )
         assert response.status_code == 200, response.text
@@ -658,7 +658,7 @@ class TestLndTypePlusRoute:
         verbatim gets a pipeline the request layer accepts rather than a tabular-sink
         rejection.
         """
-        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=LND_TYPE_PLUS_QUERY)
+        response = client.get("/v1/analyses/lnd_type_plus/pipeline.json", params=LND_TYPE_PLUS_QUERY)
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
         assert len(expanded.inputs) == 3
@@ -676,7 +676,7 @@ class TestLndTypePlusRoute:
         That is what keeps each year reclassified against its OWN counterpart bands.
         """
         params = {k: v for k, v in LND_TYPE_PLUS_QUERY.items() if k != "calendar_year"}
-        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=params)
+        response = client.get("/v1/analyses/lnd_type_plus/pipeline.json", params=params)
         assert response.status_code == 200, response.text
         expanded = parse_pipeline(response.json())
         assert not any("calendar_year" in (step.where or "") for step in expanded.steps if step.op == "filter")
@@ -688,7 +688,7 @@ class TestLndTypePlusRoute:
         what catches that, and `resolve_analysis` raises the 400.
         """
         params = {k: v for k, v in LND_TYPE_PLUS_QUERY.items() if k != "model_group_id"}
-        response = client.get("/v1/analyses/lnd-type-plus/pipeline.json", params=params)
+        response = client.get("/v1/analyses/lnd_type_plus/pipeline.json", params=params)
         assert response.status_code == 400
         assert "model_group_id" in response.json()["detail"]
 
@@ -699,7 +699,7 @@ class TestLndTypePlusRoute:
         band-wide frame long and invalidate the raster output rather than narrow it.
         """
         response = client.get(
-            "/v1/analyses/lnd-type-plus/pipeline.json",
+            "/v1/analyses/lnd_type_plus/pipeline.json",
             params={**LND_TYPE_PLUS_QUERY, "grid_cell": "1,2"},
         )
         assert response.status_code == 400
@@ -711,9 +711,9 @@ class TestAnalysesCatalog:
         response = client.get("/v1/analyses.json")
         assert response.status_code == 200, response.text
         assert {entry["name"] for entry in response.json()} == {
-            "difference",
-            "land-change",
-            "salinity-veg-investigation",
-            "land-type-confidence",
-            "lnd-type-plus",
+            "diff",
+            "lnd_chng",
+            "sal_veg_investigation",
+            "lnd_conf",
+            "lnd_type_plus",
         }

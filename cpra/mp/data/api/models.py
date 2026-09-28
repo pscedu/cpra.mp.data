@@ -182,8 +182,8 @@ class AnalysisDataQuery(AnalysisQuery, Compression):
 
 
 class VisualizationQuery(DataQuery):
-    # A named analysis (`cpra.mp.data.analyses.ANALYSES`), e.g. `difference` or
-    # `land-change`. Deliberately the ONLY field this model declares for the analysis --
+    # A named analysis (`cpra.mp.data.analyses.ANALYSES`), e.g. `diff` or
+    # `lnd_chng`. Deliberately the ONLY field this model declares for the analysis --
     # its own parameters (`dimension`/`order`/...) have no fixed field set (see
     # `AnalysisQuery`'s docstring above) and are instead read directly off the raw request
     # query string by the visualization layer itself (`DatasetVisualization.

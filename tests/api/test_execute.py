@@ -305,7 +305,7 @@ class TestEndToEnd:
         # The two years straddle the one bound, so both branches are exercised in one
         # result: 2040's 32 cells match the arm, 2030's 32 fall through to the `else`. A
         # `case` never drops a row, so the height is the full 64 either way -- which is
-        # what separates it from the `filter` this replaces in `land-type-confidence`.
+        # what separates it from the `filter` this replaces in `lnd_conf`.
         df = self._run(
             annual_dataset,
             [

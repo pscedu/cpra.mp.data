@@ -1,4 +1,4 @@
-"""`difference` -- a dataset-scoped analysis over two selected values of one dimension:
+"""`diff` -- a dataset-scoped analysis over two selected values of one dimension:
 negate whichever of the two is later (`order="asc"`) or earlier (`order="desc"`), then sum
 across it. Replaces the portal's `subtract-asc`/`subtract-desc` catalog entries (see
 `cpra-mp-ui/src/helpers/catalog.ts`'s real derivation, lines 95-138) with a named pipeline
@@ -25,7 +25,7 @@ from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 class Difference(Analysis):
     class Meta:
-        name = "difference"
+        name = "diff"
         label = "Difference"
         type = "dataset"
         variables = None
@@ -50,13 +50,13 @@ class Difference(Analysis):
         raw = filters.get(dim)
         if raw is None:
             raise InvalidAnalysisParametersError(
-                f"difference on dimension {dim!r} requires a {dim!r} filter selecting "
+                f"diff on dimension {dim!r} requires a {dim!r} filter selecting "
                 "exactly 2 distinct values, but none was given"
             )
         values = normalized_filter_values(dim, raw)
         if len(values) != 2:
             raise InvalidAnalysisParametersError(
-                f"difference on dimension {dim!r} requires exactly 2 distinct selected "
+                f"diff on dimension {dim!r} requires exactly 2 distinct selected "
                 f"values, got {len(values)}: {raw!r}"
             )
 
@@ -79,7 +79,7 @@ class Difference(Analysis):
         values = normalized_filter_values(dim, self.filters[dim])
         if len(values) != 2:
             raise InvalidAnalysisParametersError(
-                f"difference on dimension {dim!r} requires exactly 2 distinct selected "
+                f"diff on dimension {dim!r} requires exactly 2 distinct selected "
                 f"values, got {len(values)}: {self.filters[dim]!r}"
             )
         earlier, later = sorted(values)
@@ -104,7 +104,7 @@ class Difference(Analysis):
         ]
 
     def pipeline(self):
-        assert self.dataset is not None, "difference is a type='dataset' analysis"
+        assert self.dataset is not None, "diff is a type='dataset' analysis"
         dim = self.parameters.dimension
         required = required_dataset_dimensions(self.dataset)
         group_by = [d for d in required if d != dim]

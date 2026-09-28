@@ -1,4 +1,4 @@
-"""`salinity-veg-investigation` -- the one `type="custom"` v1 entry: the earliest calendar
+"""`sal_veg_investigation` -- the one `type="custom"` v1 entry: the earliest calendar
 year at which marsh coverage (`ffibs_coverage_ratio`/annual/`veg_grid_cell_v001`,
 `ffibs_type=pl_fm`) and paired salinity (`sal`/annual/`hydro_compartment_v001`,
 `aggregate_type=2_wk_max`) both cross their thresholds, at every vegetation-grid pixel --
@@ -12,7 +12,7 @@ exceeds the given salinity threshold"), served as one request instead.
 
 The only entry exercising the `type="custom"` path, multiple named inputs, and a
 `project` + spatial `join`, and the only one with no existing consumer (unlike
-`difference`/`land-change`, which replace real portal catalog entries).
+`diff`/`lnd_chng`, which replace real portal catalog entries).
 
 **Why the inputs are named `coverage`/`salinity` and the join operands `marsh`/`sal`.**
 A `join`'s output value columns are named after its OPERANDS (see `ops.validate_shapes`),
@@ -48,7 +48,7 @@ from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 class SalinityVegInvestigation(Analysis):
     class Meta:
-        name = "salinity-veg-investigation"
+        name = "sal_veg_investigation"
         label = "Salinity-Veg Investigation"
         type = "custom"
         variables = None
@@ -86,7 +86,7 @@ class SalinityVegInvestigation(Analysis):
         """
         if filters:
             raise InvalidAnalysisParametersError(
-                f"analysis 'salinity-veg-investigation' takes no selection, but got: "
+                f"analysis 'sal_veg_investigation' takes no selection, but got: "
                 f"{', '.join(sorted(filters))} -- it names its own two inputs, on two "
                 f"different grids, so there is no single frame for a grid_cell/where to "
                 f"narrow; its dimension values are parameters "
@@ -94,7 +94,7 @@ class SalinityVegInvestigation(Analysis):
             )
 
     def pipeline(self):
-        assert self.dataset is None, "salinity-veg-investigation is a type='custom' analysis"
+        assert self.dataset is None, "sal_veg_investigation is a type='custom' analysis"
         p = self.parameters
         coverage_where = selection_filter_where(
             {

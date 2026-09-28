@@ -189,11 +189,11 @@ class TestGetAnalysisClass:
         monkeypatch.setattr(
             api_utils,
             "ANALYSES",
-            {"land-change": _FakeDatasetAnalysisClass, "salinity-veg-investigation": _FakeCustomAnalysisClass},
+            {"lnd_chng": _FakeDatasetAnalysisClass, "sal_veg_investigation": _FakeCustomAnalysisClass},
         )
 
     def test_returns_a_known_analysis(self):
-        assert get_analysis_class("land-change").Meta.type == "dataset"
+        assert get_analysis_class("lnd_chng").Meta.type == "dataset"
 
     def test_unknown_name_raises_404(self):
         with pytest.raises(HTTPException) as excinfo:
@@ -202,21 +202,21 @@ class TestGetAnalysisClass:
         assert "Unknown analysis name" in excinfo.value.detail
 
     def test_matching_type_is_accepted(self):
-        assert get_analysis_class("land-change", "dataset") is not None
+        assert get_analysis_class("lnd_chng", "dataset") is not None
 
     def test_mismatched_type_raises_400(self):
         with pytest.raises(HTTPException) as excinfo:
-            get_analysis_class("land-change", "custom")
+            get_analysis_class("lnd_chng", "custom")
         assert excinfo.value.status_code == 400
         assert "Invalid analysis type" in excinfo.value.detail
 
     def test_custom_type_mismatch_the_other_direction(self):
         with pytest.raises(HTTPException) as excinfo:
-            get_analysis_class("salinity-veg-investigation", "dataset")
+            get_analysis_class("sal_veg_investigation", "dataset")
         assert excinfo.value.status_code == 400
 
     def test_type_is_optional(self):
-        assert get_analysis_class("salinity-veg-investigation") is not None
+        assert get_analysis_class("sal_veg_investigation") is not None
 
 
 class TestLazyFrameSource:

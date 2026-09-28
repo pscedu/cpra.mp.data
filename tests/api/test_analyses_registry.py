@@ -8,28 +8,28 @@ path any hand-authored pipeline goes through. Everything here drives
 `validate_shapes`/`compile_plan`/`execute`/`run_to_path` directly, exactly as
 `tests/api/test_execute.py` does for hand-authored pipelines.
 
-**Representative datasets.** `difference`/`land-change` are `type="dataset"` and take
+**Representative datasets.** `diff`/`lnd_chng` are `type="dataset"` and take
 whatever `DatasetRef` a route resolves for them; `tests/factories.py`'s `ssf`/
 `ecoregion_v001` (`ANNUAL_KWARGS`) is used here as that representative dataset, per that
 module's own documented convention ("the compiler cares about grid TYPES and SHAPES, not
-real-world variable semantics") -- `land-change`'s real `Meta.variables = ["lnd_type"]`
+real-world variable semantics") -- `lnd_chng`'s real `Meta.variables = ["lnd_type"]`
 lives on `morph_pixel_v001` (8265x20674 pixels), far too large to write as a test fixture;
 the `Meta.variables` declaration itself is unaffected by this substitution, only which
 dataset proves the pipeline-construction MACHINERY works.
 
-`salinity-veg-investigation` is `type="custom"` with hardcoded inputs
+`sal_veg_investigation` is `type="custom"` with hardcoded inputs
 (`ffibs_coverage_ratio`/`veg_grid_cell_v001`, `sal`/`hydro_compartment_v001`), written by
 `tests/factories.py`'s `write_ffibs_coverage_dataset`/`write_sal_annual_dataset` and
 assembled by the `salinity_veg_data` fixture in `tests/api/conftest.py` -- shared with
 `tests/api/test_analyses_endpoints.py`, which needs the same data to drive the same
 analysis through its HTTP routes.
 
-`land-type-confidence` is also `type="dataset"`, but its own `Meta.variables = ["lnd_type"]`
+`lnd_conf` is also `type="dataset"`, but its own `Meta.variables = ["lnd_type"]`
 lives only on a raster grid and its `pipeline()` sinks to `tif`, so a vector stand-in would
 not survive `validate_shapes`; it runs on `tests/factories.py`'s `vct`/`veg_grid_cell_v001`
 raster stand-in (`RASTER_KWARGS`) instead, through `run_to_path` rather than `_run`.
 
-`lnd-type-plus` is `type="custom"` too, with THREE hardcoded inputs across two grids
+`lnd_type_plus` is `type="custom"` too, with THREE hardcoded inputs across two grids
 (`elev` and `lnd_type` on `morph_pixel_v002`, `stg` on `hydro_compartment_v002`) -- and
 those are the one real, un-substituted grid pair in this module, because the analysis names
 them itself. At its real size `morph_pixel_v002` is ~97 million pixels per band, so the
@@ -41,11 +41,11 @@ two grids. It does not store depths: the analysis COMPUTES depth as
 test asks for.
 
 **The band-wide entries get their own execution classes.** The long-shaped registered
-analyses run through `_run` below; `salinity-veg-investigation` is band-wide end to end and
+analyses run through `_run` below; `sal_veg_investigation` is band-wide end to end and
 is the only entry that exercises a vector-to-raster `project` feeding a band-wide `join`
 together with a `case` naming that join's operand value columns, so
 `TestSalinityVegInvestigationExecution` runs it separately and pins the two halves apart.
-`lnd-type-plus` is band-wide end to end as well, and is the only entry that collapses a
+`lnd_type_plus` is band-wide end to end as well, and is the only entry that collapses a
 band-wide join of THREE operands with a single paired `case` -- arms that compute and
 reclassify a depth, and an `else` that hands back one of the operands untouched -- so
 `TestLndTypePlusExecution` pins that against a raster small enough to assert pixel by
@@ -63,8 +63,8 @@ from cpra.mp.data.analyses import (
     resolve_analysis,
     resolve_analysis_chain,
 )
-from cpra.mp.data.analyses.land_change import EARLY_BASELINE_YEAR
-from cpra.mp.data.analyses.land_type_confidence import SCENARIO_WEIGHTS
+from cpra.mp.data.analyses.lnd_chng import EARLY_BASELINE_YEAR
+from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.request.ops import validate_shapes
@@ -86,7 +86,7 @@ COMMON_ANNUAL_FILTERS = {
     "scenario_id": ANNUAL_KWARGS["scenario_id"],
     "percentile": ANNUAL_KWARGS["percentile"],
 }
-# `land-type-confidence`'s real dataset is `lnd_type`, whose only grid in `variables.csv`
+# `lnd_conf`'s real dataset is `lnd_type`, whose only grid in `variables.csv`
 # is `morph_pixel` -- a RASTER grid, and far too large to write as a fixture. The
 # representative dataset here is therefore `vct`/`veg_grid_cell_v001` (`RASTER_KWARGS`),
 # the same raster stand-in `tests/api/test_analyses_endpoints.py` uses, rather than the
@@ -115,7 +115,7 @@ def _write_ensemble(base_path, code_by_scenario, years=(2050,), **overrides):
         )
 
 
-# `lnd-type-plus`'s parameters are its inputs' shared selection plus the one year the
+# `lnd_type_plus`'s parameters are its inputs' shared selection plus the one year the
 # fixtures write. All three inputs are named by the analysis itself, so none of this is a
 # filter -- and `aggregate_type`, which only `stg` carries, is pinned by the analysis too.
 LND_TYPE_PLUS_PARAMS = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
@@ -150,17 +150,17 @@ class TestRegistryDrift:
         # tripwire: it fails loudly instead of the drift test silently covering only some
         # of the entries.
         assert set(ANALYSES) == {
-            "salinity-veg-investigation",
-            "difference",
-            "land-change",
-            "land-type-confidence",
-            "lnd-type-plus",
+            "sal_veg_investigation",
+            "diff",
+            "lnd_chng",
+            "lnd_conf",
+            "lnd_type_plus",
         }
 
     def test_difference_compiles(self, base_path):
         write_annual_dataset(base_path, years=(2030, 2040))
         resolved = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
             params={"dimension": "calendar_year", "order": "asc"},
@@ -171,7 +171,7 @@ class TestRegistryDrift:
     def test_land_change_two_image_compiles(self, base_path):
         write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": 2040},
             params={},
@@ -183,7 +183,7 @@ class TestRegistryDrift:
         write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=500)
         write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=520)
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
@@ -197,14 +197,14 @@ class TestRegistryDrift:
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
     def test_land_change_compiles_on_a_raster_grid_too(self, base_path):
-        """`land-change`'s own `Meta.variables` (`lnd_type`) is raster-only, so the raster
+        """`lnd_chng`'s own `Meta.variables` (`lnd_type`) is raster-only, so the raster
         selection is the one it really runs under -- and its `output.format` is derived
         from the grid kind, which `validate_shapes` then checks against the final frame.
         The two-image case above proves the vector half of the same derivation.
         """
         write_raster_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=RASTER_DATASET,
             filters={
                 "model_group_id": RASTER_KWARGS["model_group_id"],
@@ -220,7 +220,7 @@ class TestRegistryDrift:
     def test_land_type_confidence_compiles(self, base_path):
         _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1))
         resolved = resolve_analysis(
-            "land-type-confidence",
+            "lnd_conf",
             dataset=RASTER_DATASET,
             filters=ENSEMBLE_FILTERS,
             params={},
@@ -237,7 +237,7 @@ class TestRegistryDrift:
             base_path, crosswalk_path, depths=[0.2] * 8, land_types=[1] * 8
         )
         resolved = resolve_analysis(
-            "lnd-type-plus", dataset=None, filters={}, params=LND_TYPE_PLUS_PARAMS
+            "lnd_type_plus", dataset=None, filters={}, params=LND_TYPE_PLUS_PARAMS
         )
         # Band-wide end to end (the one `project` lands ON the raster grid), so `tif` is
         # the only sink `validate_shapes` accepts -- and it is what `pipeline.json`
@@ -248,7 +248,7 @@ class TestRegistryDrift:
 
     def test_salinity_veg_investigation_compiles(self, salinity_veg_data, base_path):
         resolved = resolve_analysis(
-            "salinity-veg-investigation",
+            "sal_veg_investigation",
             dataset=None,
             filters={},
             params={"model_group_id": 500, "scenario_id": 7},
@@ -268,7 +268,7 @@ class TestDifferenceExecution:
             base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id
         )
         resolved = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
             params={"dimension": "calendar_year", "order": "asc"},
@@ -284,7 +284,7 @@ class TestDifferenceExecution:
             base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year)
         )
         resolved = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
             params={"dimension": "calendar_year", "order": "desc"},
@@ -302,7 +302,7 @@ class TestDifferenceExecution:
             base_path, years=(2030, 2040, 2050), value_fn=lambda year, geo_id: float(year)
         )
         resolved = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040]},
             params={"dimension": "calendar_year", "order": "asc"},
@@ -316,7 +316,7 @@ class TestDifferenceExecution:
             base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year)
         )
         resolved = resolve_analysis(
-            "difference",
+            "diff",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2030, 2040], "grid_cell": "3,5"},
             params={"dimension": "calendar_year", "order": "asc"},
@@ -331,7 +331,7 @@ class TestLandChangeExecution:
             base_path, years=(EARLY_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0
         )
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={**COMMON_ANNUAL_FILTERS, "calendar_year": 2040},
             params={},
@@ -355,7 +355,7 @@ class TestLandChangeExecution:
             value_fn=lambda year, geo_id: 1.0,
         )
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
@@ -389,7 +389,7 @@ class TestLandChangeExecution:
             value_fn=lambda year, geo_id: 1000.0 if year == EARLY_BASELINE_YEAR else 1.0,
         )
         resolved = resolve_analysis(
-            "land-change",
+            "lnd_chng",
             dataset=SSF_DATASET,
             filters={
                 "scenario_id": ANNUAL_KWARGS["scenario_id"],
@@ -405,7 +405,7 @@ class TestLandChangeExecution:
         assert set(df["value"].to_list()) == {111.0}
 
 
-class TestLandTypeConfidenceExecution:
+class TestLandConfidenceExecution:
     """The weighted sum, over an ensemble whose members are written one uniform `lnd_type`
     code each -- so every pixel's result is the total weight of the members this test made
     land, and a member leaking in (or dropping out) moves that total by its own weight
@@ -418,7 +418,7 @@ class TestLandTypeConfidenceExecution:
     def _run_confidence(self, base_path, tmp_path, dataset=RASTER_DATASET):
         """Resolve the analysis over what's already on disk and run it to a GeoTIFF."""
         resolved = resolve_analysis(
-            "land-type-confidence", dataset=dataset, filters=ENSEMBLE_FILTERS, params={}
+            "lnd_conf", dataset=dataset, filters=ENSEMBLE_FILTERS, params={}
         )
         validate_shapes(resolved.pipeline)
         out = tmp_path / "confidence.tif"
@@ -499,14 +499,14 @@ class TestChainedAnalysisExecution:
     """`resolve_analysis_chain`'s own exception contract (unknown later stage, pairwise
     parameter collisions, single-name delegation) is pure/in-memory and lives in
     `tests/test_analyses.py`; these run the chains that DO reach disk, through the same
-    `validate_shapes` -> `run_to_path` -> rasterio path `TestLandTypeConfidenceExecution`
+    `validate_shapes` -> `run_to_path` -> rasterio path `TestLandConfidenceExecution`
     uses -- plus a test documenting the one combination the plan's own §5 anticipated
     might not survive ("write it and see").
     """
 
     def _run_chain(self, base_path, tmp_path, filters, dimension, order="asc"):
         resolved = resolve_analysis_chain(
-            ["land-type-confidence", "difference"],
+            ["lnd_conf", "diff"],
             dataset=RASTER_DATASET,
             filters=filters,
             params={"dimension": dimension, "order": order},
@@ -517,8 +517,8 @@ class TestChainedAnalysisExecution:
         return out
 
     def test_calendar_year_worked_example(self, base_path, tmp_path):
-        """The plan's own worked example (§3.7): `land-type-confidence` reduces each of
-        two years' ensembles to a confidence value, then `difference` -- chained rather
+        """The plan's own worked example (§3.7): `lnd_conf` reduces each of
+        two years' ensembles to a confidence value, then `diff` -- chained rather
         than standalone -- subtracts one year from the other. All-land at 2040
         (confidence 1.0) and all-water at 2050 (confidence 0.0) makes the expected
         difference readable straight off the two confidences, with no extra arithmetic.
@@ -575,7 +575,7 @@ class TestChainedAnalysisExecution:
             assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
 
     def test_lnd_type_plus_cannot_chain_with_difference(self):
-        """`lnd-type-plus,difference` is the one combination the plan's own §5
+        """`lnd_type_plus,diff` is the one combination the plan's own §5
         anticipated might not survive contact with the chain mechanism -- and it doesn't,
         for a structural reason rather than an oversight: `filters` is shared
         UNPARTITIONED across every stage (only `params` is split per stage), but
@@ -586,14 +586,14 @@ class TestChainedAnalysisExecution:
         """
         with pytest.raises(InvalidAnalysisParametersError, match="calendar_year"):
             resolve_analysis_chain(
-                ["lnd-type-plus", "difference"],
+                ["lnd_type_plus", "diff"],
                 dataset=None,
                 filters={},
                 params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
             )
         with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
             resolve_analysis_chain(
-                ["lnd-type-plus", "difference"],
+                ["lnd_type_plus", "diff"],
                 dataset=None,
                 filters={"calendar_year": [2040, 2050]},
                 params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
@@ -601,7 +601,7 @@ class TestChainedAnalysisExecution:
 
 
 class TestSalinityVegInvestigationExecution:
-    """`salinity-veg-investigation` is the only registered analysis whose pipeline is
+    """`sal_veg_investigation` is the only registered analysis whose pipeline is
     band-wide end to end, and the only one that exercises the two pieces of machinery a
     paired raster shape needs: a vector-to-raster `project` feeding a band-wide `join`
     (both operands read off ONE `scan_raster`, so their `batch_layout`s agree), and a
@@ -617,7 +617,7 @@ class TestSalinityVegInvestigationExecution:
         deliberately leaves out.
         """
         resolved = resolve_analysis(
-            "salinity-veg-investigation",
+            "sal_veg_investigation",
             dataset=None,
             filters={},
             params={"model_group_id": 500, "scenario_id": 7},
@@ -679,7 +679,7 @@ class TestSalinityVegInvestigationExecution:
 
 
 class TestLndTypePlusExecution:
-    """`lnd-type-plus` collapses a band-wide join exactly once, with a paired `case` over
+    """`lnd_type_plus` collapses a band-wide join exactly once, with a paired `case` over
     all three inputs at once: the arms compute `stage - elevation/1000`, reclassify it, and
     claim it only where the land type beneath it is open water, while the `else` hands back
     that land type everywhere they do not. That one step IS the result, and it is what these
@@ -693,7 +693,7 @@ class TestLndTypePlusExecution:
 
     def _run_plus(self, base_path, tmp_path, params=None):
         resolved = resolve_analysis(
-            "lnd-type-plus", dataset=None, filters={}, params=params or LND_TYPE_PLUS_PARAMS
+            "lnd_type_plus", dataset=None, filters={}, params=params or LND_TYPE_PLUS_PARAMS
         )
         validate_shapes(resolved.pipeline)
         out = tmp_path / "lnd_type_plus.tif"
@@ -938,7 +938,7 @@ class TestLndTypePlusExecution:
 
 
 class TestLndTypePlusNarrowsItsReads:
-    """`lnd-type-plus` states the caller's selection ONCE, past the join, rather than as a
+    """`lnd_type_plus` states the caller's selection ONCE, past the join, rather than as a
     leading `filter` per input -- see "Why the selection is stated once, at the end" in
     `analyses/lnd_type_plus.py`. That is only affordable because `execution.plan`'s dimension
     passes push a post-join conjunct back to every origin's READ, so the cost of writing it
@@ -954,7 +954,7 @@ class TestLndTypePlusNarrowsItsReads:
 
     @staticmethod
     def _compile(base_path, crosswalk_path, params):
-        resolved = resolve_analysis("lnd-type-plus", dataset=None, filters={}, params=params)
+        resolved = resolve_analysis("lnd_type_plus", dataset=None, filters={}, params=params)
         validate_shapes(resolved.pipeline)
         return compile_plan(resolved.pipeline, base_path=base_path)
 

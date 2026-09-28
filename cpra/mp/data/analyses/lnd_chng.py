@@ -1,12 +1,12 @@
-"""`land-change` -- a dataset-scoped, `kind="variable"` analysis producing a categorical
+"""`lnd_chng` -- a dataset-scoped, `kind="variable"` analysis producing a categorical
 land-type-change code (`variables=["lnd_type"]`, `legend="lnd_chng"`) between an
 automatically-derived baseline year and a caller-selected comparison year. Renamed from
 `concatenate`, whose caller-facing shape it replaces: rather than the caller supplying any
-filterable `dimension` and exactly 2 values of it, `land-change` fixes the concatenation
+filterable `dimension` and exactly 2 values of it, `lnd_chng` fixes the concatenation
 axis to `calendar_year` and derives the earlier (baseline) year itself from the selected
 `model_group_id`, so the caller supplies only the later (comparison) year -- the same
 single-value shape selecting `calendar_year` already has for every other variable. This is
-the concrete sense in which `land-change` "behaves like a variable" rather than a special
+the concrete sense in which `lnd_chng` "behaves like a variable" rather than a special
 multi-select mode.
 
 The baseline-year rule is a business rule, not derived from anything else in this
@@ -58,7 +58,7 @@ LATE_BASELINE_YEAR = 2025
 
 class LandChange(Analysis):
     class Meta:
-        name = "land-change"
+        name = "lnd_chng"
         label = "Land Change"
         type = "dataset"
         kind = "variable"
@@ -82,19 +82,19 @@ class LandChange(Analysis):
         values = normalized_filter_values("calendar_year", raw) if raw is not None else []
         if len(values) != 1:
             raise InvalidAnalysisParametersError(
-                "land-change requires exactly 1 selected calendar_year (the comparison "
+                "lnd_chng requires exactly 1 selected calendar_year (the comparison "
                 f"year -- the baseline year is derived automatically), got {raw!r}"
             )
         mg_raw = filters.get("model_group_id")
         mg_values = normalized_filter_values("model_group_id", mg_raw) if mg_raw is not None else []
         if len(mg_values) not in (1, 2):
             raise InvalidAnalysisParametersError(
-                "land-change requires exactly 1 selected model_group_id (two-image mode) "
+                "lnd_chng requires exactly 1 selected model_group_id (two-image mode) "
                 f"or exactly 2 (three-image mode), got {len(mg_values)}: {mg_raw!r}"
             )
 
     def pipeline(self):
-        assert self.dataset is not None, "land-change is a type='dataset' analysis"
+        assert self.dataset is not None, "lnd_chng is a type='dataset' analysis"
         dim = "calendar_year"
         t1 = normalized_filter_values(dim, self.filters[dim])[0]
         mg_values = normalized_filter_values("model_group_id", self.filters["model_group_id"])
@@ -102,7 +102,7 @@ class LandChange(Analysis):
         t0 = EARLY_BASELINE_YEAR if min(mg_values) < BASELINE_ERA_BREAKPOINT else LATE_BASELINE_YEAR
 
         # t0 is never one of the caller's own filter values -- fold it in the same way
-        # `land-type-confidence` folds in its fixed `scenario_id` set, so BOTH years reach
+        # `lnd_conf` folds in its fixed `scenario_id` set, so BOTH years reach
         # the leading filter step rather than just the caller-selected one.
         filters = {**self.filters, dim: [t0, t1]}
 
@@ -114,7 +114,7 @@ class LandChange(Analysis):
 
         # Folding t0/t1 into `filters` above guarantees `selection_filter_where` always
         # returns a conjunct (at minimum the `calendar_year IN (...)` one), unlike
-        # `difference`/the old `concatenate`, which may see an empty `filters` on a direct
+        # `diff`/the old `concatenate`, which may see an empty `filters` on a direct
         # constructor call -- so the leading `filter` step here is unconditional.
         conjuncts = [selection_filter_where(filters, grid_cell_where=self.grid_cell_where)]
         if three_image:

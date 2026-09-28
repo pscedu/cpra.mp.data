@@ -319,7 +319,7 @@ class TestCaseLongDimensionArms:
         assert df["value"].to_list() == [0.0, 0.0, 0.0, 1.0]
 
     def test_arms_partition_the_frame_by_dimension(self):
-        """The ensemble-weighting shape (`analyses/land_type_confidence.py`): one arm per
+        """The ensemble-weighting shape (`analyses/lnd_conf.py`): one arm per
         member, each naming only its own dimension value, no `else` because the arms cover
         everything the upstream filter left.
         """

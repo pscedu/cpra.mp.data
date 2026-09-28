@@ -298,7 +298,7 @@ class CaseStep(BaseModel):
     """Rewrite the running value by the FIRST matching arm of `cases`, falling through to
     `else` (default null) where none match -- one op for what a reclassification would
     otherwise need a chain of steps and a disjointness trick to say (see
-    `analyses/lnd_type_plus.py`'s depth classes, and `analyses/land_type_confidence.py`'s
+    `analyses/lnd_type_plus.py`'s depth classes, and `analyses/lnd_conf.py`'s
     per-scenario weights).
 
     **Why this is not a chain of conditional rewrites.** A step that rewrites the RUNNING

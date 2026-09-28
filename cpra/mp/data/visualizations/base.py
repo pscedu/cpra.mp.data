@@ -183,17 +183,17 @@ class BaseVisualization:
         if caller_select is not None:
             select = caller_select.split(",") if isinstance(caller_select, str) else list(caller_select)
 
-        # A dimension the analysis COLLAPSES is gone from its output frame -- `difference`
+        # A dimension the analysis COLLAPSES is gone from its output frame -- `diff`
         # over `model_group_id` returns one value per grid cell per day, not one per model
         # group -- so naming it in `select` asks for a column that no longer exists, and the
         # analysis routes fail the whole read ("unable to find column"). The two values are
-        # exactly what a `difference` needs as FILTERS and still have to be SENT, so this
+        # exactly what a `diff` needs as FILTERS and still have to be SENT, so this
         # drops only the `select` entry, never the parameter itself.
         #
         # Filtering one finished list rather than guarding each place a column is added is
         # deliberate: a collapsed dimension reaches `select` three ways, and the multi-value
         # branch above is only one of them. The time column goes in unconditionally at the
-        # top (so a `difference` over `calendar_day` hit the identical failure), and
+        # top (so a `diff` over `calendar_day` hit the identical failure), and
         # `caller_select` bypasses both (so `SpeciesStackedBar` did too, over `calendar_year`).
         # `TimeSeriesLine`/`StackedBar` already exclude collapsed dimensions from their own
         # compare-channel choices, for the same underlying reason -- a collapsed dimension

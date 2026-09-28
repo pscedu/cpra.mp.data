@@ -1,8 +1,8 @@
 # Named Analyses (Registry API)
 
 A named analysis is a pre-built [pipeline](analysis-api.md) with its own request-shaped
-parameters -- a `difference` between two scenarios, a `land-change` land-type-change
-code, a `salinity-veg-investigation` earliest-crossing-year surface -- registered under a
+parameters -- a `diff` between two scenarios, a `lnd_chng` land-type-change
+code, a `sal_veg_investigation` earliest-crossing-year surface -- registered under a
 short name so a caller never has to hand-author the equivalent pipeline JSON. Every named
 analysis is **sugar over the same pipeline grammar** documented in the
 [Analysis API](analysis-api.md): resolving one always produces a real `Pipeline`, run
@@ -20,20 +20,20 @@ Returns the full list of registered analyses, each with:
 
 | Field | Description |
 |---|---|
-| `name` | The analysis's route name (e.g. `difference`, `land-change`, `salinity-veg-investigation`) |
+| `name` | The analysis's route name (e.g. `diff`, `lnd_chng`, `sal_veg_investigation`) |
 | `label` | A human-readable display label |
 | `type` | `"dataset"` (operates on one caller-chosen dataset) or `"custom"` (its inputs are fixed by the analysis itself) |
 | `variables` | The variable(s) it's meaningful for, or `null` for any |
 | `legend` | A named legend/color-map hint for rendered output, or `null` |
 | `result_kind` | `"value"`, `"difference"`, or `"category"` -- a presentation hint for how to label the result |
 
-As of this writing, five analyses are registered: `difference`, `land-change` and
-`land-type-confidence` (`type="dataset"`), and `salinity-veg-investigation` and
-`lnd-type-plus` (`type="custom"`).
+As of this writing, five analyses are registered: `diff`, `lnd_chng` and
+`lnd_conf` (`type="dataset"`), and `sal_veg_investigation` and
+`lnd_type_plus` (`type="custom"`).
 
 ## Dataset-Scoped vs. Custom Routes
 
-A `type="dataset"` analysis (`difference`, `land-change`) runs against a caller-chosen
+A `type="dataset"` analysis (`diff`, `lnd_chng`) runs against a caller-chosen
 dataset, so its routes are nested under that dataset the same way the flat Data API's
 routes are:
 
@@ -44,7 +44,7 @@ GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/tiles/{z
 GET /v1/datasets/{variable}/{time_unit}/{grid}/analyses/{analysis_name}/pipeline.json
 ```
 
-A `type="custom"` analysis (`salinity-veg-investigation`, `lnd-type-plus`) fixes its own inputs inside
+A `type="custom"` analysis (`sal_veg_investigation`, `lnd_type_plus`) fixes its own inputs inside
 its `pipeline()` method -- it isn't scoped to any one caller-chosen dataset, so its
 routes have no `/v1/datasets/...` prefix at all:
 
@@ -56,17 +56,17 @@ GET /v1/analyses/{analysis_name}/pipeline.json
 ```
 
 Requesting a `type="dataset"` analysis through the custom route (or vice versa) is
-rejected with a 400 naming the mismatch -- e.g. `GET /v1/analyses/difference/data.csv`
-fails, since `difference` requires a dataset and this route supplies none.
+rejected with a 400 naming the mismatch -- e.g. `GET /v1/analyses/diff/data.csv`
+fails, since `diff` requires a dataset and this route supplies none.
 
 Every route above accepts:
 
 - The dataset's own dimension filters (for the dataset-scoped routes) plus the reserved
   `grid_cell` and `where` keys, exactly as the flat Data API accepts them -- forwarded to
   the analysis as its pipeline input's own filters.
-- The analysis's own declared parameters (e.g. `dimension`/`order` for `difference`,
+- The analysis's own declared parameters (e.g. `dimension`/`order` for `diff`,
   `model_group_id`/`scenario_id`/`marsh_threshold`/`salinity_threshold` for
-  `salinity-veg-investigation`) as additional query parameters -- there is no fixed
+  `sal_veg_investigation`) as additional query parameters -- there is no fixed
   parameter set at the route level, since it differs per analysis; whatever isn't one
   of the route's own known fields is handed to the analysis's `Parameters` model for
   validation.
@@ -79,7 +79,7 @@ Every route above accepts:
 
 ## Registered Analyses
 
-### `difference`
+### `diff`
 
 `type="dataset"`. Computes the difference between two selected values of one dimension:
 negates whichever of the two is later (`order=asc`) or earlier (`order=desc`), then sums
@@ -94,10 +94,10 @@ across it, collapsing that dimension out of the result.
 distinct values -- fewer or more is rejected with a 400 before a pipeline is even built.
 
 ```
-GET /v1/datasets/sal/annual/hydro_compartment_v001/analyses/difference/data.csv?model_group_id=520&scenario_id=7,8&aggregate_type=2_wk_max&calendar_year=2030&dimension=scenario_id&order=asc
+GET /v1/datasets/sal/annual/hydro_compartment_v001/analyses/diff/data.csv?model_group_id=520&scenario_id=7,8&aggregate_type=2_wk_max&calendar_year=2030&dimension=scenario_id&order=asc
 ```
 
-### `land-change`
+### `lnd_chng`
 
 `type="dataset"`. Produces a categorical land-type-change code (`variables=["lnd_type"]`,
 `legend="lnd_chng"`) between an automatically-derived baseline year and a caller-selected
@@ -128,10 +128,10 @@ and a tabular `data.{format}` is rejected -- ask for `tif` (or `png`/`jpg` on th
 routes).
 
 ```
-GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/land-change/data.tif?model_group_id=500&scenario_id=7&calendar_year=2050
+GET /v1/datasets/lnd_type/annual/morph_pixel_v001/analyses/lnd_chng/data.tif?model_group_id=500&scenario_id=7&calendar_year=2050
 ```
 
-### `land-type-confidence`
+### `lnd_conf`
 
 `type="dataset"`. A confidence-weighted land/water surface over the five-member land-type
 ensemble (`variables=["lnd_type"]`). Each member (`scenario_id` 34-38) is reduced to a land
@@ -170,18 +170,18 @@ weights no longer total `1.0` and its confidence reads low rather than being res
 the members that actually reported.
 
 ```
-GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/land-type-confidence/data.tif?model_group_id=705&calendar_year=2050
-GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/land-type-confidence/data/{z}/{x}/{y}.png?model_group_id=705&calendar_year=2050
+GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/lnd_conf/data.tif?model_group_id=705&calendar_year=2050
+GET /v1/datasets/lnd_type/annual/morph_pixel_v002/analyses/lnd_conf/data/{z}/{x}/{y}.png?model_group_id=705&calendar_year=2050
 ```
 
-### `salinity-veg-investigation`
+### `sal_veg_investigation`
 
 `type="custom"`. The earliest calendar year at which marsh coverage
 (`ffibs_coverage_ratio`/annual/`veg_grid_cell_v001`, fixed `ffibs_type=pl_fm`) and paired
 salinity (`sal`/annual/`hydro_compartment_v001`, fixed `aggregate_type=2_wk_max`) both
 cross their thresholds, at every vegetation-grid pixel -- the paired (`project` + spatial
 `join`) pipeline shape shown in full in the
-[Analysis API's salinity-veg-investigation example](analysis-api.md#the-salinity-veg-investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).
+[Analysis API's sal_veg_investigation example](analysis-api.md#the-sal_veg_investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).
 Because it's `type="custom"`, its two inputs are fixed by its own `pipeline()` method --
 there is no `/v1/datasets/.../` dataset to scope it to.
 
@@ -197,11 +197,11 @@ rejected the same way any paired-shape pipeline's tabular output would be, since
 result is inherently one raster surface.
 
 ```
-GET /v1/analyses/salinity-veg-investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
-GET /v1/analyses/salinity-veg-investigation/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7
+GET /v1/analyses/sal_veg_investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
+GET /v1/analyses/sal_veg_investigation/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7
 ```
 
-### `lnd-type-plus`
+### `lnd_type_plus`
 
 `type="custom"`. The `lnd_type` categorical surface extended with two shallow-inundation
 classes the land types don't themselves distinguish.
@@ -292,8 +292,8 @@ Output is always a raster (`tif`, or `png`/`jpg` on the tile routes) -- the one 
 lands **on** the pixel grid and nothing projects off it, so a tabular output is rejected.
 
 ```
-GET /v1/analyses/lnd-type-plus/data.tif?model_group_id=705&scenario_id=7&calendar_year=2050
-GET /v1/analyses/lnd-type-plus/data/{z}/{x}/{y}.png?model_group_id=705&scenario_id=7&calendar_year=2050
+GET /v1/analyses/lnd_type_plus/data.tif?model_group_id=705&scenario_id=7&calendar_year=2050
+GET /v1/analyses/lnd_type_plus/data/{z}/{x}/{y}.png?model_group_id=705&scenario_id=7&calendar_year=2050
 ```
 
 ## Seeing the Expanded Pipeline: `pipeline.json`
@@ -304,7 +304,7 @@ parameters and filters resolve to -- the same shape a hand-authored `POST
 request itself supplied. For example:
 
 ```
-GET /v1/datasets/sal/annual/hydro_compartment_v001/analyses/difference/pipeline.json?model_group_id=520&scenario_id=7,8&aggregate_type=2_wk_max&calendar_year=2030&dimension=scenario_id&order=asc
+GET /v1/datasets/sal/annual/hydro_compartment_v001/analyses/diff/pipeline.json?model_group_id=520&scenario_id=7,8&aggregate_type=2_wk_max&calendar_year=2030&dimension=scenario_id&order=asc
 ```
 
 returns:
@@ -342,6 +342,6 @@ rather than in the order the query string listed them.
 which is exactly the hand-authored "Map Query Comparing Two Scenarios" pipeline shown in
 the [Analysis API](analysis-api.md#map-query-comparing-two-scenarios) -- proving the named
 analysis is sugar over the same pipeline grammar, never a second engine. This holds for
-every registered analysis: `.../analyses/salinity-veg-investigation/pipeline.json?...` likewise
+every registered analysis: `.../analyses/sal_veg_investigation/pipeline.json?...` likewise
 returns exactly the explicit paired-shape `Pipeline` shown in the
-[salinity-veg-investigation example](analysis-api.md#the-salinity-veg-investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).
+[sal_veg_investigation example](analysis-api.md#the-sal_veg_investigation-earliest-year-marsh-and-salinity-both-cross-a-threshold).

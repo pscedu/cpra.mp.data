@@ -1080,7 +1080,7 @@ class Map(DatasetVisualization):
         """Is this a difference result?
 
         Reads the resolved analysis's own `result_kind` when `analysis=` is selected
-        (`difference`'s `Meta.result_kind = "difference"`); a map with no analysis
+        (`diff`'s `Meta.result_kind = "difference"`); a map with no analysis
         selected is never a difference.
 
         Returns:
@@ -1095,7 +1095,7 @@ class Map(DatasetVisualization):
         default legend" (see `_get_legend`, which does exactly that).
 
         Reads the resolved analysis's own declared `legend` when `analysis=` is selected
-        (`land-change`'s `Meta.legend = "lnd_chng"`; `difference` declares none); a map
+        (`lnd_chng`'s `Meta.legend = "lnd_chng"`; `diff` declares none); a map
         with no analysis selected has no override.
         """
         resolved = self.resolved_analysis
