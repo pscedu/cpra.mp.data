@@ -149,7 +149,7 @@ def main(model_group_id, base_path):
     # The baseline is the base year's confidence as-is. A pixel with no valid baseline is
     # NaN here and stays NaN through the subtraction, so it propagates as nodata into the
     # change raster for every year.
-    base_year = years[0]
+    base_year = 2029
     click.echo(f"Computing baseline from {base_year} ({len(by_year[base_year])} scenarios)...")
     baseline = confidence_array(by_year[base_year], grid)
 
