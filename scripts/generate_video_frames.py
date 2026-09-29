@@ -197,7 +197,10 @@ def hex_to_rgba(color: str):
 # running pale where the pixel has barely moved to dark where it has flipped outright.
 # Each band runs from its own break up to the next, so the breaks are closed lower bounds
 # and the last band has no upper bound.
-CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
+# Opt3
+# CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
+# Opt4
+CONFIDENCE_BREAKS = [-1, -0.75, -0.42, -0.09, 0, 0.17, 0.50, 0.83]
 
 # The 3-stop ramps from the earlier symbology (data-input/confidence_groups.png), pale to
 # dark, used as given rather than resampled to a longer ramp.
@@ -212,13 +215,10 @@ TRANSPARENT_BAND = None
 # One color per band, in break order. The loss ramp is reversed because the bands run from
 # the most negative value up: the first band is the far "now water" end and so takes the
 # darkest blue, and the third is the edge of the transparent middle and takes the palest.
-CONFIDENCE_BAND_COLORS = (
-    CONFIDENCE_LOSS_RAMP[::-1] + [TRANSPARENT_BAND, TRANSPARENT_BAND] + CONFIDENCE_GAIN_RAMP
-)
+CONFIDENCE_BAND_COLORS = CONFIDENCE_LOSS_RAMP[::-1] + [TRANSPARENT_BAND, TRANSPARENT_BAND] + CONFIDENCE_GAIN_RAMP
 
 assert len(CONFIDENCE_BAND_COLORS) == len(CONFIDENCE_BREAKS), (
-    f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors "
-    f"for {len(CONFIDENCE_BREAKS)} breaks"
+    f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors " f"for {len(CONFIDENCE_BREAKS)} breaks"
 )
 
 # Confidence outputs are labeled by the year their filename ends in, so a directory of
@@ -810,9 +810,7 @@ def main(
             classes, src_crs, src_transform, output_dir, save_full, skip_last_group=land_water_data is not None
         )
         if land_water_data is not None:
-            write_land_water_group_png(
-                historic_data, baseline_land_water_data, land_water_data, output_dir, save_full
-            )
+            write_land_water_group_png(historic_data, baseline_land_water_data, land_water_data, output_dir, save_full)
 
     if confidence_data is not None:
         write_confidence_pngs(confidence_data, output_dir, save_full)
