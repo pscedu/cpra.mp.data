@@ -198,14 +198,14 @@ def hex_to_rgba(color: str):
 # Each band runs from its own break up to the next, so the breaks are closed lower bounds
 # and the last band has no upper bound.
 # Opt3
-# CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
+CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
 # Opt4
-CONFIDENCE_BREAKS = [-1, -0.75, -0.42, -0.09, 0, 0.17, 0.50, 0.83]
+# CONFIDENCE_BREAKS = [-1, -0.75, -0.42, -0.09, 0, 0.17, 0.50, 0.83]
 
 # The 3-stop ramps from the earlier symbology (data-input/confidence_groups.png), pale to
 # dark, used as given rather than resampled to a longer ramp.
-CONFIDENCE_LOSS_RAMP = ["#A0C7D4", "#4999B6", "#256B84"]
-CONFIDENCE_GAIN_RAMP = ["#ABCB9F", "#658859", "#1F4314"]
+CONFIDENCE_LOSS_RAMP = ["#AFB9BD", "#66A9C2", "#226178"]
+CONFIDENCE_GAIN_RAMP = ["#E0EDD8", "#658859", "#1F4314"]
 
 # The two bands either side of zero, [-0.09, 0) and [0, 0.17). A pixel this close to its
 # base-year confidence has not meaningfully moved, so it is left out of the layer rather
