@@ -2,9 +2,9 @@
 
 The catalog API provides routes for querying what datasets and combinations of dimensions are available in the data and analysis API. It uses a hierarchy of dimensions to allow cascading selection of datasets, as in the MP-DAP. This hierarchy follows the order of dataset, partition, and non-partition dimensions outlined above.
 
-For dataset and partition dimensions, the catalog uses the data directory tree to determine the available choices for each dimension. For non-partition dimensions, it use the Parquet data and COG file names to determine the available choices.
+Available choices come from a materialized catalog side-table (`cpra.mp.data.catalog`) rather than a walk of the data tree, so they cover tabular and raster datasets alike and cost one partition read per dataset. The side-table holds one row per distinct dimension combination × contiguous calendar run, and `write_parquet`/`write_cog` keep it in sync on every write.
 
-🚧 **TODO:** We still need to finalize how to represent `calendar_date` ranges in the response without specifying each individual date. The syntax in the example below is one possibility.
+Calendar dimensions are reported as `[start, end]` pairs per contiguous run rather than as every individual date; a run of one is reported as a bare value.
 
 ## Examples
 
@@ -90,30 +90,61 @@ src_id,src_lng,src_lat,dst_id,dst_lng,dst_lat,scale_factor,dst_grid
 ,-91.90275,29.7798,844,,,1.0,hydro_compartment_v001
 ```
 
-### Query a Dataset Catalog
+### Query a Request's Catalog
+
+`GET /v1/catalog.json` takes the same parameter set as the data routes — `analysis=`, dotted pipeline parameters, dimension selections, `grid_cell`/`where` — and resolves the same pipeline they would. It answers two questions about that one request: what the caller can still steer (`choices`/`results`/`exact`), and what the request would produce (`output`).
 
 ```
-GET /v1/datasets/2029.1.0/sal/hydro_compartment/daily/catalog.json?model_group_id=500&scenario_id=7&calendar_date=2030-01-01
+GET /v1/catalog.json?variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=500&scenario_id=7&calendar_day=2030-01-01
 ```
 
 ```json
 {
   "choices": {
-	"plan_version": ["2023.0.2", "2029.1.0"],
-	"variable": ["aedd", "eadd", ...],
-	"geographic_unit": ["hydro_compartment"],
-	"time_unit": ["annual", "daily"],
-	"model_group": [500, 521],
-	"scenario": [7, 8],
-	"calendar_date": [["2025-01-01", "2044-12-31"], ["2050-01-01", "2070-12-31"]]
+	"model_group_id": [500, 521],
+	"scenario_id": [7, 8],
+	"aggregate_type": ["mean"],
+	"model": ["icm_v2023.0.0"],
+	"calendar_day": [["2025-01-01", "2044-12-31"], ["2050-01-01", "2070-12-31"]]
   },
-  "dataset": {
-	"metric": "sal",
-	"geographic_unit": "hydro_compartment",
+  "results": {
+	"model_group_id": [500],
+	"scenario_id": [7],
+	"aggregate_type": ["mean"],
+	"model": ["icm_v2023.0.0"],
+	"calendar_day": ["2030-01-01"]
+  },
+  "exact": true,
+  "output": {
+	"grid": "hydro_compartment_v001",
+	"grid_type": "vector",
+	"shape": "long",
 	"time_unit": "daily",
-	"model_group": 500,
-	"scenario": 7,
-	"calendar_date": "2030-01-01"
+	"time_column": "calendar_day",
+	"value_columns": ["value"],
+	"variables": ["sal"],
+	"label": "Salinity",
+	"legend": "sal",
+	"result_kind": "value",
+	"collapsed_dimensions": []
   }
 }
 ```
+
+`choices` lists every value available for each dimension, `results` what the request selected (defaulting to the first choice where it selected nothing, or selected something unavailable), and `exact` is false when the two differ for any selectable dimension. Consecutive calendar values are compressed into `[start, end]` pairs.
+
+The dataset triple is not reported in `choices`/`results`. It names *which* data to read rather than which slice of it, and a request that reads several datasets has no single triple to report. What a client needs from it — which grid to draw on, which time unit to step by, which legend and units to label with — is a fact about the result, and lives in `output`.
+
+#### With an Analysis
+
+```
+GET /v1/catalog.json?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_chng&calendar_year=2050&model_group_id=500
+```
+
+`output` describes what the analysis produces rather than what it reads: `lnd_chng` outputs land-change categories, so `legend`, `label`, and `result_kind` are the analysis's, not the input variable's.
+
+`collapsed_dimensions` names what the pipeline consumed — here `calendar_year`, which `lnd_chng` uses to pick its comparison and baseline years. A collapsed dimension is **absent** from `choices` and `results` rather than reported with a value the caller cannot change, and defaulting it does not make `exact` false.
+
+`output.value_columns` and `output.variables` are parallel: zip them, and each pair is a column of the result and the variable whose units, legend and number format label it (null where none could be resolved). `output.folded_into` says how to read that first list. It is null for every pipeline without an [`unpivot`](analysis-api.md) step, and the names really are columns. When it is set — to the name of the label column that step folded into — the names are the **values** that column takes instead: the result carries one `value` column with the measurements stacked, one row per name. A client keying display metadata per measurement does the same thing either way, looking the measurement up by column when `folded_into` is null and by that column's value when it is not.
+
+When a request reads several datasets, each dimension's choices are the values **common to all of them**: an analysis joins its inputs, so a `model_group_id` only one of them has would yield an empty result. A dimension with no value common to every input is a 404, as is a request naming a dataset nothing has been written for.

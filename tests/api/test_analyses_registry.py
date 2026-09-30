@@ -8,7 +8,7 @@ path any hand-authored pipeline goes through. Everything here drives
 `validate_shapes`/`compile_plan`/`execute`/`run_to_path` directly, exactly as
 `tests/api/test_execute.py` does for hand-authored pipelines.
 
-**Representative datasets.** `diff`/`lnd_chng` are `type="dataset"` and take
+**Representative datasets.** `diff`/`lnd_chng` read the caller's dataset and take
 whatever `DatasetRef` a route resolves for them; `tests/factories.py`'s `ssf`/
 `ecoregion_v001` (`ANNUAL_KWARGS`) is used here as that representative dataset, per that
 module's own documented convention ("the compiler cares about grid TYPES and SHAPES, not
@@ -17,19 +17,20 @@ lives on `morph_pixel_v001` (8265x20674 pixels), far too large to write as a tes
 the `Meta.variables` declaration itself is unaffected by this substitution, only which
 dataset proves the pipeline-construction MACHINERY works.
 
-`sal_veg_investigation` is `type="custom"` with hardcoded inputs
+`sal_veg_investigation` fixes its own inputs (`require_dataset` is never called; it
+`reject_dataset`s instead), with hardcoded inputs
 (`ffibs_coverage_ratio`/`veg_grid_cell_v001`, `sal`/`hydro_compartment_v001`), written by
 `tests/factories.py`'s `write_ffibs_coverage_dataset`/`write_sal_annual_dataset` and
 assembled by the `salinity_veg_data` fixture in `tests/api/conftest.py` -- shared with
 `tests/api/test_analyses_endpoints.py`, which needs the same data to drive the same
 analysis through its HTTP routes.
 
-`lnd_conf` is also `type="dataset"`, but its own `Meta.variables = ["lnd_type"]`
+`lnd_conf` also reads the caller's dataset, but its own `Meta.variables = ["lnd_type"]`
 lives only on a raster grid and its `pipeline()` sinks to `tif`, so a vector stand-in would
 not survive `validate_shapes`; it runs on `tests/factories.py`'s `vct`/`veg_grid_cell_v001`
 raster stand-in (`RASTER_KWARGS`) instead, through `run_to_path` rather than `_run`.
 
-`lnd_type_plus` is `type="custom"` too, with THREE hardcoded inputs across two grids
+`lnd_type_plus` fixes its own inputs too, THREE of them across two grids
 (`elev` and `lnd_type` on `morph_pixel_v002`, `stg` on `hydro_compartment_v002`) -- and
 those are the one real, un-substituted grid pair in this module, because the analysis names
 them itself. At its real size `morph_pixel_v002` is ~97 million pixels per band, so the
@@ -39,6 +40,13 @@ instead of substituting a stand-in dataset; `tests/factories.py`'s
 two grids. It does not store depths: the analysis COMPUTES depth as
 `stage - elevation/1000`, so the factory solves for the elevation that yields each depth a
 test asks for.
+
+`sediment_dynamics` reads the caller's dataset for its `grid`/`time_unit` and then reads
+FIVE datasets on it (`elev`, `inun`, `lnd_type`, `test_mnrl_accr`, `test_org_accr`), all on
+`morph_pixel` -- so it shares `lnd_type_plus`'s shrunk `morph_pixel_v002` rather than taking
+a stand-in, and `tests/factories.py`'s `write_sediment_dynamics_datasets` writes all five at
+that grid's shrunk size. It is the only entry whose final frame is LONG on a raster grid:
+the `grid_cell` filter lowers the joined frame and the `unpivot` keeps it there.
 
 **The band-wide entries get their own execution classes.** The long-shaped registered
 analyses run through `_run` below; `sal_veg_investigation` is band-wide end to end and
@@ -67,15 +75,19 @@ from cpra.mp.data.analyses.lnd_chng import EARLY_BASELINE_YEAR
 from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import compile_plan
+from cpra.mp.data.analysis.request.descriptor import output_descriptor
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from tests.factories import (
     ANNUAL_KWARGS,
     LND_TYPE_PLUS_SELECTION,
     RASTER_KWARGS,
+    SEDIMENT_DYNAMICS_DTYPES,
+    sediment_dynamics_value,
     write_annual_dataset,
     write_ffibs_coverage_dataset,
     write_lnd_type_plus_datasets,
     write_raster_dataset,
+    write_sediment_dynamics_datasets,
 )
 
 SSF_DATASET = DatasetRef(
@@ -115,10 +127,27 @@ def _write_ensemble(base_path, code_by_scenario, years=(2050,), **overrides):
         )
 
 
-# `lnd_type_plus`'s parameters are its inputs' shared selection plus the one year the
-# fixtures write. All three inputs are named by the analysis itself, so none of this is a
-# filter -- and `aggregate_type`, which only `stg` carries, is pinned by the analysis too.
-LND_TYPE_PLUS_PARAMS = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
+# `lnd_type_plus`'s selection: its inputs' shared model group and scenario, plus the one
+# year the fixtures write. These are FILTERS, not parameters -- `LndTypePlus.Parameters` is
+# empty, and a dimension name is never an analysis parameter. The analysis names all three
+# of its inputs itself, so the filter lands on its OUTPUT frame as a trailing `filter` step
+# and is pushed back down into the reads from there. (`aggregate_type`, which only `stg`
+# carries, is pinned by the analysis itself and never appears here.)
+LND_TYPE_PLUS_FILTERS = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
+
+# `sediment_dynamics` is the one entry that takes a dataset and then reads five OTHER ones:
+# the triple's `grid`/`time_unit` say which morphology grid and step to read all five on,
+# and its `variable` only says which of the five the caller was looking at. `elev` here is
+# therefore arbitrary among the five -- `test_the_callers_variable_does_not_choose_the_inputs`
+# below is what pins that it makes no difference.
+SEDIMENT_DYNAMICS_DATASET = DatasetRef(
+    variable="elev", time_unit="annual", grid="morph_pixel_v002"
+)
+# The shrunk `morph_pixel_v002` is 2x4, so a pixel's row-major cell id IS its index into
+# the flat value sequences `tests.factories.sediment_dynamics_value` is written against.
+SEDIMENT_DYNAMICS_PIXEL = 5
+SEDIMENT_DYNAMICS_YEARS = (2040, 2050)
+SEDIMENT_DYNAMICS_FILTERS = {**LND_TYPE_PLUS_SELECTION, "grid_cell": str(SEDIMENT_DYNAMICS_PIXEL)}
 
 
 def _run(resolved, base_path):
@@ -155,6 +184,7 @@ class TestRegistryDrift:
             "lnd_chng",
             "lnd_conf",
             "lnd_type_plus",
+            "sediment_dynamics",
         }
 
     def test_difference_compiles(self, base_path):
@@ -237,7 +267,7 @@ class TestRegistryDrift:
             base_path, crosswalk_path, depths=[0.2] * 8, land_types=[1] * 8
         )
         resolved = resolve_analysis(
-            "lnd_type_plus", dataset=None, filters={}, params=LND_TYPE_PLUS_PARAMS
+            "lnd_type_plus", dataset=None, filters=LND_TYPE_PLUS_FILTERS, params={}
         )
         # Band-wide end to end (the one `project` lands ON the raster grid), so `tif` is
         # the only sink `validate_shapes` accepts -- and it is what `pipeline.json`
@@ -246,12 +276,28 @@ class TestRegistryDrift:
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
+    def test_sediment_dynamics_compiles(self, morph_pixel_v002_shrunk, base_path):
+        write_sediment_dynamics_datasets(base_path)
+        resolved = resolve_analysis(
+            "sediment_dynamics",
+            dataset=SEDIMENT_DYNAMICS_DATASET,
+            filters=SEDIMENT_DYNAMICS_FILTERS,
+            params={},
+        )
+        # The one entry whose final frame is long on a RASTER grid: the `grid_cell` filter
+        # lowers it and the `unpivot` keeps it there, so `csv` is what `validate_shapes`
+        # accepts and what `pipeline.json` publishes -- the mirror image of
+        # `lnd_type_plus`'s `tif` two tests up.
+        assert resolved.pipeline.output.format == "csv"
+        validate_shapes(resolved.pipeline)
+        assert compile_plan(resolved.pipeline, base_path=base_path) is not None
+
     def test_salinity_veg_investigation_compiles(self, salinity_veg_data, base_path):
         resolved = resolve_analysis(
             "sal_veg_investigation",
             dataset=None,
-            filters={},
-            params={"model_group_id": 500, "scenario_id": 7},
+            filters={"model_group_id": 500, "scenario_id": 7},
+            params={},
         )
         validate_shapes(resolved.pipeline)
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
@@ -574,29 +620,50 @@ class TestChainedAnalysisExecution:
             # 1.0 - 0.0 == 1.0.
             assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
 
-    def test_lnd_type_plus_cannot_chain_with_difference(self):
-        """`lnd_type_plus,diff` is the one combination the plan's own §5
-        anticipated might not survive contact with the chain mechanism -- and it doesn't,
-        for a structural reason rather than an oversight: `filters` is shared
-        UNPARTITIONED across every stage (only `params` is split per stage), but
-        `LndTypePlus.validate_selection` requires `filters == {}` while `Difference`'s
-        (run against that SAME dict) requires the differencing dimension's 2 values to be
-        IN `filters`. No `filters` value satisfies both, so the chain always fails --
-        just on whichever stage's requirement it hits first.
+    def test_lnd_type_plus_chains_with_difference(self):
+        """`lnd_type_plus,diff` is the one combination the plan's own §5 anticipated might
+        not survive contact with the chain mechanism. It didn't, once -- and the reason it
+        now does is the whole point of dropping `LndTypePlus.validate_selection`.
+
+        The old failure was structural, not an oversight: `filters` is shared UNPARTITIONED
+        across every stage (only `params` is split per stage), and the two stages made
+        contradictory demands of that one dict. `LndTypePlus.validate_selection` required
+        `filters == {}`; `Difference`'s, run against the same dict, required the
+        differencing dimension's two values to be IN it. No value satisfied both, so the
+        chain failed on whichever requirement it hit first. With the blanket rejection gone
+        there is only one demand left, `Difference`'s, and the selection it asks for is an
+        ordinary trailing filter on `lnd_type_plus`'s output frame -- exactly what it is on
+        any other analysis's.
+        """
+        resolved = resolve_analysis_chain(
+            ["lnd_type_plus", "diff"],
+            dataset=None,
+            filters={**LND_TYPE_PLUS_SELECTION, "calendar_year": [2040, 2050]},
+            params={"dimension": "calendar_year", "order": "asc"},
+        )
+        # `lnd_type_plus`'s own five steps, then the selection filter both stages share,
+        # then `diff`'s negate-and-sum pair. The differencing dimension survives into the
+        # filter as an `IN`, which is what `Difference` needs two of.
+        assert [step.op for step in resolved.pipeline.steps] == [
+            "filter", "project", "join", "filter", "case", "case", "group"
+        ]
+        assert resolved.pipeline.steps[3].where == (
+            "calendar_year IN (2040, 2050) AND model_group_id = 705 AND scenario_id = 7"
+        )
+        # `calendar_year` is collapsed by `diff`; `aggregate_type` was already collapsed by
+        # `lnd_type_plus`'s own leading filter, and the chain unions the two stages'.
+        assert resolved.collapsed_dimensions == frozenset({"calendar_year", "aggregate_type"})
+
+    def test_the_chained_difference_still_rejects_a_one_value_selection(self):
+        """The cardinality rule `Difference` enforces is untouched by any of the above:
+        one value is not a difference, whatever the stage in front of it was.
         """
         with pytest.raises(InvalidAnalysisParametersError, match="calendar_year"):
             resolve_analysis_chain(
                 ["lnd_type_plus", "diff"],
                 dataset=None,
-                filters={},
-                params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
-            )
-        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
-            resolve_analysis_chain(
-                ["lnd_type_plus", "diff"],
-                dataset=None,
-                filters={"calendar_year": [2040, 2050]},
-                params={**LND_TYPE_PLUS_PARAMS, "dimension": "calendar_year", "order": "asc"},
+                filters=LND_TYPE_PLUS_FILTERS,
+                params={"dimension": "calendar_year", "order": "asc"},
             )
 
 
@@ -619,8 +686,8 @@ class TestSalinityVegInvestigationExecution:
         resolved = resolve_analysis(
             "sal_veg_investigation",
             dataset=None,
-            filters={},
-            params={"model_group_id": 500, "scenario_id": 7},
+            filters={"model_group_id": 500, "scenario_id": 7},
+            params={},
         )
         out = tmp_path / "out.tif"
         run_to_path(resolved.pipeline, out, base_path=salinity_veg_data)
@@ -691,9 +758,12 @@ class TestLndTypePlusExecution:
     asserting on a computed value, not a read one.
     """
 
-    def _run_plus(self, base_path, tmp_path, params=None):
+    def _run_plus(self, base_path, tmp_path, filters=None):
         resolved = resolve_analysis(
-            "lnd_type_plus", dataset=None, filters={}, params=params or LND_TYPE_PLUS_PARAMS
+            "lnd_type_plus",
+            dataset=None,
+            filters=LND_TYPE_PLUS_FILTERS if filters is None else filters,
+            params={},
         )
         validate_shapes(resolved.pipeline)
         out = tmp_path / "lnd_type_plus.tif"
@@ -905,8 +975,8 @@ class TestLndTypePlusExecution:
         write_lnd_type_plus_datasets(
             base_path, crosswalk_path, depths=[1.50] * 8, land_types=[4] * 8, year=2050
         )
-        params = {k: v for k, v in LND_TYPE_PLUS_PARAMS.items() if k != "calendar_year"}
-        with rio.open(self._run_plus(base_path, tmp_path, params=params)) as src:
+        filters = {k: v for k, v in LND_TYPE_PLUS_FILTERS.items() if k != "calendar_year"}
+        with rio.open(self._run_plus(base_path, tmp_path, filters=filters)) as src:
             assert src.count == 2
             by_year = {
                 description: src.read(index).ravel().tolist()
@@ -953,8 +1023,8 @@ class TestLndTypePlusNarrowsItsReads:
     """
 
     @staticmethod
-    def _compile(base_path, crosswalk_path, params):
-        resolved = resolve_analysis("lnd_type_plus", dataset=None, filters={}, params=params)
+    def _compile(base_path, crosswalk_path, filters):
+        resolved = resolve_analysis("lnd_type_plus", dataset=None, filters=filters, params={})
         validate_shapes(resolved.pipeline)
         return compile_plan(resolved.pipeline, base_path=base_path)
 
@@ -976,7 +1046,7 @@ class TestLndTypePlusNarrowsItsReads:
         rather than a band list -- so the projected stage surface is one band as well.
         """
         self._write_two_years(base_path, crosswalk_path)
-        plan = self._compile(base_path, crosswalk_path, LND_TYPE_PLUS_PARAMS)
+        plan = self._compile(base_path, crosswalk_path, LND_TYPE_PLUS_FILTERS)
         for name in ("elevation", "land_type"):
             assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2050]
         assert [
@@ -991,10 +1061,151 @@ class TestLndTypePlusNarrowsItsReads:
         makes the single-band result above a narrowing rather than an empty dataset.
         """
         self._write_two_years(base_path, crosswalk_path)
-        params = {k: v for k, v in LND_TYPE_PLUS_PARAMS.items() if k != "calendar_year"}
-        plan = self._compile(base_path, crosswalk_path, params)
+        filters = {k: v for k, v in LND_TYPE_PLUS_FILTERS.items() if k != "calendar_year"}
+        plan = self._compile(base_path, crosswalk_path, filters)
         for name in ("elevation", "land_type"):
             assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2040, 2050]
         assert [
             metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()
         ] == [[2040, 2050]]
+
+
+class TestSedimentDynamicsExecution:
+    """The one entry that STACKS its operands instead of collapsing them: five rasters on
+    one grid, joined, sampled at a single pixel, and folded into one `value` column plus a
+    `variable` label column. Every other multi-input analysis here reduces to one number,
+    because `validate_shapes` allows exactly one value column at a sink; this one keeps all
+    five and satisfies the same rule by stacking (see `analyses/sediment_dynamics.py`).
+    """
+
+    @staticmethod
+    def _resolve(filters=None, dataset=SEDIMENT_DYNAMICS_DATASET):
+        return resolve_analysis(
+            "sediment_dynamics",
+            dataset=dataset,
+            filters=SEDIMENT_DYNAMICS_FILTERS if filters is None else filters,
+            params={},
+        )
+
+    def test_five_variables_at_one_pixel_come_back_as_five_rows_per_year(
+        self, morph_pixel_v002_shrunk, base_path
+    ):
+        """The whole analysis, end to end and value by value. Two years and five variables
+        is ten rows, each carrying its own variable's own number at the selected pixel --
+        `sediment_dynamics_value` writes a distinct value per (variable, year, pixel), so a
+        fold that stacked one operand five times, or sampled the wrong pixel, or paired the
+        years wrong, cannot produce this table.
+        """
+        write_sediment_dynamics_datasets(base_path, years=SEDIMENT_DYNAMICS_YEARS)
+        df = _run(self._resolve(), base_path)
+
+        assert df.height == len(SEDIMENT_DYNAMICS_DTYPES) * len(SEDIMENT_DYNAMICS_YEARS)
+        assert df["grid_cell"].unique().to_list() == [SEDIMENT_DYNAMICS_PIXEL]
+        assert set(df["variable"].to_list()) == set(SEDIMENT_DYNAMICS_DTYPES)
+        # The operand names are GONE as columns -- that is what the fold did to the frame.
+        assert not set(SEDIMENT_DYNAMICS_DTYPES) & set(df.columns)
+        assert dict(zip(zip(df["variable"], df["calendar_year"]), df["value"])) == {
+            (variable, year): pytest.approx(
+                sediment_dynamics_value(variable, year, SEDIMENT_DYNAMICS_PIXEL)
+            )
+            for variable in SEDIMENT_DYNAMICS_DTYPES
+            for year in SEDIMENT_DYNAMICS_YEARS
+        }
+
+    def test_another_pixel_reads_that_pixels_values(self, morph_pixel_v002_shrunk, base_path):
+        """The control for the sample above: the `grid_cell` conjunct is what picks the
+        pixel, and every variable is sampled at the SAME one. The fixtures vary by pixel
+        index, so a filter that sampled pixel 0 regardless (or sampled each operand
+        independently) would disagree here while passing the test above unchanged.
+        """
+        write_sediment_dynamics_datasets(base_path, years=(2040,))
+        other = 2
+        df = _run(self._resolve({**SEDIMENT_DYNAMICS_FILTERS, "grid_cell": str(other)}), base_path)
+        assert df["grid_cell"].unique().to_list() == [other]
+        assert dict(zip(df["variable"], df["value"])) == {
+            variable: pytest.approx(sediment_dynamics_value(variable, 2040, other))
+            for variable in SEDIMENT_DYNAMICS_DTYPES
+        }
+
+    def test_an_unselected_year_is_excluded(self, morph_pixel_v002_shrunk, base_path):
+        """`calendar_year` is an ordinary filter composed into the same post-join conjunct
+        as the pixel, and reaches all five reads through `execution.plan`'s dimension
+        passes. Three years on disk, one selected, five rows out.
+        """
+        write_sediment_dynamics_datasets(base_path, years=(2040, 2050, 2060))
+        resolved = self._resolve({**SEDIMENT_DYNAMICS_FILTERS, "calendar_year": 2050})
+        df = _run(resolved, base_path)
+        assert df["calendar_year"].unique().to_list() == [2050]
+        assert df.height == len(SEDIMENT_DYNAMICS_DTYPES)
+
+    def test_the_callers_variable_does_not_choose_the_inputs(
+        self, morph_pixel_v002_shrunk, base_path
+    ):
+        """The triple's `variable` says which of the five the caller was looking at; the
+        analysis reads all five regardless. Resolving against a different one of the five
+        has to produce the identical pipeline, or `Meta.variables` would be five entry
+        points to five different results.
+        """
+        pipelines = {
+            variable: self._resolve(
+                dataset=DatasetRef(variable=variable, time_unit="annual", grid="morph_pixel_v002")
+            ).pipeline.model_dump(mode="json")
+            for variable in ("elev", "test_org_accr")
+        }
+        assert pipelines["elev"] == pipelines["test_org_accr"]
+
+    def test_the_grid_and_time_unit_do_come_from_the_caller(self):
+        """The other half of the same question: `grid`/`time_unit` are the two the triple
+        really supplies, so naming the other morphology grid moves every one of the five
+        inputs onto it.
+        """
+        resolved = self._resolve(
+            dataset=DatasetRef(variable="elev", time_unit="annual", grid="morph_pixel_v001")
+        )
+        assert {selection.grid for selection in resolved.pipeline.inputs.values()} == {
+            "morph_pixel_v001"
+        }
+
+    def test_without_a_pixel_it_is_rejected_with_a_message_naming_grid_cell(self):
+        """A band-wide frame cannot be unpivoted, and the `grid_cell` filter is what lowers
+        it -- so "no pixel" is not a narrowing the caller merely skipped, it is a pipeline
+        that cannot be built. The analysis says so itself rather than letting
+        `_type_unpivot`'s own band-wide rejection (accurate, but silent about the cause)
+        surface from `validate_shapes` a layer later.
+        """
+        filters = {k: v for k, v in SEDIMENT_DYNAMICS_FILTERS.items() if k != "grid_cell"}
+        with pytest.raises(InvalidAnalysisParametersError, match="grid_cell="):
+            self._resolve(filters)
+
+    def test_a_resolved_grid_cell_conjunct_satisfies_the_same_requirement(self):
+        """`grid_cell_where` is how a caller who had to turn coordinates into ids passes the
+        pixel (`resolve_analysis`'s own argument), and it REPLACES `filters['grid_cell']`
+        -- so the requirement above has to read both, or a coordinate-addressed request
+        would be rejected for naming no pixel while naming one.
+        """
+        resolved = resolve_analysis(
+            "sediment_dynamics",
+            dataset=SEDIMENT_DYNAMICS_DATASET,
+            filters=LND_TYPE_PLUS_SELECTION,
+            params={},
+            grid_cell_where="grid_cell IN (5)",
+        )
+        assert "grid_cell IN (5)" in resolved.pipeline.steps[1].where
+
+    def test_the_output_descriptor_reports_the_five_folded_names(self):
+        """What the chart actually consumes: one `value` column, `folded_into='variable'`,
+        and the five names paired with their `Variable`s so per-variable units, number
+        formats and `display_scale_factor` can be keyed off one source. `legend` is null
+        because five variables in three units have no single one -- see the module
+        docstring.
+        """
+        resolved = self._resolve()
+        descriptor = output_descriptor(resolved.pipeline)
+        assert descriptor.folded_into == "variable"
+        assert list(descriptor.value_columns) == sorted(SEDIMENT_DYNAMICS_DTYPES)
+        assert [variable.name for variable in descriptor.variables] == sorted(
+            SEDIMENT_DYNAMICS_DTYPES
+        )
+        assert descriptor.variable is None
+        assert resolved.legend is None
+        assert resolved.meta.label == "Sediment Dynamics"

@@ -43,6 +43,7 @@ from cpra.mp.data.analysis.execution.execute import (
     _parse_point_sample_ids,
     _point_sample_overrides,
     _point_sample_reads,
+    _shared_point_sample_window,
     _shared_tile_window,
     execute,
 )
@@ -59,6 +60,7 @@ from cpra.mp.data.analysis.request.ops import (
     JOIN_LOWERING_TABLE,
     PROJECT_LOWERING_TABLE,
     Shape,
+    UNPIVOT_LOWERING_TABLE,
     validate_shapes,
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
@@ -157,8 +159,16 @@ class TestLoweringTableAgreement:
         # rather than `Shape`'s members.
         assert self._registered("project") == set(PROJECT_LOWERING_TABLE)
 
+    def test_unpivot_shapes_are_fully_covered(self):
+        # The one table with a shape MISSING from it on purpose: an `unpivot` is long-only
+        # (`_type_unpivot` rejects a band-wide input outright), and the absent `band_wide`
+        # key is what this check reads that from. Written as the same set comparison as
+        # every other op above rather than as an assertion about which shape is absent, so
+        # that adding a band-wide lowering to one side without the other still fails.
+        assert self._registered("unpivot") == set(UNPIVOT_LOWERING_TABLE)
+
     def test_every_registered_lowering_is_named_by_a_table(self):
-        # The other direction, across all six ops at once: no entry may sit in
+        # The other direction, across all seven ops at once: no entry may sit in
         # `_LOWERINGS` under an op kind the request layer does not type, or under a key
         # that op's own declared domain does not contain.
         domains = {
@@ -168,6 +178,7 @@ class TestLoweringTableAgreement:
             "case": set(Shape),
             "group": set(Shape),
             "project": set(PROJECT_LOWERING_TABLE),
+            "unpivot": set(UNPIVOT_LOWERING_TABLE),
         }
         for kind, key in _LOWERINGS:
             assert kind in domains, f"{kind!r} is not an op the request layer types"
@@ -784,6 +795,79 @@ class TestBandWideEndToEnd:
         assert df.columns == ["b0"]
         assert df["b0"].unique().to_list() == pytest.approx([15.0])
 
+    def test_a_pixel_named_after_the_join_narrows_the_shared_scan_to_it(self, base_path, monkeypatch):
+        # `analyses/sediment_dynamics.py`'s shape, at two operands instead of five: join
+        # the rasters band-for-band, name ONE pixel, fold the operand columns into rows.
+        # The join is what used to defeat the narrowing -- `_Validity` tracks a single
+        # origin, so the joined frame carried none and neither operand recorded a
+        # `point_sample_step`, leaving both rasters to be read whole and sampled
+        # afterwards. `compile_plan` now records the sample for the GROUP, and
+        # `_shared_point_sample_window` reduces the two windows to the one this scan reads.
+        #
+        # Asserted on the window rather than only on the values, for the reason the
+        # single-origin test above gives at length: both files cover the same extent, so a
+        # full-grid read returns the identical numbers and inspecting the answer alone
+        # could never catch the regression. `(row=200, col=800)` again, so an absolute id
+        # (211200) and a window-relative one (0) are provably different, and a `divmod`
+        # against the wrong axis lands on a pixel this fixture fills differently.
+        row, col = 200, 800
+        grid = GRIDS[RASTER_GRID]
+        cell_id = row * grid.width + col
+
+        def _fill(background, target, dtype):
+            def data_fn(year):
+                data = raster_array(fill=background, grid_name=RASTER_GRID, dtype=dtype)
+                data[row, col] = target
+                return data
+
+            return data_fn
+
+        write_raster_dataset(
+            base_path, years=(2030,), variable="vct", data_fn=_fill(1, 77, "int32")
+        )
+        write_raster_dataset(
+            base_path, years=(2030,), variable="ffibs_score", data_fn=_fill(2, 88, "float32")
+        )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "filter", "input": "j", "where": f"grid_cell = {cell_id}", "as": "s"},
+                    {"op": "unpivot", "input": "s"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [2, 2]
+
+        import cpra.mp.data.analysis.execution.execute as execute_module
+        from cpra.mp.data.analysis.io.raster import scan_raster as real_scan_raster
+
+        windows = []
+
+        def capturing_scan_raster(*args, **kwargs):
+            windows.append(kwargs.get("window"))
+            return real_scan_raster(*args, **kwargs)
+
+        monkeypatch.setattr(execute_module, "scan_raster", capturing_scan_raster)
+
+        df = execute(plan, base_path=base_path).collect()
+
+        # One scan for the group, over one pixel -- not two scans, and not the whole grid.
+        assert len(windows) == 1
+        window = windows[0]
+        assert (window.col_off, window.row_off, window.width, window.height) == (col, row, 1, 1)
+
+        # Both operands' own values, under the folded labels the operand names became, at
+        # the ABSOLUTE id the caller named -- the narrowing is invisible in all three.
+        assert df["grid_cell"].unique().to_list() == [cell_id]
+        assert {row["variable"]: row["value"] for row in df.to_dicts()} == pytest.approx(
+            {"a": 77.0, "b": 88.0}
+        )
+
     def test_one_shared_scan_still_aligns_operands_narrowed_by_different_amounts(
         self, base_path, monkeypatch
     ):
@@ -894,6 +978,81 @@ class TestBandWideEndToEnd:
 
         assert df.columns == ["b0"]
         assert df["b0"].unique().to_list() == pytest.approx([7.0])
+
+    def test_five_operand_join_then_point_filter_then_unpivot(self, base_path):
+        # `sediment_dynamics`'s own shape, end to end and at its real operand count: five
+        # rasters on one grid, joined band-wide, sampled at a single `grid_cell`, then
+        # folded so the five operand-named value columns become five rows of one `value`.
+        # Three things only this combination checks:
+        #
+        # * The `unpivot` is what makes the pipeline WRITABLE. A five-operand join's output
+        #   carries five value columns, which every sink rejects; a `calculate` could
+        #   collapse them only by doing arithmetic across five different measurements,
+        #   which is not what a five-series chart wants. This is the op that was missing.
+        # * The fold is per-observation, not per-column: one cell x two years x five
+        #   variables is ten rows, and each carries its own year and cell. A fold that
+        #   dropped the index columns would still give ten rows of the right values.
+        # * Each variable's own fill is distinct and hand-checked below, so a fold that
+        #   mislabeled the stack -- `variable` rotated by one against `value` -- fails
+        #   here even though the row count and the two column contents would each be right
+        #   on their own.
+        grid = GRIDS[RASTER_GRID]
+        cell_id = 200 * grid.width + 800
+        # Five variables `variables.csv` actually places on this grid, rather than
+        # `sediment_dynamics`'s own five: those live on `morph_pixel`, whose 8265x20674
+        # pixels are not something to write five COGs of in a unit test. What this test is
+        # about is the operand COUNT and the fold, neither of which depends on which
+        # variables they are -- and the three that require a dimension of their own are
+        # kept in on purpose, since those dimension columns ride through the fold as index
+        # columns and are exactly what a fold that dropped its index would lose.
+        operands = {
+            "vct": ({}, "int32"),
+            "ffibs_score": ({}, "float32"),
+            "veg_area": ({}, "int64"),
+            "ffibs_coverage_ratio": ({"ffibs_type": "pl_fm"}, "float32"),
+            "hsi": ({"species_code": "allig"}, "float32"),
+        }
+        fills = dict(zip(operands, (1, 2, 3, 4, 5)))
+        for variable, (dimensions, dtype) in operands.items():
+            write_raster_dataset(
+                base_path,
+                years=(2030, 2040),
+                variable=variable,
+                data_fn=lambda year, fill=fills[variable], dtype=dtype: raster_array(
+                    fill=fill * 10 + (year - 2030) // 10, grid_name=RASTER_GRID, dtype=dtype
+                ),
+                **dimensions,
+            )
+        pipeline = _pipeline(
+            {
+                "inputs": {name: raster_input(variable=name) for name in fills},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": list(fills), "as": "j"},
+                    {"op": "filter", "input": "j", "where": f"grid_cell = {cell_id}", "as": "pt"},
+                    {"op": "unpivot", "input": "pt", "as": "stacked"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.frame_types["j"].shape is Shape.band_wide
+        assert plan.frame_types["pt"].shape is Shape.long
+        assert plan.frame_types["stacked"].value_columns == frozenset({"value"})
+        assert plan.frame_types["stacked"].folded_columns == frozenset(fills)
+
+        df = execute(plan, base_path=base_path).collect()
+
+        # Five times the two-year, one-cell result the join produced.
+        assert df.height == 10
+        assert set(df["variable"].to_list()) == set(fills)
+        assert df["grid_cell"].unique().to_list() == [cell_id]
+        assert not set(fills) & set(df.columns)
+        assert {"ffibs_type", "species_code"} <= set(df.columns)
+        assert dict(zip(zip(df["variable"], df["calendar_year"]), df["value"])) == {
+            (variable, year): pytest.approx(fill * 10 + (year - 2030) // 10)
+            for variable, fill in fills.items()
+            for year in (2030, 2040)
+        }
 
     def test_raster_to_vector_project_runs_through_execute(self, base_path, crosswalk_path):
         # A constant-fill (10) raster and a crosswalk with ONE zone covering the whole
@@ -1781,6 +1940,27 @@ class TestTileScopedReads:
 
         with pytest.raises(ValueError, match="mixes tile-disjoint and overlapping"):
             _shared_tile_window(("a", "b"), inputs)
+
+    def test_a_join_groups_point_sample_window_refuses_to_union(self):
+        # `_shared_point_sample_window`'s two refusals, directly -- neither is reachable
+        # from a pipeline (`compile_plan` records a group's `point_sample_step`s together,
+        # off one filter, and a band-wide join's operands share a grid, so
+        # `_derive_point_sample_window` runs the same `where` against the same grid for
+        # each of them), and both are the reason the reduction is not a union.
+        #
+        # A tile window may be unioned: a wider window is more pixels, never different
+        # ones. A point sample's window IS the answer, so two origins disagreeing about
+        # which pixel was asked for have to fall back to the full read rather than be
+        # averaged into a window neither of them named -- and an origin with no window at
+        # all (tile-scoped, disjoint, or zero-band, which `_point_sample_overrides` skips)
+        # takes its whole sibling group with it, because the group is read as one.
+        window = Window(800, 200, 1, 1)
+        assert _shared_point_sample_window(("a", "b"), {"a": window, "b": window}) is window
+        assert _shared_point_sample_window(("a", "b"), {"a": window}) is None
+        assert (
+            _shared_point_sample_window(("a", "b"), {"a": window, "b": Window(801, 200, 1, 1)})
+            is None
+        )
 
     def test_a_tile_scoped_project_reads_whole_features_across_the_tile_edge(
         self, base_path, crosswalk_path, geometry_path

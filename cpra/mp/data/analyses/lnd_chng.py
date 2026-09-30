@@ -37,6 +37,7 @@ digit, and it has to arrive at the `sum` unchanged rather than null.
 
 from cpra.mp.data.analyses.base import (
     Analysis,
+    AnalysisMeta,
     InvalidAnalysisParametersError,
     dataset_input_selection,
     dataset_output_format,
@@ -57,21 +58,21 @@ LATE_BASELINE_YEAR = 2025
 
 
 class LandChange(Analysis):
-    class Meta:
-        name = "lnd_chng"
-        label = "Land Change"
-        type = "dataset"
-        kind = "variable"
-        variables = ["lnd_type"]
-        legend = "lnd_chng"
-        result_kind = "category"
+    Meta = AnalysisMeta(
+        name="lnd_chng",
+        label="Land Change",
+        kind="variable",
+        variables=["lnd_type"],
+        legend="lnd_chng",
+        result_kind="category",
         # Unconditional: `lnd_type` only exists at annual grain, so `calendar_year` is
         # always the concatenation axis. `model_group_id`'s OTHER subsumption (in
         # three-image mode only) is not declared here at all, because it isn't static --
         # the runtime `collapsed_dimensions` (derived structurally by
         # `default_collapsed_dimensions`, since this pipeline always ends in an ordinary
         # `group`) already reports it correctly per-request.
-        subsumed_dimensions = ["calendar_year"]
+        subsumed_dimensions=["calendar_year"],
+    )
 
     class Parameters(Analysis.Parameters):
         pass  # no fields -- comparison year and image count both come from ordinary filters
@@ -94,7 +95,7 @@ class LandChange(Analysis):
             )
 
     def pipeline(self):
-        assert self.dataset is not None, "lnd_chng is a type='dataset' analysis"
+        self.require_dataset()
         dim = "calendar_year"
         t1 = normalized_filter_values(dim, self.filters[dim])[0]
         mg_values = normalized_filter_values("model_group_id", self.filters["model_group_id"])

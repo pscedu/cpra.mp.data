@@ -263,9 +263,10 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
       writes no file at all (`run_to_path` returns `False`), and raises `NotFoundError`
       rather than handing back a path to a file that isn't there -- the same 404 the HTTP
       routes answer that request with.
-    * `format="png"`/`"jpg"` are TILE formats and are rejected outright. Both need a
-      tile's `x`/`y`/`z` and pixel size, which this signature has nowhere to put --
-      `execution.sink.render_tile` is the entry point for those.
+    * `format="png"`/`"jpg"`/`"pbf"` are TILE formats and are rejected outright. Each
+      needs a tile's `x`/`y`/`z` (and, for the raster two, a pixel size), which this
+      signature has nowhere to put -- `execution.sink.render_tile` and
+      `execution.sink.sink_vector_tile` are the entry points for those.
     """
     from cpra.mp.data.analysis.execution.execute import execute, run_to_path
     from cpra.mp.data.analysis.execution.plan import compile_plan
@@ -279,12 +280,17 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
     validate_shapes(parsed)
     format = parsed.output.format
 
-    if format in {TileFormat.png.value, TileFormat.jpg.value}:
+    # Every `TileFormat` member, rather than the two raster ones spelled out: `pbf` joined
+    # this enum when it stopped being a bare URL suffix, and it is a tile for exactly the
+    # same reason the other two are -- it is addressed by `x`/`y`/`z`, which this signature
+    # has nowhere to take.
+    if format in {member.value for member in TileFormat}:
         raise ShapeError(
             f"analyze_data(): output.format={format!r} is a map TILE format, which needs "
-            "a tile's x/y/z and pixel size -- analyze_data() has nowhere to put those. "
-            "Use format='tif' with output_path= for the whole raster, or call "
-            "cpra.mp.data.analysis.execution.sink.render_tile directly for one tile"
+            "a tile's x/y/z (and, for png/jpg, a pixel size) -- analyze_data() has nowhere "
+            "to put those. Use format='tif' with output_path= for the whole raster, or a "
+            "tabular format for the whole table; call cpra.mp.data.analysis.execution.sink"
+            ".render_tile (png/jpg) or .sink_vector_tile (pbf) directly for one tile"
         )
 
     if format == DataFormat.tif.value:

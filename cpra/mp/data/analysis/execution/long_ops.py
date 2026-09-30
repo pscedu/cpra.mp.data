@@ -1,6 +1,6 @@
-"""The long-shape lowerings: `filter_long`/`case_long`/`group_long`/`join_long`, one free
-function per op this vertical slice executes, each taking what it reads as arguments and
-returning a new `LongFrame` rather than mutating anything. `calculate` has no lowering of
+"""The long-shape lowerings: `filter_long`/`case_long`/`group_long`/`join_long`/
+`unpivot_long`, one free function per op this vertical slice executes, each taking what it
+reads as arguments and returning a new `LongFrame` rather than mutating anything. `calculate` has no lowering of
 its own in either shape -- `request.ops.compile_ops` lowers it to an arm-less `case`, whose
 `else` is the calculate's expression.
 
@@ -24,7 +24,9 @@ that were expensive to find the first time.
 
 `project` has no entry here on purpose: `project` is the one op that CHANGES shape
 (`request.ops.PROJECT_LOWERING_TABLE`), so it has no single-shape lowering the way the
-other four do. Its lowerings live in `execution/project.py`, one per direction.
+others do. Its lowerings live in `execution/project.py`, one per direction. `unpivot` is
+the converse case -- it has no BAND-WIDE lowering, so `unpivot_long` is the whole of it;
+see `request.ops.UNPIVOT_LOWERING_TABLE` for why that is a rejection rather than a gap.
 """
 
 from collections.abc import Callable, Sequence
@@ -42,10 +44,10 @@ from cpra.mp.data.analysis.request.expressions import (
     split_where_halves,
     value_predicate_mask,
 )
-from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp, calculate_label
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, UnpivotOp, calculate_label
 from cpra.mp.data.analysis.request.pipeline import DATASET_SELECTION_COLUMNS
 
-__all__ = ["case_expression", "case_long", "filter_long", "group_long", "join_long"]
+__all__ = ["case_expression", "case_long", "filter_long", "group_long", "join_long", "unpivot_long"]
 
 
 def filter_long(lf: LongFrame, where: str, value_columns: Sequence[str] = ("value",)) -> LongFrame:
@@ -313,10 +315,16 @@ def group_long(lf: LongFrame, op: GroupOp) -> LongFrame:
     return lf.group_by(*op.by, "grid_cell").agg(getattr(pl.col(op.of), op.aggregate)())
 
 
-def join_long(frames: list[LongFrame], op: JoinOp) -> LongFrame:
+def join_long(frames: list[LongFrame], names: Sequence[str]) -> LongFrame:
     """The long-shape lowering of a `join`: combine `frames` (already resolved, in
-    `op.inputs` order) on `grid_cell` plus every shared dimension, inner, renaming each
+    `names` order) on `grid_cell` plus every shared dimension, inner, renaming each
     operand's `value` column to its own step name first.
+
+    Takes the operand names rather than the `JoinOp` they came from -- nothing else about
+    the op bears on the lowering, and `execution.band_ops.sample_grid_cells_band_wide`
+    reaches this function from the band-wide side, where the operand names come off
+    `JOIN_OPERAND_COLUMN` and there is no op in hand. Same signature shape as
+    `band_ops.join_band_wide(frames, names, ...)`, its band-wide counterpart.
 
     The rename is what makes a join usable: both operands carry `value`, so the result
     would otherwise have two columns of one name. `join(inputs: [a, b])` therefore yields
@@ -342,18 +350,43 @@ def join_long(frames: list[LongFrame], op: JoinOp) -> LongFrame:
     aggregate, and null handling is specified too precisely elsewhere for that to be a
     default.
     """
-    renamed = [frame.rename({"value": name}) for name, frame in zip(op.inputs, frames)]
+    renamed = [frame.rename({"value": name}) for name, frame in zip(names, frames)]
     carried = [
         frame.drop(
             [column for column in frame.collect_schema().names() if column in DATASET_SELECTION_COLUMNS]
         )
         for frame in renamed
     ]
-    key_columns = [
-        set(frame.collect_schema().names()) - {name} for name, frame in zip(op.inputs, carried)
-    ]
+    key_columns = [set(frame.collect_schema().names()) - {name} for name, frame in zip(names, carried)]
     shared = sorted(set.intersection(*key_columns))
     result = carried[0]
     for other in carried[1:]:
         result = result.join(other, on=shared, how="inner")
     return result
+
+
+def unpivot_long(lf: LongFrame, op: UnpivotOp, value_columns: Sequence[str]) -> LongFrame:
+    """The long-shape lowering of an `unpivot`: stack `value_columns` into one `value`
+    column plus the label column `op.into`, which carries the name of the column each row's
+    measurement came from. The exact inverse of the rename `join_long` above performs, and
+    the op a multi-variable result reaches a one-value-column sink through.
+
+    `value_columns` is the incoming frame's value columns off the typing walk, the same
+    parameter and for the same reason `filter_long`/`case_long` take one: a long frame's
+    schema cannot tell a value column from a dimension column by inspection, so only the
+    walk knows which of them to fold. Everything NOT in it is an index column and rides
+    through untouched, one copy per folded name -- `grid_cell` and every dimension
+    included, which is exactly what makes the result a longer frame of the same
+    observations rather than a different set of them.
+
+    Sorted, so the stacking order is the operand names' own rather than whatever order a
+    `frozenset` iterated in: the row order of the result is otherwise non-deterministic
+    across runs, and `output.sort` is not always given.
+
+    There is no band-wide counterpart, by construction -- `request.ops._type_unpivot`
+    rejects a band-wide input outright (its columns are positional bands, so there are no
+    names to fold), which is why `UNPIVOT_LOWERING_TABLE` has no `band_wide` row.
+    """
+    folded = sorted(value_columns)
+    index = [column for column in lf.collect_schema().names() if column not in set(folded)]
+    return lf.unpivot(index=index, on=folded, variable_name=op.into, value_name="value")

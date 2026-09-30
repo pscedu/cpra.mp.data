@@ -59,9 +59,10 @@ from cpra.mp.data.analysis.request.pipeline import (
     JoinStep,
     Pipeline,
     ProjectStep,
+    UnpivotStep,
     _step_explicit_inputs,
 )
-from cpra.mp.data.analysis.request.types import AggregateFunction, Grid
+from cpra.mp.data.analysis.request.types import AggregateFunction, Grid, TileFormat
 from cpra.mp.data.grids import GRIDS
 
 
@@ -154,8 +155,23 @@ class GroupOp(BaseModel):
     output: str
 
 
+class UnpivotOp(BaseModel):
+    """Fold `input`'s operand-named value columns into one `value` column plus the label
+    column `into`. See `pipeline.UnpivotStep` for what the op means and why it is long-only;
+    the op adds nothing the step did not already say.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    op: Literal["unpivot"] = "unpivot"
+    step_no: int
+    input: str
+    into: str = "variable"
+    output: str
+
+
 Op = Annotated[
-    ProjectOp | JoinOp | FilterOp | CaseOp | GroupOp,
+    ProjectOp | JoinOp | FilterOp | CaseOp | GroupOp | UnpivotOp,
     Field(discriminator="op"),
 ]
 
@@ -212,6 +228,17 @@ PROJECT_LOWERING_TABLE: dict[tuple[str, str], Shape] = {
 JOIN_LOWERING_TABLE: dict[Shape, Shape] = {
     Shape.long: Shape.long,
     Shape.band_wide: Shape.band_wide,
+}
+
+# The unpivot lowering table, and the one table with a MISSING row on purpose:
+# `Shape.band_wide` is absent, so `_type_unpivot`'s lookup raises `KeyError` and it turns
+# that into a `ShapeError`, exactly as `_type_project` does for raster-to-raster. Saying
+# "long only" as an absent key rather than as an `if` is what lets
+# `tests/api/test_execute.py::TestLoweringTableAgreement` check the executor's registry
+# against the same data the typing walk consults, instead of against a second hand-written
+# list of which shapes this op accepts.
+UNPIVOT_LOWERING_TABLE: dict[Shape, Shape] = {
+    Shape.long: Shape.long,
 }
 
 
@@ -294,6 +321,8 @@ def compile_ops(pipeline: Pipeline) -> list[Op]:
                 of=step.of,
                 output=output,
             )
+        elif isinstance(step, UnpivotStep):
+            op = UnpivotOp(step_no=step_no, input=input_name, into=step.into, output=output)
         else:  # pragma: no cover -- exhaustive over the Step union
             raise RequestError(f"step {step_no} has unrecognized op {getattr(step, 'op', None)!r}")
 
@@ -343,6 +372,18 @@ class FrameType:
 
     Defaults to empty, the answer for every long frame and every raster input no
     raster-to-vector `project` reaches -- which is to say, almost all of them.
+
+    `folded_columns`/`folded_into` are what an `unpivot` leaves behind: the value-column
+    names it folded away, and the label column they became values of. They exist because
+    the fold is the one op that destroys information the RESULT is still about --
+    `value_columns` afterwards is `{"value"}` like any other frame's, but the rows are five
+    variables stacked, and `descriptor.output_descriptor` has to be able to say so (it
+    resolves each value column's `Variable` by name, and after a fold there is no name left
+    to resolve). Empty/`None` for every frame no `unpivot` reached, and carried forward
+    unchanged by every op that `dataclasses.replace`s its input's type -- a later `filter`
+    or `group` narrows a folded frame without un-folding it. A `join` builds a fresh
+    `FrameType` and so resets both, which is correct: its operands' measurements are
+    columns again.
     """
 
     shape: Shape
@@ -350,6 +391,8 @@ class FrameType:
     has_count_by_value: bool
     value_columns: frozenset[str]
     extra_columns: frozenset[str] = frozenset()
+    folded_columns: frozenset[str] = frozenset()
+    folded_into: str | None = None
 
 
 def project_direction(current: FrameType, to_grid: str) -> tuple[str, str]:
@@ -583,6 +626,66 @@ def _type_group(current: FrameType) -> FrameType:
     return dataclasses.replace(current, value_columns=frozenset({"value"}))
 
 
+def _type_unpivot(step_no: int, step: UnpivotStep | UnpivotOp, current: FrameType) -> FrameType:
+    """Fold several operand-named value columns into one `value` plus the label column
+    `step.into`. Three rejections, in the order a caller hits them:
+
+    **A band-wide input.** `UNPIVOT_LOWERING_TABLE` has no `band_wide` row, so the lookup
+    below raises and this turns it into a `ShapeError`. A band-wide frame's columns are
+    positional (`b0`, `b1`, ...) and what each one MEANS lives in band metadata, so folding
+    them is not a fold at all -- it is the band-wide-to-long transition, which a spatial
+    filter already is (`FILTER_LOWERING_TABLE`). Saying so beats letting the executor meet
+    a frame it cannot name the columns of.
+
+    **One value column.** Every frame that has not been through a `join` carries exactly
+    `{"value"}` -- `_type_case`, `_type_group` and this function all collapse to that one
+    name -- so folding one is never "fold the single measurement": it produces a label
+    column whose every entry is the literal string `"value"`, which is a constant dressed
+    up as a dimension. The caller meant to fold a join's output and put the `unpivot`
+    somewhere that no longer sees one.
+
+    **`into` naming one of the operands.** `unpivot(into="marsh")` over `{marsh, sal}` asks
+    for a label column named after one of the things being labelled; polars would take the
+    name and the result would carry `marsh` meaning "which operand" rather than "the marsh
+    measurement". Structure alone cannot catch this (`pipeline._validate_label_column_name`
+    does not know the frame's operands), which is why it is here.
+
+    Everything else passes through: the fold drops no rows, changes no grid, and moves no
+    dimension -- the frame is the same observations, stacked.
+    """
+    try:
+        out_shape = UNPIVOT_LOWERING_TABLE[current.shape]
+    except KeyError as exc:
+        raise ShapeError(
+            f"step {step_no} (unpivot): cannot unpivot a band-wide frame -- its columns "
+            "are positional bands, not named measurements; a spatial filter (grid_cell) "
+            "is what turns a band-wide frame long, and an unpivot goes after it"
+        ) from exc
+
+    if len(current.value_columns) < 2:
+        raise ShapeError(
+            f"step {step_no} (unpivot): input carries one value column "
+            f"({sorted(current.value_columns)}), so there is nothing to fold -- unpivot "
+            "stacks the operand-named value columns a join produces, and this frame has "
+            "not been through one (or a later case/calculate/group already collapsed it)"
+        )
+
+    if step.into in current.value_columns:
+        raise ShapeError(
+            f"step {step_no} (unpivot): into={step.into!r} names one of the value columns "
+            f"being folded ({sorted(current.value_columns)}) -- the label column has to be "
+            "a name none of the operands already use"
+        )
+
+    return dataclasses.replace(
+        current,
+        shape=out_shape,
+        value_columns=frozenset({"value"}),
+        folded_columns=current.value_columns,
+        folded_into=step.into,
+    )
+
+
 def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[FrameType]) -> FrameType:
     """A join's operands must agree on both shape and grid, whatever that shape is.
 
@@ -694,15 +797,88 @@ def annotate_frame_types(pipeline: Pipeline, ops: list[Op]) -> dict[str, FrameTy
             new_type = _type_case(op.step_no, op, frame_types[op.input])
         elif isinstance(op, GroupOp):
             new_type = _type_group(frame_types[op.input])
+        elif isinstance(op, UnpivotOp):
+            new_type = _type_unpivot(op.step_no, op, frame_types[op.input])
         else:  # pragma: no cover -- exhaustive over the Op union
             raise RequestError(f"step {op.step_no} has unrecognized op {getattr(op, 'op', None)!r}")
         frame_types[op.output] = new_type
     return frame_types
 
 
+def final_frame_name(pipeline: Pipeline, ops: list[Op]) -> str:
+    """The name the pipeline's FINAL frame is bound to -- the last op's output, or, for a
+    pipeline with no steps at all, its one input's own key.
+
+    This is the same rule `execution.execute.execute` uses to decide which frame it hands
+    back (see that function's docstring); the zero-step case is exact rather than a
+    fallback, because `pipeline.validate_pipeline` already requires "zero steps implies
+    exactly one input", so the unpacking below cannot see more than one name.
+
+    Public, and takes `ops` rather than re-deriving them, because three callers need this
+    answer against work they have already done: `validate_shapes` below (which has just
+    compiled `ops`), `output_frame_type` (which compiles them for the same reason), and
+    `api.pipeline`'s vector-tile renderer (which reads it off a compiled execution plan and
+    must not compile a second time to ask). Before this was extracted each wrote the rule
+    out again.
+    """
+    if ops:
+        return ops[-1].output
+    (name,) = pipeline.inputs
+    return name
+
+
+def output_frame_type(pipeline: Pipeline) -> FrameType:
+    """The `FrameType` of `pipeline`'s final frame -- the shape, grid, and value columns of
+    what it would WRITE.
+
+    Opens nothing: `annotate_frame_types` needs only the declared ops and each input's grid
+    kind, so this is available synchronously at spec-build time, before the pipeline is
+    executed and before any crosswalk or catalog is consulted.
+
+    `pipeline` must already be structurally valid (`pipeline.parse_pipeline`); this raises
+    the same `ShapeError`s `validate_shapes` does for every per-op rule, since it runs the
+    same walk. It does NOT run the sink rules -- a caller that wants those wants
+    `validate_shapes`, which reaches the same frame by the same two lines.
+
+    Callers outside the shape rules want this for the grid: `FrameType.grid` means "the
+    grid this frame is currently addressed against", which is what decides whether a
+    `grid_cell` is a vector id or a raster coordinate pair, and what a rendered result is
+    drawn on. See `request.descriptor.output_descriptor`, which layers the presentation
+    facts (time unit, per-column variable) on top of this one.
+    """
+    ops = compile_ops(pipeline)
+    return annotate_frame_types(pipeline, ops)[final_frame_name(pipeline, ops)]
+
+
+def _spatial_lowering(ops: list[Op], frame_types: dict[str, FrameType]) -> tuple[int, list[str]] | None:
+    """The LAST `filter` op that turned a band-wide frame long, as `(step_no, the spatial
+    conjuncts it did it with)` -- `None` when no op in `ops` did that.
+
+    A filter is the only op whose lowering table changes shape (`FILTER_LOWERING_TABLE`),
+    and within it band-wide-in/long-out is the single spatial entry, so the two frame types
+    alone identify the cause with no re-classification needed. The conjuncts are re-derived
+    only to QUOTE them back: `_type_filter` classified against
+    `value_columns | extra_columns`, and this repeats that against the same input frame so
+    the message names exactly the conjuncts that op treated as spatial.
+
+    Used only to explain the long-final-frame rejection below. Nothing decides anything on
+    the result -- a request that trips that rule is rejected either way, this only picks
+    which message says so.
+    """
+    for op in reversed(ops):
+        if not isinstance(op, FilterOp):
+            continue
+        current = frame_types[op.input]
+        if current.shape is not Shape.band_wide or frame_types[op.output].shape is not Shape.long:
+            continue
+        kinds = classify_where_kinds(op.where, current.value_columns | current.extra_columns)
+        return op.step_no, kinds[PredicateKind.spatial]
+    return None
+
+
 def validate_shapes(pipeline: Pipeline) -> None:
     """Type `pipeline` (assumed already structurally valid -- see `pipeline.
-    validate_pipeline`) via `annotate_frame_types`, then check the two rules that belong
+    validate_pipeline`) via `annotate_frame_types`, then check the three rules that belong
     to the FINAL frame rather than to any one op. Raises `ShapeError` for every
     shape-dependent rejection decidable from the declared ops and each input's grid kind
     alone:
@@ -717,7 +893,13 @@ def validate_shapes(pipeline: Pipeline) -> None:
     - a `join` mixing a long frame with a band-wide one (`_type_join`);
     - a band-wide `join` whose operands sit on two different grids (`_type_join`);
     - a `join` over an operand that is itself an uncollapsed join's output (`_type_join`);
-    - a long final frame under an output format that needs a raster surface (below);
+    - an `unpivot` over a band-wide frame, over a frame carrying one value column, or with
+      an `into` naming one of the columns being folded (`_type_unpivot`);
+    - a final frame that is not long on a VECTOR grid under `output.format='pbf'`
+      (below);
+    - a long final frame under an output format that needs a raster surface (below),
+      reported against the `grid_cell` that caused it when a spatial `filter` is what
+      lowered the frame (`_spatial_lowering`);
     - a band-wide final frame under an output format that needs a tabular sink (below --
       the converse of the previous rule; nothing past this function would otherwise
       catch it, since `execution.execute.run_to_path` picks its sink from the result's
@@ -728,7 +910,7 @@ def validate_shapes(pipeline: Pipeline) -> None:
     """
     ops = compile_ops(pipeline)
     frame_types = annotate_frame_types(pipeline, ops)
-    final = frame_types[ops[-1].output] if ops else next(iter(frame_types.values()))
+    final = frame_types[final_frame_name(pipeline, ops)]
 
     if len(final.value_columns) != 1:
         raise ShapeError(
@@ -738,7 +920,51 @@ def validate_shapes(pipeline: Pipeline) -> None:
             "(or whose aggregate) say which operand the one surviving value comes from"
         )
 
+    if pipeline.output.format == TileFormat.pbf.value:
+        # The `pbf` rule, and the one sink rule that tests the final frame's GRID rather
+        # than only its shape. A vector tile's geometry is the grid's own PMTiles boundary
+        # archive (`execution.sink.sink_vector_tile`), into which this pipeline's values are
+        # injected by `grid_cell` -- so the frame has to be long (rows to inject) AND
+        # addressed against a grid that has polygons to inject them into. A raster point
+        # query satisfies the first half and fails the second: its `grid_cell`s are pixel
+        # ids of a grid with no boundary archive at all.
+        #
+        # Rejecting here, rather than letting `sink_vector_tile` return its `None`, is what
+        # keeps "this pipeline could never have had a boundary archive" (a client error)
+        # from collapsing into the 204 that means "no data at this location."
+        #
+        # Declared before the two rules below, which `pbf` would otherwise fall through
+        # into: `pbf` is not a `RASTER_OUTPUT_FORMATS` member, so a band-wide final frame
+        # would trip the "needs a tabular sink" rule and be told to add a spatial filter --
+        # advice that produces a long frame still on a raster grid, which this rule rejects
+        # anyway.
+        if final.shape != Shape.long or GRIDS[final.grid].grid_type != "vector":
+            raise ShapeError(
+                f"pipeline's final frame (grid={final.grid!r}, shape={final.shape.value!r}) "
+                "is not a long frame on a vector grid -- a .pbf vector tile needs the final "
+                "result addressed against a vector grid's polygons, not a raster's pixels"
+            )
+
     if final.shape == Shape.long and pipeline.output.format in RASTER_OUTPUT_FORMATS:
+        # Same rejection either way; the two messages differ only in what they tell the
+        # caller to change. A `grid_cell` on a raster grid means "sample these points", so
+        # it lowers the frame to rows (`FILTER_LOWERING_TABLE`'s one shape-changing entry)
+        # -- a deliberate, documented behaviour, not a missing `project`. Telling that
+        # caller to "add a project to a raster grid" is advice that cannot work: projecting
+        # the sampled points back onto a grid is not what they asked for, and the thing
+        # they actually have to change is the `grid_cell` or the format. So when a spatial
+        # filter is what did the lowering, name it.
+        lowering = _spatial_lowering(ops, frame_types)
+        if lowering is not None:
+            step_no, conjuncts = lowering
+            raise ShapeError(
+                f"step {step_no} (filter): conjunct(s) {conjuncts} sample the raster at a "
+                "set of grid_cell points, which makes the result tabular (long), but "
+                f"output.format={pipeline.output.format!r} needs a raster surface. A "
+                "grid_cell selection over a raster grid always returns the sampled points "
+                "as rows -- ask for a tabular format to get them, or drop grid_cell to get "
+                "the whole surface"
+            )
         raise ShapeError(
             f"pipeline's final frame is long (tabular), but output.format="
             f"{pipeline.output.format!r} needs a raster surface -- add a project to a "

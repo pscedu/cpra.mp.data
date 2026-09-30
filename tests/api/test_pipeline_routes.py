@@ -1,9 +1,12 @@
-"""End-to-end tests for the `/v1/analysis...` pipeline routes (`cpra/mp/data/api/pipeline.py`),
-through the real ASGI app rather than against the engine's internals.
+"""End-to-end tests for hand-written pipelines over the data routes
+(`cpra/mp/data/api/pipeline.py`), through the real ASGI app rather than against the engine's
+internals.
 
-Every test here posts (or GETs) a JSON-shaped pipeline body at one of the four routes --
-`/v1/analysis.<format>` (POST and dotted-query GET), `/v1/analysis/{z}/{x}/{y}.png`, and
-`/v1/analysis/{z}/{x}/{y}.pbf` -- and asserts on the HTTP response. The layers underneath
+Every test here posts (or GETs) a JSON-shaped pipeline at one of the two paths the
+consolidation left -- `/v1/data.<format>` (POST with a JSON body, GET with the dotted query
+codec) and `/v1/data/{z}/{x}/{y}.<format>` (`png` and `pbf`) -- and asserts on the HTTP
+response. A pipeline written by hand is just one of the things those paths accept now;
+`analysis=` and the dataset triple are the others, and a request may carry all three. The layers underneath
 (`request.pipeline`'s parse/validate, `execution.plan`'s compile, `execution.execute`'s
 walk, `execution.sink`'s write) each have their own focused tests; what this module pins
 is that the routes wire them together, that the request encodings agree with each other,
@@ -24,6 +27,7 @@ SHAPES, not real-world variable semantics.
 
 import copy
 import io
+import json
 
 import mercantile
 import numpy as np
@@ -303,7 +307,7 @@ class TestNotebookQueryEndToEnd:
     """
 
     def test_post(self, client, notebook_query_data):
-        response = client.post("/v1/analysis.tif", json=NOTEBOOK_QUERY)
+        response = client.post("/v1/data.tif", json=NOTEBOOK_QUERY)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -311,7 +315,7 @@ class TestNotebookQueryEndToEnd:
 
     def test_get_dotted_query(self, client, notebook_query_data):
         query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
-        response = client.get("/v1/analysis.tif", params=query)
+        response = client.get("/v1/data.tif", params=query)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -322,7 +326,7 @@ class TestNotebookQueryEndToEnd:
         tile_query["output"] = {"format": "png"}
         query = pipeline_to_query(parse_pipeline(tile_query))
         tile = _tile_for_grid(notebook_query_data)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
@@ -330,13 +334,17 @@ class TestNotebookQueryEndToEnd:
     def test_pbf_tile_rejects_the_paired_shape_gracefully(self, client, notebook_query_data):
         """This shape's output is always raster (band-wide on `veg_grid_cell_v001`), so a
         `.pbf` request against it must 400 -- and, since a `.pbf` request never reaches
-        `execute()` at all (the vector/raster check happens at shape-typing, against
-        `ExecutionPlan.frame_types`, before any data is read), this one test in the class
-        is NOT affected by the join/batch_layout gap the rest of the class documents.
+        `execute()` at all (the route overwrites `output.format` with the URL's `pbf` and
+        `validate_shapes`'s `pbf` rule rejects from the declared ops alone, before any data
+        is read or any plan is compiled), this one test in the class is NOT affected by the
+        join/batch_layout gap the rest of the class documents.
+
+        Note what the query says and what it does not: `NOTEBOOK_QUERY`'s own
+        `output.format` is `tif`, and it is the URL that makes this a vector-tile request.
         """
         query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
         tile = _tile_for_grid(notebook_query_data)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.pbf", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf", params=query)
         assert response.status_code == 400, response.text
         assert "is not a long frame on a vector grid" in response.json()["detail"]
 
@@ -364,7 +372,7 @@ class TestNotebookQueryEndToEnd:
         tile_query["output"] = {"format": "png"}
         query = pipeline_to_query(parse_pipeline(tile_query))
         tile = _tile_for_grid(notebook_query_data)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
         assert response.status_code == 400, response.text
         assert "no data available" in response.json()["detail"]
 
@@ -391,7 +399,7 @@ class TestPairedAccumulatorEdgeCases:
 
     def test_sum_aggregate_by_valid_band_count(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
-        response = client.post("/v1/analysis.tif", json=self._pipeline("sum"))
+        response = client.post("/v1/data.tif", json=self._pipeline("sum"))
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -408,7 +416,7 @@ class TestPairedAccumulatorEdgeCases:
 
     def test_mean_aggregate_divides_by_valid_count_not_band_count(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
-        response = client.post("/v1/analysis.tif", json=self._pipeline("mean"))
+        response = client.post("/v1/data.tif", json=self._pipeline("mean"))
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -423,7 +431,7 @@ class TestPairedAccumulatorEdgeCases:
 
     def test_max_aggregate_all_masked_row_is_nodata(self, client, accumulator_edge_case_data):
         _base_path, third = accumulator_edge_case_data
-        response = client.post("/v1/analysis.tif", json=self._pipeline("max"))
+        response = client.post("/v1/data.tif", json=self._pipeline("max"))
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -451,7 +459,7 @@ class TestPairedCountConsistency:
 
     def test_zero_vs_nodata_and_mixed_pixel(self, client, count_edge_case_data):
         _base_path, fifth = count_edge_case_data
-        response = client.post("/v1/analysis.tif", json=self._pipeline())
+        response = client.post("/v1/data.tif", json=self._pipeline())
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -470,7 +478,7 @@ class TestPairedCountConsistency:
         tile_query["output"] = {"format": "png"}
         query = pipeline_to_query(parse_pipeline(tile_query))
         tile = _tile_for_grid(base_path)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
@@ -510,7 +518,7 @@ class TestSingleInputEndToEnd:
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        response = client.post("/v1/analysis.csv", json=self.VECTOR_PIPELINE)
+        response = client.post("/v1/data.csv", json=self.VECTOR_PIPELINE)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.height == 32  # one row per ecoregion -- 2030 fails `value > 2035` everywhere.
@@ -534,7 +542,7 @@ class TestSingleInputEndToEnd:
             ],
             "output": {"format": "tif"},
         }
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -545,8 +553,8 @@ class TestSingleInputEndToEnd:
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
         query = pipeline_to_query(parse_pipeline(self.VECTOR_PIPELINE))
-        post_response = client.post("/v1/analysis.csv", json=self.VECTOR_PIPELINE)
-        get_response = client.get("/v1/analysis.csv", params=query)
+        post_response = client.post("/v1/data.csv", json=self.VECTOR_PIPELINE)
+        get_response = client.get("/v1/data.csv", params=query)
         assert get_response.status_code == 200, get_response.text
         # Row order isn't guaranteed stable across two independent query-plan executions
         # (no explicit sort in this pipeline), so compare parsed/sorted frames rather than
@@ -579,7 +587,7 @@ class TestFilterWhereDimensionNot:
             ],
             "output": {"format": "csv"},
         }
-        pipeline_response = client.post("/v1/analysis.csv", json=pipeline)
+        pipeline_response = client.post("/v1/data.csv", json=pipeline)
         assert pipeline_response.status_code == 200, pipeline_response.text
         pipeline_df = pl.read_csv(io.BytesIO(pipeline_response.content)).sort(
             ["calendar_year", "grid_cell"]
@@ -593,8 +601,13 @@ class TestFilterWhereDimensionNot:
         ).any()
 
         flat_response = client.get(
-            "/v1/datasets/ssf/annual/ecoregion_v001/data.csv",
-            params={"where": "not (calendar_year = 2030 and grid_cell = 5)"},
+            "/v1/data.csv",
+            params={
+                "variable": "ssf",
+                "time_unit": "annual",
+                "grid": "ecoregion_v001",
+                "where": "not (calendar_year = 2030 and grid_cell = 5)",
+            },
         )
         assert flat_response.status_code == 200, flat_response.text
         flat_df = pl.read_csv(io.BytesIO(flat_response.content)).sort(["calendar_year", "grid_cell"])
@@ -623,7 +636,7 @@ class TestInputGridCellEndToEnd:
         write_parquet(annual_frame(years=(2030,)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        response = client.post("/v1/analysis.csv", json=self.PIPELINE)
+        response = client.post("/v1/data.csv", json=self.PIPELINE)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert sorted(df["grid_cell"].to_list()) == [5, 6]
@@ -635,9 +648,9 @@ class TestInputGridCellEndToEnd:
         query = pipeline_to_query(parse_pipeline(self.PIPELINE))
         assert query["step.1.where"] == "grid_cell = 5 OR grid_cell = 6"
         post_df = pl.read_csv(
-            io.BytesIO(client.post("/v1/analysis.csv", json=self.PIPELINE).content)
+            io.BytesIO(client.post("/v1/data.csv", json=self.PIPELINE).content)
         ).sort("grid_cell")
-        get_response = client.get("/v1/analysis.csv", params=query)
+        get_response = client.get("/v1/data.csv", params=query)
         assert get_response.status_code == 200, get_response.text
         get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
         assert get_df.equals(post_df)
@@ -659,7 +672,7 @@ class TestOutputSortSelect:
             "steps": [],
             "output": {"format": "csv", "sort": "-calendar_year", "select": "calendar_year,value"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert list(df.columns) == ["calendar_year", "value"]
@@ -669,7 +682,7 @@ class TestOutputSortSelect:
 class TestOutputColorMap:
     """`output.color_map` actually changes a rendered raster tile's pixels for a
     SINGLE-INPUT pipeline -- a dataset-scoped pipeline rendered as a raster PNG tile
-    (`/v1/analysis/{z}/{x}/{y}.png`) is the portal's difference-map shape on a raster grid.
+    (`/v1/data/{z}/{x}/{y}.png`) is the portal's difference-map shape on a raster grid.
     """
 
     def test_color_map_changes_rendered_pixels(self, client, base_path, monkeypatch):
@@ -692,8 +705,8 @@ class TestOutputColorMap:
         default_query = pipeline_to_query(parse_pipeline(_pipeline("default")))
         ffibs_query = pipeline_to_query(parse_pipeline(_pipeline("ffibs")))
 
-        default_response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=default_query)
-        ffibs_response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=ffibs_query)
+        default_response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=default_query)
+        ffibs_response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=ffibs_query)
 
         assert default_response.status_code == 200, default_response.text
         assert ffibs_response.status_code == 200, ffibs_response.text
@@ -738,7 +751,7 @@ class TestProjectAggregateCountByValue:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
 
@@ -773,7 +786,7 @@ class TestProjectAggregateCountByValue:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400, response.text
         assert "cannot be a group.aggregate" in response.json()["detail"]
 
@@ -804,7 +817,7 @@ class TestPostProjectGridCellFilterEndToEnd:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["grid_cell"].to_list() == [1]
@@ -822,7 +835,7 @@ class TestPostProjectGridCellFilterEndToEnd:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert sorted(df["grid_cell"].to_list()) == [1, 2]
@@ -854,7 +867,7 @@ class TestPostProjectGridCellFilterEndToEnd:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
@@ -877,7 +890,7 @@ class TestPostProjectGridCellFilterEndToEnd:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["grid_cell"].to_list() == [5]
@@ -902,7 +915,7 @@ class TestProjectOnlyReaggregation:
             "steps": [{"op": "project", "input": "vct", "to": "hydro_compartment_v001", "aggregate": "mean"}],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
 
@@ -948,7 +961,7 @@ class TestWeightedCaseEndToEnd:
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
-        response = client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE)
+        response = client.post("/v1/data.csv", json=self.WEIGHTED_PIPELINE)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         actual = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
@@ -962,9 +975,9 @@ class TestWeightedCaseEndToEnd:
 
         query = pipeline_to_query(parse_pipeline(self.WEIGHTED_PIPELINE))
         post_df = pl.read_csv(
-            io.BytesIO(client.post("/v1/analysis.csv", json=self.WEIGHTED_PIPELINE).content)
+            io.BytesIO(client.post("/v1/data.csv", json=self.WEIGHTED_PIPELINE).content)
         ).sort("grid_cell")
-        get_response = client.get("/v1/analysis.csv", params=query)
+        get_response = client.get("/v1/data.csv", params=query)
         assert get_response.status_code == 200, get_response.text
         get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
         assert get_df.equals(post_df)
@@ -997,7 +1010,7 @@ class TestWeightedCaseEndToEnd:
             west, south, east, north = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
         tile = mercantile.tile((west + east) / 2, (south + north) / 2, 8)
 
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
         assert response.status_code == 200, response.text
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -1025,7 +1038,7 @@ class TestWeightedCaseEndToEnd:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df.filter(pl.col("grid_cell") == 1)["value"][0] == pytest.approx(
@@ -1052,7 +1065,7 @@ class TestWeightedCaseEndToEnd:
             ],
             "output": {"format": "csv", "sort": "calendar_year"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["value"].to_list() == pytest.approx([0.0, 2040.01], rel=1e-5)
@@ -1072,7 +1085,7 @@ class TestWeightedCaseEndToEnd:
             ],
             "output": {"format": "csv", "sort": "calendar_year"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["value"].to_list() == [0.0, None]
@@ -1098,7 +1111,7 @@ class TestWeightedCaseEndToEnd:
             ],
             "output": {"format": "tif"},
         }
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             assert src.count == 1
@@ -1113,8 +1126,11 @@ class TestWeightedCaseEndToEnd:
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
         flat_response = client.get(
-            "/v1/datasets/ssf/annual/ecoregion_v001/data.csv",
+            "/v1/data.csv",
             params={
+                "variable": "ssf",
+                "time_unit": "annual",
+                "grid": "ecoregion_v001",
                 "calculate.1.expression": "value * 0.5",
                 "calculate.1.where": "calendar_year = 2030",
                 "calculate.2.expression": "value * 0.25",
@@ -1136,7 +1152,7 @@ class TestWeightedCaseEndToEnd:
         """
         pipeline = copy.deepcopy(NOTEBOOK_QUERY)
         pipeline["steps"][2] = {"op": "calculate", "expression": "marsh - sal * 0.5"}
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             assert src.count == 1
@@ -1148,16 +1164,57 @@ class TestWeightedCaseEndToEnd:
 
 
 class TestRejections:
-    def test_post_format_mismatch_is_400(self, client, notebook_query_data):
-        response = client.post("/v1/analysis.csv", json=NOTEBOOK_QUERY)
-        assert response.status_code == 400
-        assert "does not match" in response.json()["detail"]
+    def test_post_url_format_overwrites_the_bodys_own(self, client, notebook_query_data):
+        """The URL's extension WINS over the body's `output.format`; it is not cross-checked
+        against it (which is what this route used to do, 400-ing with "does not match").
 
-    def test_get_dotted_format_mismatch_is_400(self, client, notebook_query_data):
-        query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
-        response = client.get("/v1/analysis.csv", params=query)
+        `NOTEBOOK_QUERY` declares `tif` and ends band-wide, so asking for it as `.csv` is
+        still a 400 -- but a 400 from the SINK-SHAPE rule, which is the observable
+        difference: the message names `output.format='csv'`, the URL's value, proving the
+        overwrite happened before `validate_shapes` ran rather than a mismatch being caught
+        before it.
+        """
+        response = client.post("/v1/data.csv", json=NOTEBOOK_QUERY)
         assert response.status_code == 400
-        assert "does not match" in response.json()["detail"]
+        detail = response.json()["detail"]
+        assert "output.format='csv'" in detail
+        assert "needs a tabular sink" in detail
+
+    def test_get_dotted_format_overwrites_the_querys_own(self, client, notebook_query_data):
+        """The same rule on the dotted GET spelling -- `output.format=tif` in the query
+        string loses to the `.csv` in the URL.
+        """
+        query = pipeline_to_query(parse_pipeline(NOTEBOOK_QUERY))
+        assert query["output.format"] == "tif"
+        response = client.get("/v1/data.csv", params=query)
+        assert response.status_code == 400
+        assert "output.format='csv'" in response.json()["detail"]
+
+    def test_url_format_overwrite_is_not_only_a_rejection(
+        self, client, base_path, monkeypatch
+    ):
+        """The positive half of the rule the two tests above only see reject: a pipeline
+        that declares `csv` and is fetched as `.ndjson` is SERVED, as ndjson.
+
+        This is the case the old cross-check got wrong in a way that mattered. The portal
+        holds one pipeline per map and offers it both as tiles and as a download, so
+        "re-request this exact pipeline in another format" is an ordinary client move, and
+        under the cross-check it forced the client to rewrite `output.format` to match
+        every extension it fetched -- making `pipeline_to_query()` no longer one stable
+        identity for the thing being looked at.
+        """
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [],
+            "output": {"format": "csv"},
+        }
+        response = client.get("/v1/data.ndjson", params=pipeline_to_query(parse_pipeline(pipeline)))
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith("application/x-ndjson")
+        assert json.loads(response.content.splitlines()[0])["calendar_year"] == 2030
 
     def test_three_inputs_is_400(self, client, base_path, monkeypatch):
         """A chained 3-input join (two spatial joins folding a, b, c together) is
@@ -1184,7 +1241,7 @@ class TestRejections:
             ],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "not yet supported" in response.json()["detail"]
 
@@ -1202,7 +1259,7 @@ class TestRejections:
             "output": {"format": "png"},
         }
         query = pipeline_to_query(parse_pipeline(pipeline))
-        response = client.get("/v1/analysis/3/1/2.png", params=query)
+        response = client.get("/v1/data/3/1/2.png", params=query)
         assert response.status_code == 400
         assert "raster surface" in response.json()["detail"]
 
@@ -1229,7 +1286,7 @@ class TestRejections:
             ],
             "output": {"format": "tif"},
         }
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 200, response.text
         with rio.MemoryFile(response.content) as memfile, memfile.open() as dataset:
             band = dataset.read(1)

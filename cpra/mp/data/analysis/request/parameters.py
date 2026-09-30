@@ -7,8 +7,9 @@ the result). `api/models.py` subclasses these for the HTTP query surface, and
 `DataOptions` is the WHOLE options vocabulary a flat request has. It used to have a
 superset, `Options`, carrying the fields that described how a request executed
 (`group_by`/`group_aggregate`/`summarize_*`/`calculate`); every one of those is now a
-pipeline step instead, `api.__init__.reject_retired_params` 400s the flat spellings with
-the step to use, and the model itself is gone rather than kept as a shape nothing reads.
+pipeline step instead, `request.unified.partition_query` 400s the flat spellings with the
+step to use (`RETIRED_PARAMS`), and the model itself is gone rather than kept as a shape
+nothing reads.
 
 These are a sibling of `request/types.py`, not a layer above it: that module owns the
 closed enum vocabularies (the grid/variable/time-unit types, `AggregateFunction`) and this
@@ -17,7 +18,7 @@ one owns the field sets those vocabularies type.
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from cpra.mp.data.analysis.request.types import dimension_type
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, dimension_type
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 
 BaseDatasetDimensions = create_model(
@@ -46,6 +47,24 @@ class DatasetDimensions(BaseDatasetDimensions):
 
 class FilterDimensions(BaseFilterDimensions):
     model_config = ConfigDict(use_enum_values=True)
+
+
+class Compression(BaseModel):
+    """How to compress the response body -- a TRANSPORT concern, and the reason this is
+    its own model rather than two more `DataOptions` fields: it never rides inside the
+    `Pipeline` (`request.pipeline.Output` carries no compression field), it binds on the
+    tabular and `tif` formats but not on the tile routes, and `api.utils.validate_
+    compression` draws a different allowed-algorithm line for each.
+
+    Lives here rather than in `api/models.py` (where it used to, and from which it is
+    still re-exported for the routes that bind it) so that `request.unified`'s decoder can
+    read the two parameter NAMES off the model itself, the same way it reads the dimension
+    and data-option names off their models, rather than repeating them as a hand-written
+    frozenset that nothing would keep in step.
+    """
+
+    compression_algorithm: CompressionAlgorithm = CompressionAlgorithm.zstd
+    compression_level: int = 6
 
 
 class DataOptions(BaseModel):

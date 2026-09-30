@@ -6,10 +6,11 @@ value objects the interface contract with the API route layer names explicitly, 
 (SQL-literal quoting, structural
 `collapsed_dimensions` derivation) those entries share.
 
-Mirrors `cpra.mp.data.visualizations.base`'s conventions where they overlap (a nested
-`Meta` plain class per entry, never a pydantic model; `Parameters` IS a pydantic model,
-since it is validated directly from raw request-shaped values) -- see that module and
-`cpra/mp/data/visualizations/stacked_bar.py`'s `Meta` for the pattern being followed.
+Both per-entry declarations are validated pydantic models: `Meta` is an `AnalysisMeta`
+instance built at import time, and `Parameters` is an `AnalysisParameters` subclass
+validated per request. `cpra.mp.data.visualizations` still uses the older bare
+`class Meta:` convention (see `cpra/mp/data/visualizations/stacked_bar.py`) and has not
+been converted; nothing here depends on the two staying alike.
 
 Like `cpra.mp.data.analysis.request`, nothing here imports FastAPI: every exception is a
 plain `ValueError` subclass, and `cpra/mp/data/api/boundary.py` -- which owns the one
@@ -19,13 +20,13 @@ type-to-status table -- is responsible for translating it to a status code.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict
 
 from cpra.mp.data.analysis.request.data_query import grid_cell_conjunct
 from cpra.mp.data.analysis.request.expressions import split_top_level_and
-from cpra.mp.data.analysis.request.pipeline import GroupStep, Pipeline
+from cpra.mp.data.analysis.request.pipeline import FilterStep, GroupStep, Pipeline
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
@@ -48,8 +49,8 @@ class AnalysisRegistryError(ValueError):
 
 
 class UnknownAnalysisError(AnalysisRegistryError):
-    """`resolve_analysis` (or `api/utils.py`'s `get_analysis_class`) was asked for a name
-    not in `ANALYSES` -- maps to a 404 at the route layer.
+    """`resolve_analysis` was asked for a name not in `ANALYSES` -- maps to a 404 at the
+    route layer, via `api/__init__.py`'s `AnalysisRegistryError` handler.
     """
 
 
@@ -62,22 +63,41 @@ class InvalidAnalysisParametersError(AnalysisRegistryError):
     """
 
 
-class AnalysisTypeMismatchError(AnalysisRegistryError):
-    """An analysis was resolved against the wrong route kind: a `type="custom"` analysis
-    given a `dataset`, or a `type="dataset"` analysis resolved with `dataset=None`. Maps
-    to a 400 at the route layer -- see `api/utils.py`'s
-    `get_analysis_class(name, type=...)`, which makes the identical distinction for
-    visualizations already.
+class AnalysisDatasetMismatchError(AnalysisRegistryError):
+    """An analysis was resolved with the wrong answer to "did the caller name a dataset?":
+    one that fixes its own inputs was given a `variable`/`time_unit`/`grid` triple, or one
+    that reads the caller's dataset was given none. Maps to a 400 at the route layer.
+
+    This was `AnalysisTypeMismatchError`, raised by `resolve_analysis` off `Meta.type`
+    before it built the analysis at all. `Meta.type` said which ROUTE could resolve an
+    analysis, and with one route there is no route kind left to mismatch -- so the check
+    moved into `pipeline()`, where each analysis states its own requirement through
+    `Analysis.require_dataset` / `Analysis.reject_dataset` below. The error survives the
+    field because the mistake it names does: `diff` still cannot difference a dataset
+    nobody chose, and `lnd_type_plus` still reads three fixed inputs that a caller's triple
+    would only contradict.
+    """
+
+
+class AnalysisChainError(AnalysisRegistryError):
+    """A comma-separated chain (`lnd_conf,diff`) put an analysis somewhere it cannot go --
+    today only "a stage after the first is not `kind='dimension'`". Maps to a 400.
+
+    Split out of the former `AnalysisTypeMismatchError`, which carried both this and the
+    dataset question under one name while reporting a `kind` in its message and a `type` in
+    its name. They are unrelated mistakes: this one is about chain POSITION and is decided
+    before anything is resolved; `AnalysisDatasetMismatchError` above is about what the
+    caller selected and is decided inside `pipeline()`.
     """
 
 
 @dataclass(frozen=True)
 class DatasetRef:
-    """The three dataset-selection dimensions a `type="dataset"` analysis is resolved
-    against -- exactly the `variable`/`time_unit`/`grid` triple every flat data endpoint
-    and every `analysis.request.pipeline.InputSelection` already takes. `None` for a
-    `type="custom"` analysis (see `resolve_analysis`), since a custom analysis's inputs
-    are hardcoded in its own `pipeline()` method, not supplied by the route.
+    """The three dataset-selection dimensions an analysis reads its input from -- exactly
+    the `variable`/`time_unit`/`grid` triple the unified data route's own sugar names and
+    every `analysis.request.pipeline.InputSelection` already takes. `None` when the caller
+    named no dataset, which is the only correct call for an analysis whose inputs are
+    hardcoded in its own `pipeline()` method (`lnd_type_plus`, `sal_veg_investigation`).
     """
 
     variable: str
@@ -165,7 +185,7 @@ def dataset_input_selection(dataset: DatasetRef) -> dict[str, Any]:
     WHICH dataset to read and carries no filtering of any kind (it is `extra="forbid"`, so
     a dimension name folded in here is a hard rejection, not a silently-ignored key) --
     a caller's dimension filters become a `filter` STEP instead, via
-    `selection_filter_where` below. Shared by the single-input (`type="dataset"`) entries.
+    `selection_filter_where` below. Shared by the single-input, caller-dataset entries.
     """
     return {
         "variable": dataset.variable,
@@ -189,8 +209,8 @@ def dataset_output_format(dataset: DatasetRef) -> str:
     That makes the declared value a real contract rather than a placeholder, and
     `request.ops.validate_shapes` enforces it in both directions: a long (vector) final
     frame under a raster format is rejected, and so is a band-wide (raster) one under a
-    tabular format. A `type="dataset"` analysis reads whichever dataset the route resolved
-    for it, so the only value that is right for every reachable selection is one derived
+    tabular format. Such an analysis reads whichever dataset the caller named
+    (`Analysis.require_dataset`), so the only value that is right for every reachable selection is one derived
     from that dataset's own grid kind -- these analyses neither project nor change shape,
     so the final frame's kind is the input grid's kind.
     """
@@ -284,15 +304,94 @@ def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     """The dimensions a pipeline's result no longer varies over: every dimension any of
     its inputs carries, minus whatever the pipeline's OWN trailing `group.by` still keeps
     (derived structurally, rather than each analysis hand-declaring it) --
-    `frozenset()` when the last step isn't a `group` at all (nothing has been collapsed).
+    `frozenset()` when nothing collapsing is found (nothing has been collapsed).
     For `sal_veg_investigation`, whose trailing `group.by` is always `[]`, this is
     simply every dimension either input carries (both are pinned single-valued dataset
     selections, so nothing meaningful varies in the output either way).
+
+    Scans BACKWARD past trailing `filter` steps rather than reading `steps[-1]` outright,
+    because a caller's dimension/`grid_cell`/`where` selection is appended to the resolved
+    pipeline as a trailing `filter` (`request.unified`, via `selection_filter_where`). A
+    filter narrows rows; it never collapses a dimension, so it must not hide the `group`
+    that did. Reading `steps[-1]` bare would make every selected request report nothing
+    collapsed, which `visualizations.base` then turns into a `select` naming a column the
+    read cannot find.
+
+    An empty `steps` is the `download` sentinel's shape -- one input, no ops -- and
+    collapses nothing.
     """
-    last_step = pipeline.steps[-1]
-    if not isinstance(last_step, GroupStep):
+    for step in reversed(pipeline.steps):
+        if isinstance(step, FilterStep):
+            continue
+        if isinstance(step, GroupStep):
+            return frozenset(pipeline_input_dimensions(pipeline)) - set(step.by)
         return frozenset()
-    return frozenset(pipeline_input_dimensions(pipeline)) - set(last_step.by)
+    return frozenset()
+
+
+class AnalysisMeta(BaseModel):
+    """One registry entry's static metadata -- a VALIDATED model, instantiated at import
+    time, not the bare `class Meta:` this used to be.
+
+    That change is the point of the class. `/v1/analyses.json` serves these fields
+    directly (`api.__init__.analyses_catalog`), and `resolve_analysis_chain`'s chain gate
+    and `visualizations.map`'s title/legend hooks read them at request time -- so a field
+    an entry simply forgot to declare used to surface as an `AttributeError` (a 500) from
+    whichever of those ran first, at whatever point in the request it ran.
+    `sal_veg_investigation` shipped with no `kind` for exactly that reason. Constructing
+    each `Meta` through this model instead turns every omission and every misspelled value
+    into an error at the import that registers it, where it cannot reach a caller.
+
+    `frozen=True` because these are catalog facts about a class, not per-request state, and
+    `extra="forbid"` so a field name that drifts (a `Meta` still declaring a field this
+    model has dropped) fails loudly rather than being silently ignored the way
+    `api.models.Analysis`'s permissive read of it would.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str
+    label: str
+    # There is no `type` field. It said which ROUTE kind could resolve this analysis
+    # (`"dataset"` took the caller's `{variable}/{time_unit}/{grid}` path segments,
+    # `"custom"` fixed its own inputs and required `dataset=None`) and had exactly two
+    # enforcers, `resolve_analysis`'s `expected_type` check and `api.utils.
+    # get_analysis_class(name, type)`. Both were route-layer discriminators, and there is
+    # one route now. The underlying REQUIREMENT did not go away and is stated where it is
+    # actually known -- in each `pipeline()`, via `Analysis.require_dataset` /
+    # `Analysis.reject_dataset`.
+    #
+    # The analysis's PRESENTATION class, which is a different partition from the one
+    # `type` drew and the one the portal actually renders from:
+    #
+    # - `"variable"` stands in for one (or several) input variable(s) in the portal's
+    #   variable dropdown (`lnd_conf`, `lnd_chng`, `lnd_type_plus`);
+    # - `"dimension"` operates across one dimension of whatever it is given -- a plain
+    #   dataset, or the output of a `"variable"` analysis it is chained after (`diff`).
+    #   Only this kind may appear as a non-leading stage of a chain (see
+    #   `resolve_analysis_chain`);
+    # - `"internal"` is neither: no variable-dropdown role and nothing to chain onto it
+    #   (`sal_veg_investigation`, which exists to exercise the multi-input path).
+    #
+    # Required, and three-valued. It was an optional `str | None` whose `None` meant
+    # "internal" by omission, which is indistinguishable from "the author forgot".
+    kind: Literal["variable", "dimension", "internal"]
+    # Which datasets an analysis that reads the caller's dataset is meaningful for; `None`
+    # means "any", and is also what an analysis with fixed inputs declares, since it has no
+    # caller-chosen dataset to qualify.
+    variables: list[str] | None = None
+    # A `structure/legends.csv` name that overrides the input variable's own legend, and the
+    # kind of value the result carries. Both are presentation overrides consulted ahead of
+    # anything derivable from the pipeline -- see `analysis.request.descriptor`, which
+    # derives the rest and deliberately does not fold these in.
+    legend: str | None = None
+    result_kind: Literal["value", "difference", "category"] = "value"
+    # The dimensions this analysis removes from the caller's view, for the portal's
+    # `subsumedFor(dataset)` lookup -- advisory catalog metadata only. It plays no role in
+    # resolution or chaining, both of which read the runtime `collapsed_dimensions` instead
+    # (see `default_collapsed_dimensions` above and each `Analysis` subclass's own
+    # `collapsed_dimensions` property/override).
+    subsumed_dimensions: list[str] = []
 
 
 class AnalysisParameters(BaseModel):
@@ -310,10 +409,9 @@ class AnalysisParameters(BaseModel):
 class Analysis:
     """Base class for one `ANALYSES` registry entry. A concrete subclass declares:
 
-    - a nested `Meta` (a plain class, not a pydantic model -- mirrors
-      `visualizations.stacked_bar.StackedBar.Meta`): `name`, `label`, `type`
-      (`"dataset"` or `"custom"`), `variables` (`None` = any), `legend`, `result_kind`
-      (`"value"`, `"difference"`, or `"category"`);
+    - a `Meta` -- an `AnalysisMeta` INSTANCE, built at import time, so every required
+      field's absence and every misspelled value is an import error rather than a 500 from
+      whichever consumer reached for it first (see `AnalysisMeta`);
     - a nested `Parameters` (a pydantic model subclassing `AnalysisParameters`) for its
       own request-specific parameters;
     - a `pipeline()` method building a real `analysis.request.pipeline.Pipeline` from
@@ -331,26 +429,11 @@ class Analysis:
     hand-declared value.
     """
 
-    class Meta:
-        name: ClassVar[str]
-        label: ClassVar[str]
-        type: ClassVar[str]
-        variables: ClassVar[list[str] | None] = None
-        legend: ClassVar[str | None] = None
-        result_kind: ClassVar[str] = "value"
-        # "variable": stands in for one (or several) input variable(s) in the portal's
-        # variable dropdown, e.g. `lnd_conf`. "dimension": operates across one
-        # dimension of whatever it's given -- a plain dataset or the output of a
-        # `kind="variable"` analysis it's chained after, e.g. `diff`. `None` (the
-        # default) is neither -- `sal_veg_investigation`'s reading, a `type="custom"`
-        # analysis with no variable-dropdown role and nothing to chain onto it.
-        kind: ClassVar[str | None] = None
-        # The dimensions this analysis removes from the caller's view, for the portal's
-        # `subsumedFor(dataset)` lookup -- advisory catalog metadata only. It plays no role
-        # in resolution or chaining, both of which read the runtime `collapsed_dimensions`
-        # instead (see `default_collapsed_dimensions` below and each `Analysis` subclass's
-        # own `collapsed_dimensions` property/override).
-        subsumed_dimensions: ClassVar[list[str]] = []
+    # Declared, not defaulted: there is no sensible `name`/`label`/`type`/`kind` for the
+    # abstract base, and a stand-in would only let a subclass inherit one silently. A
+    # subclass that declares no `Meta` fails at `analyses.ANALYSES`'s own registration
+    # check, which is import time.
+    Meta: ClassVar[AnalysisMeta]
 
     class Parameters(AnalysisParameters):
         pass
@@ -382,6 +465,42 @@ class Analysis:
 
     def pipeline(self) -> Pipeline:
         raise NotImplementedError
+
+    def require_dataset(self) -> DatasetRef:
+        """`self.dataset`, or a 400 naming what to send -- for an analysis that reads
+        whatever dataset the caller chose.
+
+        This is the half of the retired `Meta.type` gate that still has to be enforced, and
+        it is a `raise` rather than the `assert` it replaces because it is now reachable
+        from an ordinary request. Under the old route layout the two cases were structural:
+        `/v1/datasets/{variable}/{time_unit}/{grid}/analyses/...` could not be matched
+        without a triple and `/v1/analyses/{name}/...` had nowhere to put one, so an
+        `assert` only ever documented a route-layer invariant. On one route the triple is
+        query sugar a caller may simply omit, and omitting it must answer 400, not 500.
+        """
+        if self.dataset is None:
+            raise AnalysisDatasetMismatchError(
+                f"analysis {self.Meta.name!r} reads the dataset you choose -- name one "
+                "with variable=, time_unit= and grid="
+            )
+        return self.dataset
+
+    def reject_dataset(self) -> None:
+        """The mirror image, for an analysis whose inputs are fixed in `pipeline()`.
+
+        Rejected rather than ignored: the triple is INPUT sugar (it is how the unified
+        route spells "read this dataset"), and an analysis that reads three fixed inputs
+        across two grids has nothing to read it as. Accepting it silently would leave a
+        caller believing they had selected something. What a chart drawn from such an
+        analysis renders on is a separate question, answered from the resolved pipeline by
+        `analysis.request.descriptor.output_descriptor` rather than from a triple the
+        caller had to invent to agree with it.
+        """
+        if self.dataset is not None:
+            raise AnalysisDatasetMismatchError(
+                f"analysis {self.Meta.name!r} reads its own fixed inputs and takes no "
+                f"dataset -- drop variable=, time_unit= and grid= (got {self.dataset!r})"
+            )
 
     def _dimension_steps(self, group_by: list[str]) -> list[dict]:
         """The steps a `kind="dimension"` analysis contributes when chained after
@@ -416,7 +535,7 @@ class ResolvedAnalysis:
     """
 
     pipeline: Pipeline
-    meta: type
+    meta: AnalysisMeta
     legend: str | None
     result_kind: str
     collapsed_dimensions: frozenset[str]

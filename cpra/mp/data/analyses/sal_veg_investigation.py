@@ -1,4 +1,4 @@
-"""`sal_veg_investigation` -- the one `type="custom"` v1 entry: the earliest calendar
+"""`sal_veg_investigation` -- the one v1 entry with FIXED inputs: the earliest calendar
 year at which marsh coverage (`ffibs_coverage_ratio`/annual/`veg_grid_cell_v001`,
 `ffibs_type=pl_fm`) and paired salinity (`sal`/annual/`hydro_compartment_v001`,
 `aggregate_type=2_wk_max`) both cross their thresholds, at every vegetation-grid pixel --
@@ -10,7 +10,7 @@ This is the salinity/freshwater-vegetation QA-QC investigation the team's templa
 notebook works through block by block ("the first year each freshwater marsh raster cell
 exceeds the given salinity threshold"), served as one request instead.
 
-The only entry exercising the `type="custom"` path, multiple named inputs, and a
+The only entry exercising the fixed-input path, multiple named inputs, and a
 `project` + spatial `join`, and the only one with no existing consumer (unlike
 `diff`/`lnd_chng`, which replace real portal catalog entries).
 
@@ -40,24 +40,36 @@ from pydantic import Field
 
 from cpra.mp.data.analyses.base import (
     Analysis,
-    InvalidAnalysisParametersError,
+    AnalysisMeta,
     selection_filter_where,
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 
 class SalinityVegInvestigation(Analysis):
-    class Meta:
-        name = "sal_veg_investigation"
-        label = "Salinity-Veg Investigation"
-        type = "custom"
-        variables = None
-        legend = None
-        result_kind = "value"
+    Meta = AnalysisMeta(
+        name="sal_veg_investigation",
+        label="Salinity-Veg Investigation",
+        variables=None,
+        legend=None,
+        result_kind="value",
+        # Neither a variable the portal offers nor a stage anything may chain onto: this
+        # entry exists to exercise the two-input, two-grid path end to end. It declared no
+        # `kind` at all until `AnalysisMeta` made the field required -- which read as
+        # `None` at `resolve_analysis_chain`'s gate and at `map.py`'s title hook, i.e.
+        # indistinguishable from an author who forgot one.
+        kind="internal",
+    )
 
     class Parameters(Analysis.Parameters):
-        model_group_id: int
-        scenario_id: int
+        # `model_group_id`/`scenario_id` were declared here too, required, back when a
+        # fixed-input analysis could not RECEIVE a dimension filter. They are ordinary
+        # filters now, composed into the trailing `filter` step `pipeline()` writes over the
+        # joined frame; see `lnd_type_plus.Parameters` for the whole argument, including why
+        # nothing replaces the `required`. What is left is the two THRESHOLDS, which were
+        # never dimensions -- they are this analysis's own numbers, and `analyses._register`'s
+        # dimension-name check passes precisely because neither names one.
+        #
         # Bounded, per the task's own callout ("be careful about quoting/validation
         # there, it is the point of this entry"): both thresholds are interpolated
         # directly into a pipeline `filter.where` string below. Pydantic's `float` +
@@ -70,45 +82,37 @@ class SalinityVegInvestigation(Analysis):
         marsh_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
         salinity_threshold: float = Field(default=5.5, ge=0.0)
 
-    @classmethod
-    def validate_selection(cls, parameters, filters):
-        """Reject a selection outright rather than accepting one `pipeline()` below would
-        silently drop.
-
-        A `type="dataset"` analysis composes `filters` into its leading `filter` step via
-        `selection_filter_where(self.filters)`; this one cannot. It has no dataset, and
-        its two inputs sit on DIFFERENT grids (`veg_grid_cell_v001` pixels and
-        `hydro_compartment_v001` polygons), so neither a `grid_cell` selection nor a bare
-        `where` has one unambiguous frame to apply to -- and the caller-facing dimension
-        values it does accept (`model_group_id`/`scenario_id`) are declared `Parameters`,
-        applied to both inputs by `pipeline()` itself. Silently ignoring a `grid_cell` the
-        caller sent would look like a whole-extent answer to a point query.
-        """
-        if filters:
-            raise InvalidAnalysisParametersError(
-                f"analysis 'sal_veg_investigation' takes no selection, but got: "
-                f"{', '.join(sorted(filters))} -- it names its own two inputs, on two "
-                f"different grids, so there is no single frame for a grid_cell/where to "
-                f"narrow; its dimension values are parameters "
-                f"(model_group_id, scenario_id) instead"
-            )
+    # No `validate_selection`. It rejected any `filters` at all, on the reading that a
+    # fixed-input analysis has no single frame for a selection to narrow -- true of a
+    # `grid_cell`, which names a cell in a lattice this request does not say which of, and
+    # NOT true of the dimension filters that made up every real use of it. The engine now
+    # makes that distinction itself: a dimension conjunct on the joined frame pushes down to
+    # both origins' reads (`execution.plan`), while a spatial or value predicate lowers the
+    # frame to long (`request.ops.FILTER_LOWERING_TABLE`) and is then rejected against this
+    # analysis's raster `output.format` by `validate_shapes`, with a message that says which
+    # of the two problems the caller actually has.
 
     def pipeline(self):
-        assert self.dataset is None, "sal_veg_investigation is a type='custom' analysis"
+        self.reject_dataset()
         p = self.parameters
-        coverage_where = selection_filter_where(
-            {
-                "model_group_id": p.model_group_id,
-                "scenario_id": p.scenario_id,
-                "ffibs_type": "pl_fm",
-            }
-        )
-        salinity_where = selection_filter_where(
-            {
-                "model_group_id": p.model_group_id,
-                "scenario_id": p.scenario_id,
-                "aggregate_type": "2_wk_max",
-            }
+        # The caller's selection, stated ONCE on the joined frame below rather than folded
+        # into each input's own `filter`. `execution.plan`'s dimension passes push a
+        # conjunct declared anywhere down to every origin's read, across the join and past
+        # the `project`, so the two read the same bytes either way -- and stating it once
+        # keeps it from having to be spelled twice, in two dicts that could drift.
+        selection_where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
+        # What stays per-input is DEFINITIONAL rather than selected: `ffibs_type=pl_fm` is
+        # the freshwater marsh this investigation is about, and `aggregate_type=2_wk_max` is
+        # the one reading of salinity its threshold means anything against. Neither is a
+        # dimension the pairing carries -- each is declared by exactly one of the two
+        # inputs -- so there is no later frame to state either on.
+        coverage_where = selection_filter_where({"ffibs_type": "pl_fm"})
+        salinity_where = selection_filter_where({"aggregate_type": "2_wk_max"})
+        # Between the join and the threshold `case`, for the same reason `lnd_type_plus`
+        # puts its own there: a dimension filter leaves the pairing standing, and the `case`
+        # is what collapses it. `None` when the caller selected nothing, which is now legal.
+        selection_steps = (
+            [] if selection_where is None else [{"op": "filter", "where": selection_where}]
         )
         data = {
             "inputs": {
@@ -138,6 +142,7 @@ class SalinityVegInvestigation(Analysis):
                     "as": "sal",
                 },
                 {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
+                *selection_steps,
                 # The threshold test, as a single-armed `case` over the pair -- see "Why
                 # the threshold test is a `case`" in the module docstring. No `else`, so a
                 # year failing either threshold comes out null and the `group` below skips

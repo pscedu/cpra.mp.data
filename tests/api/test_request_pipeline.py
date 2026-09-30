@@ -424,6 +424,65 @@ class TestGroupStep:
         assert pipeline.steps[-1].of == "calendar_year"
 
 
+class TestUnpivotStep:
+    """The structural half of `unpivot` -- names and defaults. What it does to the frame's
+    shape is `test_request_ops.TestUnpivotShapeRules`.
+    """
+
+    def test_into_defaults_to_variable(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot"})
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[-1].into == "variable"
+
+    def test_into_may_be_a_dimension_name(self):
+        """The one name-rule exemption (`_validate_name(allow_dimension=True)`): the label
+        column's contents ARE dimension values, and its default is itself a dimension, so
+        the collision check every other chosen name gets would reject the default."""
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "into": "scenario_id"})
+        pipeline = parse_pipeline(data)
+        assert pipeline.steps[-1].into == "scenario_id"
+
+    def test_into_must_still_be_snake_case(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "into": "NotSnakeCase"})
+        with pytest.raises(RequestError, match="must match"):
+            parse_pipeline(data)
+
+    def test_into_may_not_be_a_reserved_word(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "into": "value"})
+        with pytest.raises(RequestError, match="reserved"):
+            parse_pipeline(data)
+
+    def test_into_may_not_be_a_positional_band_name(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "into": "b0"})
+        with pytest.raises(RequestError, match="positional band-name"):
+            parse_pipeline(data)
+
+    def test_as_still_gets_the_ordinary_name_rules(self):
+        """Only `into` is exempt -- an `unpivot`'s own output name is a name like any
+        other."""
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "as": "scenario_id"})
+        with pytest.raises(RequestError, match="dimension"):
+            parse_pipeline(data)
+
+    def test_unpivot_without_an_input_cannot_be_first_step(self):
+        data = simple_pipeline()
+        data["steps"] = [{"op": "unpivot"}]
+        with pytest.raises(RequestError, match="no input to chain from"):
+            parse_pipeline(data)
+
+    def test_unknown_field_rejected(self):
+        data = simple_pipeline()
+        data["steps"].append({"op": "unpivot", "on": ["a", "b"]})
+        with pytest.raises(ValueError):
+            parse_pipeline(data)
+
+
 class TestZeroStepPipelines:
     def test_zero_step_pipeline_with_one_input_accepted(self):
         data = {
@@ -855,6 +914,7 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
             "calculate": {"op", "input", "expression", "as"},
             "case": {"op", "input", "cases", "else", "as"},
             "group": {"op", "input", "by", "aggregate", "of", "as"},
+            "unpivot": {"op", "input", "into", "as"},
         }
 
     def test_the_tables_cover_exactly_the_ops_the_discriminator_accepts(self):
@@ -949,6 +1009,7 @@ class TestTheQueryCodecsFieldTablesTrackTheModels:
                     "of": "calendar_year",
                     "as": "earliest",
                 },
+                {"op": "unpivot", "input": "earliest", "into": "measurement", "as": "stacked"},
             ],
             "output": {"format": "csv", "color_map": "viridis", "sort": "-value", "select": "grid_cell,value"},
         }

@@ -97,10 +97,26 @@ DOMAIN_COLUMN = "__domain__"
 # Output formats that render to a single raster/image surface (a GeoTIFF band or a map
 # tile pixel) rather than a table -- these need a band-wide (not long) final frame; see
 # `ops.validate_shapes`'s sink-shape rule, which is what actually enforces this.
+#
+# `pbf` is deliberately NOT here. A vector tile is drawn, like a `png`, but it is drawn
+# from ROWS: the geometry comes from the grid's PMTiles boundary archive and the pipeline
+# contributes one value per `grid_cell`, so what it needs from the final frame is what a
+# CSV needs, plus the stricter requirement that the frame be addressed against a vector
+# grid at all. That extra half is `validate_shapes`'s own `pbf` rule, which is why `pbf`
+# cannot simply be sorted into one of these two buckets.
 RASTER_OUTPUT_FORMATS = frozenset({DataFormat.tif.value, TileFormat.png.value, TileFormat.jpg.value})
 
 
-def _validate_name(name: str, kind: str) -> None:
+def _validate_name(name: str, kind: str, *, allow_dimension: bool = False) -> None:
+    """The identifier rule for a name a request CHOOSES -- an input key, a step's `as`, an
+    `unpivot`'s `into` column.
+
+    `allow_dimension` opts out of the last check alone, and exists for exactly one caller:
+    an `unpivot`'s label column, whose whole job is to hold variable names and whose
+    default (`"variable"`) is therefore a dimension on purpose. For every other name the
+    collision is a real hazard -- see that check's own message -- so the opt-out is stated
+    at the one call site that needs it rather than being the default.
+    """
     if not name:
         raise RequestError(f"{kind} name must not be empty")
     if not _NAME_RE.match(name):
@@ -117,12 +133,20 @@ def _validate_name(name: str, kind: str) -> None:
             f"{kind} name {name!r} matches the positional band-name pattern (b0, b1, ...) "
             "or the reserved _band index column, and would be shadowed by it"
         )
-    if name in DIMENSIONS:
+    if name in DIMENSIONS and not allow_dimension:
         raise RequestError(
             f"{kind} name {name!r} collides with a dimension the data structure already "
             "declares -- this only bites once a join renames a value column to this "
             "name, which is exactly why it is rejected up front instead"
         )
+
+
+def _validate_label_column_name(i: int, into: str) -> None:
+    """An `unpivot`'s `into`: the identifier rule minus the dimension-collision check --
+    see `UnpivotStep`, and `_validate_name`'s `allow_dimension`, for why that one does not
+    apply to a column whose contents ARE dimension values.
+    """
+    _validate_name(into, f"step {i} (unpivot) 'into'", allow_dimension=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -331,8 +355,49 @@ class CaseStep(BaseModel):
     as_: str | None = Field(default=None, alias="as")
 
 
+class UnpivotStep(BaseModel):
+    """Fold a `join`'s several operand-named value columns back into ONE `value` column,
+    plus a label column (`into`) carrying the operand name each folded row came from --
+    the inverse of what a `join` does to the frame's width, and the op that lets a
+    multi-variable result reach a sink at all.
+
+    **Why this exists rather than a wider sink rule.** `ops.validate_shapes` requires
+    exactly one value column at the sink, and the two ways to satisfy that from a join's
+    output are to COLLAPSE the operands into one number (`case`/`calculate`, which is what
+    `lnd_type_plus` does) or to keep all of them and stack them. Stacking is what a chart
+    of five variables over one pixel needs, and it is the only one of the two that does
+    not throw four of the five measurements away. Relaxing the sink rule instead would
+    push the cost onto every consumer of `value` -- the shared chart base class, the
+    vector-tile sink, and `_type_project`/`_type_group`, all of which name that column
+    literally -- so the fold happens here, once, and everything downstream keeps seeing
+    the one-value-column frame it already expects.
+
+    **Long only.** A band-wide frame's bands are POSITIONAL (`b0`, `b1`, ...), and folding
+    them means naming the band metadata each column stands for, which is the band-wide-to-
+    long transition itself rather than a fold -- `ops._type_unpivot` rejects a band-wide
+    input and says so. For a single-pixel chart that costs nothing: the `grid_cell` filter
+    has already lowered the frame (`FILTER_LOWERING_TABLE`'s one shape-changing entry).
+
+    `into` defaults to `"variable"`, which is a DIMENSION name on purpose -- a join names
+    each operand after the variable it reads, so the folded labels are variable names and
+    land in the column that already means that everywhere else. It is therefore checked
+    against the reserved/band-name rules but NOT against `DIMENSIONS` the way an input or
+    an `as` is (`_validate_label_column_name`): colliding with a dimension is the point.
+
+    `input` is optional, chaining from the previous step, the same as
+    `project`/`filter`/`calculate`/`case`/`group`.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    op: Literal["unpivot"] = "unpivot"
+    input: str | None = None
+    into: str = "variable"
+    as_: str | None = Field(default=None, alias="as")
+
+
 Step = Annotated[
-    ProjectStep | JoinStep | FilterStep | CalculateStep | CaseStep | GroupStep,
+    ProjectStep | JoinStep | FilterStep | CalculateStep | CaseStep | GroupStep | UnpivotStep,
     Field(discriminator="op"),
 ]
 
@@ -354,7 +419,7 @@ def _step_explicit_inputs(step: Any) -> list[str]:
 
 class Output(BaseModel):
     """`format` reuses `DataFormat` (tabular formats + `tif`) and `TileFormat`
-    (`png`/`jpg`) directly rather than a third format enum. `color_map` is only
+    (`png`/`jpg`/`pbf`) directly rather than a third format enum. `color_map` is only
     meaningful for a rendered/raster format; not checked here (that needs to know the
     final frame's shape, which needs the shape-typing walk -- see `ops.validate_shapes`).
     `sort`/`select` are a comma-separated `[-]column` list and a comma-separated column
@@ -433,6 +498,10 @@ def validate_pipeline(pipeline: Pipeline) -> None:
       a `when`'s conjuncts name columns the frame actually carries is checked downstream --
       `ops._type_case` rejects a `grid_cell` one, and the rest resolve at execution, where
       the band metadata is in hand;
+    - `unpivot.into` matches the identifier rule, minus the dimension-collision check a
+      name a request chooses otherwise gets (`_validate_label_column_name`). That the
+      frame actually has several value columns to fold, and that `into` does not collide
+      with one of them, needs the typing walk and is `ops._type_unpivot`'s job;
     - `output.sort`/`output.select` are syntactically sound comma-separated `[-]column`
       lists -- no empty component, no bare `-`, no `-`-prefixed `select` entry, no name
       repeated within one list (`_validate_output_sort_or_select`). Whether a named
@@ -518,6 +587,8 @@ def _validate_step_rules(i: int, step: Any) -> None:
             aggregates.validate_group_aggregate(step.aggregate)
         except AggregateError as exc:
             raise RequestError(f"step {i} (group): {exc}") from exc
+    elif isinstance(step, UnpivotStep):
+        _validate_label_column_name(i, step.into)
     else:  # pragma: no cover -- exhaustive over the Step union
         raise RequestError(f"step {i} has unrecognized op {getattr(step, 'op', None)!r}")
 

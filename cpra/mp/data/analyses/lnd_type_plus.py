@@ -1,4 +1,4 @@
-"""`lnd_type_plus` -- a `type="custom"` analysis that extends the `lnd_type` categorical
+"""`lnd_type_plus` -- a fixed-input analysis that extends the `lnd_type` categorical
 surface with two SHALLOW-INUNDATION classes the morphology model's land types do not
 themselves distinguish. Annual inundation depth is COMPUTED here rather than read: mean
 annual stage (`stg`/annual/`hydro_compartment_v002`, `aggregate_type=mean`) is projected
@@ -111,8 +111,9 @@ horizontal `sum` SKIPS nulls rather than propagating them, so a pixel with eleva
 stage summed to the bare negated elevation and reclassified as real inundation wherever the
 ground sits below the NAVD88 datum. Four steps became none.
 
-**Why the selection is stated once, at the end.** `model_group_id`/`scenario_id`/
-`calendar_year` are one `filter` on the fully joined frame, just before the `case`, rather
+**Why the selection is stated once, at the end.** The caller's dimension filters -- in
+practice `model_group_id`/`scenario_id`/`calendar_year` -- are one `filter` on the fully
+joined frame, just before the `case`, rather
 than a leading `filter` repeated per input. Every step between the reads and that filter
 works one (model group, scenario, year) triple at a time -- the join groups band-for-band on
 exactly those three dimensions and the `case` collapses a pairing that agrees on them -- so
@@ -156,12 +157,10 @@ it to null before any step here sees it. So the `else` hands back a null rather 
 `-9999`, and a sentinel can never be mistaken for a land-type code.
 """
 
-from typing import Any
-
 from cpra.mp.data.analyses.base import (
     Analysis,
+    AnalysisMeta,
     DatasetRef,
-    InvalidAnalysisParametersError,
     required_dataset_dimensions,
     selection_filter_where,
 )
@@ -221,65 +220,46 @@ def _ordered_intersection(*sequences: list[str]) -> list[str]:
 
 
 class LndTypePlus(Analysis):
-    class Meta:
-        name = "lnd_type_plus"
-        label = "Land Type Plus"
-        type = "custom"
-        # `None`, not a variable list: this field says which dataset a `type="dataset"`
-        # analysis is meaningful for, and a custom analysis has no caller-chosen dataset
-        # to qualify -- its inputs are fixed in `pipeline()` below. Same reading as
-        # `sal_veg_investigation`'s.
-        variables = None
+    Meta = AnalysisMeta(
+        name="lnd_type_plus",
+        label="Land Type Plus",
+        # `None`, not a variable list: this field says which dataset an analysis that
+        # reads the caller's dataset is meaningful for, and this one has no caller-chosen
+        # dataset to qualify -- its inputs are fixed in `pipeline()` below, which
+        # `reject_dataset` enforces. Same reading as `sal_veg_investigation`'s.
+        variables=None,
         # `structure/legends.csv`'s own `lnd_type_plus` entry, which covers the full `1`-`7`
         # result domain. NOT `lnd_type`: its ramp stops at `5`, so both shallow classes
         # would render off the end of it. The two legends share their `1`-`5` colors, so a
         # pixel this analysis leaves alone draws the same as it does under plain `lnd_type`;
         # the entry's own `2` is relabelled "Water - Deep" because that is what a `2` here
         # means -- open water that either carries no depth or is deeper than 1.0 m.
-        legend = "lnd_type_plus"
-        result_kind = "category"
-        kind = "variable"
-        subsumed_dimensions = ["aggregate_type"]
+        legend="lnd_type_plus",
+        result_kind="category",
+        kind="variable",
+        subsumed_dimensions=["aggregate_type"],
+    )
 
     class Parameters(Analysis.Parameters):
-        # Required, and for the same reason `sal_veg_investigation`'s are: with no
-        # dataset in the URL these arrive as the analysis's own parameters rather than as
-        # dimension filters (see `api.__init__._resolve_custom_analysis`), and leaving
-        # either unpinned would read every model group / scenario on disk into one
-        # band-wide join, whose operand union is what `config.ANALYSIS_BAND_CEILING` is
-        # checked against.
-        model_group_id: int
-        scenario_id: int
-        # Optional: omitted means every year, one output band per year (the `case`'s
-        # pairing keeps `calendar_year`), which is a legitimate multi-band request and is
-        # also a large read -- three inputs' worth here. A single year is the common case.
-        calendar_year: int | None = None
+        """No parameters of its own.
 
-    @classmethod
-    def validate_selection(cls, parameters: "LndTypePlus.Parameters", filters: dict[str, Any]) -> None:
-        """Reject a selection outright rather than accepting one `pipeline()` silently
-        drops -- the same contract `sal_veg_investigation` has, and now for the same
-        reason as well: with stage on `hydro_compartment_v002` and the other two inputs on
-        `morph_pixel_v002`, a `grid_cell` names a cell in a lattice the request does not
-        say which of.
+        `model_group_id`/`scenario_id`/`calendar_year` were declared here, the first two
+        required, back when a fixed-input analysis could not RECEIVE a dimension filter:
+        the route split meant a request with no dataset in its URL had nowhere to put one,
+        so the dimension values this analysis needs pinned arrived as parameters instead.
+        With one route and one selection rule they are ordinary filters again -- composed
+        into the same trailing `filter` step below, pushed down to all three origins by
+        `execution.plan`, and named identically to the way they are named for every other
+        analysis.
 
-        A caller-written `where` has the same problem in the value direction: it would
-        have to be applied to one of three inputs, and nothing in the request says which.
-        And a spatial predicate would additionally turn a band-wide frame long
-        (`request.ops.FILTER_LOWERING_TABLE`), making the raster `output.format` this
-        analysis declares invalid rather than merely narrowing the result. Both are
-        rejected rather than half-supported; the dimension values this analysis does take
-        are `Parameters`.
+        Nothing replaces the `required` part. Leaving a model group or scenario unpinned is
+        a large read -- three inputs' worth, across every model group and scenario on disk
+        -- and what bounds it is `config.ANALYSIS_BAND_CEILING`, checked against the join's
+        operand union, rather than a required field here. A dimension-named parameter is
+        exactly what `analyses._register` now forbids: with none declared anywhere, a
+        dimension name is ALWAYS a filter, and the decoder's partition cannot mispartition
+        one into a `Parameters` default while the caller's real value goes to `filters`.
         """
-        if filters:
-            raise InvalidAnalysisParametersError(
-                f"analysis 'lnd_type_plus' takes no selection, but got: "
-                f"{', '.join(sorted(filters))} -- it names its own three inputs, across "
-                f"two different grids, and joins them as raster surfaces, so a "
-                f"grid_cell/where has no single frame to narrow and would change the "
-                f"result's shape rather than its extent; its dimension values are "
-                f"parameters (model_group_id, scenario_id, calendar_year) instead"
-            )
 
     @property
     def collapsed_dimensions(self) -> frozenset[str]:
@@ -311,23 +291,25 @@ class LndTypePlus(Analysis):
         return frozenset(declared - shared)
 
     def pipeline(self):
-        assert self.dataset is None, "lnd_type_plus is a type='custom' analysis"
-        p = self.parameters
+        self.reject_dataset()
 
-        selection: dict[str, Any] = {
-            "model_group_id": p.model_group_id,
-            "scenario_id": p.scenario_id,
-        }
-        if p.calendar_year is not None:
-            selection["calendar_year"] = p.calendar_year
         # The caller's selection, written ONCE, at the end -- see "Why the selection is
-        # stated once, at the end" in the module docstring. `stage_where` is not a selection
-        # at all: `aggregate_type` is this analysis's own definitional choice, and it has to
-        # be applied on stage's own branch, because nothing downstream pairs or groups on a
-        # dimension only one input declares. Left unfiltered, stage would bring one band per
-        # aggregate type into a pairing that expects exactly one band per operand, and the
-        # whole year would pair-miss and drop.
-        selection_where = selection_filter_where(selection)
+        # stated once, at the end" in the module docstring. `self.filters`, not
+        # `self.parameters`: the dimension values are ordinary filters now (see
+        # `Parameters` above), which is also what lets a `grid_cell`/`where` through, since
+        # `selection_filter_where` composes all three into the same conjunct. Both of those
+        # lower the frame to long (`request.ops.FILTER_LOWERING_TABLE`), so this analysis's
+        # own raster `output.format` then fails `validate_shapes` with the targeted
+        # spatial-lowering message -- which is the rejection the deleted blanket
+        # `validate_selection` was approximating, stated by the shape checker that actually
+        # knows, and only for the formats it is actually wrong for.
+        #
+        # `stage_where` is not a selection at all: `aggregate_type` is this analysis's own
+        # definitional choice, and it has to be applied on stage's own branch, because
+        # nothing downstream pairs or groups on a dimension only one input declares. Left
+        # unfiltered, stage would bring one band per aggregate type into a pairing that
+        # expects exactly one band per operand, and the whole year would pair-miss and drop.
+        selection_where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
         stage_where = selection_filter_where({"aggregate_type": STAGE_AGGREGATE_TYPE})
 
         steps: list[dict] = [
@@ -349,15 +331,21 @@ class LndTypePlus(Analysis):
                 "inputs": ["stage_m", "elevation", "land_type"],
                 "as": "paired",
             },
-            # The caller's selection, and the only one this pipeline states. Declared past
-            # the join, it is a dimension conjunct over a frame all three origins feed --
-            # exactly the case `execution.plan`'s two dimension passes exist for, so it
-            # narrows every origin's READ rather than only the frame it is written on. See
-            # the module docstring. It sits before the `case` because a dimension filter
-            # leaves the pairing standing and the `case` is what collapses it; nothing may
-            # follow that collapse which would want the pair back.
-            {"op": "filter", "where": selection_where, "as": "selected"},
         ]
+        # The caller's selection, and the only one this pipeline states. Declared past the
+        # join, it is a dimension conjunct over a frame all three origins feed -- exactly
+        # the case `execution.plan`'s two dimension passes exist for, so it narrows every
+        # origin's READ rather than only the frame it is written on. See the module
+        # docstring. It sits before the `case` because a dimension filter leaves the pairing
+        # standing and the `case` is what collapses it; nothing may follow that collapse
+        # which would want the pair back.
+        #
+        # Conditional, because an unfiltered request is now legal: with the dimension values
+        # no longer required `Parameters`, `selection_filter_where` returns `None` for a
+        # caller who selected nothing, and a `filter` step with no `where` is not a step.
+        # The `case` then chains from the join directly.
+        if selection_where is not None:
+            steps.append({"op": "filter", "where": selection_where, "as": "selected"})
         # The depth, its reclassification, the water restriction AND the land type showing
         # through, in one step -- see "Why the reclassification is one `case` step" in the
         # module docstring. `DEPTH_CLASSES` is stated ascending by bound, each interval open

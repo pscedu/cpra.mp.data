@@ -2,8 +2,10 @@
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from cpra.mp.data import config
+from cpra.mp.data.analyses.base import AnalysisMeta
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.legends import LEGENDS
@@ -160,35 +162,34 @@ class TestVisualizations:
             assert viz["type"] in ("dataset", "custom")
 
 
-class _FakeCatalogAnalysisMeta:
-    name = "lnd_chng"
-    label = "Land Change"
-    type = "dataset"
-    variables = ["ssf"]
-    legend = None
-    result_kind = "vector"
-    kind = "variable"
-    subsumed_dimensions = ["scenario_id"]
-
-
 class _FakeCatalogAnalysis:
-    Meta = _FakeCatalogAnalysisMeta
+    # A real `AnalysisMeta`, not a stand-in class: the route serves `Meta.model_dump()`,
+    # so a fake that only duck-types the attribute reads would not exercise it. Building
+    # it here also keeps this fake honest about the required fields -- `kind` cannot be
+    # left off a fake any more than it can be left off a real entry.
+    Meta = AnalysisMeta(
+        name="lnd_chng",
+        label="Land Change",
+        variables=["ssf"],
+        legend=None,
+        result_kind="value",
+        kind="variable",
+        subsumed_dimensions=["scenario_id"],
+    )
 
 
 class TestAnalyses:
-    """`/v1/analyses.json`, mirroring `TestVisualizations` above --
-    built the same way (`analysis.Meta.__dict__` per registered class). The real registry
-    (`cpra.mp.data.analyses.ANALYSES`) is a concurrent change that may not have
-    landed yet (see `api/utils.py`'s guarded import), so this monkeypatches a small fake
-    registry onto both places `api/__init__.py`/`api/utils.py` bind the name, exercising
-    the route itself rather than the real analyses' content -- see
-    `tests/api/test_analyses_endpoints.py` for the full route-surface coverage.
+    """`/v1/analyses.json`, built from `analysis.Meta.model_dump()` per registered class.
+    Not quite the mirror of `TestVisualizations` above it any more: those `Meta`s are still
+    bare classes served through `__dict__`, while every analysis `Meta` is a validated
+    `AnalysisMeta` instance.
 
-    The fake `Meta`/analysis classes above are module-level, not nested inside this test
-    class: a nested class body has no closure over its enclosing class body's namespace
-    (unlike a nested function), so `class _FakeAnalysis: Meta = _Meta` would raise
-    `NameError` at collection time if `_Meta` were itself just another sibling nested
-    class here.
+    This monkeypatches a small fake registry onto both places `api/__init__.py`/
+    `api/utils.py` bind the name, exercising the route itself rather than the real
+    analyses' content -- see `tests/api/test_analyses_endpoints.py` for the full
+    route-surface coverage. The fake analysis class is module-level rather than nested
+    here: a nested class body has no closure over its enclosing class body's namespace
+    (unlike a nested function).
     """
 
     @pytest.fixture(autouse=True)
@@ -205,9 +206,13 @@ class TestAnalyses:
         assert response.status_code == 200
         assert {a["name"] for a in response.json()} == {"lnd_chng"}
 
-    def test_each_entry_declares_a_type(self, client):
+    def test_no_entry_carries_a_type(self, client):
+        """`AnalysisMeta` dropped `type` with the route split that read it, and
+        `api.models.Analysis` dropped it too -- so the field is absent from the wire rather
+        than serving as `null`. `kind` is the surviving partition, asserted below."""
         for analysis in client.get("/v1/analyses.json").json():
-            assert analysis["type"] in ("dataset", "custom")
+            assert "type" not in analysis
+            assert analysis["kind"] in ("variable", "dimension", "internal")
 
     def test_kind_and_subsumed_dimensions_are_published(self, client):
         """The portal's dimension picker (`dimensions-select.tsx`, plan §4.4) hides/strips
@@ -218,35 +223,48 @@ class TestAnalyses:
         assert by_name["lnd_chng"]["kind"] == "variable"
         assert by_name["lnd_chng"]["subsumed_dimensions"] == ["scenario_id"]
 
-    def test_kind_and_subsumed_dimensions_fall_back_when_a_meta_declares_neither(
-        self, client, monkeypatch
-    ):
-        """`diff`/`sal_veg_investigation` (`kind="dimension"`/`None`) declare no
-        `subsumed_dimensions` at all -- the model's own defaults (`None`/`[]`) must survive
-        the round trip rather than raising or silently omitting the fields. Re-patches over
-        the class-level `_fake_registry` fixture's own fake for this one test.
+    def test_subsumed_dimensions_defaults_through_the_round_trip(self, client, monkeypatch):
+        """`diff` declares no `subsumed_dimensions` -- it removes nothing from the caller's
+        view that `collapsed_dimensions` doesn't already report per-request -- so
+        `AnalysisMeta`'s own `[]` default has to survive the dump and this route's response
+        model rather than raising or omitting the field. Re-patches over the class-level
+        `_fake_registry` fixture's fake for this one test.
+
+        `kind` gets no such test because it no longer HAS a default: see
+        `test_a_meta_cannot_omit_kind` below.
         """
         import cpra.mp.data.api as api_module
         import cpra.mp.data.api.utils as api_utils
 
-        class _BareMeta:
-            name = "diff"
-            label = "Difference"
-            type = "dataset"
-            variables = None
-            legend = None
-            result_kind = "difference"
-
         class _BareAnalysis:
-            Meta = _BareMeta
+            Meta = AnalysisMeta(
+                name="diff",
+                label="Difference",
+                kind="dimension",
+                variables=None,
+                legend=None,
+                result_kind="difference",
+            )
 
         fake = {"diff": _BareAnalysis}
         monkeypatch.setattr(api_utils, "ANALYSES", fake)
         monkeypatch.setattr(api_module, "ANALYSES", fake)
 
         by_name = {a["name"]: a for a in client.get("/v1/analyses.json").json()}
-        assert by_name["diff"]["kind"] is None
+        assert by_name["diff"]["kind"] == "dimension"
         assert by_name["diff"]["subsumed_dimensions"] == []
+
+    def test_a_meta_cannot_omit_kind(self):
+        """The failure this route used to serve as `kind: null`, moved to import time.
+
+        `sal_veg_investigation` really did ship without a `kind`, and nothing caught it
+        here: the omission dumped to an absent key, `api.models.Analysis` filled in its
+        `None` default, and the portal could not tell that from a deliberate declaration.
+        `AnalysisMeta` has no default to fall back on, so the same omission is now a
+        `ValidationError` raised by the module that declares it.
+        """
+        with pytest.raises(ValidationError):
+            AnalysisMeta(name="x", label="X")
 
 
 class TestDatasetsIndex:
@@ -282,16 +300,24 @@ class TestDatasetsIndex:
         assert client.get("/v1/datasets.xlsx").status_code == 422
 
 
-class TestDatasetCatalogEndpoint:
-    """/v1/datasets/{variable}/{time_unit}/{grid}/catalog.json, backed by CatalogQuery
-    reading the materialized catalog side-table rather than walking the data tree.
+class TestCatalogEndpoint:
+    """/v1/catalog.json -- what a request can still be steered by, and what it would
+    produce.
 
-    See tests/api/test_catalog_query.py for CatalogQuery's own unit tests -- including why
-    there is no test here for the old "no common values" 404: that ValueError is
-    unreachable in the current CatalogQuery (see that file's TestChoiceIntersection).
+    It takes the same parameter set as the four data routes and resolves the same pipeline,
+    which is the whole point of the change: the route it replaces was keyed on a
+    {variable}/{time_unit}/{grid} path triple, so an analysis that fixes its own inputs had
+    no way to ask what it was allowed to select, and the portal covered for it by inventing
+    a triple per derived variable and keeping it in agreement by hand.
+
+    Two halves, tested here through the route and in tests/api/test_catalog_query.py as
+    units: choices/results/exact (CatalogQuery over the pipeline's inputs, strictly
+    intersected, minus what the analysis collapsed -- see that file's TestSeveralInputs for
+    the intersection and its 404), and `output` (the output descriptor with the analysis's
+    presentation overrides folded in).
     """
 
-    URL = "/v1/datasets/vct/annual/veg_grid_cell_v001/catalog.json"
+    URL = "/v1/catalog.json?variable=vct&time_unit=annual&grid=veg_grid_cell_v001"
 
     @pytest.fixture(autouse=True)
     def _catalog_path(self, catalog_path, monkeypatch):
@@ -319,11 +345,11 @@ class TestDatasetCatalogEndpoint:
             **kwargs,
         )
 
-    def test_returns_choices_results_and_exact(self, client, base_path, _catalog_path):
+    def test_returns_choices_results_exact_and_output(self, client, base_path, _catalog_path):
         self._write(base_path, _catalog_path)
         response = client.get(self.URL)
         assert response.status_code == 200
-        assert set(response.json()) == {"choices", "results", "exact"}
+        assert set(response.json()) == {"choices", "results", "exact", "output"}
 
     def test_reports_available_scenarios(self, client, base_path, _catalog_path):
         self._write(base_path, _catalog_path, scenario_id=7)
@@ -332,15 +358,86 @@ class TestDatasetCatalogEndpoint:
         assert body["choices"]["scenario_id"] == [7, 8]
 
     def test_selection_is_reflected_in_results(self, client, base_path, _catalog_path):
+        """Also the cast: `scenario_id=8` arrives as the string "8" and the catalog's
+        column is Int32, so without `api.catalog.catalog_filters` the selection would miss
+        and fall back to the first choice -- which is 7 here, not 8, so the assertion
+        distinguishes the two."""
         self._write(base_path, _catalog_path, scenario_id=7)
         self._write(base_path, _catalog_path, scenario_id=8)
-        body = client.get(f"{self.URL}?scenario_id=8").json()
+        body = client.get(f"{self.URL}&scenario_id=8").json()
         assert body["results"]["scenario_id"] == [8]
 
     def test_unavailable_selection_is_inexact(self, client, base_path, _catalog_path):
         self._write(base_path, _catalog_path)
-        body = client.get(f"{self.URL}?scenario_id=99").json()
+        body = client.get(f"{self.URL}&scenario_id=99").json()
         assert body["exact"] is False
+
+    def test_the_dataset_triple_is_not_echoed_back(self, client, base_path, _catalog_path):
+        """It was a restatement of the caller's own path segments, it has no single answer
+        once a request reads several datasets, and what a client needs from it is in
+        `output` instead."""
+        self._write(base_path, _catalog_path)
+        body = client.get(self.URL).json()
+        assert not {"variable", "time_unit", "grid"} & set(body["choices"])
+        assert not {"variable", "time_unit", "grid"} & set(body["results"])
+
+    def test_output_describes_the_result_of_a_plain_read(self, client, base_path, _catalog_path):
+        self._write(base_path, _catalog_path)
+        output = client.get(self.URL).json()["output"]
+        assert output["grid"] == "veg_grid_cell_v001"
+        assert output["grid_type"] == "raster"
+        assert output["time_unit"] == "annual"
+        assert output["time_column"] == "calendar_year"
+        assert output["variables"] == ["vct"]
+        assert output["legend"] == "vct"
+        assert output["result_kind"] == "value"
+        assert output["collapsed_dimensions"] == []
+        # Null, which is what says `value_columns` holds columns of the result.
+        assert output["folded_into"] is None
+
+    def test_output_of_an_unpivoted_pipeline_reports_the_folded_names(self, client, base_path, _catalog_path):
+        """The other reading of `value_columns`: after an `unpivot` the result carries one
+        `value` column and the names are the VALUES of the label column instead. Reported
+        that way, with `folded_into` naming the column, so a client can key display
+        metadata per measurement without caring which reading it got -- see
+        `api.models.CatalogOutput`."""
+        self._write(base_path, _catalog_path)
+        self._write(base_path, _catalog_path, variable="ffibs_score")
+        query = "&".join(
+            [
+                "input.vct.variable=vct&input.vct.time_unit=annual&input.vct.grid=veg_grid_cell_v001",
+                "input.ffibs_score.variable=ffibs_score",
+                "input.ffibs_score.time_unit=annual",
+                "input.ffibs_score.grid=veg_grid_cell_v001",
+                "step.1.op=join&step.1.type=spatial&step.1.inputs=vct,ffibs_score&step.1.as=j",
+                "step.2.op=filter&step.2.input=j&step.2.where=grid_cell%20%3D%205&step.2.as=pt",
+                "step.3.op=unpivot&step.3.input=pt&step.3.as=stacked",
+                "output.format=csv",
+            ]
+        )
+        output = client.get(f"/v1/catalog.json?{query}").json()["output"]
+        assert output["folded_into"] == "variable"
+        assert output["value_columns"] == ["ffibs_score", "vct"]
+        assert output["variables"] == ["ffibs_score", "vct"]
+
+    def test_an_analysis_overrides_what_the_result_is(self, client, base_path, _catalog_path):
+        """`lnd_chng` reads the caller's dataset but outputs land-change categories, not
+        vegetation types, so its own legend/label/kind win over the input variable's."""
+        self._write(base_path, _catalog_path)
+        output = client.get(f"{self.URL}&analysis=lnd_chng&calendar_year=2030&model_group_id=500").json()["output"]
+        assert output["legend"] == "lnd_chng"
+        assert output["label"] == "Land Change"
+        assert output["result_kind"] == "category"
+
+    def test_a_collapsed_dimension_is_absent_rather_than_defaulted(self, client, base_path, _catalog_path):
+        """`lnd_chng` consumes `calendar_year` to pick its comparison and baseline years, so
+        it is not a choice the caller still has. Absent, not reported with a value they
+        cannot change -- and `exact` must not be dragged down by defaulting it."""
+        self._write(base_path, _catalog_path)
+        body = client.get(f"{self.URL}&analysis=lnd_chng&calendar_year=2030&model_group_id=500").json()
+        assert body["output"]["collapsed_dimensions"] == ["calendar_year"]
+        assert "calendar_year" not in body["choices"]
+        assert "calendar_year" not in body["results"]
 
     def test_missing_catalog_entries_is_404(self, client, _catalog_path):
         """No data has ever been written for this variable/time_unit/grid -- CatalogQuery's
@@ -349,3 +446,14 @@ class TestDatasetCatalogEndpoint:
         response = client.get(self.URL)
         assert response.status_code == 404
         assert "No catalog entries" in response.json()["detail"]
+
+    def test_a_compression_parameter_is_rejected(self, client, base_path, _catalog_path):
+        """A JSON metadata response carries no compression, so asking for it is a 400
+        rather than a silently ignored parameter."""
+        self._write(base_path, _catalog_path)
+        assert client.get(f"{self.URL}&compression_algorithm=gzip").status_code == 400
+
+    def test_a_render_option_is_rejected(self, client, base_path, _catalog_path):
+        """Render options belong to the visualization route. Nothing here draws anything."""
+        self._write(base_path, _catalog_path)
+        assert client.get(f"{self.URL}&height=400").status_code == 400

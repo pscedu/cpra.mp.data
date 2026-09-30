@@ -33,7 +33,7 @@ from cpra.mp.data.analysis.execution.frame import (
 )
 from cpra.mp.data.analysis.execution.long_ops import filter_long, join_long
 from cpra.mp.data.analysis.request.expressions import ExpressionError
-from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp
 from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
@@ -200,9 +200,7 @@ def _long_equivalent_survivors(where: str) -> set[tuple[str, int]]:
             "value": [1.0, 3.0, 5.0],
         }
     )
-    joined = join_long(
-        [elev, stg], JoinOp(step_no=0, type="spatial", inputs=["elev", "stg"], output="joined")
-    )
+    joined = join_long([elev, stg], ["elev", "stg"])
     rows = filter_long(joined, where).collect()
     survivors: set[tuple[str, int]] = set()
     for year in rows["calendar_year"].to_list():
@@ -491,6 +489,209 @@ class TestSampleGridCellsBandWide:
         assert result["grid_cell"].to_list() == [1]
         assert result["calendar_year"].to_list() == [2021]
         assert result["value"].to_list() == [50]
+
+
+class TestSampleGridCellsOverAJoin:
+    """The transition a joined band-wide frame makes under a spatial conjunct. The plain
+    unpivot gives one `value` column discriminated by the internal operand tag, which is
+    not the shape `request.ops._type_filter` types this step as producing (a filter
+    restricts; it never changes how many operands a frame carries) -- so a joined frame
+    takes the `join_long` route instead, and lands in the same paired long shape the
+    equivalent long pipeline would have produced.
+    """
+
+    @staticmethod
+    def _joined(a_bands, a_metadata, b_bands, b_metadata, *, height):
+        window = _window(height=height)
+        a = (pl.LazyFrame(a_bands), pl.DataFrame(a_metadata), window)
+        b = (pl.LazyFrame(b_bands), pl.DataFrame(b_metadata), window)
+        return join_band_wide([a, b], ["marsh", "sal"], extra_columns=[])
+
+    def test_operand_named_value_columns_survive_the_transition(self):
+        joined = self._joined(
+            {"b0": [1, 2, 3]},
+            {"variable": ["lnd_type"], "calendar_year": [2020]},
+            {"b0": [10, 20, 30]},
+            {"variable": ["sal"], "calendar_year": [2020]},
+            height=3,
+        )
+
+        result = filter_band_wide(
+            joined, "grid_cell IN (1, 2)", extra_columns=[], grid_width=1, value_columns=("marsh", "sal")
+        ).collect()
+
+        # One row per surviving pixel, one column per operand -- NOT one row per
+        # (pixel, band) with a single `value`, which is what the unpaired unpivot gives.
+        assert set(result.columns) == {"grid_cell", "calendar_year", "marsh", "sal"}
+        rows = {row["grid_cell"]: (row["marsh"], row["sal"]) for row in result.to_dicts()}
+        assert rows == {1: (2, 20), 2: (3, 30)}
+
+    def test_variable_is_dropped_because_the_operands_disagree_on_it(self):
+        """`join_long`'s rule, reached through it rather than restated: after a join
+        "which dataset did this row come from" has no single answer, and keeping the
+        column would make it a key that matches nothing.
+        """
+        joined = self._joined(
+            {"b0": [1]},
+            {"variable": ["lnd_type"], "calendar_year": [2020]},
+            {"b0": [10]},
+            {"variable": ["sal"], "calendar_year": [2020]},
+            height=1,
+        )
+
+        result = filter_band_wide(
+            joined, "grid_cell = 0", extra_columns=[], grid_width=1, value_columns=("marsh", "sal")
+        ).collect()
+
+        assert "variable" not in result.columns
+
+    def test_shared_dimension_keys_the_pairing_across_several_bands(self):
+        joined = self._joined(
+            {"b0": [1, 2], "b1": [3, 4]},
+            {"variable": ["lnd_type", "lnd_type"], "calendar_year": [2020, 2021]},
+            {"b0": [10, 20], "b1": [30, 40]},
+            {"variable": ["sal", "sal"], "calendar_year": [2020, 2021]},
+            height=2,
+        )
+
+        result = filter_band_wide(
+            joined, "grid_cell = 1", extra_columns=[], grid_width=1, value_columns=("marsh", "sal")
+        ).collect()
+
+        # Pixel 1 of each year, each operand paired with its OWN year's counterpart.
+        rows = {row["calendar_year"]: (row["marsh"], row["sal"]) for row in result.to_dicts()}
+        assert rows == {2020: (2, 20), 2021: (4, 40)}
+
+    def test_an_operand_named_value_conjunct_applies_to_the_long_frame(self):
+        """Rejected band-wide (`_type_filter` points at `case`), ordinary once long: one
+        row carries every operand, so there is nothing to pair and nothing to pick.
+        """
+        joined = self._joined(
+            {"b0": [1, 9]},
+            {"variable": ["lnd_type"], "calendar_year": [2020]},
+            {"b0": [10, 20]},
+            {"variable": ["sal"], "calendar_year": [2020]},
+            height=2,
+        )
+
+        result = filter_band_wide(
+            joined,
+            "grid_cell IN (0, 1) AND marsh > 5",
+            extra_columns=[],
+            grid_width=1,
+            value_columns=("marsh", "sal"),
+        ).collect()
+
+        assert result["grid_cell"].to_list() == [1]
+        assert result["marsh"].to_list() == [9]
+
+    def test_a_band_with_no_counterpart_is_dropped(self):
+        """Inner, as `join_long` is -- the paired long shape has no cell for a value with
+        no counterpart. `unify_metadata_parts` takes the opposite rule for the filter that
+        stays band-wide, where an unpaired band is still a representable band.
+        """
+        joined = self._joined(
+            {"b0": [1, 2], "b1": [3, 4]},
+            {"variable": ["lnd_type", "lnd_type"], "calendar_year": [2020, 2021]},
+            {"b0": [10, 20]},
+            {"variable": ["sal"], "calendar_year": [2020]},
+            height=2,
+        )
+
+        result = filter_band_wide(
+            joined, "grid_cell = 0", extra_columns=[], grid_width=1, value_columns=("marsh", "sal")
+        ).collect()
+
+        assert result["calendar_year"].to_list() == [2020]
+
+    def test_an_operand_with_no_bands_is_an_empty_frame_not_a_missing_column(self):
+        """An operand can reach here contributing no bands at all -- `join_band_wide`
+        guards that by contributing no metadata rows for it, and a preceding dimension
+        filter can produce it too. Skipping it here would drop its column and reintroduce
+        the missing-column failure on the path whose answer is just "no rows".
+        """
+        window = _window(height=2)
+        a = (
+            pl.LazyFrame({"b0": [1, 2]}),
+            pl.DataFrame({"variable": ["lnd_type"], "calendar_year": [2020]}),
+            window,
+        )
+        empty = (pl.LazyFrame({}), pl.DataFrame(), window)
+        joined = join_band_wide([a, empty], ["marsh", "sal"], extra_columns=[])
+        assert joined[1].get_column(JOIN_OPERAND_COLUMN).to_list() == ["marsh"]
+
+        result = filter_band_wide(
+            joined, "grid_cell = 0", extra_columns=[], grid_width=1, value_columns=("marsh", "sal")
+        ).collect()
+
+        assert result.height == 0
+        assert {"marsh", "sal"} <= set(result.columns)
+
+    def test_carried_columns_ride_along_from_the_first_operand(self):
+        window = _window(height=2)
+        a = (
+            pl.LazyFrame({"b0": [1, 2], "__zone__": [7, 8]}),
+            pl.DataFrame({"variable": ["lnd_type"], "calendar_year": [2020]}),
+            window,
+        )
+        b = (
+            pl.LazyFrame({"b0": [10, 20], "__zone__": [7, 8]}),
+            pl.DataFrame({"variable": ["sal"], "calendar_year": [2020]}),
+            window,
+        )
+        joined = join_band_wide([a, b], ["marsh", "sal"], extra_columns=["__zone__"])
+
+        result = filter_band_wide(
+            joined,
+            "grid_cell IN (0, 1)",
+            extra_columns=["__zone__"],
+            grid_width=1,
+            value_columns=("marsh", "sal"),
+        ).collect()
+
+        # Taken from operand 0 alone, so it is carried along rather than keyed on -- the
+        # same rule `join_band_wide` applies to its own carried columns.
+        rows = {row["grid_cell"]: row["__zone__"] for row in result.to_dicts()}
+        assert rows == {0: 7, 1: 8}
+
+    def test_agrees_with_the_long_pipeline_it_stands_in_for(self):
+        """The whole point of routing through `join_long`: joining band-wide and then
+        sampling points must give what sampling the same points out of each operand and
+        joining long gives.
+        """
+        window = _window(height=3)
+        a = (
+            pl.LazyFrame({"b0": [1, 2, 3], "b1": [4, 5, 6]}),
+            pl.DataFrame({"variable": ["lnd_type", "lnd_type"], "calendar_year": [2020, 2021]}),
+            window,
+        )
+        b = (
+            pl.LazyFrame({"b0": [10, 20, 30], "b1": [40, 50, 60]}),
+            pl.DataFrame({"variable": ["sal", "sal"], "calendar_year": [2020, 2021]}),
+            window,
+        )
+        where = "grid_cell IN (0, 2)"
+
+        band_wide_first = filter_band_wide(
+            join_band_wide([a, b], ["marsh", "sal"], extra_columns=[]),
+            where,
+            extra_columns=[],
+            grid_width=1,
+            value_columns=("marsh", "sal"),
+        ).collect()
+
+        long_first = join_long(
+            [
+                sample_grid_cells_band_wide(a, where, extra_columns=[], grid_width=1),
+                sample_grid_cells_band_wide(b, where, extra_columns=[], grid_width=1),
+            ],
+            ["marsh", "sal"],
+        ).collect()
+
+        key = ["grid_cell", "calendar_year"]
+        assert band_wide_first.sort(key).select(*key, "marsh", "sal").to_dicts() == (
+            long_first.sort(key).select(*key, "marsh", "sal").to_dicts()
+        )
 
 
 class TestFilterBandWide:

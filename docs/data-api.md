@@ -15,27 +15,40 @@ access to the data (notebooks, scripts): `read_data` accepts the same filter par
 names documented here, with no HTTP involved. See the
 [README's Analyzing Data section](../README.md#analyzing-data) for usage.
 
-All of the data endpoints use the general format:
+There are two data endpoints -- one for a whole response, one for a map tile:
 
 ```
-/v1/datasets/<variable>/<time_unit>/<grid>/data.<format>
+GET /v1/data.<format>?variable=<variable>&time_unit=<time_unit>&grid=<grid>&...
+GET /v1/data/{z}/{x}/{y}.<format>?variable=<variable>&time_unit=<time_unit>&grid=<grid>&...
 ```
+
+The dataset is named by the `variable`/`time_unit`/`grid` **query parameters**, all three
+together -- a partial triple is a 400. It used to be three path segments
+(`/v1/datasets/<variable>/<time_unit>/<grid>/data.<format>`); that form, and the separate
+`/tiles/{z}/{x}/{y}.pbf` route beside it, are gone. Which kind of tile you get is now the
+tile URL's own extension, not a different route.
 
 Example URIs for vector-grid (Parquet) data are:
 
 ```
-/v1/datasets/sal/daily/hydro_compartment_v001/data.csv
-/v1/datasets/sal/daily/hydro_compartment_v001/data.ndjson
-/v1/datasets/sal/daily/hydro_compartment_v001/data.parquet
+/v1/data.csv?variable=sal&time_unit=daily&grid=hydro_compartment_v001
+/v1/data.ndjson?variable=sal&time_unit=daily&grid=hydro_compartment_v001
+/v1/data.parquet?variable=sal&time_unit=daily&grid=hydro_compartment_v001
 ```
 
 Additional example URIs for raster-grid (COG) data and map tiles are:
 
 ```
-/v1/datasets/elev/annual/morph_pixel_v001/data.tif
-/v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png
-/v1/datasets/damage/decadal/clara_grid_cell_v001/tiles/{z}/{x}/{y}.pbf
+/v1/data.tif?variable=elev&time_unit=annual&grid=morph_pixel_v001
+/v1/data/{z}/{x}/{y}.png?variable=elev&time_unit=annual&grid=morph_pixel_v001
+/v1/data/{z}/{x}/{y}.pbf?variable=damage&time_unit=decadal&grid=clara_grid_cell_v001
 ```
+
+`POST /v1/data.<format>` takes the same formats and a pipeline JSON body instead of a
+query string; see the [Analysis API](analysis-api.md). The same two GET endpoints also
+carry `analysis=` for a pre-built transformation -- see
+[the named-analysis registry](analyses-api.md) -- which is why they are no longer keyed on
+a dataset in the path: an analysis that supplies its own inputs has no triple to put there.
 
 Tabular formats are `csv`, `ndjson`, and `parquet`. Raster output is `tif` (GeoTIFF);
 raster map tiles are `png` or `jpg`; vector map tiles are Mapbox vector tiles (`pbf`).
@@ -46,7 +59,10 @@ parameters (the accepted algorithms differ by format; `zstd` level 6 is the defa
 
 Filter parameters limit the rows, columns, or bands of the dataset to those matching
 specific criteria. Any dimension from the partition and non-partition dimensions can be
-used as a filter parameter. Multiple values can be provided in a comma-separated list.
+used as a filter parameter. Multiple values are given by **repeating the key**
+(`scenario_id=34&scenario_id=35`), not by a comma-separated list -- the comma is a
+separator inside `grid_cell`, `where`, `sort` and `select`, and inside `analysis=`, but
+never inside a dimension's value.
 Note that special characters in SQL-style parameters should be
 [percent-encoded](https://developer.mozilla.org/en-US/docs/Glossary/Percent-encoding)
 (e.g., using
@@ -119,7 +135,7 @@ This request returns daily mean salinity data for all grid cells on a specific d
 CSV.
 
 ```
-GET /v1/datasets/sal/daily/hydro_compartment_v001/data.csv?model_group_id=520&scenario_id=7&calendar_day=2030-01-01
+GET /v1/data.csv?variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=520&scenario_id=7&calendar_day=2030-01-01
 ```
 
 #### Basic Time Series Query
@@ -128,7 +144,7 @@ This request returns daily time series data for three grid cells as newline-deli
 JSON.
 
 ```
-GET /v1/datasets/sal/daily/hydro_compartment_v001/data.ndjson?model_group_id=520&scenario_id=7&grid_cell=79,842,1003&sort=calendar_day
+GET /v1/data.ndjson?variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=520&scenario_id=7&grid_cell=79,842,1003&sort=calendar_day
 ```
 
 ### Raster-Grid Data
@@ -138,7 +154,7 @@ GET /v1/datasets/sal/daily/hydro_compartment_v001/data.ndjson?model_group_id=520
 This request returns colorized elevation data for a single year as PNG map tiles.
 
 ```
-GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7&calendar_year=2045&color_map=elevation
+GET /v1/data/{z}/{x}/{y}.png?variable=elev&time_unit=annual&grid=morph_pixel_v001&model_group_id=500&scenario_id=7&calendar_year=2045&color_map=elevation
 ```
 
 #### Time Series Query at Specific Points
@@ -148,7 +164,7 @@ Data is already served in long format (one `grid_cell` column and one `value` co
 one column per grid cell), so no `unpivot` parameter is needed:
 
 ```
-GET /v1/datasets/elev/annual/morph_pixel_v001/data.csv?model_group_id=500&scenario_id=7&grid_cell=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&sort=calendar_year,grid_cell
+GET /v1/data.csv?variable=elev&time_unit=annual&grid=morph_pixel_v001&model_group_id=500&scenario_id=7&grid_cell=-90.4914181,30.0144111,-90.8628217,29.4254702,-91.3641637,29.5319325&sort=calendar_year,grid_cell
 ```
 
 ## Migration from Removed Parameters
@@ -160,6 +176,11 @@ Several parameters that used to describe how a request *transforms* data --
 with a 400 naming the exact parameter and its replacement, rather than being silently
 ignored. `unpivot` is also rejected, though it was already a no-op (data is served in long
 format regardless).
+
+More generally, **an unrecognized query parameter is now a 400** rather than ignored, so a
+misspelled `calender_year=2050` is reported instead of silently widening the request to
+every year. (With an `analysis=` selected, the leftover is checked against that analysis's
+declared parameters first; see [the registry doc](analyses-api.md#parameters).)
 
 Every one of these has a pipeline equivalent on the [Analysis API](analysis-api.md):
 

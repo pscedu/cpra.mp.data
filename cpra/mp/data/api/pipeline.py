@@ -4,9 +4,9 @@ HTTP response, for each of the four response shapes the four routes in `api/__in
 need (tabular, `tif`, `png`/`jpg` tile, `pbf` tile).
 
 **What is NOT this module's job.** Parsing the request body/query string into a `Pipeline`
-(`request.pipeline.parse_pipeline`/`pipeline_from_query`), validating its shape
-(`request.ops.validate_shapes`), and matching the URL's `{format}` segment against
-`pipeline.output.format` (`api.__init__._check_output_format_agreement`) all happen in the
+(`request.pipeline.parse_pipeline`/`pipeline_from_query`), overwriting `pipeline.output
+.format` from the URL's `{format}` segment, and validating its shape
+(`request.ops.validate_shapes`) all happen in the
 route, before any function here is called -- everything here assumes it already has a
 structurally- and shape-valid `Pipeline` in hand. Every exception this module's own code
 raises, or lets escape from `execution`/`request`, is caught by `api.boundary`'s handlers,
@@ -28,14 +28,11 @@ caller for `render_tile`/`sink_vector_tile` directly.
 - `tif`: `PipelineRasterResponse` below -- a temp file, `FileResponse` on success, and
   `HTTPException(404)` when `run_to_path` reports no bands. `run_to_path` is synchronous,
   so it is driven off the event loop via `anyio.to_thread.run_sync`.
-- `png`/`jpg`: purpose-built (`respond_to_analysis_tile`), specifically NOT
-  `HTTPException` on a tile miss -- see `execution.sink.render_tile`'s and `empty_tile`'s
-  docstrings: a 404 on an image URL still needs a decodable image body, which
-  `HTTPException` would discard in favor of a JSON error document.
-- `pbf`: purpose-built (`respond_to_analysis_vector_tile`), and again not
-  `HTTPException` -- a miss here is a bodiless 204 (`execution.sink.sink_vector_tile`'s
-  own docstring), which `HTTPException` cannot express either (it always carries a JSON
-  body).
+- `png`/`jpg` and `pbf`: purpose-built (`respond_to_analysis_tile`,
+  `respond_to_analysis_vector_tile`), and specifically NOT `HTTPException` on a tile miss.
+  Both answer a miss with a bodiless 204, which `HTTPException` cannot express -- it always
+  carries a JSON body. The raster half used to answer 404 with a blank encoded image
+  instead; `execution.sink.render_tile`'s docstring records why that changed.
 """
 
 import tempfile
@@ -50,12 +47,10 @@ from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.execution import sink
 from cpra.mp.data.analysis.io import output
-from cpra.mp.data.analysis.request.errors import ShapeError
-from cpra.mp.data.analysis.request.ops import Shape
+from cpra.mp.data.analysis.request.ops import final_frame_name
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
 from cpra.mp.data.api.tabular import StreamingThread, sleep_between_polls
-from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
 
 # The rasterio profile key each compression algorithm spells its level with. Only the
@@ -328,12 +323,26 @@ async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str
     Compiles the plan for this one tile (`compile_plan(pipeline, tile=...)`), executes it,
     and renders it (`sink.render_tile`) -- all off the event loop in one `anyio.to_thread.
     run_sync` call, since every step does real file I/O. A `None` render (nothing to show:
-    see `render_tile`'s own docstring for the two cases this covers) is a 404 whose BODY is
-    `sink.empty_tile(format, tile_size)` -- a decodable, correctly-sized, transparent image
-    of the requested format -- returned directly as this function's `Response`, never as a
-    raised `HTTPException`: raising one here would replace that body with a JSON error
-    document and the image `Content-Type` with `application/json`, exactly the anti-pattern
-    `execution.sink.empty_tile`'s own docstring warns against.
+    see `render_tile`'s own docstring for the two cases this covers) is a BODILESS 204,
+    returned directly as this function's `Response` rather than as a raised
+    `HTTPException`, which always carries a JSON body and so cannot express one.
+
+    A `FileNotFoundError` is caught into the same 204, and is the reason the `try` wraps the
+    thread call rather than living inside `_render`. App-wide it means 404
+    `application/json` (`api.boundary`, which owns that mapping and keeps it for every other
+    route); on a tile route it would be the only 404 left on an image URL, and it is not a
+    distinction a tile client can act on -- "the file for this dataset is not written yet"
+    and "this tile's footprint misses the data" are the same empty square. Narrowed to
+    `FileNotFoundError` deliberately: a malformed request still answers 400 through the
+    boundary, because a client that keeps requesting tiles for a request that can never
+    succeed should be told so.
+
+    That exception is a VECTOR read's (`io.vector.scan_vector` -> `tabular.read_parquet` ->
+    `pl.scan_parquet(...).collect()`), so on THIS route it can only come from a pipeline
+    that has a vector input among its inputs. A raster dataset with nothing written for it
+    raises nothing at all: the scan finds no bands, `render_tile` returns `None`, and the
+    answer is already the 204 above -- which is why the missing-file test for this catch
+    (`tests/api/test_analysis_boundary_module.py`) goes through the `pbf` route.
     """
     tile = TileRequest(x=x, y=y, z=z)
 
@@ -345,50 +354,31 @@ async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str
             band_wide, tile, format, color_map=pipeline.output.color_map, variable_legend=variable_legend
         )
 
-    body = await anyio.to_thread.run_sync(_render)
-    media_type = _TILE_MIME_TYPES[format]
+    try:
+        body = await anyio.to_thread.run_sync(_render)
+    except FileNotFoundError:
+        body = None
     if body is None:
-        return Response(content=sink.empty_tile(format, tile.tile_size), status_code=404, media_type=media_type)
-    return Response(content=body, status_code=200, media_type=media_type)
+        return Response(status_code=204)
+    return Response(content=body, status_code=200, media_type=_TILE_MIME_TYPES[format])
 
 
-def _final_frame_name(plan) -> str:
-    """The name (an input's own key, or a step's `as`/synthesized name) the plan's final
-    frame is bound to -- the same "last op's output, else the lone input" rule `execution.
-    execute.execute` itself uses (see that function's docstring), needed here only to look
-    the final frame's `FrameType` up in `plan.frame_types`.
+def _final_frame_grid(plan, pipeline) -> str:
+    """The grid the plan's final frame is addressed against -- which grid's PMTiles
+    boundary archive a `.pbf` vector tile reads its geometry from.
+
+    Reads only; that the grid is a VECTOR one, and the frame long, is already settled by
+    `request.ops.validate_shapes`'s `pbf` sink rule, which every route runs before
+    compiling a plan. This used to be a route-level check (`_require_vector_final_frame`)
+    because `pbf` was not a member of `request.types.TileFormat` and so could never be a
+    pipeline's declared `output.format` for that rule to key on; it is one now.
+
+    Goes through the plan's ALREADY-COMPILED `ops`/`frame_types` rather than calling
+    `ops.output_frame_type(pipeline)`, which would answer the same question by compiling
+    and re-walking the pipeline a second time. `final_frame_name` is the piece the two
+    share.
     """
-    if plan.ops:
-        return plan.ops[-1].output
-    (name,) = plan.inputs.keys()
-    return name
-
-
-def _require_vector_final_frame(plan) -> str:
-    """The final frame's grid name, once confirmed to be a long frame addressed against a
-    VECTOR grid -- what a `.pbf` vector tile needs, and the one check `request.ops.
-    validate_shapes` structurally cannot perform itself: `pbf` is deliberately not a member
-    of `request.types.DataFormat`/`TileFormat` (see `request.pipeline.Output.format`'s
-    docstring), so `validate_shapes`'s sink-shape rule -- keyed on `pipeline.output.format`
-    -- never sees `pbf` and has nothing to reject a raster-final pipeline against on this
-    route's behalf. So this check is performed at the route level instead, against
-    `ExecutionPlan.frame_types`.
-
-    Raises `ShapeError` (-> 400 via `api.boundary`) rather than deferring to `sink.
-    sink_vector_tile`'s own `None` return: that function cannot tell "this grid genuinely
-    has no PMTiles archive" apart from "this pipeline's final grid was never going to have
-    one, because it addresses raster pixels, not vector polygons" -- both would otherwise
-    read as the same 204 "nothing to render", collapsing a client error into a case meant
-    for "no data at this location."
-    """
-    frame_type = plan.frame_types[_final_frame_name(plan)]
-    if frame_type.shape != Shape.long or GRIDS[frame_type.grid].grid_type != "vector":
-        raise ShapeError(
-            f"pipeline's final frame (grid={frame_type.grid!r}, shape={frame_type.shape.value!r}) "
-            "is not a long frame on a vector grid -- a .pbf vector tile needs the final "
-            "result addressed against a vector grid's polygons, not a raster's pixels"
-        )
-    return frame_type.grid
+    return plan.frame_types[final_frame_name(pipeline, plan.ops)].grid
 
 
 async def respond_to_analysis_vector_tile(pipeline, x: int, y: int, z: int, *, base_path=None) -> Response:
@@ -407,16 +397,21 @@ async def respond_to_analysis_vector_tile(pipeline, x: int, y: int, z: int, *, b
 
     A `None` result (see `sink.sink_vector_tile`'s docstring for the several cases that
     collapses) is a bodiless 204, not a 404: an MVT client already treats a 204 as an empty
-    tile, so there is nothing to encode as a body the way an image tile needs one.
+    tile. A `FileNotFoundError` joins it, for the reason `respond_to_analysis_tile` gives --
+    a tile client cannot act on the difference between an unwritten dataset and a tile with
+    nothing in it, and both tile routes now answer it the same way.
     """
 
     def _render() -> bytes | None:
         plan = compile_plan(pipeline, base_path=base_path)
-        grid_name = _require_vector_final_frame(plan)
+        grid_name = _final_frame_grid(plan, pipeline)
         result = execute(plan, base_path=base_path)
         return sink.sink_vector_tile(result, grid_name, (x, y, z))
 
-    body = await anyio.to_thread.run_sync(_render)
+    try:
+        body = await anyio.to_thread.run_sync(_render)
+    except FileNotFoundError:
+        body = None
     if body is None:
         return Response(status_code=204)
     return Response(content=body, status_code=200, media_type=_VECTOR_TILE_MEDIA_TYPE)

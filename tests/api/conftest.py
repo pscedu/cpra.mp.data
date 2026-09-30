@@ -22,6 +22,7 @@ from tests.factories import (
     write_lnd_type_plus_datasets,
     write_raster_crosswalk,
     write_sal_annual_dataset,
+    write_sediment_dynamics_datasets,
 )
 
 # Dimension values the real MPD serves but the structure CSVs do not. Described as plain
@@ -141,3 +142,23 @@ def lnd_type_plus_data(morph_pixel_v002_shrunk, base_path, crosswalk_path, monke
     )
     monkeypatch.setattr(config, "BASE_PATH", base_path)
     return base_path
+
+
+# The years `sediment_dynamics_data` writes, exported so a test can assert the series it
+# gets back rather than restating the fixture's own default.
+SEDIMENT_DYNAMICS_DATA_YEARS = (2040, 2050)
+
+
+@pytest.fixture
+def sediment_dynamics_data(morph_pixel_v002_shrunk, base_path, monkeypatch):
+    """The five inputs of the `sediment_dynamics` analysis on disk, one COG per (variable,
+    year) on the shrunk `morph_pixel_v002` -- what the chart of the same name draws.
+
+    The sibling of `lnd_type_plus_data` above, and here for the same reason: the analysis
+    is driven through `resolve_analysis` by `test_analyses_registry.py` and through the
+    HTTP routes (both the spec route and the data URL that spec emits) by
+    `test_endpoints_data.py`, so the one writer is shared rather than repeated.
+    """
+    selection = write_sediment_dynamics_datasets(base_path, years=SEDIMENT_DYNAMICS_DATA_YEARS)
+    monkeypatch.setattr(config, "BASE_PATH", base_path)
+    return selection

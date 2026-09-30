@@ -18,7 +18,6 @@ from cpra.mp.data.api.models import (
     DataQuery,
     DatasetDimensions,
     FilterDimensions,
-    TileQuery,
 )
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -71,7 +70,7 @@ class TestEnums:
         assert {m.value for m in OutputType} == {"raster", "vector"}
 
     def test_tile_formats(self):
-        assert {m.value for m in TileFormat} == {"jpg", "png"}
+        assert {m.value for m in TileFormat} == {"jpg", "pbf", "png"}
 
     def test_tif_is_a_data_format(self):
         assert DataFormat.tif in DataFormat
@@ -132,34 +131,37 @@ class TestDataOptions:
         assert set(DataOptions.model_fields) == {"grid_cell", "where", "sort", "select", "color_map"}
 
 
-class TestQuerySplitting:
-    """TileQuery and DataQuery arrive flat from the query string and are split apart."""
+class TestDataQuery:
+    """`DataQuery` is one flat model now, not a pair of halves waiting to be split.
 
-    def test_tile_query_splits_filters_from_options(self):
-        # The two halves `TileQuery` is assembled from, taken back apart: a dimension
-        # filter goes one way, a `DataOptions` field the other, and neither property
-        # reports a field belonging to the other half (the two tests below).
-        query = TileQuery(model_group_id=[500], where="calendar_year > 2035", grid_cell="1,2")
-        assert query.filter_dimensions.model_group_id == [500]
-        assert query.options.where == "calendar_year > 2035"
-        assert query.options.grid_cell == "1,2"
+    The `filter_dimensions`/`options`/`compression` splitter properties are gone with
+    `api.data_query.build_data_query`, their only caller, and `TileQuery` is gone with the
+    split tile routes that named it -- `partition_query(allow_compression=False)` rejects a
+    compression parameter on a tile outright rather than merely declining to bind it. What
+    the model is still for is binding on `VisualizationQuery` and being SUBTRACTED to name
+    the render-option category, so what these pin is the field set, not a round trip.
+    """
 
-    def test_filter_dimensions_drops_option_fields(self):
-        query = TileQuery(model_group_id=[500], where="calendar_year > 2035")
-        assert not hasattr(query.filter_dimensions, "where")
+    def test_it_is_the_union_of_its_three_bases(self):
+        fields = set(DataQuery.model_fields)
+        assert set(DataOptions.model_fields) <= fields
+        assert set(FilterDimensions.model_fields) <= fields
+        assert set(Compression.model_fields) <= fields
 
-    def test_options_drops_filter_fields(self):
-        query = TileQuery(model_group_id=[500], where="calendar_year > 2035")
-        assert not hasattr(query.options, "model_group_id")
+    def test_a_filter_and_an_option_bind_side_by_side(self):
+        query = DataQuery(model_group_id=[500], where="calendar_year > 2035", grid_cell="1,2")
+        assert query.model_group_id == [500]
+        assert query.where == "calendar_year > 2035"
+        assert query.grid_cell == "1,2"
 
-    def test_data_query_exposes_compression(self):
+    def test_compression_binds_flat(self):
         query = DataQuery(compression_algorithm="gzip", compression_level=3)
-        assert query.compression.compression_algorithm == CompressionAlgorithm.gzip
-        assert query.compression.compression_level == 3
+        assert query.compression_algorithm == CompressionAlgorithm.gzip.value
+        assert query.compression_level == 3
 
-    def test_data_query_compression_defaults(self):
-        assert DataQuery().compression.compression_algorithm == CompressionAlgorithm.zstd
-        assert DataQuery().compression.compression_level == 6
+    def test_compression_defaults_flat(self):
+        assert DataQuery().compression_algorithm == CompressionAlgorithm.zstd.value
+        assert DataQuery().compression_level == 6
 
     def test_compression_defaults(self):
         compression = Compression()

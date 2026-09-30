@@ -11,6 +11,7 @@ from pydantic import field_validator
 
 from cpra.mp.data.analyses.base import (
     Analysis,
+    AnalysisMeta,
     InvalidAnalysisParametersError,
     dataset_input_selection,
     dataset_output_format,
@@ -24,14 +25,14 @@ from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 
 class Difference(Analysis):
-    class Meta:
-        name = "diff"
-        label = "Difference"
-        type = "dataset"
-        variables = None
-        legend = None
-        result_kind = "difference"
-        kind = "dimension"
+    Meta = AnalysisMeta(
+        name="diff",
+        label="Difference",
+        variables=None,
+        legend=None,
+        result_kind="difference",
+        kind="dimension",
+    )
 
     class Parameters(Analysis.Parameters):
         dimension: str
@@ -104,9 +105,9 @@ class Difference(Analysis):
         ]
 
     def pipeline(self):
-        assert self.dataset is not None, "diff is a type='dataset' analysis"
+        dataset = self.require_dataset()
         dim = self.parameters.dimension
-        required = required_dataset_dimensions(self.dataset)
+        required = required_dataset_dimensions(dataset)
         group_by = [d for d in required if d != dim]
 
         steps: list[dict] = []

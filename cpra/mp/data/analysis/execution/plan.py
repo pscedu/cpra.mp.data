@@ -193,6 +193,18 @@ sits in the declared chain, and to no longer tracking origin validity for that o
 it (per the table above, a spatial filter turns a band-wide frame long, so anything after
 it addresses a different, already-materialized frame).
 
+A spatial filter on a JOINED band-wide frame records the same thing for every raster origin
+of that join at once. `_Validity` tracks one origin and a join has several, so the walk's
+own `_incoming` gate retires them all before the per-op branches run -- but the origins are
+named anyway, by `band_wide_join_origin_groups`, and they are read as one shared scan
+(`execution.execute._open_band_wide_join_group`), which is exactly the unit a single window
+can be sized for. So the gate records the sample rather than merely dropping it, subject to
+both reference counts being one: the narrowing applies to the SHARED READ, so a second
+consumer of the join's output, or an origin that also feeds some other branch, would be
+handed one pixel where it asked for a grid. Only a filter sitting directly on the join is
+recognized; an op in between is left unnarrowed rather than reasoned about, since not
+narrowing is always correct.
+
 **Overview eligibility is a per-raster-SOURCE property, decided here rather than wherever
 the read happens.** A tile read is free to let GDAL serve a decimated window from a raster's
 own pyramid (`io.raster_io.tile_read_shape`) whenever the read feeds nothing but per-pixel
@@ -381,6 +393,7 @@ from cpra.mp.data.analysis.request.ops import (
     Op,
     ProjectOp,
     Shape,
+    UnpivotOp,
     annotate_frame_types,
     compile_ops,
     project_direction,
@@ -436,7 +449,10 @@ class ResolvedInput:
     `band_metadata` is `io.catalog.resolve_raster_bands`'s result, narrowed by every
     dimension predicate pushdown allowed through, and `point_sample_step` is the step
     number of the first spatial filter reached while this origin was still band-wide
-    (`None` if none was). `straddling_vector_grid` is the name of the vector grid this
+    (`None` if none was) -- either one this origin carried its own validity to, or one
+    sitting directly on a band-wide `join` this origin is an operand of, which samples
+    every origin of that join at once (see the module docstring). `straddling_vector_grid`
+    is the name of the vector grid this
     origin's pixels get redistributed onto, if any `ops` entry ever runs a raster-to-vector
     `project` step reachable from this origin (`None` otherwise) -- see the module
     docstring's paragraph on overview eligibility for what it and `overview_permitted` are
@@ -906,6 +922,37 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
 
         incoming = _incoming(op.input)
         if incoming is None:
+            # A spatial filter sitting directly on a band-wide JOIN still point-samples
+            # every raster origin that frame's pixels came from, even though no single
+            # origin's `_Validity` survived the join to say so (`_Validity` tracks ONE
+            # origin, and a join has several, so the gate above retires them all). The
+            # origins are named anyway -- `band_wide_join_origin_groups[op.input]` is the
+            # group `execution.execute._open_band_wide_join_group` opens as one shared
+            # scan, and one shared scan takes one window, so recording the sample here is
+            # what lets that window be the pixel's rather than the whole grid's. The frame
+            # is band-wide by construction: only a band-wide join writes that dict.
+            #
+            # Both reference counts have to be one. The window is a property of the SHARED
+            # READ, not of this filter's own frame, so anything else reading the group --
+            # a second op off the join's output, or an origin feeding some other branch as
+            # well as this join -- would silently be handed the narrowed read too, and see
+            # one pixel where it asked for a grid. `_incoming` makes the same check for a
+            # single origin; a joined group needs it made for every member.
+            #
+            # Only a filter DIRECTLY on the join output, deliberately. A `calculate` (or a
+            # dimension-only `filter`) in between leaves the pixels alone and could in
+            # principle carry the group forward, but a `group` or a `project` in between
+            # does not, and distinguishing them is a second forward pass for a shape no
+            # analysis here writes. Not narrowing is always correct, only slower.
+            if (
+                isinstance(op, FilterOp)
+                and kinds[PredicateKind.spatial]
+                and reference_count[op.input] == 1
+            ):
+                group = band_wide_join_origin_groups.get(op.input, ())
+                if all(reference_count[origin] == 1 for origin in group):
+                    for origin in group:
+                        point_sample_step.setdefault(origin, op.step_no)
             states[op.output] = None
             continue
 
@@ -999,6 +1046,26 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 vector_columns_ok[origin] = True
             new_grid_cell = incoming.grid_cell and ("grid_cell" in by_set)
             states[op.output] = _Validity(origin=origin, value=False, grid_cell=new_grid_cell)
+            continue
+
+        if isinstance(op, UnpivotOp):  # pragma: no cover -- see below
+            # Value validity retires, for the same reason a `case` retires it: after the
+            # fold the running value is no longer the one column a pushed-down value
+            # predicate would have been testing -- it is several stacked, discriminated by
+            # `op.into`, and a predicate on `value` past here means "whichever operand this
+            # row came from", which no single source read can answer. `grid_cell` validity
+            # survives: the fold repeats each row's cell id rather than changing it.
+            #
+            # Nothing reaches this branch today, hence the pragma: an `unpivot` needs
+            # several value columns, only a `join` produces those, and a join retires the
+            # origin state outright -- so the `incoming is None` gate at the top of this
+            # loop has already `continue`d for every unpivot there can currently be. It is
+            # written out anyway rather than left to fall through to the unrecognized-op
+            # raise below, so that the walk stays exhaustive over `Op` by construction
+            # rather than by what today's pipelines happen to contain, and so that the day
+            # some other op widens `value_columns` this says what an unpivot does to the
+            # pushdown instead of erroring.
+            states[op.output] = dataclasses.replace(incoming, value=False)
             continue
 
         # Unreachable: the branches above are exhaustive over the `Op` union, which is why

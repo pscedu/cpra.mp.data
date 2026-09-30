@@ -244,3 +244,127 @@ class TestCompareDimensionsExclusion:
         ]
         assert "calendar_year" not in fields
         assert "model_group_id" in fields
+
+
+# ------------------------------------------------------------------------------------------
+# A fixed-input analysis on a dataset-scoped visualization
+# ------------------------------------------------------------------------------------------
+
+
+class TestFixedInputAnalysisVisualization:
+    """An analysis that reads its own fixed inputs (`lnd_type_plus`) selected as `analysis=`
+    on a `DatasetVisualization`.
+
+    Such an analysis names its own inputs, so it must be resolved with NO dataset. Passing
+    one through anyway is what a map of `lnd_type_plus` used to do, and it was rejected
+    outright (today: `AnalysisDatasetMismatchError`, raised by the analysis's own
+    `pipeline()` via `reject_dataset`), so the Variable dropdown could offer the derived
+    variable but never render it.
+
+    What used to be a fork is now a single decode. The `_analysis_is_custom`/
+    `_analysis_filters`/`_analysis_params` trio these tests turned on existed to reproduce, on
+    the visualization's side, the filters-or-parameters split the two families of data routes
+    were making on theirs; both sides run `api.unified.decode_request` now, so the assertions
+    below are against `decoded.partition` -- one object, shared with the route. And the split
+    itself is gone in the direction that matters: a dimension value is ALWAYS a filter, here
+    exactly as everywhere else, landing in the trailing selection `filter` step that
+    `lnd_type_plus.validate_selection`'s blanket rejection used to make impossible.
+
+    NOTHING is named here -- no `variable`, no `grid`, no `time_unit`, exactly as in the URL
+    the portal sends. The three used to be constructor arguments and this class passed
+    `variable=None` with a grid and a time unit anyway, because the visualization needed a
+    render context and there was nowhere else to get one. There is now: `grid` and
+    `time_unit` are read back off `output_descriptor`, which says `morph_pixel_v002`/`annual`
+    (the grid the analysis PROJECTS onto, which none of its three inputs is on) and no single
+    variable, because it folds three. No data on disk is needed -- resolving only builds a
+    `Pipeline` in memory.
+    """
+
+    def _map(self, **overrides):
+        kwargs = {
+            "analysis": "lnd_type_plus",
+            "model_group_id": 700,
+            "scenario_id": 34,
+            "calendar_year": 2025,
+        }
+        kwargs.update(overrides)
+        return Map(**kwargs)
+
+    def test_the_render_context_is_the_analysis_s_output_not_an_argument(self):
+        """The half of this that used to be constructor arguments. The analysis reads
+        `elev`/`lnd_type` on `morph_pixel_v002` and `stg` on `hydro_compartment_v002`, and
+        projects onto `morph_pixel_v002`; no input is the answer, the output is."""
+        m = self._map()
+        assert m.variable is None
+        assert m.grid.name == "morph_pixel_v002"
+        assert m.time_unit == "annual"
+
+    def test_a_fixed_input_analysis_resolves_instead_of_raising_a_dataset_mismatch(self):
+        resolved = self._map().resolved_analysis
+        assert resolved is not None
+        assert resolved.meta.name == "lnd_type_plus"
+        # Its own three fixed inputs, and no dataset of the visualization's.
+        assert {i.variable for i in resolved.pipeline.inputs.values()} == {"stg", "elev", "lnd_type"}
+
+    def test_it_names_no_dataset_so_its_urls_carry_no_triple(self):
+        m = self._map()
+        assert m.decoded.partition.dataset == {}
+        assert m.names_dataset is False
+
+    def test_dimension_values_stay_filters_and_reach_the_selection_step(self):
+        """The reversal of the old behaviour: no `Parameters` anywhere, and the selection is
+        a trailing filter against the analysis's OUTPUT frame rather than something the
+        analysis had to declare a field for."""
+        m = self._map()
+        assert m.decoded.partition.params == {}
+        assert m.decoded.partition.filters == {
+            "model_group_id": ["700"],
+            "scenario_id": ["34"],
+            "calendar_year": ["2025"],
+        }
+        selection = m.decoded.pipeline.steps[-2]
+        assert selection.op == "filter"
+        assert selection.where == "calendar_year = 2025 AND model_group_id = 700 AND scenario_id = 34"
+
+    def test_a_dataset_analysis_on_the_same_visualization_still_names_its_dataset(self):
+        m = Map(
+            variable=ANNUAL_KWARGS["variable"],
+            grid=ANNUAL_KWARGS["grid"],
+            time_unit=ANNUAL_KWARGS["time_unit"],
+            analysis="diff",
+            dimension="calendar_year",
+            order="asc",
+            calendar_year=[2030, 2040],
+            **COMMON_ANNUAL_FILTER_LISTS,
+        )
+        assert m.names_dataset is True
+        assert m.decoded.partition.dataset["variable"] == ANNUAL_KWARGS["variable"]
+        assert m.decoded.partition.filters["calendar_year"] == ["2030", "2040"]
+        # `dimension=`/`order=` are the analysis's own parameters; the dimension VALUES aren't.
+        assert set(m.decoded.partition.params) == {"dimension", "order"}
+
+    def test_the_tile_url_is_the_one_data_tile_route_with_no_triple(self):
+        url = self._map()._tile_url_template("png")
+        assert url.startswith("https://api.mpdp.coastal.la.gov/v1/data/{z}/{x}/{y}.png?")
+        assert "analysis=lnd_type_plus" in url
+        assert "model_group_id=700" in url
+        assert "variable=" not in url
+
+    def test_the_data_url_is_the_one_data_route_with_no_triple(self):
+        m = self._map()
+        uri = m.get_data_uri(None, "morph_pixel_v002", "annual", **m.params)
+        assert uri.startswith("https://api.mpdp.coastal.la.gov/v1/data.csv?")
+        assert "analysis=lnd_type_plus" in uri
+        assert "variable=" not in uri
+
+    def test_the_legend_and_title_come_from_the_analysis_not_a_stand_in_variable(self):
+        m = self._map()
+        assert m._legend_name() == "lnd_type_plus"
+        assert m._get_legend_metadata()["title"] == "Land Type Plus"
+
+    def test_an_unknown_analysis_name_is_left_for_the_registry_to_reject(self):
+        from cpra.mp.data.analyses import UnknownAnalysisError
+
+        m = self._map(analysis="no_such_analysis")
+        with pytest.raises(UnknownAnalysisError):
+            _ = m.resolved_analysis

@@ -15,8 +15,9 @@ from cpra.mp.data.visualizations import VISUALIZATIONS
 try:
     from cpra.mp.data.analyses import ANALYSES, DatasetRef, resolve_analysis, resolve_analysis_chain
     from cpra.mp.data.analyses.base import (
+        AnalysisChainError,
+        AnalysisDatasetMismatchError,
         AnalysisRegistryError,
-        AnalysisTypeMismatchError,
         InvalidAnalysisParametersError,
         UnknownAnalysisError,
     )
@@ -30,13 +31,16 @@ except ModuleNotFoundError:  # pragma: no cover -- exercised once the registry p
         """Stand-in for `cpra.mp.data.analyses.base.AnalysisRegistryError`, used only so
         `api/__init__.py`'s exception handler has something to register against while the
         registry package hasn't landed yet -- never actually raised in that case, since
-        `resolve_analysis` itself is `None` and unreachable (every route 404s via
-        `get_analysis_class` first)."""
+        `resolve_analysis`/`resolve_analysis_chain` are themselves `None` and any route that
+        would reach one fails before it."""
 
     class UnknownAnalysisError(AnalysisRegistryError):
         pass
 
-    class AnalysisTypeMismatchError(AnalysisRegistryError):
+    class AnalysisChainError(AnalysisRegistryError):
+        pass
+
+    class AnalysisDatasetMismatchError(AnalysisRegistryError):
         pass
 
     class InvalidAnalysisParametersError(AnalysisRegistryError):
@@ -86,8 +90,14 @@ def validate_format(format, output_type):
         raise HTTPException(status_code=400, detail=msg)
 
 
-def get_visualization_class(name: str, type: str | None = None):
-    """Get a visualization class by name, and optionally, by type."""
+def get_visualization_class(name: str):
+    """Get a visualization class by name, 404ing on an unknown one.
+
+    There is no `type` argument any more. It existed to keep a `type="custom"`
+    visualization off the dataset-scoped route and vice versa, and both of those routes
+    are now the one `/v1/visualizations/{visualization}.json`, which serves every
+    registered class the same way.
+    """
 
     VisualizationClass = VISUALIZATIONS.get(name, None)
 
@@ -95,32 +105,14 @@ def get_visualization_class(name: str, type: str | None = None):
         msg = f"Unknown visualization name: {name}"
         raise HTTPException(status_code=404, detail=msg)
 
-    if type is not None and VisualizationClass.Meta.type != type:
-        msg = f"Invalid visualization type: expected {type}, got {VisualizationClass.Meta.type}"
-        raise HTTPException(status_code=400, detail=msg)
-
     return VisualizationClass
 
 
-def get_analysis_class(name: str, type: str | None = None):
-    """Get a named-analysis class by name, and optionally, by type ("dataset" or
-    "custom").
-
-    The same 404 (unknown name) / 400 (wrong route kind) distinction
-    `get_visualization_class` above already makes, generalized rather than reinvented:
-    a `type="dataset"` analysis is rejected on `/v1/analyses/{name}/...`
-    and a `type="custom"` analysis is rejected on the dataset-scoped route, both via this
-    one function.
-    """
-
-    AnalysisClass = ANALYSES.get(name, None)
-
-    if AnalysisClass is None:
-        msg = f"Unknown analysis name: {name}"
-        raise HTTPException(status_code=404, detail=msg)
-
-    if type is not None and AnalysisClass.Meta.type != type:
-        msg = f"Invalid analysis type: expected {type}, got {AnalysisClass.Meta.type}"
-        raise HTTPException(status_code=400, detail=msg)
-
-    return AnalysisClass
+# There is no `get_analysis_class` any more. It was the named-analysis counterpart to
+# `get_visualization_class` above, and existed to give each of the 8 named-analysis routes a
+# 404 gate before it built anything -- checking both that the name was registered and (via
+# the retired `AnalysisMeta.type`) that it belonged on that route shape. With one data route
+# for every shape there is nothing left to pre-empt: `resolve_analysis_chain` raises
+# `UnknownAnalysisError` for an unregistered name and `AnalysisDatasetMismatchError` for a
+# dataset an analysis does not take, and `api/__init__.py`'s `AnalysisRegistryError` handler
+# maps them to the same 404/400 the gate used to raise directly.

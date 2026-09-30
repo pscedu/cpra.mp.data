@@ -7,7 +7,6 @@ import polars as pl
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns
-from cpra.mp.data.variables import VARIABLES
 from cpra.mp.data.visualizations.colors import selection_color
 from cpra.mp.data.visualizations.display import display_unit, display_value_expr
 
@@ -33,12 +32,149 @@ def is_grid_cell_ids(grid_cell):
     return grid_cell is None or all(token.isdigit() for token in grid_cell_tokens(grid_cell))
 
 
-class BaseVisualization:
-    def __init__(self, request=None, height=400, width=600, **kwargs):
+def analysis_chain(implied: str, chain: str | None) -> str:
+    """`chain` with `implied` at its head, stated once.
+
+    A visualization that declares `Meta.analysis` IS the presentation of that analysis
+    (`SedimentDynamics`), so the analysis has to lead: it is what produces the frame, and
+    only a `kind="dimension"` analysis may follow one. A caller's own chain is kept, after
+    it -- `analysis=diff` on this chart means the five surfaces' differences, not a
+    different chart -- and a caller who named the implied analysis themselves gets it once
+    rather than twice.
+    """
+    names = [name for name in (chain or "").split(",") if name and name != implied]
+    return ",".join([implied, *names])
+
+
+class DatasetVisualization:
+    """Visualization for a single dataset."""
+
+    def __init__(self, request=None, decoded=None, height=400, width=600, **kwargs):
         self.request = request
+        self._decoded = decoded
         self.height = height
         self.width = width
         self.params = kwargs
+
+    @classmethod
+    def request_items(cls, items):
+        """The query pairs the ROUTE should decode for this visualization: the caller's own,
+        with `Meta.analysis` forced to the head of the chain where the class declares one.
+
+        A chart that is the presentation of a named analysis (`SedimentDynamics`) should be
+        reachable by naming the CHART -- a client picking "Sediment Dynamics" from a chart
+        menu has said everything it needs to, and requiring it to also know which analysis
+        backs it is a coupling with no upside and a silent failure mode (the spec would be
+        built over a plain single-variable read and every layer would filter it to nothing).
+        So the route asks the class rather than the query string.
+
+        Stated here rather than in `__init__` because the route decodes BEFORE it
+        constructs. `__init__` has the same rule to apply to `self.params`, which is what
+        puts `analysis=` on the data URLs the spec emits, and both go through
+        `analysis_chain` so there is one statement of what "implied" means.
+        """
+        implied = getattr(getattr(cls, "Meta", None), "analysis", None)
+        if implied is None:
+            return list(items)
+        chain = ",".join(str(value) for key, value in items if key == "analysis")
+        return [
+            *((key, value) for key, value in items if key != "analysis"),
+            ("analysis", analysis_chain(implied, chain)),
+        ]
+
+    @property
+    def names_dataset(self):
+        """Whether a data/tile URL this spec emits should carry the `variable`/`time_unit`/
+        `grid` triple.
+
+        It should exactly when the request this was built from carried one. An analysis that
+        fixes its own inputs (`lnd_type_plus`) takes no dataset and `resolve_analysis_chain`
+        rejects one outright, so re-emitting a triple would turn a working spec's own data
+        URL into a 400 -- while a plain filtered read has nothing else to say what to read.
+        `partition.dataset` is that question already answered, by the same partition the
+        pipeline was built from, so this cannot disagree with it.
+        """
+        return bool(self.decoded.partition.dataset)
+
+    @property
+    def dataset_params(self):
+        """That triple as URL pairs -- `[]` when `names_dataset` is false.
+
+        The caller's OWN triple, read back off the partition, and not the output one
+        (`self.variable`/`self.grid`/`self.time_unit`). A data URL is this same request
+        asked again, so what it has to carry is what to READ; the output triple is what
+        comes back, and the two differ for any analysis that projects or folds. Emitting the
+        output one was harmless while they agreed and stopped being harmless with
+        `sediment_dynamics`, whose output has no single variable at all -- the URL came out
+        carrying a literal `variable=None`, which is a 400 on the route it points at.
+
+        `query_items` states the same rule for the notebook decode, off `self.params` --
+        there because it is what the partition is built FROM and reading it back would be a
+        cycle. Same triple either way: the partition's `dataset` is those three parameters
+        sorted into their category, unchanged.
+        """
+        dataset = self.decoded.partition.dataset
+        return [(name, dataset[name]) for name in ("variable", "time_unit", "grid") if name in dataset]
+
+    def forward_query(self, params=None, *, compression=True):
+        """This visualization's own request re-emitted as URL `(key, value)` pairs, for a
+        data or tile URL the spec points at. `params` defaults to `self.params`.
+
+        Three ways this is not a plain `urlencode(self.params)`:
+
+        - **Render options are dropped.** `height`/`width`/`show_water`/... are category 5 of
+          THIS route's partition and of no other's; `/v1/data.csv` has no visualization class
+          to declare them against, so under `analysis=download` they are leftovers and a 400,
+          and under a named analysis they reach its `extra="forbid"` `Parameters` and are a
+          400 from further in. `api.models.RENDER_OPTIONS` derives the set from
+          `VisualizationQuery` structurally, so a field added there cannot be missed here.
+        - **The named analysis's own parameters are added back.** `dimension=`/`order=`/...
+          have no fixed field set, so `VisualizationQuery` cannot declare them and FastAPI
+          never binds them into `self.params` for a request-driven visualization;
+          `partition.params` is precisely the set the decoder could attribute to no other
+          category, which is precisely them. A notebook caller passes them as ordinary
+          keyword arguments, so they are already in `self.params` and the merge is a no-op.
+        - **`grid_cell` is comma-joined, not repeated.** It is one scalar parameter carrying
+          a comma-separated list, unlike a dimension, which repeats.
+        - **The dataset triple is dropped.** A notebook caller passes `variable`/`time_unit`/
+          `grid` as ordinary keyword arguments, so they land in `self.params` with everything
+          else, but whether an emitted URL should carry them is a question only
+          `names_dataset` answers -- an analysis that fixes its own inputs 400s on a triple.
+          Dropping them here leaves `get_data_uri` and `map._tile_url_template` as the one
+          place that re-emits them, rather than having them arrive twice by two routes.
+
+        `compression=False` is the tile routes: `partition_query(allow_compression=False)`
+        rejects a compression parameter outright rather than ignoring it, and `Compression`'s
+        fields have non-`None` defaults, so a request-driven visualization always has them in
+        `self.params` and would always send them.
+
+        Reads `self._decoded` -- the decode the ROUTE handed in -- rather than `self.decoded`,
+        which is not the same thing for a notebook caller: `DatasetVisualization.decoded`
+        builds its decode out of `query_items`, which calls this, so going through the
+        property would be a cycle. There is nothing to recover in that case anyway; that is
+        the branch where the analysis's parameters are already in `self.params`.
+        """
+        from cpra.mp.data.analysis.request.unified import COMPRESSION_OPTIONS, DATASET_SUGAR
+        from cpra.mp.data.api.models import RENDER_OPTIONS
+
+        params = self.params if params is None else params
+        analysis_params = self._decoded.partition.params if self._decoded is not None else {}
+        dropped = set(RENDER_OPTIONS) | DATASET_SUGAR
+        if not compression:
+            dropped |= COMPRESSION_OPTIONS
+
+        pairs = []
+        for key, value in {**params, **analysis_params}.items():
+            if value is None or key in dropped:
+                continue
+            if isinstance(value, (list, tuple)):
+                if key == "grid_cell":
+                    pairs.append((key, ",".join(str(item) for item in value)))
+                else:
+                    pairs.extend((key, item) for item in value)
+            else:
+                pairs.append((key, value))
+        return pairs
 
     def chart(self):
         """Build the visualization using Altair."""
@@ -47,138 +183,89 @@ class BaseVisualization:
 
     def get_base_chart(
         self,
-        data_sources: alt.UrlData | dict[str, alt.UrlData],
+        source: alt.UrlData,
         time_column: str,
-        join_column: str | None = None,
         date_column: str | None = "date",
     ) -> alt.Chart:
-        """Generate a base chart from the given data source and options."""
-        chart: alt.Chart | None = None
+        """Generate a base chart from the given data source and options.
 
-        if isinstance(data_sources, alt.UrlData):
-            data_sources = {"value": data_sources}
+        One source, because every visualization now has one: `SedimentDynamics` was the only
+        caller that passed several (five single-variable reads it joined here with a
+        `transform_lookup` per source, keyed on the time column) and it reads the stacked
+        output of the `sediment_dynamics` analysis instead. What went with that loop: the
+        per-source `display_scale_factor` applied to the field a lookup landed in -- which
+        was written twice, so a joined source was divided by its factor twice, and
+        `sediment_dynamics`'s hover tooltip showed `elev` in metres/1000.
+        """
+        # The API serves storage units; every chart downstream reads display units, so the
+        # conversion happens here, once, on the way in -- see visualizations.display. A
+        # result that carries no single variable (an analysis that folds several) has no one
+        # factor to apply and is left alone; `SedimentDynamics` scales per row instead.
+        value_expr = display_value_expr(self.variable)
 
-        for source_name, source in data_sources.items():
-            # The API serves storage units; every chart downstream reads display units, so
-            # the conversion happens here, once, on the way in -- see visualizations.display.
-            value_expr = display_value_expr(self.source_variable(source_name))
+        calculate_exprs = {}
+        if value_expr != "datum.value":
+            calculate_exprs["value"] = value_expr
 
-            # If this is the first data source, create the chart.
-            if chart is None:
-                chart = alt.Chart(source)
-
-                # Collect and apply calculate expressions.
-                calculate_exprs = {}
-                # Both entries read `datum.value` directly rather than one reading the
-                # other, so they don't depend on which calculate transform Vega runs first.
-                if value_expr != "datum.value":
-                    calculate_exprs["value"] = value_expr
-                if source_name != "value":
-                    calculate_exprs[source_name] = value_expr
-
-                if date_column:
-                    if time_column == "calendar_year":
-                        calculate_exprs[date_column] = "toDate(toString(datum.calendar_year))"
-                    else:
-                        calculate_exprs[date_column] = "datum.calendar_day"
-
-                if calculate_exprs:
-                    chart = chart.transform_calculate(**calculate_exprs)
-            # Otherwise, join this data source to the previous chart.
+        if date_column:
+            if time_column == "calendar_year":
+                calculate_exprs[date_column] = "toDate(toString(datum.calendar_year))"
             else:
-                col = join_column or time_column
-                chart = chart.transform_lookup(
-                    col,
-                    as_=[source_name],
-                    from_=alt.LookupData(source, col, ["value"]),
-                )
-                # The lookup pulls the joined source's raw `value` across, so this source's
-                # own scaling has to be applied to the field it landed in.
-                joined_field = f"datum['{source_name}']"
-                joined_expr = display_value_expr(self.source_variable(source_name), joined_field)
-                if joined_expr != joined_field:
-                    chart = chart.transform_calculate(**{source_name: joined_expr})
+                calculate_exprs[date_column] = "datum.calendar_day"
 
-                # The lookup pulls the joined source's raw `value` across, so this source's
-                # own scaling has to be applied to the field it landed in.
-                joined_field = f"datum['{source_name}']"
-                joined_expr = display_value_expr(self.source_variable(source_name), joined_field)
-                if joined_expr != joined_field:
-                    chart = chart.transform_calculate(**{source_name: joined_expr})
-
+        chart = alt.Chart(source)
+        if calculate_exprs:
+            chart = chart.transform_calculate(**calculate_exprs)
         return chart
 
-    def source_variable(self, source_name):
-        """The variable whose values the ``get_base_chart`` data source ``source_name`` carries.
-
-        A source is named for the variable it holds (``get_data_source``'s ``name or
-        variable``), so a multi-variable chart like ``SedimentDynamics`` is answered by
-        name alone.  The exception is a ``DatasetVisualization``, whose single source is
-        named ``"value"`` after the field it fills; that falls back to the one variable the
-        visualization is about.  Returns ``None`` when neither applies, which
-        ``display_value_expr`` treats as "no scaling".
-        """
-
-        return VARIABLES.get(source_name) or getattr(self, "variable", None)
-
     def get_data_uri(self, variable, grid, time_unit, **kwargs):
-        """Get an API data URI.
+        """The `/v1/data.csv` URL for one of this spec's data sources.
 
-        When a named analysis is selected (`resolved_analysis` -- a `DatasetVisualization`
-        property, absent/`None` on a visualization that doesn't have one, e.g.
-        `SedimentDynamics`), points at that analysis's own `.../analyses/{name}/data.csv`
-        route instead of the plain `.../data.csv` route. With no analysis selected, this
-        is unchanged -- there's no reason to route an unanalyzed filtered read through an
-        analysis; either way the data returned is already long format (grid_cell/value
-        columns), so there is no `unpivot` param to forward on either route.
+        One route for every case now. What used to pick between three routes -- the flat
+        dataset route, the dataset-scoped analysis route and the custom-analysis route -- is
+        two ordinary query parameters on this one: `analysis=` (forwarded from `kwargs` like
+        any other, rather than being lifted into a path segment), and the
+        `variable`/`time_unit`/`grid` triple, emitted by `dataset_params` only when this
+        request actually names a dataset.
+
+        `kwargs` is the caller's parameters for this source -- `self.params`, less the
+        dataset triple this takes as three arguments of its own. `forward_query` is what
+        turns them into pairs; see it for why they are not simply urlencoded.
+
+        The three arguments are the OUTPUT triple, and describe the frame that comes back:
+        which columns it requires, which time column to select and parse. What the URL
+        SENDS is `dataset_params` -- see it for why the two are not the same triple.
         """
 
-        required_cols = required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit, "grid": grid}))
+        required_cols = (
+            required_columns(pl.DataFrame({"variable": variable, "time_unit": time_unit, "grid": grid}))
+            if variable is not None
+            else []
+        )
         select = [self.get_time_column(time_unit), "grid_cell", "value"]
-
-        resolved = getattr(self, "resolved_analysis", None)
-        analysis_name = kwargs.pop("analysis", None)
-
-        if resolved is not None:
-            # Only the analysis route's own known fields, plus whatever extra parameters
-            # the named analysis itself declares (`dimension`/`order`/...), have any
-            # meaning here -- every OTHER `VisualizationQuery` field (the map-only display
-            # params, ...) would otherwise reach the analysis route as an unrecognized
-            # query parameter and be rejected outright, since its `Parameters` model is
-            # `extra="forbid"` (see `analyses/base.py`).
-            from cpra.mp.data.api.models import AnalysisDataQuery
-
-            # `kwargs` alone is missing a named analysis's own parameters (`dimension`/
-            # `order`/...) for a request-driven visualization: `VisualizationQuery` can't
-            # declare them (each analysis declares its own), so FastAPI's query-model
-            # binding never puts them in `self.params` -- and `kwargs` here traces back to
-            # exactly that dict (via `get_data_source`) -- only `_analysis_params`'s own
-            # extra scan of the raw query string recovers them (see its docstring above).
-            # Folding it in is what actually lets those parameters reach the emitted
-            # data.csv URL; it never overlaps `kwargs`'s own `VisualizationQuery`-declared
-            # keys, so this can't clobber anything already there.
-            extra_analysis_params = getattr(self, "_analysis_params", {})
-            allowed = set(AnalysisDataQuery.model_fields) | set(extra_analysis_params)
-            kwargs = {k: v for k, v in {**kwargs, **extra_analysis_params}.items() if k in allowed}
 
         # A caller-supplied `select` (`SpeciesStackedBar.data_source`) replaces the computed
         # one outright, but still has to be filtered below, so it is taken out of `kwargs`
         # here and re-emitted as the single `select` parameter at the end rather than being
-        # passed straight through by the loop.
+        # passed straight through by `forward_query`.
         caller_select = kwargs.pop("select", None)
 
-        params = []
+        params = [*self.dataset_params, *self.forward_query(kwargs)]
+
+        # A dimension the caller selected several values of stays a column of the result, so
+        # the chart needs it named in `select` to tell the series apart.
         for param_name, param_values in kwargs.items():
-            if isinstance(param_values, (list, tuple)):
-                if param_name == "grid_cell":
-                    params.append(("grid_cell", ",".join([str(geo) for geo in param_values])))
-                else:
-                    for value in param_values:
-                        params.append((param_name, value))
-                if param_name in required_cols and len(param_values) > 1:
-                    select.append(param_name)
-            elif param_values is not None:
-                params.append((param_name, param_values))
+            if isinstance(param_values, (list, tuple)) and param_name in required_cols and len(param_values) > 1:
+                select.append(param_name)
+
+        # A FOLDED result tells its rows apart the same way: `sediment_dynamics` returns one
+        # row per (year, variable) with the variable name in a label column, so without that
+        # column the five surfaces arrive as five unlabelled values per year. It is named by
+        # the descriptor rather than assumed (`UnpivotStep.into` is the analysis's choice),
+        # and is `None` for every unfolded result, which is all of them today but one.
+        folded_into = self.decoded.descriptor.folded_into if self.decoded is not None else None
+        if folded_into is not None:
+            select.append(folded_into)
 
         if caller_select is not None:
             select = caller_select.split(",") if isinstance(caller_select, str) else list(caller_select)
@@ -199,37 +286,17 @@ class BaseVisualization:
         # compare-channel choices, for the same underlying reason -- a collapsed dimension
         # has nothing left to compare across -- so this keeps the request in step with the
         # chart that consumes it. With no analysis selected, nothing is collapsed.
+        resolved = self.decoded.analysis if self.decoded is not None else None
         if resolved is not None:
             select = [column for column in select if column not in resolved.collapsed_dimensions]
 
         # Set select param to limit columns returned.
         params.append(("select", ",".join(select)))
 
-        if resolved is not None:
-            if self.request:
-                dataset_url = self.request.url_for(
-                    "get_dataset_analysis_data",
-                    variable=variable,
-                    time_unit=time_unit,
-                    grid=grid,
-                    analysis_name=analysis_name,
-                    format="csv",
-                )
-            else:
-                dataset_url = (
-                    f"https://api.mpdp.coastal.la.gov/v1/datasets/{variable}/{time_unit}/{grid}"
-                    f"/analyses/{analysis_name}/data.csv"
-                )
-        elif self.request:
-            dataset_url = self.request.url_for(
-                "get_model_data",
-                variable=variable,
-                time_unit=time_unit,
-                grid=grid,
-                format="csv",
-            )
+        if self.request:
+            dataset_url = self.request.url_for("get_data", format="csv")
         else:
-            dataset_url = f"https://api.mpdp.coastal.la.gov/v1/datasets/{variable}/{time_unit}/{grid}/data.csv"
+            dataset_url = "https://api.mpdp.coastal.la.gov/v1/data.csv"
 
         return f"{dataset_url}?{urlencode(params)}"
 
@@ -251,7 +318,12 @@ class BaseVisualization:
             time_column = self.get_time_column(time_unit)
             parse[time_column] = "date:%Y-%m-%d" if time_column == "calendar_day" else "number"
 
-        return alt.UrlData(data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=(name or variable))
+        # `name or variable or "value"`: a source is named for the variable it carries. An
+        # output with no single variable (`lnd_type_plus`, `sediment_dynamics`) has nothing
+        # to name it after, so it takes the name of the field it fills.
+        return alt.UrlData(
+            data_uri, format=alt.CsvDataFormat(type="csv", parse=parse), name=(name or variable or "value")
+        )
 
     def get_time_column(self, time_unit):
         """Get the name of the time column."""
@@ -308,20 +380,140 @@ class BaseVisualization:
         chart = self.chart()
         return chart.to_dict()
 
+    @cached_property
+    def descriptor(self):
+        """What this request's pipeline PRODUCES -- the render context every property below
+        is derived from.
 
-class DatasetVisualization(BaseVisualization):
-    """Visualization for a single dataset."""
+        This was three constructor arguments, which is what let the route and a notebook give
+        different answers to the same question. `grid` and `time_unit` are facts about the
+        output frame, not about what the caller typed: an analysis may project onto a grid
+        none of its inputs is on (`lnd_type_plus` outputs `morph_pixel_v002`) or fold several
+        variables into one categorical result. The route had already been deriving them from
+        `output_descriptor`; a notebook was still passing its own input triple straight
+        through. Reading them off `decoded` here means there is one derivation, and the
+        triple goes back to being what it is in a URL -- an ordinary request parameter, in
+        `self.params` with the rest of them.
+        """
+        return self.decoded.descriptor
 
-    def __init__(self, variable, grid, time_unit, **kwargs):
-        super().__init__(**kwargs)
-        self.variable = VARIABLES[variable]
-        self.grid = GRIDS[grid]
-        self.time_unit = time_unit
+    @cached_property
+    def variable(self):
+        """The one variable the result is about, or `None` when it carries none: the analysis
+        that produced it folded several (`lnd_type_plus` reads three), so there is no single
+        presentation variable to take a label, a unit or a legend from.
+
+        `None` also means this request named no dataset -- an analysis that fixes its own
+        inputs is the only way to get here -- which is what `names_dataset` keys off.
+        """
+        return self.descriptor.variable
+
+    @cached_property
+    def grid(self):
+        """The grid the result is ON, which is not always a grid its inputs are on."""
+        return GRIDS[self.descriptor.grid]
+
+    @cached_property
+    def time_unit(self):
+        """The time unit the result steps by, or `None` when it has no time column left."""
+        return self.descriptor.time_unit
+
+    @cached_property
+    def decoded(self):
+        """This visualization's request, decoded -- the route's own decode when there was a
+        route, and one performed here when there wasn't.
+
+        The fallback is the notebook case: `Map(variable="elev", grid=..., time_unit=...,
+        calendar_year=[2050], analysis="diff", dimension="model_group_id")` has to reach the
+        same `Pipeline` the equivalent URL would, and re-deriving it here from
+        `self.params` -- through the very same `partition_query`/`resolve_analysis_chain`/
+        `build_pipeline` sequence -- is the only way to be sure it does. `decode_request_sync`
+        exists for exactly this: a spec is built from synchronous cached properties, with no
+        event loop to await the async form on.
+
+        This is also what replaced `map.py`'s `_data_query_pipeline`, which lowered the
+        no-`analysis=` case onto a `Pipeline` by hand through `build_data_query_pipeline`.
+        There is no second path to keep in step now: analysis or not, notebook or route, one
+        decoder answers.
+        """
+        if self._decoded is not None:
+            return self._decoded
+
+        # Imported lazily: `cpra.mp.data.api`'s `__init__.py` imports `VISUALIZATIONS` from
+        # this package at module level, so importing it back from here at module level would
+        # be a circular import -- see `map.py`'s `feature_colors`, which does the same for
+        # its own engine imports.
+        from cpra.mp.data.api.models import RENDER_OPTIONS
+        from cpra.mp.data.api.unified import decode_request_sync
+
+        # `validate_sink=False`, for the same reason `api.__init__.get_visualization` passes
+        # it on the route half: `format="csv"` here names the format the SPEC's data URLs
+        # will ask for, not a sink this decode writes to. A visualization over a raster
+        # dataset has a band-wide final frame until one of its data sources adds a
+        # `grid_cell`, so validating the tabular sink against this pipeline would reject
+        # every raster visualization before its first chart was built. The two sink rules
+        # still bind where they mean something -- on the `/v1/data.{format}` request the
+        # emitted URL turns into.
+        return decode_request_sync(
+            self.query_items(),
+            format="csv",
+            render_fields=RENDER_OPTIONS,
+            validate_sink=False,
+        )
+
+    def query_items(self):
+        """This visualization's constructor arguments as the raw `(key, value)` query pairs
+        `decode_request_sync` takes -- the notebook half of `decoded` above.
+
+        The dataset triple is re-attached straight from `self.params`, and NOT from
+        `self.variable`/`self.grid`/`self.time_unit`: those are derived from `descriptor`,
+        which is derived from `decoded`, which is built out of this -- reading them here
+        would be a cycle. It is also the wrong triple to send. These are the datasets to
+        READ; the properties describe what comes back, and for an analysis that projects,
+        the two differ. A caller that named none simply has none of the three in `params`,
+        which is exactly the request `resolve_analysis_chain` wants for an analysis that
+        fixes its own inputs.
+
+        `forward_query` drops the triple for this reason -- so it is emitted here, once,
+        rather than arriving again among the ordinary parameters.
+
+        Values are stringified, since a query string is what the decoder parses -- a notebook
+        writing `calendar_year=[2050, 2060]` and a URL writing
+        `calendar_year=2050&calendar_year=2060` have to arrive identically, and `forward_query`
+        already renders exactly that (minus the render options, which the decoder would only
+        put back in a category this class never reads).
+        """
+        dataset = [
+            (name, str(self.params[name]))
+            for name in ("variable", "time_unit", "grid")
+            if self.params.get(name) is not None
+        ]
+        return [*dataset, *((key, str(value)) for key, value in self.forward_query())]
+
+    @cached_property
+    def source_params(self):
+        """`self.params` without the dataset triple: the parameters a data source's URL
+        carries, as against the dataset it reads.
+
+        A notebook caller passes `variable`/`time_unit`/`grid` as ordinary keyword arguments
+        -- there is nowhere else for them to go now that they are not constructor arguments
+        -- so they land in `params` with everything else. `get_data_source` takes them as
+        three arguments of its own and would get two values for each.
+        """
+        from cpra.mp.data.analysis.request.unified import DATASET_SUGAR
+
+        return {key: value for key, value in self.params.items() if key not in DATASET_SUGAR}
 
     @cached_property
     def data_source(self):
-        """Get the Altair data source."""
-        return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **self.params)
+        """Get the Altair data source.
+
+        The triple handed down is the OUTPUT one -- what the chart has to parse, index and
+        label by. Whether a URL should carry one at all is `get_data_uri`'s question, and
+        `names_dataset` is how it answers.
+        """
+        variable = self.variable.name if self.variable is not None else None
+        return self.get_data_source(variable, self.grid.name, self.time_unit, **self.source_params)
 
     @cached_property
     def _analysis_name(self):
@@ -329,78 +521,28 @@ class DatasetVisualization(BaseVisualization):
         return self.params.get("analysis")
 
     @cached_property
-    def _analysis_filters(self):
-        """Dimension filters + `grid_cell`/`where`, in the exact shape `resolve_analysis`'s
-        `filters` argument expects -- mirrors `api.__init__._analysis_filters`."""
-        from cpra.mp.data.api.models import FilterDimensions
-
-        filter_fields = set(FilterDimensions.model_fields)
-        filters = {k: v for k, v in self.params.items() if k in filter_fields and v is not None}
-        for extra_key in ("grid_cell", "where"):
-            value = self.params.get(extra_key)
-            if value is not None:
-                filters[extra_key] = value
-        return filters
-
-    @cached_property
-    def _analysis_params(self):
-        """The named analysis's own declared parameters (`dimension`/`order`/...), read off
-        whatever isn't a `VisualizationQuery` field -- mirrors
-        `api.__init__._analysis_extra_params`. A request-driven visualization only has
-        these in `self.params` when `self.request`'s raw query string carries them (a
-        route handler's `dict(query)` only ever carries `VisualizationQuery`'s own
-        declared fields, since the analysis's parameters have no fixed field set of their
-        own); a notebook caller that builds this class directly passes them as ordinary
-        keyword arguments instead, which already land in `self.params`.
-        """
-        from cpra.mp.data.api.models import VisualizationQuery
-
-        known = set(VisualizationQuery.model_fields)
-        extra_params = {k: v for k, v in self.params.items() if k not in known and v is not None}
-        if self.request is not None:
-            for key, value in self.request.query_params.items():
-                if key not in known and key not in extra_params:
-                    extra_params[key] = value
-        return extra_params
-
-    @cached_property
     def resolved_analysis(self):
-        """The `analysis=` request parameter, resolved into a real, ready-to-
-        compile `Pipeline` plus presentation metadata (`.legend`/`.result_kind`/
-        `.collapsed_dimensions`/`.title_suffix`) -- or `None` when no analysis was
-        selected, the signal every migrated hook in this module (and in `map.py`/
-        `time_series_line.py`/`stacked_bar.py`) falls back to its pre-existing legacy
-        behavior on.
+        """The `ResolvedAnalysis` behind this visualization -- its `Pipeline` plus the
+        presentation metadata that overrides what the pipeline alone would say
+        (`.legend`/`.result_kind`/`.collapsed_dimensions`/`.title_suffix`/`.meta`) -- or
+        `None` when no `analysis=` was selected, which every hook in this module (and in
+        `map.py`/`time_series_line.py`/`stacked_bar.py`) reads as "plain dataset behavior".
 
-        `grid_cell` is resolved against real geometry FIRST and passed separately as
-        `grid_cell_where`, exactly as `api.__init__._resolve_dataset_analysis` does for
-        the HTTP routes and for the same reason: the registry cannot parse a coordinate
-        (doing so needs `io/`), and a visualization's `grid_cell` is a coordinate as often
-        as it is an id -- `_grid_cells` above already resolves the same value the same
-        way. A `None` back from `resolve_grid_cell_sync` means the value was a vector
-        grid's digit-id form (or absent), which `_analysis_filters`'s own raw `grid_cell`
-        key covers.
+        Read straight off `decoded`, which is the decode the route already performed (or,
+        for a notebook caller, the one `decoded` performs for itself). Nothing is resolved
+        here any more: the four properties this replaced -- `_analysis_is_custom`,
+        `_analysis_filters`, `_analysis_params` and this one's own body -- existed to
+        reproduce, on this side, the filters/params split and the dataset-or-not routing the
+        route layer was doing on its own side. Both sides now run one decoder, so there is
+        nothing left to keep in agreement.
+
+        In particular there is no `type="custom"` fork left. Whether an analysis takes the
+        caller's dataset is a fact its own `pipeline()` states (`require_dataset`/
+        `reject_dataset`), a caller who names a dataset it rejects gets
+        `AnalysisDatasetMismatchError` -> 400, and this class simply does not name one when
+        `self.variable is None` (see `query_items`).
         """
-        name = self._analysis_name
-        if name is None:
-            return None
-
-        # Imported lazily: `cpra.mp.data.api`'s `__init__.py` imports `VISUALIZATIONS`
-        # from this package at module level, so importing it back from here at module
-        # level would be a circular import -- see `map.py`'s `feature_colors`, which
-        # already does the same thing for its own model imports.
-        from cpra.mp.data.analyses import DatasetRef, resolve_analysis_chain
-        from cpra.mp.data.api.data_query import resolve_grid_cell_sync
-
-        grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, self.params.get("grid_cell"))
-        dataset = DatasetRef(variable=self.variable.name, time_unit=self.time_unit, grid=self.grid.name)
-        return resolve_analysis_chain(
-            name.split(","),
-            dataset=dataset,
-            filters=self._analysis_filters,
-            params=self._analysis_params,
-            grid_cell_where=grid_cell_where,
-        )
+        return self.decoded.analysis if self.decoded is not None else None
 
     @cached_property
     def difference_suffix(self):
@@ -523,23 +665,44 @@ class DatasetVisualization(BaseVisualization):
         return DIMENSIONS[self.time_column]
 
     @cached_property
+    def result_label(self):
+        """What this visualization's values are called, for a title or an axis.
+
+        The variable's own label wherever there is one variable. Where there isn't -- an
+        analysis that folds several into one result, so `output_descriptor(...).variable` is
+        `None` -- the analysis's own `Meta.label` is the only thing that names the result,
+        and is exactly the override `descriptor.py` declines to fold in on the grounds that
+        `analyses/` imports `request/` and not the other way round. The last fallback is for
+        neither: a multi-input pipeline written out by hand, which nothing names.
+        """
+        if self.variable is not None:
+            return self.variable.label
+        resolved = self.resolved_analysis
+        return resolved.meta.label if resolved is not None else "Value"
+
+    @cached_property
     def title(self):
         """Get the chart title."""
-        title = self.variable.label
+        title = self.result_label
         aggregate_type = self.params.get("aggregate_type", None)
         if aggregate_type and len(aggregate_type) == 1:
             aggregate_label = DIMENSIONS["aggregate_type"].values.filter(value=aggregate_type[0])["label"][0]
             title = f"{aggregate_label} {title}"
-        return f"{self.time_unit.title()} {title}{self.difference_suffix}"
+        # `time_unit` is `None` when the pipeline's inputs disagree on one, which no analysis
+        # in the registry does today but which `OutputDescriptor` allows for; the unit is
+        # simply left off the title rather than guessed at.
+        prefix = f"{self.time_unit.title()} " if self.time_unit else ""
+        return f"{prefix}{title}{self.difference_suffix}"
 
     @cached_property
     def variable_label(self):
         """Get the variable label and unit.
 
         The unit shown is the display unit, matching the scaling `get_base_chart` applies
-        to the values this labels.
+        to the values this labels. A result with no single variable has no unit to show, and
+        `display_unit` answers `None` for it.
         """
-        label = f"{self.variable.label}{self.difference_suffix}"
+        label = f"{self.result_label}{self.difference_suffix}"
         unit = display_unit(self.variable)
         if unit:
             label += f" ({unit})"

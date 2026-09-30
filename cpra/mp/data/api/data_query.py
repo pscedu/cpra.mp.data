@@ -1,14 +1,16 @@
-"""The flat data routes' one piece of request-to-`Pipeline` work that
-`request.data_query.build_data_query_pipeline` deliberately cannot do for itself:
+"""The decoder's one piece of request-to-`Pipeline` work that neither
+`request.unified.partition_query` nor the named-analysis registry may do for itself:
 resolving a coordinate-valued `grid_cell` against real grid geometry, which needs `io/`
 and therefore cannot live under `request/` (see that module's docstring, and
 `tests/api/test_analysis_layering.py`).
 
-`build_data_query` is what the three `/v1/datasets/{variable}/{time_unit}/{grid}/...`
-routes call to turn their flat query parameters into a `Pipeline`: it resolves
-`grid_cell`, hands the resulting conjunct to `build_data_query_pipeline`, and returns the
-`Pipeline` together with the two extras a route needs to plumb into its response but
-cannot recover from the pipeline alone.
+The two `resolve_grid_cell` forms below are the whole module. `api.unified.decode_request`
+calls the async one (and `decode_request_sync` the blocking one, for a visualization
+building its spec outside the event loop), once it has probed the resolved pipeline for the
+grid its output is addressed against. There is no `build_data_query` wrapper any more: it
+existed to compose this with `build_data_query_pipeline` for the three
+`/v1/datasets/{variable}/{time_unit}/{grid}/...` routes, all of which are now
+`GET /v1/data.{format}` going through the unified decoder.
 
 **Why `grid_cell` resolution is grid-kind-dependent, and exactly how.** The two grid kinds
 have always disagreed about what a `grid_cell` value MEANS, and this module reproduces that
@@ -52,36 +54,8 @@ from cpra.mp.data.analysis.io.geography import (
     resolve_vector_grid_cell,
     resolve_vector_grid_cell_sync,
 )
-from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import NotFoundError
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.variables import VARIABLES
-
-
-class ResolvedDataQuery(NamedTuple):
-    """A flat data query, lowered: the `Pipeline` itself plus the two things a route has to
-    carry separately into its response because the `Pipeline` does not record them.
-
-    `relabel` is `io.geography.resolve_raster_point_labels`'s absolute-id -> coordinate-
-    string map for a raster point query, and `None` for everything else. It cannot live on
-    the `Pipeline`: the pipeline's `where` names integer ids (that is what the executor
-    filters on), and the caller's own coordinate strings are a presentation concern applied
-    to the RESULT -- see `execution.execute.run_to_path`'s `relabel` argument.
-
-    `float_precision` is the query's one variable's declared CSV rounding, which a
-    `Pipeline` has no field for either (`request.pipeline.Output` carries `format`/
-    `color_map`/`sort`/`select`/`compression` and nothing about number formatting). A flat
-    data query always has exactly one variable, so unlike a general pipeline it always has
-    exactly one answer here -- see `api.pipeline.PipelineTabularSource`.
-
-    Both are `None`-by-default plumbing rather than behavior: a route that ignores them
-    (the two tile routes, neither of which produces text floats or a `grid_cell` column)
-    is not skipping a step.
-    """
-
-    pipeline: object
-    relabel: dict[int, list[str]] | None
-    float_precision: int | None
 
 
 class _VectorPoints(NamedTuple):
@@ -168,33 +142,4 @@ def resolve_grid_cell_sync(grid_name: str, grid_cell: str | None):
 
     return _vector_point_where(
         resolve_vector_grid_cell_sync(grid_name, resolved.lngs, resolved.lats)
-    )
-
-
-async def build_data_query(
-    dataset_dimensions, filter_dimensions, options, format: str
-) -> ResolvedDataQuery:
-    """Lower one flat data/tile request onto a `Pipeline`, resolving `grid_cell` first.
-
-    Runs only `build_data_query_pipeline`'s own STRUCTURAL validation (see that function)
-    -- a caller still runs `request.ops.validate_shapes` on the returned pipeline before
-    handing it to a responder, exactly as the `/v1/analysis...` routes do for a pipeline
-    they parsed. That ordering is deliberate rather than incidental: resolving `grid_cell`
-    is what decides whether a raster request's final frame is band-wide or long, and
-    `validate_shapes` is what turns that shape into the right rejection for the requested
-    format (a raster grid asked for `csv` with no `grid_cell`; a point query asked for
-    `tif`) -- it cannot answer either question before this function has run.
-
-    `format` is the string the URL's own extension resolves to, used verbatim as
-    `output.format`.
-    """
-    grid_cell_where, relabel = await resolve_grid_cell(dataset_dimensions.grid, options.grid_cell)
-    pipeline = build_data_query_pipeline(
-        dataset_dimensions, filter_dimensions, options, format, grid_cell_where=grid_cell_where
-    )
-    variable = VARIABLES.get(dataset_dimensions.variable)
-    return ResolvedDataQuery(
-        pipeline=pipeline,
-        relabel=relabel,
-        float_precision=variable.float_precision if variable is not None else None,
     )

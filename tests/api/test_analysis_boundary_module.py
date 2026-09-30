@@ -1,9 +1,14 @@
 """Tests for `cpra.mp.data.api.boundary` -- the exception -> HTTP mapping installed onto
-the four `/v1/analysis...` pipeline routes -- and, since a mapping is only meaningful
-through the routes that trigger it, a route-level smoke test of all four response shapes
-(tabular, `tif`, `png` tile, `pbf` tile) that boundary.py's own module docstring already
-references this file by name for (its MRO claim, and the tile route's `RequestError`
-propagation test in `test_pipeline_exec.py`).
+the data routes -- and, since a mapping is only meaningful through the routes that trigger
+it, a route-level smoke test of all four response shapes (tabular, `tif`, `png` tile, `pbf`
+tile) that boundary.py's own module docstring already references this file by name for (its
+MRO claim, and the tile route's `RequestError` propagation test in `test_pipeline_exec.py`).
+
+There are two paths now where there were four: `POST /v1/data.{format}`, which takes the
+`Pipeline` JSON these tests write, and `GET /v1/data/{z}/{x}/{y}.{format}`, which takes the
+same pipeline in the dotted query codec (`pipeline_to_query`). The four response SHAPES are
+unchanged -- they are a property of `output.format` and the sink behind it, not of which URL
+asked -- which is why `TestFourRoutesEndToEnd` keeps its name and its four-way coverage.
 
 Two layers:
 
@@ -63,7 +68,13 @@ from cpra.mp.data.analysis.request.expressions import ExpressionError
 from cpra.mp.data.api import pipeline as api_pipeline
 from cpra.mp.data.api.boundary import install_analysis_boundary, resolve_detail, resolve_status
 from cpra.mp.data.tabular import write_parquet
-from tests.factories import ANNUAL_KWARGS, RASTER_KWARGS, annual_frame, write_raster_dataset
+from tests.factories import (
+    ANNUAL_KWARGS,
+    RASTER_KWARGS,
+    annual_frame,
+    write_pmtiles,
+    write_raster_dataset,
+)
 
 # --------------------------------------------------------------------------------------
 # resolve_status: the plain function `PipelineTabularResponse` consults directly (see this
@@ -304,7 +315,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_csv(io.BytesIO(response.content))
         expected = annual_frame(years=(2030,))["1"][0]
@@ -327,7 +338,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "ndjson"},
         }
-        response = client.post("/v1/analysis.ndjson", json=pipeline)
+        response = client.post("/v1/data.ndjson", json=pipeline)
         assert response.status_code == 200, response.text
         rows = [json.loads(line) for line in response.text.splitlines()]
         expected = annual_frame(years=(2030,))["1"][0]
@@ -349,7 +360,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "parquet"},
         }
-        response = client.post("/v1/analysis.parquet", json=pipeline)
+        response = client.post("/v1/data.parquet", json=pipeline)
         assert response.status_code == 200, response.text
         df = pl.read_parquet(io.BytesIO(response.content))
         expected = annual_frame(years=(2030,))["1"][0]
@@ -376,7 +387,7 @@ class TestFourRoutesEndToEnd:
             "output": {"format": "parquet"},
         }
         response = client.post(
-            "/v1/analysis.parquet",
+            "/v1/data.parquet",
             params={"compression_algorithm": "gzip", "compression_level": 9},
             json=pipeline,
         )
@@ -403,7 +414,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 404, response.text
         assert "Dataset does not exist" in response.text
         assert str(base_path) not in response.text
@@ -436,7 +447,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 500
         assert "the sink fell over" in response.text
 
@@ -456,7 +467,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "sort": "no_such_column"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert response.headers["content-type"].startswith("text/csv")
         assert "no_such_column" in response.text
@@ -480,7 +491,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "sort": "not_a_real_column"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "not_a_real_column" in response.text
 
@@ -499,7 +510,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "sort": "value,,grid_cell"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "empty component" in response.text
 
@@ -514,7 +525,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "select": "-value"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "must not start with '-'" in response.text
 
@@ -532,7 +543,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "sort": "value,-"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "bare '-'" in response.text
 
@@ -550,7 +561,7 @@ class TestFourRoutesEndToEnd:
             "steps": [],
             "output": {"format": "csv", "sort": "value,-value"},
         }
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "more than once" in response.text
 
@@ -563,7 +574,7 @@ class TestFourRoutesEndToEnd:
         """
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         pipeline = {"inputs": {}, "steps": [], "output": {"format": "csv"}}
-        response = client.post("/v1/analysis.csv", json=pipeline)
+        response = client.post("/v1/data.csv", json=pipeline)
         assert response.status_code == 400
         assert "detail" in response.json()
 
@@ -589,7 +600,7 @@ class TestFourRoutesEndToEnd:
             ],
             "output": {"format": "tif"},
         }
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 404
         assert response.json() == {"detail": "source data do not exist"}
 
@@ -605,7 +616,7 @@ class TestFourRoutesEndToEnd:
             ],
             "output": {"format": "tif"},
         }
-        response = client.post("/v1/analysis.tif", json=pipeline)
+        response = client.post("/v1/data.tif", json=pipeline)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
             data = src.read(1)
@@ -627,23 +638,24 @@ class TestFourRoutesEndToEnd:
 
         query = pipeline_to_query(parse_pipeline(pipeline))
         tile = _tile_for_grid(base_path)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
         image = Image.open(io.BytesIO(response.content))
         assert image.size == (256, 256)
 
-    def test_png_tile_miss_is_404_with_a_decodable_transparent_image_not_json(
-        self, client, base_path, monkeypatch
-    ):
+    def test_png_tile_miss_is_a_bodiless_204(self, client, base_path, monkeypatch):
         """`render_tile` returns `None` when a dimension predicate narrows the request to
         no bands at all (`calendar_year = 9999`, same technique as the `tif` 404 case
-        above) -- `respond_to_analysis_tile` turns that into a 404 whose BODY is still a
-        decodable, correctly-sized image (`sink.empty_tile`), per that function's own
-        docstring: raising `HTTPException` here instead would replace the image body with a
-        JSON error document, exactly the anti-pattern this route is built to avoid. Checked
-        two ways: the content-type is `image/png` (not `application/json`), and Pillow can
-        actually decode the body at the requested tile size.
+        above), and `respond_to_analysis_tile` answers it the way the `pbf` route has
+        always answered its own miss: 204, no body.
+
+        This was a 404 carrying a blank PNG (`sink.empty_tile`, now deleted). The argument
+        for that body was that a 404 on an image URL should still decode as an image -- an
+        argument about the body, which a 204 settles by not having one. MapLibre reads a
+        zero-length tile response as a transparent texture natively, so the picture the
+        client ends up drawing is the same one; the `jpg` miss stops being an opaque black
+        square, and nothing PIL-encodes per miss any more.
         """
         write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda y: y - 2000)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
@@ -660,12 +672,52 @@ class TestFourRoutesEndToEnd:
 
         query = pipeline_to_query(parse_pipeline(pipeline))
         tile = _tile_for_grid(base_path)
-        response = client.get(f"/v1/analysis/{tile.z}/{tile.x}/{tile.y}.png", params=query)
-        assert response.status_code == 404
-        assert response.headers["content-type"] == "image/png"
-        image = Image.open(io.BytesIO(response.content))
-        assert image.size == (256, 256)
-        # Fully transparent (see `empty_tile`'s own docstring: an all-zero RGBA array), not
-        # a rendered nodata color -- a caller diffing this against a real nodata tile could
-        # otherwise mistake "no data at this location" for "one specific rendered value."
-        assert image.convert("RGBA").getextrema() == ((0, 0), (0, 0), (0, 0), (0, 0))
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png", params=query)
+        assert response.status_code == 204
+        assert response.content == b""
+
+    def test_a_missing_file_on_a_tile_route_is_the_same_204(self, client, base_path, tiles_path, monkeypatch):
+        """The loose end the 204 closed. A dataset with no parquet written for it raises
+        `FileNotFoundError` out of the reader (`io.vector.scan_vector` -> `tabular.
+        read_parquet`), which `api.boundary` maps app-wide to a 404 `application/json` --
+        correct on a data URL, and, once a raster miss stopped being a 404, the only 404
+        left on a tile URL.
+
+        Both tile responders catch it into the same bodiless 204 instead. A tile client
+        cannot act on the difference between "not written yet" and "nothing in this tile":
+        both are an empty square. The same pipeline downloaded through `/v1/data.csv`
+        still answers 404 carrying `resolve_detail`'s fixed "Dataset does not exist" text,
+        which the second half of this test pins -- the boundary is unchanged, and it is the
+        tile route that opts out ahead of it. (That body is plain text rather than
+        `{"detail": ...}` JSON for the reason
+        `test_tabular_error_body_is_plain_text_not_json` above gives: the tabular route's
+        sink fails inside `StreamingThread` and consults `resolve_status`/`resolve_detail`
+        itself rather than reaching a registered handler.)
+
+        This is the `pbf` route rather than the `png` one because the exception is a VECTOR
+        read's: a raster dataset with no COG written never raises at all (`run_to_path`
+        answers `False`, which `PipelineRasterResponse` turns into its own 404, and a raster
+        tile render simply finds no bands and returns `None`), so `png` has no
+        `FileNotFoundError` to catch unless one of its inputs is vector. The PMTiles archive
+        IS written, so a 204 here cannot be the missing-archive 204 that
+        `test_endpoints_data.py::TestVectorTiles::test_missing_pmtiles_file_is_204` covers.
+        """
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        tile = mercantile.Tile(x=1, y=2, z=3)
+        write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
+
+        pipeline = {
+            "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
+            "steps": [],
+            "output": {"format": "pbf"},
+        }
+        from cpra.mp.data.analysis.request.pipeline import parse_pipeline, pipeline_to_query
+
+        query = pipeline_to_query(parse_pipeline(pipeline))
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf", params=query)
+        assert response.status_code == 204
+        assert response.content == b""
+
+        download = client.post("/v1/data.csv", json={**pipeline, "output": {"format": "csv"}})
+        assert download.status_code == 404
+        assert download.text == "Dataset does not exist"

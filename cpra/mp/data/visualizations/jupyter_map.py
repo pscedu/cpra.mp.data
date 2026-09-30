@@ -37,15 +37,29 @@ class JupyterMap:
 
         from cpra.mp.data.visualizations import JupyterMap
 
-        m = JupyterMap("elev", "morph_pixel_v001", "annual", calendar_year=2030)
+        m = JupyterMap(variable="elev", grid="morph_pixel_v001", time_unit="annual", calendar_year=2030)
         m  # renders in Jupyter cell
+
+    An analysis that fixes its own inputs takes no triple at all, the same way it takes
+    none in a URL::
+
+        m = JupyterMap(analysis="lnd_type_plus", calendar_year=2050, scenario_id=7, model_group_id=500)
     """
 
-    def __init__(self, variable: str, grid: str, time_unit: str, **kwargs):
+    def __init__(self, **kwargs):
+        """Every argument is a query parameter, including the dataset triple.
+
+        There is one visualization route now (`/v1/visualizations/map.json`), and the
+        `variable`/`grid`/`time_unit` triple that used to be three path segments of
+        `/v1/datasets/{variable}/{grid}/{time_unit}/visualization/map.json` is three ordinary
+        query parameters on it -- which is what lets them be omitted, for an analysis that
+        names its own inputs and 400s on a triple. So this no longer takes them apart from
+        the rest: they go through the same loop every other parameter does.
+        """
         base = "https://api.mpdp.coastal.la.gov"
         if "base_url" in kwargs:
             base = kwargs.pop("base_url")
-        path = f"{base}/v1/datasets/{variable}/{grid}/{time_unit}/visualization/map.json"
+        path = f"{base}/v1/visualizations/map.json"
 
         params = []
         for key, value in kwargs.items():

@@ -23,8 +23,9 @@ This module holds the logic shared by:
 
 Also holds ``CatalogQuery``, the production catalog-query implementation, which
 resolves a request's dimension choices/results by scanning the materialized
-side-table above (loaded scoped to the requested variable/time_unit/grid) rather
-than walking the data tree -- used by the ``/catalog.json`` API route. It raises
+side-table above (loaded scoped to each of the resolved pipeline's input
+datasets) rather than walking the data tree -- used by the ``/v1/catalog.json``
+API route. It raises
 ``ValueError`` rather than an HTTP-framework exception so this module has no
 web-framework dependency; callers (e.g. the FastAPI route in ``api/__init__.py``)
 catch it and translate it into an ``HTTPException``.
@@ -289,44 +290,92 @@ class Catalog:
             f.unlink()
 
 
+def _unique_datasets(datasets):
+    """``datasets`` deduplicated by triple, preserving first-seen order.
+
+    Two inputs of one analysis may name the same dataset (``lnd_type_plus`` reads ``elev``
+    and ``lnd_type`` off the same grid and time unit, and a hand-written pipeline may name
+    one dataset twice outright), and scanning a partition a second time would intersect a
+    set of choices with itself -- harmless, but a wasted read of the same files.
+    """
+    seen = {}
+    for dataset in datasets:
+        seen.setdefault(tuple(getattr(dataset, name, None) for name in PART_COLS), dataset)
+    return list(seen.values())
+
+
 class CatalogQuery:
     """Data catalog query backed by the materialized ``Catalog`` side-table above.
 
-    Given a request's dataset dimensions (variable/time_unit/grid) and filter
-    dimensions, it resolves the available ``choices`` and selected ``results`` for
-    every dimension by scanning the side-table (one row per dimension combination x
-    contiguous calendar run) rather than walking the data tree -- so it works for
-    tabular (Parquet) and raster (multi-band COG) datasets alike.  Used by the
-    ``/catalog.json`` API route.
+    Given the datasets a request READS -- ``pipeline.inputs``, one entry per named input,
+    each carrying a variable/time_unit/grid -- and the caller's dimension selection, it
+    resolves the available ``choices`` and selected ``results`` for every dimension by
+    scanning the side-table (one row per dimension combination x contiguous calendar run)
+    rather than walking the data tree, so it works for tabular (Parquet) and raster
+    (multi-band COG) datasets alike.  Used by the ``/v1/catalog.json`` API route.
 
-    The catalog is loaded from ``catalog_path`` scoped to the requested
-    variable/time_unit/grid partition(s) unless a preloaded ``catalog`` frame is
-    supplied (used by the CLI/tests).
+    **One query, several inputs, strict intersection.**  Each dataset is scanned on its
+    own and every dimension's choices are narrowed to the values common to all of them
+    (``_update``, which was always written to reconcile repeated visits and now actually
+    gets them).  Intersection rather than union is the point: an analysis joins its inputs,
+    so a ``model_group_id`` only one of them has is a choice that yields an empty result,
+    and offering it would be worse than not offering it.  A dimension no input carries is
+    simply absent.
+
+    **The dataset triple itself is not reported.**  ``variable``/``time_unit``/``grid`` are
+    dataset-typed dimensions -- they name which data to read rather than which slice of it,
+    they used to be a restatement of the request's own path segments, and across several
+    inputs there is no single answer to intersect toward.  What a client actually needs is
+    what the RESULT is addressed against, which is not in general any input's triple
+    (``lnd_type_plus`` projects onto ``morph_pixel_v002``, which none of its three inputs is
+    on).  That is the output descriptor, and the route serves it alongside this.
+
+    ``filters`` maps a dimension name to a non-empty LIST of values already cast to that
+    dimension's dtype -- the catalog's columns are typed and a query string's values are
+    not, so the casting is ``api.catalog.catalog_filters``'s job one layer up.  A dimension
+    the caller said nothing about is simply absent from the mapping.
+
+    ``omit`` is the resolved analysis's ``collapsed_dimensions``: a dimension the pipeline
+    has already collapsed is not a choice the caller has, so it is left out entirely rather
+    than reported with a value they cannot change.  Skipping it during the scan, rather than
+    deleting it afterwards, is also what keeps ``exact`` honest -- defaulting a dimension
+    nobody can select must not report the request as inexact.
+
+    The catalog is loaded from ``catalog_path`` scoped to each requested
+    variable/time_unit/grid partition unless a preloaded ``catalog`` frame is supplied
+    (used by the CLI/tests).
 
     Raises ``ValueError`` (not an HTTP-framework exception, to keep this module free of
     a web-framework dependency) when a query has no catalog entries or no valid values
     for some dimension; callers translate that into the appropriate HTTP error.
     """
 
-    def __init__(self, dataset_dimensions, filter_dimensions, catalog=None, catalog_path=None):
-        self.dataset_dimensions = dataset_dimensions
-        self.filter_dimensions = filter_dimensions
+    def __init__(self, datasets, filters, omit=(), catalog=None, catalog_path=None):
+        self.datasets = list(datasets)
+        self.filters = dict(filters)
+        self.omit = frozenset(omit)
         self._catalog = catalog
         self._catalog_path = get_catalog_path(catalog_path)
         self._choices = {}
         self._results = {}
         self._exact = True
+        # Which time unit to compress each calendar dimension's runs under -- recorded from
+        # the first input that contributes the dimension, since the step size a "contiguous
+        # run" is measured in is a property of the dataset the values came from and not of
+        # the values themselves.  Inputs that disagree (an annual and a decadal input in one
+        # pipeline) are not producible by any registered analysis, and the only consequence
+        # if one is written by hand is a run list split more finely than it had to be.
+        self._calendar_time_unit = {}
 
-    def _load_catalog(self):
-        """Load the side-table scoped to the requested dataset partition(s).
+    def _load_catalog(self, dataset):
+        """Load the side-table scoped to one input's dataset partition.
 
         A preloaded frame (the ``catalog`` constructor arg) is returned as-is.  Otherwise
-        the Hive-partitioned catalog under ``catalog_path`` is read for the
-        variable/time_unit/grid selected by the dataset dimensions (a wildcard for any
-        left unset), so a single request never unions the heterogeneous per-variable
-        schemas of the whole tree.  ``PART_COLS`` are taken from each file's own path
-        (the partitioned write strips them from the file itself) as Strings, to match
-        the values the dataset dimensions carry.
+        the Hive-partitioned catalog under ``catalog_path`` is read for exactly the
+        variable/time_unit/grid this input names -- an ``InputSelection`` carries all three
+        -- so a single request never unions the heterogeneous per-variable schemas of the
+        whole tree.  ``PART_COLS`` are not read back out of the paths: the glob has already
+        pinned all three to one value apiece, and they are no longer reported as choices.
 
         Files are read one at a time and concatenated with ``diagonal_relaxed`` rather
         than handed to ``pl.read_parquet`` as a list, for the same reason
@@ -342,17 +391,8 @@ class CatalogQuery:
         """
         if self._catalog is not None:
             return self._catalog
-        parts = []
-        for name in PART_COLS:
-            value = getattr(self.dataset_dimensions, name, None)
-            parts.append(f"{name}={value}" if value else f"{name}=*")
-        frames = [
-            pl.read_parquet(path).with_columns(
-                pl.lit(v, dtype=pl.String).alias(k)
-                for k, v in parse_path_dims(path.parent.relative_to(self._catalog_path)).items()
-            )
-            for path in self._catalog_path.glob("/".join(parts) + "/*.parquet")
-        ]
+        partition = "/".join(f"{name}={getattr(dataset, name)}" for name in PART_COLS)
+        frames = [pl.read_parquet(path) for path in self._catalog_path.glob(f"{partition}/*.parquet")]
         if not frames:
             msg = "No catalog entries for the requested dataset"
             raise ValueError(msg)
@@ -377,17 +417,11 @@ class CatalogQuery:
             self._choices[dimension_name] = dimension_values
 
         selected_values = []
-        prop_value = getattr(
-            self.dataset_dimensions if dimension.type == "dataset" else self.filter_dimensions,
-            dimension_name,
-            # Metadata dimensions (e.g. `model`) are stored as file tags but are not
-            # filterable via FilterDimensions, so there's no attribute to read here --
-            # fall through to the default-value selection below.
-            None,
-        )
+        # Metadata dimensions (e.g. `model`) are stored as file tags and are not selectable
+        # -- there is no key a caller could send -- so they fall through to the default-value
+        # selection below.
+        prop_value = self.filters.get(dimension_name)
         if prop_value:
-            if not isinstance(prop_value, (list, tuple)):
-                prop_value = (prop_value,)
             # For float dimensions with known canonical values, normalise
             # prop_value through dtype → canonical map so that both a clean
             # input (0.1) and its float32 repr (0.10000000149011612) resolve
@@ -424,7 +458,9 @@ class CatalogQuery:
             if dimension_name in ("calendar_day", "calendar_year"):
                 if not isinstance(values, pl.Series):
                     values = pl.Series(values)
-                offsets = calendar_run_offsets(values, dimension_name, self.dataset_dimensions.time_unit)
+                offsets = calendar_run_offsets(
+                    values, dimension_name, self._calendar_time_unit[dimension_name]
+                )
                 groups = (
                     pl.DataFrame({"value": values, "offset": offsets})
                     .group_by("offset")
@@ -444,11 +480,44 @@ class CatalogQuery:
                 ]
 
     def execute(self):
-        """Resolve dimension choices/results from the catalog side-table."""
-        catalog = self._load_catalog()
-        input_df = get_input_data_frame(**dict(self.dataset_dimensions), **dict(self.filter_dimensions))
-        required_cols = required_columns(input_df)
-        non_cal = [c for c in CATALOG_DIMS if c in catalog.columns and c in required_cols and c not in CAL_DIMS]
+        """Resolve dimension choices/results from the catalog side-table.
+
+        One scan per input, in ``datasets`` order, with ``_update`` intersecting each one's
+        answer into the running choices.  Duplicate triples are scanned once -- two inputs
+        of one analysis may legitimately name the same dataset, and a second scan of it
+        would intersect a set with itself.
+        """
+        for dataset in _unique_datasets(self.datasets):
+            self._scan(dataset)
+        self._compress()
+        return {"choices": self._choices, "results": self._results, "exact": self._exact}
+
+    def _scan(self, dataset):
+        """Fold one input's available dimension values into the running choices/results.
+
+        Which dimensions this input even HAS is ``required_columns`` of its own triple
+        crossed with the caller's selection -- a dimension's ``required`` may be a Polars
+        expression over the others (`percentile` is required for `ssf` and not for `vct`),
+        so it is answered per input rather than once for the request.
+        """
+        catalog = self._load_catalog(dataset)
+        required_cols = required_columns(
+            get_input_data_frame(
+                variable=dataset.variable,
+                time_unit=dataset.time_unit,
+                grid=dataset.grid,
+                **self.filters,
+            )
+        )
+        non_cal = [
+            c
+            for c in CATALOG_DIMS
+            if c in catalog.columns
+            and c in required_cols
+            and c not in CAL_DIMS
+            and c not in PART_COLS
+            and c not in self.omit
+        ]
 
         lf = catalog.lazy()
         for col in non_cal:
@@ -467,16 +536,13 @@ class CatalogQuery:
             sel = pl.Series(self._results[col], dtype=dim.dtype)
             lf = lf.filter(pl.col(col).is_in(sel) | pl.col(col).is_null())
 
-        time_unit = (self._results.get("time_unit") or [None])[0]
         for cal in CAL_DIMS:
-            if cal not in required_cols or f"{cal}_min" not in catalog.columns:
+            if cal not in required_cols or cal in self.omit or f"{cal}_min" not in catalog.columns:
                 continue
             ext = lf.select(f"{cal}_min", f"{cal}_max").drop_nulls().unique().collect()
             values = set()
             for mn, mx in ext.iter_rows():
-                values.update(expand_calendar_range(cal, time_unit, mn, mx).to_list())
+                values.update(expand_calendar_range(cal, dataset.time_unit, mn, mx).to_list())
             if values:
+                self._calendar_time_unit.setdefault(cal, dataset.time_unit)
                 self._update(dimension_name=cal, dimension_values=sorted(values))
-
-        self._compress()
-        return {"choices": self._choices, "results": self._results, "exact": self._exact}

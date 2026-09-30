@@ -37,6 +37,14 @@ never reaches the value mask either way), so the two orders are equivalent up to
 bands the value mask ends up allocating expressions for. Dimension-first is chosen since
 it can only shrink that set, never grow it.
 
+**PAIRED frames are `case_band_wide`'s business alone -- with one exception, the SPATIAL
+filter.** A spatial conjunct does not evaluate anything against a paired frame's operands,
+so it needs none of the pairing-and-reducing the paragraph above rules out; it changes the
+frame's SHAPE, and the paired long shape it has to land in (one row per key, one
+operand-named value column per operand) is not something a single unpivot produces. That
+transition is `_sample_grid_cells_joined`, and it performs the operand combination by
+calling `execution.long_ops.join_long` itself -- see its docstring.
+
 **Spatial: transition first, whole `where` after.** `sample_grid_cells_band_wide` does
 not itself decide which pixels survive a mixed `where` -- it unconditionally unpivots
 every pixel into one long row per (pixel, band) observation (attaching each band's
@@ -520,8 +528,115 @@ def select_dimension_band_wide(
     return out_lf, kept_metadata, window
 
 
+def _sample_grid_cells_joined(
+    band_wide: BandWideFrame,
+    where: str,
+    extra_columns: Sequence[str],
+    *,
+    grid_width: int,
+    value_columns: Sequence[str],
+) -> LongFrame:
+    """`sample_grid_cells_band_wide` over a JOINED frame -- one whose metadata carries
+    `JOIN_OPERAND_COLUMN`, and whose typed shape therefore has one operand-named value
+    column per operand rather than a single `value`.
+
+    The plain unpivot cannot serve this case. It puts every band's measurement into one
+    `value` column and distinguishes them by the metadata each band's row carries -- which
+    on a joined frame means the result is discriminated by `JOIN_OPERAND_COLUMN`, an
+    internal tag, and carries no column named after any operand at all. `request.ops.
+    _type_filter` types a spatial filter as shape-changing but `value_columns`-preserving
+    (a filter RESTRICTS; it never changes how many operands a frame carries), so the next
+    step goes looking for `marsh`/`sal` and finds `value`.
+
+    So each operand is unpivoted SEPARATELY -- its own bands, its own metadata rows -- and
+    the results handed to `long_ops.join_long`, the long-shape join itself. That is the
+    strongest available statement of what this transition means: a band-wide `join`
+    followed by a spatial filter produces exactly the frame the equivalent long pipeline
+    would have, because the operand combination is performed by literally the same
+    function. The rename to operand names, the shared-dimension key, and the dropping of
+    `variable`/`time_unit`/`grid` all come from there rather than being restated here.
+
+    **Inner, so a band with no counterpart is dropped.** That is `join_long`'s rule, and
+    it is the right one here even though `unify_metadata_parts` deliberately takes the
+    opposite one: that function serves the filter that stays BAND-WIDE, where an unpaired
+    band is still a representable band and dropping it would have the filter quietly
+    finish a job `join_band_wide` did not do. The paired LONG shape has no such cell -- a
+    row carries one value per operand -- so the unpaired band has nowhere to go, and
+    `case_band_wide`'s pairing (`_pair_band_groups`) already drops the same misses.
+
+    **An operand left with no bands at all** (a preceding dimension filter can empty one;
+    see `select_dimension_band_wide`) still gets a frame, an empty one, rather than being
+    skipped. Skipping it would drop its column from the result and reintroduce the very
+    missing-column failure above, on the path where the answer is simply "no rows".
+
+    **The spatial conjuncts run once on the BAND-WIDE frame, before any operand is
+    unpivoted, and the result is materialized there.** They are the one kind that can: a
+    spatial conjunct names `grid_cell` alone, and `row_major_grid_cell` has already made
+    that an ordinary column of the band-wide frame -- one whose value is a property of the
+    PIXEL, identical across every band and therefore across every operand -- so dropping
+    the rows it rejects while the pixels are still rows commutes with everything below.
+    Both halves of that matter, and for different reasons:
+
+    * *Before the unpivots*, because the operands do not share one unpivot here the way
+      the plain path's bands do. Each is its own branch off `indexed`, the join stands
+      between them and the filter, and joining three whole-raster frames on `grid_cell` to
+      then keep two rows is minutes of work for an answer that is a handful of pixels.
+    * *Materialized*, because those branches are the reason a lazy filter alone did not
+      help: three unpivots reading one `LazyFrame` make three separate scans of the shared
+      upstream work (the multi-raster read and, for `lnd_type_plus`, a vector-to-raster
+      `project`'s rasterization), so the plan's expensive part ran once per operand.
+      `.collect()` after the spatial filter costs a frame of a few rows and buys the read
+      being paid for exactly once.
+
+    The dimension and value conjuncts stay after the join, and `where` in its entirety is
+    still applied there: a dimension conjunct may name a column only one operand carries
+    (which is why `_joined_metadata_parts` keeps them apart in the first place), and a
+    value conjunct names operand columns that do not exist until the join has made them.
+    """
+    lf, metadata_df, window = band_wide
+    spatial = classify_where_kinds(where, value_columns)[PredicateKind.spatial]
+    spatial_where = combine_conjuncts(spatial) if spatial else None
+    names = band_column_names(metadata_df)
+    present = metadata_df.get_column(JOIN_OPERAND_COLUMN).unique(maintain_order=True).to_list()
+    operands = [*present, *sorted(set(value_columns) - set(present))]
+    parts = dict(zip(present, _joined_metadata_parts(metadata_df)))
+    schema = lf.collect_schema()
+    value_dtype = schema[names[0]] if names else pl.Float64
+
+    indexed = row_major_grid_cell(lf, window, grid_width=grid_width)
+    if spatial_where is not None:
+        indexed = indexed.filter(pl.sql_expr(spatial_where)).collect().lazy()
+    frames: list[LongFrame] = []
+    for position, operand in enumerate(operands):
+        if operand not in parts:
+            frames.append(pl.LazyFrame(schema={"grid_cell": pl.Int64, "value": value_dtype}))
+            continue
+        part = parts[operand]
+        position_column = f"{_BAND_POSITION_COLUMN}_{present.index(operand)}"
+        band_names = [names[band] for band in part.get_column(position_column).to_list()]
+        # `extra_columns` ride on the first operand alone, so `join_long` carries them
+        # along rather than keying on them -- the same rule `join_band_wide` applies when
+        # it takes its carried columns from operand 0.
+        carried = list(extra_columns) if position == 0 else []
+        long_part = indexed.unpivot(
+            index=["grid_cell", *carried], on=band_names, variable_name="__band", value_name="value"
+        )
+        identity = pl.DataFrame({"__band": pl.Series(band_names, dtype=pl.String)}).hstack(
+            part.drop(position_column)
+        )
+        frames.append(long_part.join(identity.lazy(), on="__band", how="left").drop("__band"))
+
+    joined = long_ops.join_long(frames, operands)
+    return long_ops.filter_long(joined, where, operands)
+
+
 def sample_grid_cells_band_wide(
-    band_wide: BandWideFrame, where: str, extra_columns: Sequence[str], *, grid_width: int
+    band_wide: BandWideFrame,
+    where: str,
+    extra_columns: Sequence[str],
+    *,
+    grid_width: int,
+    value_columns: Sequence[str] = ("value",),
 ) -> LongFrame:
     """The band-wide lowering of a `where` containing a SPATIAL (`grid_cell`) conjunct:
     the one case that changes the frame's shape, from band-wide to long -- see the module
@@ -547,9 +662,18 @@ def sample_grid_cells_band_wide(
     dimension/value/spatial `where` against a long frame (a spatial conjunct is just an
     ordinary `grid_cell` column there, and needs no further rewriting: the id it names is
     already the id `row_major_grid_cell` just produced).
+
+    `value_columns` is the incoming frame's value columns, as `filter_band_wide` receives
+    them; a JOINED frame (several operand-named ones) takes an entirely different route
+    through `_sample_grid_cells_joined` -- see there for why one `value` column cannot
+    carry a paired frame across this transition.
     """
     validate_extra_columns(extra_columns)
     lf, metadata_df, window = band_wide
+    if JOIN_OPERAND_COLUMN in metadata_df.columns:
+        return _sample_grid_cells_joined(
+            band_wide, where, extra_columns, grid_width=grid_width, value_columns=value_columns
+        )
     names = band_column_names(metadata_df)
     indexed = row_major_grid_cell(lf, window, grid_width=grid_width)
     long_lf = indexed.unpivot(index=["grid_cell", *extra_columns], on=names, variable_name="__band", value_name="value")
@@ -612,7 +736,9 @@ def filter_band_wide(
                 f"filter_band_wide needs grid_width to decode the spatial conjunct in {where!r} "
                 "into absolute pixel ids"
             )
-        return sample_grid_cells_band_wide(band_wide, where, extra_columns, grid_width=grid_width)
+        return sample_grid_cells_band_wide(
+            band_wide, where, extra_columns, grid_width=grid_width, value_columns=value_columns
+        )
 
     result = band_wide
     if kinds[PredicateKind.dimension]:

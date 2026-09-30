@@ -23,15 +23,19 @@ from pydantic import ValidationError
 
 from cpra.mp.data.analyses import (
     ANALYSES,
-    AnalysisTypeMismatchError,
+    AnalysisDatasetMismatchError,
+    AnalysisRegistryError,
     DatasetRef,
     InvalidAnalysisParametersError,
     ResolvedAnalysis,
     UnknownAnalysisError,
+    _register,
     resolve_analysis,
     resolve_analysis_chain,
 )
 from cpra.mp.data.analyses.base import (
+    Analysis,
+    AnalysisMeta,
     cast_dimension_value,
     dataset_output_format,
     default_collapsed_dimensions,
@@ -85,34 +89,107 @@ class TestRegistry:
             "lnd_chng",
             "lnd_conf",
             "lnd_type_plus",
+            "sediment_dynamics",
         }
 
     def test_keyed_by_meta_name(self):
         for name, cls in ANALYSES.items():
             assert cls.Meta.name == name
 
+    def test_every_meta_is_a_validated_model(self):
+        """Not a tautology: `cls.Meta.name` reads identically off a bare `class Meta:`, so
+        an entry that kept the old form would key into `ANALYSES` correctly and only
+        differ in having skipped every check `AnalysisMeta` performs. `_register` is what
+        forbids it, and this is the assertion that `_register` is still wired in."""
+        for cls in ANALYSES.values():
+            assert isinstance(cls.Meta, AnalysisMeta)
+
+    def test_a_bare_meta_is_refused_at_registration(self):
+        class _BareMeta:
+            name = "bare"
+            label = "Bare"
+            type = "dataset"
+            kind = "dimension"
+
+        class _BareAnalysis(Analysis):
+            Meta = _BareMeta
+
+        with pytest.raises(AnalysisRegistryError, match="must declare `Meta = AnalysisMeta"):
+            _register([_BareAnalysis])
+
+    def test_an_analysis_with_no_meta_of_its_own_is_refused(self):
+        """`Analysis` declares `Meta` as a bare `ClassVar` annotation with no value, so a
+        subclass that forgets one has no inherited stand-in to pick up -- the lookup fails
+        here rather than at the first consumer to read a field off it."""
+
+        class _NoMeta(Analysis):
+            pass
+
+        with pytest.raises(AnalysisRegistryError, match="no Meta of its own"):
+            _register([_NoMeta])
+
+    def test_a_dimension_named_parameter_is_refused_at_registration(self):
+        """The rule the decoder's partition rests on: a dimension name is ALWAYS a filter.
+        It is sound only while no analysis declares a dimension-named parameter --
+        `lnd_type_plus` and `sal_veg_investigation` both did, back when a fixed-input
+        analysis had no route that could carry a filter -- and a reintroduction is both the
+        worst failure the design has and invisible to every response-level test: the
+        caller's `model_group_id` lands in `filters`, `Parameters` takes its default, and
+        the request 200s for the wrong model group. So it is refused at import.
+        """
+
+        class _DimensionNamed(Analysis):
+            Meta = AnalysisMeta(name="dim_named", label="Dimension-named", kind="internal")
+
+            class Parameters(Analysis.Parameters):
+                model_group_id: int | None = None
+
+        with pytest.raises(AnalysisRegistryError, match="always a FILTER"):
+            _register([_DimensionNamed])
+
+    def test_a_non_dimension_parameter_registers_fine(self):
+        """The other side of the guard: `is_filterable_dimension` is what draws the line,
+        so an ordinary parameter name -- and a DATASET-typed dimension, which selects an
+        input rather than filtering one -- is untouched by it."""
+
+        class _Ordinary(Analysis):
+            Meta = AnalysisMeta(name="ordinary", label="Ordinary", kind="internal")
+
+            class Parameters(Analysis.Parameters):
+                threshold: float = 0.5
+
+        assert _register([_Ordinary]) == {"ordinary": _Ordinary}
+
     def test_meta_shape(self):
-        assert ANALYSES["diff"].Meta.type == "dataset"
+        # No `Meta.type` assertions here any more -- the field is gone with the route split
+        # that read it. `Meta.kind` is the surviving partition, and it is a DIFFERENT one:
+        # `lnd_type_plus` was `type="custom"` and is `kind="variable"`, because "fixes its
+        # own inputs" and "stands in for a variable in the portal dropdown" are unrelated
+        # facts. Whether an entry takes the caller's dataset is asserted where it is now
+        # stated -- by `pipeline()`, in `TestResolveAnalysisContract` below.
+        assert ANALYSES["diff"].Meta.kind == "dimension"
         assert ANALYSES["diff"].Meta.variables is None
         assert ANALYSES["diff"].Meta.legend is None
         assert ANALYSES["diff"].Meta.result_kind == "difference"
 
-        assert ANALYSES["lnd_chng"].Meta.type == "dataset"
         assert ANALYSES["lnd_chng"].Meta.kind == "variable"
         assert ANALYSES["lnd_chng"].Meta.variables == ["lnd_type"]
         assert ANALYSES["lnd_chng"].Meta.legend == "lnd_chng"
         assert ANALYSES["lnd_chng"].Meta.result_kind == "category"
         assert ANALYSES["lnd_chng"].Meta.subsumed_dimensions == ["calendar_year"]
 
-        assert ANALYSES["sal_veg_investigation"].Meta.type == "custom"
         assert ANALYSES["sal_veg_investigation"].Meta.result_kind == "value"
+        # Explicit, and explicitly `"internal"` -- neither a portal variable nor a
+        # chainable stage. It declared no `kind` at all until `AnalysisMeta` made the
+        # field required, which read as `None` at every consumer.
+        assert ANALYSES["sal_veg_investigation"].Meta.kind == "internal"
 
-        assert ANALYSES["lnd_conf"].Meta.type == "dataset"
+        assert ANALYSES["lnd_conf"].Meta.kind == "variable"
         assert ANALYSES["lnd_conf"].Meta.variables == ["lnd_type"]
         assert ANALYSES["lnd_conf"].Meta.legend == "lnd_conf"
         assert ANALYSES["lnd_conf"].Meta.result_kind == "value"
 
-        assert ANALYSES["lnd_type_plus"].Meta.type == "custom"
+        assert ANALYSES["lnd_type_plus"].Meta.kind == "variable"
         assert ANALYSES["lnd_type_plus"].Meta.variables is None
         assert ANALYSES["lnd_type_plus"].Meta.legend == "lnd_type_plus"
         assert ANALYSES["lnd_type_plus"].Meta.result_kind == "category"
@@ -157,19 +234,31 @@ class TestResolveAnalysisContract:
         with pytest.raises(UnknownAnalysisError):
             resolve_analysis("not-a-real-analysis", dataset=None, filters={}, params={})
 
-    def test_dataset_analysis_without_dataset_raises_type_mismatch(self):
-        with pytest.raises(AnalysisTypeMismatchError):
+    def test_an_analysis_that_needs_a_dataset_says_so_when_given_none(self):
+        """`AnalysisDatasetMismatchError`, raised by `Analysis.require_dataset` from inside
+        `pipeline()` -- not by a `Meta.type` check ahead of it. The retired field named the
+        ROUTE a request had to arrive on, and there is one route now; what survives is the
+        requirement itself, stated by the method that actually needs the dataset."""
+        # A valid two-value selection, so `diff`'s own `validate_selection` passes and the
+        # missing dataset is what the call actually fails on.
+        with pytest.raises(AnalysisDatasetMismatchError):
             resolve_analysis(
-                "diff", dataset=None, filters={}, params={"dimension": "calendar_year", "order": "asc"}
+                "diff",
+                dataset=None,
+                filters={"calendar_year": [2030, 2040]},
+                params={"dimension": "calendar_year", "order": "asc"},
             )
 
-    def test_custom_analysis_with_dataset_raises_type_mismatch(self):
-        with pytest.raises(AnalysisTypeMismatchError):
+    def test_an_analysis_with_fixed_inputs_says_so_when_given_a_dataset(self):
+        """The other direction, from `Analysis.reject_dataset`. `sal_veg_investigation`
+        hardcodes its two inputs, so a caller-named dataset is not a narrowing of anything
+        -- it is a dataset the pipeline would never read."""
+        with pytest.raises(AnalysisDatasetMismatchError):
             resolve_analysis(
                 "sal_veg_investigation",
                 dataset=SSF_DATASET,
                 filters={},
-                params={"model_group_id": 500, "scenario_id": 7},
+                params={},
             )
 
     def test_missing_required_parameter_raises_invalid_parameters(self):
@@ -446,7 +535,7 @@ class TestSharedHelpers:
             selection_filter_where({"variable": "ssf"})
 
     def test_dataset_output_format_follows_the_grid_kind(self):
-        """A `type="dataset"` analysis that never changes shape ends band-wide on a raster
+        """An analysis that reads the caller's dataset and never changes shape ends band-wide on a raster
         grid and tabular on a vector one, and `validate_shapes` rejects the mismatched sink
         in either direction -- so the declared format has to be derived, not fixed.
         """
@@ -464,6 +553,37 @@ class TestSharedHelpers:
         # tests below for the exact value. This test instead confirms the *general* rule
         # directly against a hand-built pipeline with no trailing group.
         pipeline.steps = pipeline.steps[:-1]  # drop the trailing group step
+        assert default_collapsed_dimensions(pipeline) == frozenset()
+
+    def test_default_collapsed_dimensions_sees_past_a_trailing_selection_filter(self):
+        """A caller's dimension/`grid_cell`/`where` selection is appended as a trailing
+        `filter`. A filter narrows rows but collapses nothing, so it must not hide the
+        `group` that did -- otherwise every selected request reports nothing collapsed and
+        `visualizations.base` builds a `select` naming a column the read cannot find.
+        """
+        analysis = Difference(
+            dataset=SSF_DATASET,
+            filters={"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50},
+            parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
+        )
+        pipeline = analysis.pipeline()
+        expected = default_collapsed_dimensions(pipeline)
+        assert expected  # the fixture's own pipeline really does end in a group
+
+        pipeline.steps.append(FilterStep(where="model_group_id = 500"))
+        assert default_collapsed_dimensions(pipeline) == expected
+
+        pipeline.steps.append(FilterStep(where="grid_cell = 5"))
+        assert default_collapsed_dimensions(pipeline) == expected
+
+    def test_default_collapsed_dimensions_empty_for_a_stepless_pipeline(self):
+        """The `download` sentinel's shape -- one input, no ops. `steps[-1]` would raise."""
+        pipeline = Difference(
+            dataset=SSF_DATASET,
+            filters={"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50},
+            parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
+        ).pipeline()
+        pipeline.steps = []
         assert default_collapsed_dimensions(pipeline) == frozenset()
 
 
@@ -857,38 +977,49 @@ class TestLandChangePipeline:
 # ------------------------------------------------------------------------------------------
 
 
+# What a caller pins in practice, and what used to be two required `Parameters` fields.
+SELECTION = {"model_group_id": 500, "scenario_id": 7}
+
+
 class TestSalinityVegInvestigationParameters:
-    def test_requires_model_group_id_and_scenario_id(self):
-        with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(scenario_id=7)
-        with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(model_group_id=500)
+    """The two thresholds are the whole of it. `model_group_id`/`scenario_id` used to be
+    declared here too, the pair of them required -- they are ordinary FILTERS now, and
+    `analyses._register` rejects a dimension-named `Parameters` field outright, so they
+    could not be declared here again even by accident.
+    """
+
+    def test_the_field_set_is_exactly_the_two_thresholds(self):
+        assert set(SalinityVegInvestigation.Parameters.model_fields) == {
+            "marsh_threshold",
+            "salinity_threshold",
+        }
 
     def test_defaults(self):
-        params = SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7)
+        params = SalinityVegInvestigation.Parameters()
         assert params.marsh_threshold == 0.5
         assert params.salinity_threshold == 5.5
 
     def test_marsh_threshold_bounds(self):
         with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=1.5)
+            SalinityVegInvestigation.Parameters(marsh_threshold=1.5)
         with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, marsh_threshold=-0.1)
+            SalinityVegInvestigation.Parameters(marsh_threshold=-0.1)
 
     def test_salinity_threshold_lower_bound(self):
         with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, salinity_threshold=-1)
+            SalinityVegInvestigation.Parameters(salinity_threshold=-1)
 
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
-            SalinityVegInvestigation.Parameters(model_group_id=500, scenario_id=7, bogus=1)
+            SalinityVegInvestigation.Parameters(bogus=1)
 
 
 class TestSalinityVegInvestigationPipeline:
-    def _build(self, **overrides):
-        params = {"model_group_id": 500, "scenario_id": 7, **overrides}
+    def _build(self, filters=SELECTION, **overrides):
         analysis = SalinityVegInvestigation(
-            dataset=None, filters={}, parameters=SalinityVegInvestigation.Parameters(**params)
+            dataset=None,
+            filters=dict(filters),
+            parameters=SalinityVegInvestigation.Parameters(**overrides),
         )
         return analysis, analysis.pipeline()
 
@@ -912,22 +1043,28 @@ class TestSalinityVegInvestigationPipeline:
             "hydro_compartment_v001",
         )
 
-        coverage_filter, salinity_filter, project_step, join_step, case_step, group_step = (
-            pipeline.steps
-        )
+        (
+            coverage_filter,
+            salinity_filter,
+            project_step,
+            join_step,
+            selection_filter,
+            case_step,
+            group_step,
+        ) = pipeline.steps
 
+        # The per-input `where`s are DEFINITIONAL only -- the one reading of each input this
+        # investigation is about. The caller's `model_group_id`/`scenario_id` used to be
+        # spelled into both of these as well; it is one conjunct past the join now
+        # (`selection_filter` below), which `execution.plan` pushes back down to both reads.
         assert isinstance(coverage_filter, FilterStep)
         assert coverage_filter.input == "coverage"
-        assert coverage_filter.where == (
-            "ffibs_type = 'pl_fm' AND model_group_id = 500 AND scenario_id = 7"
-        )
+        assert coverage_filter.where == "ffibs_type = 'pl_fm'"
         assert coverage_filter.as_ == "marsh"
 
         assert isinstance(salinity_filter, FilterStep)
         assert salinity_filter.input == "salinity"
-        assert salinity_filter.where == (
-            "aggregate_type = '2_wk_max' AND model_group_id = 500 AND scenario_id = 7"
-        )
+        assert salinity_filter.where == "aggregate_type = '2_wk_max'"
         assert salinity_filter.as_ == "selected_salinity"
 
         assert isinstance(project_step, ProjectStep)
@@ -938,6 +1075,11 @@ class TestSalinityVegInvestigationPipeline:
         assert join_step.op == "join"
         assert join_step.type == "spatial"
         assert set(join_step.inputs) == {"marsh", "sal"}
+
+        # The caller's selection, once, on the joined frame -- before the `case`, which is
+        # what collapses the pairing a dimension conjunct still needs standing.
+        assert isinstance(selection_filter, FilterStep)
+        assert selection_filter.where == "model_group_id = 500 AND scenario_id = 7"
 
         # The threshold test collapses the pairing and says what survives it, which a
         # `filter` has no way to state.
@@ -966,8 +1108,39 @@ class TestSalinityVegInvestigationPipeline:
 
     def test_custom_thresholds_are_interpolated(self):
         _, pipeline = self._build(marsh_threshold=0.75, salinity_threshold=3.0)
-        case_step = pipeline.steps[4]
+        case_step = next(step for step in pipeline.steps if step.op == "case")
         assert case_step.cases[0].when == "marsh > 0.75 AND sal > 3.0"
+
+    def test_an_unselected_request_states_no_selection_step_at_all(self):
+        """Legal now, and the reason the step is conditional: with the dimension values no
+        longer required `Parameters`, `selection_filter_where({})` is `None`, and a `filter`
+        with no `where` is not a step. The `case` chains from the join directly.
+        """
+        _, pipeline = self._build(filters={})
+        assert [step.op for step in pipeline.steps] == [
+            "filter",
+            "filter",
+            "project",
+            "join",
+            "case",
+            "group",
+        ]
+
+    def test_a_grid_cell_reaches_the_same_conjunct(self):
+        """The blanket `validate_selection` used to reject this outright. It composes into
+        the trailing conjunct like any other selection now; what makes it an error is the
+        raster `output.format`, rejected by `validate_shapes` with a message naming
+        `grid_cell` -- asserted at the decoder, in `test_unified_decoder.py`.
+        """
+        analysis = SalinityVegInvestigation(
+            dataset=None,
+            filters={"grid_cell": "1,2"},
+            parameters=SalinityVegInvestigation.Parameters(),
+        )
+        selection = next(
+            step for step in analysis.pipeline().steps if step.op == "filter" and step.input is None
+        )
+        assert selection.where == "grid_cell IN (1, 2)"
 
     def test_collapsed_dimensions_union_both_inputs(self):
         analysis, _ = self._build()
@@ -1162,46 +1335,35 @@ class TestLandConfidencePipeline:
 
 
 class TestLndTypePlusParameters:
-    def test_requires_model_group_id_and_scenario_id(self):
-        with pytest.raises(ValidationError):
-            LndTypePlus.Parameters(model_group_id=705)
+    """It declares NO parameters. `model_group_id`/`scenario_id`/`calendar_year` were
+    declared here, the first two required, back when a fixed-input analysis had nowhere to
+    put a dimension filter; they are ordinary filters now, composed into the same trailing
+    `filter` step every other selection goes to.
 
-    def test_calendar_year_is_optional(self):
-        assert LndTypePlus.Parameters(model_group_id=705, scenario_id=7).calendar_year is None
+    There is no `TestLndTypePlusSelection` any more either. `validate_selection` rejected
+    any `filters` at all with "takes no selection", which rejected the dimension filters
+    that were every real use of it. What the blanket rejection was approximating -- that a
+    `grid_cell` lowers this analysis's frame to long and cannot then be written to its
+    raster sink -- is `validate_shapes`'s judgement, made per format and with a message
+    naming `grid_cell`; see `test_a_grid_cell_is_a_conjunct_like_any_other` below and the
+    decoder's own `test_a_raster_point_selection_cannot_be_written_as_a_surface`.
+    """
+
+    def test_it_declares_no_parameters_at_all(self):
+        assert LndTypePlus.Parameters.model_fields == {}
 
     def test_rejects_extra_fields(self):
         with pytest.raises(ValidationError):
-            LndTypePlus.Parameters(model_group_id=705, scenario_id=7, dimension="calendar_year")
-
-
-class TestLndTypePlusSelection:
-    """It takes no `filters` at all -- see `LndTypePlus.validate_selection`: its three
-    inputs span two grids, so a `grid_cell` names a cell in a lattice the request does not
-    say which of, a bare `where` has no one operand to apply to, and a spatial predicate
-    would turn the join long and invalidate the raster sink rather than simply narrowing
-    the result.
-    """
-
-    params = LndTypePlus.Parameters(model_group_id=705, scenario_id=7)
-
-    def test_accepts_an_empty_selection(self):
-        LndTypePlus.validate_selection(self.params, {})  # no raise
-
-    def test_rejects_a_grid_cell(self):
-        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
-            LndTypePlus.validate_selection(self.params, {"grid_cell": "3,5"})
-
-    def test_rejects_a_where(self):
-        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
-            LndTypePlus.validate_selection(self.params, {"where": "value > 1"})
+            LndTypePlus.Parameters(dimension="calendar_year")
 
 
 class TestLndTypePlusPipeline:
+    # The selection a caller writes, which used to be three `Parameters` fields.
+    FILTERS = {"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050}
+
     def _build(self, **overrides):
-        params = {"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050, **overrides}
-        analysis = LndTypePlus(
-            dataset=None, filters={}, parameters=LndTypePlus.Parameters(**params)
-        )
+        filters = {key: value for key, value in {**self.FILTERS, **overrides}.items() if value is not None}
+        analysis = LndTypePlus(dataset=None, filters=filters, parameters=LndTypePlus.Parameters())
         return analysis, analysis.pipeline()
 
     def test_the_three_inputs_are_fixed(self):
@@ -1413,36 +1575,50 @@ class TestLndTypePlusPipeline:
 
     def test_resolves_through_resolve_analysis(self):
         resolved = resolve_analysis(
-            "lnd_type_plus",
-            dataset=None,
-            filters={},
-            params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
+            "lnd_type_plus", dataset=None, filters=dict(self.FILTERS), params={}
         )
         assert isinstance(resolved, ResolvedAnalysis)
         assert resolved.pipeline.steps[-1].else_ == "land_type"
         assert resolved.collapsed_dimensions == frozenset({"aggregate_type"})
 
-    def test_string_parameters_off_a_query_string_are_coerced(self):
-        # Every parameter arrives as a string on the real routes (`_analysis_extra_params`
-        # reads the raw query string), so the `int` fields have to coerce.
+    def test_string_filter_values_off_a_query_string_are_coerced(self):
+        # Every value arrives as a string on the real route (the decoder reads the raw
+        # query string), so `format_dimension_literal` has to cast before it renders --
+        # otherwise the conjunct would read `model_group_id = '705'` against an int column.
         resolved = resolve_analysis(
             "lnd_type_plus",
             dataset=None,
-            filters={},
-            params={"model_group_id": "705", "scenario_id": "7", "calendar_year": "2050"},
+            filters={"model_group_id": "705", "scenario_id": "7", "calendar_year": "2050"},
+            params={},
         )
         assert resolved.pipeline.steps[-2].where == (
             "calendar_year = 2050 AND model_group_id = 705 AND scenario_id = 7"
         )
 
-    def test_a_selection_is_rejected_by_resolve_analysis(self):
-        with pytest.raises(InvalidAnalysisParametersError, match="takes no selection"):
-            resolve_analysis(
-                "lnd_type_plus",
-                dataset=None,
-                filters={"grid_cell": "3,5"},
-                params={"model_group_id": 705, "scenario_id": 7},
-            )
+    def test_an_entirely_unselected_request_states_no_selection_step(self):
+        """Legal now: `selection_filter_where({})` is `None`, and a `filter` with no `where`
+        is not a step, so the `case` chains from the join directly. Nothing replaces the
+        `required` this drops -- what bounds the read is `config.ANALYSIS_BAND_CEILING`
+        against the join's operand union.
+        """
+        analysis = LndTypePlus(dataset=None, filters={}, parameters=LndTypePlus.Parameters())
+        assert [step.op for step in analysis.pipeline().steps] == [
+            "filter",
+            "project",
+            "join",
+            "case",
+        ]
+
+    def test_a_grid_cell_is_a_conjunct_like_any_other(self):
+        """`validate_selection` rejected this outright. It composes into the same trailing
+        conjunct now; what makes it wrong is the analysis's raster `output.format`, which
+        `validate_shapes` rejects because a spatial filter lowers the frame to long -- a
+        judgement about the SINK, not about the filter, and one this method never makes.
+        """
+        analysis = LndTypePlus(
+            dataset=None, filters={"grid_cell": "3,5"}, parameters=LndTypePlus.Parameters()
+        )
+        assert analysis.pipeline().steps[-2].where == "grid_cell IN (3, 5)"
 
 
 def _conjunct_holds(value, conjunct, measured="value"):
@@ -1539,8 +1715,8 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
         resolved = resolve_analysis(
             "lnd_type_plus",
             dataset=None,
-            filters={},
-            params={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
+            filters={"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050},
+            params={},
         )
         self._assert_subset_with_teeth(
             LndTypePlus.Meta.subsumed_dimensions, resolved.collapsed_dimensions, "calendar_year"

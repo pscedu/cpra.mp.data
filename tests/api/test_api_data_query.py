@@ -1,11 +1,12 @@
-"""Tests for `cpra.mp.data.api.data_query` -- the flat routes' `grid_cell` resolution and
-their request-to-`ResolvedDataQuery` lowering.
+"""Tests for `cpra.mp.data.api.data_query.resolve_grid_cell` -- turning the one
+`grid_cell=` spelling that needs I/O (a coordinate pair) into a `grid_cell` conjunct and,
+for a raster grid, the relabel map that names the pixel back.
 
-Asserted against the returned `Pipeline`/`relabel`/`float_precision` directly rather than
-through the ASGI app, the same way `test_request_data_query.py` tests the builder this
-layer wraps: what the routes then do with those three values is
-`test_endpoints_data.py`'s subject, and keeping the two apart means a `grid_cell`
-resolution bug is never diagnosed as a response-plumbing bug.
+Asserted against the returned `(where, relabel)` directly rather than through the ASGI
+app: what a route then does with those is `test_endpoints_data.py`'s subject, and keeping
+the two apart means a `grid_cell` resolution bug is never diagnosed as a response-plumbing
+bug. The composition this used to sit under, `build_data_query`, is gone -- see the note
+at the bottom of this file.
 
 The vector coordinate path is the only one that opens a file, so only its tests take the
 `geometry_path`-backed fixture; the raster path needs nothing but `structure/grids.csv`'s
@@ -19,10 +20,9 @@ from rasterio.transform import xy as raster_xy
 from rasterio.warp import transform
 from shapely.geometry import box
 
-from cpra.mp.data.analysis.request.parameters import DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.errors import NotFoundError, RequestError
 from cpra.mp.data.api.boundary import resolve_status
-from cpra.mp.data.api.data_query import build_data_query, resolve_grid_cell
+from cpra.mp.data.api.data_query import resolve_grid_cell
 from cpra.mp.data.grids import GRIDS
 from tests.factories import write_grid_geometry
 
@@ -232,81 +232,14 @@ class TestResolveGridCellErrors:
         assert resolve_status(excinfo.value) == 400
 
 
-class TestBuildDataQuery:
-    """`build_data_query` composes `resolve_grid_cell` with
-    `request.data_query.build_data_query_pipeline` and reports the two extras a route has
-    to plumb separately.
-    """
-
-    async def test_a_plain_query_needs_no_extras(self):
-        resolved = await build_data_query(
-            DatasetDimensions(variable="ssf", time_unit="annual", grid=VECTOR_GRID),
-            FilterDimensions(scenario_id=[7]),
-            DataOptions(),
-            "csv",
-        )
-        assert resolved.pipeline.steps[0].where == "scenario_id = 7"
-        assert resolved.pipeline.output.format == "csv"
-        assert resolved.relabel is None
-
-    async def test_no_filters_at_all_means_no_filter_step(self):
-        resolved = await build_data_query(
-            DatasetDimensions(variable="ssf", time_unit="annual", grid=VECTOR_GRID),
-            FilterDimensions(),
-            DataOptions(),
-            "parquet",
-        )
-        assert resolved.pipeline.steps == []
-
-    async def test_a_resolved_grid_cell_becomes_a_conjunct_alongside_the_dimensions(
-        self, ecoregion_geometry
-    ):
-        lng, lat = _lng_lat(500500, 3300500)
-        resolved = await build_data_query(
-            DatasetDimensions(variable="ssf", time_unit="annual", grid=VECTOR_GRID),
-            FilterDimensions(scenario_id=[7]),
-            DataOptions(grid_cell=f"{lng},{lat}"),
-            "csv",
-        )
-        assert resolved.pipeline.steps[0].where == "scenario_id = 7 AND grid_cell = 1"
-
-    async def test_a_raster_point_query_carries_its_relabel_map(self):
-        row, col = 10, 20
-        lng, lat = _raster_pixel_lng_lat(row, col)
-        expected_id = row * GRIDS[RASTER_GRID].width + col
-        resolved = await build_data_query(
-            DatasetDimensions(variable="vct", time_unit="annual", grid=RASTER_GRID),
-            FilterDimensions(),
-            DataOptions(grid_cell=f"{lng},{lat}"),
-            "csv",
-        )
-        assert resolved.pipeline.steps[0].where == f"grid_cell = {expected_id}"
-        assert resolved.relabel == {expected_id: [f"{lng},{lat}"]}
-
-    async def test_float_precision_comes_from_the_querys_one_variable(self):
-        resolved = await build_data_query(
-            DatasetDimensions(variable="sal", time_unit="daily", grid="hydro_compartment_v001"),
-            FilterDimensions(),
-            DataOptions(),
-            "csv",
-        )
-        assert resolved.float_precision == 1
-
-    async def test_a_variable_declaring_no_precision_reports_none(self):
-        resolved = await build_data_query(
-            DatasetDimensions(variable="ssf", time_unit="annual", grid=VECTOR_GRID),
-            FilterDimensions(),
-            DataOptions(),
-            "csv",
-        )
-        assert resolved.float_precision is None
-
-    async def test_output_options_are_carried_onto_the_pipeline(self):
-        resolved = await build_data_query(
-            DatasetDimensions(variable="ssf", time_unit="annual", grid=VECTOR_GRID),
-            FilterDimensions(),
-            DataOptions(sort="grid_cell", select="grid_cell,value"),
-            "csv",
-        )
-        assert resolved.pipeline.output.sort == "grid_cell"
-        assert resolved.pipeline.output.select == "grid_cell,value"
+# There is no `TestBuildDataQuery` here any more. `build_data_query` -- `resolve_grid_cell`
+# composed with `request.data_query.build_data_query_pipeline`, plus the `relabel` and
+# `float_precision` a route had to plumb separately -- is gone with the flat routes it was
+# the entry point for. `api.unified.decode_request` is that composition now, for every
+# route rather than three of them, and `test_unified_decoder.py` is where the cases that
+# class pinned live: the trailing filter conjunct, the stepless no-filter pipeline, the
+# coordinate `grid_cell` and its relabel map, and `float_precision` off the descriptor.
+#
+# What stays here is `resolve_grid_cell` itself, still a distinct unit with its own two
+# grid-type paths and its own error vocabulary, and still worth testing apart from whatever
+# assembles a pipeline around it.

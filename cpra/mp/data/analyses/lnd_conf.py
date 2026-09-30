@@ -50,6 +50,7 @@ from typing import Any
 
 from cpra.mp.data.analyses.base import (
     Analysis,
+    AnalysisMeta,
     InvalidAnalysisParametersError,
     dataset_input_selection,
     dataset_output_format,
@@ -81,23 +82,21 @@ def _value_in(values: tuple[int, ...]) -> str:
 
 
 class LandConfidence(Analysis):
-    class Meta:
-        name = "lnd_conf"
-        label = "Land Confidence"
-        type = "dataset"
-        variables = ["lnd_type"]
-        legend = "lnd_conf"
-        result_kind = "value"
-        kind = "variable"
-        subsumed_dimensions = ["scenario_id"]
+    Meta = AnalysisMeta(
+        name="lnd_conf",
+        label="Land Confidence",
+        variables=["lnd_type"],
+        legend="lnd_conf",
+        result_kind="value",
+        kind="variable",
+        subsumed_dimensions=["scenario_id"],
+    )
 
     class Parameters(Analysis.Parameters):
         pass
 
     @classmethod
-    def validate_selection(
-        cls, parameters: "LandConfidence.Parameters", filters: dict[str, Any]
-    ) -> None:
+    def validate_selection(cls, parameters: "LandConfidence.Parameters", filters: dict[str, Any]) -> None:
         if filters.get("scenario_id") is not None:
             raise InvalidAnalysisParametersError(
                 "lnd_conf combines a fixed ensemble "
@@ -107,8 +106,8 @@ class LandConfidence(Analysis):
             )
 
     def pipeline(self):
-        assert self.dataset is not None, "lnd_conf is a type='dataset' analysis"
-        required = required_dataset_dimensions(self.dataset)
+        dataset = self.require_dataset()
+        required = required_dataset_dimensions(dataset)
         group_by = [d for d in required if d != "scenario_id"]
 
         # Fold the fixed member set in as though the caller had selected it, so it renders

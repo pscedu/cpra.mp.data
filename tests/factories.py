@@ -296,6 +296,69 @@ def write_lnd_type_plus_datasets(
     return selection
 
 
+# The five hardcoded variables of the `sediment_dynamics` named analysis, with the dtype
+# `variables.csv` declares for each -- a COG's band dtype has to match, and two of these
+# five are `Float64` while two are `Int32`, which is the whole point of the chart's
+# metre/centimetre split. They share `morph_pixel_v002` (shrunk by the same
+# `morph_pixel_v002_shrunk` fixture `lnd_type_plus`'s own inputs use) and
+# `LND_TYPE_PLUS_SELECTION`'s model group and scenario, so a test needing both analyses'
+# data on disk gets one grid and one selection rather than two.
+SEDIMENT_DYNAMICS_DTYPES = {
+    "elev": "int32",
+    "inun": "float32",
+    "lnd_type": "int32",
+    "test_mnrl_accr": "float64",
+    "test_org_accr": "float64",
+}
+
+# Per-variable value offsets, so a stacked row's number says which variable AND which
+# pixel it came from: the value written at pixel `p` of `variable` in `year` is
+# `offset + (year - SEDIMENT_DYNAMICS_BASE_YEAR) + p` (see
+# :func:`sediment_dynamics_value`). A uniform fill would let the fold silently stack the
+# same operand five times and still pass.
+SEDIMENT_DYNAMICS_OFFSETS = {
+    "elev": 100,
+    "inun": 200,
+    "lnd_type": 300,
+    "test_mnrl_accr": 400,
+    "test_org_accr": 500,
+}
+SEDIMENT_DYNAMICS_BASE_YEAR = 2040
+
+
+def sediment_dynamics_value(variable, year, pixel):
+    """The value :func:`write_sediment_dynamics_datasets` writes at ``pixel`` (a row-major
+    index into the shrunk grid) for ``variable`` in ``year`` -- distinct across all three
+    axes, and exactly representable in every one of the five dtypes above.
+    """
+    return SEDIMENT_DYNAMICS_OFFSETS[variable] + (year - SEDIMENT_DYNAMICS_BASE_YEAR) + pixel
+
+
+def write_sediment_dynamics_datasets(base_path, years=(2040, 2050), **overrides):
+    """The five hardcoded inputs of the ``sediment_dynamics`` named analysis, one COG per
+    (variable, year) on ``morph_pixel_v002``.
+
+    Needs the ``morph_pixel_v002_shrunk`` fixture, like every other writer on that grid:
+    at its real size it is ~97 million pixels per band and this writes ten bands.
+    """
+    selection = {**LND_TYPE_PLUS_SELECTION, **overrides}
+    pixels = np.arange(LND_TYPE_PLUS_SHAPE[0] * LND_TYPE_PLUS_SHAPE[1])
+    for variable, dtype in SEDIMENT_DYNAMICS_DTYPES.items():
+        write_raster_dataset(
+            base_path,
+            years=years,
+            variable=variable,
+            grid="morph_pixel_v002",
+            time_unit="annual",
+            data_fn=lambda year, variable=variable, dtype=dtype: np.array(
+                [sediment_dynamics_value(variable, year, pixel) for pixel in pixels],
+                dtype=dtype,
+            ).reshape(LND_TYPE_PLUS_SHAPE),
+            **selection,
+        )
+    return selection
+
+
 def _stg_rows_exist(base_path, selection):
     """Has this selection's stage series already been written under ``base_path``?
 

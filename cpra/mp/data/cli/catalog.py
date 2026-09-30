@@ -130,18 +130,24 @@ def compact(catalog_dir):
 
 @catalog.command()
 @click.option("--catalog", "catalog_dir", default="catalog")
-@click.option("--variable", default=None)
-@click.option("--time-unit", default=None)
-@click.option("--grid", default=None)
+@click.option("--variable", required=True)
+@click.option("--time-unit", required=True)
+@click.option("--grid", required=True)
 def query(catalog_dir, variable, time_unit, grid):
-    from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
+    """Time one `CatalogQuery` against a catalog tree.
 
-    dd_kwargs = {k: v for k, v in dict(variable=variable, time_unit=time_unit, grid=grid).items() if v is not None}
-    dd = DatasetDimensions(**dd_kwargs)
-    fd = FilterDimensions()
+    All three of the triple are required: `CatalogQuery` takes the datasets a resolved
+    pipeline READS, and a pipeline input names all three. The partial-triple wildcard this
+    used to allow resolved the missing members from the catalog's own choices, which the
+    query no longer reports -- the dataset triple is a fact about the output descriptor now,
+    not a dimension a caller chooses (see `catalog.CatalogQuery`).
+    """
+    from cpra.mp.data.analysis.request.pipeline import InputSelection
+
+    dataset = InputSelection(variable=variable, time_unit=time_unit, grid=grid)
 
     t = time.time()
-    out = CatalogQuery(dd, fd, catalog_path=catalog_dir).execute()
+    out = CatalogQuery([dataset], {}, catalog_path=catalog_dir).execute()
     click.echo(f"[table] {(time.time()-t)*1000:.1f} ms")
     for k, v in out["choices"].items():
         click.echo(f"  {k}: choices={v}  result={out['results'][k]}")

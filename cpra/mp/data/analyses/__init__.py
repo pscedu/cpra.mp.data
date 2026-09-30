@@ -1,5 +1,7 @@
 """Named-analysis registry: mirrors `cpra.mp.data.visualizations`'s `VISUALIZATIONS`
-pattern (`ANALYSES = {cls.Meta.name: cls for cls in [...]}`) for the small set of
+pattern (`ANALYSES = {cls.Meta.name: cls for cls in [...]}`, though each entry's `Meta` is
+an `AnalysisMeta` INSTANCE here rather than the bare `class Meta:` that module still uses)
+for the small set of
 multi-step, non-visual analyses a route can resolve by NAME rather than requiring a caller
 to hand-author the equivalent `analysis.request.pipeline.Pipeline` JSON directly --
 replacing the portal's own client-side-only `subtract-asc`/`subtract-desc`/`concatenate`
@@ -9,24 +11,27 @@ derivation logic and its un-enforced cardinality rules. The registry-drift test
 `execution.plan.compile_plan` any hand-authored pipeline does -- nothing is reachable only
 through a named analysis.
 
-`ANALYSES`, `DatasetRef`, and `resolve_analysis` are the exact three names
-`cpra/mp/data/api/utils.py` imports -- see that module's `get_analysis_class`, which
-resolves `ANALYSES[name].Meta.type` directly for its own 404/400 (unknown name / wrong
-route kind) translation, independent of the exceptions `resolve_analysis` itself raises
-below for the parameter-validation/pipeline-construction half of the same job.
+`cpra/mp/data/api/utils.py` re-exports this package's names for the API layer, and does no
+resolving of its own: there is no `get_analysis_class` pre-flight gate any more, so an
+unknown name, a dataset mismatch and a bad parameter all surface as the three
+`AnalysisRegistryError` subclasses `resolve_analysis` raises below, mapped to their 404/400
+by one handler in `api/__init__.py`.
 """
 
 from pydantic import ValidationError
 
 from cpra.mp.data.analyses.base import (
     Analysis,
+    AnalysisMeta,
+    AnalysisChainError,
+    AnalysisDatasetMismatchError,
     AnalysisRegistryError,
-    AnalysisTypeMismatchError,
     DatasetRef,
     InvalidAnalysisParametersError,
     ResolvedAnalysis,
     UnknownAnalysisError,
     default_collapsed_dimensions,
+    is_filterable_dimension,
     pipeline_input_dimensions,
 )
 from cpra.mp.data.analyses.diff import Difference
@@ -34,23 +39,75 @@ from cpra.mp.data.analyses.lnd_chng import LandChange
 from cpra.mp.data.analyses.lnd_conf import LandConfidence
 from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
+from cpra.mp.data.analyses.sediment_dynamics import SedimentDynamics
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.pipeline import append_steps
 
 # Landed in this order (`sal_veg_investigation` first -- the only entry exercising
-# the `type="custom"` path, multiple named inputs, and a `project` + spatial `join`, and
+# the fixed-input path, multiple named inputs, and a `project` + spatial `join`, and
 # the only one with no existing consumer waiting on it), but `ANALYSES` itself is a `name
 # -> class` dict, so registration order has no behavioral effect.
-ANALYSES = {
-    cls.Meta.name: cls
-    for cls in [SalinityVegInvestigation, Difference, LandChange, LandConfidence, LndTypePlus]
-}
+_REGISTERED = [
+    SalinityVegInvestigation,
+    Difference,
+    LandChange,
+    LandConfidence,
+    LndTypePlus,
+    SedimentDynamics,
+]
+
+
+def _register(classes: list[type[Analysis]]) -> dict[str, type[Analysis]]:
+    """Build the `name -> class` registry, rejecting an entry whose `Meta` is not an
+    `AnalysisMeta` instance or whose `Parameters` names a dimension.
+
+    The `Meta` check is what makes `AnalysisMeta`'s validation binding. A subclass that
+    keeps the old bare `class Meta:` would otherwise register fine -- `cls.Meta.name` reads
+    the same off either -- and would then be missing exactly the guarantees the model exists
+    to give: no forgotten `kind`, no misspelled `result_kind`, no field this model has since
+    dropped.
+
+    The `Parameters` check is what makes the decoder's partition unambiguous. A request's
+    parameters are split into dimension FILTERS and the analysis's own PARAMETERS by name
+    (`request.unified.partition_query`), and the rule it applies is the simplest one there
+    is: a dimension name is always a filter. That rule is only sound while no analysis
+    declares a dimension-named parameter -- `lnd_type_plus` and `sal_veg_investigation` both
+    did, back when a fixed-input analysis had no route that could carry a filter -- and a
+    reintroduction would be the highest-severity failure the design has AND invisible to
+    every response-level test: the caller's `model_group_id` lands in `filters`,
+    `Parameters` takes its default, and the request 200s for the wrong model group. So the
+    possibility is removed rather than policed.
+
+    Both raise at the import of this module, which is the import every consumer of
+    `ANALYSES` goes through.
+    """
+    for cls in classes:
+        meta = cls.__dict__.get("Meta")
+        if not isinstance(meta, AnalysisMeta):
+            raise AnalysisRegistryError(
+                f"{cls.__name__} must declare `Meta = AnalysisMeta(...)`; got "
+                f"{type(meta).__name__ if meta is not None else 'no Meta of its own'}"
+            )
+        dimension_named = sorted(
+            field for field in cls.Parameters.model_fields if is_filterable_dimension(field)
+        )
+        if dimension_named:
+            raise AnalysisRegistryError(
+                f"{cls.__name__}.Parameters declares dimension-named field(s) "
+                f"{dimension_named} -- a dimension name is always a FILTER, never an "
+                f"analysis parameter, so declare it nowhere and read it off `self.filters`"
+            )
+    return {cls.Meta.name: cls for cls in classes}
+
+
+ANALYSES = _register(_REGISTERED)
 
 __all__ = [
     "ANALYSES",
     "Analysis",
+    "AnalysisChainError",
+    "AnalysisDatasetMismatchError",
     "AnalysisRegistryError",
-    "AnalysisTypeMismatchError",
     "DatasetRef",
     "InvalidAnalysisParametersError",
     "ResolvedAnalysis",
@@ -69,14 +126,13 @@ def resolve_analysis(
     grid_cell_where: str | None = None,
 ) -> ResolvedAnalysis:
     """Resolve a named analysis into a `ResolvedAnalysis` (a real, `compile_plan`-ready
-    `Pipeline` plus presentation metadata): look `name` up in `ANALYSES`, check its
-    `Meta.type` against whether `dataset` was given (a `type="dataset"` analysis requires
-    one; a `type="custom"` analysis requires `dataset=None`), validate `params` against
-    its `Parameters` model, run its own `validate_selection` cardinality/consistency rule
-    against `filters`, then build and return its `pipeline()`.
+    `Pipeline` plus presentation metadata): look `name` up in `ANALYSES`, validate
+    `params` against its `Parameters` model, run its own `validate_selection`
+    cardinality/consistency rule against `filters`, then build and return its `pipeline()`.
 
-    `dataset` is `None` for a `type="custom"` analysis (its inputs are hardcoded in its
-    own `pipeline()` method -- see `sal_veg_investigation.py`); `filters` is the dataset's
+    `dataset` is `None` when the caller named no `variable`/`time_unit`/`grid`, which is
+    what an analysis with fixed inputs requires (they are hardcoded in its own
+    `pipeline()` method -- see `sal_veg_investigation.py`); `filters` is the dataset's
     dimension filters plus the two reserved keys `grid_cell` and `where`, which the
     analysis composes into its pipeline's leading `filter` STEP (see
     `base.selection_filter_where`) rather than onto its input selection -- an
@@ -103,8 +159,8 @@ def resolve_analysis(
     module's three exception types:
 
     - `UnknownAnalysisError` -- `name` is not in `ANALYSES` (maps to 404);
-    - `AnalysisTypeMismatchError` -- `name` resolves to an analysis whose `Meta.type`
-      doesn't match whether `dataset` was given (maps to 400);
+    - `AnalysisDatasetMismatchError` -- `name` resolves to an analysis that needs a
+      `dataset` and was given none, or fixes its own inputs and was given one (400);
     - `InvalidAnalysisParametersError` -- `params` failed `Parameters` validation,
       `filters` failed the analysis's `validate_selection` cardinality rule, or the
       resulting `Pipeline` itself failed `parse_pipeline`'s validation (maps to 400).
@@ -116,14 +172,12 @@ def resolve_analysis(
     if analysis_class is None:
         raise UnknownAnalysisError(f"unknown analysis name {name!r} -- known: {sorted(ANALYSES)}")
 
-    expected_type = "custom" if dataset is None else "dataset"
-    if analysis_class.Meta.type != expected_type:
-        given = "no dataset given" if dataset is None else f"dataset given: {dataset!r}"
-        raise AnalysisTypeMismatchError(
-            f"analysis {name!r} is type={analysis_class.Meta.type!r}, but was resolved "
-            f"as if it were type={expected_type!r} ({given})"
-        )
-
+    # No `Meta.type` gate here any more. It compared `dataset is None` against a declared
+    # route kind BEFORE the analysis existed; each `pipeline()` now states the same
+    # requirement itself (`Analysis.require_dataset`/`reject_dataset`), which is both
+    # closer to the code that reads `self.dataset` and one fewer place for the two to
+    # disagree. `AnalysisDatasetMismatchError` still names the mistake, and still 400s --
+    # it is raised a few lines lower, out of `analysis.pipeline()`.
     try:
         parameters = analysis_class.Parameters.model_validate(params)
     except ValidationError as exc:
@@ -194,8 +248,8 @@ def resolve_analysis_chain(
     naming the field, for the day a second one is added or the same one is named twice.
 
     Raises the same three `AnalysisRegistryError` subclasses `resolve_analysis` does (see
-    its docstring) -- an unknown name anywhere in `names`, a non-`type="dataset"`/wrong-
-    `kind` analysis in a chain position that requires one, a parameter collision, an
+    its docstring), plus `AnalysisChainError` -- an unknown name anywhere in `names`, a
+    wrong-`kind` analysis in a chain position, a parameter collision, an
     unrecognized parameter, a `dimension` that names an already-collapsed dimension, or a
     `Pipeline`-construction failure at any stage.
     """
@@ -212,7 +266,7 @@ def resolve_analysis_chain(
         classes.append(cls)
     for cls in classes[1:]:
         if cls.Meta.kind != "dimension":
-            raise AnalysisTypeMismatchError(
+            raise AnalysisChainError(
                 f"analysis {cls.Meta.name!r} is kind={cls.Meta.kind!r}, but only a "
                 "kind='dimension' analysis may follow the first stage of a chain"
             )

@@ -802,6 +802,119 @@ def _fake_raster_bands_per_variable(by_variable):
     return _fake
 
 
+class TestPointSampleThroughABandWideJoin:
+    """A spatial `filter` sitting directly on a band-wide `join` records a
+    `point_sample_step` for EVERY raster origin of that join -- the record
+    `execution.execute` needs to read one pixel's window instead of every operand's whole
+    raster (`analyses/sediment_dynamics.py` is the shape that pays for it).
+
+    `_Validity` cannot say this on its own: it tracks a single origin, so a join retires
+    every operand's state before the per-op branches run. What makes the record safe
+    instead is that the operands are read as ONE scan
+    (`execution.execute._open_band_wide_join_group`), and one scan takes one window -- so
+    the group is exactly the unit a point sample can be sized for, provided nothing else
+    is reading it.
+    """
+
+    OPERANDS = {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")}
+    JOIN = {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"}
+    # The pixel and the fold that follows it -- `sediment_dynamics`' own shape, and the
+    # only one that reaches a sink without throwing an operand away: a join's output
+    # carries one value column per operand and every sink wants exactly one.
+    SAMPLE = {"op": "filter", "input": "j", "where": "grid_cell = 7", "as": "s"}
+    STACK = {"op": "unpivot", "input": "s"}
+
+    @pytest.fixture(autouse=True)
+    def _bands(self, monkeypatch):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2040}]),
+        )
+
+    def _compile(self, steps, fmt="csv"):
+        # `fmt` follows the final frame's shape, which is what `validate_shapes` checks it
+        # against: `csv` for a chain that ends folded and long, `tif` for one that never
+        # leaves band-wide because nothing in it named a pixel.
+        return compile_plan(
+            _pipeline({"inputs": dict(self.OPERANDS), "steps": steps, "output": {"format": fmt}})
+        )
+
+    def _steps(self):
+        return [dict(self.JOIN), dict(self.SAMPLE), dict(self.STACK)]
+
+    def test_both_operands_record_the_filters_own_step(self):
+        plan = self._compile(self._steps())
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+        # 2 -- the `filter`'s own `step_no`, it being the second declared step.
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [2, 2]
+
+    def test_the_sample_takes_both_operands_off_the_overviews(self):
+        # The consequence that has to travel with the record, not a separate decision: an
+        # overview's decimated grid can hand back a neighbouring pixel's value, which is
+        # the wrong answer for a request that named one pixel. `compile_plan` reads
+        # `point_sample_step` for this, so widening the record widens this too.
+        plan = self._compile(self._steps())
+        assert [plan.inputs[name].overview_permitted for name in ("a", "b")] == [False, False]
+
+    def test_a_dimension_only_filter_on_the_join_records_nothing(self):
+        # A dimension conjunct does not lower the frame and does not name a pixel; it is
+        # band SELECTION, answered by the band-identity pass. Nothing to sample.
+        plan = self._compile(
+            [
+                dict(self.JOIN),
+                {"op": "filter", "input": "j", "where": "calendar_year >= 2030", "as": "narrowed"},
+                {"op": "case", "input": "narrowed", "cases": [{"when": "a > 0.5", "then": "b"}]},
+            ],
+            fmt="tif",
+        )
+        assert plan.band_wide_join_scans == {"j": ("a", "b")}
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [None, None]
+
+    def test_a_second_reader_of_the_joined_frame_blocks_it(self):
+        # The narrowing applies to the shared READ, not to this filter's own frame, so a
+        # second op off the same join would be handed one pixel where it asked for a
+        # grid. A dangling second branch off `j` is legal (see
+        # `TestBandWideJoinCeiling::test_an_operand_read_by_another_step_...` for the same
+        # shape one level down) and is precisely the case that has to refuse.
+        # Declared between the join and the sample rather than after the fold, only so the
+        # LAST step stays the one the sink is typed against (`ops.final_frame_name`); where
+        # in the chain it sits changes nothing about the reference count it adds.
+        plan = self._compile(
+            [
+                dict(self.JOIN),
+                {"op": "filter", "input": "j", "where": "calendar_year >= 2030", "as": "elsewhere"},
+                dict(self.SAMPLE),
+                dict(self.STACK),
+            ]
+        )
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [None, None]
+
+    def test_an_operand_read_outside_the_join_blocks_it_too(self):
+        # Same rule one level down: `a` feeds the join AND a branch of its own, and the
+        # shared scan is where both of them get their pixels from.
+        plan = self._compile(
+            [
+                {"op": "filter", "input": "a", "where": "calendar_year >= 2030", "as": "own_branch"},
+                *self._steps(),
+            ]
+        )
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [None, None]
+
+    def test_a_step_between_the_join_and_the_filter_is_left_unnarrowed(self):
+        # Deliberate, and documented in the gate: a `calculate` here happens to leave the
+        # pixels alone, but a `group` or a `project` would not, and telling them apart is
+        # a forward pass no pipeline in this codebase needs. Reading whole is correct.
+        plan = self._compile(
+            [
+                dict(self.JOIN),
+                {"op": "calculate", "input": "j", "expression": "a + b", "as": "summed"},
+                {"op": "filter", "input": "summed", "where": "grid_cell = 7"},
+            ]
+        )
+        assert [plan.inputs[name].point_sample_step for name in ("a", "b")] == [None, None]
+
+
 class TestDimensionPushdownAcrossJoinsAndFanOut:
     """A dimension conjunct reaches an origin's read no matter where in the pipeline it was
     declared -- across a join, across a fan-out, and from the other side of either.

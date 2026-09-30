@@ -34,7 +34,7 @@ to tell "no source data" (`False`, no file written) from "wrote a raster" --
 the same count for its own "nothing to show" answer, so its `by=[]` case
 (`test_filter_calculate_group_collapses_to_one_band`) puts the same released metadata to
 work at the other destination: one surviving band there means a rendered tile, and zero
-means `None` (a 404 carrying `empty_tile`'s blank image).
+means `None` (a bodiless 204, as `sink_vector_tile`'s own miss already was).
 """
 
 import gzip
@@ -61,7 +61,6 @@ from cpra.mp.data.analysis.execution.sink import (
     _band_descriptions,
     _resolve_write_dtype,
     apply_output_shaping,
-    empty_tile,
     render_tile,
     sink_tabular,
     sink_vector_tile,
@@ -642,61 +641,6 @@ class TestRenderTile:
         assert image.format == "JPEG"
         assert image.mode == "RGB"
         assert image.size == (8, 8)
-
-    def test_a_rendered_tile_and_an_empty_one_share_an_encoder(self, base_path, monkeypatch):
-        # A blank tile a client cannot decode would defeat the whole point of sending one,
-        # so `empty_tile` goes through this function's own encoder rather than a second
-        # spelling of it. The stub legend here returns an all-zero RGBA array -- which is
-        # exactly the array `empty_tile` builds -- so a real render and a blank one must
-        # come out byte for byte identical.
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda _y: 50)
-        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
-        self._stub_legend(monkeypatch, [])
-        _plan, rendered = self._render(base_path, pipeline, tile_size=16)
-
-        assert rendered == empty_tile("png", tile_size=16)
-
-
-class TestEmptyTile:
-    """The body a route pairs with the 404 it sends when `render_tile` returned `None`.
-
-    The point of it is entirely on the client side -- an image URL that answers with a JSON
-    error document makes every map pan past the edge of the data log a decode failure -- so
-    every assertion here is what a client's decoder would see, read back out of the encoded
-    bytes rather than off the array that produced them.
-    """
-
-    def test_a_png_is_a_fully_transparent_tile_of_the_requested_size(self):
-        result = empty_tile("png", tile_size=32)
-
-        image = Image.open(BytesIO(result))
-        assert image.format == "PNG"
-        assert image.mode == "RGBA"
-        assert image.size == (32, 32)
-        assert np.asarray(image)[:, :, 3].max() == 0  # every pixel fully transparent
-
-    def test_a_jpg_is_a_solid_tile_of_the_requested_size(self):
-        # JPEG has no alpha channel, so there is no transparent answer to give -- a blank
-        # `jpg` tile is necessarily a solid color, and is black because dropping the alpha
-        # column off the same all-zero RGBA array is what produces it. Asserted as "one
-        # color everywhere" rather than exact bytes: JPEG is lossy, and a uniform image is
-        # the strongest thing its encoder actually promises to round-trip.
-        result = empty_tile("jpg", tile_size=32)
-
-        image = Image.open(BytesIO(result))
-        assert image.format == "JPEG"
-        assert image.mode == "RGB"
-        assert image.size == (32, 32)
-        assert np.asarray(image).max() == 0
-
-    def test_it_defaults_to_the_same_tile_size_a_tile_request_does(self):
-        # Both sides of a miss have to agree on size without being told: a route sending
-        # this for a tile it could not render has a `TileRequest` whose `tile_size` the
-        # client never supplied either, so the two defaults must be the one constant.
-        assert Image.open(BytesIO(empty_tile("png"))).size == (
-            TileRequest(0, 0, 0).tile_size,
-            TileRequest(0, 0, 0).tile_size,
-        )
 
 
 class TestSinkVectorTile:

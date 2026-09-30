@@ -78,7 +78,20 @@ class OutputType(str, Enum):
 
 
 class TileFormat(str, Enum):
+    """The three map-tile formats. `png`/`jpg` are raster tiles rendered from a band-wide
+    frame; `pbf` is a Mapbox Vector Tile, whose geometry comes from the grid's own PMTiles
+    boundary archive with the pipeline's values injected into it.
+
+    `pbf` is a member here, rather than the bare URL suffix it used to be, so that a
+    pipeline can SPELL it. Every other output format is checked against the final frame's
+    shape by `ops.validate_shapes`; while `pbf` was unspellable that one format's rule had
+    to live at the route layer instead (a private `api/pipeline` helper reaching into the
+    compiled plan), which meant the `.pbf` route and the `.{format}` route could not be one
+    declaration and their relative order was load-bearing.
+    """
+
     jpg = "jpg"
+    pbf = "pbf"
     png = "png"
 
 

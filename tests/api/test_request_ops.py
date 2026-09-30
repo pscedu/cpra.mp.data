@@ -15,14 +15,18 @@ from cpra.mp.data.analysis.request.expressions import PredicateKind
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
     PROJECT_LOWERING_TABLE,
+    UNPIVOT_LOWERING_TABLE,
     CaseOp,
     FilterOp,
     GroupOp,
     JoinOp,
     ProjectOp,
     Shape,
+    UnpivotOp,
     annotate_frame_types,
     compile_ops,
+    final_frame_name,
+    output_frame_type,
     validate_shapes,
 )
 from cpra.mp.data.analysis.request.pipeline import DOMAIN_COLUMN, ZONE_COLUMN, parse_pipeline
@@ -335,6 +339,145 @@ class TestJoinShapeRules:
         validate_shapes(pipeline)
 
 
+class TestUnpivotShapeRules:
+    """`_type_unpivot` -- the fold that takes a join's several operand-named value columns
+    back down to the one column the sink rules allow, and the three things it rejects.
+
+    The accepted case is the reason the op exists: a multi-variable result reaches a CSV or
+    a chart by stacking its measurements, not by collapsing them into an arithmetic of one.
+    """
+
+    def test_folds_a_joins_operand_columns_into_one_value_column(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(grid=VECTOR_GRID),
+                    "b": vector_input(grid=VECTOR_GRID, variable="stg"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "unpivot", "input": "j", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        # The sink rule is the point: two value columns would be rejected here (see
+        # `TestSinkRules` below), and the unpivot is what makes the same pipeline writable.
+        validate_shapes(pipeline)
+        final = output_frame_type(pipeline)
+        assert final.value_columns == frozenset({"value"})
+        assert final.folded_columns == frozenset({"a", "b"})
+        assert final.folded_into == "variable"
+        assert final.shape is Shape.long
+
+    def test_into_names_the_label_column(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(grid=VECTOR_GRID),
+                    "b": vector_input(grid=VECTOR_GRID, variable="stg"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "unpivot", "input": "j", "into": "measurement", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        assert output_frame_type(pipeline).folded_into == "measurement"
+
+    def test_band_wide_input_rejected(self):
+        """The missing row in `UNPIVOT_LOWERING_TABLE`, from the request layer's side: a
+        band-wide frame's columns are positional bands, so there are no measurement names
+        to fold. The error names the remedy -- a spatial filter first."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": raster_input(grid=RASTER_GRID),
+                    "b": raster_input(grid=RASTER_GRID, variable="sal"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "unpivot", "input": "j", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="cannot unpivot a band-wide frame"):
+            validate_shapes(pipeline)
+
+    def test_band_wide_join_unpivoted_after_a_spatial_filter_accepted(self):
+        """The remedy that error names, end to end -- and the shape `sediment_dynamics`
+        takes: the `grid_cell` filter turns the joined band-wide frame long, and the
+        unpivot then has named columns to fold."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": raster_input(grid=RASTER_GRID),
+                    "b": raster_input(grid=RASTER_GRID, variable="sal"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "filter", "input": "j", "where": "grid_cell = '1,2'", "as": "pt"},
+                    {"op": "unpivot", "input": "pt", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        validate_shapes(pipeline)
+        assert output_frame_type(pipeline).folded_columns == frozenset({"a", "b"})
+
+    def test_single_value_column_input_rejected(self):
+        """Nothing to fold. Stated as its own rejection rather than allowed through as a
+        no-op, because a pipeline that unpivots one column has either lost a join it meant
+        to do or collapsed it already, and both are author errors worth naming."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [{"op": "unpivot", "input": "a", "as": "u"}],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="nothing to fold"):
+            validate_shapes(pipeline)
+
+    def test_into_colliding_with_an_operand_rejected(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(grid=VECTOR_GRID),
+                    "b": vector_input(grid=VECTOR_GRID, variable="stg"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "unpivot", "input": "j", "into": "b", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        with pytest.raises(ShapeError, match="names one of the value columns"):
+            validate_shapes(pipeline)
+
+    def test_compiles_to_an_unpivot_op_carrying_into(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {
+                    "a": vector_input(grid=VECTOR_GRID),
+                    "b": vector_input(grid=VECTOR_GRID, variable="stg"),
+                },
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "unpivot", "into": "measurement", "as": "u"},
+                ],
+                "output": {"format": "csv"},
+            }
+        )
+        op = compile_ops(pipeline)[-1]
+        assert isinstance(op, UnpivotOp)
+        # `input` omitted: chained off the previous step's output, like every other op.
+        assert (op.input, op.into, op.output) == ("j", "measurement", "u")
+
+
 class TestSinkRules:
     def test_more_than_one_value_column_at_sink_rejected(self):
         pipeline = parse_pipeline(
@@ -418,6 +561,46 @@ class TestSinkRules:
         with pytest.raises(ShapeError, match="tabular sink"):
             validate_shapes(pipeline)
 
+    def test_long_final_shape_on_a_vector_grid_under_pbf_accepted(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [],
+                "output": {"format": "pbf"},
+            }
+        )
+        validate_shapes(pipeline)
+
+    def test_band_wide_final_shape_under_pbf_rejected(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [],
+                "output": {"format": "pbf"},
+            }
+        )
+        with pytest.raises(ShapeError, match="not a long frame on a vector grid"):
+            validate_shapes(pipeline)
+
+    def test_long_final_shape_on_a_RASTER_grid_under_pbf_rejected(self):
+        """The half no other sink rule covers, and the reason `pbf` needs one of its own.
+
+        A `grid_cell` filter over a raster grid samples it to points, which satisfies every
+        shape rule a tabular format asks for -- but its `grid_cell`s are that raster's pixel
+        ids, and a raster grid has no PMTiles boundary archive to inject them into. Were
+        `pbf` merely sorted in with the tabular formats, this pipeline would type cleanly
+        and then answer 204 ("no data at this location") for what is a client error.
+        """
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "grid_cell = 7"}],
+                "output": {"format": "pbf"},
+            }
+        )
+        with pytest.raises(ShapeError, match="not a long frame on a vector grid"):
+            validate_shapes(pipeline)
+
 
 class TestCompileOps:
     def test_compiles_one_op_per_step_in_order(self):
@@ -465,6 +648,80 @@ class TestCompileOps:
 
         for step_no in range(1, 50):
             assert not _NAME_RE.match(str(step_no))
+
+
+class TestOutputFrameType:
+    """`final_frame_name` / `output_frame_type` -- the "which frame does this pipeline
+    WRITE" rule, extracted so `validate_shapes`, the vector-tile renderer and the output
+    descriptor share one copy of it instead of three."""
+
+    def test_no_steps_names_the_lone_input(self):
+        pipeline = parse_pipeline({"inputs": {"only": vector_input()}, "output": {"format": "csv"}})
+        assert final_frame_name(pipeline, compile_ops(pipeline)) == "only"
+        assert output_frame_type(pipeline).grid == VECTOR_GRID
+        assert output_frame_type(pipeline).shape is Shape.long
+
+    def test_with_steps_names_the_last_ops_output(self):
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [
+                    {"op": "filter", "input": "a", "where": "value > 1", "as": "kept"},
+                    {"op": "project", "to": RASTER_GRID, "as": "painted"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        assert final_frame_name(pipeline, compile_ops(pipeline)) == "painted"
+
+    def test_grid_is_the_projects_target_not_the_inputs_own(self):
+        """The point of reading the grid off the FINAL frame rather than off the inputs:
+        a pipeline that projects outputs on the grid it projected TO."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": vector_input()},
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID}],
+                "output": {"format": "tif"},
+            }
+        )
+        final = output_frame_type(pipeline)
+        assert final.grid == RASTER_GRID
+        assert final.shape is Shape.band_wide
+
+    def test_spatial_filter_lowers_the_shape_but_keeps_the_raster_grid(self):
+        """`FrameType.grid` means "currently addressed against", not "currently shaped
+        like" -- a `grid_cell` sample of a raster is long and still on the raster grid."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "grid_cell = '1,2'"}],
+                "output": {"format": "csv"},
+            }
+        )
+        final = output_frame_type(pipeline)
+        assert final.shape is Shape.long
+        assert final.grid == RASTER_GRID
+
+    def test_raises_the_same_per_op_shape_errors_validate_shapes_does(self):
+        """It runs the same walk, so a pipeline rejected for a per-op rule is rejected here
+        too -- callers do not get a `FrameType` for a pipeline that could never type."""
+        pipeline = parse_pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "project", "input": "a", "to": RASTER_GRID_2}],
+                "output": {"format": "tif"},
+            }
+        )
+        with pytest.raises(ShapeError):
+            output_frame_type(pipeline)
+
+    def test_does_not_run_the_sink_rules(self):
+        """The converse: a band-wide result under `format='csv'` is a SINK rejection, and
+        describing the output is not the same question as writing it."""
+        pipeline = parse_pipeline({"inputs": {"a": raster_input()}, "output": {"format": "csv"}})
+        assert output_frame_type(pipeline).shape is Shape.band_wide
+        with pytest.raises(ShapeError):
+            validate_shapes(pipeline)
 
 
 class TestCarriedColumnTyping:
@@ -762,3 +1019,10 @@ class TestLoweringTableCoverage:
     def test_other_two_directions_lower_to_long(self):
         assert PROJECT_LOWERING_TABLE[("vector", "vector")] == Shape.long
         assert PROJECT_LOWERING_TABLE[("raster", "vector")] == Shape.long
+
+    def test_unpivot_lowering_table_is_long_only(self):
+        # The one table that is deliberately NOT total over `Shape`: the missing band-wide
+        # row is how "an unpivot has no band-wide lowering" is stated, and both
+        # `_type_unpivot`'s rejection and `execute._LOWERINGS`'s registry read it from here
+        # (see `test_execute.TestLoweringTableAgreement`).
+        assert UNPIVOT_LOWERING_TABLE == {Shape.long: Shape.long}

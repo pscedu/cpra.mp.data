@@ -21,23 +21,29 @@ A small, fixed set of named, pre-built pipelines (`diff`, `lnd_chng`,
 `sal_veg_investigation`) is also available without hand-authoring pipeline JSON at
 all -- see [the named-analysis registry](analyses-api.md).
 
-Four endpoints accept a pipeline, sharing one request model:
+Three endpoints accept a pipeline, sharing one request model:
 
 ```
-POST /v1/analysis.<csv|ndjson|parquet|tif>
-GET  /v1/analysis.<csv|ndjson|parquet|tif>
-GET  /v1/analysis/{z}/{x}/{y}.<png|jpg>
-GET  /v1/analysis/{z}/{x}/{y}.pbf
+POST /v1/data.<csv|ndjson|parquet|tif>
+GET  /v1/data.<csv|ndjson|parquet|tif>
+GET  /v1/data/{z}/{x}/{y}.<png|jpg|pbf>
 ```
 
-`POST` takes the pipeline as a JSON body. `GET` (the flat form and both tile forms) takes
+`POST` takes the pipeline as a JSON body. `GET` (the flat form and the tile form) takes
 the identical pipeline flattened into a dotted query string, so a pipeline can be
-embedded in a map tile URL template. On the `.{format}` routes, `<format>` in the URL must
-agree with the pipeline's own `output.format` -- a mismatch (e.g. a `.csv` URL for a
-pipeline whose `output.format` is `"tif"`) is rejected with a 400 before anything is read.
-The `.pbf` vector-tile route is the exception: `pbf` is not a spellable `output.format`,
-so there is nothing to cross-check; that route instead requires the pipeline's final
-frame to be a table on a vector grid, and rejects anything else with a 400.
+embedded in a map tile URL template.
+
+**`<format>` in the URL wins.** Whatever the pipeline's own `output.format` says is
+overwritten by the extension it is fetched with, so one saved pipeline can be requested
+as `.png` tiles and offered as a `.csv` download without being rewritten in between. (This
+is a change: a mismatch used to be a 400.) What the format still decides is which sink
+rule the pipeline's final frame has to satisfy -- a `.csv` URL for a pipeline that ends
+band-wide on a raster grid is still a 400, now phrased as "final frame is band-wide, but
+`output.format='csv'` needs a tabular sink".
+
+`pbf` is one of the three tile formats, not a bare URL suffix: a pipeline can declare it,
+and its rule is that the final frame be a table on a **vector** grid. A raster-grid
+pipeline fails that whether or not it was point-sampled to rows first.
 
 ## Request Shape
 
@@ -71,6 +77,7 @@ step's output:
 | `calculate` | `input` (optional), `expression`, `as` | **Unconditionally** rewrite the running value: `expression` is applied to every row/band. It carries no `where` of its own -- it is exactly a `case` with only an `else`, and is lowered to one. A rewrite that should apply only *sometimes* is a `case` with an arm. |
 | `case` | `input` (optional), `cases` (a non-empty list of `{when, then}` arms), `else` (optional), `as` | Rewrite the running value by the **first matching** arm, SQL `CASE WHEN` style. Every `when` is read against the *incoming* value, so the arms are independent of one another and each row/pixel is written exactly once. Anything matching no arm takes `else`, which defaults to null -- i.e. masked, so **a pass-through is `else: "value"`**, written out rather than assumed. **Nodata is yours to state:** a null matches no `when` (every predicate reads null as false), so with no `else` it stays null, but `else 0` really does paint every nodata row/pixel `0`. Arms may test nullity directly (`x IS NULL`, `x IS NOT NULL`), and `coalesce` is available in a `then`/`else`. An arm's `when` may also be a **dimension** predicate, or mix dimension and value conjuncts (`scenario_id = 8 AND value > 0`); the dimension half picks which *bands* (or rows) the arm applies to, and an arm excluded from a band simply isn't in that band's chain, leaving the remaining arms and the `else` to write it. |
 | `group` | `input` (optional), `by` (dimensions to group by; `[]` collapses to one value per `grid_cell`), `aggregate` (`sum`/`min`/`max`/`count`/`mean` -- the decomposable aggregates only; `count_by_value` is never valid here), `of` (defaults to `"value"`; a numeric dimension such as `calendar_year` is also valid, for "first year a condition held"), `as` | Collapse rows/bands. |
+| `unpivot` | `input` (optional), `into` (the label column's name; defaults to `"variable"`), `as` | Fold a `join`'s operand-named value columns into one `value` column plus a label column naming which operand each row came from. **Long frames only.** This is the other way to satisfy the one-value-column sink rule: a `case`/`calculate`/`group` collapses several measurements into one number, an `unpivot` keeps all of them and stacks them as rows. |
 
 Every op may name its input explicitly; when it doesn't, it consumes whatever the
 immediately preceding step produced (`join` is the exception -- its `inputs` is required,
@@ -89,6 +96,10 @@ pipeline with an empty `steps` list, exactly one input, and an `output`.
 Input names and step `as` names must match `[a-z_][a-z0-9_]*`, must not collide with each
 other, and must not be `value`, `grid_cell`, `value_category`, a positional band name
 (`b0`, `b1`, ...), or any dimension the data structure already declares.
+
+An `unpivot`'s `into` gets every one of those rules except the last: a label column holds
+variable names, and its default (`"variable"`) is itself a dimension, so the
+dimension-collision check does not apply to it.
 
 The running measurement is spelled **`value`** in every `filter.where`,
 `calculate.expression`, and `case` arm, in every single-input chain. The one exception is a frame
@@ -113,7 +124,7 @@ result is collected.
 
 Compression is **not** part of the pipeline body -- it is a pair of query parameters,
 `compression_algorithm` (default `zstd`) and `compression_level` (default `6`), accepted
-on both `POST /v1/analysis.{format}` and `GET /v1/analysis.{format}`. For `tif` output the
+on both `POST /v1/data.{format}` and `GET /v1/data.{format}`. For `tif` output the
 algorithm must be one of `deflate`/`lzw`/`lzma`/`zstd`/`none`; for tabular output, one of
 `gzip`/`lz4`/`zstd`/`none`. There is no `output.compression` field -- an earlier version
 accepted one and then ignored it; it is now rejected like any other unknown output field.
@@ -147,6 +158,7 @@ The rules, in full:
 | `case` | shape unchanged (and always one value column out, so it collapses a pairing) |
 | `group` | shape unchanged |
 | `join` | shape unchanged; operands must agree on shape **and** grid |
+| `unpivot` | long -> long; **band-wide is rejected** -- a band-wide frame's columns are positional bands, not named measurements, so there is nothing to fold. A spatial `filter` is what turns a joined raster frame long, and the `unpivot` goes after it. |
 
 Two consequences of the spatial-filter row are worth calling out. A `grid_cell` filter
 over a raster frame is what turns it into a table, which is how a raster dataset reaches a
@@ -191,7 +203,12 @@ Each of these is a 400 naming the specific problem:
   predicate in a `when` is fine -- see the `case` row of the ops table.)
 - **More than one value column reaching the sink** -- every output writes exactly one
   measured quantity. A `join`'s paired frame must therefore be collapsed before the
-  output, by a `case`, a `calculate`, or a `group`.
+  output, by a `case`, a `calculate`, or a `group` -- or folded by an `unpivot`, which
+  keeps every measurement and stacks them as rows instead.
+- **An `unpivot` of a band-wide frame** (above), **of a frame carrying one value column**
+  (there is nothing to fold -- either the `join` is missing or something already collapsed
+  it), or **whose `into` names one of the columns being folded** (the label column has to
+  be a name none of the operands already use).
 - **A long final frame under a raster output format** (`tif`/`png`/`jpg`), or **a
   band-wide final frame under a tabular one** (`csv`/`ndjson`/`parquet`). Add a `project`,
   or (from band-wide) a spatial `filter`.
@@ -247,7 +264,7 @@ always carries an `aggregate_type` dimension at every time granularity -- pin it
 explicitly rather than leaving it to match every stored value.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
@@ -279,7 +296,7 @@ restriction is an ordinary `filter` on `grid_cell`, which may be folded into the
 filter or kept separate as here.
 
 ```json
-POST /v1/analysis.ndjson
+POST /v1/data.ndjson
 {
   "inputs": {
     "damage": {"variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001"}
@@ -300,7 +317,7 @@ value `filter` drops non-matching rows, and `group`'s `count` aggregate counts w
 left.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "damage": {"variable": "damage", "time_unit": "decadal", "grid": "clara_grid_cell_v001"}
@@ -319,7 +336,7 @@ POST /v1/analysis.csv
 One `filter` mixing dimension and value conditions, then a `group`:
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}
@@ -335,7 +352,7 @@ POST /v1/analysis.csv
 A plain selection with no transformation at all is a pipeline with no steps:
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
@@ -354,7 +371,7 @@ written exactly once and there is no ordering to get wrong. No `else`, because t
 `filter` already pinned `model_group_id` to exactly these two and nothing reaches it:
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "sal": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
@@ -383,7 +400,7 @@ For a plain raster selection with no transformation, use the [Data API](data-api
 directly -- no pipeline is needed:
 
 ```
-GET /v1/datasets/elev/annual/morph_pixel_v001/data/{z}/{x}/{y}.png?model_group_id=500&scenario_id=7&calendar_year=2045&color_map=elevation
+GET /v1/data/{z}/{x}/{y}.png?variable=elev&time_unit=annual&grid=morph_pixel_v001&model_group_id=500&scenario_id=7&calendar_year=2045&color_map=elevation
 ```
 
 #### Map Query Comparing Two Years
@@ -410,7 +427,7 @@ from.
 }
 ```
 
-As a `GET` request to `/v1/analysis/{z}/{x}/{y}.png`, this pipeline is flattened into the
+As a `GET` request to `/v1/data/{z}/{x}/{y}.png`, this pipeline is flattened into the
 same dotted query encoding shown in the sal_veg_investigation example below
 (`input.elev.variable=elev&...&step.1.op=filter&...&output.format=png&output.color_map=elevation_difference`);
 there is no `POST` form for the tile route.
@@ -445,7 +462,7 @@ through.
 ```
 
 The same pipeline works on `.tif` output too (drop the tile route, `POST` this to
-`/v1/analysis.tif` with `output.format` set to `"tif"`).
+`/v1/data.tif` with `output.format` set to `"tif"`).
 
 #### Single Year Summarized by Hydro Compartment
 
@@ -454,7 +471,7 @@ Elevation for a single year summarized by hydro compartment as a Parquet file --
 which is what makes a tabular output legal here:
 
 ```json
-POST /v1/analysis.parquet
+POST /v1/data.parquet
 {
   "inputs": {
     "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
@@ -475,7 +492,7 @@ threshold in a single year: a value `filter` masks the non-matching pixels, then
 precede the project -- after it, `value` is the already-counted zone total.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
@@ -497,7 +514,7 @@ one row per (zone, value) pair, with the category in a `value_category` column -
 later `group` may itself group by.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "lnd_type": {"variable": "lnd_type", "time_unit": "annual", "grid": "morph_pixel_v001"}
@@ -516,7 +533,7 @@ A spatial `filter` is the other way out of band-wide shape: it turns the raster 
 a table of just the named cells, with no zonal aggregation at all.
 
 ```json
-POST /v1/analysis.csv
+POST /v1/data.csv
 {
   "inputs": {
     "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
@@ -536,7 +553,7 @@ raster surface on the vegetation grid. No `aggregate` is given (nor allowed) -- 
 target pixel draws from exactly one source zone.
 
 ```json
-POST /v1/analysis.tif
+POST /v1/data.tif
 {
   "inputs": {
     "salinity": {"variable": "sal", "time_unit": "annual", "grid": "hydro_compartment_v001"}
@@ -571,7 +588,7 @@ value: `min of=calendar_year` asks only *whether* the band is present, and `of` 
 **As an explicit pipeline:**
 
 ```json
-POST /v1/analysis.tif
+POST /v1/data.tif
 {
   "inputs": {
     "coverage": {"variable": "ffibs_coverage_ratio", "time_unit": "annual", "grid": "veg_grid_cell_v001"},
@@ -596,27 +613,74 @@ the only one -- is spelled positionally instead of comma-joined, for the same re
 `step.3.cases.1.when=value%20%3E%201.0&step.3.cases.1.then=0&step.3.cases.2.when=...`.
 
 ```
-GET /v1/analysis.tif?input.coverage.variable=ffibs_coverage_ratio&input.coverage.time_unit=annual&input.coverage.grid=veg_grid_cell_v001&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&step.1.op=filter&step.1.input=coverage&step.1.where=ffibs_type%20%3D%20%27pl_fm%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.1.as=marsh&step.2.op=filter&step.2.input=salinity&step.2.where=aggregate_type%20%3D%20%272_wk_max%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.2.as=selected_salinity&step.3.op=project&step.3.input=selected_salinity&step.3.to=veg_grid_cell_v001&step.3.as=sal&step.4.op=join&step.4.type=spatial&step.4.inputs=marsh,sal&step.4.as=paired&step.5.op=case&step.5.cases.1.when=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.5.cases.1.then=marsh&step.6.op=group&step.6.by=&step.6.aggregate=min&step.6.of=calendar_year&output.format=tif
+GET /v1/data.tif?input.coverage.variable=ffibs_coverage_ratio&input.coverage.time_unit=annual&input.coverage.grid=veg_grid_cell_v001&input.salinity.variable=sal&input.salinity.time_unit=annual&input.salinity.grid=hydro_compartment_v001&step.1.op=filter&step.1.input=coverage&step.1.where=ffibs_type%20%3D%20%27pl_fm%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.1.as=marsh&step.2.op=filter&step.2.input=salinity&step.2.where=aggregate_type%20%3D%20%272_wk_max%27%20AND%20model_group_id%20%3D%20500%20AND%20scenario_id%20%3D%207&step.2.as=selected_salinity&step.3.op=project&step.3.input=selected_salinity&step.3.to=veg_grid_cell_v001&step.3.as=sal&step.4.op=join&step.4.type=spatial&step.4.inputs=marsh,sal&step.4.as=paired&step.5.op=case&step.5.cases.1.when=marsh%20%3E%200.5%20AND%20sal%20%3E%205.5&step.5.cases.1.then=marsh&step.6.op=group&step.6.by=&step.6.aggregate=min&step.6.of=calendar_year&output.format=tif
 ```
 
 And as map tiles, replacing `output.format=tif` with `output.format=png`:
 
 ```
-GET /v1/analysis/{z}/{x}/{y}.png?...same query as above, with output.format=png
+GET /v1/data/{z}/{x}/{y}.png?...same query as above, with output.format=png
 ```
 
 **As the `sal_veg_investigation` named analysis** -- the same request, with the
 `Pipeline` above built by the registry rather than hand-authored:
 
 ```
-GET /v1/analyses/sal_veg_investigation/data.tif?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
+GET /v1/data.tif?analysis=sal_veg_investigation&model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5
 ```
 
-`sal_veg_investigation` is a `type="custom"` analysis (its two inputs are fixed by its own
-`pipeline()` method, not supplied by a dataset in the URL -- see
-[the registry doc](analyses-api.md#sal_veg_investigation)), so this route has no
-`/v1/datasets/{variable}/{time_unit}/{grid}/` prefix. Fetching
-`GET /v1/analyses/sal_veg_investigation/pipeline.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
+`sal_veg_investigation` fixes its own inputs -- its two datasets come from its own
+`pipeline()` method rather than from the request -- so this URL carries no
+`variable`/`time_unit`/`grid` triple, and sending one is a 400 (see
+[the registry doc](analyses-api.md#sal_veg_investigation)). Fetching
+`GET /v1/analyses/sal_veg_investigation.json?model_group_id=500&scenario_id=7&marsh_threshold=0.5&salinity_threshold=5.5`
 returns exactly the explicit `Pipeline` JSON shown at the top of this section (with
 `model_group_id`/`scenario_id` substituted from the request) -- proving the named
 analysis is sugar over the same pipeline grammar, never a second engine.
+
+#### Five Variables at One Pixel, Stacked into a Single Column
+
+The pipeline a multi-series chart of one location wants: five annual variables on one
+raster grid, joined pixel-for-pixel, sampled at a single `grid_cell`, and folded so that
+every measurement arrives in one `value` column discriminated by `variable`.
+
+This is the one shape the collapsing ops cannot serve. A `case`, a `calculate` or a
+`group` satisfies the single-value-column sink rule by reducing five measurements to one
+number, which is exactly what a chart drawing five series must not do. `unpivot` satisfies
+the same rule the other way: it keeps all five and stacks them as rows.
+
+Note the order. The `join` leaves a **band-wide** frame (raster operands), and an
+`unpivot` rejects one -- its columns are positional bands, with no measurement names to
+fold. The `grid_cell` filter in between is what turns it long, and only then are there
+operand-named columns (`elev`, `inun`, ...) for the fold to stack. The `unpivot` also has
+to come after the filter for a second reason: folding first would turn every pixel of the
+grid into five rows, and only then throw all but one away.
+
+```json
+POST /v1/data.csv
+{
+  "inputs": {
+    "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"},
+    "inun": {"variable": "inun", "time_unit": "annual", "grid": "morph_pixel_v001"},
+    "lnd_type": {"variable": "lnd_type", "time_unit": "annual", "grid": "morph_pixel_v001"},
+    "mnrl_accr": {"variable": "mnrl_accr", "time_unit": "annual", "grid": "morph_pixel_v001"},
+    "org_accr": {"variable": "org_accr", "time_unit": "annual", "grid": "morph_pixel_v001"}
+  },
+  "steps": [
+    {"op": "join", "type": "spatial", "inputs": ["elev", "inun", "lnd_type", "mnrl_accr", "org_accr"], "as": "paired"},
+    {"op": "filter", "input": "paired", "where": "grid_cell = 211200", "as": "point"},
+    {"op": "unpivot", "input": "point", "as": "stacked"}
+  ],
+  "output": {"format": "csv", "sort": "variable,calendar_year"}
+}
+```
+
+The result is one row per (`grid_cell`, `calendar_year`, `variable`) -- five times the
+rows the join produced, with the operand names in a `variable` column and every
+measurement in `value`. Pass `into` to call that column something else.
+
+`GET /v1/catalog.json` describes this output by its **folded** names: `value_columns` is
+`["elev", "inun", "lnd_type", "mnrl_accr", "org_accr"]`, `variables` is parallel to it as
+always, and `folded_into` is `"variable"` -- which is what tells a client that those names
+are values of that column rather than columns of the result. For every pipeline without an
+`unpivot`, `folded_into` is null.

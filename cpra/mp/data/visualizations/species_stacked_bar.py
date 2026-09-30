@@ -144,7 +144,7 @@ class SpeciesStackedBar(StackedBar):
         by, so with no filter at all the response would carry no `veg_species_code` at all.
         """
 
-        params = {name: value for name, value in self.params.items() if name != SPECIES_DIMENSION}
+        params = {name: value for name, value in self.source_params.items() if name != SPECIES_DIMENSION}
         params["select"] = ",".join([self.time_column, SPECIES_DIMENSION, "grid_cell", "value"])
         return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **params)
 

@@ -105,6 +105,17 @@ read_window is not None`) is never narrowed this way at all -- the tile's own wi
 already governs what gets read, and combining the two is a case no caller in this
 codebase produces today.
 
+The origins of a band-wide `join` are narrowed the same way and for the same reason, but
+as a GROUP: their read is one shared scan (see the next paragraph but one), and one scan
+takes one window, so `_shared_point_sample_window` reduces the per-origin answers to a
+single window for `_open_band_wide_join_group` -- or to `None`, leaving the group's full
+read alone, if they do not all agree. This is the path that matters most in practice, since
+it is the one an analysis reading several surfaces at one pixel takes: `analyses/
+sediment_dynamics.py` joins five rasters and then names a pixel, and without it each of the
+five would be read whole and sampled afterwards. `compile_plan` is what makes it reachable
+-- a joined origin records no `point_sample_step` from its own `_Validity`, which a join
+retires, so the gate there records one for the whole group off the filter that samples it.
+
 **The raster-to-vector crosswalk is attached HERE, at open time, not inside
 `project.project_raster_to_vector`.** `ResolvedInput.straddling_vector_grid` names the
 destination vector grid a raster origin's pixels get redistributed onto, if any (see
@@ -254,7 +265,11 @@ def _run_group(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
 
 
 def _run_join(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
-    return long_ops.join_long([frames[name] for name in op.inputs], op)
+    return long_ops.join_long([frames[name] for name in op.inputs], op.inputs)
+
+
+def _run_unpivot(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
+    return long_ops.unpivot_long(frames[op.input], op, sorted(frame_types[op.input].value_columns))
 
 
 def _run_project(frames: dict[str, LongFrame], op, frame_types) -> LongFrame:
@@ -410,6 +425,10 @@ _LOWERINGS: dict[tuple[str, object], object] = {
     ("group", Shape.band_wide): _run_group_band_wide,
     ("join", Shape.long): _run_join,
     ("join", Shape.band_wide): _run_join_band_wide,
+    # No `("unpivot", Shape.band_wide)` entry, and that absence is checked rather than
+    # merely intended: `UNPIVOT_LOWERING_TABLE` has no band-wide row either, and
+    # `TestLoweringTableAgreement` asserts this registry partitions that table exactly.
+    ("unpivot", Shape.long): _run_unpivot,
     ("project", ("vector", "vector")): _run_project,
     ("project", ("raster", "vector")): _run_project_raster_to_vector,
     ("project", ("vector", "raster")): project.project_vector_to_raster,
@@ -675,10 +694,18 @@ def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozense
     extent -- see `_derive_point_sample_window` for how, and `execute`'s own docstring for
     how the result gets used.
 
+    Two readers consume this. An ordinary raster origin gets its own window straight from
+    here, via `_open_band_wide_input`'s `point_sample_window=`. An origin belonging to a
+    band-wide join's shared scan cannot -- that scan reads one window for the whole group --
+    so `_shared_point_sample_window` collapses the group's entries into the single window
+    `_open_band_wide_join_group` reads over, or into `None` if they do not all agree. Either
+    way the window comes from here, so the two paths cannot size a point sample differently.
+
     `skip` names the origins `_point_sample_reads` already claimed for the point reader.
     Those never reach `_open_band_wide_input` at all, so a window sized for one here would
     be dead -- and, worse, misleading, since a reader that opens no window would appear to
-    have been handed one.
+    have been handed one. A joined origin is never in `skip` (`_point_sample_reads` rejects
+    one outright), so the group path always sees every window this produces for it.
 
     Deliberately skips an origin under either of two conditions, in both cases leaving
     that origin to the full-window read this walk has always done: `resolved.read_window
@@ -882,6 +909,39 @@ def _shared_tile_decimation(origins: tuple[str, ...], inputs: dict[str, Resolved
     return (min(row for row, _col in factors), min(col for _row, col in factors))
 
 
+def _shared_point_sample_window(origins: tuple[str, ...], windows: dict[str, Window]):
+    """The ONE narrower window a band-wide join group's shared scan may be read over --
+    `None` (no narrowing; read whatever `_shared_tile_window` decided) unless every origin
+    in the group has a point-sample window and all of them are the SAME window.
+
+    `windows` is `_point_sample_overrides`' result. A join group's origins arrive here with
+    a window each rather than one between them because that function works per origin, and
+    the group needs a single answer: one scan reads one window, and the operands stay
+    positionally aligned precisely BECAUSE they share it (`_shared_tile_window` says the
+    same thing about the tile case).
+
+    In practice the windows agree whenever they exist at all -- `compile_plan` records the
+    group's `point_sample_step`s together, from one filter, and `request.ops.
+    validate_shapes` already requires a band-wide join's operands to share a grid, so
+    `_derive_point_sample_window` is running the same `where` against the same grid for each
+    of them. The equality check is therefore not expected to reject anything; it is here
+    because a union would be the WRONG fallback if it ever did. A tile window may be unioned
+    -- a wider window is more pixels, never different ones -- but a point sample's window is
+    the answer, not a bound on it, and two origins disagreeing about which pixel was asked
+    for is a disagreement to fall back from, not to average.
+
+    `None` for any origin at all is likewise a refusal rather than a partial narrowing:
+    `_point_sample_overrides` skips an origin that is tile-scoped, disjoint, or zero-band,
+    and a group is read as one, so an origin it skipped is an origin whose sibling must not
+    be narrowed either.
+    """
+    group = [windows.get(name) for name in origins]
+    if not group or any(window is None for window in group):
+        return None
+    extents = {(int(w.col_off), int(w.row_off), int(w.width), int(w.height)) for w in group}
+    return group[0] if len(extents) == 1 else None
+
+
 def _empty_zone_sources(
     zone_crosswalks: tuple[ZoneCrosswalk, ...], window: ReadWindow
 ) -> dict[int, project.ZoneSource]:
@@ -909,6 +969,8 @@ def _open_band_wide_join_group(
     origins: tuple[str, ...],
     inputs: dict[str, ResolvedInput],
     zone_crosswalks: tuple[ZoneCrosswalk, ...] = (),
+    *,
+    point_sample_window: Window | None = None,
 ) -> tuple[dict[str, tuple[BandWideFrame, tuple[str, ...]]], dict[int, project.ZoneSource]]:
     """One shared `scan_raster` call over the UNION of `origins`' band metadata, sliced
     back into one `(BandWideFrame, extra_columns)` pair per origin -- what
@@ -957,6 +1019,15 @@ def _open_band_wide_join_group(
     origin feeding a raster-to-vector `project` gets the straddling-feature widening -- at
     ONE resolution covering every origin's own (`_shared_tile_decimation`).
 
+    `point_sample_window` (`_shared_point_sample_window`'s answer for this group) takes the
+    place of both, exactly as it does for a single origin in `_open_band_wide_input`: the
+    window becomes the pixel's and the resolution becomes `(1, 1)`, since the pixel under a
+    coordinate is the whole answer and a decimated grid can hand back a neighbour's value
+    instead. It is only ever non-`None` for a group that is NOT tile-scoped (a tile-scoped
+    origin is skipped by `_point_sample_overrides` upstream), so the two never actually
+    compete -- the override is written as one anyway rather than as a branch, so that if
+    they ever do, the narrower, exact answer is the one that wins.
+
     A PARTIAL zero-band mismatch within an otherwise-nonzero group (one operand resolves
     to zero bands, another does not) raises `ValueError` naming the mismatched origins,
     rather than letting it through to become a silent row-count mismatch downstream: the
@@ -976,6 +1047,8 @@ def _open_band_wide_join_group(
         )
 
     decimation = _shared_tile_decimation(origins, inputs) if read_window is not None else (1, 1)
+    if point_sample_window is not None:
+        read_window, decimation = point_sample_window, (1, 1)
 
     band_metadata = [inputs[name].band_metadata for name in origins]
     heights = [df.height for df in band_metadata]
@@ -1105,7 +1178,10 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     see that function and `_derive_point_sample_window` for how, and the module docstring's
     "a point sample reads a narrower window" paragraph for why. Every origin it names gets
     opened over that narrower window (`_open_band_wide_input`'s own `point_sample_window`
-    override) instead of the full-extent read `resolved.read_window` alone would give.
+    override) instead of the full-extent read `resolved.read_window` alone would give. An
+    origin belonging to a band-wide join group is narrowed too, but through the prelude
+    below rather than that loop: the group is one scan, so `_shared_point_sample_window`
+    reduces its origins' windows to the single one `_open_band_wide_join_group` reads.
     `plan.ops` itself is walked unchanged below -- narrowing the window never requires
     rewriting any op, since `band_ops.sample_grid_cells_band_wide` emits `grid_cell` as an
     ABSOLUTE id regardless of how much of the grid its read actually covered, so the same
@@ -1143,7 +1219,10 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
             continue
         opened_groups.add((origins, group_crosswalks))
         opened, group_zone_sources = _open_band_wide_join_group(
-            origins, plan.inputs, group_crosswalks
+            origins,
+            plan.inputs,
+            group_crosswalks,
+            point_sample_window=_shared_point_sample_window(origins, point_sample_windows),
         )
         for name, (frame, extra) in opened.items():
             band_wide_join_frames[name] = frame

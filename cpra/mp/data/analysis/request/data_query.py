@@ -53,9 +53,14 @@ from cpra.mp.data.analysis.request.types import dimension_type
 
 # The one input a flat data query ever names -- there is nothing else in scope to
 # disambiguate it from, so a fixed name (rather than one derived from the request) is
-# simplest and is never seen by a caller: `respond_to_analysis*` addresses steps/output by
-# position, not by this name.
-_INPUT_NAME = "data"
+# simplest.
+#
+# PUBLIC, because a caller does see it. `pipeline_to_query` renders this pipeline's input
+# as `input.data.variable=`/`.time_unit=`/`.grid=`, which is what a saved link and a
+# `pipeline.json` response carry, and `request.unified`'s decoder binds the flat
+# `variable=`/`time_unit=`/`grid=` sugar to this same name so the two spellings resolve to
+# one pipeline. Changing it is a breaking change to saved links, not an internal rename.
+DEFAULT_INPUT_NAME = "data"
 
 
 def _quote_value(value, python_type: type) -> str:
@@ -174,7 +179,7 @@ def build_data_query_pipeline(
     `Pipeline` `parse_pipeline`/`pipeline_from_query` return.
     """
     inputs = {
-        _INPUT_NAME: InputSelection(
+        DEFAULT_INPUT_NAME: InputSelection(
             variable=dataset_dimensions.variable,
             time_unit=dataset_dimensions.time_unit,
             grid=dataset_dimensions.grid,
@@ -193,7 +198,7 @@ def build_data_query_pipeline(
 
     steps = []
     if conjuncts:
-        steps.append(FilterStep(input=_INPUT_NAME, where=" AND ".join(conjuncts)))
+        steps.append(FilterStep(input=DEFAULT_INPUT_NAME, where=" AND ".join(conjuncts)))
 
     output = Output(
         format=format,

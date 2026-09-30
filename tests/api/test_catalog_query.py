@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
+from cpra.mp.data.analysis.request.pipeline import InputSelection
 from cpra.mp.data.catalog import CatalogQuery
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
@@ -26,9 +26,16 @@ from cpra.mp.data.tabular import write_parquet
 
 
 def query(catalog_path, dimensions, **filters):
-    return CatalogQuery(
-        DatasetDimensions(**dimensions), FilterDimensions(**filters), catalog_path=catalog_path
-    ).execute()
+    """One input, no collapsed dimensions -- the shape every test below but
+    TestSeveralInputs has.
+
+    `dimensions` is the dataset triple, which is now a pipeline INPUT rather than a
+    `DatasetDimensions` model, and `filters` is a plain dict of already-typed values rather
+    than a `FilterDimensions` model: the query compares raw values against the catalog's own
+    typed columns, and casting a query string's strings into those types is
+    `api.catalog.catalog_filters`'s job, one layer up.
+    """
+    return CatalogQuery([InputSelection(**dimensions)], filters, catalog_path=catalog_path).execute()
 
 
 # vct/veg_grid_cell_v001 needs no extra required dimensions beyond the always-required
@@ -230,10 +237,15 @@ class TestCatalogChoices:
         result = query(raster_tree, raster_dimensions, scenario_id=[7, 8])
         assert result["results"]["scenario_id"] == [7, 8]
 
-    def test_dataset_dimensions_reflect_the_request(self, raster_tree, raster_dimensions):
+    def test_the_dataset_triple_is_not_reported_as_a_choice(self, raster_tree, raster_dimensions):
+        """`variable`/`time_unit`/`grid` used to come back in choices/results, echoing the
+        caller's own path segments. They don't any more: they name which data to read rather
+        than which slice of it, a request may read several datasets with no single triple to
+        report, and what the client actually needs -- what the RESULT is addressed against --
+        is the output descriptor `/v1/catalog.json` serves alongside this."""
         result = query(raster_tree, raster_dimensions)
-        assert result["results"]["variable"] == ["vct"]
-        assert result["results"]["grid"] == ["veg_grid_cell_v001"]
+        assert not {"variable", "time_unit", "grid"} & set(result["choices"])
+        assert not {"variable", "time_unit", "grid"} & set(result["results"])
 
 
 class TestChoiceIntersection:
@@ -442,3 +454,90 @@ class TestFloatNormalisation:
         result = query(aep_tree, DAMAGE_DIMENSIONS, aep=[99.0])
         assert result["results"]["aep"] == [0.1]
         assert result["exact"] is False
+
+
+class TestSeveralInputs:
+    """One query, several datasets, strict intersection.
+
+    An analysis JOINS its inputs, so a `model_group_id` only one of them was written for is
+    a choice that yields an empty result; offering it would be worse than not offering it.
+    Every dimension's choices are therefore narrowed to the values common to all the
+    datasets the resolved pipeline reads, and a dimension with nothing in common is a 404 at
+    the route rather than an empty list.
+
+    `vct` and `veg_area` are the fixture pair because both live on `veg_grid_cell` and
+    neither requires a dimension the other doesn't, so the only thing that differs between
+    the two trees below is what was written.
+    """
+
+    def _write(self, base_path, catalog_path, variable, scenarios):
+        for scenario in scenarios:
+            write_cog(
+                _raster_array(),
+                base_path=base_path,
+                catalog_path=catalog_path,
+                calendar_year=2030,
+                model_group_id=500,
+                scenario_id=scenario,
+                **{**RASTER_KWARGS, "variable": variable},
+            )
+
+    def _inputs(self, *variables):
+        return [
+            InputSelection(variable=variable, grid=RASTER_KWARGS["grid"], time_unit="annual")
+            for variable in variables
+        ]
+
+    @pytest.fixture
+    def overlapping(self, base_path, catalog_path):
+        self._write(base_path, catalog_path, "vct", (7, 8))
+        self._write(base_path, catalog_path, "veg_area", (8, 9))
+        return catalog_path
+
+    def test_choices_are_the_values_every_input_has(self, overlapping):
+        result = CatalogQuery(self._inputs("vct", "veg_area"), {}, catalog_path=overlapping).execute()
+        assert result["choices"]["scenario_id"] == [8]
+
+    def test_a_value_only_one_input_has_is_not_offered(self, overlapping):
+        """7 is a perfectly good `vct` scenario and would be offered for a `vct`-only
+        request; it is withheld here because `veg_area` has nothing to join it against."""
+        single = CatalogQuery(self._inputs("vct"), {}, catalog_path=overlapping).execute()
+        both = CatalogQuery(self._inputs("vct", "veg_area"), {}, catalog_path=overlapping).execute()
+        assert 7 in single["choices"]["scenario_id"]
+        assert 7 not in both["choices"]["scenario_id"]
+
+    def test_selecting_the_common_value_is_exact(self, overlapping):
+        result = CatalogQuery(
+            self._inputs("vct", "veg_area"), {"scenario_id": [8]}, catalog_path=overlapping
+        ).execute()
+        assert result["results"]["scenario_id"] == [8]
+
+    def test_the_same_dataset_twice_is_scanned_once(self, overlapping):
+        """Two inputs of one analysis may legitimately name the same dataset (a difference
+        of one variable between two model groups). Intersecting a set with itself is a
+        no-op, so the answer must be the single-input answer, not a narrowed one."""
+        once = CatalogQuery(self._inputs("vct"), {}, catalog_path=overlapping).execute()
+        twice = CatalogQuery(self._inputs("vct", "vct"), {}, catalog_path=overlapping).execute()
+        assert twice["choices"] == once["choices"]
+        assert twice["results"] == once["results"]
+
+    def test_inputs_with_nothing_in_common_are_an_error(self, base_path, catalog_path):
+        self._write(base_path, catalog_path, "vct", (7,))
+        self._write(base_path, catalog_path, "veg_area", (9,))
+        with pytest.raises(ValueError, match="No common values for dimension scenario_id"):
+            CatalogQuery(self._inputs("vct", "veg_area"), {}, catalog_path=catalog_path).execute()
+
+    def test_an_omitted_dimension_is_absent_rather_than_defaulted(self, overlapping):
+        """`omit` is the resolved analysis's `collapsed_dimensions`. A dimension the
+        pipeline has already collapsed is not a choice the caller has, so it is left out of
+        the scan entirely -- which is also what keeps `exact` honest, since defaulting a
+        dimension nobody can select must not report the request as inexact."""
+        result = CatalogQuery(
+            self._inputs("vct"),
+            {},
+            omit=("scenario_id", "model_group_id", "calendar_year", "model"),
+            catalog_path=overlapping,
+        ).execute()
+        assert "scenario_id" not in result["choices"]
+        assert "scenario_id" not in result["results"]
+        assert result["exact"] is True

@@ -33,6 +33,11 @@ class Map(DatasetVisualization):
     class Meta:
         name = "map"
         label = "Map Visualization"
+        # A VISUALIZATION's `Meta.type`, which is not the retired `AnalysisMeta.type`: it is
+        # still served by `/v1/visualizations.json` (`api.models.Visualization`). Route
+        # selection no longer reads it -- `get_visualization_class` lost its `type` argument,
+        # and the one visualization route tells a dataset visualization apart by
+        # `issubclass(..., DatasetVisualization)` -- but the catalog entry stays.
         type = "dataset"
         max_grid_cells = 10
 
@@ -44,19 +49,19 @@ class Map(DatasetVisualization):
         so the map style only needs a single global-state lookup per feature
         rather than a full color expression evaluation per feature per frame.
 
-        Reads the resolved analysis's `Pipeline` when `analysis=` is selected, and
-        otherwise lowers this map's own dataset/filters/options onto the same kind of
-        `Pipeline` the flat `/v1/datasets/...` data routes build
-        (`request.data_query.build_data_query_pipeline`), so a plain (unanalyzed) map
-        still honors `grid_cell`/`where`. Either way the result goes through EXACTLY the
+        Reads `self.decoded.pipeline` -- the SAME `Pipeline` `/v1/data.csv` would run for
+        this request, analysis or not, and the same one the tile URLs below re-request. There
+        is no fork here any more: the no-`analysis=` branch used to lower this map's own
+        dataset and filters onto a pipeline by hand (`_data_query_pipeline`, via
+        `request.data_query.build_data_query_pipeline`), which was a second place a filter
+        had to mean the same thing. The result then goes through EXACTLY the
         `validate_shapes` -> `compile_plan` -> `execute` path every HTTP response does --
-        this reads data, so it must not be a second, quieter engine with its own idea of
-        what a filter means.
+        this reads data, so it must not be a second, quieter engine.
 
         Synchronous throughout, unlike the routes: a visualization builds its spec from
         cached properties with no event loop to await on. `execute` itself is sync (it
-        returns a lazy frame), and `resolved_analysis`/`_data_query_pipeline` resolve
-        `grid_cell` through `api.data_query.resolve_grid_cell_sync`.
+        returns a lazy frame), and `decoded` resolves `grid_cell` through
+        `api.unified.decode_request_sync`.
 
         Bug this replaces: the storage format is long (one row per grid cell, after
         grouping/aggregation collapses every other dimension), not the wide,
@@ -74,8 +79,7 @@ class Map(DatasetVisualization):
         from cpra.mp.data.analysis.execution.plan import compile_plan
         from cpra.mp.data.analysis.request.ops import validate_shapes
 
-        resolved = self.resolved_analysis
-        pipeline = resolved.pipeline if resolved is not None else self._data_query_pipeline()
+        pipeline = self.decoded.pipeline
 
         # A vector grid's final frame is always long (a `project` INTO a raster grid is
         # the only way to reach band-wide, and nothing here builds one), so `execute`
@@ -102,37 +106,6 @@ class Map(DatasetVisualization):
         if legend is None:
             return {}
         return {str(fid): self._classify_step_color(val, legend) for fid, val in values.items()}
-
-    def _data_query_pipeline(self):
-        """This map's own dataset plus its `grid_cell`/`where`/dimension filters, lowered
-        onto a `Pipeline` -- the no-`analysis=` half of `feature_colors` above.
-
-        Built through `request.data_query.build_data_query_pipeline`, the same function
-        the flat `/v1/datasets/{variable}/{time_unit}/{grid}/data.{format}` route uses, so
-        a filter means here exactly what it means there. `format="csv"` only because
-        `Output.format` is required and the frame this ends up collecting is tabular;
-        nothing below reads it.
-        """
-        from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
-        from cpra.mp.data.api.data_query import resolve_grid_cell_sync
-        from cpra.mp.data.api.models import DataOptions, DatasetDimensions, FilterDimensions
-
-        def bind(model):
-            fields = set(model.model_fields)
-            return model(**{k: v for k, v in self.params.items() if k in fields and v is not None})
-
-        dataset_dimensions = DatasetDimensions(
-            variable=self.variable.name, grid=self.grid.name, time_unit=self.time_unit
-        )
-        options = bind(DataOptions)
-        grid_cell_where, _relabel = resolve_grid_cell_sync(self.grid.name, options.grid_cell)
-        return build_data_query_pipeline(
-            dataset_dimensions,
-            bind(FilterDimensions),
-            options,
-            "csv",
-            grid_cell_where=grid_cell_where,
-        )
 
     def _classify_step_color(self, value: float, legend: Legend) -> str:
         """Classify a value into a color bucket matching the step expression behavior."""
@@ -281,9 +254,14 @@ class Map(DatasetVisualization):
         color_map = f"continuous:{','.join(str(b) for b in breaks)}"
         return self.raster_source(color_map=color_map, **kwargs)
 
-    def _difference_breaks(self, variable: Variable, zero_color: str = "#ffffff") -> list:
-        """Return flat [value, color, ...] stops for difference visualization."""
-        limit = variable.difference_legend_limit or 1
+    def _difference_breaks(self, variable: Variable | None, zero_color: str = "#ffffff") -> list:
+        """Return flat [value, color, ...] stops for difference visualization.
+
+        `variable` is `None` for a result that carries no single presentation variable, which
+        has no declared limit of its own; the symmetric +/-1 default covers it, as it already
+        did for a variable that declares none.
+        """
+        limit = (variable.difference_legend_limit if variable is not None else None) or 1
         if limit > 0:
             return [-limit, "#d53e4f", 0, zero_color, limit, "#3288bd"]
         return [limit, "#3288bd", 0, zero_color, -limit, "#d53e4f"]
@@ -304,7 +282,7 @@ class Map(DatasetVisualization):
         if self.request:
             return {
                 "type": "vector",
-                "tiles": [self._get_vector_tile_url_template()],
+                "tiles": [self._tile_url_template("pbf")],
                 "minzoom": 0,
                 "maxzoom": 14,
             }
@@ -313,70 +291,31 @@ class Map(DatasetVisualization):
             "url": f"{STATIC_TILES_BASE_URL}/{grid_name}",
         }
 
-    def _get_vector_tile_url_template(self) -> str:
-        """Generate the tile URL template for the dynamic MVT endpoint.
+    def _tile_url_template(self, format: str) -> str:
+        """The `/v1/data/{z}/{x}/{y}.{format}` template this map's tiles are fetched from.
 
-        Routes to the named analysis's own vector-tile endpoint when `analysis=` is
-        selected. Builds the query string from a known field ALLOWLIST -- the target
-        route's own query model fields, plus (once an analysis is selected) whatever
-        extra parameters that analysis itself declares (`dimension`/`order`/...) -- rather
-        than a denylist of fields to strip: a denylist silently forwards any newly-added
-        `VisualizationQuery` field to a route that, once an analysis is selected, rejects
-        anything it doesn't recognize outright (its `Parameters` model is `extra=
-        "forbid"`; see `analyses/base.py`).
+        One builder for both tile kinds now, and one route under both: `format="pbf"` is the
+        vector source's MVT endpoint and `format="png"` the raster source's. The four routes
+        this replaced (plain/analysis x vector/raster) differed only in which segments of the
+        request they carried in the path, and the whole request is in the query string here.
+
+        No field ALLOWLIST either. It existed because a follow-up request's target route
+        bound a DIFFERENT query model than the visualization route did, so the extra fields
+        had to be named and dropped; the two routes now run the same partition, and the only
+        category that is this route's alone is the render options `forward_query` subtracts.
+        Compression goes with them: a tile response carries none, and
+        `partition_query(allow_compression=False)` rejects one outright rather than ignoring
+        it -- while `Compression`'s fields have non-`None` defaults and so are always bound.
         """
-        from cpra.mp.data.api.models import AnalysisQuery, TileQuery
-
-        resolved = self.resolved_analysis
-
-        if resolved is not None:
+        if self.request:
             base_url = str(
-                self.request.url_for(
-                    "get_dataset_analysis_vector_tile",
-                    variable=self.variable.name,
-                    grid=self.grid.name,
-                    time_unit=self.time_unit,
-                    analysis_name=self._analysis_name,
-                    z="{z}",
-                    x="{x}",
-                    y="{y}",
-                )
+                self.request.url_for("get_data_tile", z="{z}", x="{x}", y="{y}", format=format)
             )
-            allowed = set(AnalysisQuery.model_fields) | set(self._analysis_params)
         else:
-            base_url = str(
-                self.request.url_for(
-                    "get_vector_tile",
-                    variable=self.variable.name,
-                    grid=self.grid.name,
-                    time_unit=self.time_unit,
-                    z="{z}",
-                    x="{x}",
-                    y="{y}",
-                )
-            )
-            allowed = set(TileQuery.model_fields)
+            base_url = f"https://api.mpdp.coastal.la.gov/v1/data/{{z}}/{{x}}/{{y}}.{format}"
 
-        # `self.params` alone is missing a named analysis's own parameters
-        # (`dimension`/`order`/...) for a request-driven visualization: `VisualizationQuery`
-        # doesn't declare them (it can't -- each analysis declares its own), so FastAPI's
-        # query-model binding never puts them in `self.params` at all -- only
-        # `_analysis_params`'s own extra scan of the raw query string recovers them (see
-        # its docstring in `base.py`). Merging it in here is what actually lets those
-        # parameters reach the follow-up tile request; `_analysis_params` never overlaps
-        # `self.params`'s own `VisualizationQuery`-declared keys, so this can't clobber
-        # anything already there.
-        params_source = {**self.params, **self._analysis_params} if resolved is not None else self.params
+        query_params = [*self.dataset_params, *self.forward_query(compression=False)]
 
-        query_params = []
-        for key, value in params_source.items():
-            if value is None or key not in allowed:
-                continue
-            if isinstance(value, (list, tuple)):
-                for v in value:
-                    query_params.append((key, v))
-            else:
-                query_params.append((key, value))
         if query_params:
             return f"{base_url}?{urlencode(query_params)}"
         return base_url
@@ -890,93 +829,6 @@ class Map(DatasetVisualization):
             },
         ]
 
-    def _get_tile_url_template(self) -> str:
-        """Generate the tile URL template for raster data.
-
-        Routes to the named analysis's own tile endpoint when `analysis=` is selected,
-        forwarding only that route's own known fields plus the analysis's own declared
-        parameters (`dimension`/`order`/...) -- see `_get_vector_tile_url_template`'s
-        docstring for why forwarding the full `VisualizationQuery` field set would
-        otherwise trip the analysis route's strict (`extra="forbid"`) parameter
-        validation. Unchanged (the plain per-dataset tile endpoint) when no analysis was
-        selected.
-
-        Returns:
-            A tile URL template with {z}/{x}/{y} placeholders.
-        """
-        resolved = self.resolved_analysis
-        analysis_name = self._analysis_name
-
-        if self.request:
-            if resolved is not None:
-                base_url = str(
-                    self.request.url_for(
-                        "get_dataset_analysis_tile",
-                        variable=self.variable.name,
-                        grid=self.grid.name,
-                        time_unit=self.time_unit,
-                        analysis_name=analysis_name,
-                        z="{z}",
-                        x="{x}",
-                        y="{y}",
-                        format="png",
-                    )
-                )
-            else:
-                base_url = str(
-                    self.request.url_for(
-                        "get_model_tile",
-                        variable=self.variable.name,
-                        grid=self.grid.name,
-                        time_unit=self.time_unit,
-                        z="{z}",
-                        x="{x}",
-                        y="{y}",
-                        format="png",
-                    )
-                )
-        else:
-            base = (
-                f"https://api.mpdp.coastal.la.gov/v1/datasets"
-                f"/{self.variable.name}/{self.grid.name}/{self.time_unit}"
-            )
-            base_url = (
-                f"{base}/analyses/{analysis_name}/data/{{z}}/{{x}}/{{y}}.png"
-                if resolved is not None
-                else f"{base}/data/{{z}}/{{x}}/{{y}}.png"
-            )
-
-        if resolved is not None:
-            from cpra.mp.data.api.models import AnalysisQuery
-
-            allowed = set(AnalysisQuery.model_fields) | set(self._analysis_params)
-            # See `_get_vector_tile_url_template`'s identical merge for why
-            # `self._analysis_params` has to be folded in here: a named analysis's own
-            # parameters (`dimension`/`order`/...) never land in `self.params` itself for a
-            # request-driven visualization, since `VisualizationQuery` has no fixed field
-            # set for them.
-            params_source = {
-                k: v for k, v in {**self.params, **self._analysis_params}.items() if k in allowed
-            }
-        else:
-            # Build query string from filter dimensions and options
-            exclude = {"height", "width", "start_date", "end_date", "request"}
-            params_source = {k: v for k, v in self.params.items() if k not in exclude}
-
-        query_params = []
-        for key, value in params_source.items():
-            if value is None:
-                continue
-            if isinstance(value, (list, tuple)):
-                for v in value:
-                    query_params.append((key, v))
-            else:
-                query_params.append((key, value))
-
-        if query_params:
-            return f"{base_url}?{urlencode(query_params)}"
-        return base_url
-
     def chart(self) -> dict[str, Any]:
         """Build the map visualization.
 
@@ -1008,7 +860,7 @@ class Map(DatasetVisualization):
         )
 
         if self.grid.grid_type == "raster":
-            tile_url = self._get_tile_url_template()
+            tile_url = self._tile_url_template("png")
             style["sources"]["data"] = (
                 self.difference_raster_source(tile_urls=[tile_url])
                 if is_difference
@@ -1107,7 +959,8 @@ class Map(DatasetVisualization):
         Returns:
             A Legend instance for the current map.
         """
-        return LEGENDS.get(self._legend_name()) or self.variable.legend or LEGENDS.get("default")
+        variable_legend = self.variable.legend if self.variable is not None else None
+        return LEGENDS.get(self._legend_name()) or variable_legend or LEGENDS.get("default")
 
     def _get_legend_metadata(self, difference: bool = False) -> dict[str, Any]:
         """Generate legend metadata for the style response.
@@ -1118,13 +971,16 @@ class Map(DatasetVisualization):
         Returns:
             A dictionary with legend title, unit, type, and color steps.
         """
+        # `None` for a result carrying no single presentation variable (`lnd_type_plus`).
+        # Every `display.*` helper below is the identity for it, and `result_label` falls
+        # back to the analysis's own `Meta.label` for the title.
         var = self.variable
 
         if difference:
             # The client renders these as tick labels, so unlike `_difference_breaks` --
             # which colorizes storage-unit pixels server-side and stays in storage units --
             # the limit is converted for display here.
-            limit = to_display(var, var.difference_legend_limit or 1)
+            limit = to_display(var, (var.difference_legend_limit if var is not None else None) or 1)
             steps = sorted(
                 [
                     {"color": "#d53e4f", "value": -1 * limit},
@@ -1134,7 +990,7 @@ class Map(DatasetVisualization):
                 key=lambda s: s["value"],
             )
             return {
-                "title": f"{var.label} Difference",
+                "title": f"{self.result_label} Difference",
                 "subtitle": display_unit(var),
                 "type": "continuous",
                 "numberFormat": display_number_format(var),
@@ -1157,7 +1013,11 @@ class Map(DatasetVisualization):
             steps.append(step)
 
         resolved = self.resolved_analysis
-        title = resolved.meta.label if resolved is not None and resolved.meta.kind == "variable" else var.label
+        title = (
+            resolved.meta.label
+            if resolved is not None and resolved.meta.kind == "variable"
+            else self.result_label
+        )
         return {
             "title": title,
             "subtitle": display_unit(var),

@@ -18,10 +18,12 @@ from shapely.geometry import box
 
 from cpra.mp.data.visualizations.base import (
     DatasetVisualization,
+    analysis_chain,
     grid_cell_tokens,
     is_grid_cell_ids,
 )
 from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
+from cpra.mp.data.visualizations.sediment_dynamics import SedimentDynamics
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 from tests.factories import write_grid_geometry
 
@@ -281,3 +283,64 @@ class TestDataSourceParse:
         viz = DatasetVisualization(**ANNUAL_RASTER)
         source = viz.get_data_source(**ANNUAL_RASTER, grid_cell="-91.5,29.5")
         assert "grid_cell" not in source.to_dict()["format"]["parse"]
+
+
+class TestAnalysisChain:
+    """`analysis_chain(implied, chain)` — how a chart's own analysis composes with the
+    caller's.
+
+    The implied one always leads: it is what produces the shape every layer of the chart
+    reads, and an analysis appended before it would be operating on a frame the chart's
+    source does not have yet.
+    """
+
+    def test_no_caller_chain_is_just_the_implied_one(self):
+        assert analysis_chain("sediment_dynamics", None) == "sediment_dynamics"
+
+    def test_an_empty_caller_chain_is_too(self):
+        """`""` is what an `analysis=` the caller sent with no value arrives as, and an
+        empty name in a chain is a 400 two layers down."""
+        assert analysis_chain("sediment_dynamics", "") == "sediment_dynamics"
+
+    def test_a_callers_chain_is_kept_after_it(self):
+        assert analysis_chain("sediment_dynamics", "diff") == "sediment_dynamics,diff"
+
+    def test_the_implied_one_is_not_repeated(self):
+        """A caller who names it explicitly -- an old permalink, a notebook copying a URL
+        out of a spec -- gets one of it, not two. Chaining an analysis onto itself is a
+        different request, and not the one they asked for."""
+        assert analysis_chain("sediment_dynamics", "sediment_dynamics,diff") == (
+            "sediment_dynamics,diff"
+        )
+
+
+class TestRequestItems:
+    """`DatasetVisualization.request_items(items)` — the same rule applied to the raw query
+    pairs, which is what the spec route decodes.
+
+    Stated as a classmethod because the route decodes BEFORE it constructs: there is no
+    instance to ask yet when the analysis has to be known.
+    """
+
+    def test_a_chart_with_no_implied_analysis_passes_its_items_through(self):
+        items = [("variable", "ssf"), ("analysis", "diff")]
+        assert DatasetVisualization.request_items(items) == items
+
+    def test_the_implied_analysis_is_added(self):
+        assert SedimentDynamics.request_items([("variable", "elev")]) == [
+            ("variable", "elev"),
+            ("analysis", "sediment_dynamics"),
+        ]
+
+    def test_a_callers_analysis_is_chained_onto_it(self):
+        assert SedimentDynamics.request_items([("analysis", "diff")]) == [
+            ("analysis", "sediment_dynamics,diff")
+        ]
+
+    def test_repeated_analysis_parameters_are_one_chain(self):
+        """`analysis=a&analysis=b` and `analysis=a,b` are the same request -- the decoder
+        joins repeats the same way (`request.unified.partition_query`), and this runs before
+        it."""
+        assert SedimentDynamics.request_items(
+            [("analysis", "diff"), ("analysis", "lnd_chng")]
+        ) == [("analysis", "sediment_dynamics,diff,lnd_chng")]

@@ -1,5 +1,5 @@
 """Tests for `cpra.mp.data.analysis.execution.long_ops` -- the long-shape lowerings for
-`filter`/`case`/`group`/`join`. There is no `calculate` lowering: `request.ops.compile_ops`
+`filter`/`case`/`group`/`join`/`unpivot`. There is no `calculate` lowering: `request.ops.compile_ops`
 lowers a `calculate` to an arm-less `case`, so it is tested here as one.
 
 Every fixture here is a small in-memory `pl.LazyFrame` built directly, not read off disk:
@@ -17,9 +17,10 @@ from cpra.mp.data.analysis.execution.long_ops import (
     filter_long,
     group_long,
     join_long,
+    unpivot_long,
 )
 from cpra.mp.data.analysis.request.expressions import ExpressionError
-from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, JoinOp
+from cpra.mp.data.analysis.request.ops import CaseOp, GroupOp, UnpivotOp
 from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
@@ -473,8 +474,7 @@ class TestJoinLong:
 
     def test_joins_on_shared_dimensions_plus_grid_cell_and_renames_value_per_operand(self):
         a, b = self._pair()
-        op = JoinOp(step_no=1, type="attribute", inputs=["a", "b"], output="j")
-        df = join_long([a, b], op).collect().sort("calendar_year")
+        df = join_long([a, b], ["a", "b"]).collect().sort("calendar_year")
         assert df["a"].to_list() == [5.0, 6.0]
         assert df["b"].to_list() == [100.0, 200.0]
         assert "value" not in df.columns
@@ -499,8 +499,7 @@ class TestJoinLong:
                 "value": [100.0, 200.0],
             }
         )
-        op = JoinOp(step_no=1, type="attribute", inputs=["a", "b"], output="j")
-        df = join_long([a, b], op).collect().sort("calendar_year")
+        df = join_long([a, b], ["a", "b"]).collect().sort("calendar_year")
         assert df["region"].to_list() == ["gulf", "gulf"]
         assert df["a"].to_list() == [5.0, 6.0]
         assert df["b"].to_list() == [100.0, 200.0]
@@ -538,8 +537,7 @@ class TestJoinLong:
             {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"},
             {"variable": "omar", "time_unit": "annual", "grid": "ecoregion_v001"},
         )
-        op = JoinOp(step_no=1, type="spatial", inputs=["a", "b"], output="j")
-        df = join_long([a, b], op).collect().sort("calendar_year")
+        df = join_long([a, b], ["a", "b"]).collect().sort("calendar_year")
         assert df.height == 2
         assert df["a"].to_list() == [5.0, 6.0]
         assert df["b"].to_list() == [100.0, 200.0]
@@ -552,8 +550,7 @@ class TestJoinLong:
             {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"},
             {"variable": "omar", "time_unit": "annual", "grid": "ecoregion_v001"},
         )
-        op = JoinOp(step_no=1, type="spatial", inputs=["a", "b"], output="j")
-        df = join_long([a, b], op).collect()
+        df = join_long([a, b], ["a", "b"]).collect()
         assert set(df.columns) == {"calendar_year", "grid_cell", "a", "b"}
 
     def test_dataset_selection_columns_are_dropped_even_when_both_operands_agree(self):
@@ -563,8 +560,70 @@ class TestJoinLong:
         # columns do not depend on whether the operands happened to match there.
         selection = {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}
         a, b = self._dataset_selection_pair(selection, selection)
-        op = JoinOp(step_no=1, type="spatial", inputs=["a", "b"], output="j")
-        df = join_long([a, b], op).collect().sort("calendar_year")
+        df = join_long([a, b], ["a", "b"]).collect().sort("calendar_year")
         assert set(df.columns) == {"calendar_year", "grid_cell", "a", "b"}
         assert df["a"].to_list() == [5.0, 6.0]
         assert df["b"].to_list() == [100.0, 200.0]
+
+
+class TestUnpivotLong:
+    """`unpivot_long` -- the exact inverse of the rename `join_long` performs, and the only
+    way a multi-variable result reaches a sink that allows one value column.
+    """
+
+    def _joined(self):
+        """What `join_long` leaves behind for two operands: one row per (year, cell), with
+        each operand's measurement in a column named for the operand."""
+        return pl.LazyFrame(
+            {
+                "calendar_year": [2030, 2040],
+                "grid_cell": [1, 1],
+                "sal": [5.0, 6.0],
+                "stg": [100.0, 200.0],
+            }
+        )
+
+    def _op(self, into="variable"):
+        return UnpivotOp(step_no=1, input="j", into=into, output="u")
+
+    def test_stacks_the_value_columns_one_row_per_operand(self):
+        df = unpivot_long(self._joined(), self._op(), ["sal", "stg"]).collect()
+        assert df.height == 4
+        assert set(df.columns) == {"calendar_year", "grid_cell", "variable", "value"}
+        assert sorted(zip(df["variable"], df["calendar_year"], df["value"])) == [
+            ("sal", 2030, 5.0),
+            ("sal", 2040, 6.0),
+            ("stg", 2030, 100.0),
+            ("stg", 2040, 200.0),
+        ]
+
+    def test_index_columns_ride_through_once_per_folded_name(self):
+        # The fold repeats each row's index columns rather than changing them, which is
+        # what makes the result a LONGER frame of the same observations. Asserted on
+        # `grid_cell` in particular: every downstream consumer keys on it, and a fold that
+        # lost it would silently un-address the result.
+        df = unpivot_long(self._joined(), self._op(), ["sal", "stg"]).collect()
+        assert df["grid_cell"].to_list() == [1, 1, 1, 1]
+        assert sorted(df["calendar_year"].to_list()) == [2030, 2030, 2040, 2040]
+
+    def test_into_names_the_label_column(self):
+        df = unpivot_long(self._joined(), self._op(into="measurement"), ["sal", "stg"]).collect()
+        assert "measurement" in df.columns
+        assert set(df["measurement"].to_list()) == {"sal", "stg"}
+
+    def test_a_column_not_in_value_columns_is_an_index_column(self):
+        # The reason the function takes `value_columns` at all: a long frame's schema
+        # cannot tell a value column from a dimension by inspection, so only the typing
+        # walk knows which to fold. Here `stg` is withheld, and rides through as an index
+        # column instead of being stacked.
+        df = unpivot_long(self._joined(), self._op(), ["sal"]).collect()
+        assert df.height == 2
+        assert df["stg"].to_list() == [100.0, 200.0]
+        assert set(df["variable"].to_list()) == {"sal"}
+
+    def test_stacking_order_is_the_operand_names_sorted(self):
+        # `frozenset` iteration order is not stable across runs, and `output.sort` is not
+        # always given -- so the fold sorts rather than taking whatever order it was
+        # handed. Passed in reverse to prove the sort is the function's, not the caller's.
+        df = unpivot_long(self._joined(), self._op(), ["stg", "sal"]).collect()
+        assert df["variable"].to_list() == ["sal", "sal", "stg", "stg"]

@@ -60,7 +60,12 @@ ours to disclose.
   a server MISCONFIGURATION (an absent crosswalk or grid file) also answers 404 rather
   than 500 -- a deliberate conflation, kept because narrowing it means catching at each
   read site, of which the engine has
-  several (tabular sink, vector tile, raster scan).
+  several (tabular sink, vector tile, raster scan). The two TILE routes are the one
+  exception, and they opt out before this handler is reached rather than by being excluded
+  here: `api.pipeline.respond_to_analysis_tile`/`respond_to_analysis_vector_tile` catch
+  `FileNotFoundError` around their own thread call and answer the bodiless 204 a tile miss
+  already answers with. A JSON 404 is a fine answer on a data URL and a poor one on a tile
+  URL, and the route is what knows which it is.
 
 **`resolve_status`, and why it exists alongside the registered handlers rather than being
 replaced by them.** Both `install_analysis_boundary`'s handlers AND `resolve_status` below

@@ -13,7 +13,7 @@ import polars as pl
 import pytest
 import rasterio
 
-from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions
+from cpra.mp.data.analysis.request.pipeline import InputSelection
 from cpra.mp.data.catalog import (
     CatalogQuery,
     contiguous_runs,
@@ -259,8 +259,8 @@ class TestCatalogQueryPreloadedCatalog:
         """`catalog_path` points at a directory that doesn't even exist -- proof the
         preloaded frame short-circuits `_load_catalog`'s disk read rather than merely
         taking priority over it."""
-        dd = DatasetDimensions(variable="ssf", grid="ecoregion_v001", time_unit="annual")
-        query = CatalogQuery(dd, FilterDimensions(), catalog=self._catalog_frame(), catalog_path=tmp_path / "missing")
+        dd = InputSelection(variable="ssf", grid="ecoregion_v001", time_unit="annual")
+        query = CatalogQuery([dd], {}, catalog=self._catalog_frame(), catalog_path=tmp_path / "missing")
 
         result = query.execute()
 
@@ -271,9 +271,9 @@ class TestCatalogQueryPreloadedCatalog:
         """`percentile` is required for `ssf`, but if every row's value for it is null
         (e.g. a legacy/partial catalog row), CatalogQuery skips it rather than reporting
         an empty choice list or crashing."""
-        dd = DatasetDimensions(variable="ssf", grid="ecoregion_v001", time_unit="annual")
+        dd = InputSelection(variable="ssf", grid="ecoregion_v001", time_unit="annual")
         query = CatalogQuery(
-            dd, FilterDimensions(), catalog=self._catalog_frame(percentile=None), catalog_path=tmp_path / "missing"
+            [dd], {}, catalog=self._catalog_frame(percentile=None), catalog_path=tmp_path / "missing"
         )
 
         result = query.execute()
@@ -287,10 +287,15 @@ class TestCatalogQueryRepeatedExecute:
     """`CatalogQuery` keeps `_choices`/`_results` as instance state rather than resetting
     it in `execute()`, so calling `execute()` a second time on the same instance re-visits
     `_update` for every dimension name and merges into the choices already recorded from
-    the first call -- the only way `_update`'s "already seen this dimension" branch (and
-    the `ValueError` it can raise) is reachable, since a single `execute()` call visits
-    each dimension name exactly once (see tests/api/test_catalog_query.py's
-    TestChoiceIntersection docstring, which notes that branch is otherwise dead)."""
+    the first call.
+
+    This used to be the ONLY way `_update`'s "already seen this dimension" branch was
+    reachable, a single `execute()` visiting each dimension name exactly once. It isn't any
+    more: a query now scans one dataset per pipeline input and that branch is what
+    intersects them (see tests/api/test_catalog_query.py's TestSeveralInputs). What these
+    two keep covering is the re-entrancy itself -- that the state survives `execute()` and
+    that a catalog changed underneath a live instance is reported rather than silently
+    replacing what was already resolved."""
 
     def _write(self, base_path, catalog_path, scenario_id):
         df = pl.DataFrame(
@@ -313,8 +318,8 @@ class TestCatalogQueryRepeatedExecute:
 
     def test_second_call_merges_into_the_first_when_values_overlap(self, base_path, catalog_path):
         self._write(base_path, catalog_path, scenario_id=7)
-        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
-        query = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path)
+        dd = InputSelection(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+        query = CatalogQuery([dd], {}, catalog_path=catalog_path)
 
         first = query.execute()
         second = query.execute()
@@ -324,8 +329,8 @@ class TestCatalogQueryRepeatedExecute:
 
     def test_second_call_raises_when_the_catalog_changed_with_no_overlap(self, base_path, catalog_path):
         self._write(base_path, catalog_path, scenario_id=7)
-        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
-        query = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path)
+        dd = InputSelection(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+        query = CatalogQuery([dd], {}, catalog_path=catalog_path)
         query.execute()
 
         # Rewrite the on-disk catalog so scenario_id no longer overlaps what the first
@@ -374,9 +379,9 @@ class TestCatalogQueryHeterogeneousPartitionFiles:
         self._write(base_path, catalog_path, scenario_id=7)
         self._write(base_path, catalog_path, scenario_id=8)
         self._widen_one_file(catalog_path, scenario_id=8)
-        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+        dd = InputSelection(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
 
-        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+        result = CatalogQuery([dd], {}, catalog_path=catalog_path).execute()
 
         assert result["choices"]["scenario_id"] == [7, 8]
 
@@ -386,24 +391,26 @@ class TestCatalogQueryHeterogeneousPartitionFiles:
         self._write(base_path, catalog_path, scenario_id=7)
         self._write(base_path, catalog_path, scenario_id=8)
         self._widen_one_file(catalog_path, scenario_id=8)
-        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+        dd = InputSelection(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
 
-        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+        result = CatalogQuery([dd], {}, catalog_path=catalog_path).execute()
 
         assert "aep" not in result["choices"]
         assert "aep" not in result["results"]
 
-    def test_the_partition_dimensions_come_from_the_path(self, base_path, catalog_path):
+    def test_the_partition_dimensions_are_pinned_by_the_glob_not_read_back(self, base_path, catalog_path):
         """The Hive-partitioned write strips variable/time_unit/grid out of the files
-        themselves, so reading a file alone yields neither -- `_load_catalog` has to put
-        them back from the directory names."""
+        themselves, so reading a file alone yields none of them. `_load_catalog` used to put
+        them back from the directory names to report them as choices; it no longer does,
+        because the glob has already pinned each to the one value the input names and the
+        triple is not a choice the caller has (see `CatalogQuery`'s docstring). A query over
+        a partition whose files lack the columns entirely must still work."""
         self._write(base_path, catalog_path, scenario_id=7)
         on_disk = pl.read_parquet(next(catalog_path.joinpath(*self.PARTITION).glob("*.parquet")))
         assert not {"variable", "time_unit", "grid"} & set(on_disk.columns)
-        dd = DatasetDimensions(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
+        dd = InputSelection(variable="sal", grid="hydro_compartment_v001", time_unit="annual")
 
-        result = CatalogQuery(dd, FilterDimensions(), catalog_path=catalog_path).execute()
+        result = CatalogQuery([dd], {}, catalog_path=catalog_path).execute()
 
-        assert result["choices"]["variable"] == ["sal"]
-        assert result["choices"]["time_unit"] == ["annual"]
-        assert result["choices"]["grid"] == ["hydro_compartment_v001"]
+        assert result["choices"]["scenario_id"] == [7]
+        assert not {"variable", "time_unit", "grid"} & set(result["choices"])
