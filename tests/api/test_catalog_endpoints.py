@@ -171,6 +171,18 @@ class TestVisualizations:
         assert by_name["map"] is False
         assert {name for name, axis in by_name.items() if axis} == set(by_name) - {"map"}
 
+    def test_only_sediment_dynamics_declares_an_implied_analysis(self, client):
+        """The other half of what a client needs to not offer a broken combination. A chart
+        declaring an analysis puts it at the head of the chain, so a caller's own
+        `kind="variable"` analysis would land in a non-leading stage and
+        `resolve_analysis_chain` 400s. The portal reads this to drop the chart from the
+        picker instead; asserting the null for every other entry is what keeps that
+        predicate from silently matching nothing.
+        """
+        by_name = {v["name"]: v["analysis"] for v in client.get("/v1/visualizations.json").json()}
+        assert by_name["sediment-dynamics"] == "sediment_dynamics"
+        assert {name for name, analysis in by_name.items() if analysis is not None} == {"sediment-dynamics"}
+
 
 class _FakeCatalogAnalysis:
     # A real `AnalysisMeta`, not a stand-in class: the route serves `Meta.model_dump()`,

@@ -124,6 +124,18 @@ class Visualization(BaseModel):
     # `DatasetVisualization.validate_time_axis` enforces it server-side; this field is what
     # lets a client not offer the combination in the first place.
     time_axis: bool = True
+    # The named analysis this visualization IS the presentation of, put at the head of the
+    # chain by `BaseVisualization.request_items` -- `sediment_dynamics` for the one chart
+    # that declares it (`visualizations/sediment_dynamics.py`), null for every other.
+    #
+    # Published for the same reason as `time_axis` above: so a client can decline to offer
+    # a combination the server would reject. A caller who names their own analysis gets it
+    # appended after this one, and `resolve_analysis_chain` allows only a `kind="dimension"`
+    # analysis in a non-leading stage -- so picking a `kind="variable"` analysis (which is
+    # what the portal's variable dropdown holds) alongside such a chart is a 400. Without
+    # this field the only way to know which chart implies an analysis is to un-hyphenate
+    # its name and hope, which is a coincidence rather than a contract.
+    analysis: str | None = None
 
 
 class CatalogOutput(BaseModel):
