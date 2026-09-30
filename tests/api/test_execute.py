@@ -1484,7 +1484,15 @@ class TestBandWideEndToEnd:
         # while its sibling keeps the scan's real row count -- a shape mismatch
         # `join_band_wide`'s own precondition would also catch, but only after producing a
         # confusing error with no indication which operand was actually empty), so it
-        # raises `ValueError` naming the mismatched origin instead.
+        # raises instead.
+        #
+        # `NotFoundError`, not a bare `ValueError`: this is reachable from an ordinary,
+        # well-formed request whose DERIVED selection happens to have no data -- `lnd_chng`
+        # deriving a baseline `calendar_year` the dataset does not carry is the case that
+        # found it, as a 500 in a deployed portal. `api.boundary` maps it to a 404 with the
+        # message below, which is the answer a caller can act on. The message names each
+        # empty operand's DATASET as well as its step name, since a registered analysis
+        # writes its own pipeline and a caller has never seen the name `'a'`.
         write_raster_dataset(
             base_path,
             years=(2030,),
@@ -1512,8 +1520,11 @@ class TestBandWideEndToEnd:
         assert plan.inputs["a"].band_metadata.height == 0
         assert plan.band_wide_join_scans == {"j": ("a", "b")}
 
-        with pytest.raises(ValueError, match="partial zero-band mismatch"):
+        from cpra.mp.data.analysis.request.errors import NotFoundError
+
+        with pytest.raises(NotFoundError, match=r"no data for 'a' \(variable=vct,") as excinfo:
             execute(plan, base_path=base_path)
+        assert "'b' did while it did not" in str(excinfo.value)
 
 
 def _tile_over_the_raster_grid(zoom=12):

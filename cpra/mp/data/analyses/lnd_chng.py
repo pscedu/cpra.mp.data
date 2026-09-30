@@ -38,10 +38,20 @@ which is long throughout.
 The baseline-year rule is a business rule, not derived from anything else in this
 codebase: `model_group_id` values below `BASELINE_ERA_BREAKPOINT` belong to an earlier
 model era whose baseline year is `EARLY_BASELINE_YEAR`; at or above it, the baseline year
-is `LATE_BASELINE_YEAR`. In three-image mode (two selected `model_group_id` values), the
-LOWER of the two decides the era regardless of where the other one falls -- e.g.
-`model_group_id` 650 and 900 selected together still resolve to the 2019 baseline, since
-650 is the lower one.
+is `LATE_BASELINE_YEAR`. `BASELINE_YEAR_OVERRIDES` names the model groups the breakpoint
+does not describe at all, and wins over it where it has an entry -- `model_group_id` 0
+compares against 2025, not the 2019 its position below the breakpoint would otherwise give
+it. That override is not a tweak to the era rule but a statement that the group is outside
+the eras: the breakpoint sorts MODEL eras, and a group whose data is not one of them has
+its baseline given directly rather than derived. It was added because the derived 2019
+simply has no data for that group, which surfaced as a 500 from a deployed portal (see
+`tests/api/test_analyses_endpoints.py::TestLandChangeMissingBaselineRoute`, which still
+pins the answer for the general case of a baseline year no dataset carries).
+
+In three-image mode (two selected `model_group_id` values), the LOWER of the two decides
+the baseline regardless of where the other one falls -- e.g. `model_group_id` 650 and 900
+selected together still resolve to the 2019 baseline, since 650 is the lower one, and 0
+selected alongside anything resolves to its own 2025 for the same reason.
 
 Two modes, selected by how many `model_group_id` values are selected (mirrors
 `concatenate`'s own two-mode split; see that history for the portal-side derivation this
@@ -85,6 +95,28 @@ from cpra.mp.data.grids import GRIDS
 BASELINE_ERA_BREAKPOINT = 700
 EARLY_BASELINE_YEAR = 2019
 LATE_BASELINE_YEAR = 2025
+
+# The model groups the breakpoint above does not describe, mapped to the baseline year each
+# one compares against. Also given directly by the maintainer, and a TABLE rather than a
+# third named constant because these are exceptions to the era rule rather than a third
+# era: an entry says "this group's baseline is not derivable from where it sits relative to
+# `BASELINE_ERA_BREAKPOINT`", and the next such group needs a row here, not another branch.
+# Group 0's year happens to equal `LATE_BASELINE_YEAR` today; it is spelled as a literal on
+# purpose, so moving the late era's baseline does not silently move group 0's with it.
+BASELINE_YEAR_OVERRIDES = {0: 2025}
+
+
+def baseline_year(model_group_id: int) -> int:
+    """The `calendar_year` `model_group_id`'s land types are compared AGAINST -- the whole
+    of the derivation the caller does not get to make (see the module docstring's
+    baseline-year paragraph).
+
+    Module-level rather than a method so a test, and any future caller that needs to know
+    which year a selection will actually read, can ask without building an `Analysis`.
+    """
+    if model_group_id in BASELINE_YEAR_OVERRIDES:
+        return BASELINE_YEAR_OVERRIDES[model_group_id]
+    return EARLY_BASELINE_YEAR if model_group_id < BASELINE_ERA_BREAKPOINT else LATE_BASELINE_YEAR
 
 
 class LandChange(Analysis):
@@ -161,7 +193,10 @@ class LandChange(Analysis):
         years = normalized_filter_values(dim, raw_years) if raw_years is not None else []
         mg_values = normalized_filter_values("model_group_id", self.filters["model_group_id"])
         three_image = len(mg_values) == 2
-        t0 = EARLY_BASELINE_YEAR if min(mg_values) < BASELINE_ERA_BREAKPOINT else LATE_BASELINE_YEAR
+        # `min` in three-image mode: the lower model group decides, and it is also the one
+        # the baseline branch is filtered to below, so the year and the group it is read
+        # from cannot disagree.
+        t0 = baseline_year(min(mg_values))
 
         # A raster selection stays band-wide unless something lowers it, and only a SPATIAL
         # conjunct does (`request.ops.FILTER_LOWERING_TABLE`) -- a caller's value `where`

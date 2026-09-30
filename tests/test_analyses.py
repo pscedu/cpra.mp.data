@@ -48,9 +48,11 @@ from cpra.mp.data.analyses.base import (
 from cpra.mp.data.analyses.diff import Difference
 from cpra.mp.data.analyses.lnd_chng import (
     BASELINE_ERA_BREAKPOINT,
+    BASELINE_YEAR_OVERRIDES,
     EARLY_BASELINE_YEAR,
     LATE_BASELINE_YEAR,
     LandChange,
+    baseline_year,
 )
 from cpra.mp.data.analyses.lnd_conf import (
     LAND_VALUES,
@@ -989,6 +991,53 @@ class TestLandChangeBaselineYear:
     def test_a_straddling_pair_still_uses_the_lower_ones_era(self):
         leading = self._leading_filter([650, 900])
         assert f"calendar_year = {EARLY_BASELINE_YEAR}" in leading.where
+
+    def test_an_overridden_model_group_ignores_the_breakpoint(self):
+        """`model_group_id` 0 sits below the breakpoint, so the era rule alone would give it
+        `EARLY_BASELINE_YEAR` -- a year its data does not carry, which reached a deployed
+        portal as a 500. `BASELINE_YEAR_OVERRIDES` is what says the breakpoint does not
+        describe this group at all.
+        """
+        # Named rather than iterated off the table: a loop over `BASELINE_YEAR_OVERRIDES`
+        # passes vacuously the moment the table is empty, which is exactly the regression
+        # this is here to catch.
+        assert BASELINE_YEAR_OVERRIDES[0] == 2025
+        leading = self._leading_filter(0)
+        assert f"calendar_year = {BASELINE_YEAR_OVERRIDES[0]}" in leading.where
+        assert f"calendar_year = {EARLY_BASELINE_YEAR}" not in leading.where
+
+        # Every override has to actually differ from what the era rule would derive,
+        # otherwise the row is dead weight that reads as a rule when it is a no-op.
+        for model_group_id, year in BASELINE_YEAR_OVERRIDES.items():
+            derived = (
+                EARLY_BASELINE_YEAR
+                if model_group_id < BASELINE_ERA_BREAKPOINT
+                else LATE_BASELINE_YEAR
+            )
+            assert year != derived, model_group_id
+
+    def test_the_override_wins_in_a_pair_it_is_the_lower_of(self):
+        """The `min()` rule and the override table compose in the one order that keeps the
+        year consistent with the data it is read from: `min()` picks the GROUP, then the
+        group picks the year. Taking the min of each group's YEAR instead would hand back
+        650's 2019 for this pair while the baseline branch reads group 0 -- which has no
+        2019. The pair is 0 and 650 rather than 0 and something past the breakpoint because
+        group 0's override coincides with `LATE_BASELINE_YEAR`, and a pair whose two years
+        agree cannot tell the orders apart.
+        """
+        leading = self._leading_filter([0, 650])
+        assert f"calendar_year = {BASELINE_YEAR_OVERRIDES[0]}" in leading.where
+        assert f"calendar_year = {EARLY_BASELINE_YEAR}" not in leading.where
+        assert "model_group_id = 0" in leading.where
+
+    def test_baseline_year_is_asking_the_same_question_the_pipeline_does(self):
+        """The helper exists so a caller can know which year a selection will read without
+        building an `Analysis`; if it ever stopped agreeing with `pipeline()`, it would be
+        worse than not having it.
+        """
+        for model_group_id in (0, BASELINE_ERA_BREAKPOINT - 50, BASELINE_ERA_BREAKPOINT, 900):
+            leading = self._leading_filter(model_group_id)
+            assert f"calendar_year = {baseline_year(model_group_id)}" in leading.where
 
 
 class TestLandChangePipeline:

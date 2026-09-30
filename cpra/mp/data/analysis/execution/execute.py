@@ -219,6 +219,7 @@ from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_points import sample_raster_points
 from cpra.mp.data.analysis.io.vector import scan_vector
+from cpra.mp.data.analysis.request.errors import NotFoundError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
     FilterOp,
@@ -741,6 +742,14 @@ def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozense
     return windows
 
 
+def _dataset_label(selection) -> str:
+    """`InputSelection` as the three query parameters a caller actually spells, for an
+    error message. The step name alone (`'base'`, `'years'`) names a position inside a
+    pipeline the caller may never have written -- a registered analysis builds its own --
+    so it says nothing about which dataset came back empty."""
+    return f"variable={selection.variable}, time_unit={selection.time_unit}, grid={selection.grid}"
+
+
 def _grid_read_window(grid_name: str, window=None, decimation: tuple[int, int] = (1, 1)) -> ReadWindow:
     """A `ReadWindow` built from `grid_name`'s own geometry, with no file
     opened -- the window a zero-band raster origin gets, since `io.raster.scan_raster`
@@ -1029,7 +1038,8 @@ def _open_band_wide_join_group(
     they ever do, the narrower, exact answer is the one that wins.
 
     A PARTIAL zero-band mismatch within an otherwise-nonzero group (one operand resolves
-    to zero bands, another does not) raises `ValueError` naming the mismatched origins,
+    to zero bands, another does not) raises `request.errors.NotFoundError` naming the
+    mismatched origins AND the datasets they select,
     rather than letting it through to become a silent row-count mismatch downstream: the
     zero-band operand's slice would otherwise become a zero-column selection over the
     shared frame, which collapses to height 0 (the same Polars "zero columns loses the row
@@ -1061,11 +1071,15 @@ def _open_band_wide_join_group(
 
     zero_names = [name for name, height in zip(origins, heights) if height == 0]
     if zero_names:
-        raise ValueError(
-            f"band-wide join group {list(origins)!r} has a partial zero-band mismatch: "
-            f"{zero_names!r} resolved to zero bands while the rest did not -- "
-            "join_band_wide requires every operand to share one row count, which a mix of "
-            "zero-band and non-zero-band operands from one shared scan cannot give"
+        missing = ", ".join(f"{name!r} ({_dataset_label(inputs[name].selection)})" for name in zero_names)
+        present = ", ".join(repr(name) for name in origins if name not in zero_names)
+        raise NotFoundError(
+            f"no data for {missing} -- a band-wide join needs every operand to resolve to "
+            f"at least one band, and {present} did while it did not. The dimension values "
+            "one operand selects are not always the caller's own: an analysis may derive "
+            "some itself (`lnd_chng` derives its baseline calendar_year from the selected "
+            "model_group_id), in which case this means the derived selection has no data "
+            "for the dataset the caller named."
         )
 
     combined = pl.concat(band_metadata, how="diagonal_relaxed")
