@@ -35,15 +35,24 @@ carry.
 
 `legend = "lnd_conf"` colorizes that fraction directly: five even bands over `[0, 1]`,
 diverging about the `0.4`-`0.6` band that straddles an evenly-split ensemble, water-colored
-below it and land-colored above.
+below it and land-colored above, under a transparent `No Data` band for everything below
+`0.0`. Nothing this analysis outputs is below `0.0` -- the fraction's domain starts there --
+so that band catches exactly one thing: the nodata sentinel
+(`execution.sink.DEFAULT_NODATA`) a null pixel is filled with before the tile warp.
+`Legend.colorize_pixels` digitizes every pixel it is given, nodata included, so a legend
+with no under-band paints the whole out-of-domain area in its FIRST color; here that was
+the darkest water color, which reads as a confident all-water answer where there is no
+answer at all.
 
-Not to be confused with `legends.csv`'s neighboring `lnd_conf_diff`, whose break points are
-`scripts/generate_video_frames.py`'s `CONFIDENCE_BREAKS`: those classify a SIGNED `[-1, 1]`
+`difference_legend = "lnd_conf_diff"` is the reading of this analysis's output once a
+chained `diff` stage has differenced it. Its break points are
+`scripts/generate_video_frames.py`'s `CONFIDENCE_BREAKS`: they classify a SIGNED `[-1, 1]`
 difference of this fraction between two years ("likely land gain", "high confidence no
-change", ...), which is the reading of a `lnd_conf,diff` chain's output
-rather than of this analysis's own. This analysis declares only the undifferenced legend --
-see `analyses.resolve_analysis_chain`, where a chained stage's own `legend` (today
-`diff` declares none) is what would override it.
+change", ...), which is a statement about `lnd_conf,diff`'s output and not about this
+analysis's own -- so the two legends are declared as the two separate fields they are
+rather than one field that would have to be wrong for one of the two requests. See
+`analyses.resolve_analysis_chain`, which applies it: a chained stage's own `legend` wins
+first (today `diff` declares none), then this.
 """
 
 from typing import Any
@@ -87,6 +96,7 @@ class LandConfidence(Analysis):
         label="Land Confidence",
         variables=["lnd_type"],
         legend="lnd_conf",
+        difference_legend="lnd_conf_diff",
         result_kind="value",
         kind="variable",
         subsumed_dimensions=["scenario_id"],

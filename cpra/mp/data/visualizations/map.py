@@ -105,7 +105,7 @@ class Map(DatasetVisualization):
         if not values:
             return {}
 
-        if self._is_difference():
+        if self._uses_difference_ramp():
             stops = self._difference_breaks(self.variable)
             return {str(fid): self._interpolate_stop_color(val, stops) for fid, val in values.items()}
 
@@ -856,7 +856,7 @@ class Map(DatasetVisualization):
         calendar_day = self.params.get("calendar_day", [])
         model_group_id = self.params.get("model_group_id", [])
 
-        is_difference = self._is_difference()
+        uses_ramp = self._uses_difference_ramp()
         is_overlay = self.params.get("is_overlay", True)
 
         # Insert data layers after "initial-conditions-water" so they render
@@ -870,7 +870,7 @@ class Map(DatasetVisualization):
             tile_url = self._tile_url_template("png")
             style["sources"]["data"] = (
                 self.difference_raster_source(tile_urls=[tile_url])
-                if is_difference
+                if uses_ramp
                 else self.raster_source(tile_urls=[tile_url], color_map=self._legend_name())
             )
             data_layers = self.raster_layers("data-layer", "data")
@@ -879,7 +879,7 @@ class Map(DatasetVisualization):
             if self.request:
                 # Dynamic MVT endpoint: colors derived from the 'value' property
                 # embedded in each tile, no global-state lookup needed.
-                fill_color = self._legend_fill_expr(is_difference)
+                fill_color = self._legend_fill_expr(uses_ramp)
             else:
                 # Static PMTiles fallback: pre-compute colors server-side and
                 # pass via global state for the browser to look up per feature.
@@ -926,7 +926,7 @@ class Map(DatasetVisualization):
             style["layers"].insert(water_insert_idx, style["layers"].pop(insert_idx - 1))
 
         # Include legend metadata for UI rendering
-        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(is_difference)]}}
+        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(uses_ramp)]}}
 
         # Set an empty object as the default value for selection colors.
         # TODO: Add support for setting initial selection colors based on the value
@@ -948,6 +948,28 @@ class Map(DatasetVisualization):
         resolved = self.resolved_analysis
         return resolved is not None and resolved.result_kind == "difference"
 
+    def _uses_difference_ramp(self) -> bool:
+        """Should this map's coloring be the SYNTHESIZED diverging ramp
+        (`_difference_breaks`: red at `-limit`, white/transparent at `0`, blue at `+limit`,
+        off the variable's `difference_legend_limit`) rather than a named legend?
+
+        A difference with no named legend, which is every difference there was until
+        `lnd_conf` declared a `Meta.difference_legend`. The ramp exists because a
+        difference of an arbitrary variable has no classification anyone has written down:
+        it is derived from the variable's own scale, and is the honest default for that.
+        An analysis that HAS written one down (`lnd_conf,diff` ->
+        `lnd_conf_diff`, whose classes are "likely land gain"/"high confidence no
+        change"/... rather than a symmetric ramp) says something the limit cannot, so it
+        wins -- and this is the one place that has to be decided, since all four coloring
+        branches (`feature_colors`, the raster source, `_legend_fill_expr`, and the legend
+        metadata) read it.
+
+        Distinct from `_is_difference`, which stays the plain question about the RESULT and
+        still answers `True` here -- `difference_suffix` and the title still say
+        "Difference" for a difference that happens to have a legend of its own.
+        """
+        return self._is_difference() and self._legend_name() is None
+
     def _legend_name(self) -> str | None:
         """The named legend (a `cpra.mp.data.legends.LEGENDS` key) this map's coloring
         should use, or `None` for "no override -- fall back to the variable's own
@@ -955,7 +977,11 @@ class Map(DatasetVisualization):
 
         Reads the resolved analysis's own declared `legend` when `analysis=` is selected
         (`lnd_chng`'s `Meta.legend = "lnd_chng"`; `diff` declares none); a map
-        with no analysis selected has no override.
+        with no analysis selected has no override. For a CHAIN this is what
+        `resolve_analysis_chain` settled on, which is where a leading analysis's
+        `Meta.difference_legend` takes over once a stage has differenced its output
+        (`lnd_conf,diff` -> `lnd_conf_diff`) -- nothing about that resolution is redone
+        here.
         """
         resolved = self.resolved_analysis
         return resolved.legend if resolved is not None else None
@@ -973,7 +999,10 @@ class Map(DatasetVisualization):
         """Generate legend metadata for the style response.
 
         Args:
-            difference: Whether this is a difference visualization.
+            difference: Whether this map is colored by the synthesized diverging ramp --
+                `_uses_difference_ramp`, not `_is_difference`. A difference that names a
+                legend of its own (`lnd_conf,diff`) takes the branch below, so that the
+                key the client renders matches the colors the tiles actually came back in.
 
         Returns:
             A dictionary with legend title, unit, type, and color steps.
@@ -1025,6 +1054,13 @@ class Map(DatasetVisualization):
             if resolved is not None and resolved.meta.kind == "variable"
             else self.result_label
         )
+        # A difference reaching THIS branch is one with a legend of its own, and its title
+        # still has to say what the reader is looking at. `" Difference"` verbatim rather
+        # than `difference_suffix`: that is the chain's whole `title_suffix`, which for
+        # `lnd_conf,diff` is `" Confidence Difference"` and would repeat the word already
+        # inside `Meta.label` ("Land Confidence").
+        if self._is_difference():
+            title = f"{title} Difference"
         return {
             "title": title,
             "subtitle": display_unit(var),

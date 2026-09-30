@@ -170,6 +170,62 @@ class TestResolvedAnalysisMetadataHooks:
         assert m.difference_suffix == ""
 
 
+class TestDifferenceRampVsNamedLegend:
+    """`_uses_difference_ramp` -- which of the map's two colorings a difference gets.
+
+    A difference used to have exactly one: the synthesized diverging ramp built from the
+    variable's `difference_legend_limit` (`_difference_breaks`). `lnd_conf` declaring a
+    `Meta.difference_legend` makes that a choice, and the choice is made in ONE place
+    because four branches read it (`feature_colors`, the raster source, `_legend_fill_expr`,
+    and the legend metadata) and a map whose tiles and whose key disagree is worse than
+    either answer alone.
+
+    `_is_difference` deliberately still answers `True` for the named-legend case -- the
+    result IS a difference, and the title still says so -- so the two are asserted together
+    here rather than one standing in for the other.
+    """
+
+    # `lnd_conf`'s real dataset. No `scenario_id`: the analysis fixes its own ensemble and
+    # `validate_selection` rejects a caller-supplied one outright.
+    RASTER = dict(variable="lnd_type", grid="morph_pixel_v002", time_unit="annual", model_group_id=[705])
+
+    def _map(self, **kwargs):
+        return Map(calendar_year=[2040, 2050], dimension="calendar_year", order="asc", **self.RASTER, **kwargs)
+
+    def test_land_confidence_difference_uses_its_named_legend_not_the_ramp(self):
+        m = self._map(analysis="lnd_conf,diff")
+        assert m._is_difference() is True
+        assert m._legend_name() == "lnd_conf_diff"
+        assert m._uses_difference_ramp() is False
+
+    def test_a_difference_with_no_named_legend_still_uses_the_ramp(self):
+        m = self._map(analysis="diff")
+        assert m._is_difference() is True
+        assert m._legend_name() is None
+        assert m._uses_difference_ramp() is True
+
+    def test_an_undifferenced_analysis_uses_neither(self):
+        """`lnd_conf` alone: not a difference at all, so the ramp question never arises and
+        the legend is the undifferenced one."""
+        m = Map(analysis="lnd_conf", **self.RASTER, calendar_year=[2040])
+        assert m._is_difference() is False
+        assert m._legend_name() == "lnd_conf"
+        assert m._uses_difference_ramp() is False
+
+    def test_the_legend_key_matches_the_colors_the_tiles_come_back_in(self):
+        """The whole point of routing the metadata off the same predicate: a reader sees
+        `lnd_conf_diff`'s own classes, in its own colors, rather than a continuous
+        red/white/blue scale keyed to a limit these tiles were never colored by.
+        """
+        metadata = self._map(analysis="lnd_conf,diff")._get_legend_metadata(False)
+        assert metadata["type"] == "discrete"
+        assert [step["label"] for step in metadata["steps"]][:2] == ["No Data", "Likely Land Loss"]
+        assert metadata["steps"][0]["color"] == "#00000000"
+        # Still named as a difference, from `Meta.label` plus the word -- not from the
+        # chain's `title_suffix`, which would repeat "Confidence".
+        assert metadata["title"] == "Land Confidence Difference"
+
+
 class TestCompareDimensionsExclusion:
     """`StackedBar.compare_dimensions`/`TimeSeriesLine.chart()`'s own local equivalent must
     exclude whatever the resolved analysis's own `collapsed_dimensions` says it already

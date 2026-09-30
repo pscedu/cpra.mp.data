@@ -55,9 +55,11 @@ no single grid to resolve against.
 import io
 
 import mercantile
+import numpy as np
 import pytest
 import rasterio as rio
 from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
+from PIL import Image
 from rasterio.crs import CRS
 from rasterio.warp import transform, transform_bounds
 from shapely.geometry import box
@@ -688,6 +690,103 @@ class TestLandConfidenceRoute:
         response = client.get(pipeline_url("lnd_conf"), params=LAND_TYPE_CONFIDENCE_QUERY)
         assert response.json()["output"]["format"] == "tif"
         validate_shapes(parse_pipeline(response.json()))  # no raise
+
+
+class TestLandConfidenceLegendRoute:
+    """The two legend facts about `lnd_conf`, end to end: nodata renders transparent, and
+    differencing it switches the published legend to `lnd_conf_diff`.
+
+    Both are presentation rather than arithmetic, so every test above passes either way --
+    the surface is the same numbers under the wrong colors. They are asserted through the
+    routes that actually serve them: the rendered PNG for the first (alpha is the only
+    place transparency exists) and `/v1/catalog.json` for the second (the portal draws its
+    key from `output.legend`).
+    """
+
+    DIFFERENCE_QUERY = {
+        "analysis": "lnd_conf,diff",
+        **RASTER_DATASET,
+        "dimension": "calendar_year",
+        "order": "asc",
+        "calendar_year": [2030, 2050],
+        "model_group_id": [RASTER_KWARGS["model_group_id"]],
+    }
+
+    @pytest.fixture
+    def ensemble_dataset(self, base_path, monkeypatch):
+        """The five ensemble members over two years, every one holding a land code, so the
+        weighted sum is 1.0 at every pixel in both -- and their difference is 0.0."""
+        for scenario_id in SCENARIO_WEIGHTS:
+            write_raster_dataset(
+                base_path, years=(2030, 2050), scenario_id=scenario_id, fill_fn=lambda year: 1
+            )
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        return base_path
+
+    def test_the_tile_renders_nodata_transparent_and_data_opaque(self, client, ensemble_dataset):
+        """A zoom-8 tile is far larger than this fixture's raster, so the warp fills most of
+        it with `DEFAULT_NODATA` -- which `colorize_pixels` digitizes like any other pixel,
+        into whichever bucket sits below the lowest break. Without the `No Data` band that
+        was `lnd_conf`'s darkest WATER color, so the whole area outside the model domain
+        came back drawn as a confident all-water answer.
+
+        The opaque half of the assertion is what keeps this from passing on a blank tile:
+        the pixels that do carry data (confidence 1.0 here) must still be painted.
+
+        `color_map` is sent explicitly, and has to be: `io.output.resolve_legend` falls back
+        to the VARIABLE's legend when a tile request names none, so this URL without it
+        renders `lnd_conf`'s numbers through `lnd_type`'s colors -- which have carried a
+        transparent `No Data` band all along, and would answer both assertions no matter
+        what `lnd_conf` declares. `lnd_conf` here is the same name `visualizations.map`
+        puts in the tile URL it hands the portal (`_legend_name`).
+        """
+        tile = _tile_for_grid(ensemble_dataset)
+        response = client.get(
+            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png",
+            params={**LAND_TYPE_CONFIDENCE_QUERY, "color_map": "lnd_conf"},
+        )
+        assert response.status_code == 200, response.text
+        alpha = np.array(Image.open(io.BytesIO(response.content)).convert("RGBA"))[:, :, 3]
+        assert (alpha == 0).any(), "no transparent nodata"
+        assert (alpha == 255).any(), "no opaque data -- the tile is blank"
+
+    def test_differencing_switches_the_published_legend(self, client, ensemble_dataset):
+        """`lnd_conf` classifies a weighted fraction on `[0, 1]`; its difference is a signed
+        change in that fraction, which `lnd_conf_diff` reads as "likely land gain"/"high
+        confidence no change"/... `diff` cannot name either -- it knows nothing about what it
+        was chained onto -- so the name comes from `lnd_conf`'s own `Meta.difference_legend`
+        (`analyses.resolve_analysis_chain`).
+        """
+        response = client.get("/v1/catalog.json", params=self.DIFFERENCE_QUERY)
+        assert response.status_code == 200, response.text
+        output = response.json()["output"]
+        assert output["legend"] == "lnd_conf_diff"
+        assert output["result_kind"] == "difference"
+
+        # Undifferenced, the same selection still publishes the fraction's own legend.
+        plain = client.get("/v1/catalog.json", params=LAND_TYPE_CONFIDENCE_QUERY)
+        assert plain.json()["output"]["legend"] == "lnd_conf"
+
+    def test_the_map_style_draws_the_named_legend_rather_than_the_diverging_ramp(
+        self, client, ensemble_dataset
+    ):
+        """The other consumer, and the one a reader sees. Every other difference map colors
+        its tiles with a synthesized `continuous:` ramp off the variable's
+        `difference_legend_limit` and renders a matching continuous key; this one asks the
+        tile route for `lnd_conf_diff` by name and renders that legend's own classes. The
+        tile URL and the key are asserted together because agreeing is the whole point --
+        `visualizations.map` decides once, in `_uses_difference_ramp`.
+        """
+        response = client.get("/v1/visualizations/map.json", params=self.DIFFERENCE_QUERY)
+        assert response.status_code == 200, response.text
+        style = response.json()
+        assert "color_map=lnd_conf_diff" in style["sources"]["data"]["tiles"][0]
+        assert "continuous" not in style["sources"]["data"]["tiles"][0]
+
+        legend = style["state"]["legend"]["default"]["entries"][0]
+        assert legend["type"] == "discrete"
+        assert legend["title"] == "Land Confidence Difference"
+        assert [step["label"] for step in legend["steps"]][:2] == ["No Data", "Likely Land Loss"]
 
 
 class TestLandChangeChainRoute:

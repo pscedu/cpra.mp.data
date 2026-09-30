@@ -18,6 +18,7 @@ filter, `grid_cell`, and caller-written `where` is composed into the pipeline's 
 import json
 from datetime import date
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
@@ -68,6 +69,7 @@ from cpra.mp.data.analysis.request.pipeline import (
     ProjectStep,
     pipeline_to_query,
 )
+from cpra.mp.data.analysis.execution.sink import DEFAULT_NODATA
 from cpra.mp.data.legends import LEGENDS
 
 SSF_DATASET = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v001")
@@ -217,15 +219,71 @@ class TestRegistry:
         `test_structure.TestLegendsCsv`'s structural checks (both are well-formed) can tell
         them apart -- picking the wrong one is silently wrong colors, never an error, so the
         domain is asserted directly here.
+
+        Both are declared now, as the two separate fields they are: `legend` for this
+        analysis's own output and `difference_legend` for a `lnd_conf,diff` chain's -- see
+        `test_land_type_confidence_declares_the_differenced_legend` below, which asserts the
+        pairing, and `TestChainedLegendResolution` for the resolution that applies it.
         """
 
         def bounds(legend_name):
             return [b for b in LEGENDS[legend_name].break_points["upper_bound"].to_list() if b is not None]
 
         declared = bounds(ANALYSES["lnd_conf"].Meta.legend)
+        # `0.0` is the transparent `No Data` band's own upper bound, and the fraction's
+        # floor: nothing this analysis outputs falls below it, so the band catches the
+        # nodata sentinel alone (see the module docstring).
         assert all(0.0 <= b <= 1.0 for b in declared), declared
         # The other one, for contrast: signed, and so not a reading of the fraction itself.
         assert any(b < 0.0 for b in bounds("lnd_conf_diff"))
+
+    def test_land_type_confidence_declares_the_differenced_legend(self):
+        """The other half of the pair: `difference_legend` has to classify a SIGNED change
+        in that fraction, which is `[-1, 1]` -- a legend whose bounds were all non-negative
+        would color half the possible results out of range and is the mistake this field
+        exists to keep from being made silently.
+
+        `lnd_conf` is the only entry declaring one; every other analysis's difference falls
+        back to `visualizations.map`'s synthesized diverging ramp, which is what a variable
+        with no written-down classification of its own can honestly offer.
+        """
+        meta = ANALYSES["lnd_conf"].Meta
+        assert meta.difference_legend == "lnd_conf_diff"
+        assert meta.difference_legend in LEGENDS
+        bounds = [
+            b
+            for b in LEGENDS[meta.difference_legend].break_points["upper_bound"].to_list()
+            if b is not None
+        ]
+        assert min(bounds) <= -1.0 and max(bounds) <= 1.0, bounds
+        assert [name for name, cls in ANALYSES.items() if cls.Meta.difference_legend] == ["lnd_conf"]
+
+    def test_every_declared_difference_legend_is_a_real_one(self):
+        """`test_every_declared_legend_is_a_real_one`'s counterpart for the second legend
+        field -- a typo here is invisible for exactly the same reason, and one rung further
+        from anything that runs, since only a CHAIN ever reaches it."""
+        for name, cls in ANALYSES.items():
+            if cls.Meta.difference_legend is not None:
+                assert cls.Meta.difference_legend in LEGENDS, name
+
+    @pytest.mark.parametrize("legend_name", ["lnd_conf", "lnd_conf_diff"])
+    def test_the_confidence_legends_render_nodata_transparent(self, legend_name):
+        """The nodata sentinel has to fall in a transparent band on both.
+
+        `Legend.colorize_pixels` digitizes EVERY pixel a tile carries, the nodata fill
+        included (`execution.sink.render_tile` fills nulls with `DEFAULT_NODATA` before the
+        warp and never masks them again), so a value below the lowest break lands in the
+        first bucket and is drawn in that bucket's color. Without a leading `No Data` band
+        that was the darkest water color for `lnd_conf` -- the whole area outside the model
+        domain rendered as a confident all-water answer -- and, once
+        `difference_legend` routes `lnd_conf,diff` onto `lnd_conf_diff`, would be "Likely
+        Land Loss" for the same pixels.
+
+        Asserted through `colorize_pixels` rather than by reading the CSV, since the claim
+        is about what a tile actually comes out as: alpha `0` in the RGBA it returns.
+        """
+        color = LEGENDS[legend_name].colorize_pixels(np.array([[[DEFAULT_NODATA]]]))
+        assert color[0][0][3] == 0, color
 
 
 # ------------------------------------------------------------------------------------------
@@ -456,6 +514,73 @@ class TestResolveAnalysisChainContract:
         )
         assert chained.pipeline == plain.pipeline
         assert chained.collapsed_dimensions == plain.collapsed_dimensions
+
+
+class TestChainedLegendResolution:
+    """Which legend a chain publishes -- `resolve_analysis_chain`'s three-way
+    stage-then-`difference_legend`-then-running resolution.
+
+    This is presentation metadata, so nothing about the compiled pipeline changes with it
+    and no response-level test can notice it going wrong: `lnd_conf,diff` would still return
+    the same numbers under the wrong legend, colored as an undifferenced `[0, 1]` fraction.
+    """
+
+    CHAIN_FILTERS = {"model_group_id": 705, "calendar_year": [2040, 2050]}
+    CHAIN_PARAMS = {"dimension": "calendar_year", "order": "asc"}
+
+    def test_differencing_land_confidence_switches_to_the_differenced_legend(self):
+        """The requested behavior: `lnd_conf,diff` publishes `lnd_conf_diff`, not
+        `lnd_conf`. `diff` declares no legend of its own and could not -- it has no idea
+        what it was chained onto -- so the name comes from the LEADING analysis's
+        `Meta.difference_legend`.
+        """
+        resolved = resolve_analysis_chain(
+            ["lnd_conf", "diff"],
+            dataset=LND_TYPE_DATASET,
+            filters=self.CHAIN_FILTERS,
+            params=self.CHAIN_PARAMS,
+        )
+        assert resolved.legend == "lnd_conf_diff"
+        assert resolved.result_kind == "difference"
+        # Undifferenced, the same analysis still publishes the fraction's own legend --
+        # `difference_legend` is reached by the chain and by nothing else.
+        assert (
+            resolve_analysis(
+                "lnd_conf", dataset=LND_TYPE_DATASET, filters={"model_group_id": 705}, params={}
+            ).legend
+            == "lnd_conf"
+        )
+
+    def test_a_leading_analysis_with_no_differenced_legend_keeps_its_own(self):
+        """`lnd_type_plus` declares `legend="lnd_type_plus"` and no `difference_legend`, so
+        a difference of it keeps the legend it had. The alternative -- falling through to
+        `None` because the result is now a difference -- would silently drop a legend an
+        analysis did declare.
+        """
+        resolved = resolve_analysis_chain(
+            ["lnd_type_plus", "diff"],
+            dataset=None,
+            filters=self.CHAIN_FILTERS,
+            params=self.CHAIN_PARAMS,
+        )
+        assert resolved.legend == "lnd_type_plus"
+        assert resolved.result_kind == "difference"
+
+    def test_a_plain_difference_still_publishes_no_legend(self):
+        """`diff` alone over an ordinary dataset is unchanged: no leading analysis means no
+        `difference_legend` to reach for, so the legend stays `None` and
+        `visualizations.map` draws the synthesized diverging ramp it always has. The new
+        field narrows nothing and widens nothing -- it only answers for the one analysis
+        that declares it.
+        """
+        resolved = resolve_analysis(
+            "diff",
+            dataset=SSF_DATASET,
+            filters={"model_group_id": 705, "calendar_year": [2040, 2050]},
+            params=self.CHAIN_PARAMS,
+        )
+        assert resolved.legend is None
+        assert resolved.result_kind == "difference"
 
 
 # ------------------------------------------------------------------------------------------

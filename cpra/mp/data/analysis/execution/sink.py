@@ -328,9 +328,10 @@ def _encode_tile_image(color: np.ndarray, image_format) -> bytes:
 
     JPEG carries no alpha channel, so the alpha column is dropped rather than flattened
     against a background: a fully transparent RGBA pixel encodes as whatever RGB it was
-    carrying. Nothing rendered here is transparent in practice -- `colorize_pixels`
-    digitizes every pixel, nodata included, into an opaque legend bucket (see `render_tile`)
-    -- so this only settles what an alpha channel that never arrives would have meant.
+    carrying. Which is a real difference wherever the legend declares a transparent band --
+    a `No Data` band being the usual one (see `render_tile`) -- and is the cost of asking
+    for `jpg` on a map whose nodata is meant to disappear, not something this can repair
+    without inventing a background color the caller never named.
     (`Image.fromarray` infers RGB vs RGBA from the array's own shape; passing `mode=`
     explicitly is deprecated as of Pillow 11.)
     """
@@ -394,13 +395,15 @@ def render_tile(
     nothing left to read off a file even if this function still opened one.
     `color_map`/`variable_legend` are forwarded to `io.output.resolve_legend` unchanged.
 
-    Note that a nodata pixel is NOT rendered transparent: `Legend.colorize_pixels`
-    digitizes against the legend's break points, and a value below the lowest break --
-    which `DEFAULT_NODATA` always is -- lands in the first bucket, whose color is an opaque
-    one (no `LEGENDS` entry declares a transparent under-color). That is the
-    long-standing behavior, reproduced here rather than changed. It is also why a MISS is a
-    204 rather than a rendered all-nodata tile: the two are different pictures, and only the
-    caller's own legend would say what the second one should look like.
+    Whether a nodata pixel renders transparent is the LEGEND's answer, not this function's.
+    `Legend.colorize_pixels` digitizes against the break points, and a value below the
+    lowest break -- which `DEFAULT_NODATA` always is -- lands in the first bucket, so a
+    legend whose first entry is a transparent `No Data` band (`lnd_type`, `hsi`,
+    `lnd_conf`, ...) drops nodata out of the picture and one without such a band paints it
+    in whatever that first color happens to be. Nothing here inspects or special-cases the
+    sentinel. It is also why a MISS is a 204 rather than a rendered all-nodata tile: the
+    two are different pictures, and only the caller's own legend would say what the second
+    one should look like.
     """
     lf, metadata_df, window = band_wide
     if has_no_bands(metadata_df):
