@@ -1009,11 +1009,20 @@ class TestLndTypePlusExecution:
                 description: src.read(index).ravel().tolist()
                 for index, description in enumerate(src.descriptions, start=1)
             }
-            # A paired band is described by its whole pairing key, not the calendar
-            # dimension alone -- the year is the last conjunct of the three.
+            # A paired band is described by everything the pair has one value for, not by
+            # the calendar dimension alone: the pairing KEY (model group, scenario, year --
+            # which all three operands carry) and the ONE-SIDED columns pairing could not
+            # key on but the pair still has a single value for. `aggregate_type=mean` is the
+            # stage aggregate this analysis selects and only the `stg` operand carries;
+            # `model` only the vector operand carries at all. Both are in the CSV a
+            # `grid_cell` request already returns (that request lowers to long, where
+            # `join_long` carries a one-sided column through), so the GeoTIFF omitting them
+            # was the two shapes disagreeing rather than the download being tidier.
             assert {d: set(v) for d, v in by_year.items()} == {
-                "model_group_id=705, scenario_id=7, calendar_year=2040": {6},
-                "model_group_id=705, scenario_id=7, calendar_year=2050": {4},
+                "model_group_id=705, scenario_id=7, aggregate_type=mean, "
+                "calendar_year=2040, model=icm_v2023.0.0": {6},
+                "model_group_id=705, scenario_id=7, aggregate_type=mean, "
+                "calendar_year=2050, model=icm_v2023.0.0": {4},
             }
 
     def test_another_scenario_on_disk_does_not_reach_the_join(

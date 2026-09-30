@@ -690,6 +690,121 @@ class TestLandConfidenceRoute:
         validate_shapes(parse_pipeline(response.json()))  # no raise
 
 
+class TestLandChangeChainRoute:
+    """A CHAINED analysis whose leading stage is a paired band-wide reduce -- the portal's
+    land-change difference map, and the shape that turns on what a paired reduce's metadata
+    keeps.
+
+    `lnd_chng`'s baseline branch groups `calendar_year` away so a single baseline band can
+    broadcast across the comparison, which makes the comparison year ONE-SIDED: the
+    comparison operand carries it, the baseline operand has no such column, so it is no part
+    of the pairing key. `execution.band_ops._paired_metadata` used to keep the key alone, so
+    the frame reaching `diff` had `model_group_id`/`scenario_id` and no year at all -- while
+    the caller had CHOSEN that year, and `resolve_analysis_chain` therefore (correctly) left
+    it in the `remaining` dimensions it builds the chained stage's trailing `by` from
+    (`collapsed_dimensions` means "the caller cannot steer it"). That `by` reached polars as
+    a 400.
+
+    The year is carried now, the same way `long_ops.join_long` carries a column only one
+    operand has, so this chain and the download below both report it. `band_ops.
+    _present_group_columns` remains as a backstop for a `by` naming a column no band carries
+    at all (`tests/api/test_band_ops.py::TestGroupBandWide`), which this no longer reaches.
+
+    The raster stand-in carries it, per this module's convention: what matters is that the
+    grid is raster (so the frame stays band-wide -- the same chain over a vector grid is long
+    throughout and never had the defect) and that the values are land-type codes.
+    """
+
+    # 705 is at or above `lnd_chng.BASELINE_ERA_BREAKPOINT`, so the derived baseline year is
+    # 2025 and 2040 is the one comparison year band-wide output allows.
+    QUERY = {
+        "analysis": "lnd_chng,diff",
+        **RASTER_DATASET,
+        "dimension": "scenario_id",
+        "order": "asc",
+        "calendar_year": 2040,
+        "model_group_id": 705,
+        "scenario_id": [34, 35],
+    }
+
+    @pytest.fixture
+    def land_change_dataset(self, base_path, monkeypatch):
+        """Two scenarios, each with the derived baseline year and the comparison year.
+
+        Both start as land type 1. Scenario 34 stays 1 (two-image code 1*10 + 1 = 11);
+        scenario 35 becomes 2 (1*10 + 2 = 12). Their asc difference is therefore a uniform
+        -1 -- a value neither stage could produce alone, so a chain that silently dropped
+        either one would not land on it.
+        """
+        for scenario_id, comparison in ((34, 1), (35, 2)):
+            write_raster_dataset(
+                base_path,
+                years=(2025, 2040),
+                model_group_id=705,
+                scenario_id=scenario_id,
+                fill_fn=lambda year, comparison=comparison: 1 if year == 2025 else comparison,
+            )
+        monkeypatch.setattr(config, "BASE_PATH", base_path)
+        return base_path
+
+    def test_data_tif_differences_two_land_change_surfaces(self, client, land_change_dataset):
+        response = client.get("/v1/data.tif", params=self.QUERY)
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.count == 1
+            band = src.read(1, masked=True)
+        assert band.count()
+        assert set(band.compressed().tolist()) == {-1}
+
+    def test_png_tile(self, client, land_change_dataset):
+        """The reported URL's route. The failure was in the band-wide lowering rather than
+        in the sink, so a tile and a download fail and pass together -- but the tile is what
+        the map actually requests.
+        """
+        tile = _tile_for_grid(land_change_dataset)
+        response = client.get(
+            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png",
+            params={**self.QUERY, "color_map": "continuous:-1,#d53e4f,0,#00000000,1,#3288bd"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "image/png"
+
+    def test_the_download_names_the_comparison_year(self, client, land_change_dataset):
+        """`lnd_chng` alone, on the same fixture: the year the pairing could not key on is
+        still what a reader needs to know which comparison they downloaded.
+
+        It is one-sided rather than shared -- the baseline branch grouped it away so one
+        baseline band could broadcast -- so it was absent from the band descriptions while
+        the same selection's CSV (which lowers to long) reported it.
+        `band_ops._paired_metadata` carries it now, one value per pair.
+        """
+        response = client.get(
+            "/v1/data.tif",
+            params={k: v for k, v in self.QUERY.items() if k not in ("dimension", "order")}
+            | {"analysis": "lnd_chng"},
+        )
+        assert response.status_code == 200, response.text
+        with rio.open(io.BytesIO(response.content)) as src:
+            assert src.descriptions == (
+                "model_group_id=705, scenario_id=34, calendar_year=2040",
+                "model_group_id=705, scenario_id=35, calendar_year=2040",
+            )
+
+    def test_the_chained_by_still_names_the_year_the_pairing_dropped(
+        self, client, land_change_dataset
+    ):
+        """The published pipeline is the other half: the narrowing happens at execution, so
+        `by` must still ARRIVE naming `calendar_year`. If it stopped doing so, the fix above
+        would be untested by anything and this chain would quietly stop grouping on a
+        dimension a long-shape run of it still splits by.
+        """
+        response = client.get(pipeline_url("lnd_chng,diff"), params=self.QUERY)
+        assert response.status_code == 200, response.text
+        expanded = parse_pipeline(response.json())
+        assert expanded.steps[-1].op == "group"
+        assert "calendar_year" in expanded.steps[-1].by
+
+
 class TestLndTypePlusRoute:
     """`lnd_type_plus` on the consolidated routes. The fixed-input machinery itself is
     already carried by `sal_veg_investigation` above; what these pin is the one thing that

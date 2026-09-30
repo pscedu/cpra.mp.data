@@ -345,18 +345,47 @@ def _pair_band_groups(
     return grouped, key_columns, pairs
 
 
-def _paired_metadata(grouped: pl.DataFrame, key_columns: list[str], kept_rows: list[int]) -> pl.DataFrame:
-    """The metadata a paired reduce's surviving pairs leave behind: the pairing key columns
-    alone, one row per surviving pair -- the dimensions that still mean something once the
-    operand axis is gone. `add_reserved_band_index` covers the no-shared-dimension case for
-    the same "zero columns loses the row count" reason `group_band_wide`'s `by == []`
-    branch does.
+def _paired_metadata(grouped: pl.DataFrame, kept_rows: list[int], coalesced: pl.DataFrame) -> pl.DataFrame:
+    """The metadata a paired reduce's surviving pairs leave behind: the COALESCED pair rows
+    (`_coalesced_pair_metadata`), one per surviving pair, minus any column no surviving pair
+    carried a value for.
+
+    The pairing KEY columns are the dimensions the pair was formed on; they are what this
+    used to return alone. The rest are the one-sided ones -- a dimension only one operand
+    carried, which pairing could not key on because the other operand has no value for it.
+    Dropping those made band-wide disagree with long over the same pipeline: `long_ops.
+    join_long` keys on the columns both operands share, so a column only one of them carries
+    rides along unchanged, and the joined frame reports it. `lnd_type_plus` is the shipped
+    proof in both directions -- its `aggregate_type=mean` is in the CSV a `grid_cell`
+    request returns (that request lowers to long) and was absent from the GeoTIFF the same
+    selection downloads. `lnd_chng` is the one a reader notices: its baseline branch groups
+    `calendar_year` away so one baseline band can broadcast, which makes the comparison
+    year one-sided, so the download said which model group and scenario it compared and
+    not which year.
+
+    Coalescing is what makes the value well-defined, and `_coalesced_pair_metadata` already
+    computes it for the arms' own dimension halves: a key column is identical across the
+    pair by construction, a one-sided column has exactly one real value in it, and the
+    genuinely ambiguous case (three-plus operands, two carrying the same non-key column with
+    different values) raises there rather than being picked between here. This reuses that
+    frame rather than recomputing it, so the metadata a pair LEAVES and the metadata its
+    arms were EVALUATED against cannot drift apart.
+
+    An all-null column is dropped rather than carried: with no surviving pair holding a
+    value, it says nothing about the output, and `sink._band_descriptions` would omit it
+    from every band anyway. `add_reserved_band_index` covers what is left when that empties
+    the frame -- operands sharing no dimension and carrying no one-sided one either -- for
+    the same "zero columns loses the row count" reason `group_band_wide`'s `by == []` branch
+    does. That fallback is built from `grouped` rather than from `coalesced`: a coalesced
+    frame with no columns to coalesce has no height left to read either (Polars collapses a
+    zero-column frame outright, which is the very hazard the reserved index exists for), so
+    the row count has to come from a frame that still has columns.
     """
-    kept = grouped[kept_rows]
+    carried = [name for name in coalesced.columns if coalesced.get_column(name).null_count() < coalesced.height]
     return (
-        kept.select(key_columns)
-        if key_columns
-        else add_reserved_band_index(kept).select(RESERVED_BAND_INDEX_COLUMN)
+        coalesced.select(carried)
+        if carried
+        else add_reserved_band_index(grouped[kept_rows]).select(RESERVED_BAND_INDEX_COLUMN)
     )
 
 
@@ -898,10 +927,11 @@ def case_band_wide(
     names = band_column_names(metadata_df)
 
     if len(value_columns) > 1:
-        grouped, key_columns, pairs = _pair_band_groups(metadata_df, value_columns)
+        grouped, _key_columns, pairs = _pair_band_groups(metadata_df, value_columns)
         if not pairs:
             return empty_band_wide(window)
-        applicable = _band_applicability(_coalesced_pair_metadata(metadata_df, pairs))
+        coalesced = _coalesced_pair_metadata(metadata_df, pairs)
+        applicable = _band_applicability(coalesced)
         kept_rows = []
         band_exprs = []
         for pair_index, (row_index, _positions, substitutions) in enumerate(pairs):
@@ -918,7 +948,7 @@ def case_band_wide(
             kept_rows.append(row_index)
         return (
             _select_band_exprs(lf, band_exprs, [f"b{i}" for i in range(len(kept_rows))], extra_columns),
-            _paired_metadata(grouped, key_columns, kept_rows),
+            _paired_metadata(grouped, kept_rows, coalesced),
             window,
         )
 
@@ -934,6 +964,33 @@ def case_band_wide(
         for position, name in enumerate(names)
     ]
     return _select_band_exprs(lf, exprs, names, extra_columns), metadata_df, window
+
+
+def _present_group_columns(metadata_df: pl.DataFrame, by: Sequence[str]) -> list[str]:
+    """`by` narrowed to the metadata columns this frame actually carries.
+
+    A band-wide `group`'s `by` names METADATA columns, one row per band. A pipeline's `by`
+    is written in terms of DIMENSIONS the caller steers, and in long shape those coincide --
+    every steerable dimension is a column of the frame. Band-wide they can come apart, since
+    a band-wide frame's metadata carries only what its bands have values for.
+
+    This is a BACKSTOP, not the fix for the one case that made it necessary. `lnd_chng,diff`
+    over a raster grid used to arrive here with `calendar_year` in `by` and no such column:
+    `lnd_chng`'s baseline branch groups the year away so one baseline band can broadcast,
+    which made the year one-sided, and `_paired_metadata` used to keep the pairing key
+    alone. It carries a one-sided column now -- see that function -- so the year is present
+    and this narrowing no longer bites there. What is left for it is a `by` naming a column
+    NO band has a value for, where there is genuinely nothing to group on.
+
+    Dropping rather than raising is sound rather than lenient: a band-wide frame reaching a
+    `group` holds one row per band, and a column absent from that frame took no more than
+    one value across every band in it -- grouping on a constant cannot split anything, and
+    grouping on a dimension no band carries cannot either.
+
+    `op.of` keeps its hard error above for the opposite reason: `of` READS a band's value
+    for a column, so an absent one has nothing to read and no harmless reading.
+    """
+    return [name for name in by if name in metadata_df.columns]
 
 
 def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequence[str]) -> BandWideFrame:
@@ -979,11 +1036,12 @@ def group_band_wide(band_wide: BandWideFrame, op: GroupOp, extra_columns: Sequen
             f"('value') nor one of its band metadata columns ({sorted(metadata_df.columns)})"
         )
     of_values = metadata_df.get_column(op.of).to_list() if op.of != "value" else None
+    by = _present_group_columns(metadata_df, op.by)
     indexed = metadata_df.with_row_index("__pos")
-    groups_df = indexed.group_by(op.by, maintain_order=True).agg(pl.col("__pos"))
+    groups_df = indexed.group_by(by, maintain_order=True).agg(pl.col("__pos"))
 
-    if op.by:
-        metadata_out = groups_df.select(op.by)
+    if by:
+        metadata_out = groups_df.select(by)
     else:
         metadata_out = add_reserved_band_index(groups_df).drop("__pos")
 

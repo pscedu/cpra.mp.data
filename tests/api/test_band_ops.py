@@ -1202,17 +1202,45 @@ class TestCaseBandWidePaired:
 
     def test_no_shared_dimension_pairs_every_band_into_one_group(self):
         """When the operands share no non-null dimension at all there is nothing to key on,
-        so the whole frame is one pairing group. It still has to be a well-formed pair, and
-        the surviving band is indexed by `RESERVED_BAND_INDEX_COLUMN` -- the same fallback
-        `group_band_wide` uses for `by == []`.
+        so the whole frame is one pairing group. It still has to be a well-formed pair.
+
+        The surviving band keeps the ONE-SIDED dimension the pairing could not key on:
+        `calendar_year` is null on `sal`'s row, so it is no part of the key, but `marsh`
+        carries 2030 and there is exactly one value for the pair to report. That is what
+        `long_ops.join_long` does with a column only one operand carries, and a paired
+        band-wide reduce is the same pipeline in the other shape.
         """
         lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
         metadata_df = pl.DataFrame(
             {
-                # Every pairable column is null in at least one row, so none qualifies.
+                # Null on one side, so it cannot be a pairing key -- but it is still the
+                # only thing that says WHEN the surviving band is.
                 "calendar_year": [2030, None],
                 JOIN_OPERAND_COLUMN: ["marsh", "sal"],
             }
+        )
+        out_lf, out_metadata, _window_out = case_band_wide(
+            (lf, metadata_df, _window(height=1)),
+            _case_op(("marsh > 1 AND sal > 1", "marsh")),
+            extra_columns=[],
+            value_columns=("marsh", "sal"),
+        )
+
+        assert out_metadata.columns == ["calendar_year"]
+        assert out_metadata["calendar_year"].to_list() == [2030]
+        assert out_lf.collect()["b0"].to_list() == [5.0]
+
+    def test_nothing_left_to_report_uses_the_reserved_band_index(self):
+        """The fallback the case above used to take, now reached only when there is neither
+        a shared dimension nor a one-sided one: `variable` is per-band identity
+        (`PAIRING_KEY_EXCLUDED_COLUMNS`), so it is neither pairable nor reportable, and the
+        pair has nothing left to say about itself. `RESERVED_BAND_INDEX_COLUMN` is what keeps
+        the metadata frame's HEIGHT meaningful there -- the same fallback `group_band_wide`
+        uses for `by == []`.
+        """
+        lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
+        metadata_df = pl.DataFrame(
+            {"variable": ["marsh", "sal"], JOIN_OPERAND_COLUMN: ["marsh", "sal"]}
         )
         out_lf, out_metadata, _window_out = case_band_wide(
             (lf, metadata_df, _window(height=1)),
@@ -1270,6 +1298,46 @@ class TestGroupBandWide:
         assert list(result.columns) == ["b0"]
         # every band collapses into the one group: 1+10+100, None+20+200, 3+None+300
         assert result["b0"].to_list() == [111, 220, 303]
+
+    def test_by_naming_a_column_the_metadata_lacks_is_narrowed_away(self):
+        """A pipeline's `by` is written in terms of DIMENSIONS the caller steers; band-wide,
+        `group`'s `by` names METADATA columns, and a band-wide frame's metadata carries only
+        what its bands have values for. A `by` naming a column no band carries has nothing
+        to group on, and `_present_group_columns` drops it rather than letting it reach
+        polars as `unable to find column ...`.
+
+        Dropping is sound rather than lenient: the frame holds one row per band, so a column
+        absent from it took no more than one value across every band, and grouping on a
+        constant cannot split anything. The result must therefore be indistinguishable from
+        asking for the present column alone.
+
+        The shipped request that first hit this -- `lnd_chng,diff` over a raster grid --
+        no longer reaches it: the year was one-sided rather than absent, and
+        `band_ops._paired_metadata` carries a one-sided column now
+        (`tests/api/test_analyses_endpoints.py::TestLandChangeChainRoute`). This stays as
+        the backstop for a `by` naming a column that really is nowhere in the frame.
+        """
+        band_wide = _three_band_fixture()
+        op = GroupOp(step_no=1, input="x", by=["regime", "calendar_year"], aggregate="sum", output="y")
+        out_lf, out_metadata, _window_out = group_band_wide(band_wide, op, extra_columns=[])
+        result = out_lf.collect()
+
+        # The absent name is gone from the output frame too -- not carried as a null column.
+        assert out_metadata.columns == ["regime"]
+        assert out_metadata["regime"].to_list() == ["a", "b"]
+        assert result["b0"].to_list() == [11, 20, 3]
+        assert result["b1"].to_list() == [100, 200, 300]
+
+    def test_by_entirely_absent_falls_back_to_the_reserved_band_index(self):
+        # Narrowed to nothing is the same case as `by=[]` above, and has to take the same
+        # branch rather than emit a metadata frame with no columns at all.
+        band_wide = _three_band_fixture()
+        op = GroupOp(step_no=1, input="x", by=["calendar_year"], aggregate="sum", output="y")
+        out_lf, out_metadata, _window_out = group_band_wide(band_wide, op, extra_columns=[])
+
+        assert out_metadata.columns == [RESERVED_BAND_INDEX_COLUMN]
+        assert out_metadata[RESERVED_BAND_INDEX_COLUMN].to_list() == [0]
+        assert out_lf.collect()["b0"].to_list() == [111, 220, 303]
 
     def test_no_bands_returns_empty(self):
         window = _window(height=2)
