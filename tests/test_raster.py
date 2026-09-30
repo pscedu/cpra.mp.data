@@ -375,3 +375,110 @@ class TestVrt:
             band.set("band", "2")
             out.append(band)
         assert len(out.findall("VRTRasterBand")) == 2
+
+
+class TestCompactCogIncludeValues:
+    """Writing only *some* of a partition's bands into a separate tree.
+
+    This is what `scripts/migrate_to_long_format.py --append-missing` runs on: an output
+    tree built by an earlier migration pass, and an input tree that has since grown new
+    single-band COGs. Only the bands the output lacks may be written, and they must be
+    written even when each one is, on its own, already sitting in a perfectly good file.
+    """
+
+    def _band_values(self, path):
+        with rio.open(path) as src:
+            return sorted(int(desc.split("=")[1]) for desc in src.descriptions)
+
+    def test_writes_only_the_requested_values(self, base_path, tmp_path):
+        output_path = tmp_path / "out"
+        write_raster_dataset(base_path, years=(2030, 2031, 2032))
+
+        result = compact_cog(
+            base_path=base_path,
+            output_base_path=output_path,
+            catalog_path=None,
+            include_values=[2032],
+            **RASTER_KWARGS,
+        )
+
+        assert len(result["outputs"]) == 1
+        assert self._band_values(result["outputs"][0]) == [2032]
+
+    def test_an_excluded_band_does_not_extend_a_run(self, base_path, tmp_path):
+        """2030 and 2032 are only contiguous *through* 2031. Excluding 2031 has to leave two
+        one-band files, not one file claiming a run it doesn't have -- the same way a
+        genuinely absent year would."""
+        output_path = tmp_path / "out"
+        write_raster_dataset(base_path, years=(2030, 2031, 2032))
+
+        result = compact_cog(
+            base_path=base_path,
+            output_base_path=output_path,
+            catalog_path=None,
+            include_values=[2030, 2032],
+            **RASTER_KWARGS,
+        )
+
+        assert sorted(self._band_values(p) for p in result["outputs"]) == [[2030], [2032]]
+
+    def test_out_of_place_copies_a_group_that_is_already_optimal(self, base_path, tmp_path):
+        """A lone year lives optimally in its own single-band file already, so an in-place
+        compaction leaves it alone. Out-of-place that reasoning doesn't hold: the file isn't
+        in the output tree at all, and skipping it would silently drop the year."""
+        output_path = tmp_path / "out"
+        write_raster_dataset(base_path, years=(2030,))
+
+        result = compact_cog(
+            base_path=base_path, output_base_path=output_path, catalog_path=None, **RASTER_KWARGS
+        )
+
+        assert len(result["outputs"]) == 1
+        assert self._band_values(result["outputs"][0]) == [2030]
+
+    def test_in_place_still_skips_a_group_that_is_already_optimal(self, base_path):
+        """The converse: nothing to gain from rewriting a file into itself."""
+        write_raster_dataset(base_path, years=(2030,))
+
+        result = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
+
+        assert result == {"outputs": [], "sources_merged": 0}
+        assert len(list(base_path.rglob("*.tif"))) == 1
+
+    def test_refuses_to_filter_an_in_place_merge(self, base_path):
+        """In place, compact_cog unlinks the sources it consumed. A source holding both an
+        included and an excluded band would be unlinked with the excluded band still only
+        in it -- so the combination is refused rather than silently losing data."""
+        write_raster_dataset(base_path, years=(2030, 2031))
+
+        with pytest.raises(ValueError, match="output_base_path"):
+            compact_cog(base_path=base_path, catalog_path=None, include_values=[2030], **RASTER_KWARGS)
+
+        assert len(list(base_path.rglob("*.tif"))) == 2
+
+    def test_catalogs_only_the_values_it_wrote(self, base_path, tmp_path):
+        """The catalog rows have to describe what landed in the output tree, not what
+        compact_cog happened to read on the way there.
+
+        The catalog is a directory of its own rather than the ``catalog_path`` fixture: the
+        sources are written by ``write_cog``, whose own catalog hook would otherwise have
+        already recorded all three years there before compact_cog ran.
+        """
+        output_path = tmp_path / "out"
+        out_catalog = tmp_path / "out-catalog"
+        write_raster_dataset(base_path, years=(2030, 2031, 2032))
+
+        compact_cog(
+            base_path=base_path,
+            output_base_path=output_path,
+            catalog_path=out_catalog,
+            include_values=[2032],
+            **RASTER_KWARGS,
+        )
+
+        rows = pl.concat(
+            [pl.read_parquet(p) for p in out_catalog.rglob("*.parquet")], how="diagonal_relaxed"
+        )
+        assert rows.height == 1
+        assert rows["calendar_year_min"][0] == 2032
+        assert rows["calendar_year_max"][0] == 2032

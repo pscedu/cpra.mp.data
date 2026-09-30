@@ -574,6 +574,7 @@ def compact_cog(
     compression_level=6,
     group_years=DECADE_GROUP_YEARS,
     vrt_transform=None,
+    include_values=None,
     **kwargs,
 ):
     """Merge maximal contiguous calendar runs of COGs into larger multi-band COGs.
@@ -619,9 +620,20 @@ def compact_cog(
     (canonical dataset-directory order) instead of alongside their sources, and leaves
     the source files in place -- used by the migration to build a long-format tree
     out-of-place without mutating the input ``base_path``. It defaults to ``base_path``
-    (the in-place behavior). Out-of-place mode assumes every source needs rewriting
-    (true for legacy COGs, which are always rewritten): a group already living optimally
-    in a single up-to-date file is skipped and would *not* be copied across.
+    (the in-place behavior). Out-of-place mode copies every group across, including one
+    already living optimally in a single up-to-date file -- the point of that mode is a
+    *complete* output tree, and the "already optimal" skip below would silently leave such
+    a group out of it. (Harmless while every source was a legacy COG, since those are
+    rewritten regardless; not once current-format single-band COGs are in the mix, which
+    is exactly what a model run writing into the input tree mid-migration produces.)
+
+    ``include_values``, when given, is a collection of calendar values: every band whose
+    value is not among them is dropped before runs are detected, so only those values are
+    written and catalogued.  Used by ``scripts/migrate_to_long_format.py --append-missing``
+    to add just the bands an output partition is missing, as extra files alongside the ones
+    already there (compact the output in place afterwards to consolidate them).  Restricted
+    to out-of-place writes: an in-place merge unlinks the sources it consumed, and a source
+    holding both included and excluded bands would take the excluded ones down with it.
 
     ``vrt_transform``, when given, is called as ``(vrt_text, dtype) -> (vrt_text, dtype)``
     on each group's finished VRT, just before it is copied to the output, and lets a caller
@@ -643,6 +655,11 @@ def compact_cog(
     base_path = get_base_path(base_path)
     catalog_path = get_write_catalog_path(catalog_path)
     output_base_path = base_path if output_base_path is None else Path(output_base_path)
+    if include_values is not None:
+        if output_base_path == base_path:
+            msg = "include_values requires an output_base_path other than base_path"
+            raise ValueError(msg)
+        include_values = set(include_values)
     dataset_dir = dataset_path(base_path, **kwargs)
     grid = GRIDS[kwargs["grid"]]
 
@@ -684,6 +701,14 @@ def compact_cog(
                 legacy_paths.add(tif)
             tif_tags[tif] = {k: v for k, v in tags.items() if k in METADATA_DIMENSIONS}
             triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
+
+        if include_values is not None:
+            # Before the sort/run detection, so an excluded band can't join a run and
+            # drag its neighbours into a rewrite -- and so a gap left by an excluded
+            # band ends the run around it, exactly as a genuinely absent band would.
+            triples = [triple for triple in triples if triple[0] in include_values]
+            if not triples:
+                continue
 
         triples.sort(key=lambda triple: triple[0])
         values = pl.Series([value for value, _tif, _band in triples])
@@ -743,9 +768,11 @@ def compact_cog(
                 # that file's bands split off into a different group, is already
                 # optimal; nothing to gain from rewriting it. A legacy group is
                 # rewritten regardless of file count -- that's its only path into the
-                # new format.
+                # new format. Out-of-place, nothing is "already" anything: the group is
+                # not in the output tree at all yet, so it is always written.
                 already_optimal = (
-                    not run_is_legacy
+                    output_base_path == base_path
+                    and not run_is_legacy
                     and len(unique_paths) == 1
                     and path_band_counts[next(iter(unique_paths))] == len(sub_run)
                 )
