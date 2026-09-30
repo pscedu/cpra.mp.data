@@ -1,13 +1,39 @@
 """`lnd_chng` -- a dataset-scoped, `kind="variable"` analysis producing a categorical
 land-type-change code (`variables=["lnd_type"]`, `legend="lnd_chng"`) between an
-automatically-derived baseline year and a caller-selected comparison year. Renamed from
-`concatenate`, whose caller-facing shape it replaces: rather than the caller supplying any
-filterable `dimension` and exactly 2 values of it, `lnd_chng` fixes the concatenation
+automatically-derived baseline year and the caller-selected comparison year(s). Renamed
+from `concatenate`, whose caller-facing shape it replaces: rather than the caller supplying
+any filterable `dimension` and exactly 2 values of it, `lnd_chng` fixes the concatenation
 axis to `calendar_year` and derives the earlier (baseline) year itself from the selected
-`model_group_id`, so the caller supplies only the later (comparison) year -- the same
-single-value shape selecting `calendar_year` already has for every other variable. This is
-the concrete sense in which `lnd_chng` "behaves like a variable" rather than a special
-multi-select mode.
+`model_group_id`, so the caller supplies only the later year(s) -- the same shape selecting
+`calendar_year` already has for every other variable. This is the concrete sense in which
+`lnd_chng` "behaves like a variable" rather than a special multi-select mode.
+
+**The baseline broadcasts; it is not one half of a pair.** Each comparison year is compared
+against the SAME derived baseline and comes back as its own row/band, so a land-type change
+series over time is an ordinary `calendar_year` selection -- several values, or (as a chart
+request sends it) none at all, which means every year. That is why `calendar_year` is not in
+`Meta.subsumed_dimensions` and why this pipeline ends on a `calculate` rather than a
+`group`: the caller still selects years, the result still varies over them, and nothing
+here folds the axis away.
+
+The broadcast is the `join`. The baseline branch is filtered to the derived year and then
+`group`ed over every OTHER required dimension, which drops its `calendar_year` column; the
+comparison branch keeps every selected year. `execution.long_ops.join_long` keys on
+`grid_cell` plus the columns both operands carry, so a column only one of them carries
+rides along unchanged -- one baseline value per grid cell, fanned out across every
+comparison year. Band-wide, the same missing column is excluded from
+`execution.band_ops._pair_band_groups`'s pairing key, which pairs the baseline band with
+the comparison band for any single year.
+
+**Band-wide output takes exactly one comparison year**, and `pipeline()` -- not
+`validate_selection`, which cannot see the grid -- 400s on any other count. That pairing
+requires exactly one band per operand per group, and with `calendar_year` out of the key a
+one-band baseline against N comparison bands is a single group holding N+1 bands: a pairing
+MISS, which drops silently and surfaces as an empty result rather than as anything a caller
+could act on. A raster selection lowers to long when (and only when) it carries a spatial
+conjunct (`request.ops.FILTER_LOWERING_TABLE`), which is what a per-grid-cell chart request
+always does, so the series a chart asks for is unaffected -- as is every vector dataset,
+which is long throughout.
 
 The baseline-year rule is a business rule, not derived from anything else in this
 codebase: `model_group_id` values below `BASELINE_ERA_BREAKPOINT` belong to an earlier
@@ -19,19 +45,22 @@ LOWER of the two decides the era regardless of where the other one falls -- e.g.
 
 Two modes, selected by how many `model_group_id` values are selected (mirrors
 `concatenate`'s own two-mode split; see that history for the portal-side derivation this
-replaces, `cpra-mp-ui/src/helpers/catalog.ts`'s `threeImage` reading):
+replaces, `cpra-mp-ui/src/helpers/catalog.ts`'s `threeImage` reading). Both place each
+land-type value in its own decimal digit and add them:
 
-* **two-image** (`model_group_id` selected to exactly 1 value): a `case` whose one arm is
-  `value * 10` when `calendar_year = t0` (the derived baseline year), with `else` `value`,
-  then `group`/`sum` over every other required dimension.
-* **three-image** (`model_group_id` selected to exactly 2 values, `mg0 < mg1`): a `filter`
-  dropping `model_group_id = mg1 AND calendar_year = t0` (the redundant corner), then a
-  `case` whose arms are `value * 100` when `calendar_year = t0` and `value * 10` when
-  `model_group_id = mg0 AND calendar_year = t1`, with `else` `value`, then `group`/`sum`
-  over every other required dimension (excluding `model_group_id`, which the `case` above
-  has folded away).
+* **two-image** (`model_group_id` selected to exactly 1 value): `baseline * 10 +
+  comparison`, where `baseline` is the derived year's land type and `comparison` is each
+  selected year's, unchanged.
+* **three-image** (`model_group_id` selected to exactly 2 values, `mg0 < mg1`):
+  `baseline * 100 + comparison`, where `baseline` is `mg0`'s land type in the derived year
+  and `comparison` is the two model groups' land types in the selected year already packed
+  into two digits -- `mg0`'s multiplied by 10 and `mg1`'s passed through, summed by the
+  `group` that folds `model_group_id` away. The 2x2 (model group x year) grid's fourth
+  corner, `mg1` in the baseline year, is simply never read: the baseline branch is filtered
+  to `mg0`. It used to be excluded by a `NOT (...)` conjunct on a single shared read, which
+  is the same thing said negatively because there was one branch to say it on.
 
-Both modes' `else` is `value`, not omitted: the cell the arms do not name is the ones
+The three-image `case`'s `else` is `value`, not omitted: `mg1`'s land type is the ones
 digit, and it has to arrive at the `sum` unchanged rather than null.
 """
 
@@ -47,6 +76,7 @@ from cpra.mp.data.analyses.base import (
     selection_filter_where,
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
+from cpra.mp.data.grids import GRIDS
 
 # The model_group_id boundary between the two baseline eras. Given directly by the
 # maintainer -- no existing convention in either repo names this boundary or either
@@ -65,27 +95,31 @@ class LandChange(Analysis):
         variables=["lnd_type"],
         legend="lnd_chng",
         result_kind="category",
-        # Unconditional: `lnd_type` only exists at annual grain, so `calendar_year` is
-        # always the concatenation axis. `model_group_id`'s OTHER subsumption (in
-        # three-image mode only) is not declared here at all, because it isn't static --
-        # the runtime `collapsed_dimensions` (derived structurally by
-        # `default_collapsed_dimensions`, since this pipeline always ends in an ordinary
-        # `group`) already reports it correctly per-request.
-        subsumed_dimensions=["calendar_year"],
+        # Nothing. This field is what the portal hides from the caller
+        # (`Structure.subsumedFor`), and `calendar_year` is the one dimension this analysis
+        # most needs a caller to keep: the comparison years are selected, the result varies
+        # over them, and a chart plots them. It DID list `calendar_year`, back when the two
+        # years were fused into one code by a trailing `group`/`sum` -- see the module
+        # docstring's second paragraph for what replaced that.
+        #
+        # `model_group_id`'s subsumption (in three-image mode only) is not declared here
+        # either, and for the reason it never was: it isn't static. The runtime
+        # `collapsed_dimensions` below reports it correctly per-request.
+        subsumed_dimensions=[],
     )
 
     class Parameters(Analysis.Parameters):
-        pass  # no fields -- comparison year and image count both come from ordinary filters
+        pass  # no fields -- comparison years and image count both come from ordinary filters
 
     @classmethod
     def validate_selection(cls, parameters: "LandChange.Parameters", filters: dict) -> None:
-        raw = filters.get("calendar_year")
-        values = normalized_filter_values("calendar_year", raw) if raw is not None else []
-        if len(values) != 1:
-            raise InvalidAnalysisParametersError(
-                "lnd_chng requires exactly 1 selected calendar_year (the comparison "
-                f"year -- the baseline year is derived automatically), got {raw!r}"
-            )
+        """`calendar_year` has no rule here at all any more, and its absence is the
+        interesting half: an unselected dimension means "every value of it" everywhere else
+        in this system, and it means that here too -- every year against the derived
+        baseline, which is the series a chart asks for. It used to be "exactly 1", which is
+        a rule only a raster IMAGE needs; `pipeline()` states that one where the grid kind
+        is known (see the module docstring's third paragraph), so a chart is not held to it.
+        """
         mg_raw = filters.get("model_group_id")
         mg_values = normalized_filter_values("model_group_id", mg_raw) if mg_raw is not None else []
         if len(mg_values) not in (1, 2):
@@ -94,64 +128,147 @@ class LandChange(Analysis):
                 f"or exactly 2 (three-image mode), got {len(mg_values)}: {mg_raw!r}"
             )
 
+    @property
+    def _three_image(self) -> bool:
+        """Two selected `model_group_id` values, the three-image mode. Read by
+        `pipeline()` and by `collapsed_dimensions`, which must agree about it without one
+        having to build the other.
+        """
+        raw = self.filters.get("model_group_id")
+        return len(normalized_filter_values("model_group_id", raw) if raw is not None else []) == 2
+
+    @property
+    def collapsed_dimensions(self) -> frozenset[str]:
+        """Stated here rather than derived, because `base.default_collapsed_dimensions`
+        reads a trailing `group.by` and this pipeline ends on a `calculate`.
+
+        The answer is also shorter than it used to be. `calendar_year` is no longer in it:
+        the result carries one value per (grid cell, selected comparison year), so the
+        caller's own year selection still varies the output and the visualization layer
+        must keep the column. `model_group_id` is, in three-image mode only, because the
+        two selected model groups are packed into two digits of a single code and the
+        `group` that packs them drops the column.
+        """
+        return frozenset({"model_group_id"}) if self._three_image else frozenset()
+
     def pipeline(self):
-        self.require_dataset()
+        dataset = self.require_dataset()
         dim = "calendar_year"
-        t1 = normalized_filter_values(dim, self.filters[dim])[0]
+        # An empty list is "every year", the ordinary meaning of an unselected dimension --
+        # `selection_filter_where` writes no conjunct for it and the comparison branch reads
+        # the lot. See `validate_selection`.
+        raw_years = self.filters.get(dim)
+        years = normalized_filter_values(dim, raw_years) if raw_years is not None else []
         mg_values = normalized_filter_values("model_group_id", self.filters["model_group_id"])
         three_image = len(mg_values) == 2
         t0 = EARLY_BASELINE_YEAR if min(mg_values) < BASELINE_ERA_BREAKPOINT else LATE_BASELINE_YEAR
 
-        # t0 is never one of the caller's own filter values -- fold it in the same way
-        # `lnd_conf` folds in its fixed `scenario_id` set, so BOTH years reach
-        # the leading filter step rather than just the caller-selected one.
-        filters = {**self.filters, dim: [t0, t1]}
-
-        required = required_dataset_dimensions(self.dataset)
-        group_by = [d for d in required if d != dim]
-        if three_image:
-            group_by = [d for d in group_by if d != "model_group_id"]
-            mg0, mg1 = sorted(mg_values)
-
-        # Folding t0/t1 into `filters` above guarantees `selection_filter_where` always
-        # returns a conjunct (at minimum the `calendar_year IN (...)` one), unlike
-        # `diff`/the old `concatenate`, which may see an empty `filters` on a direct
-        # constructor call -- so the leading `filter` step here is unconditional.
-        conjuncts = [selection_filter_where(filters, grid_cell_where=self.grid_cell_where)]
-        if three_image:
-            # Drop the redundant corner of the 2x2 (model_group_id, calendar_year) grid,
-            # so the three surviving cells are what the `case` below encodes.
-            conjuncts.append(
-                f"NOT (model_group_id = {format_dimension_literal('model_group_id', mg1)} "
-                f"AND {dim} = {format_dimension_literal(dim, t0)})"
+        # A raster selection stays band-wide unless something lowers it, and only a SPATIAL
+        # conjunct does (`request.ops.FILTER_LOWERING_TABLE`) -- a caller's value `where`
+        # does not. Band-wide, the join below pairs one baseline band against one comparison
+        # band and N of them pair-MISS, which drops silently; say so instead. See the module
+        # docstring's third paragraph.
+        spatial = self.grid_cell_where is not None or bool(self.filters.get("grid_cell"))
+        if len(years) != 1 and not spatial and GRIDS[dataset.grid].grid_type == "raster":
+            got = f"got {len(years)}: {years!r}" if years else "none selected, which is all of them"
+            raise InvalidAnalysisParametersError(
+                f"lnd_chng draws one image per comparison year and a raster grid "
+                f"({dataset.grid!r}) holds one, so select exactly 1 calendar_year -- {got}. "
+                "Several years are a series rather than an image; select a grid_cell to ask "
+                "for one."
             )
-        steps: list[dict] = [{"op": "filter", "where": " AND ".join(c for c in conjuncts if c)}]
 
-        # Place each surviving cell in its own decimal digit, then let `group sum` pack
-        # them into one number -- see `concatenate`'s own history for why these are ARMS
-        # rather than successive rewrites (`case` tests every `when` against the value the
-        # frame arrived with, so the `* 10` arm cannot see what the `* 100` arm wrote).
+        # t0 is never one of the caller's own filter values -- fold it in the same way
+        # `lnd_conf` folds in its fixed `scenario_id` set. Each branch states the WHOLE
+        # selection, its own year(s) included, so both narrow to their own bands at the
+        # read: `execution.plan`'s dimension passes push a conjunct to the origins that
+        # actually feed the frame it was written on, not to every origin in the pipeline.
+        baseline_filters = {**self.filters, dim: [t0]}
+        comparison_filters = {**self.filters, dim: years}
         if three_image:
-            cases = [
-                {"when": f"{dim} = {format_dimension_literal(dim, t0)}", "then": "value * 100"},
+            # The 2x2 grid's fourth corner (`mg1` in the baseline year) is redundant, and
+            # here it is simply not read: the baseline is `mg0`'s.
+            mg0, mg1 = sorted(mg_values)
+            baseline_filters["model_group_id"] = [mg0]
+
+        required = required_dataset_dimensions(dataset)
+        # Dropping `calendar_year` from the baseline's `group.by` is the whole point of the
+        # step: with the column gone, the join has nothing to match it against and the one
+        # baseline value per grid cell broadcasts across every comparison year. The
+        # aggregate itself is an identity -- one year, one model group, one row per cell.
+        baseline_by = [d for d in required if d != dim]
+        comparison_by = list(required)
+        if three_image:
+            baseline_by = [d for d in baseline_by if d != "model_group_id"]
+            comparison_by = [d for d in comparison_by if d != "model_group_id"]
+
+        # Both branches' `where` is unconditional: folding the year(s) into `filters` above
+        # guarantees `selection_filter_where` returns a conjunct (at minimum the
+        # `calendar_year` one), unlike `diff`, which may see an empty `filters` on a direct
+        # constructor call.
+        steps: list[dict] = [
+            {
+                "op": "filter",
+                "input": "base",
+                "where": selection_filter_where(
+                    baseline_filters, grid_cell_where=self.grid_cell_where
+                ),
+                "as": "baseline_year",
+            },
+            {"op": "group", "by": baseline_by, "aggregate": "sum", "as": "baseline"},
+            {
+                "op": "filter",
+                "input": "years",
+                "where": selection_filter_where(
+                    comparison_filters, grid_cell_where=self.grid_cell_where
+                ),
+                # A join operand's name IS the value column name the `calculate` below
+                # reads, so in two-image mode this filter's output is the operand itself.
+                "as": "comparison_years" if three_image else "comparison",
+            },
+        ]
+        if three_image:
+            # The tens and ones digits, packed on the comparison branch alone so the
+            # baseline is free to broadcast: `mg0`'s land type is multiplied by 10, `mg1`'s
+            # passes through, and the `group` below sums the pair per (grid cell, year).
+            # That `group` is also what drops `model_group_id`, without which the two model
+            # groups' bands would be keyed apart and never meet.
+            steps.append(
                 {
-                    "when": (
-                        f"model_group_id = {format_dimension_literal('model_group_id', mg0)} "
-                        f"AND {dim} = {format_dimension_literal(dim, t1)}"
-                    ),
-                    "then": "value * 10",
-                },
-            ]
-        else:
-            cases = [{"when": f"{dim} = {format_dimension_literal(dim, t0)}", "then": "value * 10"}]
-        steps.append({"op": "case", "cases": cases, "else": "value"})
-        steps.append({"op": "group", "by": group_by, "aggregate": "sum"})
-        # A pipeline's first step must name its input explicitly; every later step chains
-        # from the one before it.
-        steps[0]["input"] = "x"
+                    "op": "case",
+                    "cases": [
+                        {
+                            "when": f"model_group_id = {format_dimension_literal('model_group_id', mg0)}",
+                            "then": "value * 10",
+                        }
+                    ],
+                    "else": "value",
+                    "as": "scaled",
+                }
+            )
+            steps.append(
+                {"op": "group", "by": comparison_by, "aggregate": "sum", "as": "comparison"}
+            )
+        steps.append(
+            {"op": "join", "type": "spatial", "inputs": ["baseline", "comparison"], "as": "paired"}
+        )
+        # The hundreds digit (three-image) or the tens digit (two-image), and the single
+        # value column the sink rule requires: a `calculate` always produces exactly one,
+        # whatever the join handed it. A null on either operand carries through as a null,
+        # which is the right answer -- a grid cell with no baseline has no change to report.
+        steps.append(
+            {"op": "calculate", "expression": f"baseline * {100 if three_image else 10} + comparison"}
+        )
 
         data = {
-            "inputs": {"x": dataset_input_selection(self.dataset)},
+            # The same dataset twice, once per branch. `execution.plan` narrows each origin
+            # from the conjuncts on the frames it feeds, so the baseline read is one year
+            # wide and the comparison read is the caller's selection -- not both reading
+            # both.
+            "inputs": {
+                "base": dataset_input_selection(dataset),
+                "years": dataset_input_selection(dataset),
+            },
             "steps": steps,
             # Derived from the dataset's grid kind: this analysis neither projects nor
             # otherwise changes shape, so a vector selection ends tabular and a raster one
@@ -160,6 +277,6 @@ class LandChange(Analysis):
             # `data.{format}`/tile routes overwrite it from their own URL segment -- but
             # what `pipeline.json` publishes has to be resubmittable, and this analysis's
             # own `Meta.variables` (`lnd_type`) lives only on a raster grid.
-            "output": {"format": dataset_output_format(self.dataset)},
+            "output": {"format": dataset_output_format(dataset)},
         }
         return parse_pipeline(data)

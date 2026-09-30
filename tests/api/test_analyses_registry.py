@@ -383,9 +383,34 @@ class TestLandChangeExecution:
             params={},
         )
         df = _run(resolved, base_path)
-        # t0 (the baseline year) is multiplied by 10 (-> 10), t1 (2040) is untouched (->
-        # 1); summed per geography across the two years -> 11.
+        # The baseline branch is the derived year alone (-> 1), the comparison branch is
+        # 2040 (-> 1), and the join packs them as `baseline * 10 + comparison` -> 11.
         assert set(df["value"].to_list()) == {11.0}
+        # The comparison year survives the join rather than being folded into the code:
+        # the baseline carries no `calendar_year` of its own, so it broadcasts across
+        # whatever years the caller selected instead of pairing with one of them.
+        assert set(df["calendar_year"].to_list()) == {2040}
+
+    def test_every_comparison_year_is_its_own_row(self, base_path):
+        """What makes a land-change series over time possible, and the whole point of the
+        join: one derived baseline, N comparison years, N rows -- not one code per grid
+        cell with the year folded away. A chart names geographies and therefore sends no
+        `calendar_year` at all, which is this with every year selected."""
+        write_annual_dataset(
+            base_path,
+            years=(EARLY_BASELINE_YEAR, 2040, 2050),
+            value_fn=lambda year, geo_id: 1.0 if year == EARLY_BASELINE_YEAR else 2.0,
+        )
+        resolved = resolve_analysis(
+            "lnd_chng",
+            dataset=SSF_DATASET,
+            filters={**COMMON_ANNUAL_FILTERS, "calendar_year": [2040, 2050]},
+            params={},
+        )
+        df = _run(resolved, base_path)
+        # Both years compared against the SAME baseline (1 * 10 + 2 = 12), one row each.
+        assert sorted(set(df["calendar_year"].to_list())) == [2040, 2050]
+        assert set(df["value"].to_list()) == {12.0}
 
     def test_three_image_mode_encodes_all_three_corners(self, base_path):
         write_annual_dataset(
@@ -412,15 +437,16 @@ class TestLandChangeExecution:
             params={},
         )
         df = _run(resolved, base_path)
-        # Surviving corners after the `NOT (mg=520 AND year=t0)` conjunct:
-        # (500, t0) -> *100 -> 100; (500, 2040) -> *10 -> 10; (520, 2040) -> untouched -> 1.
-        # Grouped (summed) over model_group_id/calendar_year per geography: 100 + 10 + 1 = 111.
+        # The three images, each a separate branch rather than a corner of one filter:
+        # baseline (500, t0) -> *100 -> 100; comparison (500, 2040) -> *10 -> 10 and
+        # (520, 2040) -> untouched -> 1, summed over model_group_id -> 11. 100 + 11 = 111.
         assert set(df["value"].to_list()) == {111.0}
 
-    def test_the_three_image_corner_conjunct_really_drops_that_corner(self, base_path):
-        """The redundant corner is dropped by a `NOT (... AND ...)` conjunct on the
-        leading `filter` step. Give (520, t0) a value no other corner has, so its
-        survival would be visible in the sum rather than hidden by uniform values.
+    def test_the_three_image_baseline_is_the_first_model_group_alone(self, base_path):
+        """(520, t0) is the fourth corner, and it is not read at all: the baseline branch
+        filters positively to `model_group_id = 500`, so there is nothing to exclude. Give
+        it a value no other corner has, so its survival would be visible in the sum rather
+        than hidden by uniform values.
         """
         write_annual_dataset(
             base_path,
@@ -446,8 +472,9 @@ class TestLandChangeExecution:
             params={},
         )
         df = _run(resolved, base_path)
-        # Still 111: the 1000.0 corner is (520, t0), which the NOT conjunct drops. Had
-        # it survived it would have been multiplied by 100 and added 100000 to the sum.
+        # Still 111: the 1000.0 corner is (520, t0), which no branch selects. Had the
+        # baseline taken both model groups it would have summed to 1001 and packed as
+        # 100100 instead.
         assert set(df["value"].to_list()) == {111.0}
 
 

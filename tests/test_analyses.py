@@ -60,9 +60,11 @@ from cpra.mp.data.analyses.lnd_conf import (
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
+    CalculateStep,
     CaseStep,
     FilterStep,
     GroupStep,
+    JoinStep,
     ProjectStep,
     pipeline_to_query,
 )
@@ -176,7 +178,9 @@ class TestRegistry:
         assert ANALYSES["lnd_chng"].Meta.variables == ["lnd_type"]
         assert ANALYSES["lnd_chng"].Meta.legend == "lnd_chng"
         assert ANALYSES["lnd_chng"].Meta.result_kind == "category"
-        assert ANALYSES["lnd_chng"].Meta.subsumed_dimensions == ["calendar_year"]
+        # Nothing: `lnd_chng` compares every selected year against one derived baseline and
+        # keeps the year column, so `calendar_year` stays the caller's to choose.
+        assert ANALYSES["lnd_chng"].Meta.subsumed_dimensions == []
 
         assert ANALYSES["sal_veg_investigation"].Meta.result_kind == "value"
         # Explicit, and explicitly `"internal"` -- neither a portal variable nor a
@@ -788,15 +792,17 @@ class TestLandChangeParameters:
 class TestLandChangeCardinality:
     params = LandChange.Parameters()
 
-    def test_rejects_missing_calendar_year(self):
-        with pytest.raises(InvalidAnalysisParametersError):
-            LandChange.validate_selection(self.params, {"model_group_id": 500})
+    def test_accepts_a_missing_calendar_year(self):
+        """"Every year against the derived baseline" -- the series a chart asks for, which
+        is how the portal sends one (`getSpecUrl` sets `includeTimeDimension` false as soon
+        as the request names a grid cell, so no `calendar_year` reaches the API at all).
+        """
+        LandChange.validate_selection(self.params, {"model_group_id": 500})  # no raise
 
-    def test_rejects_two_calendar_years(self):
-        with pytest.raises(InvalidAnalysisParametersError):
-            LandChange.validate_selection(
-                self.params, {"calendar_year": [2030, 2040], "model_group_id": 500}
-            )
+    def test_accepts_several_calendar_years(self):
+        LandChange.validate_selection(
+            self.params, {"calendar_year": [2030, 2040], "model_group_id": 500}
+        )  # no raise
 
     def test_rejects_missing_model_group_id(self):
         with pytest.raises(InvalidAnalysisParametersError):
@@ -827,6 +833,11 @@ class TestLandChangeBaselineYear:
     """
 
     def _leading_filter(self, model_group_id):
+        """The BASELINE branch's own filter, which is `steps[0]` -- the derived year is the
+        only year on it. The comparison branch's filter (a later step) carries the caller's
+        own year selection and never the derived one; the two are separate reads now, so
+        the baseline year no longer shows up as the extra member of a two-value `IN`.
+        """
         analysis = LandChange(
             dataset=SSF_DATASET,
             filters={
@@ -839,19 +850,20 @@ class TestLandChangeBaselineYear:
         )
         leading = analysis.pipeline().steps[0]
         assert isinstance(leading, FilterStep)
+        assert "2040" not in leading.where  # the comparison year is the other branch's
         return leading
 
     def test_below_breakpoint_uses_the_early_baseline(self):
         leading = self._leading_filter(BASELINE_ERA_BREAKPOINT - 50)
-        assert f"calendar_year IN ({EARLY_BASELINE_YEAR}, 2040)" in leading.where
+        assert f"calendar_year = {EARLY_BASELINE_YEAR}" in leading.where
 
     def test_at_the_breakpoint_uses_the_late_baseline(self):
         leading = self._leading_filter(BASELINE_ERA_BREAKPOINT)
-        assert f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040)" in leading.where
+        assert f"calendar_year = {LATE_BASELINE_YEAR}" in leading.where
 
     def test_a_straddling_pair_still_uses_the_lower_ones_era(self):
         leading = self._leading_filter([650, 900])
-        assert f"calendar_year IN ({EARLY_BASELINE_YEAR}, 2040)" in leading.where
+        assert f"calendar_year = {EARLY_BASELINE_YEAR}" in leading.where
 
 
 class TestLandChangePipeline:
@@ -865,75 +877,150 @@ class TestLandChangePipeline:
 
     def test_two_image_mode(self):
         analysis, pipeline = self._build(
-            {"calendar_year": 2040, "model_group_id": 705, "scenario_id": 7, "percentile": 50}
+            {
+                "calendar_year": [2040, 2050],
+                "model_group_id": 705,
+                "scenario_id": 7,
+                "percentile": 50,
+            }
         )
-        assert len(pipeline.steps) == 3
-        leading = pipeline.steps[0]
-        assert isinstance(leading, FilterStep)
-        assert leading.input == "x"
-        assert leading.where == (
-            f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040) AND model_group_id = 705 "
+        baseline, group, comparison, join, calculate = pipeline.steps
+
+        # The baseline branch: the derived year alone, read from its own input.
+        assert isinstance(baseline, FilterStep)
+        assert baseline.input == "base"
+        assert baseline.where == (
+            f"calendar_year = {LATE_BASELINE_YEAR} AND model_group_id = 705 "
             "AND percentile = 50 AND scenario_id = 7"
         )
-        case = pipeline.steps[1]
-        assert isinstance(case, CaseStep)
-        assert [(arm.when, arm.then) for arm in case.cases] == [
-            (f"calendar_year = {LATE_BASELINE_YEAR}", "value * 10")
-        ]
-        # The ones digit: the year no arm names keeps its value through the `sum`.
-        assert case.else_ == "value"
-        group = pipeline.steps[2]
+        # THE BROADCAST. `calendar_year` is missing from `by`, so the group drops the
+        # column, and `join_long`/`_pair_band_groups` then have nothing to match it
+        # against -- one baseline value per grid cell against every comparison year. The
+        # `sum` itself is an identity here: one year, one model group, one row per cell.
         assert isinstance(group, GroupStep)
         assert sorted(group.by) == sorted(["model_group_id", "scenario_id", "percentile"])
-        assert analysis.collapsed_dimensions == frozenset({"calendar_year"})
+        assert "calendar_year" not in group.by
+
+        # The comparison branch: every selected year, unreduced, straight into the join.
+        assert isinstance(comparison, FilterStep)
+        assert comparison.input == "years"
+        assert comparison.where == (
+            "calendar_year IN (2040, 2050) AND model_group_id = 705 "
+            "AND percentile = 50 AND scenario_id = 7"
+        )
+        assert comparison.as_ == "comparison"
+
+        assert isinstance(join, JoinStep)
+        assert join.inputs == ["baseline", "comparison"]
+        # A join operand's name is its value column's name, so the tens digit is written
+        # over the operands directly -- and a `calculate` leaves exactly one value column,
+        # which is what the sink rule requires.
+        assert isinstance(calculate, CalculateStep)
+        assert calculate.expression == "baseline * 10 + comparison"
+
+        # Nothing. The result carries one code per (grid cell, selected year).
+        assert analysis.collapsed_dimensions == frozenset()
 
     def test_two_image_mode_with_exactly_one_model_group_selected(self):
         # model_group_id present but pinned to a single value: still two-image.
-        analysis, pipeline = self._build(
+        _, pipeline = self._build(
             {"calendar_year": 2040, "model_group_id": [705], "scenario_id": 7, "percentile": 50}
         )
-        assert len(pipeline.steps) == 3
-        assert pipeline.steps[1].cases[0].then == "value * 10"
+        assert len(pipeline.steps) == 5
+        assert pipeline.steps[-1].expression == "baseline * 10 + comparison"
+
+    def test_an_unselected_calendar_year_means_every_year(self):
+        """The shape a chart request arrives in: no `calendar_year` at all. The comparison
+        branch then writes no year conjunct and reads the lot, while the baseline branch
+        still pins the derived year -- which is the whole series against one baseline.
+        """
+        _, pipeline = self._build(
+            {"model_group_id": 705, "scenario_id": 7, "percentile": 50}
+        )
+        baseline, _, comparison, _, _ = pipeline.steps
+        assert f"calendar_year = {LATE_BASELINE_YEAR}" in baseline.where
+        assert "calendar_year" not in comparison.where
 
     def test_three_image_mode(self):
         analysis, pipeline = self._build(
             {"calendar_year": 2040, "model_group_id": [720, 705], "scenario_id": 7, "percentile": 50}
         )
-        assert len(pipeline.steps) == 3
+        baseline, baseline_group, comparison, case, group, join, calculate = pipeline.steps
 
-        # The redundant corner is AND-ed onto the same leading `filter` the caller's own
-        # dimension filters compose into -- both are dimension conditions at the same
-        # point in the chain, so there is no reason for two consecutive filter steps.
-        filter_step = pipeline.steps[0]
-        assert isinstance(filter_step, FilterStep)
-        assert filter_step.input == "x"
+        # The 2x2 (model group x year) grid's fourth corner -- `mg1` in the baseline year --
+        # is redundant, and here it is simply never read: the baseline branch is `mg0`'s.
+        # It used to be excluded by a `NOT (...)` conjunct, which is the same thing said
+        # negatively because there was one shared read to say it on.
+        assert isinstance(baseline, FilterStep)
+        assert baseline.where == (
+            f"calendar_year = {LATE_BASELINE_YEAR} AND model_group_id = 705 "
+            "AND percentile = 50 AND scenario_id = 7"
+        )
+        assert "NOT" not in baseline.where
+        # The baseline drops `model_group_id` as well as `calendar_year`: the comparison
+        # branch folds its two model groups away too, and the two operands have to agree
+        # about which columns they still carry for the join to key on them.
+        assert sorted(baseline_group.by) == sorted(["scenario_id", "percentile"])
+
         # Dimension NAMES are sorted (so the string doesn't depend on dict order), but
         # each dimension's own VALUES keep the caller's order -- `[720, 705]` in, `(720,
         # 705)` out, matching `request.data_query`'s own conjunct assembly.
-        assert filter_step.where == (
-            f"calendar_year IN ({LATE_BASELINE_YEAR}, 2040) AND model_group_id IN (720, 705) "
-            "AND percentile = 50 AND scenario_id = 7 "
-            f"AND NOT (model_group_id = 720 AND calendar_year = {LATE_BASELINE_YEAR})"
+        assert isinstance(comparison, FilterStep)
+        assert comparison.where == (
+            "calendar_year = 2040 AND model_group_id IN (720, 705) "
+            "AND percentile = 50 AND scenario_id = 7"
         )
 
-        # Both digits in ONE step, as arms: read against the value the frame arrived with,
-        # so the hundreds arm cannot re-match what the tens arm wrote. As two successive
-        # rewrites they were independent only because their conditions happened to be
-        # disjoint.
-        case = pipeline.steps[1]
+        # The tens and ones digits, packed on the comparison branch alone so the baseline
+        # stays free to broadcast: the lower model group's land type is multiplied by 10
+        # and the higher one's passes through, and the `group` sums the pair per year.
         assert isinstance(case, CaseStep)
         assert [(arm.when, arm.then) for arm in case.cases] == [
-            (f"calendar_year = {LATE_BASELINE_YEAR}", "value * 100"),
-            ("model_group_id = 705 AND calendar_year = 2040", "value * 10"),
+            ("model_group_id = 705", "value * 10")
         ]
+        # The ones digit: the model group no arm names keeps its value through the `sum`.
         assert case.else_ == "value"
 
-        group = pipeline.steps[2]
         assert isinstance(group, GroupStep)
-        assert sorted(group.by) == sorted(["scenario_id", "percentile"])
         assert "model_group_id" not in group.by
+        assert "calendar_year" in group.by  # unlike the baseline's -- the year survives here
 
-        assert analysis.collapsed_dimensions == frozenset({"calendar_year", "model_group_id"})
+        assert isinstance(join, JoinStep)
+        assert join.inputs == ["baseline", "comparison"]
+        assert isinstance(calculate, CalculateStep)
+        assert calculate.expression == "baseline * 100 + comparison"
+
+        # `model_group_id` only. `calendar_year` still varies the result.
+        assert analysis.collapsed_dimensions == frozenset({"model_group_id"})
+
+    def test_a_raster_selection_takes_exactly_one_comparison_year(self):
+        """One image, one comparison year. Band-wide, the join pairs one baseline band
+        against one comparison band, and N comparison bands land in the same pairing group
+        (`calendar_year` is null on the baseline, so it is not in the pairing key) and
+        MISS -- which drops silently. Said out loud instead.
+        """
+        with pytest.raises(InvalidAnalysisParametersError, match="exactly 1 calendar_year"):
+            self._build(
+                {"calendar_year": [2040, 2050], "model_group_id": 705, "scenario_id": 7},
+                dataset=LND_TYPE_DATASET,
+            )
+        with pytest.raises(InvalidAnalysisParametersError, match="all of them"):
+            self._build({"model_group_id": 705, "scenario_id": 7}, dataset=LND_TYPE_DATASET)
+
+    def test_a_grid_cell_selection_lowers_a_raster_and_lifts_that_rule(self):
+        """A spatial conjunct is the one thing that lowers band-wide to long
+        (`ops.FILTER_LOWERING_TABLE`), and a per-grid-cell chart request always carries
+        one -- so the series is reachable on the raster grid `lnd_type` actually lives on,
+        not only on a vector dataset.
+        """
+        _, pipeline = self._build(
+            {"calendar_year": [2040, 2050], "model_group_id": 705, "scenario_id": 7, "grid_cell": "3"},
+            dataset=LND_TYPE_DATASET,
+        )
+        assert "calendar_year IN (2040, 2050)" in pipeline.steps[2].where
+        # Both branches carry the spatial conjunct: the baseline is narrowed to the same
+        # cells it will be broadcast over.
+        assert all("grid_cell" in step.where for step in pipeline.steps[:3] if hasattr(step, "where"))
 
     def test_meta_and_legend(self):
         analysis, _ = self._build({"calendar_year": 2040, "model_group_id": 705})
@@ -963,7 +1050,7 @@ class TestLandChangePipeline:
         assert isinstance(resolved, ResolvedAnalysis)
         assert resolved.legend == "lnd_chng"
         assert resolved.result_kind == "category"
-        assert resolved.collapsed_dimensions == frozenset({"calendar_year"})
+        assert resolved.collapsed_dimensions == frozenset()
 
     def test_missing_model_group_id_is_rejected_by_resolve_analysis(self):
         with pytest.raises(InvalidAnalysisParametersError):
@@ -1705,7 +1792,9 @@ class TestSubsumedDimensionsAreASubsetOfWhatsActuallyCollapsed:
         )
         # The extra thing three-image mode subsumes beyond what `Meta` declares -- proof
         # this mode is the strict-subset case the class docstring calls out, not equality.
-        assert resolved.collapsed_dimensions == frozenset({"calendar_year", "model_group_id"})
+        # `calendar_year` is NOT in it: every mode compares each selected year against the
+        # derived baseline and reports it, so the year axis survives both of them.
+        assert resolved.collapsed_dimensions == frozenset({"model_group_id"})
         assert set(LandChange.Meta.subsumed_dimensions) < resolved.collapsed_dimensions
         self._assert_subset_with_teeth(
             LandChange.Meta.subsumed_dimensions, resolved.collapsed_dimensions, "scenario_id"

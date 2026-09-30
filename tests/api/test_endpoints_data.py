@@ -20,6 +20,7 @@ from shapely.geometry import box
 from cpra.mp.data import config
 from cpra.mp.data.analysis.execution import fold as fold_module
 from cpra.mp.data.tabular import write_parquet
+from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 from tests.api.conftest import SEDIMENT_DYNAMICS_DATA_YEARS
 from tests.factories import (
     RASTER_KWARGS,
@@ -1102,6 +1103,57 @@ class TestVisualizationEndpoints:
         response = client.get(f"/v1/visualizations/nope.json?{VECTOR}")
         assert response.status_code == 404
 
+    def test_a_chart_over_a_collapsed_time_column_is_400(self, client, vector_data):
+        """`DatasetVisualization.validate_time_axis` through the route. A `diff` over
+        `calendar_year` returns one value per grid cell with no year column, so the chart's
+        own time transform would read a field the data URL does not carry -- and did, coming
+        back 200 with an empty plot on it, because `get_data_uri` drops a collapsed dimension
+        from `select` and nothing downstream objected."""
+        response = client.get(
+            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1"
+            "&analysis=diff&dimension=calendar_year&order=asc&calendar_year=2030&calendar_year=2040"
+        )
+        assert response.status_code == 400
+        assert "collapses calendar_year" in response.json()["detail"]
+
+    def test_a_chart_over_lnd_chng_draws_a_year_axis(self, client, vector_data):
+        """The reported URL, and it is a 200 now. It was a 400 twice over: `lnd_chng`
+        required exactly one comparison year and the portal's chart URL sends none (a chart
+        names geographies, and `getSpecUrl` passes `includeTimeDimension: !geographies`), so
+        the caller was told to supply a year -- for an analysis that then folded the year
+        away, leaving a time axis with nothing to plot.
+
+        Both halves are gone. No selected year means every year, each compared against the
+        derived baseline, one row apiece; so `calendar_year` survives into the result and is
+        in the data URL's `select` rather than dropped from it as a collapsed dimension."""
+        response = client.get(
+            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1&analysis=lnd_chng"
+            "&model_group_id=705"
+        )
+        assert response.status_code == 200
+        assert "calendar_year" in response.json()["data"]["url"]
+
+    def test_the_map_draws_a_collapsed_time_column(self, client, vector_data):
+        """The visualization the error above sends readers to: `Meta.time_axis = False`."""
+        response = client.get(
+            f"/v1/visualizations/map.json?{VECTOR}&grid_cell=1"
+            "&analysis=diff&dimension=calendar_year&order=asc&calendar_year=2030&calendar_year=2040"
+        )
+        assert response.status_code == 200
+
+    def test_a_species_chart_of_another_variable_is_400(self, client, vector_data):
+        """`SpeciesStackedBar.validate`. The chart is a breakdown of `veg_species`'s species
+        and every property on it dereferenced the presentation variable unchecked, so an
+        analysis that fixes its own inputs -- which has no single variable -- crashed the
+        route with an `AttributeError` for what is an ordinary bad request. The catalog says
+        which variable it draws (`Meta.variables`) and the portal's picker honors it, but the
+        route is public."""
+        response = client.get(
+            f"/v1/visualizations/species-stacked-bar.json?{VECTOR}&grid_cell=1"
+        )
+        assert response.status_code == 400
+        assert "can only draw 'veg_species'" in response.json()["detail"]
+
     def test_a_dataset_visualization_still_needs_something_to_draw(self, client, vector_data):
         """The half of the old two-route split that survives, and it survives as a fact about
         the REQUEST rather than about which URL it arrived on: no dataset, no analysis and no
@@ -1359,14 +1411,20 @@ class TestMapAnalysisTileRouting:
         (the chart's own `data.csv` source, not a tile), reached through a visualization
         that actually has one (`Map`'s vector branch only builds a `data.csv` URL as a
         PMTiles-mode fallback with no `request`, so `time-series-line` is used here
-        instead)."""
-        response = client.get(
-            f"/v1/visualizations/time-series-line.json?{VECTOR}"
-            "&analysis=diff&dimension=calendar_year&order=asc"
-            "&calendar_year=2030&calendar_year=2040&grid_cell=1"
-        )
-        assert response.status_code == 200
-        data_url = response.json()["data"]["url"]
+        instead).
+
+        Built from the chart object rather than fetched from the spec route because the only
+        dimension this fixture has two values of is `calendar_year`, and a chart differencing
+        across time is what `validate_time_axis` now rejects. Forwarding is `get_data_uri`'s
+        rule either way -- the map reaches it with the same analysis."""
+        data_url = TimeSeriesLine(
+            **dict(parse_qsl(VECTOR)),
+            analysis="diff",
+            dimension="calendar_year",
+            order="asc",
+            calendar_year=[2030, 2040],
+            grid_cell="1",
+        ).data_source.to_dict()["url"]
         assert "/v1/data.csv" in data_url
         assert "analysis=diff" in data_url
         assert "dimension=calendar_year" in data_url
@@ -1388,6 +1446,18 @@ class TestChartDataUrlIsFetchable:
         response = client.get(f"/v1/visualizations/time-series-line.json?{SALINITY}&{query}")
         assert response.status_code == 200
         return response.json()["data"]["url"]
+
+    def _chart_data_url(self, **kwargs):
+        """The same URL, built from the chart object rather than fetched from the route.
+
+        Used for the cases where the analysis collapses the TIME column: the route rejects
+        those now (`DatasetVisualization.validate_time_axis` -- there is no time axis left to
+        plot), but `get_data_uri`'s `select` filtering is a separate rule that still has to
+        hold for them, since the map reaches it with exactly the same collapse. Without a
+        `request` the emitted base is the production host, so callers fetch the query back
+        through `client` against the local path.
+        """
+        return TimeSeriesLine(**SALINITY_PARAMS, **kwargs).data_source.to_dict()["url"]
 
     def test_difference_over_model_group_id_is_fetchable(self, client, two_model_group_salinity_data):
         data_url = self._data_url(
@@ -1421,21 +1491,25 @@ class TestChartDataUrlIsFetchable:
         hit the identical "unable to find column" failure even once the multi-value path was
         guarded. Guarding the finished list instead of each append is what covers both.
 
-        (A time-series chart differencing across time has no time axis left to plot; that
-        degeneracy is the portal's to prevent. This only ensures the request itself is
-        well-formed rather than a 400.)
+        (A time-series chart differencing across time has no time axis left to plot, and the
+        SPEC route rejects that outright now -- see `validate_time_axis`. The URL is built
+        from the chart object here for that reason: this is about the request being
+        well-formed, which is the map's case too.)
         """
-        data_url = self._data_url(
-            client,
-            "analysis=diff&dimension=calendar_day&order=asc"
-            "&calendar_day=2030-01-01&calendar_day=2030-01-02"
-            "&model_group_id=500&model_group_id=521"
-            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        data_url = self._chart_data_url(
+            analysis="diff",
+            dimension="calendar_day",
+            order="asc",
+            calendar_day=["2030-01-01", "2030-01-02"],
+            model_group_id=[500, 521],
+            scenario_id=7,
+            aggregate_type="mean",
+            grid_cell="1",
         )
         query = parse_qs(urlparse(data_url).query)
         assert "calendar_day" not in query["select"][0].split(",")
         assert query["calendar_day"] == ["2030-01-01", "2030-01-02"]
-        assert client.get(data_url).status_code == 200
+        assert client.get(f"/v1/data.csv?{urlparse(data_url).query}").status_code == 200
 
     def test_a_multi_valued_dimension_the_analysis_keeps_is_still_selected_back(
         self, client, two_model_group_salinity_data
@@ -1443,16 +1517,19 @@ class TestChartDataUrlIsFetchable:
         """The guard must be narrow: an uncollapsed dimension given two values is a real
         compare channel and still belongs in `select`. Here the difference is taken over
         `calendar_day`, so `model_group_id` survives the analysis and must come back."""
-        data_url = self._data_url(
-            client,
-            "analysis=diff&dimension=calendar_day&order=asc"
-            "&calendar_day=2030-01-01&calendar_day=2030-01-02"
-            "&model_group_id=500&model_group_id=521"
-            "&scenario_id=7&aggregate_type=mean&grid_cell=1",
+        data_url = self._chart_data_url(
+            analysis="diff",
+            dimension="calendar_day",
+            order="asc",
+            calendar_day=["2030-01-01", "2030-01-02"],
+            model_group_id=[500, 521],
+            scenario_id=7,
+            aggregate_type="mean",
+            grid_cell="1",
         )
         query = parse_qs(urlparse(data_url).query)
         assert "model_group_id" in query["select"][0].split(",")
-        assert client.get(data_url).status_code == 200
+        assert client.get(f"/v1/data.csv?{urlparse(data_url).query}").status_code == 200
 
     def test_without_an_analysis_a_multi_valued_dimension_is_still_selected_back(
         self, client, two_model_group_salinity_data

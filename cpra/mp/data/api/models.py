@@ -116,6 +116,14 @@ class Visualization(BaseModel):
     type: str
     max_grid_cells: int
     variables: list[str] | None = None
+    # Whether this visualization plots the time dimension as an axis, and therefore cannot
+    # present an analysis that collapses it (a `diff` over `calendar_year` returns one value
+    # per grid cell with no year column to plot against). True for
+    # every chart and False for the map alone -- the default is the one that holds for four
+    # of the five, and `visualizations/map.py` is the one `Meta` that states it.
+    # `DatasetVisualization.validate_time_axis` enforces it server-side; this field is what
+    # lets a client not offer the combination in the first place.
+    time_axis: bool = True
 
 
 class CatalogOutput(BaseModel):

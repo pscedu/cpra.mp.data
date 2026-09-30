@@ -201,7 +201,13 @@ class TestCompareDimensionsExclusion:
         assert "calendar_year" not in sb.compare_dimensions
         assert sb.compare_dimensions == {"model_group_id": [500, 520]}
 
-    def test_three_image_land_change_excludes_both_of_its_collapsed_dimensions(self):
+    def test_three_image_land_change_excludes_its_collapsed_dimension(self):
+        """`model_group_id` alone: three-image mode packs the two model groups into one
+        code, so there is nothing left to compare them across. `calendar_year` is not in
+        it -- `lnd_chng` reports each selected year -- and it is excluded here for the
+        ORDINARY reason instead, being the chart's own time axis rather than a compare
+        channel (`test_calendar_year_is_never_a_compare_dimension` above).
+        """
         sb = StackedBar(
             variable="ssf",
             grid="ecoregion_v001",
@@ -213,7 +219,7 @@ class TestCompareDimensionsExclusion:
             scenario_id=[7],
             percentile=[50],
         )
-        assert sb.resolved_analysis.collapsed_dimensions == frozenset({"calendar_year", "model_group_id"})
+        assert sb.resolved_analysis.collapsed_dimensions == frozenset({"model_group_id"})
         assert sb.compare_dimensions == {}
 
     def test_time_series_line_chart_omits_the_collapsed_dimension_as_a_compare_channel(self):

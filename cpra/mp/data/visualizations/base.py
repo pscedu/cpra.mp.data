@@ -4,6 +4,7 @@ from urllib.parse import urlencode
 import altair as alt
 import polars as pl
 
+from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import required_columns
@@ -377,8 +378,78 @@ class DatasetVisualization:
     @property
     def spec(self):
         """Get the Vega-Lite specification."""
+        self.validate()
         chart = self.chart()
         return chart.to_dict()
+
+    def validate(self):
+        """Plan-time checks this visualization has to pass before a chart is built for it.
+
+        Run from `spec` rather than from each `chart()`, so a notebook caller reaches them
+        the same way the route does, and so a subclass adds its own by overriding this one
+        method (`SpeciesStackedBar`, which cannot draw a result that is not a species
+        breakdown) rather than by remembering to call each check.
+
+        What belongs here is a rule about the REQUEST -- whether this chart can present
+        what this pipeline produces -- decidable before any data is read. Everything
+        `chart()` does with the answer stays in `chart()`.
+        """
+        self.validate_time_axis()
+
+    def validate_time_axis(self):
+        """Reject a visualization that plots time against an analysis whose output has no
+        time column left.
+
+        `analysis=diff&dimension=calendar_year` is the case this exists for: it returns one
+        value per grid cell with no year column, so a chart with a time axis has nothing to
+        draw. Nothing failed before this check -- `get_data_uri` already drops a collapsed
+        dimension from `select`, so the request succeeded, the data URL came back with
+        `grid_cell,value`, and the spec's `toDate(toString(datum.calendar_year))` transform
+        read a field that was not there. The result was an empty chart with a 200 on it,
+        which is the worst of the three possible answers.
+
+        `Meta.time_axis` is the other half -- a `map` draws one grid cell per pixel at one
+        instant and is the one visualization that can present these results, which is why it
+        defaults to True and only `map.py` sets it False.
+        """
+        self._reject_time_axis(self.collapsed_time_column)
+
+    def _reject_time_axis(self, column):
+        """Raise for a time-plotting visualization over `column`, which this request's
+        analysis folds away. `None` is "it keeps its time column", the ordinary case."""
+        meta = getattr(self, "Meta", None)
+        if column is None or not getattr(meta, "time_axis", True):
+            return
+        raise RequestError(
+            f"visualization {getattr(meta, 'name', type(self).__name__)!r} plots "
+            f"{DIMENSIONS[column].label} as its "
+            f"time axis, but analysis {self._analysis_name!r} collapses {column} -- its "
+            "output carries one value per grid cell with no time column to plot against. Use the "
+            "map visualization for this analysis."
+        )
+
+    @cached_property
+    def collapsed_time_column(self):
+        """The time column this request's analysis folds away, or `None` if it keeps one.
+
+        Read off the RESOLVED analysis's `collapsed_dimensions`, because collapse is
+        per-request rather than per-name: `diff` collapses whichever dimension the caller
+        NAMES, so `analysis=diff&dimension=calendar_year` belongs here while
+        `dimension=model_group_id` does not. It is also the same runtime answer
+        `get_data_uri`'s `select` filtering already trusts, so the gate and the column list
+        cannot disagree.
+
+        There was a second, declared half here -- `Meta.subsumed_dimensions` consulted from
+        the query alone, for an analysis that would raise while resolving before this could
+        answer. `lnd_chng` was its only case, and it needed it because it required a
+        comparison year the portal's chart URL never sent. It now accepts any number of
+        years and returns one row per year, so no shipped analysis both plots against time
+        and folds the axis away, and the pre-decode pass had nothing left to catch.
+        """
+        resolved = self.resolved_analysis
+        if resolved is not None and self.time_column in resolved.collapsed_dimensions:
+            return self.time_column
+        return None
 
     @cached_property
     def descriptor(self):

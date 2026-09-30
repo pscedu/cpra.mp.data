@@ -74,9 +74,16 @@ class TimeSeriesLine(DatasetVisualization):
 
         main_line_encodings = [
             alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
+            # `self.data_source.name`, not `self.variable.name`: the expression has to name
+            # the Vega dataset this chart actually reads, and `get_data_source` names it
+            # `variable or "value"` -- a result that folds several variables (or fixes its
+            # own inputs, like `lnd_type_plus`) has no single variable to be named after, so
+            # `self.variable` is `None` there and the source is called "value". Re-deriving
+            # the name from the variable both crashed on that `None` and would have pointed
+            # `data()` at a dataset that does not exist whenever the two disagreed.
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
-            .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
+            .scale(domainMax=alt.expr(f"extent(pluck(data('{self.data_source.name}'), 'value'))[1]")),
             # Each series is colored as the map colors the grid cell it draws, rather than by
             # its position in the legend — see `grid_cell_colors`, which is why the palette
             # isn't handed over whole.

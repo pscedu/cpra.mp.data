@@ -57,7 +57,7 @@ class UnknownAnalysisError(AnalysisRegistryError):
 class InvalidAnalysisParametersError(AnalysisRegistryError):
     """An analysis's `Parameters` model, its cardinality rule against `filters` (e.g.
     `diff`'s "exactly 2 selected values of `dimension`" rule, or `lnd_chng`'s
-    `calendar_year`/`model_group_id` cardinality rule -- see each module's
+    `model_group_id` cardinality rule -- see each module's
     `validate_selection`), or the `Pipeline` its `pipeline()` method builds from those
     values, was rejected. Maps to a 400 at the route layer.
     """
@@ -111,9 +111,9 @@ def required_dataset_dimensions(dataset: DatasetRef) -> list[str]:
     and any variable-specific `required_dimensions` (`aggregate_type`, `ffibs_type`, ...).
     Pure/in-memory: `get_input_data_frame` only cross-joins tiny literal `pl.DataFrame`s
     and never reads a file, so this needs no `base_path` -- the same pattern
-    `visualizations.base.get_data_uri` already uses. Used to build a `diff`/
-    `lnd_chng` pipeline's trailing `group.by` (every required dimension except the one
-    the analysis operates over), and by `default_collapsed_dimensions` below.
+    `visualizations.base.get_data_uri` already uses. Used to build a `diff`/`lnd_chng`
+    pipeline's `group.by` (every required dimension except the one that branch folds
+    over), and by `default_collapsed_dimensions` below.
     """
     return required_columns(
         get_input_data_frame(variable=dataset.variable, time_unit=dataset.time_unit, grid=dataset.grid),

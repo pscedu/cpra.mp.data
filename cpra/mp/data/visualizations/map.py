@@ -40,6 +40,13 @@ class Map(DatasetVisualization):
         # `issubclass(..., DatasetVisualization)` -- but the catalog entry stays.
         type = "dataset"
         max_grid_cells = 10
+        # The only visualization here that does NOT plot time: a map draws one grid cell per
+        # pixel at whatever instant the filters pinned, so it is the one that can present an
+        # analysis whose output has no time column left (a `diff` over `calendar_year`).
+        # See `DatasetVisualization.validate_time_axis`, which rejects the
+        # combination everywhere else, and `api.models.Visualization`, which serves this so a
+        # client can offer the same chart types the server will accept.
+        time_axis = False
 
     @cached_property
     def feature_colors(self) -> dict[str, str]:

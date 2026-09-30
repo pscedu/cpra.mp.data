@@ -16,6 +16,7 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
+from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.visualizations.base import (
     DatasetVisualization,
     analysis_chain,
@@ -23,7 +24,10 @@ from cpra.mp.data.visualizations.base import (
     is_grid_cell_ids,
 )
 from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
+from cpra.mp.data.visualizations.map import Map
 from cpra.mp.data.visualizations.sediment_dynamics import SedimentDynamics
+from cpra.mp.data.visualizations.species_stacked_bar import SpeciesStackedBar
+from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 from tests.factories import write_grid_geometry
 
@@ -344,3 +348,96 @@ class TestRequestItems:
         assert SedimentDynamics.request_items(
             [("analysis", "diff"), ("analysis", "lnd_chng")]
         ) == [("analysis", "sediment_dynamics,diff,lnd_chng")]
+
+
+class TestTimeAxisGate:
+    """`DatasetVisualization.validate_time_axis` — a chart that plots time against an
+    analysis whose output has no time column left.
+
+    `diff` over `calendar_year` is the shipped case, and the rule is keyed on the RESOLVED
+    analysis rather than on a name because that is the only way to see it: the same `diff`
+    over `model_group_id` keeps its years, so the collapse is chosen per request. Nothing
+    failed before this check. `get_data_uri` already drops a collapsed dimension from
+    `select`, so the request succeeded and the chart came back 200 with a time transform
+    reading a field the response did not carry.
+    """
+
+    COLLAPSES_TIME = dict(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2050, 2060])
+    KEEPS_TIME = dict(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[705, 706])
+
+    def test_a_time_series_line_rejects_a_collapsed_time_column(self):
+        viz = TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
+        with pytest.raises(RequestError, match="collapses calendar_year"):
+            viz.validate_time_axis()
+
+    def test_a_stacked_bar_rejects_it_too(self):
+        """Every chart plots time, so the rejection is not `TimeSeriesLine`'s alone."""
+        viz = StackedBar(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
+        with pytest.raises(RequestError, match="collapses calendar_year"):
+            viz.validate_time_axis()
+
+    def test_the_map_accepts_it(self):
+        """`Meta.time_axis = False`: a map draws one instant, so a result with no time column
+        is exactly what it wants. This is the visualization the error text sends readers to,
+        which makes it the one that has to work."""
+        Map(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).validate_time_axis()
+
+    def test_an_analysis_that_keeps_the_time_column_is_fine(self):
+        """The gate is about the time column specifically -- a `diff` over `model_group_id`
+        collapses a dimension too, and still has a year per row to plot against."""
+        TimeSeriesLine(**ANNUAL_VECTOR, **self.KEEPS_TIME).validate_time_axis()
+
+    def test_no_analysis_is_fine(self):
+        TimeSeriesLine(**ANNUAL_VECTOR).validate_time_axis()
+
+    def test_the_spec_is_what_applies_it(self):
+        """Checked in `spec` rather than in each `chart()`, so a notebook caller reaches it
+        the same way the route does."""
+        with pytest.raises(RequestError, match="Use the map visualization"):
+            TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).spec
+
+    def test_lnd_chng_keeps_its_time_column(self):
+        """The reported case, and it is no longer a rejection.
+
+        `lnd_chng` compares each selected year against a derived baseline year and returns
+        one row per comparison year, so a chart over it has a series to draw. It used to
+        fold `calendar_year` away and the gate had to catch it BEFORE the decode, because
+        resolving raised for the comparison year the portal's chart URL never sent -- the
+        caller was told to supply a year for a chart that could not have drawn the result
+        with one. Both halves of that are gone: no year is every year, and every year is a
+        row.
+        """
+        viz = TimeSeriesLine(**ANNUAL_VECTOR, analysis="lnd_chng", model_group_id=705)
+        viz.validate_time_axis()
+        assert viz.collapsed_time_column is None
+
+    def test_a_collapse_of_another_dimension_is_not_it(self):
+        """`lnd_conf` folds `scenario_id`, which is not the time column -- the gate has to
+        stay specific to the axis the chart actually plots."""
+        assert TimeSeriesLine(**ANNUAL_VECTOR, analysis="lnd_conf").collapsed_time_column is None
+
+
+class TestSpeciesStackedBarNeedsItsVariable:
+    """`SpeciesStackedBar.validate` — the chart is a breakdown of one variable's species,
+    and every property on it dereferenced the presentation variable without checking there
+    was one. An analysis that fixes its own inputs has none (`lnd_type_plus` folds three
+    variables into one categorical result), which made an ordinary bad request a 500.
+    """
+
+    def test_an_input_fixing_analysis_is_rejected(self):
+        viz = SpeciesStackedBar(analysis="lnd_type_plus", grid_cell="-92.2,29.7")
+        with pytest.raises(RequestError, match="no single variable"):
+            viz.validate()
+
+    def test_another_variable_is_rejected(self):
+        """`veg_species_code` is not a column of an `ssf` result either -- that failed as an
+        "unable to find column" on the chart's own data URL rather than as a 500, which is
+        the same request being wrong in a less visible way."""
+        viz = SpeciesStackedBar(**ANNUAL_VECTOR)
+        with pytest.raises(RequestError, match="'ssf'"):
+            viz.validate()
+
+    def test_its_own_variable_is_accepted(self):
+        SpeciesStackedBar(
+            variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual"
+        ).validate()

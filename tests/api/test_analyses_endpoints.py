@@ -863,8 +863,9 @@ class TestAnalysesCatalogOutput:
 
         All four land on null for structurally the same reason (the resolve refuses with
         nothing supplied), by four different refusals: `lnd_conf` has no dataset,
-        `diff` has no `dimension` parameter, `lnd_chng` needs a selected `calendar_year`,
-        and `sediment_dynamics` needs a `grid_cell` as well as a dataset. They are
+        `diff` has no `dimension` parameter, `lnd_chng` needs a selected `model_group_id`
+        (its baseline year is derived from which era that is), and `sediment_dynamics`
+        needs a `grid_cell` as well as a dataset. They are
         parametrized together because the guarantee is about the FIELD, not about which
         objection got there first.
         """

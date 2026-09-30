@@ -210,38 +210,52 @@ GET /v1/data.csv?variable=sal&time_unit=annual&grid=hydro_compartment_v002&analy
 
 `kind="variable"`, reads the caller's dataset. Produces a categorical land-type-change code
 (`variables=["lnd_type"]`, `legend="lnd_chng"`) between an automatically-derived baseline
-year and a caller-selected comparison year -- the caller supplies only the comparison
-`calendar_year`, the same single-value shape selecting `calendar_year` already has for
-every other variable. It declares no parameters of its own; the comparison year and the
-mode below both come from ordinary filters.
+year and the caller's selected comparison years. It declares no parameters of its own;
+the comparison years and the mode below both come from ordinary filters.
 
 The baseline year is derived from the selected `model_group_id`: values below `700`
 belong to an earlier model era whose baseline year is `2019`; at or above it, the
 baseline year is `2025`.
 
+**The baseline broadcasts.** The pipeline reads the dataset twice: a baseline branch
+filtered to the derived year and then `group`ed over every other required dimension,
+which drops its `calendar_year` column, and a comparison branch carrying every year the
+caller selected. The `join` keys on `grid_cell` plus the columns both branches carry, so
+the baseline -- which no longer carries a year -- fans out across all of them. Each
+comparison year is therefore compared against the *same* baseline and comes back as its
+own row, so `calendar_year` survives into the result and a land-change series over time is
+an ordinary year selection. That is why `calendar_year` is **not** in
+`subsumed_dimensions` or `collapsed_dimensions`.
+
 There are two modes, selected by how many `model_group_id` values are selected. In both,
-each surviving land-type value is placed in its own decimal digit and the digits are then
-packed into one number by a `group`/`sum`:
+each land-type value is placed in its own decimal digit:
 
-- **Two-image** (`model_group_id` selected to exactly 1 value): the baseline year's land
-  type is multiplied by 10; the comparison year's passes through unchanged. Result:
-  `baseline * 10 + comparison`.
+- **Two-image** (`model_group_id` selected to exactly 1 value): `baseline * 10 + comparison`.
 - **Three-image** (`model_group_id` selected to exactly 2 values, whichever is lower
-  decides the baseline era): the redundant corner of the 2x2 (model group x year) grid is
-  dropped, then the baseline year's land type is multiplied by 100, the lower model group's
-  comparison-year land type by 10, and the remaining one passes through unchanged.
+  decides the baseline era): the baseline is the *lower* model group at the baseline year
+  alone; the comparison branch keeps both model groups, multiplying the lower one's value
+  by 10 and summing them. Result: `baseline * 100 + comparison`. `model_group_id` is
+  collapsed in this mode, since both of its values are folded into one code.
 
-**Cardinality rule**: the filter on `calendar_year` must select exactly 1 value (the
-comparison year -- the baseline year is derived automatically, never supplied);
-`model_group_id` must select exactly 1 (two-image) or exactly 2 (three-image) -- any
-other count is rejected with a 400. `calendar_year` is reported in `subsumed_dimensions`:
-it is still supplied, but it is no longer an ordinary dimension to compare across.
+**Cardinality rules**: `model_group_id` must select exactly 1 (two-image) or exactly 2
+(three-image) -- any other count is rejected with a 400. `calendar_year` has no rule; as
+everywhere else, selecting none of its values means all of them.
 
-`lnd_type` lives only on the `morph_pixel` pixel grid, so the result is a raster surface
-and a tabular format is rejected -- ask for `tif` (or `png`/`jpg` on the tile route).
+A **raster** output additionally requires exactly 1 comparison year, because one image
+holds one. This is checked where the grid is known rather than alongside the rule above,
+and a `grid_cell` selection lifts it -- that lowers the request to a tabular shape, which
+has a row per year to put the series in.
+
+`lnd_type` lives only on the `morph_pixel` pixel grid, so without a `grid_cell` the result
+is a raster surface and a tabular format is rejected -- ask for `tif` (or `png`/`jpg` on
+the tile route).
 
 ```
+# One image: exactly one comparison year.
 GET /v1/data.tif?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_chng&model_group_id=705&scenario_id=34&calendar_year=2050
+
+# A series at one pixel: every year against the derived baseline.
+GET /v1/data.csv?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_chng&model_group_id=705&scenario_id=34&grid_cell=-92.21787,29.71833
 ```
 
 ### `lnd_conf`

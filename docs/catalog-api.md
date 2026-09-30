@@ -138,12 +138,12 @@ The dataset triple is not reported in `choices`/`results`. It names *which* data
 #### With an Analysis
 
 ```
-GET /v1/catalog.json?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_chng&calendar_year=2050&model_group_id=500
+GET /v1/catalog.json?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_chng&calendar_year=2050&model_group_id=500&model_group_id=520
 ```
 
 `output` describes what the analysis produces rather than what it reads: `lnd_chng` outputs land-change categories, so `legend`, `label`, and `result_kind` are the analysis's, not the input variable's.
 
-`collapsed_dimensions` names what the pipeline consumed — here `calendar_year`, which `lnd_chng` uses to pick its comparison and baseline years. A collapsed dimension is **absent** from `choices` and `results` rather than reported with a value the caller cannot change, and defaulting it does not make `exact` false.
+`collapsed_dimensions` names what the pipeline consumed — here `model_group_id`, whose two selected values this analysis's three-image mode folds into one code. A collapsed dimension is **absent** from `choices` and `results` rather than reported with a value the caller cannot change, and defaulting it does not make `exact` false. It is per-request rather than per-analysis: drop one of the two `model_group_id`s above and the same analysis collapses nothing, because two-image mode compares within a single model group.
 
 `output.value_columns` and `output.variables` are parallel: zip them, and each pair is a column of the result and the variable whose units, legend and number format label it (null where none could be resolved). `output.folded_into` says how to read that first list. It is null for every pipeline without an [`unpivot`](analysis-api.md) step, and the names really are columns. When it is set — to the name of the label column that step folded into — the names are the **values** that column takes instead: the result carries one `value` column with the measurements stacked, one row per name. A client keying display metadata per measurement does the same thing either way, looking the measurement up by column when `folded_into` is null and by that column's value when it is not.
 

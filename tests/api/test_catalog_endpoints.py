@@ -161,6 +161,16 @@ class TestVisualizations:
         for viz in client.get("/v1/visualizations.json").json():
             assert viz["type"] in ("dataset", "custom")
 
+    def test_only_the_map_declares_no_time_axis(self, client):
+        """What a client needs to not offer a chart for an analysis that collapses the time
+        column (`DatasetVisualization.validate_time_axis` is the server-side half). Only
+        `map.py` states it; every other entry takes the model's `True` default, so this
+        pins that the default actually reaches the response rather than being dropped as
+        unset."""
+        by_name = {v["name"]: v["time_axis"] for v in client.get("/v1/visualizations.json").json()}
+        assert by_name["map"] is False
+        assert {name for name, axis in by_name.items() if axis} == set(by_name) - {"map"}
+
 
 class _FakeCatalogAnalysis:
     # A real `AnalysisMeta`, not a stand-in class: the route serves `Meta.model_dump()`,
@@ -430,14 +440,23 @@ class TestCatalogEndpoint:
         assert output["result_kind"] == "category"
 
     def test_a_collapsed_dimension_is_absent_rather_than_defaulted(self, client, base_path, _catalog_path):
-        """`lnd_chng` consumes `calendar_year` to pick its comparison and baseline years, so
-        it is not a choice the caller still has. Absent, not reported with a value they
-        cannot change -- and `exact` must not be dragged down by defaulting it."""
+        """`lnd_chng`'s three-image mode packs its two selected `model_group_id` values into
+        one code, so the model group is not a choice the caller still has. Absent, not
+        reported with a value they cannot change -- and `exact` must not be dragged down by
+        defaulting it.
+
+        `calendar_year` is the control here, and it used to be the subject: `lnd_chng` once
+        fused its two years into one code and collapsed the axis. It compares each selected
+        year against a derived baseline now and reports every one of them, so the year is
+        a live choice and has to come back as one.
+        """
         self._write(base_path, _catalog_path)
-        body = client.get(f"{self.URL}&analysis=lnd_chng&calendar_year=2030&model_group_id=500").json()
-        assert body["output"]["collapsed_dimensions"] == ["calendar_year"]
-        assert "calendar_year" not in body["choices"]
-        assert "calendar_year" not in body["results"]
+        query = f"{self.URL}&analysis=lnd_chng&calendar_year=2030&model_group_id=500&model_group_id=520"
+        body = client.get(query).json()
+        assert body["output"]["collapsed_dimensions"] == ["model_group_id"]
+        assert "model_group_id" not in body["choices"]
+        assert "model_group_id" not in body["results"]
+        assert "calendar_year" in body["results"]
 
     def test_missing_catalog_entries_is_404(self, client, _catalog_path):
         """No data has ever been written for this variable/time_unit/grid -- CatalogQuery's
