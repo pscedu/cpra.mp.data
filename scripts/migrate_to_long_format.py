@@ -43,6 +43,14 @@ Usage:
     python scripts/migrate_to_long_format.py \\
         --output-path /path/to/output --catalog-path /path/to/catalog --append-missing
 
+\b
+    # Repeat the catch-up, skipping every partition whose source has not changed size
+    # since the previous run's log (the new log carries those partitions forward, so
+    # each run's log is all the next one needs)
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog --append-missing \\
+        --skip-unchanged migration_previous.csv --log-path migration_next.csv
+
 After verifying correctness on one dataset, run without --dry-run to apply.
 """
 
@@ -975,6 +983,90 @@ def _run_partition(args, result_queue):
         result_queue.put(("result", pid, rel, None, [], str(exc)))
 
 
+LOG_FIELDS = [
+    "partition", "data_type", "status", "files", "geo_cols", "long_rows",
+    "elapsed_s", "peak_bytes", "source_bytes", "memory_limit", "error", "completed_at",
+]
+
+# Log statuses that mean the output was left matching its source: found to match, or
+# written (or appended to) until it did.  Only these rows' source_bytes can vouch for a
+# partition in --skip-unchanged; dry-run and failed rows never do.
+VERIFIED_STATUSES = {"skipped", "migrated", "appended", "unchanged"}
+
+
+def _source_bytes(kind: str, payload, base_path: Path) -> int | None:
+    """Total size of a task's source files: the tabular partition's Parquet files, or
+    every COG a raster partition pools (both directory orders).
+
+    Taken in the main process before the task is handed to a worker, so it can only
+    understate what the worker goes on to read -- a file that lands or grows in between
+    makes the next --skip-unchanged run re-check the partition, never wrongly skip it.
+    ``None`` when a file vanished under us; that partition is simply never skippable.
+    """
+    paths = _raster_source_tifs(base_path, payload) if kind == "raster" else payload
+    try:
+        return sum(path.stat().st_size for path in paths)
+    except OSError:
+        return None
+
+
+def _read_log(log_path: Path) -> dict[str, dict]:
+    """A previous run's log, keyed by partition.  A later row for the same partition
+    supersedes an earlier one, so e.g. a partition that later failed is not vouched for
+    by an earlier success."""
+    with open(log_path, newline="") as f:
+        return {row["partition"]: row for row in csv.DictReader(f)}
+
+
+def _vouches_for(prior: dict, source_bytes: int | None) -> bool:
+    """Whether a previous log row shows the partition matching a source of this size."""
+    return (
+        prior.get("status") in VERIFIED_STATUSES
+        and bool(prior.get("source_bytes"))
+        and source_bytes is not None
+        and int(prior["source_bytes"]) == source_bytes
+    )
+
+
+def _oom_again(prior: dict, memory_limit: int | None) -> bool:
+    """Whether a partition a previous run lost to the OOM killer would only be lost again.
+
+    A worker's peak is sized from --memory-limit, so a limit no larger than the one it was
+    killed at means batches no larger either.  With no limit either time the batches are
+    the same default size; a limit on one side only can't be compared, so it is retried.
+    Rows from logs older than the memory_limit column never match.
+    """
+    if prior.get("status") != "oom" or "memory_limit" not in prior:
+        return False
+    if prior["memory_limit"] == "":
+        return memory_limit is None
+    return memory_limit is not None and memory_limit <= int(prior["memory_limit"])
+
+
+class _ResultLog:
+    """The per-partition results CSV, written a row at a time as each partition finishes,
+    so an interrupted or killed run still leaves a log the next --skip-unchanged run can
+    use.  Every row this run writes records its --memory-limit (bytes; empty for none);
+    rows carried over from a previous log keep the limit they were recorded with."""
+
+    def __init__(self, path: Path, memory_limit: int | None):
+        self.path = path
+        self.count = 0
+        self._memory_limit = "" if memory_limit is None else memory_limit
+        self._file = open(path, "w", newline="")  # noqa: SIM115 -- held open for the whole run
+        self._writer = csv.DictWriter(self._file, fieldnames=LOG_FIELDS, restval="")
+        self._writer.writeheader()
+        self._file.flush()
+
+    def write(self, row: dict) -> None:
+        self._writer.writerow({"memory_limit": self._memory_limit, **row})
+        self._file.flush()
+        self.count += 1
+
+    def close(self) -> None:
+        self._file.close()
+
+
 def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
     """Find all Parquet files under base_path grouped by partition directory."""
     pattern_parts = []
@@ -1182,8 +1274,9 @@ def _print_progress(
     "--log-path",
     metavar="PATH",
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Where to write the per-partition migration results as a CSV. Defaults to a "
-    "timestamped file in the current directory.",
+    help="Where to write the per-partition migration results as a CSV, a row as each partition "
+    "finishes (so an interrupted run still leaves a usable log). Defaults to a timestamped file "
+    "in the current directory.",
 )
 @click.option(
     "--memory-limit",
@@ -1215,6 +1308,21 @@ def _print_progress(
     "purge, and the appended data is catalogued as it is written.",
 )
 @click.option(
+    "--skip-unchanged",
+    metavar="LOG_CSV",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="A results CSV from a previous run (its --log-path) against the same --output-path. "
+    "Partitions it records as matching or written (skipped/migrated/appended/unchanged) are "
+    "skipped without reading anything, provided the total size of their source files is "
+    "unchanged. Partitions it records as OOM-killed ('oom') are skipped too, unless this run's "
+    "--memory-limit is larger than the one they were killed at (or one run had a limit and the "
+    "other did not). Anything else is processed as usual. Skipped partitions are carried into "
+    "this run's log, as are the log's rows for partitions this run doesn't process at all, so "
+    "the newest log is always enough for the next run (passing the same path as --log-path is "
+    "fine: it is read in full before being rewritten). Mostly useful with --append-missing, "
+    "which otherwise re-reads every partition.",
+)
+@click.option(
     "--unique-parquet-rows",
     is_flag=True,
     help="Drop duplicate rows (all columns equal) from the long-format Parquet output. "
@@ -1223,7 +1331,7 @@ def _print_progress(
 def main(
     output_path, catalog_path, estimate, unconverted_only, variable, grid, time_unit, dry_run, progress,
     data_path, workers, show_progress, log_path, memory_limit, temp_path,
-    unique_parquet_rows, append_missing,
+    unique_parquet_rows, append_missing, skip_unchanged,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
 
@@ -1308,6 +1416,38 @@ def main(
             catalog_skipped = len(tasks) - len(kept)
             tasks = kept
 
+    # Sized for every task, not just the ones --skip-unchanged could skip: the sizes are
+    # what this run's log records for the next run to compare against.
+    source_bytes = {rel: _source_bytes(kind, payload, base_path) for kind, rel, payload in tasks}
+
+    # Rows carried over from the --skip-unchanged log, written ahead of this run's own.
+    # Read before this run's log is opened, so the two may be the same file.
+    carried: list[dict] = []
+    unchanged_skipped = 0
+    oom_skipped = 0
+    if skip_unchanged is not None:
+        previous = _read_log(skip_unchanged)
+        kept = []
+        for t in tasks:
+            prior = previous.get(t[1])
+            if prior is None:
+                kept.append(t)
+            elif _vouches_for(prior, source_bytes[t[1]]):
+                unchanged_skipped += 1
+                carried.append({
+                    **{field: prior.get(field, "") for field in LOG_FIELDS},
+                    "status": "unchanged", "elapsed_s": 0.0, "peak_bytes": 0, "error": "",
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                })
+            elif _oom_again(prior, memory_limit):
+                # Carried as-is (memory_limit included), so later runs keep skipping it
+                # until one is given a larger limit.
+                oom_skipped += 1
+                carried.append({field: prior.get(field, "") for field in LOG_FIELDS})
+            else:
+                kept.append(t)
+        tasks = kept
+
     # A partition whose estimated peak already exceeds --memory-limit will only
     # get OOM-killed by a worker (the batch sizing in _batch_target_rows can
     # shrink the per-batch cost, but not the one-time wide-frame sort, which
@@ -1338,14 +1478,35 @@ def main(
         summary += " (--append-missing: every partition is checked against its source.)"
     if catalog_skipped:
         summary += f" ({catalog_skipped} already converted per the catalog, skipped.)"
+    if unchanged_skipped:
+        summary += f" ({unchanged_skipped} unchanged since {skip_unchanged.name}, skipped.)"
+    if oom_skipped:
+        summary += (
+            f" ({oom_skipped} OOM-killed in an earlier run at a --memory-limit no smaller than "
+            "this one, skipped.)"
+        )
     if over_limit_skipped:
         summary += f" ({over_limit_skipped} skipped: estimated peak exceeds --memory-limit.)"
     print(summary)
     migrated = 0
-    skipped = 0
+    skipped = unchanged_skipped + oom_skipped
     errors: list[str] = []
     touched_datasets: set[tuple] = set()  # (variable, time_unit, grid) to compact in the catalog
-    log_rows: list[dict] = []  # per-partition results, written out as a CSV at the end
+
+    log = _ResultLog(
+        log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv", memory_limit
+    )
+    print(f"Writing per-partition results to {log.path}")
+    for row in carried:
+        log.write(row)
+    if skip_unchanged is not None:
+        # Partitions this run doesn't touch at all -- filtered out, skipped per the catalog
+        # or the memory estimate -- keep their previous rows, so reusing one log path
+        # across differently-filtered runs never forgets anything.
+        handled = {t[1] for t in tasks} | {row["partition"] for row in carried}
+        for rel, prior in previous.items():
+            if rel not in handled:
+                log.write({field: prior.get(field, "") for field in LOG_FIELDS})
 
     desc = "[DRY RUN]" if dry_run else ("Appending" if append_missing else "Migrating")
     packed = [
@@ -1429,10 +1590,12 @@ def main(
                                 msg = f"{rel}: worker killed (OOM?), exit code {p.exitcode}"
                                 errors.append(msg)
                                 tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
-                                log_rows.append({
+                                # SIGKILL is what the OOM killer (kernel or cgroup) sends.
+                                oom = p.exitcode == -signal.SIGKILL
+                                log.write({
                                     "partition": rel,
                                     "data_type": "raster" if kind == "raster" else "tabular",
-                                    "status": "failed",
+                                    "status": "oom" if oom else "failed",
                                     "files": "", "geo_cols": "", "long_rows": "",
                                     "elapsed_s": "", "peak_bytes": "",
                                     "error": f"exit code {p.exitcode}",
@@ -1467,7 +1630,7 @@ def main(
                 if error:
                     errors.append(f"{rel}: {error}")
                     tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
-                    log_rows.append({
+                    log.write({
                         "partition": rel, "data_type": "", "status": "failed",
                         "files": "", "geo_cols": "", "long_rows": "", "elapsed_s": "", "peak_bytes": "",
                         "error": error, "completed_at": completed_at,
@@ -1481,24 +1644,25 @@ def main(
                         touched_datasets.add((dims["variable"], dims["time_unit"], dims["grid"]))
                     if result.get("skipped"):
                         skipped += 1  # already in long format on disk
-                        log_rows.append({
+                        log.write({
                             "partition": rel, "data_type": data_type, "status": "skipped",
                             "files": result["files"], "geo_cols": result["geo_cols"],
                             "long_rows": result["long_rows"], "elapsed_s": 0.0, "peak_bytes": 0,
-                            "error": "", "completed_at": completed_at,
+                            "source_bytes": source_bytes[rel], "error": "", "completed_at": completed_at,
                         })
                     elif "elapsed_s" in result:
                         migrated += 1
-                        log_rows.append({
+                        log.write({
                             "partition": rel, "data_type": data_type,
                             "status": "appended" if result.get("appended") else "migrated",
                             "files": result["files"], "geo_cols": result["geo_cols"],
                             "long_rows": result["long_rows"], "elapsed_s": result["elapsed_s"],
-                            "peak_bytes": result["peak_bytes"], "error": "", "completed_at": completed_at,
+                            "peak_bytes": result["peak_bytes"], "source_bytes": source_bytes[rel],
+                            "error": "", "completed_at": completed_at,
                         })
                     else:
                         migrated += 1  # dry run
-                        log_rows.append({
+                        log.write({
                             "partition": rel, "data_type": data_type,
                             "status": "would_append" if result.get("appended") else "would_migrate",
                             "files": result["files"], "geo_cols": result["geo_cols"],
@@ -1517,6 +1681,7 @@ def main(
     finally:
         for pid in list(inner_bars):
             _close_inner(pid)
+        log.close()
 
     # Coalesce the catalog for every dataset touched: write_parquet appended
     # per-write rows and compact_cog appended raster rows, so a final
@@ -1527,13 +1692,7 @@ def main(
         for variable_, time_unit_, grid_ in sorted(touched_datasets):
             catalog.compact_partition(variable_, time_unit_, grid_)
 
-    if log_rows:
-        log_path = log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv"
-        with open(log_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(log_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(log_rows)
-        print(f"\nWrote {len(log_rows)} result(s) to {log_path}")
+    print(f"\nWrote {log.count} result(s) to {log.path}")
 
     verb = "append to" if append_missing else "migrate"
     label = f"Would {verb}" if dry_run else ("Appended to" if append_missing else "Migrated")

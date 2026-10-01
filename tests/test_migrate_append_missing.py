@@ -16,6 +16,7 @@ one or the other:
 ``scripts/`` is not an importable package, so the module is loaded by path.
 """
 
+import csv
 import importlib.util
 import os
 import subprocess
@@ -332,3 +333,227 @@ class TestAppendMissingCli:
         rows = _rows(output_path, ANNUAL_DATASET)
         assert rows.height == 2 * 2 * N_CELLS
         assert sorted(rows["model_group_id"].unique()) == [500, 501]
+
+
+def _run_cli(base_path, output_path, catalog_path, *extra):
+    """Run the script as a subprocess -- its workers are spawned, so they need the script
+    to be __main__, which CliRunner can't provide."""
+    env = {
+        **os.environ,
+        "CPRA_MP_DATA_BASE_PATH": str(base_path),
+        "CPRA_MP_DATA_CATALOG_PATH": str(catalog_path),
+    }
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--data-path", str(base_path),
+         "--output-path", str(output_path), "--catalog-path", str(catalog_path),
+         "--no-progress", *extra],
+        capture_output=True, text=True, cwd=SCRIPT_PATH.parent.parent, env=env, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _log(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+class TestSkipUnchanged:
+    """--skip-unchanged: trust a previous run's log for partitions whose source hasn't moved."""
+
+    def _setup(self, base_path, tmp_path):
+        output_path, catalog_path = tmp_path / "out", tmp_path / "cat"
+        _write_annual(base_path, model_group_id=500)
+        _run_cli(base_path, output_path, catalog_path, "--log-path", str(tmp_path / "1.csv"))
+        return output_path, catalog_path
+
+    def test_the_log_records_the_source_size(self, base_path, tmp_path):
+        self._setup(base_path, tmp_path)
+        (row,) = _log(tmp_path / "1.csv")
+        assert row["status"] == "migrated"
+        assert int(row["source_bytes"]) == sum(p.stat().st_size for p in base_path.rglob("*.parquet"))
+
+    def test_skips_an_unchanged_partition_without_reading_the_output(self, base_path, tmp_path):
+        """Deleting the output proves the point: a run that looked at it would rebuild it."""
+        output_path, catalog_path = self._setup(base_path, tmp_path)
+        for path in _output_files(output_path):
+            path.unlink()
+
+        stdout = _run_cli(
+            base_path, output_path, catalog_path, "--append-missing",
+            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+        )
+
+        assert "1 unchanged since 1.csv" in stdout
+        assert _output_files(output_path) == []
+        (row,) = _log(tmp_path / "2.csv")
+        assert row["status"] == "unchanged"
+        assert row["source_bytes"] == _log(tmp_path / "1.csv")[0]["source_bytes"]
+
+    def test_checks_a_partition_whose_source_grew(self, base_path, tmp_path):
+        output_path, catalog_path = self._setup(base_path, tmp_path)
+        _write_annual(base_path, model_group_id=501)
+
+        stdout = _run_cli(
+            base_path, output_path, catalog_path, "--append-missing",
+            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+        )
+
+        assert "Appended to 1 unit" in stdout
+        assert sorted(_rows(output_path, ANNUAL_DATASET)["model_group_id"].unique()) == [500, 501]
+        (row,) = _log(tmp_path / "2.csv")
+        assert row["status"] == "appended"
+        assert int(row["source_bytes"]) == sum(p.stat().st_size for p in base_path.rglob("*.parquet"))
+
+    def test_one_log_path_can_be_reused_run_after_run(self, base_path, tmp_path):
+        """Carried-forward rows keep vouching, so the same file can be both input and output."""
+        output_path, catalog_path = self._setup(base_path, tmp_path)
+        log = str(tmp_path / "1.csv")
+        for _ in range(2):
+            stdout = _run_cli(
+                base_path, output_path, catalog_path, "--append-missing",
+                "--skip-unchanged", log, "--log-path", log,
+            )
+            assert "1 unchanged since 1.csv" in stdout
+        assert [row["status"] for row in _log(log)] == ["unchanged"]
+
+    def test_skips_an_unchanged_raster_partition(self, base_path, tmp_path):
+        output_path, catalog_path = tmp_path / "out", tmp_path / "cat"
+        write_raster_dataset(base_path, years=(2030, 2031))
+        _run_cli(base_path, output_path, catalog_path, "--log-path", str(tmp_path / "1.csv"))
+        (row,) = _log(tmp_path / "1.csv")
+        assert row["data_type"] == "raster"
+        assert int(row["source_bytes"]) == sum(p.stat().st_size for p in base_path.rglob("*.tif"))
+
+        stdout = _run_cli(
+            base_path, output_path, catalog_path, "--append-missing",
+            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+        )
+        assert "1 unchanged since 1.csv" in stdout
+
+
+def _write_log(path, rows):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=migrate.LOG_FIELDS, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+GB = 1024**3
+
+
+class TestSkipOom:
+    """A partition the OOM killer took is skipped while the limit hasn't been raised."""
+
+    def _setup(self, base_path, tmp_path, memory_limit):
+        _write_annual(base_path, model_group_id=500)
+        (rel,) = (str(p.relative_to(base_path)) for p in migrate.find_partitions(base_path))
+        return _write_log(tmp_path / "1.csv", [{
+            "partition": rel, "data_type": "tabular", "status": "oom",
+            "memory_limit": memory_limit, "error": "exit code -9",
+        }])
+
+    def _run(self, base_path, tmp_path, *extra):
+        return _run_cli(
+            base_path, tmp_path / "out", tmp_path / "cat", "--append-missing",
+            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"), *extra,
+        )
+
+    def test_skipped_at_the_same_limit_and_carried_forward(self, base_path, tmp_path):
+        self._setup(base_path, tmp_path, 2 * GB)
+
+        stdout = self._run(base_path, tmp_path, "--memory-limit", "2GB")
+
+        assert "1 OOM-killed in an earlier run" in stdout
+        assert _output_files(tmp_path / "out") == []
+        (row,) = _log(tmp_path / "2.csv")
+        assert (row["status"], row["memory_limit"]) == ("oom", str(2 * GB))
+
+    def test_retried_at_a_larger_limit(self, base_path, tmp_path):
+        self._setup(base_path, tmp_path, 1 * GB)
+
+        stdout = self._run(base_path, tmp_path, "--memory-limit", "2GB")
+
+        assert "OOM-killed" not in stdout
+        (row,) = _log(tmp_path / "2.csv")
+        assert (row["status"], row["memory_limit"]) == ("migrated", str(2 * GB))
+
+    def test_retried_when_only_one_run_had_a_limit(self, base_path, tmp_path):
+        self._setup(base_path, tmp_path, 2 * GB)
+
+        assert "OOM-killed" not in self._run(base_path, tmp_path)
+        assert _log(tmp_path / "2.csv")[0]["memory_limit"] == ""
+
+
+class TestLogRows:
+    def test_rows_from_partitions_this_run_does_not_process_are_kept(self, base_path, tmp_path):
+        """Reusing one log path across e.g. --variable-filtered runs must not forget anything."""
+        _write_annual(base_path, model_group_id=500)
+        elsewhere = {"partition": "variable=other/grid=g/time_unit=annual", "status": "migrated",
+                     "source_bytes": 10, "memory_limit": ""}
+        log = _write_log(tmp_path / "log.csv", [elsewhere])
+
+        _run_cli(base_path, tmp_path / "out", tmp_path / "cat", "--skip-unchanged", str(log), "--log-path", str(log))
+
+        rows = {row["partition"]: row for row in _log(log)}
+        assert rows[elsewhere["partition"]]["status"] == "migrated"
+        assert len(rows) == 2
+
+    def test_each_row_reaches_disk_as_it_is_written(self, tmp_path):
+        """What makes the log survive a run that is killed before it finishes."""
+        log = migrate._ResultLog(tmp_path / "log.csv", 4 * GB)
+        try:
+            log.write({"partition": "a", "status": "migrated"})
+            assert [(row["partition"], row["memory_limit"]) for row in _log(log.path)] == [("a", str(4 * GB))]
+        finally:
+            log.close()
+
+    def test_a_carried_row_keeps_its_own_memory_limit(self, tmp_path):
+        log = migrate._ResultLog(tmp_path / "log.csv", None)
+        log.write({"partition": "a", "status": "oom", "memory_limit": GB})
+        log.close()
+        assert _log(log.path)[0]["memory_limit"] == str(GB)
+
+
+class TestLogPredicates:
+    def test_a_later_row_supersedes_an_earlier_one(self, tmp_path):
+        path = _write_log(tmp_path / "log.csv", [
+            {"partition": "a", "status": "migrated", "source_bytes": 10},
+            {"partition": "a", "status": "failed"},
+        ])
+        assert migrate._read_log(path)["a"]["status"] == "failed"
+
+    def test_only_matching_or_written_partitions_vouch(self):
+        vouching = [
+            status
+            for status in ("skipped", "migrated", "appended", "unchanged", "would_append", "would_migrate",
+                           "failed", "oom")
+            if migrate._vouches_for({"status": status, "source_bytes": "10"}, 10)
+        ]
+        assert vouching == ["skipped", "migrated", "appended", "unchanged"]
+
+    def test_a_different_or_unknown_size_does_not_vouch(self):
+        assert not migrate._vouches_for({"status": "migrated", "source_bytes": "10"}, 11)
+        assert not migrate._vouches_for({"status": "migrated", "source_bytes": "10"}, None)
+        assert not migrate._vouches_for({"status": "migrated", "source_bytes": ""}, 10)
+
+    def test_oom_comparison(self):
+        def oom(was, now):
+            return migrate._oom_again({"status": "oom", "memory_limit": was}, now)
+
+        assert oom("100", 100)
+        assert oom("100", 50)
+        assert not oom("100", 101)
+        assert oom("", None)  # the same default batch size both times
+        assert not oom("", 100)
+        assert not oom("100", None)
+
+    def test_only_oom_rows_from_logs_that_recorded_a_limit_count(self):
+        assert not migrate._oom_again({"status": "failed", "memory_limit": "100"}, 100)
+        assert not migrate._oom_again({"status": "oom"}, 100)  # a log from before the column
+
+    def test_a_log_from_before_source_bytes_vouches_for_nothing(self, tmp_path):
+        path = tmp_path / "old.csv"
+        path.write_text("partition,data_type,status\na,tabular,migrated\n")
+        assert not migrate._vouches_for(migrate._read_log(path)["a"], 10)
