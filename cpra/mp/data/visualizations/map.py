@@ -2,7 +2,7 @@ from functools import cached_property
 from typing import Any, final
 from urllib.parse import quote, urlencode
 
-from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
+from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITE_NAME, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
@@ -383,8 +383,8 @@ class Map(DatasetVisualization):
         """
         return {
             "version": 8,
-            "glyphs": f"{GLYPHS_BASE_URL}/{{fontstack}}/{{range}}.pbf",
-            "sprite": f"{SPRITES_BASE_URL}/sprite",
+            "glyphs": f"{GLYPHS_BASE_URL}/font/{{fontstack}}/{{range}}",
+            "sprite": f"{SPRITES_BASE_URL}/sprite/{SPRITE_NAME}",
             "sources": {
                 "basemap-raster": {
                     "type": "raster",

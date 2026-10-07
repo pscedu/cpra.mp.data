@@ -166,7 +166,11 @@ ANALYSIS_BAND_CEILING = int(get_config("ANALYSIS_BAND_CEILING", "1000"))
 # not exact, figures.)
 TABULAR_FOLD_STEP = int(get_config("TABULAR_FOLD_STEP", "25000000"))
 
-# Map tile and style URLs
-GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/glyphs")
-SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/sprites")
+# Map tile and style URLs. All three are Martin's base URL in production: it serves fonts at
+# `{GLYPHS_BASE_URL}/font/{fontstack}/{range}` and each sprite at
+# `{SPRITES_BASE_URL}/sprite/{SPRITE_NAME}`, so the bases are separate only to allow
+# serving fonts or sprites from somewhere else.
+GLYPHS_BASE_URL = get_config("GLYPHS_BASE_URL", "https://api.mpdp.coastal.la.gov/tiles")
+SPRITES_BASE_URL = get_config("SPRITES_BASE_URL", "https://api.mpdp.coastal.la.gov/tiles")
+SPRITE_NAME = get_config("SPRITE_NAME", "basemap_mp2023")
 STATIC_TILES_BASE_URL = get_config("STATIC_TILES_BASE_URL", "https://api.mpdp.coastal.la.gov/tiles")

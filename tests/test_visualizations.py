@@ -441,3 +441,17 @@ class TestSpeciesStackedBarNeedsItsVariable:
         SpeciesStackedBar(
             variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual"
         ).validate()
+
+
+class TestMapBaseStyle:
+    """The style's font and sprite URLs, in the shape Martin serves them. MapLibre fills in
+    `{fontstack}` and `{range}` (`0-255`) and appends `.json`/`.png` to the sprite itself,
+    so neither URL carries an extension."""
+
+    def test_glyphs_use_martins_font_route(self):
+        style = Map(**ANNUAL_VECTOR).get_base_style()
+        assert style["glyphs"] == "https://api.mpdp.coastal.la.gov/tiles/font/{fontstack}/{range}"
+
+    def test_the_sprite_is_named(self):
+        style = Map(**ANNUAL_VECTOR).get_base_style()
+        assert style["sprite"] == "https://api.mpdp.coastal.la.gov/tiles/sprite/basemap_mp2023"
