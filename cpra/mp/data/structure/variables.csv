@@ -8,7 +8,6 @@ Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell
 Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,,,.2f,,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile",-1000000,
 Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,,,d,,exposure_count_asset,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type",-10,
 Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,,,.1f,,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile",-15,
-Habitat Diversity Index (Shannon's H'),hdi,icm,hdi,Float32,ecoregion,annual,,,,.2f,,hdi,,-1,
 Habitat Suitability Index,hsi,icm,hsi,Float32,veg_grid_cell,annual,,,,.2f,,hsi,species_code,-1,
 Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,,,,,aggregate_type,1,
 Salinity,sal,icm,hydro,Float32,hydro_compartment,"daily, monthly, annual",ppt,,,.1f,1,sal,aggregate_type,-10,
@@ -37,4 +36,3 @@ Shallow Soil Factors,ssf,icm,morph,Float32,ecoregion,annual,mm/yr,,,.1f,,ssf,per
 Subsidence,sub,icm,morph,Float32,morph_pixel,annual,mm/yr,,,.1f,,sub,,1,
 TEST Mineral Accretion,test_mnrl_accr,icm,morph,Float64,morph_pixel,annual,cm,,,.2f,,accr,,-1,
 TEST Organic Accretion,test_org_accr,icm,morph,Float64,morph_pixel,annual,cm,,,.2f,,accr,,-1,
-ICM Wetland Value Assessment,icm_wva,icm,wva,Float32,veg_grid_cell,annual,,,,.2f,,hsi,icm_wva_type,-1,
