@@ -8,7 +8,6 @@ Expected Annual Number of Structures Damaged,easd,clara,,Float64,clara_grid_cell
 Nonstructural Expected Annual Number of Structures Damaged,easd_ns,clara,,Float64,clara_grid_cell,decadal,structure equivalents,,,.2f,,easd,"pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile",-1000000,
 Exposure: Asset Count,exposure_count_asset,clara,,Int32,clara_grid_cell,decadal,structures,,,d,,exposure_count_asset,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type",-10,
 Flood Depth,flood_depth_ft,clara,,Float32,clara_grid_cell,decadal,ft,,,.1f,,flood_depth,"aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile",-15,
-Land Confidence Change,lnd_conf_chng,icm,,Float32,morph_pixel,annual,,,,.2f,,,,,
 Habitat Diversity Index (Shannon's H'),hdi,icm,hdi,Float32,ecoregion,annual,,,,.2f,,hdi,,-1,
 Habitat Suitability Index,hsi,icm,hsi,Float32,veg_grid_cell,annual,,,,.2f,,hsi,species_code,-1,
 Flow into Marsh,flom,icm,hydro,Float32,hydro_compartment,daily,,,,,,,aggregate_type,1,
