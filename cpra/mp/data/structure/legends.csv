@@ -61,11 +61,17 @@ exposure_exposed_structures,3 to 5 structures exposed,#e6f598,6.0
 exposure_exposed_structures,6 to 9 structures exposed,#99d594,10.0
 exposure_exposed_structures,10 or more structures exposed,#3288bd,
 ffibs,No Data,#00000000,0.0
-ffibs,Fresh Forest,#5E823A,0.2
-ffibs,Fresh Marsh,#DAE86D,2.0
-ffibs,Intermediate Marsh,#92CBE8,5.0
-ffibs,Brackish Marsh,#735753,17.0
-ffibs,Saline Marsh,#0679D2,
+ffibs,Fresh Forest,#337538,0.2
+ffibs,Fresh Marsh,#5DA899,2.0
+ffibs,Intermediate Marsh,#DCCD7D,5.0
+ffibs,Brackish Marsh,#C26A77,17.0
+ffibs,Saline Marsh,#7E2954,
+ffibs_alt,No Data,#00000000,0.0
+ffibs_alt,Fresh Forest,#346607,0.2
+ffibs_alt,Fresh Marsh,#528810,2.0
+ffibs_alt,Intermediate Marsh,#8BB219,5.0
+ffibs_alt,Brackish Marsh,#BCD017,17.0
+ffibs_alt,Saline Marsh,#E0E788,
 flood_depth,No Data,#00000000,1.0
 flood_depth,1 to < 4 feet,#728d97,4.0
 flood_depth,4 to < 7 feet,#73b7ea,7.0
@@ -138,12 +144,34 @@ lnd_chng,Induced Loss,#00f0f0,533.0
 lnd_chng,No Data,#00000000,552.0
 lnd_chng,Induced Loss,#00f0f0,553.0
 lnd_chng,No Data,#00000000,
+lnd_conf,No Data,#00000000,0.0
+lnd_conf,0 to < 0.2,#018571,0.2
+lnd_conf,0.2 to < 0.4,#80cdc1,0.4
+lnd_conf,0.4 to < 0.6,#f5f5f5,0.6
+lnd_conf,0.6 to < 0.8,#dfc27d,0.8
+lnd_conf,0.8 to 1.0,#a6611a,
+lnd_conf_diff,No Data,#00000000,-1.0
+lnd_conf_diff,Likely Land Loss,#256B84,-0.67
+lnd_conf_diff,Possible Land Loss,#4999B6,-0.42
+lnd_conf_diff,Likely Stays Land,#A0C7D4,-0.09
+lnd_conf_diff,High Confidence No Change,#00000000,0.17
+lnd_conf_diff,Likely Stays Water,#ABCB9F,0.5
+lnd_conf_diff,Possible Land Gain,#658859,0.75
+lnd_conf_diff,Likely Land Gain,#1F4314,
 lnd_type,No Data,#00000000,1.0
 lnd_type,Vegetated Wetland (value=1),#008000,2.0
 lnd_type,Open Water (value=2),#6495ed,3.0
 lnd_type,Bare/Unvegetated Wetland (value=3),#8b4513,4.0
 lnd_type,Upland/Developed Areas (value=4),#999999,5.0
 lnd_type,Flotant Marsh (value=5),#afeeee,
+lnd_type_plus,No Data,#00000000,1.0
+lnd_type_plus,Vegetated Wetland (value=1),#008000,2.0
+lnd_type_plus,Water - Deep (value=2),#6495ed,3.0
+lnd_type_plus,Bare/Unvegetated Wetland (value=3),#8b4513,4.0
+lnd_type_plus,Upland/Developed Areas (value=4),#999999,5.0
+lnd_type_plus,Flotant Marsh (value=5),#afeeee,6.0
+lnd_type_plus,Water - Shallow Intertidal (value = 6),#d1dffa,7.0
+lnd_type_plus,Water - Shallow Subtidal (value = 7),#93b5f2,
 mnrl_dep,0 to < 1,#feebe2,1.0
 mnrl_dep,1 to < 10,#fbb4b9,10.0
 mnrl_dep,10 to < 100,#f768a1,100.0
@@ -275,25 +303,3 @@ wave_heights,1.00 to 1.99,#fdae61,2.0
 wave_heights,2.00 to 4.99,#ffffbf,5.0
 wave_heights,5.00 to 9.99,#abdda4,10.0
 wave_heights,10.0 or more,#2b83ba,
-lnd_type_plus,No Data,#00000000,1.0
-lnd_type_plus,Vegetated Wetland (value=1),#008000,2.0
-lnd_type_plus,Water - Deep (value=2),#6495ed,3.0
-lnd_type_plus,Bare/Unvegetated Wetland (value=3),#8b4513,4.0
-lnd_type_plus,Upland/Developed Areas (value=4),#999999,5.0
-lnd_type_plus,Flotant Marsh (value=5),#afeeee,6.0
-lnd_type_plus,Water - Shallow Intertidal (value = 6),#d1dffa,7.0
-lnd_type_plus,Water - Shallow Subtidal (value = 7),#93b5f2,
-lnd_conf,No Data,#00000000,0.0
-lnd_conf,0 to < 0.2,#018571,0.2
-lnd_conf,0.2 to < 0.4,#80cdc1,0.4
-lnd_conf,0.4 to < 0.6,#f5f5f5,0.6
-lnd_conf,0.6 to < 0.8,#dfc27d,0.8
-lnd_conf,0.8 to 1.0,#a6611a,
-lnd_conf_diff,No Data,#00000000,-1.0
-lnd_conf_diff,Likely Land Loss,#256B84,-0.67
-lnd_conf_diff,Possible Land Loss,#4999B6,-0.42
-lnd_conf_diff,Likely Stays Land,#A0C7D4,-0.09
-lnd_conf_diff,High Confidence No Change,#00000000,0.17
-lnd_conf_diff,Likely Stays Water,#ABCB9F,0.50
-lnd_conf_diff,Possible Land Gain,#658859,0.75
-lnd_conf_diff,Likely Land Gain,#1F4314,
