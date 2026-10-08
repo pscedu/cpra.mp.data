@@ -27,7 +27,6 @@ os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 import pytest  # noqa: E402
 
 from cpra.mp.data import config as cpra_config  # noqa: E402
-from cpra.mp.data.api.utils import _read_data_cached  # noqa: E402
 
 
 def pytest_configure(config):
@@ -39,25 +38,39 @@ def pytest_configure(config):
         )
 
 
-@pytest.fixture(autouse=True)
-def clear_read_cache():
-    """Reset the API's TTL cache around every test.
-
-    ``api.utils._read_data_cached`` is wrapped in a ``TTLCache`` keyed only on the
-    dimension kwargs. Without this, two tests using identical dimensions but different
-    ``tmp_path`` directories would silently share the first test's LazyFrame.
-    """
-    _read_data_cached.cache_clear()
-    yield
-    _read_data_cached.cache_clear()
-
-
 @pytest.fixture
 def base_path(tmp_path):
     """An isolated, empty data directory."""
     path = tmp_path / "data"
     path.mkdir()
     return path
+
+
+@pytest.fixture
+def catalog_path(tmp_path):
+    """An isolated catalog directory."""
+    return tmp_path / "catalog"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_catalog_path(tmp_path, monkeypatch):
+    """Point the module-level catalog default at a per-test directory.
+
+    CATALOG_PATH has no per-test fixture of its own the way BASE_PATH does (via the
+    ``base_path`` fixture) -- it derives from BASE_PATH.parent, so every test in the
+    session shares one directory unless something redirects it. Writers that don't take
+    an explicit ``catalog_path=`` argument (or tests that only pass ``base_path=``) fall
+    through to that shared default and silently leak catalog rows between tests writing
+    the same dimension combination.
+
+    This mirrors the ``crosswalk_path``/``tiles_path``/``geometry_path`` fixtures above,
+    but is autouse so isolation doesn't require opting in. It only ever changes what the
+    "not passed" default resolves to (``get_write_catalog_path``'s ``CATALOG_PATH_UNSET``
+    sentinel in cpra/mp/data/config.py) -- a test that explicitly passes
+    ``catalog_path=None`` to skip catalog writes, or an explicit ``catalog_path=<path>``,
+    is unaffected either way.
+    """
+    monkeypatch.setattr(cpra_config, "CATALOG_PATH", tmp_path / "catalog")
 
 
 @pytest.fixture

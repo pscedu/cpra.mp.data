@@ -107,7 +107,7 @@ class TestPartitionProperty:
 
 class TestRegistries:
     def test_dataset_dimensions_are_the_path_prefix(self):
-        assert list(DATASET_DIMENSIONS) == ["variable", "grid", "time_unit"]
+        assert list(DATASET_DIMENSIONS) == ["variable", "time_unit", "grid"]
 
     def test_metadata_dimensions(self):
         assert list(METADATA_DIMENSIONS) == ["model"]

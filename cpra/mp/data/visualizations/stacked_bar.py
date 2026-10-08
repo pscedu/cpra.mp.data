@@ -1,7 +1,6 @@
 import datetime as dt
 import itertools
 import json
-import re
 from functools import cached_property
 from typing import final
 
@@ -36,7 +35,7 @@ class StackedBar(DatasetVisualization):
         name = "stacked-bar"
         label = "Stacked Bar"
         type = "dataset"
-        max_geographies = 1
+        max_grid_cells = 1
 
     @cached_property
     def is_daily(self):
@@ -54,25 +53,24 @@ class StackedBar(DatasetVisualization):
         return "date" if self.is_daily else self.time_column
 
     @cached_property
-    def negate_dimension(self):
-        """The dimension a difference chart is taking its difference across, if any."""
-        negate_param = self.params.get("negate")
-        return re.match(r"\w+", negate_param).group() if negate_param else None
-
-    @cached_property
     def compare_dimensions(self):
         """Selected dimensions with more than one value, mapped onto `COMPARE_CHANNELS`.
 
-        The negate dimension is excluded: its two values are the difference itself, not two
-        series to draw. Anything past the available channels is dropped rather than silently
-        collapsed into an unreadable stack.
+        A collapsed dimension is excluded: its selected values are the analysis result
+        itself (a difference, a concatenation, ...), not two series to draw -- read off
+        the resolved analysis's own `collapsed_dimensions` when `analysis=` is selected;
+        with no analysis selected, nothing is collapsed. Anything past the available
+        channels is dropped rather than silently collapsed into an unreadable stack.
         """
+        resolved = self.resolved_analysis
+        excluded_dimensions = set(resolved.collapsed_dimensions) if resolved is not None else set()
+
         compared = {
             d: self.params[d]
             for d in DIMENSIONS.keys()
             if isinstance(self.params.get(d), (list, tuple))
             and len(self.params.get(d)) > 1
-            and d != self.negate_dimension
+            and d not in excluded_dimensions
         }
         return {k: compared[k] for k in list(compared.keys())[: len(COMPARE_CHANNELS)]}
 
@@ -211,8 +209,9 @@ class StackedBar(DatasetVisualization):
         layer = [bars, rules]
         # Difference charts can have negative values; Vega-Lite stacks negative bar
         # segments below zero automatically, so add a zero-reference rule for
-        # visual parity with TimeSeriesLine's negate handling.
-        if self.params.get("negate"):
+        # visual parity with TimeSeriesLine's difference handling.
+        resolved = self.resolved_analysis
+        if resolved is not None and resolved.result_kind == "difference":
             layer.insert(0, base.mark_rule(color="lightGray", size=2).encode(y=alt.datum(0)))
 
         viz = alt.layer(*layer).properties(width=self.chart_width, height=self.chart_height)

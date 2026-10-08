@@ -1,7 +1,6 @@
 import datetime as dt
 import itertools
 import json
-import re
 from typing import final
 
 import altair as alt
@@ -20,7 +19,7 @@ class TimeSeriesLine(DatasetVisualization):
         name = "time-series-line"
         label = "Time Series Line"
         type = "dataset"
-        max_geographies = 10
+        max_grid_cells = 10
 
     def chart(self):
         """Build the visualization using Altair."""
@@ -30,13 +29,19 @@ class TimeSeriesLine(DatasetVisualization):
         initial_date_range = (start_date, end_date)
         is_daily = self.time_column == "calendar_day"
 
-        negate_param = self.params.get("negate")
-        negate_dimension = re.match(r"\w+", negate_param).group() if negate_param else None
+        # Which dimensions the resolved analysis's own pipeline already collapsed away
+        # (e.g. `diff`'s two selected values of its own `dimension` param). A
+        # collapsed dimension has nothing left to compare across; with no analysis
+        # selected, nothing is collapsed.
+        resolved = self.resolved_analysis
+        excluded_dimensions = set(resolved.collapsed_dimensions) if resolved is not None else set()
 
         compare_dimensions = {
             d: self.params[d]
             for d in DIMENSIONS.keys()
-            if isinstance(self.params.get(d), (list, tuple)) and len(self.params.get(d)) > 1 and d != negate_dimension
+            if isinstance(self.params.get(d), (list, tuple))
+            and len(self.params.get(d)) > 1
+            and d not in excluded_dimensions
         }
         # Limit compare dimensions to the number of available channels.
         # TODO: Adjust params to remove additional compare dimensions from the data.
@@ -59,25 +64,32 @@ class TimeSeriesLine(DatasetVisualization):
         nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=["date"], empty=False)
         when_near = alt.when(nearest)
 
-        # The data is keyed by whatever the API reports as `geography`, but the legend shows
-        # `geography_label` — a coordinate selection carries the resolved grid cell ID, which
+        # The data is keyed by whatever the API reports as `grid_cell`, but the legend shows
+        # `grid_cell_label` — a coordinate selection carries the resolved grid cell ID, which
         # is what actually identifies the values being drawn. The row index doubles as the
         # tooltip's column key below, so both label lists line up with it.
-        geography_df = pl.DataFrame(
-            dict(geography=self.geographies, geography_label=self.geography_labels)
-        ).with_row_index(name="geography_idx")
+        grid_cell_label_df = pl.DataFrame(
+            dict(grid_cell=self.grid_cells, grid_cell_label=self.grid_cell_labels)
+        ).with_row_index(name="grid_cell_label_idx")
 
         main_line_encodings = [
             alt.X("date:T", axis=alt.Axis(grid=True)).title(self.time_dimension.label),
+            # `self.data_source.name`, not `self.variable.name`: the expression has to name
+            # the Vega dataset this chart actually reads, and `get_data_source` names it
+            # `variable or "value"` -- a result that folds several variables (or fixes its
+            # own inputs, like `lnd_type_plus`) has no single variable to be named after, so
+            # `self.variable` is `None` there and the source is called "value". Re-deriving
+            # the name from the variable both crashed on that `None` and would have pointed
+            # `data()` at a dataset that does not exist whenever the two disagreed.
             alt.Y("value:Q", axis=alt.Axis(grid=True))
             .title(self.variable_label)
-            .scale(domainMax=alt.expr(f"extent(pluck(data('{self.variable.name}'), 'value'))[1]")),
-            # Each series is colored as the map colors the geography it draws, rather than by
-            # its position in the legend — see `geography_colors`, which is why the palette
+            .scale(domainMax=alt.expr(f"extent(pluck(data('{self.data_source.name}'), 'value'))[1]")),
+            # Each series is colored as the map colors the grid cell it draws, rather than by
+            # its position in the legend — see `grid_cell_colors`, which is why the palette
             # isn't handed over whole.
-            alt.Color("geography_label:N")
+            alt.Color("grid_cell_label:N")
             .title(self.grid.label)
-            .scale(domain=self.geography_labels, range=self.geography_colors),
+            .scale(domain=self.grid_cell_labels, range=self.grid_cell_colors),
         ] + [
             compare_channels[i](f"{dimension}:N").title(DIMENSIONS[dimension].label)
             for i, dimension in enumerate(compare_dimensions.keys())
@@ -86,8 +98,8 @@ class TimeSeriesLine(DatasetVisualization):
         main_line = (
             self.get_base_chart(self.data_source, self.time_column)
             .transform_lookup(
-                "geography",
-                from_=alt.LookupData(geography_df, "geography", ["geography_label"]),
+                "grid_cell",
+                from_=alt.LookupData(grid_cell_label_df, "grid_cell", ["grid_cell_label"]),
             )
             .mark_line()
             .encode(*main_line_encodings)
@@ -96,6 +108,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
+        grid_cell_df = pl.DataFrame(dict(grid_cell=self.grid_cells)).with_row_index(name="grid_cell_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
@@ -103,9 +116,9 @@ class TimeSeriesLine(DatasetVisualization):
                 title=f"{label}: {', '.join([str(c) for c in val_choices])}",
                 format=display_number_format(self.variable),
             )
-            # Short labels here: a tooltip carries a row per geography, so a full label
+            # Short labels here: a tooltip carries a row per grid cell, so a full label
             # would push the numbers being read off to the right.
-            for i, label in enumerate(self.geography_short_labels)
+            for i, label in enumerate(self.grid_cell_short_labels)
             for val_choices, idx_choices in zip(compare_choices, compare_choice_indices)
         ]
 
@@ -114,15 +127,15 @@ class TimeSeriesLine(DatasetVisualization):
         # uses String() coercion on the key, so the number 0 (from JSON's 0.0) becomes
         # "0" and fails to match the CSV string "0.0". Loose == coerces correctly.
         rules = self.get_base_chart(self.data_source, self.time_column).transform_lookup(
-            "geography",
-            from_=alt.LookupData(geography_df, "geography", ["geography_idx"]),
+            "grid_cell",
+            from_=alt.LookupData(grid_cell_df, "grid_cell", ["grid_cell_idx"]),
         )
         for dim_name, dim_values in compare_dimensions.items():
             idx_expr = (
                 " : ".join([f"datum.{dim_name} == {json.dumps(v)} ? {i}" for i, v in enumerate(dim_values)]) + " : null"
             )
             rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
-        pivot_key_parts = ["geography_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
+        pivot_key_parts = ["grid_cell_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
         rules = (
             rules.transform_calculate(tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts]))
             .transform_pivot("tooltip", value="value", groupby=["date", self.time_column])
@@ -138,7 +151,7 @@ class TimeSeriesLine(DatasetVisualization):
         layer = [main_line, points, rules]
 
         # Add a horizontal rule at zero for difference charts.
-        if self.params.get("negate"):
+        if resolved is not None and resolved.result_kind == "difference":
             layer.insert(
                 0,
                 self.get_base_chart(self.data_source, self.time_column)

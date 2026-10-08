@@ -1,0 +1,141 @@
+"""`diff` -- a dataset-scoped analysis over two selected values of one dimension:
+negate whichever of the two is later (`order="asc"`) or earlier (`order="desc"`), then sum
+across it. Replaces the portal's `subtract-asc`/`subtract-desc` catalog entries (see
+`cpra-mp-ui/src/helpers/catalog.ts`'s real derivation, lines 95-138) with a named pipeline
+the server itself validates and compiles, rather than a client-side-only convention.
+"""
+
+from typing import Literal
+
+from pydantic import field_validator
+
+from cpra.mp.data.analyses.base import (
+    Analysis,
+    AnalysisMeta,
+    InvalidAnalysisParametersError,
+    dataset_input_selection,
+    dataset_output_format,
+    format_dimension_literal,
+    is_filterable_dimension,
+    normalized_filter_values,
+    required_dataset_dimensions,
+    selection_filter_where,
+)
+from cpra.mp.data.analysis.request.pipeline import parse_pipeline
+
+
+class Difference(Analysis):
+    Meta = AnalysisMeta(
+        name="diff",
+        label="Difference",
+        variables=None,
+        legend=None,
+        result_kind="difference",
+        kind="dimension",
+    )
+
+    class Parameters(Analysis.Parameters):
+        dimension: str
+        order: Literal["asc", "desc"]
+
+        @field_validator("dimension")
+        @classmethod
+        def _dimension_must_be_filterable(cls, value: str) -> str:
+            if not is_filterable_dimension(value):
+                raise ValueError(f"{value!r} is not a filterable dimension")
+            return value
+
+    @classmethod
+    def validate_selection(cls, parameters: "Difference.Parameters", filters: dict) -> None:
+        dim = parameters.dimension
+        raw = filters.get(dim)
+        if raw is None:
+            raise InvalidAnalysisParametersError(
+                f"diff on dimension {dim!r} requires a {dim!r} filter selecting "
+                "exactly 2 distinct values, but none was given"
+            )
+        values = normalized_filter_values(dim, raw)
+        if len(values) != 2:
+            raise InvalidAnalysisParametersError(
+                f"diff on dimension {dim!r} requires exactly 2 distinct selected "
+                f"values, got {len(values)}: {raw!r}"
+            )
+
+    def _dimension_steps(self, group_by: list[str]) -> list[dict]:
+        """The two steps this analysis contributes, independent of whether it leads a
+        pipeline or is appended after another analysis's output (see
+        `analyses.resolve_analysis_chain`): negate whichever of the two selected values is
+        later (`order="asc"`) or earlier (`order="desc"`), then sum across `group_by`.
+        Chaining omits `input` on the first of these, so it consumes whatever step
+        precedes it -- `validate_pipeline`'s ordinary chaining rule, the same one every
+        other multi-step analysis already relies on.
+
+        `validate_selection` (called by `resolve_analysis`/`resolve_analysis_chain` before
+        this is ever reached) already guarantees `filters[dim]` normalizes to exactly 2
+        distinct values -- re-derive here rather than trust a caller who skipped that
+        step, since a direct `Difference(...).pipeline()` call (e.g. a test) has no such
+        guarantee.
+        """
+        dim = self.parameters.dimension
+        values = normalized_filter_values(dim, self.filters[dim])
+        if len(values) != 2:
+            raise InvalidAnalysisParametersError(
+                f"diff on dimension {dim!r} requires exactly 2 distinct selected "
+                f"values, got {len(values)}: {self.filters[dim]!r}"
+            )
+        earlier, later = sorted(values)
+        negate_value = later if self.parameters.order == "asc" else earlier
+
+        # Negate one of the two values and sum: `later - earlier` said as `(-later) +
+        # earlier`, which is what lets the subtraction ride on `group`'s existing `sum`.
+        # `else: "value"` is the pass-through the other value needs -- without it the
+        # non-negated rows would go null and the sum would have nothing to add.
+        return [
+            {
+                "op": "case",
+                "cases": [
+                    {
+                        "when": f"{dim} = {format_dimension_literal(dim, negate_value)}",
+                        "then": "value * -1",
+                    }
+                ],
+                "else": "value",
+            },
+            {"op": "group", "by": group_by, "aggregate": "sum"},
+        ]
+
+    def pipeline(self):
+        dataset = self.require_dataset()
+        dim = self.parameters.dimension
+        required = required_dataset_dimensions(dataset)
+        group_by = [d for d in required if d != dim]
+
+        steps: list[dict] = []
+        where = selection_filter_where(self.filters, grid_cell_where=self.grid_cell_where)
+        if where is not None:
+            steps.append({"op": "filter", "where": where})
+        steps.extend(self._dimension_steps(group_by))
+        # A pipeline's FIRST step must name its input explicitly; every later step chains
+        # from the one before it. The leading `filter` normally carries that name, but a
+        # caller invoking `pipeline()` directly with no filters at all (the API path
+        # always supplies the two-value `dimension` filter `validate_selection` demands)
+        # leaves the `case` first, so the name goes there instead.
+        steps[0]["input"] = "x"
+
+        data = {
+            "inputs": {"x": dataset_input_selection(self.dataset)},
+            "steps": steps,
+            # Derived from the dataset's grid kind rather than fixed: `Meta.variables` is
+            # `None` here, so this analysis really does run on both kinds, and it neither
+            # projects nor otherwise changes shape -- a vector selection ends tabular, a
+            # raster one band-wide, and `validate_shapes` rejects the mismatched sink
+            # either way. Only `pipeline.json` ever shows the value, since the
+            # `data.{format}`/tile routes overwrite it from their own URL segment, but what
+            # `pipeline.json` publishes has to still validate if a caller resubmits it.
+            "output": {"format": dataset_output_format(self.dataset)},
+        }
+        return parse_pipeline(data)
+
+    @property
+    def title_suffix(self) -> str:
+        return " Difference"

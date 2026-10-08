@@ -18,14 +18,14 @@ MAP_SELECTION = [
     "#147df5",
 ]
 
-# What a geography past the end of the palette is drawn with, as the UI draws it (see
-# `getSelectionColor`): there are as many colors as the most geographies any visualization
+# What a grid cell past the end of the palette is drawn with, as the UI draws it (see
+# `getSelectionColor`): there are as many colors as the most grid cells any visualization
 # allows, so a longer selection is already past what either has a color left to tell apart.
 MAP_SELECTION_OVERFLOW = "#000000"
 
 
 def selection_color(index):
-    """Get the color the map draws the `index`th geography of a selection with.
+    """Get the color the map draws the `index`th grid cell of a selection with.
 
     The map takes a pin's color — and the outline color of the grid cell the pin fell in —
     from the pin's place in the selection. A chart read beside the map has to pick by that

@@ -330,7 +330,7 @@ def _reprojected_bbox(bbox, transformer):
 
 def write_raster_crosswalk(raster_grid_name, dst_grid_name, grids_path, crosswalks_path, block_size=512):
     """Rasterize a destination vector grid's polygons onto a raster grid's pixel grid,
-    producing the zone-ID crosswalk COG the data API's `summarize_by` and
+    producing the zone-ID crosswalk COG a pipeline `project` step and
     `api/crosswalk.py` read.
 
     Processes one `block_size` x `block_size` window at a time: only the destination

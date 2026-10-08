@@ -35,7 +35,7 @@ def continuous_legend():
 
 
 def pixels(values):
-    """Shape pixel values the way Dataset.get_raster_array delivers them: (bands, h, w)."""
+    """Shape pixel values the way Dataset._collapse_tile_bands delivers them: (bands, h, w)."""
     return np.array([[values]], dtype="float64")
 
 

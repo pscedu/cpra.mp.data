@@ -34,6 +34,7 @@ from typing import final
 import altair as alt
 import polars as pl
 
+from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.visualizations.display import display_number_format, display_unit
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
@@ -114,10 +115,28 @@ class SpeciesStackedBar(StackedBar):
         name = "species-stacked-bar"
         label = "Species Stacked Bar"
         type = "dataset"
-        max_geographies = 1
+        max_grid_cells = 1
         # `veg_species` is the only variable `veg_species_code` describes, and this chart
         # is built entirely around that dimension -- the catalog offers it for no other.
         variables = ["veg_species"]
+
+    def validate(self):
+        """This chart is a breakdown of ONE variable's species, so it needs that variable.
+
+        `Meta.variables` already says which one, and a client reads it to decide whether to
+        offer the chart at all -- but nothing enforced it server-side, and the route is
+        public. A request naming an analysis that fixes its own inputs (`lnd_type_plus`)
+        has no presentation variable at all, and every property here dereferenced that
+        `None`: `AttributeError` -> 500, for what is an ordinary bad request.
+        """
+        super().validate()
+        if self.variable is None or self.variable.name not in self.Meta.variables:
+            named = "no single variable" if self.variable is None else repr(self.variable.name)
+            raise RequestError(
+                f"visualization {self.Meta.name!r} breaks one variable down by "
+                f"{SPECIES_DIMENSION}, so it can only draw {self.Meta.variables[0]!r} -- this "
+                f"request produces {named}."
+            )
 
     @cached_property
     def variable_label(self):
@@ -144,8 +163,8 @@ class SpeciesStackedBar(StackedBar):
         by, so with no filter at all the response would carry no `veg_species_code` at all.
         """
 
-        params = {name: value for name, value in self.params.items() if name != SPECIES_DIMENSION}
-        params["select"] = ",".join([self.time_column, SPECIES_DIMENSION, "geography", "value"])
+        params = {name: value for name, value in self.source_params.items() if name != SPECIES_DIMENSION}
+        params["select"] = ",".join([self.time_column, SPECIES_DIMENSION, "grid_cell", "value"])
         return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **params)
 
     @cached_property

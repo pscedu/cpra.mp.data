@@ -1,4 +1,9 @@
-"""Tests for reading, writing, and compacting wide-format Parquet datasets."""
+"""Tests for reading, writing, and compacting long-format Parquet datasets.
+
+``write_parquet`` accepts wide input (one column per grid cell, as produced by the model
+and built by ``tests/factories.py``) and unpivots it to long (a ``grid_cell`` column plus
+a ``value`` column, one row per cell x time step) before writing. ``read_parquet`` always
+returns long-format data."""
 
 import datetime
 from pathlib import Path
@@ -9,7 +14,6 @@ import pytest
 from cpra.mp.data import config
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.tabular import compact_parquet, read_parquet, write_parquet
-
 from tests.factories import (
     ANNUAL_KWARGS,
     DAILY_KWARGS,
@@ -26,7 +30,7 @@ class TestWriteParquet:
         write_parquet(annual_frame(), base_path=base_path)
         files = list(base_path.rglob("*.parquet"))
         assert len(files) == 1
-        assert "variable=ssf/grid=ecoregion_v001/time_unit=annual" in str(files[0])
+        assert "variable=ssf/time_unit=annual/grid=ecoregion_v001" in str(files[0])
 
     def test_annual_data_keeps_partition_dimensions_as_columns(self, base_path):
         """Only daily data promotes model_group_id and friends to directories."""
@@ -48,14 +52,16 @@ class TestWriteParquet:
         result = pl.read_parquet(next(base_path.rglob("*.parquet")))
         assert result["model_group_id"].unique().to_list() == [501]
 
-    def test_long_format_input_is_pivoted(self, base_path):
-        """A frame with geography/value columns is pivoted to wide before writing."""
+    def test_long_format_input_is_written_directly(self, base_path):
+        """A frame already in long format (grid_cell/value columns, not one column per
+        grid cell) has no numeric-named columns, so the unpivot step is a no-op and the
+        frame is written straight through."""
         long_df = pl.DataFrame(
             {
                 **{k: [v] * 3 for k, v in ANNUAL_KWARGS.items() if k != "grid"},
                 "grid": ["ecoregion_v001"] * 3,
                 "calendar_year": [2030] * 3,
-                "geography": ["1", "2", "3"],
+                "grid_cell": [1, 2, 3],
                 "value": [1.0, 2.0, 3.0],
             }
         ).with_columns(
@@ -63,11 +69,13 @@ class TestWriteParquet:
             pl.col("scenario_id").cast(pl.Int32),
             pl.col("percentile").cast(pl.Int8),
             pl.col("calendar_year").cast(pl.Int32),
+            pl.col("grid_cell").cast(pl.Int32),
+            pl.col("value").cast(pl.Float32),
         )
         write_parquet(long_df, base_path=base_path, validate=False, sort=False)
         result = pl.read_parquet(next(base_path.rglob("*.parquet")))
-        assert {"1", "2", "3"} <= set(result.columns)
-        assert "geography" not in result.columns
+        assert result["grid_cell"].to_list() == [1, 2, 3]
+        assert result["value"].to_list() == pytest.approx([1.0, 2.0, 3.0])
 
     def test_accepts_a_dict_of_series(self, base_path):
         """A plain dict is accepted, but only Series preserve the required dtypes."""
@@ -79,56 +87,99 @@ class TestWriteParquet:
         with pytest.raises(ValidationError, match="expected Int32"):
             write_parquet(annual_frame().to_dict(as_series=False), base_path=base_path)
 
-    def test_sorts_geography_columns_numerically(self, base_path):
-        """Column order must be 1, 2, ... 10, not the lexical 1, 10, 2."""
+    def test_sorts_grid_cells_numerically(self, base_path):
+        """Row order must be grid_cell 1, 2, ... 10, not the lexical 1, 10, 2 that the
+        wide column names (unpivoted into grid_cell) would sort to as strings."""
         write_parquet(annual_frame(), base_path=base_path)
         result = pl.read_parquet(next(base_path.rglob("*.parquet")))
-        numeric = [c for c in result.columns if c[0].isdigit()]
-        assert numeric == [str(i) for i in ECOREGION_IDS]
+        grid_cells = result.filter(pl.col("calendar_year") == 2030)["grid_cell"].to_list()
+        assert grid_cells == list(ECOREGION_IDS)
 
     def test_sorts_rows_by_required_columns(self, base_path):
         write_parquet(annual_frame(years=(2050, 2030, 2040)), base_path=base_path)
         result = pl.read_parquet(next(base_path.rglob("*.parquet")))
-        assert result["calendar_year"].to_list() == [2030, 2040, 2050]
+        years = result.filter(pl.col("grid_cell") == 1)["calendar_year"].to_list()
+        assert years == [2030, 2040, 2050]
 
     def test_sort_false_preserves_input_order(self, base_path):
         write_parquet(annual_frame(years=(2050, 2030)), base_path=base_path, sort=False)
         result = pl.read_parquet(next(base_path.rglob("*.parquet")))
-        assert result["calendar_year"].to_list() == [2050, 2030]
+        years = result.filter(pl.col("grid_cell") == 1)["calendar_year"].to_list()
+        assert years == [2050, 2030]
 
 
 class TestWriteParquetValidation:
-    def test_unexpected_alpha_column_raises(self, base_path):
-        df = annual_frame().with_columns(surprise=pl.lit("x"))
-        with pytest.raises(ValidationError, match="Invalid columns: surprise"):
-            write_parquet(df, base_path=base_path)
-
     def test_missing_required_column_raises(self, base_path):
         df = annual_frame().drop("percentile")
         with pytest.raises(ValidationError, match="percentile"):
             write_parquet(df, base_path=base_path)
 
     def test_sort_reports_a_column_required_by_the_data_itself(self, base_path):
-        """With validation off, the sort branch still catches a column that the frame's
-        own dimension values imply: annual data must carry calendar_year."""
+        """With validation off, the sort branch still needs a column that the frame's
+        own dimension values imply: annual data must carry calendar_year. It is checked
+        eagerly, so the caller gets this package's own error rather than a Polars
+        ColumnNotFoundError raised from inside a sink producer thread."""
         df = annual_frame().drop("calendar_year")
-        with pytest.raises(ValidationError, match="Missing columns: calendar_year"):
+        with pytest.raises(ValidationError, match="calendar_year"):
             write_parquet(df, base_path=base_path, validate=False, sort=True)
 
-    def test_wrong_geography_column_count_raises(self, base_path):
-        """ecoregion_v001 declares id_count=32."""
-        df = annual_frame(geo_ids=(1, 2, 3))
-        with pytest.raises(ValidationError, match="expected 32, found 3"):
+    def test_unexpected_column_raises(self, base_path):
+        """An unrecognized column is a typo, not data. Rejecting it up front matters
+        because the alternative is silent and depends on an unrelated argument: the
+        sort's `.select()` drops the column when sort=True, and it is written into the
+        output file when sort=False.
+        """
+        df = annual_frame().with_columns(surprise=pl.lit("boom"))
+        with pytest.raises(ValidationError, match="Invalid columns: surprise"):
             write_parquet(df, base_path=base_path)
 
-    def test_geography_id_above_max_raises(self, base_path):
+    @pytest.mark.parametrize("sort", [True, False])
+    def test_unexpected_column_never_reaches_the_output(self, base_path, sort):
+        """The guard runs before either sort branch, so neither can leak the column."""
+        df = annual_frame().with_columns(surprise=pl.lit("boom"))
+        with pytest.raises(ValidationError, match="surprise"):
+            write_parquet(df, base_path=base_path, sort=sort)
+        assert list(base_path.rglob("*.parquet")) == []
+
+    def test_grid_cell_id_above_max_raises(self, base_path):
         df = annual_frame(geo_ids=tuple(range(2, 34)))
-        with pytest.raises(ValidationError, match="Invalid geography ID"):
+        with pytest.raises(ValidationError, match="Grid cell ID above maximum"):
             write_parquet(df, base_path=base_path)
 
-    def test_geography_id_below_min_raises(self, base_path):
+    def test_grid_cell_id_below_min_raises(self, base_path):
         df = annual_frame(geo_ids=tuple(range(0, 32)))
-        with pytest.raises(ValidationError, match="Invalid geography ID"):
+        with pytest.raises(ValidationError, match="Grid cell ID below minimum"):
+            write_parquet(df, base_path=base_path)
+
+    def test_grid_cell_id_count_incomplete_raises(self, base_path):
+        """Partial writes are not allowed: ecoregion_v001 has exactly 32 grid cells, so a
+        frame missing one -- even though every ID present is in range -- must be rejected
+        rather than silently written as an incomplete dataset."""
+        df = annual_frame(geo_ids=tuple(range(1, 32)))
+        with pytest.raises(ValidationError, match="Grid cell IDs incomplete"):
+            write_parquet(df, base_path=base_path)
+
+    def test_grid_cell_id_inconsistent_row_counts_raises(self, base_path):
+        """Every grid cell must appear the same number of times (once per implied time
+        step); a cell with extra or missing time steps relative to the others is also a
+        partial write, even though every ID from 1-32 is present."""
+        rows = [(gc, 2030) for gc in ECOREGION_IDS] + [(1, 2040)]
+        df = pl.DataFrame(
+            {
+                **{k: [v] * len(rows) for k, v in ANNUAL_KWARGS.items()},
+                "grid_cell": [r[0] for r in rows],
+                "calendar_year": [r[1] for r in rows],
+                "value": [1.0] * len(rows),
+            }
+        ).with_columns(
+            pl.col("model_group_id").cast(pl.Int32),
+            pl.col("scenario_id").cast(pl.Int32),
+            pl.col("percentile").cast(pl.Int8),
+            pl.col("calendar_year").cast(pl.Int32),
+            pl.col("grid_cell").cast(pl.Int32),
+            pl.col("value").cast(pl.Float32),
+        )
+        with pytest.raises(ValidationError, match="inconsistent row counts"):
             write_parquet(df, base_path=base_path)
 
     def test_wrong_value_dtype_raises(self, base_path):
@@ -142,13 +193,6 @@ class TestWriteParquetValidation:
         write_parquet(df, base_path=base_path, validate=False, sort=False)
         assert list(base_path.rglob("*.parquet"))
 
-    def test_sort_enforces_column_checks_even_when_validate_is_false(self, base_path):
-        """The column-name and geography-ID checks live in the `validate or sort` block,
-        so turning validation off does not disable them unless sorting is off too."""
-        df = annual_frame(geo_ids=(1, 2, 3))
-        with pytest.raises(ValidationError, match="expected 32, found 3"):
-            write_parquet(df, base_path=base_path, validate=False, sort=True)
-
     def test_validate_false_skips_dimension_validation(self, base_path):
         """An out-of-range dimension value passes when validate=False."""
         df = annual_frame().with_columns(calendar_year=pl.lit(1800, dtype=pl.Int32))
@@ -161,8 +205,9 @@ class TestReadParquet:
         original = annual_frame()
         write_parquet(original, base_path=base_path)
         result = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
-        assert result["calendar_year"].to_list() == original["calendar_year"].to_list()
-        assert result["1"].to_list() == pytest.approx(original["1"].to_list())
+        cell = result.filter(pl.col("grid_cell") == 1).sort("calendar_year")
+        assert cell["calendar_year"].to_list() == original["calendar_year"].to_list()
+        assert cell["value"].to_list() == pytest.approx(original["1"].to_list())
 
     def test_dataset_dimensions_are_restored_as_columns(self, base_path):
         """variable/grid/time_unit live in the path, not the file, and are re-added."""
@@ -175,20 +220,22 @@ class TestReadParquet:
     def test_column_order(self, base_path):
         write_parquet(annual_frame(), base_path=base_path)
         result = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
-        assert result.columns[:3] == ["variable", "grid", "time_unit"]
-        assert result.columns[-1] == "32"
+        assert result.columns[:3] == ["variable", "time_unit", "grid"]
+        assert result.columns[-2:] == ["grid_cell", "value"]
 
     def test_scalar_filter(self, base_path):
         write_parquet(annual_frame(years=(2030, 2040, 2050)), base_path=base_path)
         result = read_parquet(base_path=base_path, calendar_year=2040, **DATASET_KWARGS).collect()
-        assert result["calendar_year"].to_list() == [2040]
+        assert result["calendar_year"].unique().to_list() == [2040]
+        assert result.height == len(ECOREGION_IDS)
 
     def test_list_filter(self, base_path):
         write_parquet(annual_frame(years=(2030, 2040, 2050)), base_path=base_path)
         result = read_parquet(
             base_path=base_path, calendar_year=[2030, 2050], **DATASET_KWARGS
         ).collect()
-        assert result["calendar_year"].to_list() == [2030, 2050]
+        assert sorted(result["calendar_year"].unique().to_list()) == [2030, 2050]
+        assert result.height == len(ECOREGION_IDS) * 2
 
     def test_include_file_paths(self, base_path):
         write_parquet(annual_frame(), base_path=base_path)
@@ -250,7 +297,7 @@ class TestCompactParquetGlob:
     def test_written_annual_layout_is_flat(self, base_path):
         write_parquet(annual_frame(), base_path=base_path)
         path = next(base_path.rglob("*.parquet"))
-        assert path.parent == base_path / "variable=ssf/grid=ecoregion_v001/time_unit=annual"
+        assert path.parent == base_path / "variable=ssf/time_unit=annual/grid=ecoregion_v001"
 
     def test_written_daily_layout_stops_at_the_partition_dimensions(self, base_path):
         write_parquet(daily_frame(), base_path=base_path, validate=False, sort=False)
@@ -300,7 +347,9 @@ class TestCompactParquet:
         assert list(production.rglob("*")) == []
         files = list(base_path.rglob("*.parquet"))
         assert len(files) == 1
-        assert pl.read_parquet(files[0])["calendar_year"].to_list() == [2030, 2040]
+        result = pl.read_parquet(files[0])
+        years = result.filter(pl.col("grid_cell") == 1)["calendar_year"].to_list()
+        assert years == [2030, 2040]
 
     def test_merges_annual_files_within_a_dataset(self, base_path):
         self._write_two_annual_files(base_path)
@@ -310,7 +359,9 @@ class TestCompactParquet:
 
         files = list(base_path.rglob("*.parquet"))
         assert len(files) == 1
-        assert pl.read_parquet(files[0])["calendar_year"].to_list() == [2030, 2040]
+        result = pl.read_parquet(files[0])
+        years = result.filter(pl.col("grid_cell") == 1)["calendar_year"].to_list()
+        assert years == [2030, 2040]
 
     def test_merges_daily_files_within_a_partition(self, base_path):
         self._write_two_daily_files(base_path)
@@ -327,8 +378,9 @@ class TestCompactParquet:
         compact_parquet(base_path=base_path, **DATASET_KWARGS)
 
         result = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
-        for col in ("1", "16", "32"):
-            assert result[col].to_list() == pytest.approx(source[col].to_list())
+        for geo_id in (1, 16, 32):
+            cell = result.filter(pl.col("grid_cell") == geo_id).sort("calendar_year")
+            assert cell["value"].to_list() == pytest.approx(source[str(geo_id)].to_list())
 
     def test_single_file_partitions_are_left_alone(self, base_path):
         write_parquet(annual_frame(years=(2030, 2040)), base_path=base_path)

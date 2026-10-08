@@ -1,0 +1,8 @@
+# Allowlist: the working tree holds hundreds of GB of local data, and only
+# these paths are used by the Dockerfile.
+*
+!pyproject.toml
+!README.md
+!uv.lock
+!cpra/
+**/__pycache__

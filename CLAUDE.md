@@ -7,7 +7,8 @@ used from here. Don't try to repair it, don't `uv sync` it, and don't run anythi
 through `.venv/bin/python`.
 
 Instead, build your own environment under `.verify-scratch/` with `uv`. That directory is
-gitignored, so environments there are safe to create, rebuild, or delete freely.
+gitignored, so environments there are safe to create, rebuild, or delete freely. Prefer
+reusing it over creating new scratch locations elsewhere in the repo.
 
 The best option is to sync the real dependency set there, which keeps you on the same
 versions as CI (see "Running the tests" below):
@@ -28,27 +29,38 @@ uv pip install --python .verify-scratch/<name>/bin/python <packages>
 PYTHONPATH=. .verify-scratch/<name>/bin/python -c "..."
 ```
 
-Pin the Python version explicitly — don't let `uv venv` pick for you. Some compiled
-dependencies (rasterio/GDAL, notably) may not have prebuilt wheels for every Python
-version available on this machine even though `pyproject.toml`'s `requires-python`
-constraint would technically allow it; 3.13 is confirmed to work for raster work.
+Pin the Python version explicitly — don't let `uv venv`/`uv sync` pick for you. Some
+compiled dependencies (rasterio/GDAL, notably) may not have prebuilt wheels for every
+Python version available on this machine even though `pyproject.toml`'s
+`requires-python` constraint would technically allow it; 3.13 is confirmed to work for
+raster work as of this writing.
 
 `PYTHONPATH=.` is required for the ad-hoc form — the package isn't installed into a bare
 `uv venv`, so imports resolve against the repo checkout directly. A `uv sync`-built
 environment installs the project and doesn't need it.
 
+**Don't `uv sync` an existing environment just to explore.** `uv sync` will silently
+reconcile the target environment to match `pyproject.toml`'s lockfile, which can mean
+deleting and reinstalling packages that were manually added (e.g. a package installed ad
+hoc with `uv pip install` for a one-off check). It can also fall back to a different
+interpreter than you expect, and can fail partway through with a permission error,
+leaving the environment in a half-wiped state. Only run `uv sync` against a given
+environment when you actually intend to bring it in line with `pyproject.toml`.
+
 ## uv-managed interpreters go dangling between sessions
 
-`uv`-installed CPython builds live under `~/.local/share/uv/python/` outside the repo and
-get garbage-collected independently of any venv that references them. A venv directory
-and its installed packages can still be on disk while its `bin/python` symlink points at
-nothing. **Never trust an existing scratch venv without checking first:**
+`uv`-installed CPython builds live under `~/.local/share/uv/python/` (or
+`~/.local/bin/python3.x`) outside the repo, and get garbage-collected independently of
+any venv that references them. A venv directory and its installed packages can still be
+on disk while its `bin/python` symlink points at nothing. **Never trust an existing
+scratch venv without checking first:**
 
 ```sh
-readlink -f .verify-scratch/<name>/bin/python   # empty output = dangling
+readlink -f .verify-scratch/<name>/bin/python   # empty output / "No such file or directory" = dangling
 ```
 
-If it's dangling, rebuild it — don't try to work around a dangling interpreter.
+If it's dangling, rebuild it — don't try to work around a dangling interpreter, just
+recreate the venv.
 
 ## Running the tests
 
@@ -73,10 +85,10 @@ server or `psycopg2` setup is required even though the `api` extra declares it.
 
 ## Testing code that touches `data/`
 
-Never point a write path (`write_parquet`, `write_cog`, `compact_parquet`, migration
-scripts, etc.) at the real `data/` directory to test a change. `data/` is tens of
-gigabytes of production model output — there's no cheap way to reconstruct it if a bug in
-the code under test corrupts or deletes something.
+Never point a write path (`write_parquet`, `write_cog`, `compact_parquet`,
+`compact_cog`, migration scripts, etc.) at the real `data/` directory to test a change.
+`data/` is tens of gigabytes of production model output — there's no cheap way to
+reconstruct it if a bug in the code under test corrupts or deletes something.
 
 The test suite guards this two ways, and new tests should keep both intact:
 

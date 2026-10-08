@@ -45,8 +45,8 @@ class Variable:
         display_scale_factor=None,
         display_number_format=None,
         float_precision=None,
-        nodata=None,
         difference_legend_limit=None,
+        nodata=None,
     ):
         self.name = name
         self.label = label
@@ -59,10 +59,9 @@ class Variable:
         self.subroutine = subroutine
         # `unit` describes the values as *stored*; the display_* attributes describe how they
         # are shown, which differs whenever a variable is stored in a finer unit than it is
-        # read in. No variable is stored that way on this branch -- `display_scale_factor` is
-        # unset throughout, so every conversion below is an identity -- but the presentation
-        # layer reads them through one place either way, so setting a scale factor in the
-        # structure spreadsheet is all it takes. See cpra.mp.data.visualizations.display.
+        # read in (elev: stored as Int32 millimeters, shown as meters). Nothing outside the
+        # presentation layer should consult them -- see cpra.mp.data.visualizations.display,
+        # which is the only place the conversion is applied.
         self.unit = unit
         self.display_unit = display_unit
         self.display_scale_factor = display_scale_factor
@@ -73,11 +72,15 @@ class Variable:
         # attributes this is not a presentation hint the client may ignore: it changes the
         # bytes in the download, so the values a user gets are the ones the model means.
         self.float_precision = float_precision
-        # The value this variable's rasters use for "no data", where it differs from the
-        # -9999 the raster writer defaults to. Set from the structure spreadsheet; null for
-        # every variable but `elev`, whose values are stored in millimetres.
-        self.nodata = nodata
+        # In storage units, like a legend's break points -- see visualizations.map, which
+        # colorizes raster pixels with it directly and only scales the legend it hands the
+        # client for display.
         self.difference_legend_limit = difference_legend_limit
+        # The nodata sentinel raster writes declare for this variable, in storage units.
+        # The default (-9999) predates per-variable sentinels and is what every raster on
+        # disk already declares; a variable overrides it only when -9999 is a plausible
+        # stored value (elev: -9999 mm is -9.999 m, so it declares -9999000 instead).
+        self.nodata = -9999 if nodata is None else nodata
 
 
 VARIABLES = {

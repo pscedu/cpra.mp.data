@@ -1,0 +1,1708 @@
+"""Migrate model datasets into the long-format tree, out-of-place.
+
+Reads from ``--data-path`` and writes a complete long-format tree under
+``--output-path``, leaving the input untouched.  Two kinds of data are handled:
+
+* **Tabular (Parquet).**  All wide-format files in the same partition directory
+  are converted together and written as a single long-format Parquet file, so
+  each output partition contains exactly one file.
+* **Raster (COG).**  Single-band COGs (including legacy single-band files) are
+  compacted into multi-band COGs wherever a contiguous calendar run spans more
+  than one file, via ``raster.compact_cog`` writing into the output tree.
+
+Everything processed is recorded in the unified catalog side-table under
+``--catalog-path`` (per-write rows appended by the write/compact functions, then
+coalesced into minimal contiguous runs by a final compaction pass).
+
+Usage:
+
+\b
+    # Dry-run: show what would be migrated without writing anything
+    python scripts/migrate_to_long_format.py --output-path /path/to/output --dry-run
+
+\b
+    # Migrate a single dataset (works for tabular or raster variables)
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog \\
+        --variable sal --grid hydro_compartment_v001 --time-unit daily
+
+\b
+    # Migrate all datasets
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog
+
+\b
+    # Show how many partitions have already been converted, per variable/grid/
+    # time-unit, according to the catalog
+    python scripts/migrate_to_long_format.py \\
+        --catalog-path /path/to/catalog --show-progress --variable sal
+
+\b
+    # Catch up an output tree whose input kept growing during the migration: check
+    # every partition against its source and append only what is missing
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog --append-missing
+
+\b
+    # Repeat the catch-up, skipping every partition whose source has not changed size
+    # since the previous run's log (the new log carries those partitions forward, so
+    # each run's log is all the next one needs)
+    python scripts/migrate_to_long_format.py \\
+        --output-path /path/to/output --catalog-path /path/to/catalog --append-missing \\
+        --skip-unchanged migration_previous.csv --log-path migration_next.csv
+
+After verifying correctness on one dataset, run without --dry-run to apply.
+"""
+
+import csv
+import multiprocessing
+import queue
+import os
+import resource
+import signal
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree
+from datetime import datetime
+from pathlib import Path
+
+import click
+import polars as pl
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
+# Add the project root to sys.path so the package is importable when the
+# script is run from any working directory.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from cpra.mp.data.catalog import Catalog, cal_for, parse_path_dims
+from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
+from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.raster import _band_calendar_frame, compact_cog
+from cpra.mp.data.tabular import read_parquet, write_parquet
+from cpra.mp.data.utils import long_sort_expressions
+
+
+def _wide_schema(path: Path) -> dict | None:
+    """Return the schema if the file is wide-format, else None.
+
+    Reads the file footer once so callers don't need a second schema fetch.
+    """
+    schema = pl.read_parquet_schema(path)
+    return schema if any(name[:1].isdigit() for name in schema) else None
+
+
+def _dimension_cols_from_hive(path: Path) -> dict:
+    """Extract dimension values encoded in the Hive partition path."""
+    parts = {}
+    for part in path.parts:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            if key in DIMENSIONS:
+                parts[key] = pl.Series([value]).cast(DIMENSIONS[key].dtype)[0]
+    return parts
+
+
+def _convert_batched(
+    parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
+    progress_cb=None, temp_path=None, catalog_path=None, unique_parquet_rows=False,
+    group_filter=None, existing_keys=None,
+) -> list[str]:
+    """Batched conversion via temp files, bounded to roughly one batch in memory.
+
+    Works for every time unit.  The wide frame has one column per grid cell, so
+    grid_cell is produced by unpivot rather than being a row attribute.  The
+    target sort places grid_cell ahead of the calendar tail for every time unit:
+
+      other_dims → grid_cell → calendar_year (annual/decadal)
+      other_dims → grid_cell → calendar_day  (daily/monthly)
+
+    A "group" is the set of wide rows that share every sort key *outside*
+    grid_cell — i.e. other_dims, for every time unit (the calendar column sorts
+    *inside* grid_cell, which is produced by unpivot, so all wide rows for one
+    other_dims combo must stay together).  Groups must never be split across
+    batches, or a grid_cell would appear in two batches and break the global
+    order on concatenation.
+
+    The wide frame is sorted so groups are contiguous; consecutive groups are
+    packed into batches under a long-row budget; each batch is unpivoted, sorted
+    to the global order, and streamed to a temp file.  Batches are written in
+    order, so concatenating the temp files is globally sorted.  partition_by()
+    is deliberately avoided — it would materialize every group at once, each
+    retaining all (~100k) grid-cell columns.
+
+    unique_parquet_rows, when True, drops duplicate rows (all columns equal,
+    including grid_cell and value) from each batch's unpivoted long frame before
+    sorting/writing. Batches never split a group, and duplicate wide rows always
+    share the same other_dims group, so duplicates are always caught within a
+    single batch.
+
+    group_filter and existing_keys are what --append-missing (see ``_append_missing``)
+    adds on top, and are None for a normal full conversion:
+
+    * group_filter, when given, is a frame of other_dims values; wide rows outside those
+      groups are dropped up front, so only the groups that are actually short are read,
+      unpivoted and written.
+    * existing_keys, when given, is a frame of the long-format key columns
+      (other_dims + grid_cell + calendar) already present in the output; each batch is
+      anti-joined against it so only genuinely absent rows survive. The join happens
+      before the sort, so what reaches the temp file is still in the global order.
+
+    With existing_keys set the surviving row count can be zero (the counts were short but
+    every key turned out to be present), in which case nothing is written at all -- an
+    empty Parquet file in the partition would be pure noise, and ``write_parquet`` needs a
+    metadata row to write anything anyway.
+    """
+    messages: list[str] = []
+    alpha_cols = [col for col in schema if not col[:1].isdigit()]
+    other_dim_cols = [
+        col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
+    ]
+    wide_lf = pl.scan_parquet(parquet_paths)
+    if group_filter is not None and other_dim_cols:
+        wide_lf = wide_lf.join(group_filter.lazy(), on=other_dim_cols, how="semi")
+    wide_df = wide_lf.collect()
+
+    if other_dim_cols:
+        wide_df = wide_df.sort(other_dim_cols)
+        group_lengths = (
+            wide_df.lazy()
+            .select(other_dim_cols)
+            .group_by(other_dim_cols, maintain_order=True)
+            .len()
+            .select("len")
+            .collect()["len"]
+            .to_list()
+        )
+    else:
+        # No outer keys: the whole partition is one group (grid_cell → calendar).
+        group_lengths = [wide_df.height]
+
+    # The global long-format order; shared with write_parquet so it cannot drift.
+    batch_sort = long_sort_expressions(other_dim_cols, time_unit)
+
+    n_geo = len(geo_cols)
+    target_long_rows = _batch_target_rows(est, memory_limit)
+    if memory_limit is not None and est["wide_in_memory"] > memory_limit:
+        messages.append(
+            f"    WARNING: wide frame (~{_fmt_bytes(est['wide_in_memory'])}) exceeds the "
+            f"{_fmt_bytes(memory_limit)} limit; it must be loaded in full, so the limit "
+            f"cannot be honored for this partition."
+        )
+
+    # Pack consecutive groups into batches under the long-row budget (never
+    # splitting a group).
+    batches: list[tuple[int, int]] = []
+    start = 0
+    acc = 0
+    for length in group_lengths:
+        if acc > 0 and (acc + length) * n_geo > target_long_rows:
+            batches.append((start, acc))
+            start += acc
+            acc = 0
+        acc += length
+    if acc > 0:
+        batches.append((start, acc))
+
+    messages.append(
+        f"    batched conversion: {len(batches)} batch(es) via temp files "
+        f"(≈{est['long_bytes_per_row'] * target_long_rows / 1024**3:.1f} GB/batch)"
+    )
+    key_cols = [*other_dim_cols, "grid_cell", cal_for(time_unit)]
+    if progress_cb:
+        progress_cb(0, len(batches))
+    with tempfile.TemporaryDirectory(dir=temp_path) as _tmpdir:
+        tmp_paths = []
+        for i, (b_offset, b_rows) in enumerate(batches):
+            tmp_path = Path(_tmpdir) / f"chunk_{i:06d}.parquet"
+            batch_lazy = (
+                wide_df.slice(b_offset, b_rows)
+                .lazy()
+                .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
+                .with_columns(pl.col("grid_cell").cast(pl.Int32))
+            )
+            if unique_parquet_rows:
+                batch_lazy = batch_lazy.unique()
+            if existing_keys is not None:
+                batch_lazy = batch_lazy.join(existing_keys.lazy(), on=key_cols, how="anti")
+            batch_lazy.sort(*batch_sort).sink_parquet(tmp_path)
+            tmp_paths.append(tmp_path)
+            if progress_cb:
+                progress_cb(i + 1, len(batches))
+        del wide_df  # free the wide frame before the final streaming write
+        if existing_keys is not None and not sum(pq.read_metadata(p).num_rows for p in tmp_paths):
+            messages.append("    nothing to append after all (every missing key was already present)")
+            return messages
+        write_parquet(
+            pl.scan_parquet(tmp_paths),
+            base_path=output_path,
+            catalog_path=catalog_path,
+            validate=False,
+            sort=False,
+            temp_dir=temp_path,
+            **hive_dims,
+        )
+    return messages
+
+
+def _append_missing(
+    parquet_paths, output_path, existing_files, schema, geo_cols, hive_dims, time_unit,
+    rel_dir, wide_rows, n_files, dry_run=False, memory_limit=None, progress_cb=None,
+    temp_path=None, catalog_path=None, unique_parquet_rows=False,
+) -> tuple[dict, list[str]]:
+    """Append the long rows a partition's existing output is missing, as one extra file.
+
+    The situation this exists for: a model run writes new wide-format output into the
+    input tree *while* the migration is running, so a partition the catalog already shows
+    as converted is now short -- a whole model group that didn't exist when it was
+    converted, or extra calendar values inside one that did.  Re-converting the partition
+    from scratch would be correct but wasteful (and, mid-migration, immediately stale
+    again); purging and re-migrating the affected model group takes the catalog with it.
+    This instead writes *only* what is absent, as an additional file in the same partition
+    directory, leaving everything already there untouched.
+
+    The comparison is per *group* -- one combination of the partition's non-calendar
+    dimension columns (``other_dim_cols``; empty for daily, where those dimensions are
+    Hive directories and the whole partition is a single group).  Expected long rows per
+    group come from the wide sources (wide rows x grid_cell columns, deduplicated when
+    ``unique_parquet_rows`` says the conversion would have); actual ones from a group_by
+    over the output.  A group is then one of:
+
+    * **equal** -- complete, not read again.
+    * **absent** (0 rows in the output) -- appended whole, no join needed. This is the
+      common case: a model group that appeared after the partition was converted.
+    * **short** (some rows, fewer than expected) -- the output's existing keys for just
+      that group are loaded and the group's long rows are anti-joined against them, so
+      only the genuinely absent rows are written.
+    * **over** (more rows than expected, including groups the source no longer has at
+      all) -- reported and left alone.  Appending never deletes; deciding whether extra
+      rows are duplicates, a stale purge, or a source that shrank is a judgement call
+      this script shouldn't make unattended.
+
+    The appended file is internally sorted in the canonical long-format order but the
+    partition as a whole is no longer one sorted file, which is what ``compact_parquet``
+    is for -- run it over the output tree once the migration has finished.
+
+    Returns the same (result, messages) shape as ``migrate_partition``, with
+    ``appended=True`` and ``long_rows`` counting rows appended rather than rows in the
+    partition.
+    """
+    messages: list[str] = []
+    alpha_cols = [col for col in schema if not col[:1].isdigit()]
+    other_dim_cols = [
+        col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
+    ]
+    cal_col = cal_for(time_unit)
+    n_geo = len(geo_cols)
+    group_dtypes = {col: DIMENSIONS[col].dtype for col in other_dim_cols}
+
+    existing_lf = read_parquet(base_path=output_path, **hive_dims)
+
+    # Expected long rows per group: one wide row becomes one row per grid_cell column.
+    # Projection pushdown keeps this to the key columns -- no value column is read, so the
+    # scan stays cheap even over a partition of many large files.
+    #
+    # The .unique() mirrors --unique-parquet-rows, which is not cosmetic here: the real
+    # input tree does contain wide rows duplicated across files in a partition (whole
+    # model groups appear in two files), and counting those twice would make an already
+    # complete, deduplicated output look permanently short. It assumes what that flag
+    # assumes -- that duplicates are duplicates of the whole row.
+    wide_keys = pl.scan_parquet(parquet_paths).select([*other_dim_cols, cal_col])
+    if unique_parquet_rows:
+        wide_keys = wide_keys.unique()
+
+    if other_dim_cols:
+        expected = (
+            wide_keys.group_by(other_dim_cols)
+            .agg((pl.len() * n_geo).cast(pl.Int64).alias("expected"))
+            .collect()
+            .cast(group_dtypes)
+        )
+        existing = (
+            existing_lf.group_by(other_dim_cols)
+            .agg(pl.len().cast(pl.Int64).alias("existing"))
+            .collect()
+            .cast(group_dtypes)
+        )
+        # A full join so a group present only in the output (a purge that took the source
+        # but not the output, say) still shows up -- as an "over" group below.
+        counts = expected.join(existing, on=other_dim_cols, how="full", coalesce=True).with_columns(
+            pl.col("expected").fill_null(0), pl.col("existing").fill_null(0)
+        )
+    else:
+        counts = pl.DataFrame(
+            {
+                "expected": [wide_keys.select(pl.len()).collect().item() * n_geo],
+                "existing": [sum(pq.read_metadata(path).num_rows for path in existing_files)],
+            },
+            schema={"expected": pl.Int64, "existing": pl.Int64},
+        )
+
+    short = counts.filter(pl.col("existing") < pl.col("expected"))
+    over = counts.filter(pl.col("existing") > pl.col("expected"))
+
+    if over.height:
+        extra = int((over["existing"] - over["expected"]).sum())
+        messages.append(
+            f"  WARNING: {rel_dir} has {over.height} group(s) with {extra:,} row(s) more than "
+            f"the source; left as they are (appending never deletes)."
+        )
+
+    if not short.height:
+        messages.append(f"  Complete: {rel_dir} ({int(counts['existing'].sum()):,} rows)")
+        return (
+            {"skipped": True, "files": n_files, "geo_cols": n_geo, "long_rows": int(counts["expected"].sum())},
+            messages,
+        )
+
+    missing_rows = int((short["expected"] - short["existing"]).sum())
+    absent = int(short.filter(pl.col("existing") == 0).height)
+    messages.append(
+        f"  {'[DRY RUN] ' if dry_run else ''}Appending to {rel_dir}: {missing_rows:,} missing row(s) "
+        f"across {short.height} group(s) ({absent} absent, {short.height - absent} partial)"
+    )
+    if dry_run:
+        return {"appended": True, "files": n_files, "geo_cols": n_geo, "long_rows": missing_rows}, messages
+
+    t0 = time.perf_counter()
+
+    # Only the partially-present groups need a key-level diff; a group absent from the
+    # output has nothing to anti-join against, and loading its keys would just be an
+    # empty scan of the whole partition.
+    partial = short.filter(pl.col("existing") > 0)
+    if partial.height:
+        keys_lf = existing_lf.select([*other_dim_cols, "grid_cell", cal_col])
+        if other_dim_cols:
+            keys_lf = keys_lf.join(partial.select(other_dim_cols).lazy(), on=other_dim_cols, how="semi")
+        # Cast to the wide sources' own dtypes: the anti-join in _convert_batched compares
+        # these against columns coming straight off the wide frame, and a width mismatch
+        # (Int32 vs Int64, say) would make every row look absent.
+        existing_keys = keys_lf.collect().cast(
+            {**{col: schema[col] for col in [*other_dim_cols, cal_col] if col in schema}, "grid_cell": pl.Int32}
+        )
+    else:
+        existing_keys = None
+
+    # Sized from the whole partition rather than the selected groups: too-small batches
+    # cost a little time, too-large ones cost the worker.
+    est = _peak_estimates(schema, wide_rows)
+    messages += _convert_batched(
+        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
+        progress_cb, temp_path, catalog_path, unique_parquet_rows,
+        group_filter=short.select(other_dim_cols) if other_dim_cols else None,
+        existing_keys=existing_keys,
+    )
+
+    elapsed = time.perf_counter() - t0
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
+    messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
+    return (
+        {
+            "appended": True, "files": n_files, "geo_cols": n_geo, "long_rows": missing_rows,
+            "elapsed_s": elapsed, "peak_bytes": peak_bytes,
+        },
+        messages,
+    )
+
+
+def migrate_partition(
+    parquet_paths: list[Path],
+    base_path: Path,
+    output_path: Path,
+    catalog_path: Path | None = None,
+    dry_run: bool = False,
+    memory_limit: int | None = None,
+    progress_cb=None,
+    temp_path=None,
+    unique_parquet_rows: bool = False,
+    append_missing: bool = False,
+) -> tuple[dict | None, list[str]]:
+    """Convert all wide-format Parquet files in one partition to a single long-format file.
+
+    All paths must share the same parent directory (partition).  Returns (result, messages)
+    where result is a stats dict if the partition was (or would be) migrated, or None if it
+    was already in long format.  messages contains lines to print via tqdm.write in the caller.
+    Stats keys: files, geo_cols, long_rows; plus elapsed_s and peak_bytes when not a dry run.
+
+    Conversion always uses the batched temp-file path.  memory_limit (bytes),
+    when given, sizes each batch so the per-worker peak stays within it;
+    otherwise a default batch size is used.
+
+    unique_parquet_rows, when True, is forwarded to ``_convert_batched`` to drop
+    duplicate rows from the long-format output.
+
+    temp_path, when given, is the directory under which the intermediate batch
+    files are written (e.g. a fast dedicated scratch filesystem); otherwise the
+    system default temp location is used.
+
+    catalog_path, when given, is passed to ``write_parquet`` so its catalog hook
+    appends rows to the migration's catalog (None -- e.g. dry runs -- disables it).
+
+    progress_cb, when given, is called as progress_cb(done, total) to report
+    intra-partition progress (number of batches written).
+
+    append_missing, when True, changes what happens to a partition that already has
+    output: instead of being skipped when its row count matches and rebuilt from scratch
+    when it doesn't, it is compared against its source group by group and only the missing
+    rows are appended -- see ``_append_missing``.  A partition with no output yet is
+    converted normally either way.
+    """
+    messages: list[str] = []
+    schema = _wide_schema(parquet_paths[0])
+    if schema is None:
+        return None, messages
+
+    partition_dir = parquet_paths[0].parent
+    rel_dir = partition_dir.relative_to(base_path)
+    n = len(parquet_paths)
+    geo_cols = [col for col in schema if col[:1].isdigit()]
+
+    # Row counts come from Parquet footer metadata — no data scan needed.
+    wide_rows = sum(pq.read_metadata(p).num_rows for p in parquet_paths)
+    row_count = wide_rows * len(geo_cols)
+
+    hive_dims = _dimension_cols_from_hive(parquet_paths[0])
+    time_unit = str(hive_dims.get("time_unit", ""))
+
+    # Discover existing output files via read_parquet so the directory ordering
+    # of the output (which may differ from the input) is handled correctly.
+    try:
+        existing_files = (
+            read_parquet(base_path=output_path, include_file_paths="__path__", **hive_dims)
+            .select("__path__")
+            .collect()["__path__"]
+            .unique()
+            .to_list()
+        )
+    except Exception:
+        existing_files = []
+
+    if existing_files and append_missing:
+        return _append_missing(
+            parquet_paths, output_path, existing_files, schema, geo_cols, hive_dims, time_unit,
+            rel_dir, wide_rows, n, dry_run=dry_run, memory_limit=memory_limit,
+            progress_cb=progress_cb, temp_path=temp_path, catalog_path=catalog_path,
+            unique_parquet_rows=unique_parquet_rows,
+        )
+
+    if existing_files:
+        existing_rows = sum(pq.read_metadata(p).num_rows for p in existing_files)
+        if existing_rows == row_count:
+            messages.append(f"  Skipping {rel_dir} ({row_count:,} rows already written)")
+            return {"skipped": True, "files": n, "geo_cols": len(geo_cols), "long_rows": row_count}, messages
+        messages.append(f"  Output incomplete ({existing_rows:,}/{row_count:,} rows), clearing: {rel_dir}")
+        if not dry_run:
+            for p in existing_files:
+                Path(p).unlink()
+
+    messages.append(
+        f"  {'[DRY RUN] ' if dry_run else ''}Migrating: {rel_dir} "
+        f"({n} file{'s' if n > 1 else ''}, {len(geo_cols)} grid_cell cols, {row_count:,} long rows)"
+    )
+
+    if dry_run:
+        return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count}, messages
+
+    t0 = time.perf_counter()
+
+    est = _peak_estimates(schema, wide_rows)
+
+    # Always use the batched temp-file path.  Benchmarks across all time units
+    # showed it as fast or faster than a single in-memory sort while using far
+    # less memory on large partitions, with byte-identical output.  memory_limit
+    # tunes the per-batch budget.
+    messages += _convert_batched(
+        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
+        progress_cb, temp_path, catalog_path, unique_parquet_rows,
+    )
+
+    elapsed = time.perf_counter() - t0
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
+    messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
+    return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
+
+
+# --- elev: Float32 meters -> Int32 millimeters -------------------------------------------
+#
+# elev is the one variable whose storage unit changed with the long-format move: it is now
+# stored as Int32 millimeters rather than Float32 meters, so ZSTD's predictor has integers
+# to delta-encode (the same profile every other raster variable uses -- it replaces the
+# LERC_ZSTD/max_z_error special case elev used to need). Its structure row carries
+# ``display_unit``/``display_scale_factor`` so charts and legends still read meters.
+#
+# Deliberately not generalized: nothing else needs a unit change, and a general
+# "convert units on migration" facility would be a much larger promise than one variable's
+# one-time move. This applies only to elev, and only to float sources.
+
+ELEV_SCALE_FACTOR = 1000  # millimeters per meter
+ELEV_NODATA = -9999  # the sentinel every pre-migration source COG declares (raster._cog_profile's default)
+
+
+def _set_child(element, tag: str, value) -> None:
+    """Set ``element``'s ``tag`` child to ``value``, replacing rather than duplicating it."""
+
+    child = element.find(tag)
+    if child is None:
+        child = xml.etree.ElementTree.SubElement(element, tag)
+    child.text = str(value)
+
+
+def _elev_mm_vrt(vrt_text: str, dtype: str) -> tuple[str, str]:
+    """Rewrite a compaction VRT so it reads Float32 meters out as Int32 millimeters.
+
+    Passed to ``compact_cog`` as its ``vrt_transform``, so the conversion rides along with
+    the streaming CreateCopy that does the compaction rather than costing a second full
+    rewrite of 57 GB of elevation rasters.
+
+    Each band is retyped to Int32 and its ``SimpleSource`` promoted to a ``ComplexSource``
+    -- the only source type that supports ``<ScaleRatio>`` -- carrying two children:
+
+    * ``<ScaleRatio>1000</ScaleRatio>`` does the meters-to-millimeters multiply. GDAL
+      evaluates it in double precision even though the band it writes into is Int32, which
+      is what keeps the result off the float32 half-way ties that would otherwise round the
+      wrong way (2.0005 m is 2000.49996... mm in float64 and rounds to 2000, but is exactly
+      2000.5 in float32 and would round to 2001). Rounding is half-away-from-zero.
+    * ``<NODATA>`` excludes nodata pixels from the multiply, and the band's declared
+      ``<NoDataValue>`` is scaled to match (-9999 -> -9999000): GDAL initializes a VRT
+      band's read buffer to its declared nodata, so the excluded pixels come out as the
+      new sentinel. Scaling the sentinel is deliberate, not collateral -- -9999 is an
+      impossible elevation in meters but a plausible -9.999 m once values are stored as
+      millimeters, while -9999000 mm stays impossible. -9999000 is also what
+      ``Variable.nodata`` declares for elev, so migrated and freshly written rasters
+      agree. (``raster.scale_vrt_bands``, the other scaling path, deliberately excludes
+      nothing -- it preserves an older quirk for the lnd_chng multiply. Don't merge them.)
+
+    A non-float source is left alone and reported unchanged, so re-running or resuming a
+    migration over already-converted Int32 rasters can't scale them a second time.
+    """
+
+    if not dtype.startswith("float"):
+        return vrt_text, dtype
+
+    root = xml.etree.ElementTree.fromstring(vrt_text)
+    for band_el in root.findall("VRTRasterBand"):
+        band_el.set("dataType", "Int32")
+        # The nodata the sources actually carry, rather than assuming the default: whatever
+        # GDAL was told to treat as nodata on the way in has to be what's excluded here.
+        nodata_el = band_el.find("NoDataValue")
+        nodata = nodata_el.text if nodata_el is not None else str(ELEV_NODATA)
+        # The output band declares the *scaled* sentinel -- see the docstring. Set after
+        # `nodata` is read, so the source exclusion below still matches the input values.
+        _set_child(band_el, "NoDataValue", int(float(nodata) * ELEV_SCALE_FACTOR))
+
+        # `gdalbuildvrt` normally emits a SimpleSource, but emits a ComplexSource itself
+        # for sources that need one, so take either and retag -- a ComplexSource already
+        # supports ScaleRatio and is left as it is.
+        source_el = band_el.find("SimpleSource")
+        if source_el is None:
+            source_el = band_el.find("ComplexSource")
+        source_el.tag = "ComplexSource"
+        _set_child(source_el, "ScaleRatio", ELEV_SCALE_FACTOR)
+        _set_child(source_el, "NODATA", nodata)
+    return xml.etree.ElementTree.tostring(root).decode("UTF-8"), "int32"
+
+
+def _vrt_transform_for(variable: str):
+    """The VRT rewrite a variable's compaction needs, or ``None`` for the usual copy."""
+
+    return _elev_mm_vrt if variable == "elev" else None
+
+
+def _raster_source_tifs(base_path: Path, dims: dict) -> list[Path]:
+    """All source COGs for one raster partition (all dims), looked up under both
+    directory orders.
+
+    ``compact_cog`` reads from the canonical (variable/time_unit/grid) order and
+    the legacy (variable/grid/time_unit) order; mirror both here so the reported
+    source count matches what it will actually consolidate.
+    """
+    return [p for d in _raster_leaf_dirs(base_path, dims) if d.exists() for p in d.glob("*.tif")]
+
+
+def _raster_band_values(tifs, calendar_col) -> list:
+    """The calendar value of every band of every given COG, read from band descriptions.
+
+    ``_band_calendar_frame`` is the one parser for those descriptions (shared with
+    ``read_cog`` and ``compact_cog``), so a value read here is directly comparable with
+    the ones ``compact_cog`` matches ``include_values`` against.
+    """
+    if not tifs:
+        return []
+    return _band_calendar_frame([str(path) for path in tifs], "path", calendar_col)[calendar_col].to_list()
+
+
+def migrate_raster_dataset(
+    dataset_kwargs: dict,
+    base_path: Path,
+    output_path: Path,
+    catalog_path: Path | None = None,
+    dry_run: bool = False,
+    append_missing: bool = False,
+) -> tuple[dict, list[str]]:
+    """Compact one raster leaf partition's single-band COGs into multi-band COGs,
+    written into the output tree with the input left untouched.
+
+    ``dataset_kwargs`` holds every dimension encoded in the partition's directory path
+    (variable/time_unit/grid plus any further partition dims, e.g. model_group_id/
+    scenario_id) -- pinning all of them narrows ``compact_cog``'s internal glob to just
+    this one leaf directory, so each leaf partition is migrated (and its progress
+    recorded) independently, the same as a tabular partition. Every matching COG under
+    ``base_path`` (canonical or legacy directory order) for that leaf is pooled and
+    consolidated by ``raster.compact_cog`` writing into ``output_path``; catalog rows
+    are appended and the partition coalesced by compact_cog itself when
+    ``catalog_path`` is given.  Returns (result, messages); result carries
+    ``data_type="raster"``, ``files`` (source COG count) and ``geo_cols`` (output
+    COG count), plus ``elapsed_s``/``peak_bytes`` when not a dry run.
+
+    elev also changes units on the way through -- see ``_elev_mm_vrt``.
+
+    append_missing, when True, is the raster half of ``_append_missing``: every band of
+    every source COG is compared against the bands already in the output partition, and
+    only the calendar values the output lacks are written (as additional COGs alongside
+    what is already there, via ``compact_cog``'s ``include_values``).  Bands the output
+    has and the source no longer does are reported and left alone.  The missing bands land
+    in their own files rather than being merged into the existing ones -- compacting the
+    output tree in place afterwards consolidates them.
+    """
+    messages: list[str] = []
+    rel = _raster_rel(dataset_kwargs)
+
+    source_tifs = _raster_source_tifs(base_path, dataset_kwargs)
+    n_src = len(source_tifs)
+    include_values = None
+
+    if append_missing:
+        calendar_col = cal_for(dataset_kwargs["time_unit"])
+        source_values = set(_raster_band_values(source_tifs, calendar_col))
+        # The output tree is always written in the canonical directory order, so only that
+        # one of the two leaf directories can hold anything.
+        out_dir = _raster_leaf_dirs(output_path, dataset_kwargs)[0]
+        existing_values = set(
+            _raster_band_values(sorted(out_dir.glob("*.tif")), calendar_col) if out_dir.exists() else []
+        )
+        include_values = sorted(source_values - existing_values)
+        extra = sorted(existing_values - source_values)
+        if extra:
+            messages.append(
+                f"  WARNING: {rel} has {len(extra)} band(s) the source does not ({extra[0]}"
+                f"{f'..{extra[-1]}' if len(extra) > 1 else ''}); left as they are "
+                f"(appending never deletes)."
+            )
+        if not include_values:
+            messages.append(f"  Complete: {rel} ({len(existing_values)} band(s))")
+            return (
+                {"data_type": "raster", "files": n_src, "geo_cols": 0, "long_rows": 0, "skipped": True},
+                messages,
+            )
+        messages.append(
+            f"  {'[DRY RUN] ' if dry_run else ''}Appending rasters: {rel} "
+            f"({len(include_values)} of {len(source_values)} band(s) missing, "
+            f"{n_src} source COG{'s' if n_src != 1 else ''})"
+        )
+    else:
+        messages.append(
+            f"  {'[DRY RUN] ' if dry_run else ''}Compacting rasters: {rel} "
+            f"({n_src} source COG{'s' if n_src != 1 else ''})"
+        )
+
+    if dry_run:
+        return {
+            "data_type": "raster", "files": n_src, "geo_cols": 0, "long_rows": 0,
+            **({"appended": True} if append_missing else {}),
+        }, messages
+
+    t0 = time.perf_counter()
+    result = compact_cog(
+        base_path=base_path,
+        output_base_path=output_path,
+        catalog_path=catalog_path,
+        vrt_transform=_vrt_transform_for(dataset_kwargs["variable"]),
+        include_values=include_values,
+        **dataset_kwargs,
+    )
+    elapsed = time.perf_counter() - t0
+
+    n_out = len(result["outputs"])
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
+    messages.append(
+        f"    done in {elapsed:.1f}s, {n_src} -> {n_out} COG(s), peak RSS {_fmt_bytes(peak_bytes)}"
+    )
+    return {
+        "data_type": "raster",
+        "files": n_src,
+        "geo_cols": n_out,
+        "long_rows": 0,
+        "elapsed_s": elapsed,
+        "peak_bytes": peak_bytes,
+        **({"appended": True} if append_missing else {}),
+    }, messages
+
+
+def _fmt_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+_DTYPE_SIZES = {
+    pl.Float32: 4,
+    pl.Float64: 8,
+    pl.Int8: 1,
+    pl.Int16: 2,
+    pl.Int32: 4,
+    pl.Int64: 8,
+    pl.UInt8: 1,
+    pl.UInt16: 2,
+    pl.UInt32: 4,
+    pl.UInt64: 8,
+    pl.Date: 4,
+    pl.Boolean: 1,
+}
+
+
+def _dtype_itemsize(dtype) -> int:
+    if dtype in _DTYPE_SIZES:
+        return _DTYPE_SIZES[dtype]
+    try:
+        if dtype.base_type() in (pl.Datetime, pl.Duration, pl.Time):
+            return 8
+    except AttributeError:
+        pass
+    return 50  # String, Categorical, List, Struct, etc.
+
+
+def _parse_memory(value: str) -> int:
+    """Parse a human-readable memory size into bytes.
+
+    Accepts forms like '32GB', '32G', '500MB', '16gib', or a raw byte count.
+    Binary units (1 K = 1024) are used throughout.
+    """
+    s = value.strip().upper().replace("IB", "").rstrip("B")
+    mult = 1
+    for suffix, m in (("K", 1024), ("M", 1024**2), ("G", 1024**3), ("T", 1024**4)):
+        if s.endswith(suffix):
+            mult = m
+            s = s[:-1]
+            break
+    return int(float(s) * mult)
+
+
+# Tuning constants for the batched memory model.  BATCH_SORT_FACTOR is empirical:
+# a Polars unpivot→sort→sink pipeline transiently holds several copies of the
+# data (the unpivoted frame, the sort's gather/index buffers, and the parquet
+# encode buffer).  Measured batch-sort peaks were ~2.2× the batch's long form;
+# 2.5 adds a safety margin so the memory limit is not exceeded.
+DEFAULT_BATCH_LONG_ROWS = 50_000_000
+MIN_BATCH_LONG_ROWS = 5_000_000
+BATCH_SORT_FACTOR = 2.5
+
+
+def _peak_estimates(schema: dict, wide_rows: int) -> dict:
+    """Compute base memory figures for one wide-format partition.
+
+    Returns a dict with:
+      wide_in_memory      — decoded Arrow size of the wide DataFrame.
+      long_rows           — number of rows in the long form.
+      long_bytes_per_row  — bytes per row of the long form.
+      long_in_memory      — decoded Arrow size of the full long form.
+    """
+    geo_cols = [c for c in schema if c[:1].isdigit()]
+    alpha_cols = [c for c in schema if not c[:1].isdigit()]
+    value_dtype = schema[geo_cols[0]]
+    long_rows = wide_rows * len(geo_cols)
+    wide_in_memory = wide_rows * sum(_dtype_itemsize(schema[c]) for c in schema)
+    long_bytes_per_row = (
+        sum(_dtype_itemsize(schema[c]) for c in alpha_cols)
+        + _dtype_itemsize(pl.Int32)  # grid_cell
+        + _dtype_itemsize(value_dtype)
+    )
+    long_in_memory = long_rows * long_bytes_per_row
+    return {
+        "wide_in_memory": wide_in_memory,
+        "long_rows": long_rows,
+        "long_bytes_per_row": long_bytes_per_row,
+        "long_in_memory": long_in_memory,
+    }
+
+
+def _batch_target_rows(est: dict, memory_limit: int | None) -> int:
+    """Long-row budget per batch for the batched temp-file path.
+
+    Without a limit, a fixed default is used.  With a limit, the budget is sized
+    so the resident wide frame plus one batch's sort stays within it:
+    wide + BATCH_SORT_FACTOR × batch_long_bytes ≤ limit.
+    """
+    if memory_limit is None:
+        return DEFAULT_BATCH_LONG_ROWS
+    budget = memory_limit - est["wide_in_memory"]
+    if budget <= 0:
+        return MIN_BATCH_LONG_ROWS
+    return max(MIN_BATCH_LONG_ROWS, int(budget / BATCH_SORT_FACTOR / est["long_bytes_per_row"]))
+
+
+def _batched_peak(est: dict, memory_limit: int | None) -> int:
+    """Conservative peak for the batched path, given its batch budget."""
+    # A batch never holds more than the whole partition's long form.
+    target = min(_batch_target_rows(est, memory_limit), est["long_rows"])
+    loop_peak = est["wide_in_memory"] + BATCH_SORT_FACTOR * target * est["long_bytes_per_row"]
+    # The one-time sort of the wide frame (≈ 2× wide) can also be the high-water mark.
+    return int(max(2 * est["wide_in_memory"], loop_peak))
+
+
+def _partition_estimates(paths: list[Path], memory_limit: int | None) -> dict | None:
+    """Peak-memory estimates for one tabular partition, or None if not wide-format.
+
+    Wraps ``_peak_estimates`` + ``_batched_peak`` (reading only Parquet footers,
+    no data scan) so callers share one code path for both ``--estimate`` and the
+    pre-flight memory-limit check in ``main``.
+    """
+    schema = _wide_schema(paths[0])
+    if schema is None:
+        return None
+    wide_rows = sum(pq.read_metadata(p).num_rows for p in paths)
+    est = _peak_estimates(schema, wide_rows)
+    est["est_peak"] = _batched_peak(est, memory_limit)
+    return est
+
+
+def estimate_partitions(
+    partitions: dict[Path, list[Path]], base_path: Path, progress: bool = True, memory_limit: int | None = None
+) -> None:
+    """Print a memory-estimate table for all wide-format partitions, sorted by estimated peak memory.
+
+    Sizes are derived from schema dtypes (num_rows × Σ dtype.itemsize), which reflects the
+    actual decoded Arrow representation rather than the Parquet-encoded size.
+
+    Every partition is converted via the batched temp-file path.  The estimated
+    peak is the larger of the one-time wide-frame sort (≈ 2× wide) and a single
+    batch's sort (≈ wide + BATCH_SORT_FACTOR × batch long form), where the batch
+    size follows from memory_limit (or the default when none is given).
+    """
+    rows = []
+    with tqdm(total=len(partitions), desc="Estimating", unit="partition", disable=not progress) as bar:
+        for paths in partitions.values():
+            est = _partition_estimates(paths, memory_limit)
+            bar.update(1)
+            if est is None:
+                continue
+
+            rows.append(
+                {
+                    "partition": str(paths[0].parent.relative_to(base_path)),
+                    "files": len(paths),
+                    "long_rows": est["long_rows"],
+                    "wide_in_memory": est["wide_in_memory"],
+                    "est_peak": est["est_peak"],
+                }
+            )
+
+    if not rows:
+        print("No wide-format partitions found.")
+        return
+
+    rows.sort(key=lambda r: r["est_peak"], reverse=True)
+
+    part_w = max(len(r["partition"]) for r in rows)
+    part_w = max(part_w, len("Partition"))
+
+    def _row(partition, files, long_rows, wide_data, est_peak):
+        return f"{partition:<{part_w}}  {files:>5}  {long_rows:>14}  {wide_data:>10}  {est_peak:>10}"
+
+    header = _row("Partition", "Files", "Long rows", "Wide data", "Est. peak")
+    sep = "-" * len(header)
+    print(f"\n{header}\n{sep}")
+    for r in rows:
+        print(
+            _row(
+                r["partition"],
+                r["files"],
+                f"{r['long_rows']:,}",
+                _fmt_bytes(r["wide_in_memory"]),
+                _fmt_bytes(r["est_peak"]),
+            )
+        )
+    print(sep)
+    print(
+        _row(
+            "TOTAL",
+            sum(r["files"] for r in rows),
+            f"{sum(r['long_rows'] for r in rows):,}",
+            _fmt_bytes(sum(r["wide_in_memory"] for r in rows)),
+            _fmt_bytes(sum(r["est_peak"] for r in rows)),
+        )
+    )
+
+
+def _run_partition(args, result_queue):
+    """Target for worker processes spawned directly (not via Pool).
+
+    Each task runs in a fresh subprocess so allocator memory from Polars/Arrow (or
+    GDAL) is fully released when the process exits.  A task is either a tabular
+    partition (``("tabular", rel, [parquet paths])``) or a raster dataset
+    (``("raster", rel, {dim kwargs})``); the kind selects the migration function.
+    Messages are tagged tuples on result_queue:
+      ("progress", pid, rel, done, total)            — intra-partition progress
+      ("result",   pid, rel, result, messages, error) — terminal result
+    If the process is killed by a signal the queue is never written; the main
+    process detects this via p.exitcode.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    (
+        task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path,
+        unique_parquet_rows, append_missing,
+    ) = args
+    kind, rel, payload = task
+    pid = os.getpid()
+
+    def progress_cb(done, total):
+        result_queue.put(("progress", pid, rel, done, total))
+
+    try:
+        if kind == "raster":
+            result, messages = migrate_raster_dataset(
+                payload, base_path, output_path, catalog_path, dry_run, append_missing=append_missing
+            )
+        else:
+            result, messages = migrate_partition(
+                payload, base_path, output_path, catalog_path, dry_run,
+                memory_limit=memory_limit,
+                progress_cb=progress_cb if progress else None,
+                temp_path=temp_path,
+                unique_parquet_rows=unique_parquet_rows,
+                append_missing=append_missing,
+            )
+        result_queue.put(("result", pid, rel, result, messages, None))
+    except Exception as exc:
+        result_queue.put(("result", pid, rel, None, [], str(exc)))
+
+
+LOG_FIELDS = [
+    "partition", "data_type", "status", "files", "geo_cols", "long_rows",
+    "elapsed_s", "peak_bytes", "source_bytes", "memory_limit", "error", "completed_at",
+]
+
+# Log statuses that mean the output was left matching its source: found to match, or
+# written (or appended to) until it did.  Only these rows' source_bytes can vouch for a
+# partition in --skip-unchanged; dry-run and failed rows never do.
+VERIFIED_STATUSES = {"skipped", "migrated", "appended", "unchanged"}
+
+
+def _source_bytes(kind: str, payload, base_path: Path) -> int | None:
+    """Total size of a task's source files: the tabular partition's Parquet files, or
+    every COG a raster partition pools (both directory orders).
+
+    Taken in the main process before the task is handed to a worker, so it can only
+    understate what the worker goes on to read -- a file that lands or grows in between
+    makes the next --skip-unchanged run re-check the partition, never wrongly skip it.
+    ``None`` when a file vanished under us; that partition is simply never skippable.
+    """
+    paths = _raster_source_tifs(base_path, payload) if kind == "raster" else payload
+    try:
+        return sum(path.stat().st_size for path in paths)
+    except OSError:
+        return None
+
+
+def _read_log(log_path: Path) -> dict[str, dict]:
+    """A previous run's log, keyed by partition.  A later row for the same partition
+    supersedes an earlier one, so e.g. a partition that later failed is not vouched for
+    by an earlier success."""
+    with open(log_path, newline="") as f:
+        return {row["partition"]: row for row in csv.DictReader(f)}
+
+
+def _vouches_for(prior: dict, source_bytes: int | None) -> bool:
+    """Whether a previous log row shows the partition matching a source of this size."""
+    return (
+        prior.get("status") in VERIFIED_STATUSES
+        and bool(prior.get("source_bytes"))
+        and source_bytes is not None
+        and int(prior["source_bytes"]) == source_bytes
+    )
+
+
+def _oom_again(prior: dict, memory_limit: int | None) -> bool:
+    """Whether a partition a previous run lost to the OOM killer would only be lost again.
+
+    A worker's peak is sized from --memory-limit, so a limit no larger than the one it was
+    killed at means batches no larger either.  With no limit either time the batches are
+    the same default size; a limit on one side only can't be compared, so it is retried.
+    Rows from logs older than the memory_limit column never match.
+    """
+    if prior.get("status") != "oom" or "memory_limit" not in prior:
+        return False
+    if prior["memory_limit"] == "":
+        return memory_limit is None
+    return memory_limit is not None and memory_limit <= int(prior["memory_limit"])
+
+
+class _ResultLog:
+    """The per-partition results CSV, written a row at a time as each partition finishes,
+    so an interrupted or killed run still leaves a log the next --skip-unchanged run can
+    use.  Every row this run writes records its --memory-limit (bytes; empty for none);
+    rows carried over from a previous log keep the limit they were recorded with."""
+
+    def __init__(self, path: Path, memory_limit: int | None):
+        self.path = path
+        self.count = 0
+        self._memory_limit = "" if memory_limit is None else memory_limit
+        self._file = open(path, "w", newline="")  # noqa: SIM115 -- held open for the whole run
+        self._writer = csv.DictWriter(self._file, fieldnames=LOG_FIELDS, restval="")
+        self._writer.writeheader()
+        self._file.flush()
+
+    def write(self, row: dict) -> None:
+        self._writer.writerow({"memory_limit": self._memory_limit, **row})
+        self._file.flush()
+        self.count += 1
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def find_partitions(base_path: Path, variable=None, grid=None, time_unit=None) -> dict[Path, list[Path]]:
+    """Find all Parquet files under base_path grouped by partition directory."""
+    pattern_parts = []
+    for dim_name, value in [("variable", variable), ("grid", grid), ("time_unit", time_unit)]:
+        pattern_parts.append(f"{dim_name}={value}" if value else f"{dim_name}=*")
+
+    partitions: dict[Path, list[Path]] = {}
+    for dataset_dir in base_path.glob("/".join(pattern_parts)):
+        for path in sorted(dataset_dir.rglob("*.parquet")):
+            partitions.setdefault(path.parent, []).append(path)
+    return dict(sorted(partitions.items()))
+
+
+def _raster_rel(dims: dict) -> str:
+    """Canonical ``variable=.../time_unit=.../grid=.../...`` partition path for a set of
+    dimension values, in the same dimension order COGs are actually written under
+    (variable/time_unit/grid, then any further partition dims like model_group_id/
+    scenario_id in declaration order). Used as the progress-database key for a raster
+    partition, so it must be independent of which on-disk directory order (canonical or
+    legacy) the files were found under.
+    """
+    return "/".join(f"{name}={dims[name]}" for name in DIMENSIONS if name in dims)
+
+
+def _raster_leaf_dirs(base_path: Path, dims: dict) -> list[Path]:
+    """Canonical and legacy on-disk leaf directories for one raster partition (all dims)."""
+    tail = "/".join(
+        f"{name}={dims[name]}" for name in DIMENSIONS if name in dims and name not in ("variable", "time_unit", "grid")
+    )
+    canonical = base_path / f"variable={dims['variable']}" / f"time_unit={dims['time_unit']}" / f"grid={dims['grid']}"
+    legacy = base_path / f"variable={dims['variable']}" / f"grid={dims['grid']}" / f"time_unit={dims['time_unit']}"
+    return [d / tail if tail else d for d in (canonical, legacy)]
+
+
+def find_raster_datasets(base_path: Path, variable=None, grid=None, time_unit=None) -> list[dict]:
+    """Find distinct raster (COG) partitions under base_path, one per leaf directory (a
+    directory that directly contains .tif files) -- keyed by every dimension encoded in
+    its path (variable/time_unit/grid plus any further partition dimensions, e.g.
+    model_group_id/scenario_id). This mirrors ``find_partitions``'s tabular-partition
+    granularity, so raster migration progress can be tracked and resumed per leaf
+    partition instead of being collapsed to one entry per (variable, time_unit, grid).
+
+    COGs live under either the canonical (variable/time_unit/grid) or the legacy
+    (variable/grid/time_unit) directory order; both are globbed and collapsed to the
+    same canonical leaf key (``_raster_rel``), since ``compact_cog`` pools files from
+    both orders together into one partition. Returns a sorted list of dimension-kwargs
+    dicts suitable for ``compact_cog``.
+    """
+    v, g, t = variable or "*", grid or "*", time_unit or "*"
+    patterns = [
+        f"variable={v}/time_unit={t}/grid={g}",  # canonical
+        f"variable={v}/grid={g}/time_unit={t}",  # legacy
+    ]
+    datasets: dict[str, dict] = {}
+    for pattern in patterns:
+        for dataset_dir in base_path.glob(pattern):
+            top_dims = parse_path_dims(dataset_dir.relative_to(base_path))
+            for tif in dataset_dir.rglob("*.tif"):
+                dims = {**top_dims, **parse_path_dims(tif.parent.relative_to(dataset_dir))}
+                datasets[_raster_rel(dims)] = dims
+    return [datasets[rel] for rel in sorted(datasets)]
+
+
+def _catalog_completed(catalog_path: Path, tasks: list[tuple[str, str, object]]) -> set[str]:
+    """Return the ``rel`` keys of ``tasks`` already recorded in the catalog.
+
+    A tabular partition (keyed by its directory's path relative to the data root)
+    or raster leaf partition (keyed by ``_raster_rel``) counts as already converted
+    when the catalog has at least one row of the matching ``data_type`` whose
+    dimension columns agree with every dimension parsed from the partition's path.
+    The catalog is the durable record of what earlier runs finished, so this is
+    what lets a run pick up from wherever the catalog left off, without a
+    separately maintained progress log that could drift out of sync with it.
+
+    Catalog partitions (grouped by variable/time_unit/grid -- the catalog's own
+    Hive partitioning) are read at most once each, regardless of how many tasks
+    fall under them.
+    """
+    by_dataset: dict[tuple, list[tuple[str, str, dict]]] = {}
+    for kind, rel, payload in tasks:
+        dims = dict(payload) if kind == "raster" else parse_path_dims(rel)
+        key = (dims.get("variable"), dims.get("time_unit"), dims.get("grid"))
+        by_dataset.setdefault(key, []).append((kind, rel, dims))
+
+    completed: set[str] = set()
+    for (variable, time_unit, grid), items in by_dataset.items():
+        directory = catalog_path / f"variable={variable}" / f"time_unit={time_unit}" / f"grid={grid}"
+        files = list(directory.glob("*.parquet")) if directory.exists() else []
+        if not files:
+            continue
+        frame = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+        frame = frame.select(pl.col(c).cast(pl.String) for c in frame.columns)
+        for kind, rel, dims in items:
+            data_type = "raster" if kind == "raster" else "tabular"
+            sub = frame.filter(pl.col("data_type") == data_type)
+            for name, value in dims.items():
+                if name in ("variable", "time_unit", "grid"):
+                    continue
+                if name in sub.columns:
+                    sub = sub.filter(pl.col(name) == value)
+            if sub.height > 0:
+                completed.add(rel)
+    return completed
+
+
+def _print_progress(
+    base_path: Path, catalog_path: Path, variable=None, grid=None, time_unit=None, progress: bool = True
+) -> None:
+    """Scan ``base_path`` for partitions (the same discovery ``--estimate`` uses),
+    then summarize -- per variable/time_unit/grid -- how many of them the catalog
+    already shows as converted."""
+    partitions = find_partitions(base_path, variable, grid, time_unit)
+    raster_datasets = find_raster_datasets(base_path, variable, grid, time_unit)
+
+    tasks: list[tuple[str, str, object]] = [
+        ("tabular", str(paths[0].parent.relative_to(base_path)), paths) for paths in partitions.values()
+    ]
+    tasks += [("raster", _raster_rel(d), d) for d in raster_datasets]
+
+    if not tasks:
+        print("No datasets found matching the given filters.")
+        return
+
+    completed = _catalog_completed(catalog_path, tasks)
+
+    summary: dict[tuple[str, str, str], dict[str, int]] = {}
+    for _kind, rel, _payload in tasks:
+        dims = parse_path_dims(rel)
+        key = (dims.get("variable", ""), dims.get("time_unit", ""), dims.get("grid", ""))
+        entry = summary.setdefault(key, {"converted": 0, "total": 0})
+        entry["total"] += 1
+        if rel in completed:
+            entry["converted"] += 1
+
+    var_w = max([len(k[0]) for k in summary] + [len("Variable")])
+    tu_w = max([len(k[1]) for k in summary] + [len("Time unit")])
+    grid_w = max([len(k[2]) for k in summary] + [len("Grid")])
+
+    def _row(variable_, time_unit_, grid_, converted, total, pct):
+        return (
+            f"{variable_:<{var_w}}  {time_unit_:<{tu_w}}  {grid_:<{grid_w}}  "
+            f"{converted:>10}  {total:>10}  {pct:>5}"
+        )
+
+    header = _row("Variable", "Time unit", "Grid", "Converted", "Total", "Pct")
+    sep = "-" * len(header)
+    print(f"\n{header}\n{sep}")
+    total_converted = total_all = 0
+    for variable_, time_unit_, grid_ in sorted(summary):
+        entry = summary[(variable_, time_unit_, grid_)]
+        pct = f"{entry['converted'] / entry['total'] * 100:.0f}%" if entry["total"] else "-"
+        print(_row(variable_, time_unit_, grid_, entry["converted"], entry["total"], pct))
+        total_converted += entry["converted"]
+        total_all += entry["total"]
+    print(sep)
+    overall_pct = f"{total_converted / total_all * 100:.0f}%" if total_all else "-"
+    print(_row("TOTAL", "", "", total_converted, total_all, overall_pct))
+
+
+@click.command(
+    help=__doc__,
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
+)
+@click.option("--output-path", help="Root directory for long-format output (required unless --estimate).")
+@click.option(
+    "--catalog-path",
+    metavar="DIR",
+    default=None,
+    help="Root directory for the unified catalog side-table. This is the source of truth for "
+    "which partitions have already been converted -- already-converted partitions are skipped "
+    "before a migration starts. Rows are appended as data is written and coalesced into minimal "
+    "contiguous runs at the end. Also required for --show-progress. Defaults to CATALOG_PATH "
+    "(the CPRA_MP_DATA_CATALOG_PATH environment variable) if not given.",
+)
+@click.option("--estimate", is_flag=True, help="Print a memory-estimate table sorted by peak memory and exit.")
+@click.option(
+    "--unconverted-only",
+    is_flag=True,
+    help="With --estimate, only include partitions the catalog does not yet show as converted.",
+)
+@click.option("--variable", help="Migrate only this variable.")
+@click.option("--grid", help="Migrate only this grid.")
+@click.option("--time-unit", help="Migrate only this time unit.")
+@click.option("--dry-run", is_flag=True, help="Show what would be migrated without writing.")
+@click.option(
+    "--progress/--no-progress", default=True, help="Show progress bar (use --no-progress for batch jobs)."
+)
+@click.option("--data-path", default=str(BASE_PATH), show_default=True, help="Base data path.")
+@click.option(
+    "--workers",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of partitions to process in parallel. Keep low (2–4) — Polars already "
+    "saturates CPUs within each partition.",
+)
+@click.option(
+    "--show-progress",
+    is_flag=True,
+    help="Scan --data-path (optionally filtered by --variable/--grid/--time-unit), then "
+    "summarize -- per variable/time_unit/grid -- how many partitions the catalog already "
+    "shows as converted, and exit without migrating anything.",
+)
+@click.option(
+    "--log-path",
+    metavar="PATH",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Where to write the per-partition migration results as a CSV, a row as each partition "
+    "finishes (so an interrupted run still leaves a usable log). Defaults to a timestamped file "
+    "in the current directory.",
+)
+@click.option(
+    "--memory-limit",
+    metavar="SIZE",
+    help="Per-worker memory budget (e.g. '32GB'). Sizes each conversion batch so the "
+    "worker's peak memory stays within the budget. Without this flag a default batch size is used. "
+    "Partitions whose estimated peak exceeds the budget even at the minimum batch size (e.g. the "
+    "one-time wide-frame sort alone) are skipped up front rather than attempted and OOM-killed.",
+)
+@click.option(
+    "--temp-path",
+    metavar="DIR",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Directory for intermediate batch files (e.g. a fast dedicated scratch "
+    "filesystem). Defaults to the system temp location.",
+)
+@click.option(
+    "--append-missing",
+    is_flag=True,
+    help="Check every partition -- including ones the catalog already shows as converted -- "
+    "against its source, and append whatever is missing instead of skipping or rebuilding it. "
+    "Tabular partitions are compared per non-calendar-dimension group (expected long rows = "
+    "wide rows x grid_cell columns) and the absent rows are written as one extra Parquet file; "
+    "raster partitions are compared band by band and the absent calendar values written as extra "
+    "COGs. Nothing already in the output is ever rewritten or deleted, so the output partitions "
+    "end up holding more than one file -- run a compaction (compact_parquet / compact_cog, in "
+    "place on the output tree) once the migration is finished to consolidate them. This is the "
+    "answer to new wide-format output landing in the input tree mid-migration; it needs no "
+    "purge, and the appended data is catalogued as it is written.",
+)
+@click.option(
+    "--skip-unchanged",
+    metavar="LOG_CSV",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="A results CSV from a previous run (its --log-path) against the same --output-path. "
+    "Partitions it records as matching or written (skipped/migrated/appended/unchanged) are "
+    "skipped without reading anything, provided the total size of their source files is "
+    "unchanged. Partitions it records as OOM-killed ('oom') are skipped too, unless this run's "
+    "--memory-limit is larger than the one they were killed at (or one run had a limit and the "
+    "other did not). Anything else is processed as usual. Skipped partitions are carried into "
+    "this run's log, as are the log's rows for partitions this run doesn't process at all, so "
+    "the newest log is always enough for the next run (passing the same path as --log-path is "
+    "fine: it is read in full before being rewritten). Mostly useful with --append-missing, "
+    "which otherwise re-reads every partition.",
+)
+@click.option(
+    "--unique-parquet-rows",
+    is_flag=True,
+    help="Drop duplicate rows (all columns equal) from the long-format Parquet output. "
+    "Tabular data only; no equivalent is applied to raster (COG) output.",
+)
+def main(
+    output_path, catalog_path, estimate, unconverted_only, variable, grid, time_unit, dry_run, progress,
+    data_path, workers, show_progress, log_path, memory_limit, temp_path,
+    unique_parquet_rows, append_missing, skip_unchanged,
+):
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
+
+    if unconverted_only and not estimate:
+        raise click.UsageError("--unconverted-only requires --estimate")
+
+    # --unconverted-only trims the work list down to what the catalog hasn't recorded;
+    # --append-missing deliberately examines everything, including what it has.
+    if append_missing and unconverted_only:
+        raise click.UsageError("--append-missing cannot be combined with --unconverted-only")
+
+    catalog_path = Path(catalog_path) if catalog_path else CATALOG_PATH
+    if not catalog_path:
+        raise click.UsageError("--catalog-path is required (CATALOG_PATH is not set)")
+    catalog_path = catalog_path.resolve()
+
+    if show_progress:
+        _print_progress(Path(data_path).resolve(), catalog_path, variable, grid, time_unit, progress)
+        return
+
+    if not estimate and not output_path:
+        raise click.UsageError("--output-path is required unless --estimate is set")
+
+    if temp_path is not None:
+        temp_path = temp_path.resolve()
+
+    try:
+        memory_limit = _parse_memory(memory_limit) if memory_limit else None
+    except ValueError:
+        raise click.BadParameter(f"invalid value: {memory_limit!r}", param_hint="'--memory-limit'")
+
+    base_path = Path(data_path).resolve()
+    partitions = find_partitions(base_path, variable, grid, time_unit)
+    raster_datasets = find_raster_datasets(base_path, variable, grid, time_unit)
+
+    if unconverted_only:
+        tasks = [("tabular", str(paths[0].parent.relative_to(base_path)), paths) for paths in partitions.values()]
+        tasks += [("raster", _raster_rel(d), d) for d in raster_datasets]
+        completed = _catalog_completed(catalog_path, tasks)
+        partitions = {
+            p: paths for p, paths in partitions.items() if str(p.relative_to(base_path)) not in completed
+        }
+        raster_datasets = [d for d in raster_datasets if _raster_rel(d) not in completed]
+
+    if not partitions and not raster_datasets:
+        print("No datasets found matching the given filters.")
+        return
+
+    if estimate:
+        estimate_partitions(partitions, base_path, progress=progress, memory_limit=memory_limit)
+        if raster_datasets:
+            n_tifs = sum(len(_raster_source_tifs(base_path, d)) for d in raster_datasets)
+            print(
+                f"\nRaster: {len(raster_datasets)} partition(s), {n_tifs} source COG(s) "
+                "(compacted via VRT — memory-light, not modeled above)."
+            )
+        return
+
+    output_path = Path(output_path).resolve()
+    # --dry-run writes nothing (no data, no catalog), so disable the catalog write
+    # hooks by passing None through to the write/compact functions. catalog_path
+    # itself stays set (it's still used below to skip already-converted partitions).
+    write_catalog_path = None if dry_run else catalog_path
+
+    # One unified task list: tabular partitions and raster datasets, each tagged
+    # with its kind and a stable progress key (rel).
+    tasks: list[tuple[str, str, object]] = []
+    for paths in partitions.values():
+        tasks.append(("tabular", str(paths[0].parent.relative_to(base_path)), paths))
+    for d in raster_datasets:
+        tasks.append(("raster", _raster_rel(d), d))
+
+    # The catalog is the record of what earlier runs finished, and normally that's
+    # enough to skip a partition outright.  --append-missing exists precisely for the case
+    # where it isn't -- the source grew after the partition was converted -- so it compares
+    # every partition against its source instead of trusting the catalog.
+    catalog_skipped = 0
+    if not append_missing:
+        completed = _catalog_completed(catalog_path, tasks)
+        if completed:
+            kept = [t for t in tasks if t[1] not in completed]
+            catalog_skipped = len(tasks) - len(kept)
+            tasks = kept
+
+    # Sized for every task, not just the ones --skip-unchanged could skip: the sizes are
+    # what this run's log records for the next run to compare against.
+    source_bytes = {rel: _source_bytes(kind, payload, base_path) for kind, rel, payload in tasks}
+
+    # Rows carried over from the --skip-unchanged log, written ahead of this run's own.
+    # Read before this run's log is opened, so the two may be the same file.
+    carried: list[dict] = []
+    unchanged_skipped = 0
+    oom_skipped = 0
+    if skip_unchanged is not None:
+        previous = _read_log(skip_unchanged)
+        kept = []
+        for t in tasks:
+            prior = previous.get(t[1])
+            if prior is None:
+                kept.append(t)
+            elif _vouches_for(prior, source_bytes[t[1]]):
+                unchanged_skipped += 1
+                carried.append({
+                    **{field: prior.get(field, "") for field in LOG_FIELDS},
+                    "status": "unchanged", "elapsed_s": 0.0, "peak_bytes": 0, "error": "",
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                })
+            elif _oom_again(prior, memory_limit):
+                # Carried as-is (memory_limit included), so later runs keep skipping it
+                # until one is given a larger limit.
+                oom_skipped += 1
+                carried.append({field: prior.get(field, "") for field in LOG_FIELDS})
+            else:
+                kept.append(t)
+        tasks = kept
+
+    # A partition whose estimated peak already exceeds --memory-limit will only
+    # get OOM-killed by a worker (the batch sizing in _batch_target_rows can
+    # shrink the per-batch cost, but not the one-time wide-frame sort, which
+    # alone can exceed the limit).  Skip those up front instead of burning a
+    # worker slot on a doomed attempt.
+    over_limit_skipped = 0
+    if memory_limit is not None:
+        kept = []
+        for t in tasks:
+            kind, rel, payload = t
+            if kind == "tabular":
+                est = _partition_estimates(payload, memory_limit)
+                if est is not None and est["est_peak"] > memory_limit:
+                    over_limit_skipped += 1
+                    print(
+                        f"  Skipping {rel} (est. peak {_fmt_bytes(est['est_peak'])} "
+                        f"exceeds --memory-limit {_fmt_bytes(memory_limit)})"
+                    )
+                    continue
+            kept.append(t)
+        tasks = kept
+
+    n_tabular = sum(1 for t in tasks if t[0] == "tabular")
+    n_raster = sum(1 for t in tasks if t[0] == "raster")
+    total_partitions = len(tasks)
+    summary = f"Found {n_tabular} tabular partition(s) and {n_raster} raster partition(s)."
+    if append_missing:
+        summary += " (--append-missing: every partition is checked against its source.)"
+    if catalog_skipped:
+        summary += f" ({catalog_skipped} already converted per the catalog, skipped.)"
+    if unchanged_skipped:
+        summary += f" ({unchanged_skipped} unchanged since {skip_unchanged.name}, skipped.)"
+    if oom_skipped:
+        summary += (
+            f" ({oom_skipped} OOM-killed in an earlier run at a --memory-limit no smaller than "
+            "this one, skipped.)"
+        )
+    if over_limit_skipped:
+        summary += f" ({over_limit_skipped} skipped: estimated peak exceeds --memory-limit.)"
+    print(summary)
+    migrated = 0
+    skipped = unchanged_skipped + oom_skipped
+    errors: list[str] = []
+    touched_datasets: set[tuple] = set()  # (variable, time_unit, grid) to compact in the catalog
+
+    log = _ResultLog(
+        log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv", memory_limit
+    )
+    print(f"Writing per-partition results to {log.path}")
+    for row in carried:
+        log.write(row)
+    if skip_unchanged is not None:
+        # Partitions this run doesn't touch at all -- filtered out, skipped per the catalog
+        # or the memory estimate -- keep their previous rows, so reusing one log path
+        # across differently-filtered runs never forgets anything.
+        handled = {t[1] for t in tasks} | {row["partition"] for row in carried}
+        for rel, prior in previous.items():
+            if rel not in handled:
+                log.write({field: prior.get(field, "") for field in LOG_FIELDS})
+
+    desc = "[DRY RUN]" if dry_run else ("Appending" if append_missing else "Migrating")
+    packed = [
+        (
+            task, base_path, output_path, write_catalog_path, dry_run, memory_limit, progress, temp_path,
+            unique_parquet_rows, append_missing,
+        )
+        for task in tasks
+    ]
+
+    # spawn avoids fork-after-threads problems with Polars' internal thread pool.
+    # Each partition runs in a dedicated Process so the allocator (jemalloc/mimalloc)
+    # releases its pages back to the OS when the process exits, and a SIGKILL'd
+    # worker is detectable via p.exitcode without relying on Pool's dead-worker logic.
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    active: dict[int, tuple[multiprocessing.Process, str, str]] = {}  # pid -> (proc, rel, kind)
+    task_iter = iter(packed)
+
+    def _spawn_next() -> bool:
+        try:
+            item = next(task_iter)
+        except StopIteration:
+            return False
+        task = item[0]
+        p = ctx.Process(target=_run_partition, args=(item, result_queue), daemon=True)
+        p.start()
+        active[p.pid] = (p, task[1], task[0])
+        return True
+
+    # Nested per-worker progress bars (one slot per active worker, below the
+    # partition bar at position 0).  Only created for multi-batch conversions.
+    inner_bars: dict[int, tqdm] = {}
+    used_positions: set[int] = set()
+
+    def _short(rel: str, width: int = 48) -> str:
+        return rel if len(rel) <= width else "…" + rel[-(width - 1):]
+
+    def _update_inner(pid: int, rel: str, done: int, total: int) -> None:
+        if not progress or total <= 1:
+            return
+        bar_inner = inner_bars.get(pid)
+        if bar_inner is None:
+            pos = 1
+            while pos in used_positions:
+                pos += 1
+            used_positions.add(pos)
+            bar_inner = tqdm(total=total, position=pos, leave=False, desc=_short(rel), unit="batch")
+            bar_inner._slot = pos
+            inner_bars[pid] = bar_inner
+        bar_inner.total = total
+        bar_inner.n = done
+        bar_inner.refresh()
+
+    def _close_inner(pid: int) -> None:
+        bar_inner = inner_bars.pop(pid, None)
+        if bar_inner is not None:
+            used_positions.discard(getattr(bar_inner, "_slot", None))
+            bar_inner.close()
+
+    try:
+        for _ in range(workers):
+            if not _spawn_next():
+                break
+
+        with tqdm(total=total_partitions, desc=desc, unit="partition", position=0, disable=not progress) as bar:
+            remaining = total_partitions
+            while remaining > 0:
+                try:
+                    message = result_queue.get(timeout=0.2)
+                except queue.Empty:
+                    # No result yet — check whether any worker was killed without
+                    # writing to the queue (OOM kill, SIGKILL, etc.).
+                    for pid, (p, rel, kind) in list(active.items()):
+                        if not p.is_alive():
+                            p.join()
+                            if p.exitcode != 0:
+                                del active[pid]
+                                remaining -= 1
+                                _close_inner(pid)
+                                msg = f"{rel}: worker killed (OOM?), exit code {p.exitcode}"
+                                errors.append(msg)
+                                tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
+                                # SIGKILL is what the OOM killer (kernel or cgroup) sends.
+                                oom = p.exitcode == -signal.SIGKILL
+                                log.write({
+                                    "partition": rel,
+                                    "data_type": "raster" if kind == "raster" else "tabular",
+                                    "status": "oom" if oom else "failed",
+                                    "files": "", "geo_cols": "", "long_rows": "",
+                                    "elapsed_s": "", "peak_bytes": "",
+                                    "error": f"exit code {p.exitcode}",
+                                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                                })
+                                _spawn_next()
+                                bar.update(1)
+                                bar.set_postfix(migrated=migrated, skipped=skipped)
+                    continue
+                except KeyboardInterrupt:
+                    for p, _, _ in active.values():
+                        p.terminate()
+                    for p, _, _ in active.values():
+                        p.join()
+                    raise
+
+                if message[0] == "progress":
+                    _, pid, rel, done, total = message
+                    _update_inner(pid, rel, done, total)
+                    continue
+
+                _, pid, rel, result, messages, error = message
+                _close_inner(pid)
+                if pid in active:
+                    active.pop(pid)[0].join()
+                _spawn_next()
+                remaining -= 1
+
+                completed_at = datetime.now().isoformat(timespec="seconds")
+                for msg in messages:
+                    tqdm.write(msg)
+                if error:
+                    errors.append(f"{rel}: {error}")
+                    tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
+                    log.write({
+                        "partition": rel, "data_type": "", "status": "failed",
+                        "files": "", "geo_cols": "", "long_rows": "", "elapsed_s": "", "peak_bytes": "",
+                        "error": error, "completed_at": completed_at,
+                    })
+                elif result is None:
+                    skipped += 1  # not wide format
+                else:
+                    data_type = result.get("data_type", "tabular")
+                    dims = parse_path_dims(rel)
+                    if {"variable", "time_unit", "grid"} <= dims.keys():
+                        touched_datasets.add((dims["variable"], dims["time_unit"], dims["grid"]))
+                    if result.get("skipped"):
+                        skipped += 1  # already in long format on disk
+                        log.write({
+                            "partition": rel, "data_type": data_type, "status": "skipped",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": 0.0, "peak_bytes": 0,
+                            "source_bytes": source_bytes[rel], "error": "", "completed_at": completed_at,
+                        })
+                    elif "elapsed_s" in result:
+                        migrated += 1
+                        log.write({
+                            "partition": rel, "data_type": data_type,
+                            "status": "appended" if result.get("appended") else "migrated",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": result["elapsed_s"],
+                            "peak_bytes": result["peak_bytes"], "source_bytes": source_bytes[rel],
+                            "error": "", "completed_at": completed_at,
+                        })
+                    else:
+                        migrated += 1  # dry run
+                        log.write({
+                            "partition": rel, "data_type": data_type,
+                            "status": "would_append" if result.get("appended") else "would_migrate",
+                            "files": result["files"], "geo_cols": result["geo_cols"],
+                            "long_rows": result["long_rows"], "elapsed_s": "", "peak_bytes": "",
+                            "error": "", "completed_at": completed_at,
+                        })
+                bar.update(1)
+                bar.set_postfix(migrated=migrated, skipped=skipped)
+    except KeyboardInterrupt:
+        for p, _, _ in active.values():
+            p.terminate()
+        for p, _, _ in active.values():
+            p.join()
+        tqdm.write("\nInterrupted by user.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        for pid in list(inner_bars):
+            _close_inner(pid)
+        log.close()
+
+    # Coalesce the catalog for every dataset touched: write_parquet appended
+    # per-write rows and compact_cog appended raster rows, so a final
+    # compact_partition per variable/time_unit/grid collapses them into minimal
+    # contiguous runs.  Idempotent (a single-file catalog partition is a no-op).
+    if write_catalog_path is not None and touched_datasets:
+        catalog = Catalog(write_catalog_path)
+        for variable_, time_unit_, grid_ in sorted(touched_datasets):
+            catalog.compact_partition(variable_, time_unit_, grid_)
+
+    print(f"\nWrote {log.count} result(s) to {log.path}")
+
+    verb = "append to" if append_missing else "migrate"
+    label = f"Would {verb}" if dry_run else ("Appended to" if append_missing else "Migrated")
+    print(f"\n{label} {migrated} unit(s), skipped {skipped}.")
+    if errors:
+        print(f"\n{len(errors)} unit(s) failed:", file=sys.stderr)
+        for err in errors:
+            print(f"  {err}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

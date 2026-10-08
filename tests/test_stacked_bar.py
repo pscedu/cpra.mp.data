@@ -33,10 +33,10 @@ from cpra.mp.data.visualizations.stacked_bar import COMPARE_CHANNELS, StackedBar
 
 # A vector grid queried by ID needs no geometry on disk, and a raster grid never has any, so
 # every chart here builds from the structure CSVs alone.
-ANNUAL = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", geography="1,2")
-DAILY = dict(variable="sal", grid="hydro_compartment_v001", time_unit="daily", geography="1")
+ANNUAL = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", grid_cell="1,2")
+DAILY = dict(variable="sal", grid="hydro_compartment_v001", time_unit="daily", grid_cell="1")
 VEG_SPECIES = dict(
-    variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual", geography="-91.5,29.5"
+    variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual", grid_cell="-91.5,29.5"
 )
 
 
@@ -131,7 +131,11 @@ class TestSharedSkeleton:
     def test_a_difference_chart_marks_zero(self, viz):
         """Vega-Lite stacks negative segments below zero, so without this the baseline a
         difference is read against is wherever the axis happens to start."""
-        spec = viz(negate="model_group_id 500").chart().to_dict()
+        spec = (
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
+            .chart()
+            .to_dict()
+        )
         assert {"datum": 0} in [rule["encoding"].get("y") for rule in layers(spec, "rule")]
 
     def test_a_plain_chart_does_not(self, spec):
@@ -139,7 +143,11 @@ class TestSharedSkeleton:
 
     def test_the_zero_rule_is_drawn_under_the_bars(self, viz):
         """It's a reference line, not an annotation on top of the data."""
-        spec = viz(negate="model_group_id 500").chart().to_dict()
+        spec = (
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
+            .chart()
+            .to_dict()
+        )
         marks = [layer["mark"]["type"] for layer in spec["layer"]]
         assert marks.index("rule") < marks.index("bar")
 
@@ -171,22 +179,29 @@ class TestCompareDimensions:
         """The API accepts a scalar as well as a list, and a scalar can't be a comparison."""
         assert stacked_bar(model_group_id=500).compare_dimensions == {}
 
-    def test_the_negate_dimension_is_excluded(self):
+    def test_the_collapsed_dimension_is_excluded(self):
         """Its two values *are* the difference being drawn, so drawing them as two series
-        would draw the difference and both of its operands at once."""
-        viz = stacked_bar(model_group_id=[500, 520], negate="model_group_id 500")
+        would draw the difference and both of its operands at once. `compare_dimensions`
+        excludes `self.resolved_analysis.collapsed_dimensions`; `negate_dimension`, the
+        property that used to compute this without a resolved analysis, was deleted along
+        with the legacy `negate` parameter it read -- `test_the_negate_parameter_
+        may_name_a_value_too` and `test_no_negate_parameter_leaves_no_negate_dimension`,
+        which pinned that property directly, were deleted rather than converted, since
+        there is nothing left on `StackedBar` for them to call."""
+        viz = stacked_bar(
+            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
+        )
         assert viz.compare_dimensions == {}
 
-    def test_a_negate_dimension_does_not_exclude_the_others(self):
-        viz = stacked_bar(model_group_id=[500, 520], scenario_id=[7, 8], negate="model_group_id 500")
+    def test_a_collapsed_dimension_does_not_exclude_the_others(self):
+        viz = stacked_bar(
+            model_group_id=[500, 520],
+            scenario_id=[7, 8],
+            analysis="diff",
+            dimension="model_group_id",
+            order="asc",
+        )
         assert list(viz.compare_dimensions) == ["scenario_id"]
-
-    def test_the_negate_parameter_may_name_a_value_too(self):
-        """`negate` is "<dimension> <value>"; only the dimension part identifies it."""
-        assert stacked_bar(negate="model_group_id 500").negate_dimension == "model_group_id"
-
-    def test_no_negate_parameter_leaves_no_negate_dimension(self):
-        assert stacked_bar().negate_dimension is None
 
     def test_only_as_many_as_there_are_channels(self):
         """Vega-Lite would stack by the combination of every discrete channel present, so a
@@ -434,10 +449,26 @@ class TestSpeciesStackedBarDataSource:
     def test_the_species_column_is_selected(self):
         """`get_data_uri` only selects a dimension it was given several values to filter by,
         so dropping the filter would drop the column the chart keys on with it."""
-        assert self._params()["select"] == ["calendar_year,veg_species_code,geography,value"]
+        assert self._params()["select"] == ["calendar_year,veg_species_code,grid_cell,value"]
 
     def test_other_filters_are_kept(self):
         assert self._params(model_group_id=[500])["model_group_id"] == ["500"]
+
+    def test_a_dimension_the_analysis_collapsed_is_dropped_from_the_explicit_select(self):
+        """This chart is the one place that hands `get_data_uri` a ready-made `select`, which
+        is exactly what let it keep asking for a column a named analysis had collapsed away:
+        a `diff` over `calendar_year` groups that column out of its output, so naming
+        it here 400s the read ("unable to find column"). The two years still have to be SENT
+        -- they are what the difference is taken between -- so only the `select` entry goes.
+        """
+        params = self._params(
+            analysis="diff",
+            dimension="calendar_year",
+            order="asc",
+            calendar_year=[2030, 2040],
+        )
+        assert params["select"] == ["veg_species_code,grid_cell,value"]
+        assert params["calendar_year"] == ["2030", "2040"]
 
 
 class TestSpeciesStackedBarSeries:
@@ -549,7 +580,9 @@ class TestSpeciesStackedBarChart:
     def test_a_difference_axis_keeps_the_suffix_last(self):
         """The word belongs to the variable, so it goes in front of the suffix -- appending it
         to `variable_label` would read "... Species Difference Coverage"."""
-        viz = species_bar(negate="model_group_id 500")
+        viz = species_bar(
+            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
+        )
         assert viz.variable_label == "Vegetation Type: Species Coverage Difference"
 
 

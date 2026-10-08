@@ -5,22 +5,24 @@ the HTTP status has to be decided from whatever the thread has done by the time 
 chunk is ready.
 """
 
+import time
+
+import anyio
 import polars as pl
 import pytest
-import rasterio as rio
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
+from cpra.mp.data.api import tabular
 from cpra.mp.data.api.models import Compression
-from cpra.mp.data.api.raster import COMPRESSION_LEVEL_OPTIONS, RasterioStreamingResponse
+from cpra.mp.data.api.pipeline import (
+    _TABULAR_MIME_TYPES,
+    COMPRESSION_LEVEL_OPTIONS,
+    PipelineTabularResponse,
+)
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
-from cpra.mp.data.api.types import CompressionAlgorithm
-from cpra.mp.data.api.vector import VectorTileResponse
-
-from tests.factories import RASTER_KWARGS, write_raster_dataset
-
-DIMENSIONS = {k: RASTER_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 
 
 def serve(response_factory):
@@ -66,6 +68,21 @@ class TestPolarsStreamingResponse:
         response = self._client(source, format=format).get("/test")
         assert response.headers["content-type"].startswith(media_type)
 
+    def test_both_mime_maps_carry_exactly_the_tabular_data_formats(self):
+        """The two maps are deliberately separate copies (see `_TABULAR_MIME_TYPES`'s own
+        comment for why this module's response class does not import that one's), so they
+        can drift from each other and from the format vocabulary alike -- and did: both
+        carried an `arrow` entry that no route could reach, since every `{format}` path
+        segment binds straight to `DataFormat` and that enum has no `arrow` member.
+
+        `tif` is absent from both because a GeoTIFF is not streamed by either class --
+        `api.pipeline.PipelineRasterResponse` serves it from a temp file instead.
+        """
+        tabular_formats = {format.value for format in DataFormat if format is not DataFormat.tif}
+        assert set(PolarsStreamingResponse.mime_types) == tabular_formats
+        assert set(_TABULAR_MIME_TYPES) == tabular_formats
+        assert PolarsStreamingResponse.mime_types == _TABULAR_MIME_TYPES
+
     def test_parquet_body_is_readable(self, tmp_path):
         import io
 
@@ -103,6 +120,144 @@ class TestPolarsStreamingResponse:
         assert response.text == "boom"
 
 
+class SlowSource(LazyFrameSource):
+    """A writer that produces nothing for `delay` seconds and then writes normally -- the
+    shape of a slow read, and the only shape in which the response's read loop has anything
+    to wait on. A fast source writes before the loop's first read and never waits at all.
+    """
+
+    def __init__(self, lf, delay):
+        super().__init__(lf)
+        self.delay = delay
+
+    def stream_tabular(self, out_path, format, *args, **kwargs):
+        time.sleep(self.delay)
+        super().stream_tabular(out_path, format, *args, **kwargs)
+
+
+def count_reads(monkeypatch):
+    """Count every `file.read` the response's poll loop performs. Returns a one-key dict so
+    the caller can read the running total.
+    """
+    counted = {"n": 0}
+    original = anyio.AsyncFile.read
+
+    async def counting_read(self, *args, **kwargs):
+        counted["n"] += 1
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.AsyncFile, "read", counting_read)
+    return counted
+
+
+class TestPollPacing:
+    """The read loop polls a temp file a background thread is still writing, and an empty
+    read while that thread is alive means "nothing yet". Unpaced, that is a spin -- ~70,000
+    thread-pool-dispatched reads of an empty file measured on one 3.5-second request -- and
+    `api.tabular.sleep_between_polls` is what bounds it.
+    """
+
+    DELAY = 0.25
+
+    def test_the_interval_doubles_and_then_holds_at_the_cap(self):
+        async def intervals():
+            # `None` is how a caller spells "first poll of this stall" -- neither response
+            # class names a bound itself, so this is the only entry point to the series.
+            out, interval = [], None
+            for _ in range(8):
+                interval = await tabular.sleep_between_polls(interval)
+                out.append(interval)
+            return out
+
+        got = anyio.run(intervals)
+        assert got[0] == tabular.POLL_INTERVAL_MIN * 2
+        assert got[1] == tabular.POLL_INTERVAL_MIN * 4
+        # It reaches the cap and stays there rather than growing without bound, which is
+        # what keeps a finished write from going unnoticed for an arbitrarily long time.
+        assert got[-1] == tabular.POLL_INTERVAL_MAX
+        assert max(got) == tabular.POLL_INTERVAL_MAX
+
+    def test_the_cap_is_short_enough_to_not_dominate_a_quick_response(self):
+        # The pacing's whole cost is that a finished write is noticed up to one interval
+        # late, so the cap IS the worst-case added latency. Pinned because raising it is
+        # the tempting way to cut the poll count further, and it is paid by every request.
+        assert tabular.POLL_INTERVAL_MAX <= 0.01
+        assert tabular.POLL_INTERVAL_MIN < tabular.POLL_INTERVAL_MAX
+
+    def _reads_for(self, response_factory, *, paced):
+        # Its own patch context per call, not the `monkeypatch` fixture: the two calls run
+        # inside one test, and a fixture would not undo the control's zeroed bounds until
+        # the test ended -- which would silently make the paced run unpaced too.
+        with pytest.MonkeyPatch.context() as patch:
+            if not paced:
+                # The same loop with the pacing neutralized -- what it did before this fix.
+                patch.setattr(tabular, "POLL_INTERVAL_MIN", 0)
+                patch.setattr(tabular, "POLL_INTERVAL_MAX", 0)
+            counted = count_reads(patch)
+            response = serve(response_factory).get("/test")
+        assert response.status_code == 200
+        assert "a\n1\n2" in response.text
+        return counted["n"]
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            pytest.param(
+                lambda source: PolarsStreamingResponse(source, "csv", Compression()),
+                id="PolarsStreamingResponse",
+            ),
+            pytest.param(
+                lambda source: PipelineTabularResponse(source, "csv", Compression()),
+                id="PipelineTabularResponse",
+            ),
+        ],
+    )
+    def test_a_slow_writer_does_not_spin_the_read_loop(self, factory):
+        """Both classes carry a copy of the loop, so both have to be paced -- and the second
+        one's docstring says it shares the pacing rather than copying it, which only means
+        anything if it is checked here too.
+
+        Measured against the unpaced loop rather than an absolute count: how many reads a
+        spin fits into a quarter second is a property of the machine, but the ratio between
+        spinning and not is the behavior being fixed. `PipelineTabularResponse` is built on
+        a duck-typed source here, the same way `stream_or_write_to_file` consumes one.
+        """
+        source = SlowSource(pl.LazyFrame({"a": [1, 2]}), self.DELAY)
+        spun = self._reads_for(lambda: factory(source), paced=False)
+        paced = self._reads_for(lambda: factory(source), paced=True)
+
+        # A quarter second at a 10 ms cap is tens of polls (measured: 30 for both classes);
+        # unpaced it is thousands (measured: ~4,000, a ratio of ~135x).
+        assert paced < 100
+        assert spun > 20 * paced
+
+    def test_a_fast_response_is_not_slowed_by_the_pacing(self):
+        # The backoff starts at `POLL_INTERVAL_MIN` precisely so this case pays nothing
+        # noticeable: a writer that finishes in milliseconds does a handful of reads, none
+        # of which waits longer than half a millisecond.
+        source = LazyFrameSource(pl.LazyFrame({"a": [1, 2]}))
+        started = time.perf_counter()
+        response = serve(lambda: PolarsStreamingResponse(source, "csv", Compression())).get("/test")
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        assert "a\n1\n2" in response.text
+        assert elapsed < 20 * tabular.POLL_INTERVAL_MAX
+
+    def test_a_writer_that_fails_slowly_still_reports_its_status(self):
+        # The paced branch is the one with nothing to send, so it must not swallow the
+        # not-alive-and-empty exit that carries a failed writer's status out.
+        class SlowBoom(SlowSource):
+            def stream_tabular(self, *args, **kwargs):
+                time.sleep(self.delay)
+                raise RuntimeError("boom")
+
+        source = SlowBoom(pl.LazyFrame({"a": [1]}), self.DELAY)
+        response = serve(lambda: PolarsStreamingResponse(source, "csv", Compression())).get("/test")
+        assert response.status_code == 500
+        assert response.text == "boom"
+
+
 class TestStreamingThread:
     def test_captures_an_exception_instead_of_raising(self):
         source = LazyFrameSource(pl.scan_parquet("/nonexistent/path.parquet"))
@@ -121,7 +276,12 @@ class TestStreamingThread:
         assert out.read_text().startswith("a")
 
 
-class TestRasterioStreamingResponse:
+class TestCompressionLevelOptions:
+    """`api.pipeline.COMPRESSION_LEVEL_OPTIONS` -- the rasterio profile key each
+    compression algorithm spells its level with. Only the three that HAVE a level appear;
+    `.get()` returning nothing is what "this algorithm takes no level" means.
+    """
+
     def test_compression_level_option_mapping(self):
         assert COMPRESSION_LEVEL_OPTIONS[CompressionAlgorithm.deflate] == "zlevel"
         assert COMPRESSION_LEVEL_OPTIONS[CompressionAlgorithm.lzma] == "lzma_preset"
@@ -130,88 +290,3 @@ class TestRasterioStreamingResponse:
     def test_algorithms_without_a_level_option(self):
         assert CompressionAlgorithm.lzw not in COMPRESSION_LEVEL_OPTIONS
         assert CompressionAlgorithm.none not in COMPRESSION_LEVEL_OPTIONS
-
-    async def test_streams_a_geotiff(self, dataset_factory, base_path, tmp_path):
-        import io
-
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", Compression()))
-        response = client.get("/test")
-
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "image/tiff; application=geotiff"
-        with rio.open(io.BytesIO(response.content)) as src:
-            assert src.read(1)[0, 0] == 30
-
-    async def test_compression_reaches_the_output_profile(
-        self, dataset_factory, base_path, tmp_path
-    ):
-        import io
-
-        write_raster_dataset(base_path, years=(2030,), fill_fn=lambda y: y - 2000)
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        compression = Compression(
-            compression_algorithm=CompressionAlgorithm.deflate, compression_level=9
-        )
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", compression))
-        response = client.get("/test")
-
-        with rio.open(io.BytesIO(response.content)) as src:
-            assert src.profile["compress"].lower() == "deflate"
-
-    async def test_missing_source_data_raises_404(self, dataset_factory, base_path):
-        """An HTTPException raised inside __call__ is still handled by FastAPI."""
-        dataset = dataset_factory(DIMENSIONS)
-        await dataset.apply_params()
-
-        client = serve(lambda: RasterioStreamingResponse(dataset, "tif", Compression()))
-        response = client.get("/test")
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Source data do not exist"
-
-
-class TestVectorTileResponse:
-    async def test_missing_tile_raises(self, dataset_factory, base_path, tiles_path):
-        from cpra.mp.data.tabular import write_parquet
-
-        from tests.factories import ANNUAL_KWARGS, annual_frame
-
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
-        dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions)
-        await dataset.apply_params()
-
-        client = serve(lambda: VectorTileResponse(dataset, 1, 2, 3))
-        response = client.get("/test")
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Tile does not exist"
-
-    async def test_serves_a_tile(self, dataset_factory, base_path, tiles_path):
-        import mercantile
-        from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
-
-        from cpra.mp.data.tabular import write_parquet
-
-        from tests.factories import ANNUAL_KWARGS, annual_frame, write_pmtiles
-
-        tile = mercantile.Tile(x=1, y=2, z=3)
-        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
-        write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
-
-        dimensions = {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}
-        dataset = dataset_factory(dimensions)
-        await dataset.apply_params()
-
-        client = serve(lambda: VectorTileResponse(dataset, tile.x, tile.y, tile.z))
-        response = client.get("/test")
-
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
-        parsed = VectorTile()
-        parsed.ParseFromString(response.content)
-        assert len(parsed.layers[0].values) == 2

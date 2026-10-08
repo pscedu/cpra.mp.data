@@ -10,8 +10,8 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Label | Name | Type | Dtype | Required | Min Value | Max Value | Example Value |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Variable | variable | dataset | String | True |  |  | sal |
-| Grid | grid | dataset | String | True |  |  | hydro_compartment_v001 |
 | Time Unit | time_unit | dataset | String | True |  |  | daily |
+| Grid | grid | dataset | String | True |  |  | hydro_compartment_v001 |
 | Plan Implementation Scenario | model_group_id | partition | Int32 | True | 0 | 999 | 500 |
 | Environmental Scenario | scenario_id | partition | Int32 | True | 0 | 100 | 7 |
 | Aggregate Type | aggregate_type | partition | String | False |  |  | 2_wk_max |
@@ -31,8 +31,8 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 | Species | species_code | partition | String | False |  |  |  |
 | Vegetation: Coverage Type | vegetation_coverage_type | partition | String | False |  |  |  |
 | Percentile | percentile | partition | Int8 | False | 0 | 100 | 50 |
-| Vegetation: Species | veg_species_code | nonpartition | String | False |  |  | coes |
-| FFIBS: Coverage Type | ffibs_type | nonpartition | String | False |  |  | pl_bf |
+| Vegetation: Species | veg_species_code | partition | String | False |  |  | coes |
+| FFIBS: Coverage Type | ffibs_type | partition | String | False |  |  | pl_bf |
 | Year | calendar_year | nonpartition | Int32 | False | 1900 | 2100 | 2030 |
 | Date | calendar_day | nonpartition | Date | False |  |  | 2030-01-01 |
 | Model | model | metadata | String | True |  |  | icm_v2023.0.0 |
@@ -45,45 +45,45 @@ A hierarchy of dimensions is used to store and catalog Parquet and COG files. Th
 Variables represent a type of model output. Each variable has a single data type and unit. In addition to the dimensions required for all variables (see above), some variables support additional dimensions, as described in the Required Dimensions column below.
 
 <!--BEGIN SECTION variables-->
-| Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Display Unit | Display Scale Factor | Display Number Format | Float Precision | Legend | Required Dimensions | Difference Legend Limit |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -10000000 |
-| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
-| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
-| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
-| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
-| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |
-| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |
-| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures |  |  | d |  | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | -10 |
-| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft |  |  | .1f |  | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | -15 |
-| Habitat Suitability Index | hsi | icm | hsi | Float32 | veg_grid_cell | annual |  |  |  | .2f |  | hsi | species_code | -1 |
-| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  |  |  |  |  | aggregate_type | 1 |
-| Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt |  |  | .1f | 1 | sal | aggregate_type | -10 |
-| Sediment Accumulation in Open Water | sedacc | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |
-| Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |
-| Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |
-| Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |
-| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |
-| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |
-| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C |  |  | .1f |  | tmp | aggregate_type | -1 |
-| Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m |  |  | .2f |  | trg | aggregate_type | 1 |
-| Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L |  |  | .1f |  | tss | aggregate_type | -1 |
-| Vegetation Type: FFIBS Coverage | ffibs_coverage_ratio | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  |  |  | coverage | ffibs_type | 1 |
-| Vegetation Type: FFIBS | ffibs_score | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | .1f |  | ffibs |  | 1 |
-| Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_grid_cell | annual |  |  |  |  |  | vct |  | 1 |
-| Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_grid_cell | annual | square m |  |  |  |  | veg_area |  | 1 |
-| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  |  |  | coverage | veg_species_code | 1 |
-| Topobathymetric Elevation | elev | icm | morph | Float32 | morph_pixel | annual | NAVD88 m |  |  | .2f |  | elev |  | 1 |
-| Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m |  |  | .2f |  | inun |  | 1 |
-| Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  |  |  | d |  | lnd_type |  | 1 |
-| Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |
-| Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr |  |  | .2f |  | mnrl_dep |  | -1 |
-| Organic Matter Accumulation Rate | omar | icm | morph | Float64 | ecoregion | annual | g/cm^2-yr |  |  | .2f |  | omar | ffibs_type, percentile | -1 |
-| Organic Accretion | org_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |
-| Shallow Soil Factors | ssf | icm | morph | Float32 | ecoregion | annual | mm/yr |  |  | .1f |  | ssf | percentile | 1 |
-| Subsidence | sub | icm | morph | Float32 | morph_pixel | annual | mm/yr |  |  | .1f |  | sub |  | 1 |
-| TEST Mineral Accretion | test_mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |
-| TEST Organic Accretion | test_org_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |
+| Label | Name | Model | Subroutine | Data Type | Geographic Units | Time Units | Unit | Display Unit | Display Scale Factor | Display Number Format | Float Precision | Legend | Required Dimensions | Difference Legend Limit | Nodata |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Damage by Return Period in Dollars | damage | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | damage | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -10000000 |  |
+| Expected Annual Damages in Dollars | eadd | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |  |
+| Nonstructural Expected Annual Damage, Dollars | eadd_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |  |
+| Expected Annual Damages in Dollars, Structural Portion | eadd_str | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .3s |  | eadd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |  |
+| Nonstructural Expected Annual Structural Damage | eadd_str_ns | clara |  | Float64 | clara_grid_cell | decadal | $ |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |  |
+| Expected Annual Number of Structures Damaged | easd | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, percentile | -1000000 |  |
+| Nonstructural Expected Annual Number of Structures Damaged | easd_ns | clara |  | Float64 | clara_grid_cell | decadal | structure equivalents |  |  | .2f |  | easd | pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, ns_project_id, participation_rate, percentile | -1000000 |  |
+| Exposure: Asset Count | exposure_count_asset | clara |  | Int32 | clara_grid_cell | decadal | structures |  |  | d |  | exposure_count_asset | aep, pumping_id, fragility_scenario, population_variant, clara_variant, asset_type, exposure_type | -10 |  |
+| Flood Depth | flood_depth_ft | clara |  | Float32 | clara_grid_cell | decadal | ft |  |  | .1f |  | flood_depth | aep, pumping_id, fragility_scenario, population_variant, clara_variant, percentile | -15 |  |
+| Habitat Suitability Index | hsi | icm | hsi | Float32 | veg_grid_cell | annual |  |  |  | .2f |  | hsi | species_code | -1 |  |
+| Flow into Marsh | flom | icm | hydro | Float32 | hydro_compartment | daily |  |  |  |  |  |  | aggregate_type | 1 |  |
+| Salinity | sal | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | ppt |  |  | .1f | 1 | sal | aggregate_type | -10 |  |
+| Sediment Accumulation in Open Water | sedacc | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |  |
+| Sediment Accumulation at Marsh Edge | sedacc_marshedge | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |  |
+| Sediment Accumulation at Marsh Interior | sedacc_marshint | icm | hydro | Float32 | hydro_compartment | daily, annual | g/m2/yr |  |  | d |  |  | aggregate_type | -1 |  |
+| Stage (Water Level) | stg | icm | hydro | Float32 | hydro_compartment | daily, monthly, annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |  |
+| Hourly Stage (Water Level) | stghr | icm | hydro | Float32 | hydro_compartment | annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |  |
+| Stage (Water Level) in Marsh | stgm | icm | hydro | Float32 | hydro_compartment | daily, annual | NAVD88 m |  |  | .2f |  | stg | aggregate_type | 1 |  |
+| Water Temperature | tmp | icm | hydro | Float64 | hydro_compartment | daily, annual | degrees C |  |  | .1f |  | tmp | aggregate_type | -1 |  |
+| Tidal Range | trg | icm | hydro | Float32 | hydro_compartment | daily, annual | m |  |  | .2f |  | trg | aggregate_type | 1 |  |
+| Total Suspended Solids | tss | icm | hydro | Float64 | hydro_compartment | daily, monthly, annual | mg/L |  |  | .1f |  | tss | aggregate_type | -1 |  |
+| Vegetation Type: FFIBS Coverage | ffibs_coverage_ratio | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  |  |  | coverage | ffibs_type | 1 |  |
+| Vegetation Type: FFIBS | ffibs_score | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  | .1f |  | ffibs |  | 1 |  |
+| Vegetation Type: VCT | vct | icm | lavegmod | Int32 | veg_grid_cell | annual |  |  |  |  |  | vct |  | 1 |  |
+| Vegetation Type: Habitat | veg_area | icm | lavegmod | Int64 | veg_grid_cell | annual | square m |  |  |  |  | veg_area |  | 1 |  |
+| Vegetation Type: Species | veg_species | icm | lavegmod | Float32 | veg_grid_cell | annual |  |  |  |  |  | coverage | veg_species_code | 1 |  |
+| Topobathymetric Elevation | elev | icm | morph | Int32 | morph_pixel | annual | NAVD88 mm | NAVD88 m | 1000 | .3f |  | elev |  | 1 | -9999000 |
+| Inundation Depth | inun | icm | morph | Float32 | morph_pixel | annual | m |  |  | .2f |  | inun |  | 1 |  |
+| Land Type | lnd_type | icm | morph | Int32 | morph_pixel | annual |  |  |  | d |  | lnd_type |  | 1 |  |
+| Mineral Accretion | mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |  |
+| Mineral Deposition Rate | mnrl_dep | icm | morph | Float64 | morph_pixel | annual | g/cm^2-yr |  |  | .2f |  | mnrl_dep |  | -1 |  |
+| Organic Matter Accumulation Rate | omar | icm | morph | Float64 | ecoregion | annual | g/cm^2-yr |  |  | .2f |  | omar | ffibs_type, percentile | -1 |  |
+| Organic Accretion | org_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |  |
+| Shallow Soil Factors | ssf | icm | morph | Float32 | ecoregion | annual | mm/yr |  |  | .1f |  | ssf | percentile | 1 |  |
+| Subsidence | sub | icm | morph | Float32 | morph_pixel | annual | mm/yr |  |  | .1f |  | sub |  | 1 |  |
+| TEST Mineral Accretion | test_mnrl_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |  |
+| TEST Organic Accretion | test_org_accr | icm | morph | Float64 | morph_pixel | annual | cm |  |  | .2f |  | accr |  | -1 |  |
 <!--END SECTION-->
 
 ## Grids
@@ -470,14 +470,14 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
-| Less than -2.0 | #d53e4f | -2.0 |
-| -2.0 to < -1.0 | #f46d43 | -1.0 |
-| -1.0 to < -0.5 | #fdae61 | -0.5 |
-| -0.5 to < 0.0 | #fee08b | 0.0 |
-| 0.0 to < 0.5 | #e6f598 | 0.5 |
-| 0.5 to < 1.0 | #abdda4 | 1.0 |
-| 1.0 to < 2.0 | #66c2a5 | 2.0 |
-| 2.0 or greater | #3288bd |  |
+| Less than -2.0 | #3288bd | -2000.0 |
+| -2.0 to < -1.0 | #66c2a5 | -1000.0 |
+| -1.0 to < -0.5 | #abdda4 | -500.0 |
+| -0.5 to < 0.0 | #e6f598 | 0.0 |
+| 0.0 to < 0.5 | #fee08b | 500.0 |
+| 0.5 to < 1.0 | #fdae61 | 1000.0 |
+| 1.0 to < 2.0 | #f46d43 | 2000.0 |
+| 2.0 or greater | #d53e4f |  |
 
 
 ### `exposure_count_asset` Legend
@@ -498,6 +498,7 @@ Legends determine the breakpoints and colors used to map a variable.
 
 | Label | Color | Upper Bound |
 | --- | --- | --- |
+| No structures | #00000000 | 0.0 |
 | 0 structures exposed | #d53e4f | 1.0 |
 | 1 structure exposed | #fc8d59 | 2.0 |
 | 2 structures exposed | #fee08b | 3.0 |
@@ -624,6 +625,20 @@ Legends determine the breakpoints and colors used to map a variable.
 | Bare/Unvegetated Wetland (value=3) | #8b4513 | 4.0 |
 | Upland/Developed Areas (value=4) | #999999 | 5.0 |
 | Flotant Marsh (value=5) | #afeeee |  |
+
+
+### `lnd_type_plus` Legend
+
+| Label | Color | Upper Bound |
+| --- | --- | --- |
+| No Data | #00000000 | 1.0 |
+| Vegetated Wetland (value=1) | #008000 | 2.0 |
+| Water - Deep (value=2) | #6495ed | 3.0 |
+| Bare/Unvegetated Wetland (value=3) | #8b4513 | 4.0 |
+| Upland/Developed Areas (value=4) | #999999 | 5.0 |
+| Flotant Marsh (value=5) | #afeeee | 6.0 |
+| Water - Shallow Intertidal (value = 6) | #d1dffa | 7.0 |
+| Water - Shallow Subtidal (value = 7) | #93b5f2 |  |
 
 
 ### `mnrl_dep` Legend

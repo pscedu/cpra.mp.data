@@ -12,12 +12,11 @@ token.txt
 
 *.~lock*
 /test_*.py
+*.db
 
 .coverage
 coverage.xml
 .pytest_cache/
-
-*.db
 
 /catalog/
 /crosswalks/
@@ -33,3 +32,5 @@ coverage.xml
 /scratch/
 /tiles/
 /.*-scratch/
+/.verify-scratch/
+/.claude/

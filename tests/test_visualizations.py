@@ -1,12 +1,12 @@
-"""Tests for what a visualization has to get right without ever reading the data.
+"""Tests for how visualizations label and parse the grid cell they were asked for.
 
-A visualization emits a spec pointing at a `data.csv` URL, so everything it says about that
-response it says in advance. Most of this file is about the geography: which `geography`
-values to expect, and whether they arrive as numbers or strings. Both answers change when a
-vector grid is queried by coordinate rather than by grid cell ID, so they are pinned here.
-What the reader is *shown* is a third answer, since a coordinate names a point but the data
-describes the cell that contains it — including which color shows it, which has to be the
-one the map drew the same geography with.
+A visualization never reads data itself — it emits a spec pointing at a `data.csv` URL and
+has to describe that response correctly in advance: which `grid_cell` values to expect, and
+whether they arrive as numbers or strings. Both answers change when a vector grid is
+queried by coordinate rather than by grid cell ID, so they are pinned here. What the reader
+is *shown* is a third answer, since a coordinate names a point but the data describes the
+cell that contains it — including which color shows it, which has to be the one the map
+drew the same grid cell with.
 
 The stacked bars have their own file, `test_stacked_bar.py`.
 """
@@ -16,14 +16,19 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 from shapely.geometry import box
 
+from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.visualizations.base import (
     DatasetVisualization,
-    geography_tokens,
-    is_geography_ids,
+    analysis_chain,
+    grid_cell_tokens,
+    is_grid_cell_ids,
 )
 from cpra.mp.data.visualizations.colors import MAP_SELECTION, MAP_SELECTION_OVERFLOW
+from cpra.mp.data.visualizations.map import Map
+from cpra.mp.data.visualizations.sediment_dynamics import SedimentDynamics
+from cpra.mp.data.visualizations.species_stacked_bar import SpeciesStackedBar
+from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
-
 from tests.factories import write_grid_geometry
 
 ANNUAL_VECTOR = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual")
@@ -55,185 +60,185 @@ def ecoregion_geometry(geometry_path):
     )
 
 
-def _geography(*coords):
-    """Flatten coordinate pairs into a `geography` query value."""
+def _grid_cell(*coords):
+    """Flatten coordinate pairs into a `grid_cell` query value."""
     return ",".join([str(c) for pair in coords for c in pair])
 
 
-class TestGeographyTokens:
+class TestGridCellTokens:
     def test_splits_a_comma_separated_string(self):
-        assert geography_tokens("1,2,3") == ["1", "2", "3"]
+        assert grid_cell_tokens("1,2,3") == ["1", "2", "3"]
 
     def test_strips_surrounding_whitespace(self):
         """unpack_values strips too, so the API's own ID/coordinate check sees the same
         tokens this one does."""
-        assert geography_tokens(" 1 , 2 ") == ["1", "2"]
+        assert grid_cell_tokens(" 1 , 2 ") == ["1", "2"]
 
     def test_accepts_a_sequence(self):
         """Notebook callers pass a list rather than a query-string fragment."""
-        assert geography_tokens([1, 2]) == ["1", "2"]
+        assert grid_cell_tokens([1, 2]) == ["1", "2"]
 
 
-class TestIsGeographyIds:
+class TestIsGridCellIds:
     def test_digit_tokens_are_ids(self):
-        assert is_geography_ids("1,2") is True
+        assert is_grid_cell_ids("1,2") is True
 
     def test_a_decimal_point_makes_it_coordinates(self):
-        assert is_geography_ids("29.5,91.0") is False
+        assert is_grid_cell_ids("29.5,91.0") is False
 
     def test_a_sign_makes_it_coordinates(self):
         """A negative longitude has no decimal point but is still not an ID."""
-        assert is_geography_ids("-91,29") is False
+        assert is_grid_cell_ids("-91,29") is False
 
-    def test_an_absent_geography_is_ids(self):
+    def test_an_absent_grid_cell_is_ids(self):
         """No filter means the whole grid, which is keyed by ID."""
-        assert is_geography_ids(None) is True
+        assert is_grid_cell_ids(None) is True
 
 
-class TestGeographies:
-    """`geographies` has to equal what the API puts in its own `geography` column, since
+class TestGridCells:
+    """`grid_cells` has to equal what the API puts in its own `grid_cell` column, since
     scale domains and lookup keys are matched against it."""
 
     def test_vector_ids_stay_integers(self):
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
-        assert viz.geographies == [1, 2]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell="1,2")
+        assert viz.grid_cells == [1, 2]
 
     def test_vector_coordinates_resolve_to_cell_ids(self, ecoregion_geometry):
-        """The data endpoint reports a vector geography by ID however it was selected, so a
+        """The data endpoint reports a vector grid cell by ID however it was selected, so a
         coordinate has to be resolved here to know what to match against."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, IN_CELL_8))
-        assert viz.geographies == [7, 8]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, IN_CELL_8))
+        assert viz.grid_cells == [7, 8]
 
     def test_coordinates_outside_the_grid_are_dropped(self, ecoregion_geometry):
         """The API omits them from the data, so keeping them here would leave a legend entry
         and a tooltip slot with nothing behind them."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE))
-        assert viz.geographies == [7]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE))
+        assert viz.grid_cells == [7]
 
     def test_coordinates_in_one_cell_collapse(self, ecoregion_geometry):
         """The response carries one series for the cell, so a second entry would be a key
         the data never matches."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geographies == [7]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE))
+        assert viz.grid_cells == [7]
 
     def test_raster_coordinates_become_pair_labels(self):
-        """A raster grid has no IDs, so its geography stays the coordinate it was given."""
-        viz = DatasetVisualization(**ANNUAL_RASTER, geography="-91.5,29.5")
-        assert viz.geographies == ["-91.5,29.5"]
+        """A raster grid has no IDs, so its grid cell stays the coordinate it was given."""
+        viz = DatasetVisualization(**ANNUAL_RASTER, grid_cell="-91.5,29.5")
+        assert viz.grid_cells == ["-91.5,29.5"]
 
     def test_raster_coordinates_are_normalized_through_float(self):
         """The API labels with str(float(token)), so `91` comes back as `91.0`."""
-        viz = DatasetVisualization(**ANNUAL_RASTER, geography="91,29")
-        assert viz.geographies == ["91.0,29.0"]
+        viz = DatasetVisualization(**ANNUAL_RASTER, grid_cell="91,29")
+        assert viz.grid_cells == ["91.0,29.0"]
 
 
-class TestGeographyLabels:
+class TestGridCellLabels:
     """What the reader sees where there's room for it — the legend. A coordinate identifies
     the point asked about, but the values belong to the whole grid cell containing it, so
     both are shown."""
 
     def test_vector_ids_are_shown_bare(self):
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
-        assert viz.geography_labels == ["1", "2"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell="1,2")
+        assert viz.grid_cell_labels == ["1", "2"]
 
     def test_vector_coordinates_are_shown_with_the_resolved_cell(self, ecoregion_geometry):
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE))
-        assert viz.geography_labels == ["7 (-91.5, 29.5)"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE))
+        assert viz.grid_cell_labels == ["7 (-91.5, 29.5)"]
 
     def test_a_shared_cell_is_labeled_with_the_first_coordinate(self, ecoregion_geometry):
         """The two coordinates are one series in the data, so they're one legend entry, and
         the first of them is what names it."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geography_labels == ["7 (-91.5, 29.5)"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE))
+        assert viz.grid_cell_labels == ["7 (-91.5, 29.5)"]
 
     def test_raster_coordinates_are_shown_parenthesized(self):
         """A raster pixel has no ID to report, so the coordinate stands alone."""
-        viz = DatasetVisualization(**ANNUAL_RASTER, geography="-91.5,29.5")
-        assert viz.geography_labels == ["(-91.5, 29.5)"]
+        viz = DatasetVisualization(**ANNUAL_RASTER, grid_cell="-91.5,29.5")
+        assert viz.grid_cell_labels == ["(-91.5, 29.5)"]
 
-    def test_labels_stay_aligned_with_geographies(self, ecoregion_geometry):
+    def test_labels_stay_aligned_with_grid_cells(self, ecoregion_geometry):
         """The chart zips them together by position, so dropping and collapsing have to
         happen to all three lists at once."""
         viz = DatasetVisualization(
-            **ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
+            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
         )
         assert (
-            len(viz.geography_labels) == len(viz.geography_short_labels) == len(viz.geographies) == 2
+            len(viz.grid_cell_labels) == len(viz.grid_cell_short_labels) == len(viz.grid_cells) == 2
         )
 
 
-class TestGeographyShortLabels:
+class TestGridCellShortLabels:
     """What goes where a full label would crowd out the numbers — a tooltip row."""
 
     def test_vector_ids_are_unchanged(self):
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
-        assert viz.geography_short_labels == ["1", "2"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell="1,2")
+        assert viz.grid_cell_short_labels == ["1", "2"]
 
     def test_a_resolved_cell_drops_the_coordinate(self, ecoregion_geometry):
         """The ID is what the values describe; the legend still carries the coordinate that
         selected it."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE))
-        assert viz.geography_short_labels == ["7"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE))
+        assert viz.grid_cell_short_labels == ["7"]
 
     def test_a_shared_cell_appears_once(self, ecoregion_geometry):
         """One series in the data, so one tooltip row."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geography_short_labels == ["7"]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE))
+        assert viz.grid_cell_short_labels == ["7"]
 
     def test_raster_coordinates_are_kept(self):
         """There's no ID to fall back on, so dropping the coordinate would leave nothing."""
-        viz = DatasetVisualization(**ANNUAL_RASTER, geography="-91.5,29.5")
-        assert viz.geography_short_labels == ["(-91.5, 29.5)"]
+        viz = DatasetVisualization(**ANNUAL_RASTER, grid_cell="-91.5,29.5")
+        assert viz.grid_cell_short_labels == ["(-91.5, 29.5)"]
 
 
-class TestGeographyColors:
-    """The chart is read beside the map, so a geography has to be the same color in both.
+class TestGridCellColors:
+    """The chart is read beside the map, so a grid cell has to be the same color in both.
 
     The map colors a pin by its place in the selection and gives a cell the color of the
-    first pin inside it, while these lists hold only the geographies the data carries — so
+    first pin inside it, while these lists hold only the grid cells the data carries — so
     a color has to follow the selection, not the list it ends up in.
     """
 
     def test_ids_take_the_palette_in_order(self):
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography="1,2")
-        assert viz.geography_colors == MAP_SELECTION[:2]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell="1,2")
+        assert viz.grid_cell_colors == MAP_SELECTION[:2]
 
     def test_raster_coordinates_take_the_palette_in_order(self):
-        viz = DatasetVisualization(**ANNUAL_RASTER, geography=_geography(INSIDE, IN_CELL_8))
-        assert viz.geography_colors == MAP_SELECTION[:2]
+        viz = DatasetVisualization(**ANNUAL_RASTER, grid_cell=_grid_cell(INSIDE, IN_CELL_8))
+        assert viz.grid_cell_colors == MAP_SELECTION[:2]
 
     def test_a_shared_cell_keeps_the_first_coordinates_color(self, ecoregion_geometry):
         """Both pins are drawn, but the cell's outline — and its one series — is the first
         pin's color."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE))
-        assert viz.geography_colors == [MAP_SELECTION[0]]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE))
+        assert viz.grid_cell_colors == [MAP_SELECTION[0]]
 
     def test_a_pin_sharing_a_cell_does_not_shift_the_next_cell(self, ecoregion_geometry):
         """The bug this guards: cell 8 is the third pin, so it's the third color, even though
         it's the second series. Pairing the palette with the series would make it cyan."""
         viz = DatasetVisualization(
-            **ANNUAL_VECTOR, geography=_geography(INSIDE, ALSO_INSIDE, IN_CELL_8)
+            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE, IN_CELL_8)
         )
-        assert viz.geographies == [7, 8]
-        assert viz.geography_colors == [MAP_SELECTION[0], MAP_SELECTION[2]]
+        assert viz.grid_cells == [7, 8]
+        assert viz.grid_cell_colors == [MAP_SELECTION[0], MAP_SELECTION[2]]
 
     def test_a_coordinate_outside_the_grid_does_not_shift_the_next_cell(self, ecoregion_geometry):
         """It has no series and no cell outline, but it did take a pin color with it."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=_geography(OUTSIDE, IN_CELL_8))
-        assert viz.geographies == [8]
-        assert viz.geography_colors == [MAP_SELECTION[1]]
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(OUTSIDE, IN_CELL_8))
+        assert viz.grid_cells == [8]
+        assert viz.grid_cell_colors == [MAP_SELECTION[1]]
 
-    def test_colors_stay_aligned_with_geographies(self, ecoregion_geometry):
+    def test_colors_stay_aligned_with_grid_cells(self, ecoregion_geometry):
         viz = DatasetVisualization(
-            **ANNUAL_VECTOR, geography=_geography(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
+            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
         )
-        assert len(viz.geography_colors) == len(viz.geographies) == 2
+        assert len(viz.grid_cell_colors) == len(viz.grid_cells) == 2
 
     def test_a_selection_past_the_palette_is_drawn_black(self):
         """As the UI draws it: the palette holds as many colors as a visualization allows
-        geographies, so past its end there is nothing left to tell them apart with."""
-        viz = DatasetVisualization(**ANNUAL_VECTOR, geography=",".join(str(i) for i in range(12)))
-        assert viz.geography_colors[10:] == [MAP_SELECTION_OVERFLOW] * 2
+        grid cells, so past its end there is nothing left to tell them apart with."""
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=",".join(str(i) for i in range(12)))
+        assert viz.grid_cell_colors[10:] == [MAP_SELECTION_OVERFLOW] * 2
 
 
 class TestTimeSeriesLineColorScale:
@@ -245,14 +250,14 @@ class TestTimeSeriesLineColorScale:
         return spec["layer"][0]["encoding"]["color"]["scale"]
 
     def test_the_range_is_the_selections_colors(self, ecoregion_geometry):
-        scale = self._color_scale(geography=_geography(INSIDE, ALSO_INSIDE, IN_CELL_8))
+        scale = self._color_scale(grid_cell=_grid_cell(INSIDE, ALSO_INSIDE, IN_CELL_8))
         assert scale["domain"] == ["7 (-91.5, 29.5)", "8 (-91.3, 29.5)"]
         assert scale["range"] == [MAP_SELECTION[0], MAP_SELECTION[2]]
 
     def test_the_whole_palette_is_not_handed_over(self):
         """A range longer than the domain leaves Vega assigning colors to nothing, and hides
         whether the two ever lined up."""
-        scale = self._color_scale(geography="1,2")
+        scale = self._color_scale(grid_cell="1,2")
         assert len(scale["range"]) == len(scale["domain"]) == 2
 
 
@@ -269,16 +274,184 @@ class TestDataSourceParse:
         return source.to_dict()["format"]["parse"]
 
     def test_vector_ids_are_parsed_as_numbers(self, viz):
-        assert self._parse(viz, geography="1,2")["geography"] == "number"
+        assert self._parse(viz, grid_cell="1,2")["grid_cell"] == "number"
 
     def test_vector_coordinates_are_parsed_as_numbers_too(self, viz):
         """They come back as the cell IDs they resolved to."""
-        assert self._parse(viz, geography="-91.5,29.5")["geography"] == "number"
+        assert self._parse(viz, grid_cell="-91.5,29.5")["grid_cell"] == "number"
 
     def test_an_unfiltered_vector_grid_is_parsed_as_numbers(self, viz):
-        assert self._parse(viz)["geography"] == "number"
+        assert self._parse(viz)["grid_cell"] == "number"
 
-    def test_raster_geography_is_left_as_strings(self):
+    def test_raster_grid_cell_is_left_as_strings(self):
         viz = DatasetVisualization(**ANNUAL_RASTER)
-        source = viz.get_data_source(**ANNUAL_RASTER, geography="-91.5,29.5")
-        assert "geography" not in source.to_dict()["format"]["parse"]
+        source = viz.get_data_source(**ANNUAL_RASTER, grid_cell="-91.5,29.5")
+        assert "grid_cell" not in source.to_dict()["format"]["parse"]
+
+
+class TestAnalysisChain:
+    """`analysis_chain(implied, chain)` — how a chart's own analysis composes with the
+    caller's.
+
+    The implied one always leads: it is what produces the shape every layer of the chart
+    reads, and an analysis appended before it would be operating on a frame the chart's
+    source does not have yet.
+    """
+
+    def test_no_caller_chain_is_just_the_implied_one(self):
+        assert analysis_chain("sediment_dynamics", None) == "sediment_dynamics"
+
+    def test_an_empty_caller_chain_is_too(self):
+        """`""` is what an `analysis=` the caller sent with no value arrives as, and an
+        empty name in a chain is a 400 two layers down."""
+        assert analysis_chain("sediment_dynamics", "") == "sediment_dynamics"
+
+    def test_a_callers_chain_is_kept_after_it(self):
+        assert analysis_chain("sediment_dynamics", "diff") == "sediment_dynamics,diff"
+
+    def test_the_implied_one_is_not_repeated(self):
+        """A caller who names it explicitly -- an old permalink, a notebook copying a URL
+        out of a spec -- gets one of it, not two. Chaining an analysis onto itself is a
+        different request, and not the one they asked for."""
+        assert analysis_chain("sediment_dynamics", "sediment_dynamics,diff") == (
+            "sediment_dynamics,diff"
+        )
+
+
+class TestRequestItems:
+    """`DatasetVisualization.request_items(items)` — the same rule applied to the raw query
+    pairs, which is what the spec route decodes.
+
+    Stated as a classmethod because the route decodes BEFORE it constructs: there is no
+    instance to ask yet when the analysis has to be known.
+    """
+
+    def test_a_chart_with_no_implied_analysis_passes_its_items_through(self):
+        items = [("variable", "ssf"), ("analysis", "diff")]
+        assert DatasetVisualization.request_items(items) == items
+
+    def test_the_implied_analysis_is_added(self):
+        assert SedimentDynamics.request_items([("variable", "elev")]) == [
+            ("variable", "elev"),
+            ("analysis", "sediment_dynamics"),
+        ]
+
+    def test_a_callers_analysis_is_chained_onto_it(self):
+        assert SedimentDynamics.request_items([("analysis", "diff")]) == [
+            ("analysis", "sediment_dynamics,diff")
+        ]
+
+    def test_repeated_analysis_parameters_are_one_chain(self):
+        """`analysis=a&analysis=b` and `analysis=a,b` are the same request -- the decoder
+        joins repeats the same way (`request.unified.partition_query`), and this runs before
+        it."""
+        assert SedimentDynamics.request_items(
+            [("analysis", "diff"), ("analysis", "lnd_chng")]
+        ) == [("analysis", "sediment_dynamics,diff,lnd_chng")]
+
+
+class TestTimeAxisGate:
+    """`DatasetVisualization.validate_time_axis` — a chart that plots time against an
+    analysis whose output has no time column left.
+
+    `diff` over `calendar_year` is the shipped case, and the rule is keyed on the RESOLVED
+    analysis rather than on a name because that is the only way to see it: the same `diff`
+    over `model_group_id` keeps its years, so the collapse is chosen per request. Nothing
+    failed before this check. `get_data_uri` already drops a collapsed dimension from
+    `select`, so the request succeeded and the chart came back 200 with a time transform
+    reading a field the response did not carry.
+    """
+
+    COLLAPSES_TIME = dict(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2050, 2060])
+    KEEPS_TIME = dict(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[705, 706])
+
+    def test_a_time_series_line_rejects_a_collapsed_time_column(self):
+        viz = TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
+        with pytest.raises(RequestError, match="collapses calendar_year"):
+            viz.validate_time_axis()
+
+    def test_a_stacked_bar_rejects_it_too(self):
+        """Every chart plots time, so the rejection is not `TimeSeriesLine`'s alone."""
+        viz = StackedBar(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
+        with pytest.raises(RequestError, match="collapses calendar_year"):
+            viz.validate_time_axis()
+
+    def test_the_map_accepts_it(self):
+        """`Meta.time_axis = False`: a map draws one instant, so a result with no time column
+        is exactly what it wants. This is the visualization the error text sends readers to,
+        which makes it the one that has to work."""
+        Map(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).validate_time_axis()
+
+    def test_an_analysis_that_keeps_the_time_column_is_fine(self):
+        """The gate is about the time column specifically -- a `diff` over `model_group_id`
+        collapses a dimension too, and still has a year per row to plot against."""
+        TimeSeriesLine(**ANNUAL_VECTOR, **self.KEEPS_TIME).validate_time_axis()
+
+    def test_no_analysis_is_fine(self):
+        TimeSeriesLine(**ANNUAL_VECTOR).validate_time_axis()
+
+    def test_the_spec_is_what_applies_it(self):
+        """Checked in `spec` rather than in each `chart()`, so a notebook caller reaches it
+        the same way the route does."""
+        with pytest.raises(RequestError, match="Use the map visualization"):
+            TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).spec
+
+    def test_lnd_chng_keeps_its_time_column(self):
+        """The reported case, and it is no longer a rejection.
+
+        `lnd_chng` compares each selected year against a derived baseline year and returns
+        one row per comparison year, so a chart over it has a series to draw. It used to
+        fold `calendar_year` away and the gate had to catch it BEFORE the decode, because
+        resolving raised for the comparison year the portal's chart URL never sent -- the
+        caller was told to supply a year for a chart that could not have drawn the result
+        with one. Both halves of that are gone: no year is every year, and every year is a
+        row.
+        """
+        viz = TimeSeriesLine(**ANNUAL_VECTOR, analysis="lnd_chng", model_group_id=705)
+        viz.validate_time_axis()
+        assert viz.collapsed_time_column is None
+
+    def test_a_collapse_of_another_dimension_is_not_it(self):
+        """`lnd_conf` folds `scenario_id`, which is not the time column -- the gate has to
+        stay specific to the axis the chart actually plots."""
+        assert TimeSeriesLine(**ANNUAL_VECTOR, analysis="lnd_conf").collapsed_time_column is None
+
+
+class TestSpeciesStackedBarNeedsItsVariable:
+    """`SpeciesStackedBar.validate` — the chart is a breakdown of one variable's species,
+    and every property on it dereferenced the presentation variable without checking there
+    was one. An analysis that fixes its own inputs has none (`lnd_type_plus` folds three
+    variables into one categorical result), which made an ordinary bad request a 500.
+    """
+
+    def test_an_input_fixing_analysis_is_rejected(self):
+        viz = SpeciesStackedBar(analysis="lnd_type_plus", grid_cell="-92.2,29.7")
+        with pytest.raises(RequestError, match="no single variable"):
+            viz.validate()
+
+    def test_another_variable_is_rejected(self):
+        """`veg_species_code` is not a column of an `ssf` result either -- that failed as an
+        "unable to find column" on the chart's own data URL rather than as a 500, which is
+        the same request being wrong in a less visible way."""
+        viz = SpeciesStackedBar(**ANNUAL_VECTOR)
+        with pytest.raises(RequestError, match="'ssf'"):
+            viz.validate()
+
+    def test_its_own_variable_is_accepted(self):
+        SpeciesStackedBar(
+            variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual"
+        ).validate()
+
+
+class TestMapBaseStyle:
+    """The style's font and sprite URLs, in the shape Martin serves them. MapLibre fills in
+    `{fontstack}` and `{range}` (`0-255`) and appends `.json`/`.png` to the sprite itself,
+    so neither URL carries an extension."""
+
+    def test_glyphs_use_martins_font_route(self):
+        style = Map(**ANNUAL_VECTOR).get_base_style()
+        assert style["glyphs"] == "https://api.mpdp.coastal.la.gov/tiles/font/{fontstack}/{range}"
+
+    def test_the_sprite_is_named(self):
+        style = Map(**ANNUAL_VECTOR).get_base_style()
+        assert style["sprite"] == "https://api.mpdp.coastal.la.gov/tiles/sprite/basemap_mp2023"

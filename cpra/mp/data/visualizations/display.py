@@ -2,18 +2,15 @@
 
 A variable's values are stored in whatever unit the model writes and the raster/Parquet
 layer keeps (``Variable.unit``), which is not always the unit a chart or legend should
-label them with.
+label them with.  ``elev`` is the case that drives this: it is stored as Int32
+millimeters -- so that ZSTD's predictor has integers to delta-encode -- but is read in
+meters, the unit every legend label and axis title has always used.
 
 ``Variable.display_scale_factor`` is the **divisor** taking a stored value to a displayed
-one (``1000`` for a variable stored in millimeters but shown in meters), and
-``display_unit`` / ``display_number_format`` are the label and d3 format string that go
-with the result.  All three are optional: a variable stored in the unit it is shown in
-leaves them empty, and every helper here is then the identity.
-
-No variable on this branch sets ``display_scale_factor``, so the conversion is inert
-today; the columns exist so a variable *can* be stored in a finer unit than it is read in
-(``elev`` in Int32 millimeters, on the long-format branch), and this module is where that
-becomes visible when one does.
+one (``1000`` for millimeters shown as meters), and ``display_unit`` /
+``display_number_format`` are the label and d3 format string that go with the result.  All
+three are optional: a variable stored in the unit it is shown in leaves them empty, and
+every helper here is then the identity.
 
 This module is the only place the conversion is applied.  Everything upstream -- the data
 API, the raster color maps, ``legends.csv``'s break points, ``difference_legend_limit`` --
@@ -23,8 +20,15 @@ scale factor sprinkled through the read path.
 
 
 def display_unit(variable):
-    """The unit to label ``variable``'s displayed values with."""
+    """The unit to label ``variable``'s displayed values with.
 
+    ``variable`` may be ``None`` -- an output that carries no single presentation variable
+    (``output_descriptor(...).variable`` for an analysis that folds several, e.g.
+    ``lnd_type_plus``), for which there is no unit to show and the caller shows none.
+    """
+
+    if variable is None:
+        return None
     return variable.display_unit or variable.unit
 
 
@@ -32,9 +36,12 @@ def display_number_format(variable):
     """``variable``'s d3 format string for displayed values, as Vega-Lite wants it.
 
     Returns ``""`` rather than ``None`` when unset -- an Altair ``format=`` of ``None``
-    serializes into the spec as an explicit null, which Vega-Lite rejects.
+    serializes into the spec as an explicit null, which Vega-Lite rejects.  A ``None``
+    ``variable`` is that same "unset" case; see ``display_unit``.
     """
 
+    if variable is None:
+        return ""
     return variable.display_number_format or ""
 
 
@@ -43,10 +50,12 @@ def to_display(variable, value):
 
     For scaling numbers that are already in hand server-side (a legend's break points, a
     difference limit); use ``display_value_expr`` for values a chart only sees in the
-    browser.  ``None`` passes through, since a missing bound stays missing.
+    browser.  ``None`` passes through, since a missing bound stays missing -- and a ``None``
+    ``variable`` is the identity, matching ``display_value_expr``'s own ``not variable``
+    guard below.
     """
 
-    if value is None or not variable.display_scale_factor:
+    if variable is None or value is None or not variable.display_scale_factor:
         return value
     return value / variable.display_scale_factor
 

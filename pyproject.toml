@@ -64,7 +64,10 @@ jupyter = [
     "jupyterlab>=4.5.7",
     "maplibre[all]"
 ]
-scripts = ["affine", "fastexcel", "playwright", "tippecanoe"]
+# `pyproj` moved to the core dependencies with the crosswalk generators -- they are package
+# code now (see cpra.mp.data.crosswalks), not scripts. `tqdm` stays: the migration and
+# video-frame scripts still use it.
+scripts = ["affine", "fastexcel", "playwright", "tippecanoe", "tqdm"]
 
 [dependency-groups]
 dev = [
@@ -74,12 +77,23 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "sqlmodel",
+    # Also in the `scripts` extra, which is what actually needs it at runtime. It is here
+    # too because tests/test_migrate_to_long_format.py execs
+    # scripts/migrate_to_long_format.py, which imports it at module scope -- so without it
+    # the suite cannot even be collected under the `--extra api --group dev` set CI syncs.
+    "tqdm",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95"
+addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95 -m 'not memory'"
+# Deselected by default via `addopts` above; run with `pytest -m memory` (or `-m ''` for
+# everything). A `memory` test measures a subprocess's peak RSS, so its result depends on
+# the machine, the allocator, and what else is running -- real signal, but not something a
+# build should gate on. Deselecting costs no coverage: the measurement happens in a child
+# process, so these tests contribute none to begin with.
+markers = ["memory: measures peak RSS in a subprocess; environment-dependent, opt-in"]
 # Fail on deprecations this package is responsible for, so they get fixed rather than
 # accumulating. Deliberately narrow: a blanket "error" would break the build on unrelated
 # deprecations from rasterio/GDAL, Polars, or Starlette on any dependency bump.
@@ -106,6 +120,9 @@ omit = [
     "cpra/mp/data/api/__main__.py",
     "cpra/mp/data/cli/__main__.py",
 ]
+
+[tool.ruff]
+line-length = 120
 
 [tool.basedpyright]
 reportAny = false

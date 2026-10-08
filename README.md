@@ -10,7 +10,9 @@ See the [data structure documentation](docs/index.md) for details about variable
 
 Several APIs that depend on the Python library are implemented in the `cpra.mp.data.api` submodule:
 
-* [Data and Analysis API](docs/data-analysis-api.md)
+* [Data API](docs/data-api.md)
+* [Analysis API](docs/analysis-api.md)
+* [Named Analyses (Registry) API](docs/analyses-api.md)
 
 ## Writing Data
 
@@ -133,3 +135,168 @@ cog_df = read_data(
 with rio.open(vrt(cog_df["path"])) as multiband:
     print(multiband.profile)
 ```
+
+## Analyzing Data
+
+Two functions cover everything beyond a raw, single-dataset read:
+
+* `read_data` selects and narrows one dataset's stored values — the library form of the
+  [Data API](docs/data-api.md).
+* `analyze_data` runs a pipeline — filtering, calculating, aggregating, projecting onto a
+  different grid, spatially joining across datasets — the library form of the
+  [Analysis API](docs/analysis-api.md).
+
+Neither makes an HTTP request; both read Parquet/COG files directly.
+
+### `read_data`
+
+```python
+def read_data(*, variable, time_unit, grid, base_path=None, **selection)
+```
+
+`variable`, `time_unit`, and `grid` select the dataset. Every other keyword goes into
+`**selection`: a dimension filter (a scalar or a list of values, e.g. `scenario_id=7` or
+`scenario_id=[7, 8]`), or one of the reserved selection keys `grid_cell`, `where`, `sort`,
+`select` — the same parameters and semantics documented for the
+[Data API](docs/data-api.md#filter)'s query string. `read_data` only ever selects and
+narrows a single dataset; it never transforms, aggregates, or joins.
+
+### `analyze_data`
+
+```python
+async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False)
+```
+
+`pipeline` is required, and is a `dict`/JSON document in exactly the shape the
+[Analysis API](docs/analysis-api.md#request-shape) accepts (`inputs`/`steps`/`output`).
+There is no separate flat-keyword-argument form — every transformation, including a
+single-dataset filter/calculate/group, is expressed as a (possibly one-input) pipeline.
+`analyze_data` is `async`; in a notebook, just `await` it, or wrap the call with
+`asyncio.run` in a plain script.
+
+An entry under `inputs` names a dataset — the `variable`/`time_unit`/`grid` triple — and
+nothing else. Every narrowing, whether by dimension, by value, or by cell, is a `filter`
+step, so a pipeline always opens with a step that names its input explicitly — including
+a `group`, if collapsing the dataset is the only thing you want.
+
+The return value depends on the pipeline's own `output.format`:
+
+* **Tabular** output (`csv`/`ndjson`/`parquet`) returns a Polars `DataFrame` — or a
+  `LazyFrame` if `lazy=True`.
+* **Raster** output (`tif`/tile formats) requires `output_path=` (there is no in-memory
+  raster return) and returns the written file's `pathlib.Path`.
+
+```python
+from cpra.mp.data import analyze_data
+
+# Count the days each hydro compartment's salinity exceeded 5.5 in one scenario.
+df = await analyze_data({
+    "inputs": {
+        "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}
+    },
+    "steps": [
+        {"op": "filter", "input": "sal",
+         "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = 'mean'"},
+        {"op": "filter", "where": "value > 5.5"},
+        {"op": "group", "by": [], "aggregate": "count"},
+    ],
+    "output": {"format": "csv"},
+})
+# → one row per grid_cell (an empty group.by collapses every day into one count).
+```
+
+### Raster Analyses
+
+A raster dataset's frame is a stack of bands, not a table, so a pipeline over one either
+keeps that shape all the way to a GeoTIFF or turns it into a table on the way — with a
+`project` onto a vector grid, or with a `filter` on `grid_cell`. Asking for a tabular
+format from a pipeline that does neither is rejected up front, as is asking for `tif` from
+one whose result is a table.
+
+Projecting raster pixels onto a vector zone returns a table; surviving dimensions become
+columns, so there is no band bookkeeping:
+
+```python
+# Mean elevation per hydro compartment, per year, averaged across two scenarios.
+df = await analyze_data({
+    "inputs": {
+        "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
+    },
+    "steps": [
+        {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
+        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
+        {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+    ],
+    "output": {"format": "csv"},
+})
+# columns: grid_cell, calendar_year, value — one row per (compartment, year)
+```
+
+A pipeline that stays on the raster grid has no sensible tabular form, so it requires
+`output_path` and writes a GeoTIFF instead, returning the path. Each band in the written
+file carries a description naming the dimension values it resolved from, so band order is
+not the only record of which band is which:
+
+```python
+path = await analyze_data(
+    {
+        "inputs": {
+            "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
+        },
+        "steps": [
+            {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
+            {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+        ],
+        "output": {"format": "tif"},
+    },
+    output_path="mean_elev_by_year.tif",
+)
+```
+
+### Multi-Dataset Pipelines
+
+For analyses spanning several datasets — projecting one grid onto another, spatially
+joining, filtering across both — the pipeline names more than one entry under `inputs`.
+The pipeline document is identical to the one the API's `/v1/analysis` endpoints accept
+(see the [Analysis API documentation](docs/analysis-api.md#request-shape) for the full
+request shape and operations):
+
+```python
+# Earliest year each vegetation pixel has marsh coverage > 0.5 AND salinity > 5.5.
+path = await analyze_data(
+    {
+        "inputs": {
+            "coverage": {
+                "variable": "ffibs_coverage_ratio", "time_unit": "annual",
+                "grid": "veg_grid_cell_v001",
+            },
+            "salinity": {
+                "variable": "sal", "time_unit": "annual",
+                "grid": "hydro_compartment_v001",
+            },
+        },
+        "steps": [
+            {"op": "filter", "input": "coverage", "as": "marsh",
+             "where": "model_group_id = 500 AND scenario_id = 7 AND ffibs_type = 'pl_fm'"},
+            {"op": "filter", "input": "salinity", "as": "selected_salinity",
+             "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = '2_wk_max'"},
+            {"op": "project", "input": "selected_salinity", "to": "veg_grid_cell_v001", "as": "sal"},
+            {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
+            {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},
+            {"op": "group", "by": [], "aggregate": "min", "of": "calendar_year"},
+        ],
+        "output": {"format": "tif"},
+    },
+    output_path="first_exceedance_year.tif",
+)
+```
+
+A `join` leaves one value column per operand, named after the operand — which is why the
+`filter` above spells the two conditions `marsh` and `sal` rather than `value`. Exactly
+one measured quantity may reach the output, so that pairing has to be collapsed before the
+sink; the value `filter` here is what does it.
+
+A small set of pre-built pipelines — a difference between two scenarios, a land-type
+concatenation, this same earliest-exceedance-year query — is also available by name with
+no hand-authored pipeline document at all; see the
+[named-analysis registry documentation](docs/analyses-api.md).

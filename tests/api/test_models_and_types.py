@@ -3,17 +3,7 @@
 from datetime import date
 from enum import Enum
 
-import pytest
-
-from cpra.mp.data.api.models import (
-    Compression,
-    DataQuery,
-    DatasetDimensions,
-    FilterDimensions,
-    Options,
-    TileQuery,
-)
-from cpra.mp.data.api.types import (
+from cpra.mp.data.analysis.request.types import (
     AggregateFunction,
     CompressionAlgorithm,
     DataFormat,
@@ -21,6 +11,13 @@ from cpra.mp.data.api.types import (
     TileFormat,
     VectorGrid,
     dimension_type,
+)
+from cpra.mp.data.api.models import (
+    Compression,
+    DataOptions,
+    DataQuery,
+    DatasetDimensions,
+    FilterDimensions,
 )
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.grids import GRIDS
@@ -58,13 +55,22 @@ class TestEnums:
         assert {member.value for member in VectorGrid} == expected
 
     def test_aggregate_functions(self):
-        assert {m.value for m in AggregateFunction} == {"max", "mean", "min", "sum"}
+        # Membership here is the enum's whole job: it is the closed vocabulary a
+        # `project`/`group` step may NAME, not a statement that every member is legal in
+        # every step. `count_by_value` is the case that makes the distinction visible --
+        # a member of this enum, accepted by `project`, and rejected by `group`, because
+        # it collapses to one row per (group, distinct value) and only `project` has
+        # somewhere to put the extra rows. That rejection lives in
+        # `request/aggregates.py::validate_group_aggregate`, not in this set.
+        assert {m.value for m in AggregateFunction} == {
+            "count", "count_by_value", "max", "mean", "min", "sum"
+        }
 
     def test_output_types(self):
         assert {m.value for m in OutputType} == {"raster", "vector"}
 
     def test_tile_formats(self):
-        assert {m.value for m in TileFormat} == {"jpg", "png"}
+        assert {m.value for m in TileFormat} == {"jpg", "pbf", "png"}
 
     def test_tif_is_a_data_format(self):
         assert DataFormat.tif in DataFormat
@@ -107,51 +113,55 @@ class TestFilterDimensions:
         assert set(FilterDimensions.model_fields) == expected
 
 
-class TestOptions:
+class TestDataOptions:
+    """`DataOptions` is the WHOLE options vocabulary a flat request has. The five fields
+    below are it -- every parameter that used to describe how a request TRANSFORMED its
+    data (`group_by`/`group_aggregate`/`summarize_*`/`calculate`) is a pipeline step now,
+    and the `Options` superset that carried them has been deleted rather than kept as a
+    shape nothing reads. `TestRetiredParams` in `test_endpoints_data.py` pins the 400s
+    those names get; this pins that nothing here quietly grew one back.
+    """
+
     def test_defaults(self):
-        options = Options()
-        assert options.unpivot is False
-        assert options.geography is None
-        assert options.group_aggregate is None
+        options = DataOptions()
+        assert options.grid_cell is None
+        assert options.where is None
 
-    def test_aggregate_enum_is_unwrapped(self):
-        assert Options(group_aggregate="sum").group_aggregate == "sum"
-
-    def test_summarize_by_accepts_a_vector_grid(self):
-        assert Options(summarize_by="hydro_compartment_v001").summarize_by == "hydro_compartment_v001"
-
-    def test_summarize_by_rejects_a_raster_grid(self):
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError):
-            Options(summarize_by="morph_pixel_v001")
+    def test_the_field_set_is_exactly_the_five_data_access_options(self):
+        assert set(DataOptions.model_fields) == {"grid_cell", "where", "sort", "select", "color_map"}
 
 
-class TestQuerySplitting:
-    """TileQuery and DataQuery arrive flat from the query string and are split apart."""
+class TestDataQuery:
+    """`DataQuery` is one flat model now, not a pair of halves waiting to be split.
 
-    def test_tile_query_splits_filters_from_options(self):
-        query = TileQuery(model_group_id=[500], unpivot=True, group_aggregate="sum")
-        assert query.filter_dimensions.model_group_id == [500]
-        assert query.options.unpivot is True
-        assert query.options.group_aggregate == "sum"
+    The `filter_dimensions`/`options`/`compression` splitter properties are gone with
+    `api.data_query.build_data_query`, their only caller, and `TileQuery` is gone with the
+    split tile routes that named it -- `partition_query(allow_compression=False)` rejects a
+    compression parameter on a tile outright rather than merely declining to bind it. What
+    the model is still for is binding on `VisualizationQuery` and being SUBTRACTED to name
+    the render-option category, so what these pin is the field set, not a round trip.
+    """
 
-    def test_filter_dimensions_drops_option_fields(self):
-        query = TileQuery(model_group_id=[500], unpivot=True)
-        assert not hasattr(query.filter_dimensions, "unpivot")
+    def test_it_is_the_union_of_its_three_bases(self):
+        fields = set(DataQuery.model_fields)
+        assert set(DataOptions.model_fields) <= fields
+        assert set(FilterDimensions.model_fields) <= fields
+        assert set(Compression.model_fields) <= fields
 
-    def test_options_drops_filter_fields(self):
-        query = TileQuery(model_group_id=[500], unpivot=True)
-        assert not hasattr(query.options, "model_group_id")
+    def test_a_filter_and_an_option_bind_side_by_side(self):
+        query = DataQuery(model_group_id=[500], where="calendar_year > 2035", grid_cell="1,2")
+        assert query.model_group_id == [500]
+        assert query.where == "calendar_year > 2035"
+        assert query.grid_cell == "1,2"
 
-    def test_data_query_exposes_compression(self):
+    def test_compression_binds_flat(self):
         query = DataQuery(compression_algorithm="gzip", compression_level=3)
-        assert query.compression.compression_algorithm == CompressionAlgorithm.gzip
-        assert query.compression.compression_level == 3
+        assert query.compression_algorithm == CompressionAlgorithm.gzip.value
+        assert query.compression_level == 3
 
-    def test_data_query_compression_defaults(self):
-        assert DataQuery().compression.compression_algorithm == CompressionAlgorithm.zstd
-        assert DataQuery().compression.compression_level == 6
+    def test_compression_defaults_flat(self):
+        assert DataQuery().compression_algorithm == CompressionAlgorithm.zstd.value
+        assert DataQuery().compression_level == 6
 
     def test_compression_defaults(self):
         compression = Compression()
