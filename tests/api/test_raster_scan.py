@@ -535,6 +535,64 @@ class TestResolveRasterBands:
             resolve_raster_bands(bad_selection, base_path=base_path)
 
 
+class TestPathPredicate:
+    """`resolve_raster_bands`' `path_predicate`, and `compile_plan` handing it one.
+
+    A file's calendar values are only known once it is opened, but its on-path dimensions
+    are known from the glob alone -- so a request pinned to one model group must open that
+    model group's files and no others. `veg_species` (a directory per species code) made
+    the difference tens of thousands of opens per map tile.
+    """
+
+    SELECTION = TestResolveRasterBands.SELECTION
+
+    @staticmethod
+    def _two_model_groups(base_path):
+        write_raster_dataset(base_path, years=(2030, 2040), model_group_id=500)
+        write_raster_dataset(base_path, years=(2030, 2040), model_group_id=512)
+
+    def test_files_outside_the_pinned_partition_are_never_opened(self, base_path):
+        """Proved by corrupting them: if one were opened, the open would raise."""
+        self._two_model_groups(base_path)
+        for path in base_path.rglob("model_group_id=512/**/*.tif"):
+            path.write_bytes(b"not a tiff")
+
+        plan = compile_plan(
+            _pipeline(
+                {
+                    "inputs": {"a": {k: RASTER_KWARGS[k] for k in _SELECTION_FIELDS}},
+                    # The calendar conjunct cannot be applied to a path; it must be left to
+                    # the band-identity pass rather than break or widen the path predicate.
+                    "steps": [{"op": "filter", "input": "a", "where": "model_group_id = 500 AND calendar_year = 2030"}],
+                    "output": {"format": "tif"},
+                }
+            ),
+            base_path=base_path,
+        )
+
+        metadata = plan.inputs["a"].band_metadata
+        assert metadata["model_group_id"].to_list() == [500]
+        assert metadata["calendar_year"].to_list() == [2030]
+
+    def test_narrows_the_enumeration_to_matching_files(self, base_path):
+        self._two_model_groups(base_path)
+        df = resolve_raster_bands(self.SELECTION, base_path=base_path, path_predicate=pl.col("model_group_id") == 512)
+        assert df["model_group_id"].to_list() == [512, 512]
+        assert df["calendar_year"].to_list() == [2030, 2040]
+
+    def test_a_predicate_matching_no_file_keeps_one_file_rather_than_none(self, base_path):
+        """See `resolve_raster_bands`' docstring: zero bands would starve the join-sibling
+        floor (`test_execute.py`'s path-dimension floor test is the end-to-end case)."""
+        self._two_model_groups(base_path)
+        df = resolve_raster_bands(self.SELECTION, base_path=base_path, path_predicate=pl.col("model_group_id") == 999)
+        assert df["path"].n_unique() == 1
+        assert df.height > 0
+
+    def test_a_dataset_with_no_files_stays_empty(self, base_path):
+        df = resolve_raster_bands(self.SELECTION, base_path=base_path, path_predicate=pl.col("model_group_id") == 500)
+        assert df.height == 0
+
+
 class TestDroppedBandsAreNeverOpened:
     """Band selection is a real narrowing of the physical read, not a filter applied to
     rows that were already read.

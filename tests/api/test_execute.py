@@ -979,6 +979,46 @@ class TestBandWideEndToEnd:
         assert df.columns == ["b0"]
         assert df["b0"].unique().to_list() == pytest.approx([7.0])
 
+    def test_a_post_join_conjunct_that_empties_one_operand_by_its_path_still_runs(self, base_path):
+        # The same floor, reached through a PATH dimension. `model_group_id` is pushed into
+        # `resolve_raster_bands`' file list before anything is opened, so `a` -- which has
+        # no 512 -- would come back from the enumeration with zero bands, and the floor
+        # would have nothing to give back. `resolve_raster_bands` keeps one file rather
+        # than none for exactly this; without it this raises `partial zero-band mismatch`.
+        write_raster_dataset(
+            base_path,
+            years=(2030,),
+            variable="vct",
+            data_fn=lambda year: raster_array(fill=10, grid_name=RASTER_GRID, dtype="int32"),
+        )
+        for model_group_id, fill in ((500, 5), (512, 7)):
+            write_raster_dataset(
+                base_path,
+                years=(2030,),
+                variable="ffibs_score",
+                model_group_id=model_group_id,
+                data_fn=lambda year, fill=fill: raster_array(fill=fill, grid_name=RASTER_GRID, dtype="float32"),
+            )
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "filter", "input": "j", "where": "model_group_id = 512", "as": "d"},
+                    {"op": "group", "by": [], "aggregate": "sum"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert plan.inputs["a"].band_metadata["model_group_id"].to_list() == [500]
+        assert plan.inputs["b"].band_metadata["model_group_id"].to_list() == [512]
+
+        df = execute(plan, base_path=base_path)[0].collect()
+
+        assert df.columns == ["b0"]
+        assert df["b0"].unique().to_list() == pytest.approx([7.0])
+
     def test_five_operand_join_then_point_filter_then_unpivot(self, base_path):
         # `sediment_dynamics`'s own shape, end to end and at its real operand count: five
         # rasters on one grid, joined band-wide, sampled at a single `grid_cell`, then

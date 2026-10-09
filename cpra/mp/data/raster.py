@@ -327,7 +327,7 @@ def _band_calendar_frame(paths, path_column, calendar_col):
     return frame.with_columns(value.alias(calendar_col)).drop("_value")
 
 
-def read_cog(base_path=None, include_file_paths="path", **kwargs):
+def read_cog(base_path=None, include_file_paths="path", path_predicate=None, **kwargs):
     """Locate matching COGs and expand them into per-band rows.
 
     Files are named with a UUID, not by dimension value, so the calendar dimension isn't
@@ -337,6 +337,15 @@ def read_cog(base_path=None, include_file_paths="path", **kwargs):
     wherever possible, but a run that can't be extended (a gap on both sides) may remain
     a single-band file.  Every returned row is one band of one file: the on-path
     dimensions, the calendar value, the file ``path``, and the 1-based ``band`` index.
+
+    ``path_predicate``, when given, is a Polars expression over the ON-PATH dimension
+    columns only (never the calendar dimension, which no path carries, nor a metadata
+    dimension, which lives in tags), applied to the globbed file list BEFORE any file is
+    opened.  It is what keeps a narrow request over a wide dataset from opening every file
+    in it -- ``veg_species`` has one partition directory per species code, so a single
+    tile's worth of bands is a handful of files out of tens of thousands.  Unlike
+    ``kwargs``, which only accept literal values, it takes any expression, which is the
+    form ``analysis.execution.plan`` holds its pushed-down dimension predicates in.
     """
 
     base_path = get_base_path(base_path)
@@ -358,6 +367,8 @@ def read_cog(base_path=None, include_file_paths="path", **kwargs):
         include_file_paths=path_column,
         **kwargs,
     ).collect()
+    if path_predicate is not None:
+        path_frame = path_frame.filter(path_predicate)
 
     if calendar_col is None:
         lf = path_frame.with_columns(band=pl.lit(1, dtype=pl.Int64)).lazy()

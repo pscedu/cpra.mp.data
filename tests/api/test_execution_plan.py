@@ -626,9 +626,11 @@ def _fake_resolve_raster_bands(rows):
     `rows` is a list of `{dimension_name: value, ...}` dicts, one per fake band; `path`/
     `band` columns are added automatically (never inspected by anything under test here --
     only present because a real `resolve_raster_bands` result always carries them).
+    `path_predicate` is accepted and ignored: it only decides which files the real one
+    opens, and returning every band is the superset it is allowed to return anyway.
     """
 
-    def _fake(selection, *, base_path=None):
+    def _fake(selection, *, base_path=None, path_predicate=None):
         keys = rows[0].keys() if rows else []
         return pl.DataFrame(
             {
@@ -788,7 +790,7 @@ def _fake_raster_bands_per_variable(by_variable):
     per `selection.variable`, so two origins can be given genuinely different band lists.
     """
 
-    def _fake(selection, *, base_path=None):
+    def _fake(selection, *, base_path=None, path_predicate=None):
         rows = by_variable[selection.variable]
         keys = rows[0].keys() if rows else []
         return pl.DataFrame(

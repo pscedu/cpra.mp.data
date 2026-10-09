@@ -48,6 +48,8 @@ from cpra.mp.data.analysis.request.pipeline import (
     RESERVED_BAND_INDEX_COLUMN,
     InputSelection,
 )
+from cpra.mp.data.catalog import CAL_DIMS
+from cpra.mp.data.dimensions import METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.raster import read_cog
 from cpra.mp.data.utils import get_input_data_frame, required_columns
@@ -55,12 +57,13 @@ from cpra.mp.data.utils import get_input_data_frame, required_columns
 __all__ = [
     "band_dimension_columns",
     "dataset_dimension_columns",
+    "raster_path_dimension_columns",
     "resolve_raster_bands",
     "resolve_vector_bands",
 ]
 
 
-def resolve_raster_bands(selection: InputSelection, *, base_path=None) -> pl.DataFrame:
+def resolve_raster_bands(selection: InputSelection, *, base_path=None, path_predicate=None) -> pl.DataFrame:
     """The ordered band list `selection`'s raster dataset resolves to.
 
     One row per (file, band) `read_cog` finds on disk, sorted by `read_cog`'s own
@@ -82,16 +85,46 @@ def resolve_raster_bands(selection: InputSelection, *, base_path=None) -> pl.Dat
     yet is not an error at all -- it is answered with a zero-row frame, the same way an
     absent dimension value is an empty result rather than a failure everywhere else in
     this package: an empty answer to a well-formed question is an answer.
+
+    `path_predicate` narrows which FILES are opened (see `read_cog`), and may name only
+    `raster_path_dimension_columns(selection)`. It is a cost decision, not an answer: the
+    result is still a superset of what the request needs, and `execution/plan.py`'s
+    band-identity pass still makes the real narrowing over whatever comes back. Without
+    it every file in the dataset is opened just to learn its band descriptions -- for
+    `veg_species` that is every species of every model group, on every map tile.
+
+    Because it is only a cost decision, it never takes a dataset that HAS files down to
+    zero bands: a predicate matching no file keeps the dataset's first file instead. Zero
+    is a different answer from "some bands, none of which survive", and the band-identity
+    pass's join-sibling floor depends on the difference -- an operand narrowed to nothing
+    by a conjunct declared AFTER its join gets one band back, which it can only do if the
+    enumeration had a band to give. One file open is what that costs.
     """
+    selection_kwargs = {
+        "base_path": base_path,
+        "variable": selection.variable,
+        "time_unit": selection.time_unit,
+        "grid": selection.grid,
+    }
     try:
-        return read_cog(
-            base_path=base_path,
-            variable=selection.variable,
-            time_unit=selection.time_unit,
-            grid=selection.grid,
-        ).collect()
+        bands = read_cog(path_predicate=path_predicate, **selection_kwargs).collect()
+        if bands.height == 0 and path_predicate is not None:
+            # `glob_lazy_frame` sorts its paths, so "first" is deterministic.
+            bands = read_cog(path_predicate=pl.int_range(pl.len()) == 0, **selection_kwargs).collect()
+        return bands
     except ValidationError as err:
         raise NotFoundError(str(err)) from err
+
+
+def raster_path_dimension_columns(selection: InputSelection) -> frozenset[str]:
+    """The dimension columns of `selection`'s raster dataset that are encoded in its FILE
+    PATHS -- the ones a `resolve_raster_bands` `path_predicate` may name.
+
+    `dataset_dimension_columns` minus the calendar dimension (a band description, so known
+    only once a file is opened) and the metadata dimensions (dataset tags, likewise).
+    Structural, like `dataset_dimension_columns`: nothing is opened to answer it.
+    """
+    return dataset_dimension_columns(selection) - frozenset(CAL_DIMS) - frozenset(METADATA_DIMENSIONS)
 
 
 def band_dimension_columns(names: Iterable[str]) -> list[str]:

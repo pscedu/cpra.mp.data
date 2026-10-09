@@ -372,6 +372,7 @@ from rasterio.enums import Resampling
 from cpra.mp.data.analysis.execution.band_ops import PAIRING_KEY_EXCLUDED_COLUMNS, unify_metadata_parts
 from cpra.mp.data.analysis.io.catalog import (
     dataset_dimension_columns,
+    raster_path_dimension_columns,
     resolve_raster_bands,
     resolve_vector_bands,
 )
@@ -1095,43 +1096,65 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     #
     # `None` is "nothing to narrow by" -- true -- which is why it absorbs an OR and is
     # replaced by an AND.
-    narrowing: dict[str, dict[str, object]] = {name: {name: None} for name in pipeline.inputs}
-    for op in ops:
-        merged: dict[str, object] = {}
-        for parent in frame_parents[op.output]:
-            for origin, expr in narrowing[parent].items():
-                if origin not in merged:
-                    merged[origin] = expr
-                elif merged[origin] is None or expr is None:
-                    merged[origin] = None
-                else:
-                    merged[origin] = merged[origin] | expr
-        for conjunct in frame_dimension_conjuncts.get(op.output, ()):
-            names = _referenced_names(conjunct)
-            for origin, standing in frame_origin_dimensions[op.output].items():
-                # R2.9's "narrow only when certain": a conjunct naming anything this origin
-                # does not still carry -- another operand's dimension, or one a `group`
-                # collapsed on this origin's own side -- contributes nothing here rather
-                # than being decomposed into the part that does apply.
-                if origin in merged and names <= standing:
-                    expr = pl.sql_expr(conjunct)
-                    merged[origin] = expr if merged[origin] is None else merged[origin] & expr
-        narrowing[op.output] = merged
+    #
+    # `pushable(origin, standing)` is which of the names `standing` still carries a conjunct
+    # may name and still narrow `origin`. The pass runs twice: once over every standing
+    # dimension, and once over only a raster origin's ON-PATH ones (see
+    # `raster_path_predicate` below). Skipping a conjunct only ever widens the answer, so the
+    # second run is the first one's superset by construction.
+    def symbolic_dimension_predicates(pushable) -> dict[str, object]:
+        narrowing: dict[str, dict[str, object]] = {name: {name: None} for name in pipeline.inputs}
+        for op in ops:
+            merged: dict[str, object] = {}
+            for parent in frame_parents[op.output]:
+                for origin, expr in narrowing[parent].items():
+                    if origin not in merged:
+                        merged[origin] = expr
+                    elif merged[origin] is None or expr is None:
+                        merged[origin] = None
+                    else:
+                        merged[origin] = merged[origin] | expr
+            for conjunct in frame_dimension_conjuncts.get(op.output, ()):
+                names = _referenced_names(conjunct)
+                for origin, standing in frame_origin_dimensions[op.output].items():
+                    # R2.9's "narrow only when certain": a conjunct naming anything this
+                    # origin does not still carry -- another operand's dimension, or one a
+                    # `group` collapsed on this origin's own side -- contributes nothing here
+                    # rather than being decomposed into the part that does apply.
+                    if origin in merged and names <= pushable(origin, standing):
+                        expr = pl.sql_expr(conjunct)
+                        merged[origin] = expr if merged[origin] is None else merged[origin] & expr
+            narrowing[op.output] = merged
 
-    # Unioned over the TERMINAL frames -- the ones nothing else reads, so the answer leaves
-    # through them. An origin that reaches none of them, or that reaches one having been
-    # narrowed by nothing, keeps `None`.
-    origin_dimension_predicate: dict[str, object] = {}
-    for frame, per_origin in narrowing.items():
-        if reference_count[frame]:
-            continue
-        for origin, expr in per_origin.items():
-            if origin not in origin_dimension_predicate:
-                origin_dimension_predicate[origin] = expr
-            elif origin_dimension_predicate[origin] is None or expr is None:
-                origin_dimension_predicate[origin] = None
-            else:
-                origin_dimension_predicate[origin] = origin_dimension_predicate[origin] | expr
+        # Unioned over the TERMINAL frames -- the ones nothing else reads, so the answer
+        # leaves through them. An origin that reaches none of them, or that reaches one
+        # having been narrowed by nothing, keeps `None`.
+        predicates: dict[str, object] = {}
+        for frame, per_origin in narrowing.items():
+            if reference_count[frame]:
+                continue
+            for origin, expr in per_origin.items():
+                if origin not in predicates:
+                    predicates[origin] = expr
+                elif predicates[origin] is None or expr is None:
+                    predicates[origin] = None
+                else:
+                    predicates[origin] = predicates[origin] | expr
+        return predicates
+
+    origin_dimension_predicate = symbolic_dimension_predicates(lambda origin, standing: standing)
+
+    # The same narrowing for a raster origin's band ENUMERATION, restricted to the dimensions
+    # its file paths encode. `resolve_raster_bands` has to open a file to learn its bands, so
+    # a predicate it can apply to the file list alone is the difference between opening the
+    # handful of files a tile needs and opening the whole dataset -- every species of every
+    # model group, for `veg_species` -- on every tile. A conjunct over the calendar dimension
+    # (or naming one alongside a path dimension) cannot be applied before the open and is
+    # skipped here; the band-identity pass below still applies it to what comes back.
+    raster_path_columns = {name: raster_path_dimension_columns(pipeline.inputs[name]) for name in raster_origins}
+    raster_path_predicate = symbolic_dimension_predicates(
+        lambda origin, standing: standing & raster_path_columns.get(origin, frozenset())
+    )
 
     # The vector pushdown as the two passes so far leave it: the walk's value and spatial
     # conjuncts, plus the symbolic dimension predicate above. Resolved here rather than in
@@ -1159,7 +1182,10 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         return predicate
 
     raster_band_metadata: dict[str, pl.DataFrame] = {
-        name: resolve_raster_bands(pipeline.inputs[name], base_path=base_path) for name in raster_origins
+        name: resolve_raster_bands(
+            pipeline.inputs[name], base_path=base_path, path_predicate=raster_path_predicate.get(name)
+        )
+        for name in raster_origins
     }
 
     # One query per projection that will actually become bands, and none at all for a
