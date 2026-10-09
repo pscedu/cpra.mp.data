@@ -602,7 +602,7 @@ requires-dist = [
     { name = "pillow" },
     { name = "playwright", marker = "extra == 'scripts'" },
     { name = "pmtiles", specifier = ">=3.7.0" },
-    { name = "polars", specifier = ">=1.41.2" },
+    { name = "polars", specifier = ">=1.41.2,<2" },
     { name = "psycopg2-binary", marker = "extra == 'api'" },
     { name = "psycopg2-binary", marker = "extra == 'bridges2'" },
     { name = "pyarrow" },
