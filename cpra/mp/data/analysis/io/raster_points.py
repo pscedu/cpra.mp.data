@@ -15,7 +15,7 @@ reader therefore has exactly one output shape, fixed at the call, and neither ha
 describe the other's.
 
 **When the walk picks this one.** `execution/execute.py` gates it -- see
-`_point_sample_reads` there for the full condition. In short: the origin is a raster whose
+`execution.point_sample.point_sample_reads` for the full condition. In short: the origin is a raster whose
 only consumer is a spatial `filter` naming literal `grid_cell` ids. That is the request the
 old path answered by reading the whole BOUNDING BOX of those ids and then throwing away
 every pixel but the named ones; three coordinates scattered across a 20674x8265 grid made

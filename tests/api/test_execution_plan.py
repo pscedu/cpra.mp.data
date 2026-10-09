@@ -31,6 +31,7 @@ from cpra.mp.data.analysis.execution.plan import (
     TileRequest,
     compile_plan,
 )
+from cpra.mp.data.analysis.execution.point_sample import point_sample_reads
 from cpra.mp.data.analysis.io.raster_io import TILE_CRS, resampling_buffer_px, tile_decimation_factors
 from cpra.mp.data.analysis.request.errors import BandLimitError, ShapeError
 from cpra.mp.data.analysis.request.ops import Shape, validate_shapes
@@ -1510,6 +1511,33 @@ class TestBandLimitError:
         )
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.band_metadata.height == 1
+
+    def _over_the_ceiling_sampled_at(self, monkeypatch, where):
+        monkeypatch.setattr(
+            plan_module,
+            "resolve_raster_bands",
+            _fake_resolve_raster_bands([{"calendar_year": 2000 + i} for i in range(ANALYSIS_BAND_CEILING + 1)]),
+        )
+        return _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": where}],
+                "output": {"format": "csv"},
+            }
+        )
+
+    def test_an_input_the_point_reader_takes_is_exempt(self, monkeypatch):
+        """The ceiling bounds a band-wide read's VRT; the point reader builds none (the
+        species stacked bar samples 47 species x 52 years of one cell)."""
+        plan = compile_plan(self._over_the_ceiling_sampled_at(monkeypatch, "grid_cell IN (7, 8)"))
+        assert point_sample_reads(plan) == {"a": [7, 8]}
+        assert plan.inputs["a"].band_metadata.height == ANALYSIS_BAND_CEILING + 1
+
+    def test_a_spatial_filter_the_point_reader_rejects_still_raises(self, monkeypatch):
+        # An `OR` cannot be resolved to ids up front, so the read falls back to band-wide.
+        pipeline = self._over_the_ceiling_sampled_at(monkeypatch, "grid_cell = 7 OR grid_cell = 8")
+        with pytest.raises(BandLimitError):
+            compile_plan(pipeline)
 
 
 class TestBandWideJoinCeiling:

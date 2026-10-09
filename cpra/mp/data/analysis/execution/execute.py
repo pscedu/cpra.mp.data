@@ -60,7 +60,7 @@ names this exact construction.
 **A point sample that names its pixels, and nothing else, skips the band-wide reader
 entirely.** `io.raster_points.sample_raster_points` samples exactly the named pixels out of
 the underlying files and returns a LONG frame directly -- no window, no VRT, no unpivot of
-everything else. `_point_sample_reads` is the gate, and `execute` consults it before it
+everything else. `point_sample_reads` is the gate, and `execute` consults it before it
 opens anything; every origin it names is opened through that reader instead of
 `_open_band_wide_input`, and `execute`'s own local copy of `plan.frame_types` records that
 origin as `Shape.long` so the walk dispatches its spatial `filter` to the ordinary long
@@ -72,7 +72,7 @@ reader built to match it column for column. What the gate buys is the read: thre
 coordinates scattered across a 20674x8265 grid cost 4.3 million pixel rows through the
 bounding box below and 3 through this one.
 
-The gate is narrow on purpose (see `_point_sample_reads` for the conditions, one by one).
+The gate is narrow on purpose (see `point_sample_reads` for the conditions, one by one).
 It rejects, rather than trying to handle, anything where the origin carries a crosswalk, is
 tile-scoped, or has an op between it and its spatial filter -- and it inherits the
 rejection of an origin read more than once, which `compile_plan` has already made. Every
@@ -86,9 +86,9 @@ says exactly which pixels it needs -- and narrowing the window never changes wha
 `ResolvedInput.point_sample_step` names the step number of the first spatial `filter`
 reached while an origin was still band-wide (`execution.plan`'s own module docstring);
 before the ordinary input-opening loop runs, `execute` looks that step up in `plan.ops`
-and tries `_derive_point_sample_window` against its `where`. When that `where` is simple
+and tries `derive_point_sample_window` against its `where`. When that `where` is simple
 enough to name the exact absolute pixel ids before any file is opened (`grid_cell = N` or
-`grid_cell IN (...)`, unquoted integers -- `_parse_point_sample_ids`), the origin is
+`grid_cell IN (...)`, unquoted integers -- `parse_point_sample_ids`), the origin is
 opened over the SMALLEST window covering those pixels instead of its full extent. `where`
 itself is never touched: `band_ops.sample_grid_cells_band_wide` always emits `grid_cell`
 as the pixel's ABSOLUTE row-major position over the origin's full grid
@@ -100,7 +100,7 @@ optimization here, not something a caller can observe in the result. Anything th
 cannot resolve into exact ids up front -- a negation, an `OR`, more than one spatial
 conjunct, or a pixel outside the origin's own extent -- falls back to the full-window read
 this walk has always done, which is always correct, merely more expensive than a window
-`_derive_point_sample_window` could have derived. A tile-scoped origin (`resolved.
+`derive_point_sample_window` could have derived. A tile-scoped origin (`resolved.
 read_window is not None`) is never narrowed this way at all -- the tile's own window
 already governs what gets read, and combining the two is a case no caller in this
 codebase produces today.
@@ -194,7 +194,6 @@ crosswalks the underlying shared scan actually combined.
 """
 
 import dataclasses
-import re
 from collections.abc import Container
 
 import polars as pl
@@ -214,13 +213,13 @@ from cpra.mp.data.analysis.execution.frame import (
     released_band_metadata,
 )
 from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, ZoneCrosswalk, compile_plan
+from cpra.mp.data.analysis.execution.point_sample import derive_point_sample_window, point_sample_reads
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_points import sample_raster_points
 from cpra.mp.data.analysis.io.vector import scan_vector
 from cpra.mp.data.analysis.request.errors import NotFoundError
-from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import (
     FilterOp,
     FrameType,
@@ -532,167 +531,10 @@ def _dispatch_key(op: Op, frame_types: dict[str, FrameType]) -> object:
     return incoming.shape
 
 
-# The two `where` shapes `request.data_query.grid_cell_conjunct` (and any other caller
-# resolving a coordinate to a literal id list before compiling a pipeline) ever produces
-# for a raster spatial filter -- unquoted integers only, matching the convention every
-# ABSOLUTE `grid_cell` id in this codebase already uses before any window has narrowed it.
-# See `_parse_point_sample_ids` for what happens when a `where` does not match either one.
-_POINT_SAMPLE_EQ_RE = re.compile(r"^grid_cell\s*=\s*(\d+)$", re.IGNORECASE)
-_POINT_SAMPLE_IN_RE = re.compile(r"^grid_cell\s+in\s*\(\s*(\d+(?:\s*,\s*\d+)*)\s*\)$", re.IGNORECASE)
-
-
-def _parse_point_sample_ids(where: str) -> list[int] | None:
-    """Pull literal ABSOLUTE `grid_cell` ids out of `where`'s spatial conjunct, if `where`
-    is simple enough to say exactly which pixels a point sample needs BEFORE any file is
-    opened: exactly one top-level spatial conjunct (`request.expressions.
-    classify_where_kinds`), and that one conjunct is exactly `grid_cell = N` or `grid_cell
-    IN (N1, N2, ...)` with unquoted integer literals -- the two forms `request.data_query.
-    grid_cell_conjunct` produces for a raster point query.
-
-    Returns `None` -- not an error -- for anything else: two or more top-level spatial
-    conjuncts, or one spatial conjunct that isn't exactly one of the two recognized forms
-    (`grid_cell != 5`, `grid_cell = 5 OR grid_cell = 6`, a comparison this module was never
-    taught to read). `None` means "cannot narrow the window with confidence", not "no
-    pixels match" -- the caller (`_derive_point_sample_window`) falls back to reading the
-    origin's full extent, which is always a CORRECT answer for any `where` this function
-    cannot parse, only a more expensive one than a window this function could have derived.
-    """
-    kinds = classify_where_kinds(where)
-    spatial = kinds[PredicateKind.spatial]
-    if len(spatial) != 1:
-        return None
-    conjunct = spatial[0].strip()
-    match = _POINT_SAMPLE_EQ_RE.match(conjunct)
-    if match:
-        return [int(match.group(1))]
-    match = _POINT_SAMPLE_IN_RE.match(conjunct)
-    if match:
-        return [int(token) for token in match.group(1).split(",")]
-    return None
-
-
-def _derive_point_sample_window(grid_name: str, where: str) -> Window | None:
-    """Size a point sample's own narrower read window from a spatial `filter`'s `where` --
-    still written in `grid_name`'s full-grid, absolute-id convention, since every producer
-    of a spatial conjunct reaching a still-band-wide raster origin uses that convention
-    (`execution.plan`'s module docstring; no narrowing has happened yet at the point this
-    `where` was written), and the convention `band_ops.sample_grid_cells_band_wide` emits
-    its own `grid_cell` output in too -- see the module docstring for why that makes
-    narrowing the window here a pure read-size optimization rather than something able to
-    change what `where`'s literals mean.
-
-    Returns `None` -- caller falls back to a full-window read -- when `_parse_point_sample_
-    ids` cannot resolve `where` into exact ids, or when any resolved id falls outside
-    `grid_name`'s own `(height, width)` extent (an out-of-range literal a caller supplied
-    directly, with no coordinate resolution step in between to have already rejected it).
-
-    `where` itself is never touched here or by any caller of this function: only the
-    window is derived. The smallest window covering every resolved pixel, from the same
-    `divmod(id, grid.width)` decode this module already uses to validate an id is in range.
-    """
-    ids = _parse_point_sample_ids(where)
-    if ids is None:
-        return None
-
-    grid = GRIDS[grid_name]
-    rows: list[int] = []
-    cols: list[int] = []
-    for cell_id in ids:
-        row, col = divmod(cell_id, grid.width)
-        if not (0 <= row < grid.height) or not (0 <= col < grid.width):
-            return None
-        rows.append(row)
-        cols.append(col)
-
-    row_off, col_off = min(rows), min(cols)
-    height = max(rows) - row_off + 1
-    width = max(cols) - col_off + 1
-    return Window(col_off, row_off, width, height)
-
-
-def _point_sample_reads(plan: ExecutionPlan) -> dict[str, list[int]]:
-    """For every raster origin the POINT reader (`io.raster_points.sample_raster_points`)
-    should open instead of `_open_band_wide_input`, the absolute `grid_cell` ids to sample
-    it at -- the gate the module docstring's "skips the band-wide reader entirely"
-    paragraph describes. An origin this names is opened long; every other raster origin is
-    opened band-wide exactly as before.
-
-    Six conditions, all required, each rejecting into the bounding-box fallback rather than
-    into an error:
-
-    * `resolved.point_sample_step is not None` -- a spatial `filter` was reached while this
-      origin was still band-wide (`execution.plan`'s own module docstring). Without one
-      there is no set of pixels to sample and nothing to gate.
-    * Not tile-scoped, and not already empty: `resolved.read_window is None`, not
-      `resolved.tile_disjoint`, and `metadata_df` has bands. The same three skips
-      `_point_sample_overrides` makes below, for the same reasons -- a tile's own window
-      already governs the read, and the other two have no real read at all.
-    * `resolved.straddling_vector_grid is None`. A crosswalk is attached to a band-wide
-      read (`_open_band_wide_input`) and consumed positionally by a later `project`; this
-      reader returns no pixel grid for one to ride along on. An origin needing one is not a
-      point sample in any case -- it is a zonal aggregate that happens to share an origin.
-    * The origin is not part of a band-wide join's shared scan
-      (`plan.band_wide_join_scans`). Such an origin's read is owned by
-      `_open_band_wide_join_group`, which aligns several origins into one window; a long
-      frame cannot participate in that alignment. (Shape typing already makes this
-      unreachable -- a spatial filter turns a frame long, and a long frame is not a
-      band-wide join operand -- but the gate states it rather than relying on that.)
-    * **The spatial filter reads the origin itself** (`op.input == name`), not something
-      derived from it. This is the condition that makes the substitution exact rather than
-      approximate. The long lowering the walk will dispatch to applies `op.where` to
-      whatever frame it is handed; the point reader's frame holds only the named pixels.
-      Those two agree only if nothing ran in between -- an intervening
-      `case`/`group`/`join` would have run against every pixel of the bounding box on
-      the old path and against three on this one, and for a `group` in particular those are
-      different answers. `point_sample_step` is recorded through a chain of ops that left
-      the origin's pixels alone, so it can point at a filter one or more steps downstream;
-      this gate wants the first step, and nothing else.
-
-      The fan-out case -- a second op reading the same origin, still expecting it to be
-      band-wide -- needs no condition here, because `compile_plan` has already foreclosed
-      it: an origin more than one op reads is invalidated on sight (its `reference_count`
-      exceeds one, so `plan`'s `_incoming` returns nothing for it), and an invalidated
-      origin never records a `point_sample_step` at all. The first condition above is
-      therefore what rejects a fan-out, and the gate cannot widen past that without
-      `compile_plan` widening first.
-    * `_parse_point_sample_ids` resolves `op.where` to literal ids AND
-      `_derive_point_sample_window` accepts them -- the same parse and the same range check
-      the fallback already runs, so the two paths can never disagree about which `where`
-      names exactly which pixels.
-
-    Deliberately NOT a `compile_plan` concern, even though every input it reads is on the
-    plan: it decides which READER opens an origin, which is this module's job, and it wants
-    `_parse_point_sample_ids`, which lives here. `compile_plan` already recorded everything
-    it can decide without opening anything (`point_sample_step`, and the `overview_permitted
-    = False` that keeps a point-sampled origin off the overviews).
-    """
-    reads: dict[str, list[int]] = {}
-    ops_by_step = {op.step_no: op for op in plan.ops}
-    joined = {name for origins in plan.band_wide_join_scans.values() for name in origins}
-    for name, resolved in plan.inputs.items():
-        if resolved.point_sample_step is None:
-            continue
-        if resolved.read_window is not None or resolved.tile_disjoint:
-            continue
-        if has_no_bands(resolved.band_metadata):
-            continue
-        if resolved.straddling_vector_grid is not None or name in joined:
-            continue
-        op = ops_by_step[resolved.point_sample_step]
-        assert isinstance(op, FilterOp)
-        if op.input != name:
-            continue
-        ids = _parse_point_sample_ids(op.where)
-        if ids is None or _derive_point_sample_window(resolved.selection.grid, op.where) is None:
-            continue
-        reads[name] = ids
-    return reads
-
-
 def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozenset()) -> dict[str, Window]:
     """For every raster origin in `plan.inputs` whose `point_sample_step` resolved to a
     narrower window, the window to open that origin's read over instead of its full
-    extent -- see `_derive_point_sample_window` for how, and `execute`'s own docstring for
+    extent -- see `derive_point_sample_window` for how, and `execute`'s own docstring for
     how the result gets used.
 
     Two readers consume this. An ordinary raster origin gets its own window straight from
@@ -702,10 +544,10 @@ def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozense
     `_open_band_wide_join_group` reads over, or into `None` if they do not all agree. Either
     way the window comes from here, so the two paths cannot size a point sample differently.
 
-    `skip` names the origins `_point_sample_reads` already claimed for the point reader.
+    `skip` names the origins `point_sample_reads` already claimed for the point reader.
     Those never reach `_open_band_wide_input` at all, so a window sized for one here would
     be dead -- and, worse, misleading, since a reader that opens no window would appear to
-    have been handed one. A joined origin is never in `skip` (`_point_sample_reads` rejects
+    have been handed one. A joined origin is never in `skip` (`point_sample_reads` rejects
     one outright), so the group path always sees every window this produces for it.
 
     Deliberately skips an origin under either of two conditions, in both cases leaving
@@ -736,7 +578,7 @@ def _point_sample_overrides(plan: ExecutionPlan, skip: Container[str] = frozense
             continue
         op = ops_by_step[resolved.point_sample_step]
         assert isinstance(op, FilterOp)
-        window = _derive_point_sample_window(resolved.selection.grid, op.where)
+        window = derive_point_sample_window(resolved.selection.grid, op.where)
         if window is not None:
             windows[name] = window
     return windows
@@ -812,7 +654,7 @@ def _open_band_wide_input(
     for an ordinary request (read the origin whole), or the window `compile_plan` sized for
     a tile -- UNLESS `point_sample_window` is given, which then takes its place. `execute`
     passes one only for an origin whose `point_sample_step` resolved to a narrower window
-    (`_derive_point_sample_window`); `resolved.read_window` itself is left untouched by that
+    (`derive_point_sample_window`); `resolved.read_window` itself is left untouched by that
     decision (it is still `None` for the ordinary, non-tile request every point sample so
     far has been), so this is a call-site override, not a second copy of the same field.
     `resolved.decimation` rides along beside it -- the resolution `compile_plan` decided
@@ -932,7 +774,7 @@ def _shared_point_sample_window(origins: tuple[str, ...], windows: dict[str, Win
     In practice the windows agree whenever they exist at all -- `compile_plan` records the
     group's `point_sample_step`s together, from one filter, and `request.ops.
     validate_shapes` already requires a band-wide join's operands to share a grid, so
-    `_derive_point_sample_window` is running the same `where` against the same grid for each
+    `derive_point_sample_window` is running the same `where` against the same grid for each
     of them. The equality check is therefore not expected to reject anything; it is here
     because a union would be the WRONG fallback if it ever did. A tile window may be unioned
     -- a wider window is more pixels, never different ones -- but a point sample's window is
@@ -1178,7 +1020,7 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     Returns the single input's frame for a zero-step pipeline: there is nothing to walk,
     and the request layer's own rule guarantees exactly one input in that case.
 
-    Before any of that: `_point_sample_reads` looks for a raster origin whose spatial
+    Before any of that: `point_sample_reads` looks for a raster origin whose spatial
     `filter` names its pixels outright and is that origin's only consumer (see that
     function for the whole gate). Each one it names is opened by
     `io.raster_points.sample_raster_points` -- LONG, one row per (named pixel, band),
@@ -1189,7 +1031,7 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     Then, for what is left: `_point_sample_overrides` looks for a raster origin whose
     `point_sample_step` resolved to a window narrower than its full extent, per-origin --
-    see that function and `_derive_point_sample_window` for how, and the module docstring's
+    see that function and `derive_point_sample_window` for how, and the module docstring's
     "a point sample reads a narrower window" paragraph for why. Every origin it names gets
     opened over that narrower window (`_open_band_wide_input`'s own `point_sample_window`
     override) instead of the full-extent read `resolved.read_window` alone would give. An
@@ -1202,8 +1044,8 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     `where` a caller wrote against the full grid keeps meaning the same pixels whether or
     not this narrowing found anywhere to apply.
     """
-    point_sample_reads = _point_sample_reads(plan)
-    point_sample_windows = _point_sample_overrides(plan, skip=point_sample_reads)
+    point_reads = point_sample_reads(plan)
+    point_sample_windows = _point_sample_overrides(plan, skip=point_reads)
 
     # A gated origin is opened LONG, so the walk must dispatch its spatial `filter` to the
     # long lowering rather than the band-wide one. Recorded as this call's own copy of the
@@ -1212,9 +1054,9 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
     # this module makes and this module therefore records, without mutating a plan a caller
     # may hold, compare, or run again.
     frame_types = plan.frame_types
-    if point_sample_reads:
+    if point_reads:
         frame_types = dict(frame_types)
-        for name in point_sample_reads:
+        for name in point_reads:
             frame_types[name] = dataclasses.replace(frame_types[name], shape=Shape.long)
 
     extra_columns: dict[str, tuple[str, ...]] = {}
@@ -1254,12 +1096,10 @@ def execute(plan: ExecutionPlan, *, base_path=None) -> LongFrame | BandWideFrame
 
     frames: dict[str, LongFrame | BandWideFrame] = {}
     for name, resolved in plan.inputs.items():
-        if name in point_sample_reads:
+        if name in point_reads:
             # Checked before the shape test, not after: `frame_types` above already calls
             # this origin long, and the long branch is the VECTOR scan.
-            frames[name] = sample_raster_points(
-                resolved.band_metadata, resolved.selection.grid, point_sample_reads[name]
-            )
+            frames[name] = sample_raster_points(resolved.band_metadata, resolved.selection.grid, point_reads[name])
         elif frame_types[name].shape is Shape.long:
             frames[name] = scan_vector(
                 resolved.selection,

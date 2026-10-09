@@ -279,7 +279,12 @@ survived pushdown, then checked against `cpra.mp.data.config.ANALYSIS_BAND_CEILI
 (`BandLimitError` if it's exceeded) -- except an origin feeding a recorded band-wide join,
 which is exempted from its own check and instead checked as part of that join's operand
 UNION (`ExecutionPlan.band_wide_join_scans`), matching how `execution.band_ops.
-join_band_wide` actually reads both operands through one shared VRT. A dimension predicate
+join_band_wide` actually reads both operands through one shared VRT. An origin
+`execution.point_sample.point_sample_reads` hands to the point reader is exempt outright,
+with no limit of its own: the ceiling bounds a VRT, and that reader builds none -- it reads
+one pixel per band straight from the files, so a 2,444-band species-by-year sample of one
+cell is cheap. The exemption needs the finished plan (see that function), so this one check
+runs last, after the `ExecutionPlan` is built. A dimension predicate
 that legitimately narrows a raster origin to zero surviving bands is not an error here --
 `resolve_raster_bands` itself never raises for an empty result, and naming a dimension
 value that is legal but simply absent from the data is supposed to produce an empty
@@ -370,6 +375,7 @@ import polars as pl
 from rasterio.enums import Resampling
 
 from cpra.mp.data.analysis.execution.band_ops import PAIRING_KEY_EXCLUDED_COLUMNS, unify_metadata_parts
+from cpra.mp.data.analysis.execution.point_sample import point_sample_reads
 from cpra.mp.data.analysis.io.catalog import (
     dataset_dimension_columns,
     raster_path_dimension_columns,
@@ -1323,17 +1329,6 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 "cpra.mp.data.config.ANALYSIS_BAND_CEILING"
             )
 
-    joined_origins = {name for origins in band_wide_join_origin_groups.values() for name in origins}
-    for name in raster_origins:
-        if name in joined_origins:
-            continue
-        height = raster_band_metadata[name].height
-        if height > ANALYSIS_BAND_CEILING:
-            raise BandLimitError(
-                f"input {name!r} resolves to {height} bands, over the limit of "
-                f"{ANALYSIS_BAND_CEILING} -- see cpra.mp.data.config.ANALYSIS_BAND_CEILING"
-            )
-
     joined_steps = {step for steps in band_wide_join_vector_steps.values() for step in steps}
     for step_no, metadata in vector_band_metadata.items():
         if step_no in joined_steps:
@@ -1399,7 +1394,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 predicate=vector_predicate[name],
             )
 
-    return ExecutionPlan(
+    plan = ExecutionPlan(
         inputs=inputs,
         ops=ops,
         frame_types=frame_types,
@@ -1410,6 +1405,22 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         vector_band_metadata=vector_band_metadata,
         tile=tile,
     )
+
+    # Last, against the finished plan: which origins the point reader takes depends on
+    # `read_window` and `straddling_vector_grid`, settled just above (module docstring).
+    joined_origins = {name for origins in band_wide_join_origin_groups.values() for name in origins}
+    point_read_origins = point_sample_reads(plan)
+    for name in raster_origins:
+        if name in joined_origins or name in point_read_origins:
+            continue
+        height = raster_band_metadata[name].height
+        if height > ANALYSIS_BAND_CEILING:
+            raise BandLimitError(
+                f"input {name!r} resolves to {height} bands, over the limit of "
+                f"{ANALYSIS_BAND_CEILING} -- see cpra.mp.data.config.ANALYSIS_BAND_CEILING"
+            )
+
+    return plan
 
 
 def _resolve_tile_window(

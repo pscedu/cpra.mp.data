@@ -40,9 +40,7 @@ from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.execute import (
     LoweringNotImplementedError,
     _LOWERINGS,
-    _parse_point_sample_ids,
     _point_sample_overrides,
-    _point_sample_reads,
     _shared_point_sample_window,
     _shared_tile_window,
     execute,
@@ -53,6 +51,7 @@ from cpra.mp.data.analysis.execution.frame import (
     has_no_bands,
 )
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
+from cpra.mp.data.analysis.execution.point_sample import parse_point_sample_ids, point_sample_reads
 from cpra.mp.data.analysis.io.raster_io import raster_grid_geometry, tile_source_window
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
@@ -621,7 +620,7 @@ class TestBandWideEndToEnd:
     def test_point_sample_reads_a_narrower_window_and_the_value_it_names(self, base_path, monkeypatch):
         # This is the BOUNDING-BOX fallback, not the point reader: the pipeline puts a
         # dimension `filter` between the origin and the spatial one, which
-        # `_point_sample_reads` rejects (its gate requires the spatial filter to be the
+        # `point_sample_reads` rejects (its gate requires the spatial filter to be the
         # origin's only reader), so the origin is opened band-wide over a narrowed window
         # exactly as it always was. The extra step is what makes this test still test the
         # narrowing -- without it the gate fires and `scan_raster` is never called at all.
@@ -1577,7 +1576,7 @@ def _tile_over_the_raster_grid(zoom=12):
 
 
 class TestRasterPointReader:
-    """`_point_sample_reads` -- the gate that swaps `io.raster_points.sample_raster_points`
+    """`point_sample_reads` -- the gate that swaps `io.raster_points.sample_raster_points`
     in for the band-wide read, and the conditions under which it declines to.
 
     What the reader itself produces is pinned in `test_raster_points.py`, including the
@@ -1638,9 +1637,9 @@ class TestRasterPointReader:
         cells = [row * grid.width + col for row, col in pixels]
         write_raster_dataset(base_path, years=(2030,), data_fn=self._plant(pixels))
         plan = compile_plan(self._point_pipeline(cells), base_path=base_path)
-        assert set(_point_sample_reads(plan)) == {"a"}
+        assert set(point_sample_reads(plan)) == {"a"}
         # And nothing was left behind for the fallback to act on.
-        assert _point_sample_overrides(plan, skip=_point_sample_reads(plan)) == {}
+        assert _point_sample_overrides(plan, skip=point_sample_reads(plan)) == {}
 
         calls = self._counting_scan_raster(monkeypatch)
         df = execute(plan, base_path=base_path).collect()
@@ -1665,7 +1664,7 @@ class TestRasterPointReader:
         import cpra.mp.data.analysis.execution.execute as execute_module
 
         with monkeypatch.context() as ungated:
-            ungated.setattr(execute_module, "_point_sample_reads", lambda plan: {})
+            ungated.setattr(execute_module, "point_sample_reads", lambda plan: {})
             plan = compile_plan(pipeline, base_path=base_path)
             assert set(_point_sample_overrides(plan)) == {"a"}  # the fallback did narrow
             fallback = execute(plan, base_path=base_path).collect()
@@ -1701,7 +1700,7 @@ class TestRasterPointReader:
         plan = compile_plan(pipeline, base_path=base_path)
 
         assert plan.inputs["a"].point_sample_step is not None
-        assert _point_sample_reads(plan) == {}
+        assert point_sample_reads(plan) == {}
         # Rejected by the gate, but still narrowed by the fallback -- the two are separate
         # decisions, and this is the case that proves it.
         assert set(_point_sample_overrides(plan)) == {"a"}
@@ -1725,7 +1724,7 @@ class TestRasterPointReader:
         plan = compile_plan(pipeline, base_path=base_path)
 
         assert plan.inputs["a"].point_sample_step is not None
-        assert _point_sample_reads(plan) == {}
+        assert point_sample_reads(plan) == {}
         assert _point_sample_overrides(plan) == {}
 
         df = execute(plan, base_path=base_path).collect()
@@ -1733,7 +1732,7 @@ class TestRasterPointReader:
 
     def test_an_id_that_names_no_pixel_of_the_grid_is_not_gated(self, base_path):
         # A `grid_cell` id past the end of the grid parses into a literal id perfectly well
-        # -- what rejects it is the range check `_derive_point_sample_window` runs, the same
+        # -- what rejects it is the range check `derive_point_sample_window` runs, the same
         # one the fallback runs, which is why the gate asks for both and not just the parse.
         # It matters that this falls back rather than being gated: the point reader decodes
         # ids against the grid too, and an id it cannot place is a `ValueError` there, where
@@ -1751,8 +1750,8 @@ class TestRasterPointReader:
         )
         plan = compile_plan(pipeline, base_path=base_path)
 
-        assert _parse_point_sample_ids(plan.ops[0].where) == [off_grid]  # the parse did succeed
-        assert _point_sample_reads(plan) == {}
+        assert parse_point_sample_ids(plan.ops[0].where) == [off_grid]  # the parse did succeed
+        assert point_sample_reads(plan) == {}
         assert _point_sample_overrides(plan) == {}
 
         assert execute(plan, base_path=base_path).collect().height == 0
@@ -1782,7 +1781,7 @@ class TestRasterPointReader:
         plan = compile_plan(pipeline, base_path=base_path)
 
         assert plan.inputs["a"].point_sample_step is None
-        assert _point_sample_reads(plan) == {}
+        assert point_sample_reads(plan) == {}
         # The same origin and the same filter, minus the second reader, IS gated -- so what
         # the assertions above caught is the fan-out and not some unrelated thing this
         # pipeline shape got wrong.
@@ -1793,7 +1792,7 @@ class TestRasterPointReader:
                 "output": {"format": "csv"},
             }
         )
-        assert _point_sample_reads(compile_plan(solo, base_path=base_path)) == {"a": [cell]}
+        assert point_sample_reads(compile_plan(solo, base_path=base_path)) == {"a": [cell]}
 
     def test_a_tile_scoped_origin_is_not_gated(self, base_path):
         # A tile's own window already governs what gets read, and a point reader has no
@@ -1811,7 +1810,7 @@ class TestRasterPointReader:
         plan = compile_plan(pipeline, base_path=base_path, tile=TileRequest(*_tile_over_the_raster_grid()))
 
         assert plan.inputs["a"].read_window is not None
-        assert _point_sample_reads(plan) == {}
+        assert point_sample_reads(plan) == {}
 
 
 class TestTileScopedReads:
@@ -1996,7 +1995,7 @@ class TestTileScopedReads:
         # `_shared_point_sample_window`'s two refusals, directly -- neither is reachable
         # from a pipeline (`compile_plan` records a group's `point_sample_step`s together,
         # off one filter, and a band-wide join's operands share a grid, so
-        # `_derive_point_sample_window` runs the same `where` against the same grid for
+        # `derive_point_sample_window` runs the same `where` against the same grid for
         # each of them), and both are the reason the reduction is not a union.
         #
         # A tile window may be unioned: a wider window is more pixels, never different
