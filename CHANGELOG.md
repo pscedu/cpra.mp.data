@@ -1,5 +1,108 @@
 # Changelog
 
+## [0.52.0](https://github.com/pscedu/cpra.mp.data/compare/v0.51.0...v0.52.0) (2026-10-09)
+
+
+### Features
+
+* add analyze_data function ([1a6a771](https://github.com/pscedu/cpra.mp.data/commit/1a6a7717d1749fb089f017fac7051b36acb19c76))
+* **analyses:** add derived variable and dimension analyses ([fcee01d](https://github.com/pscedu/cpra.mp.data/commit/fcee01d4c74e6f1d6de654ed959ab2a89c5ba568))
+* **analyses:** add land type confidence analysis ([11c72b8](https://github.com/pscedu/cpra.mp.data/commit/11c72b806aa62590dc4b777c7618b43823eb35f8))
+* **analyses:** add land type plus named analysis ([e55d655](https://github.com/pscedu/cpra.mp.data/commit/e55d655493e8ea60a0c39fc4e2661ee8d0d4a368))
+* **analyses:** improve land confidence legends ([51c79bc](https://github.com/pscedu/cpra.mp.data/commit/51c79bc23f65ba821879845c7c952d1bb95f0fb4))
+* **analysis:** add case operation and optimize filter pushdown ([3fcbe2d](https://github.com/pscedu/cpra.mp.data/commit/3fcbe2d6bddccaa4ac27bd5b639c232182981e67))
+* **analysis:** add flexible calculate parameters ([fa02cb5](https://github.com/pscedu/cpra.mp.data/commit/fa02cb508ee959735e23f35503e8382b1e2ae98f))
+* **analysis:** add raster point reader ([9f9de04](https://github.com/pscedu/cpra.mp.data/commit/9f9de04dfeb8faa8cdf3d457f24596c9c6878c4a))
+* **analysis:** connect lowerings to execute ([a4b0a5d](https://github.com/pscedu/cpra.mp.data/commit/a4b0a5d1ea5a66cf540c42aed240d9caf66392c8))
+* **analysis:** connect tile decimation ([4956fa2](https://github.com/pscedu/cpra.mp.data/commit/4956fa24b14e9af95ab1e33e8bd1747727230cd7))
+* **analysis:** implement band-wide lowerings ([9b961e9](https://github.com/pscedu/cpra.mp.data/commit/9b961e991af0d97a272bca1373ec408b0e63ac31))
+* **analysis:** implement data query ([64c79f1](https://github.com/pscedu/cpra.mp.data/commit/64c79f1b58ba340b900dc74cd689c5a3c71e9fa2))
+* **analysis:** implement frame logic ([bf6f7f6](https://github.com/pscedu/cpra.mp.data/commit/bf6f7f6ba53cd68709953adf312e37533ff2c0a3))
+* **analysis:** implement long lowerings and walk ([6d350b8](https://github.com/pscedu/cpra.mp.data/commit/6d350b8cc7868ccd589f80c383e2c35b65a387f8))
+* **analysis:** implement raster scan ([de19618](https://github.com/pscedu/cpra.mp.data/commit/de196185a7814a3debaa2b22042a7140433166b2))
+* **analysis:** implement raster to vector projection ([bf8d625](https://github.com/pscedu/cpra.mp.data/commit/bf8d62548a2a0e7b85b2ab6c3349b3b42270d00b))
+* **analysis:** implement sinks ([f89bac2](https://github.com/pscedu/cpra.mp.data/commit/f89bac2530ae2d92028f97c408130e79fab550da))
+* **analysis:** implement the request layer ([f70099f](https://github.com/pscedu/cpra.mp.data/commit/f70099f516bb92c41638bf22ba9edfc2c467107d))
+* **analysis:** implement tiles ([d9bd1aa](https://github.com/pscedu/cpra.mp.data/commit/d9bd1aa5e79ab46f7816ebd6e8df778f17e62866))
+* **analysis:** implement vector-to-vector projection ([010de77](https://github.com/pscedu/cpra.mp.data/commit/010de77c6abdf3d7047289707f34d1927513b084))
+* **analysis:** initial work on making pipeline step order flexible ([cfa54ba](https://github.com/pscedu/cpra.mp.data/commit/cfa54ba42abb9b209c090b46a948417fb24682c8))
+* **analysis:** start connecting API to new analysis module ([b14d837](https://github.com/pscedu/cpra.mp.data/commit/b14d837a1b6400c120b4aedf4c767f84efeb2442))
+* **api:** add composable pipelines ([4a0eabb](https://github.com/pscedu/cpra.mp.data/commit/4a0eabbee6af983528ae2b6bcb8efc632579d257))
+* **api:** add count-by-value ([6ad61a0](https://github.com/pscedu/cpra.mp.data/commit/6ad61a0c512b59d203581efebc0b8dabe87860e3))
+* **api:** add pixel-level expressions ([d4890cb](https://github.com/pscedu/cpra.mp.data/commit/d4890cb45e12a2a61eafd7c0d03b9ce85c6411d2))
+* **api:** add where clause parsing and scan broadcast ([e2d822d](https://github.com/pscedu/cpra.mp.data/commit/e2d822d73a57787669b74976c2c3b55614bcda40))
+* **api:** enable Polars raster IO plugin by default ([89ceedc](https://github.com/pscedu/cpra.mp.data/commit/89ceedcf16ec6a804e5efdcc7ab932f6f4006ba4))
+* **api:** use Polars for raster tile calculations ([a8dd802](https://github.com/pscedu/cpra.mp.data/commit/a8dd8024547bd86a8efbae2cc8c38946040b3c5b))
+* **api:** use Polars to do per-window raster calculations ([7ab0069](https://github.com/pscedu/cpra.mp.data/commit/7ab0069dac8656a6adb25da3dc909e0197d4a49f))
+* **api:** use the new analysis engine ([a6dec5b](https://github.com/pscedu/cpra.mp.data/commit/a6dec5b3633101f38ac9b221ca1e25aaf39f4f01))
+* **scripts:** add --append-missing flag to migration script ([4bb5095](https://github.com/pscedu/cpra.mp.data/commit/4bb5095ef53f15037a7e163c641447116a0412a7))
+* **scripts:** add --skip-unchanged option to migration script ([563f39f](https://github.com/pscedu/cpra.mp.data/commit/563f39fd7861672918ad36dc126bbfa99bd24248))
+* **scripts:** add opt4 breakpoints ([381021c](https://github.com/pscedu/cpra.mp.data/commit/381021cef5756e3a29985c45bf366d1fe32a65ba))
+* **scripts:** add script to calculate land confidence ([714431a](https://github.com/pscedu/cpra.mp.data/commit/714431a90d27e337e93b70fd8043a2320df3ff46))
+* **scripts:** add script to generate land type plus PMTiles ([f084cad](https://github.com/pscedu/cpra.mp.data/commit/f084cad9cbce8c1e9e4d5204d57f1aec7e609bc5))
+* **scripts:** add script to remove migrated data containing a single ([9108672](https://github.com/pscedu/cpra.mp.data/commit/91086722166527682c52054e0087500631ef4701))
+* **scripts:** add script to repair excess rows in migrated data ([3997c83](https://github.com/pscedu/cpra.mp.data/commit/3997c83b30123e52b10f1012118ba595abeb70c6))
+* **scripts:** consolidate historic image groupings ([ecafe1c](https://github.com/pscedu/cpra.mp.data/commit/ecafe1cfe021a8f241cc3eaaa25edbc4563fcd49))
+* **scripts:** get rid of separate 2004-2006 video image ([f210300](https://github.com/pscedu/cpra.mp.data/commit/f2103008c6a8d28fad88745ffe69d7b3abc7f7c3))
+* **scripts:** update confidence change colors ([420100c](https://github.com/pscedu/cpra.mp.data/commit/420100c3de4a363494493d046466ce359928c7c9))
+* **scripts:** update historic loss/gain colors ([1f2d8a8](https://github.com/pscedu/cpra.mp.data/commit/1f2d8a84bb6bb9b75a75c319c5909129179e0220))
+* **scripts:** update historic loss/gain colors ([88dc94f](https://github.com/pscedu/cpra.mp.data/commit/88dc94fe20b539423379641df2af826ba6cae0ac))
+* **scripts:** update video frames to use real confidence data ([ebf63db](https://github.com/pscedu/cpra.mp.data/commit/ebf63db97aed20a9f7c36015ee1b33ae527977d2))
+* **scripts:** use bicubic resampling on RGB images ([0cc721b](https://github.com/pscedu/cpra.mp.data/commit/0cc721b87b068caeb284e5fd134d07ec5de10c5a))
+* **structure:** add ICM derived variables ([1b690f3](https://github.com/pscedu/cpra.mp.data/commit/1b690f35e5f52e6dd565420fc8fd1dd9179c4a9b))
+* **structure:** add land confidence legend ([65959bf](https://github.com/pscedu/cpra.mp.data/commit/65959bf6f9c549efdf917f821e40f931955c550d))
+* **structure:** add lnd_type_plus legend ([dd8c8b2](https://github.com/pscedu/cpra.mp.data/commit/dd8c8b28a530722cc3577ddafb9a11573d33426b))
+* **structure:** sort legends and update ffibs legend ([25c738a](https://github.com/pscedu/cpra.mp.data/commit/25c738aebf3f9c3ececdb8818d3354bf8fa46eb8))
+* **variables:** add NoData value ([e653f88](https://github.com/pscedu/cpra.mp.data/commit/e653f8893df9d2718642500d57388724502f9a4d))
+* **visualizations:** update glyph and sprite URLs ([9ea933d](https://github.com/pscedu/cpra.mp.data/commit/9ea933d939064c424d60dd5f48f9cc70e362052b))
+
+
+### Bug Fixes
+
+* **analyses:** fix output type for difference and concatenate ([1711e99](https://github.com/pscedu/cpra.mp.data/commit/1711e99e144cdbfbf866ca91c7a845e43bb73224))
+* **analyses:** make land type plus logic consistent with source notebook ([47830e3](https://github.com/pscedu/cpra.mp.data/commit/47830e3636e0441baeb721f8e29e46719d7d319b))
+* **analysis:** fix handling of raster pixel IDs ([57c210f](https://github.com/pscedu/cpra.mp.data/commit/57c210f0a49b84e246528ce2712661d071e026f1))
+* **analysis:** fix lnd_chng difference map and download columns ([60bc442](https://github.com/pscedu/cpra.mp.data/commit/60bc4427dc239ab360b8a325bd114df041d69f9b))
+* **analysis:** fix post-migration issues and update docs ([592fa11](https://github.com/pscedu/cpra.mp.data/commit/592fa1149772750324eec25977bc69cb510cda21))
+* **analysis:** fix raster pixel labeling ([e20b58b](https://github.com/pscedu/cpra.mp.data/commit/e20b58bb419ce05a090007a973378e6e7706d7f5))
+* **analysis:** handle missing tiles ([318d417](https://github.com/pscedu/cpra.mp.data/commit/318d4174cd07beb74d0c0533f00526299855ec16))
+* **analysis:** make grid_cell an output filter (partial change) ([5cabb8d](https://github.com/pscedu/cpra.mp.data/commit/5cabb8d4a6c80043761c0e2ac22c4fe7f79feef1))
+* **analysis:** remove internal analysis columns from output ([1a3e585](https://github.com/pscedu/cpra.mp.data/commit/1a3e5853e68c0f48a6f4f778bb82baef3a5a699f))
+* **analysis:** set baseline year for model group 0 ([48955f9](https://github.com/pscedu/cpra.mp.data/commit/48955f9eb1f9bf6575149c45c0f1c7863b6e85e6))
+* **api:** restrict sediment dynamics to related variables ([3e6a46a](https://github.com/pscedu/cpra.mp.data/commit/3e6a46a5d4a9e756bece195d1a2251ff9a1c5236))
+* **catalog:** handle catalog schema drift ([d006968](https://github.com/pscedu/cpra.mp.data/commit/d0069681871e19720d92ce66cb85e395a018e058))
+* **scripts:** fix OOM error in check ([d1809d8](https://github.com/pscedu/cpra.mp.data/commit/d1809d8f6a4bbb93716401be76b721d42c482b2b))
+* **scripts:** remove land/water offset and update color ramps ([87a7765](https://github.com/pscedu/cpra.mp.data/commit/87a776535c02c2d636d88625fb9d444b8318d840))
+* **scripts:** use 2029 as base year for confidence calculations ([3c1ce50](https://github.com/pscedu/cpra.mp.data/commit/3c1ce502594688ed15f14ee3be00b5fef636c616))
+* **structure:** remove hdi and icm_wva variables ([19c3eb1](https://github.com/pscedu/cpra.mp.data/commit/19c3eb13a87d9b0691237349781aa318b878cd62))
+* **structure:** remove lnd_conf and lnd_type_plus variables ([866a2d9](https://github.com/pscedu/cpra.mp.data/commit/866a2d954553e2c75b29d96325c52fc510718f39))
+* **structure:** remove lnd_conf_chng variable and land change confidence script ([d19cffe](https://github.com/pscedu/cpra.mp.data/commit/d19cffe9571a16d7c07f12384a3d204177773ae2))
+* **structure:** set -9999000 as NoData value for millimeter elevation ([a06e9b2](https://github.com/pscedu/cpra.mp.data/commit/a06e9b25652aac449524ef1d8da7cfc148e8c13f))
+* **variables:** warn on unknown legends ([6465c53](https://github.com/pscedu/cpra.mp.data/commit/6465c5361a07902a77007fd8c142c6508d20c956))
+* **visualizations:** fix time series chart for lnd_chng and ([c20c4c9](https://github.com/pscedu/cpra.mp.data/commit/c20c4c9c0d8559d7787d8886faa698271810b104))
+
+
+### Performance Improvements
+
+* **analysis:** fix tile memory regression ([18cdb99](https://github.com/pscedu/cpra.mp.data/commit/18cdb99983963d92e1e172b81d59e277dfd7b292))
+* **analysis:** group raster sampling by COG tile ([3353094](https://github.com/pscedu/cpra.mp.data/commit/3353094b3643017947ed5fea241b4047cc4ad893))
+* **analysis:** implement pushdown ([6be5b48](https://github.com/pscedu/cpra.mp.data/commit/6be5b482af743aafb34f21c97c973e58a66d36ee))
+* **analysis:** set GDAL cache size in MB ([7f121fd](https://github.com/pscedu/cpra.mp.data/commit/7f121fd35e740688bedbc9f99b7851ae49478c7d))
+* **api:** add fold optimization for tabular data ([26b1da8](https://github.com/pscedu/cpra.mp.data/commit/26b1da8ec1d61c786d5703116910bd72d7d6569e))
+* **api:** fix busy-polling of temp file during download ([613143c](https://github.com/pscedu/cpra.mp.data/commit/613143c73977a2de26009cb47a3486a21455b99d))
+* **api:** improve performance of raster transform params ([9bbe643](https://github.com/pscedu/cpra.mp.data/commit/9bbe6437d081acfe96cd9c6482183930f63da88a))
+* **api:** optimize null guard ([7d2b2c7](https://github.com/pscedu/cpra.mp.data/commit/7d2b2c7aaed87450133e239fe66a31c7d1726c38))
+* **raster:** improve VRT build performance ([389dc0c](https://github.com/pscedu/cpra.mp.data/commit/389dc0c6f5afb0a480f663640bc56061c8c0676e))
+* **raster:** optimize _parallel_read_cog_metadata ([d8f85fa](https://github.com/pscedu/cpra.mp.data/commit/d8f85facf767997404b9b22e761e54f59ce0bea0))
+
+
+### Documentation
+
+* **analysis:** clarify group_by behavior ([ba57d20](https://github.com/pscedu/cpra.mp.data/commit/ba57d204f61ba1472b625a9870c93a9661cf3528))
+* **analysis:** document analyze_data function ([9816802](https://github.com/pscedu/cpra.mp.data/commit/9816802fb52942fc9c1e320498fecee7b95c4771))
+* **analysis:** update stale docstrings ([988e5ec](https://github.com/pscedu/cpra.mp.data/commit/988e5ecc83aadb1b2d55f478291bf5ad89116b71))
+* **catalog-api:** update grid cell parameter name ([f6fcd4f](https://github.com/pscedu/cpra.mp.data/commit/f6fcd4f32c9ef3f03099c0b29115211c52b57dad))
+
 ## [0.51.0](https://github.com/pscedu/cpra.mp.data/compare/v0.50.0...v0.51.0) (2026-08-25)
 
 
