@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.52.2](https://github.com/pscedu/cpra.mp.data/compare/v0.52.1...v0.52.2) (2026-10-09)
+
+
+### Performance Improvements
+
+* **raster:** remove unnecessary metadata reads ([2d0eb6f](https://github.com/pscedu/cpra.mp.data/commit/2d0eb6f01b5b77889efb4ea5fc0d001406a595e0))
+
 ## [0.52.1](https://github.com/pscedu/cpra.mp.data/compare/v0.52.0...v0.52.1) (2026-10-09)
 
 
