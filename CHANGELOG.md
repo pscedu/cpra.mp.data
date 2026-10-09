@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.52.1](https://github.com/pscedu/cpra.mp.data/compare/v0.52.0...v0.52.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* make Release Please update uv lock file ([badb795](https://github.com/pscedu/cpra.mp.data/commit/badb795ecd1eef2e9c987902652a83e0db1ff8ad))
+
 ## [0.52.0](https://github.com/pscedu/cpra.mp.data/compare/v0.51.0...v0.52.0) (2026-10-09)
 
 
