@@ -17,11 +17,12 @@ jobs:
       tag_name: ${{ steps.rp.outputs.tag_name }}
       upload_url: ${{ steps.rp.outputs.upload_url }}
     steps:
+      # Configured by release-please-config.json and .release-please-manifest.json,
+      # which also bump the project's version in uv.lock -- otherwise the image
+      # build's `uv sync --locked` fails on a stale lockfile.
       - name: Release please
         id: rp
         uses: googleapis/release-please-action@v4
-        with:
-          release-type: python
 
   build-image-api:
     name: Build and Push API Image
