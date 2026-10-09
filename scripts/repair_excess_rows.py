@@ -84,6 +84,28 @@ SHARED = "shared"  # an output file holds rows from outside the partition; never
 NOT_WIDE = "not_wide"  # the source isn't wide-format
 
 
+_output_index: dict[Path, list[tuple[dict, Path]]] = {}
+
+
+def output_files(output_path: Path, hive_dims: dict) -> list[Path]:
+    """The output Parquet files in the partition ``hive_dims`` describes, found by path.
+
+    Deliberately a directory listing rather than ``read_parquet(include_file_paths=...)``:
+    that materializes a path string for every *row*, which for an annual dataset (every
+    model group in one partition) is enough on its own to get the process OOM-killed.
+    Each output dataset directory is walked once and cached, since the daily datasets
+    hold thousands of partitions apiece.
+    """
+    dataset_dir = output_path.joinpath(*(f"{name}={hive_dims[name]}" for name in DATASET_DIMS))
+    if dataset_dir not in _output_index:
+        _output_index[dataset_dir] = [
+            (parse_path_dims(path.parent.relative_to(output_path)), path)
+            for path in sorted(dataset_dir.rglob("*.parquet")) if path.is_file()
+        ] if dataset_dir.is_dir() else []
+    wanted = {name: str(value) for name, value in hive_dims.items()}
+    return [path for dims, path in _output_index[dataset_dir] if all(dims.get(k) == v for k, v in wanted.items())]
+
+
 def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: bool) -> dict:
     """Compare one source partition against its long-format output, group by group.
 
@@ -109,26 +131,19 @@ def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: b
     n_geo = len(geo_cols)
 
     try:
-        files = (
-            read_parquet(base_path=output_path, include_file_paths="__path__", **hive_dims)
-            .select("__path__")
-            .collect()["__path__"]
-            .unique()
-            .sort()
-            .to_list()
-        )
+        existing_lf = read_parquet(base_path=output_path, **hive_dims)
+        partition_rows = existing_lf.select(pl.len()).collect(engine="streaming").item()
     except Exception:
-        files = []
-    if not files:
+        partition_rows = 0
+    if not partition_rows:
         return {**record, "status": MISSING}
-    record["files"] = files
 
-    existing_lf = read_parquet(base_path=output_path, **hive_dims)
+    files = output_files(output_path, hive_dims)
+    record["files"] = [str(path) for path in files]
 
     # Every row in the partition's files must belong to the partition, or deleting the
     # files would take other partitions' data with them.
     file_rows = sum(pq.read_metadata(path).num_rows for path in files)
-    partition_rows = existing_lf.select(pl.len()).collect().item()
     if file_rows != partition_rows:
         return {**record, "status": SHARED, "existing": partition_rows}
 
@@ -141,13 +156,13 @@ def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: b
         expected = (
             wide_keys.group_by(other_dim_cols)
             .agg((pl.len() * n_geo).cast(pl.Int64).alias("expected"))
-            .collect()
+            .collect(engine="streaming")
             .cast(group_dtypes)
         )
         existing = (
             existing_lf.group_by(other_dim_cols)
             .agg(pl.len().cast(pl.Int64).alias("existing"))
-            .collect()
+            .collect(engine="streaming")
             .cast(group_dtypes)
         )
         counts = expected.join(existing, on=other_dim_cols, how="full", coalesce=True).with_columns(
@@ -155,7 +170,7 @@ def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: b
         )
     else:
         if unique_parquet_rows:
-            expected_rows = wide_keys.select(pl.len()).collect().item() * n_geo
+            expected_rows = wide_keys.select(pl.len()).collect(engine="streaming").item() * n_geo
         else:
             # Footer metadata only -- this is the common daily case, so it matters.
             expected_rows = sum(pq.read_metadata(path).num_rows for path in paths) * n_geo
@@ -362,6 +377,20 @@ def main(
     flag_statuses = {OVER, SHORT} if include_short else {OVER}
     flagged = [rel for rel, rec in records.items() if rec["status"] in flag_statuses]
 
+    # The migration skips a partition whose estimated peak exceeds --memory-limit even at
+    # the minimum batch size, rather than lose a worker to the OOM killer.  Here that
+    # check has to come before the purge: a partition purged and then OOM-killed in the
+    # rebuild is left with no output at all.
+    too_big = []
+    if memory_limit is not None:
+        for rel in flagged:
+            est = mig._partition_estimates(records[rel]["paths"], memory_limit)
+            if est is not None and est["est_peak"] > memory_limit:
+                records[rel]["action"] = "skipped_memory_limit"
+                records[rel]["error"] = f"est. peak {mig._fmt_bytes(est['est_peak'])}"
+                too_big.append(rel)
+        flagged = [rel for rel in flagged if rel not in too_big]
+
     tally: dict[str, int] = {}
     for rec in records.values():
         tally[rec["status"]] = tally.get(rec["status"], 0) + 1
@@ -377,6 +406,11 @@ def main(
                 print(f"    {rel}")
             if len(rels) > 20:
                 print(f"    ... and {len(rels) - 20} more")
+
+    if too_big:
+        print(f"\n  {len(too_big)} flagged partition(s) need more than --memory-limit to rebuild -- left alone:")
+        for rel in too_big:
+            print(f"    {rel} ({records[rel]['error']})")
 
     if flagged:
         print(f"\n{len(flagged)} partition(s) to purge and rebuild:")
@@ -407,6 +441,8 @@ def main(
         write_report()
         if flagged:
             print("\nDRY RUN -- nothing changed. Re-run with --execute to purge and rebuild.")
+        elif too_big and execute:
+            sys.exit(1)
         return
 
     # --- purge: every flagged partition, before any is rebuilt ---------------------------
@@ -437,6 +473,7 @@ def main(
         catalog.compact_partition(variable_, time_unit_, grid_)
 
     # --- verify --------------------------------------------------------------------------
+    _output_index.clear()  # the purge and rebuild replaced the files it lists
     failed = []
     for rel in purged:
         rec = records[rel]
@@ -451,9 +488,11 @@ def main(
             failed.append(rel)
     write_report()
 
-    print(f"\nRebuilt {len(purged) - len(failed)} of {len(flagged)} flagged partition(s) cleanly.")
-    if failed or len(purged) < len(flagged):
+    print(f"\nRebuilt {len(purged) - len(failed)} of {len(flagged) + len(too_big)} flagged partition(s) cleanly.")
+    if failed or len(purged) < len(flagged) or too_big:
         print("Not resolved:", file=sys.stderr)
+        for rel in too_big:
+            print(f"  {rel}: not purged, needs more than --memory-limit ({records[rel]['error']})", file=sys.stderr)
         for rel in flagged:
             rec = records[rel]
             if rel in failed or rec["action"] == "purge_failed":
