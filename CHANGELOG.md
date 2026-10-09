@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.54.0](https://github.com/pscedu/cpra.mp.data/compare/v0.53.0...v0.54.0) (2026-10-09)
+
+
+### Features
+
+* **api:** add health check route ([71c7b04](https://github.com/pscedu/cpra.mp.data/commit/71c7b04f1a69d37083cc35b987485224f8f66759))
+
+
+### Bug Fixes
+
+* pin Polars to version 1.x ([a0912b1](https://github.com/pscedu/cpra.mp.data/commit/a0912b1f63138a3f8a0a5f4ccce28154f55e960a))
+
 ## [0.53.0](https://github.com/pscedu/cpra.mp.data/compare/v0.52.2...v0.53.0) (2026-10-09)
 
 
