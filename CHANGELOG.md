@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.53.0](https://github.com/pscedu/cpra.mp.data/compare/v0.52.2...v0.53.0) (2026-10-09)
+
+
+### Features
+
+* **structure:** add ecorevion_v002 grid ([2ffe575](https://github.com/pscedu/cpra.mp.data/commit/2ffe57536b36b24de8a4251de5193b1fe44954a8))
+
+
+### Bug Fixes
+
+* **analyses:** update baseline years for lnd_chng ([a040bc7](https://github.com/pscedu/cpra.mp.data/commit/a040bc761373cec105fc86502baeeacd0e4b270f))
+* **analysis:** exclude point sampling from raster band limit ([4a703b7](https://github.com/pscedu/cpra.mp.data/commit/4a703b7ad34879388f4d3b0f88ea76fbdb60e100))
+
+
+### Documentation
+
+* update data structure docs ([21c5be1](https://github.com/pscedu/cpra.mp.data/commit/21c5be14f8454321595bb8246f6b4f65eebb2d92))
+
 ## [0.52.2](https://github.com/pscedu/cpra.mp.data/compare/v0.52.1...v0.52.2) (2026-10-09)
 
 
