@@ -919,8 +919,8 @@ def _open_band_wide_join_group(
             f"no data for {missing} -- a band-wide join needs every operand to resolve to "
             f"at least one band, and {present} did while it did not. The dimension values "
             "one operand selects are not always the caller's own: an analysis may derive "
-            "some itself (`lnd_chng` derives its baseline calendar_year from the selected "
-            "model_group_id), in which case this means the derived selection has no data "
+            "some itself (`lnd_chng` derives its baseline calendar_year from the grid "
+            "version), in which case this means the derived selection has no data "
             "for the dataset the caller named."
         )
 

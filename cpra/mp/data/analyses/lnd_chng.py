@@ -3,8 +3,8 @@ land-type-change code (`variables=["lnd_type"]`, `legend="lnd_chng"`) between an
 automatically-derived baseline year and the caller-selected comparison year(s). Renamed
 from `concatenate`, whose caller-facing shape it replaces: rather than the caller supplying
 any filterable `dimension` and exactly 2 values of it, `lnd_chng` fixes the concatenation
-axis to `calendar_year` and derives the earlier (baseline) year itself from the selected
-`model_group_id`, so the caller supplies only the later year(s) -- the same shape selecting
+axis to `calendar_year` and derives the earlier (baseline) year itself from the dataset's
+grid version, so the caller supplies only the later year(s) -- the same shape selecting
 `calendar_year` already has for every other variable. This is the concrete sense in which
 `lnd_chng` "behaves like a variable" rather than a special multi-select mode.
 
@@ -36,22 +36,14 @@ always does, so the series a chart asks for is unaffected -- as is every vector 
 which is long throughout.
 
 The baseline-year rule is a business rule, not derived from anything else in this
-codebase: `model_group_id` values below `BASELINE_ERA_BREAKPOINT` belong to an earlier
-model era whose baseline year is `EARLY_BASELINE_YEAR`; at or above it, the baseline year
-is `LATE_BASELINE_YEAR`. `BASELINE_YEAR_OVERRIDES` names the model groups the breakpoint
-does not describe at all, and wins over it where it has an entry -- `model_group_id` 0
-compares against 2025, not the 2019 its position below the breakpoint would otherwise give
-it. That override is not a tweak to the era rule but a statement that the group is outside
-the eras: the breakpoint sorts MODEL eras, and a group whose data is not one of them has
-its baseline given directly rather than derived. It was added because the derived 2019
-simply has no data for that group, which surfaced as a 500 from a deployed portal (see
-`tests/api/test_analyses_endpoints.py::TestLandChangeMissingBaselineRoute`, which still
-pins the answer for the general case of a baseline year no dataset carries).
-
-In three-image mode (two selected `model_group_id` values), the LOWER of the two decides
-the baseline regardless of where the other one falls -- e.g. `model_group_id` 650 and 900
-selected together still resolve to the 2019 baseline, since 650 is the lower one, and 0
-selected alongside anything resolves to its own 2025 for the same reason.
+codebase: a grid's version suffix says which Master Plan release its data comes from, and
+each release compares against its own plan year (`BASELINE_YEAR_BY_GRID_VERSION`). A grid
+ending `_v001` is MP2023 data with a 2023 baseline; `_v002` is MP2029 data with a 2029
+baseline. A grid with any other suffix has no known baseline and is rejected as a 400
+rather than guessed at. `model_group_id` plays no part in the year: in three-image mode
+both selected groups are on the same dataset, so on the same grid, and share one baseline.
+(`tests/api/test_analyses_endpoints.py::TestLandChangeMissingBaselineRoute` pins the
+answer for a derived baseline year the dataset does not carry.)
 
 Two modes, selected by how many `model_group_id` values are selected (mirrors
 `concatenate`'s own two-mode split; see that history for the portal-side derivation this
@@ -88,35 +80,29 @@ from cpra.mp.data.analyses.base import (
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.grids import GRIDS
 
-# The model_group_id boundary between the two baseline eras. Given directly by the
-# maintainer -- no existing convention in either repo names this boundary or either
-# baseline year, so the rationale for why 700 is the era boundary belongs in a follow-up
-# to this docstring rather than being invented here.
-BASELINE_ERA_BREAKPOINT = 700
-EARLY_BASELINE_YEAR = 2019
-LATE_BASELINE_YEAR = 2025
-
-# The model groups the breakpoint above does not describe, mapped to the baseline year each
-# one compares against. Also given directly by the maintainer, and a TABLE rather than a
-# third named constant because these are exceptions to the era rule rather than a third
-# era: an entry says "this group's baseline is not derivable from where it sits relative to
-# `BASELINE_ERA_BREAKPOINT`", and the next such group needs a row here, not another branch.
-# Group 0's year happens to equal `LATE_BASELINE_YEAR` today; it is spelled as a literal on
-# purpose, so moving the late era's baseline does not silently move group 0's with it.
-BASELINE_YEAR_OVERRIDES = {0: 2025}
+# Grid version suffix -> the baseline year of the Master Plan release whose data lives on
+# that grid version: `_v001` grids carry MP2023 data, `_v002` grids MP2029. Given directly
+# by the maintainer. The next release's grid version needs a row here, not another branch.
+MP2023_BASELINE_YEAR = 2023
+MP2029_BASELINE_YEAR = 2029
+BASELINE_YEAR_BY_GRID_VERSION = {"_v001": MP2023_BASELINE_YEAR, "_v002": MP2029_BASELINE_YEAR}
 
 
-def baseline_year(model_group_id: int) -> int:
-    """The `calendar_year` `model_group_id`'s land types are compared AGAINST -- the whole
-    of the derivation the caller does not get to make (see the module docstring's
-    baseline-year paragraph).
+def baseline_year(grid: str) -> int:
+    """The `calendar_year` land types on `grid` are compared AGAINST -- the whole of the
+    derivation the caller does not get to make (see the module docstring's baseline-year
+    paragraph).
 
     Module-level rather than a method so a test, and any future caller that needs to know
     which year a selection will actually read, can ask without building an `Analysis`.
     """
-    if model_group_id in BASELINE_YEAR_OVERRIDES:
-        return BASELINE_YEAR_OVERRIDES[model_group_id]
-    return EARLY_BASELINE_YEAR if model_group_id < BASELINE_ERA_BREAKPOINT else LATE_BASELINE_YEAR
+    for suffix, year in BASELINE_YEAR_BY_GRID_VERSION.items():
+        if grid.endswith(suffix):
+            return year
+    raise InvalidAnalysisParametersError(
+        f"lnd_chng has no baseline year for grid {grid!r}: the grid version must be one of "
+        f"{sorted(BASELINE_YEAR_BY_GRID_VERSION)}"
+    )
 
 
 class LandChange(Analysis):
@@ -193,10 +179,7 @@ class LandChange(Analysis):
         years = normalized_filter_values(dim, raw_years) if raw_years is not None else []
         mg_values = normalized_filter_values("model_group_id", self.filters["model_group_id"])
         three_image = len(mg_values) == 2
-        # `min` in three-image mode: the lower model group decides, and it is also the one
-        # the baseline branch is filtered to below, so the year and the group it is read
-        # from cannot disagree.
-        t0 = baseline_year(min(mg_values))
+        t0 = baseline_year(dataset.grid)
 
         # A raster selection stays band-wide unless something lowers it, and only a SPATIAL
         # conjunct does (`request.ops.FILTER_LOWERING_TABLE`) -- a caller's value `where`

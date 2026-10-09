@@ -71,7 +71,7 @@ from cpra.mp.data.analyses import (
     resolve_analysis,
     resolve_analysis_chain,
 )
-from cpra.mp.data.analyses.lnd_chng import EARLY_BASELINE_YEAR
+from cpra.mp.data.analyses.lnd_chng import MP2023_BASELINE_YEAR
 from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import compile_plan
@@ -199,7 +199,7 @@ class TestRegistryDrift:
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
     def test_land_change_two_image_compiles(self, base_path):
-        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
+        write_annual_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
             "lnd_chng",
             dataset=SSF_DATASET,
@@ -210,8 +210,8 @@ class TestRegistryDrift:
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
     def test_land_change_three_image_compiles(self, base_path):
-        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=500)
-        write_annual_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040), model_group_id=520)
+        write_annual_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2040), model_group_id=500)
+        write_annual_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2040), model_group_id=520)
         resolved = resolve_analysis(
             "lnd_chng",
             dataset=SSF_DATASET,
@@ -232,7 +232,7 @@ class TestRegistryDrift:
         from the grid kind, which `validate_shapes` then checks against the final frame.
         The two-image case above proves the vector half of the same derivation.
         """
-        write_raster_dataset(base_path, years=(EARLY_BASELINE_YEAR, 2040))
+        write_raster_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2040))
         resolved = resolve_analysis(
             "lnd_chng",
             dataset=RASTER_DATASET,
@@ -374,7 +374,7 @@ class TestDifferenceExecution:
 class TestLandChangeExecution:
     def test_two_image_mode_multiplies_t0_by_ten(self, base_path):
         write_annual_dataset(
-            base_path, years=(EARLY_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0
+            base_path, years=(MP2023_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0
         )
         resolved = resolve_analysis(
             "lnd_chng",
@@ -398,8 +398,8 @@ class TestLandChangeExecution:
         `calendar_year` at all, which is this with every year selected."""
         write_annual_dataset(
             base_path,
-            years=(EARLY_BASELINE_YEAR, 2040, 2050),
-            value_fn=lambda year, geo_id: 1.0 if year == EARLY_BASELINE_YEAR else 2.0,
+            years=(MP2023_BASELINE_YEAR, 2040, 2050),
+            value_fn=lambda year, geo_id: 1.0 if year == MP2023_BASELINE_YEAR else 2.0,
         )
         resolved = resolve_analysis(
             "lnd_chng",
@@ -415,13 +415,13 @@ class TestLandChangeExecution:
     def test_three_image_mode_encodes_all_three_corners(self, base_path):
         write_annual_dataset(
             base_path,
-            years=(EARLY_BASELINE_YEAR, 2040),
+            years=(MP2023_BASELINE_YEAR, 2040),
             model_group_id=500,
             value_fn=lambda year, geo_id: 1.0,
         )
         write_annual_dataset(
             base_path,
-            years=(EARLY_BASELINE_YEAR, 2040),
+            years=(MP2023_BASELINE_YEAR, 2040),
             model_group_id=520,
             value_fn=lambda year, geo_id: 1.0,
         )
@@ -450,15 +450,15 @@ class TestLandChangeExecution:
         """
         write_annual_dataset(
             base_path,
-            years=(EARLY_BASELINE_YEAR, 2040),
+            years=(MP2023_BASELINE_YEAR, 2040),
             model_group_id=500,
             value_fn=lambda year, geo_id: 1.0,
         )
         write_annual_dataset(
             base_path,
-            years=(EARLY_BASELINE_YEAR, 2040),
+            years=(MP2023_BASELINE_YEAR, 2040),
             model_group_id=520,
-            value_fn=lambda year, geo_id: 1000.0 if year == EARLY_BASELINE_YEAR else 1.0,
+            value_fn=lambda year, geo_id: 1000.0 if year == MP2023_BASELINE_YEAR else 1.0,
         )
         resolved = resolve_analysis(
             "lnd_chng",

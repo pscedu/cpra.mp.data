@@ -47,10 +47,8 @@ from cpra.mp.data.analyses.base import (
 )
 from cpra.mp.data.analyses.diff import Difference
 from cpra.mp.data.analyses.lnd_chng import (
-    BASELINE_ERA_BREAKPOINT,
-    BASELINE_YEAR_OVERRIDES,
-    EARLY_BASELINE_YEAR,
-    LATE_BASELINE_YEAR,
+    MP2023_BASELINE_YEAR,
+    MP2029_BASELINE_YEAR,
     LandChange,
     baseline_year,
 )
@@ -953,20 +951,18 @@ class TestLandChangeCardinality:
 
 
 class TestLandChangeBaselineYear:
-    """The `BASELINE_ERA_BREAKPOINT`/`EARLY_BASELINE_YEAR`/`LATE_BASELINE_YEAR` business
-    rule: `min()` of the selected `model_group_id` values decides the baseline era, even
-    when a straddling pair is selected together (e.g. 650 and 900 together still resolve
-    to the early baseline, since 650 is the lower one).
+    """The grid-version business rule: a `_v001` grid is MP2023 data compared against
+    `MP2023_BASELINE_YEAR`, a `_v002` grid is MP2029 data compared against
+    `MP2029_BASELINE_YEAR`, and `model_group_id` has no say in it.
     """
 
-    def _leading_filter(self, model_group_id):
+    def _leading_filter(self, model_group_id, dataset=SSF_DATASET):
         """The BASELINE branch's own filter, which is `steps[0]` -- the derived year is the
         only year on it. The comparison branch's filter (a later step) carries the caller's
-        own year selection and never the derived one; the two are separate reads now, so
-        the baseline year no longer shows up as the extra member of a two-value `IN`.
+        own year selection and never the derived one.
         """
         analysis = LandChange(
-            dataset=SSF_DATASET,
+            dataset=dataset,
             filters={
                 "calendar_year": 2040,
                 "model_group_id": model_group_id,
@@ -980,64 +976,32 @@ class TestLandChangeBaselineYear:
         assert "2040" not in leading.where  # the comparison year is the other branch's
         return leading
 
-    def test_below_breakpoint_uses_the_early_baseline(self):
-        leading = self._leading_filter(BASELINE_ERA_BREAKPOINT - 50)
-        assert f"calendar_year = {EARLY_BASELINE_YEAR}" in leading.where
+    def test_a_v001_grid_uses_the_mp2023_baseline(self):
+        assert SSF_DATASET.grid.endswith("_v001")
+        leading = self._leading_filter(500)
+        assert f"calendar_year = {MP2023_BASELINE_YEAR}" in leading.where
 
-    def test_at_the_breakpoint_uses_the_late_baseline(self):
-        leading = self._leading_filter(BASELINE_ERA_BREAKPOINT)
-        assert f"calendar_year = {LATE_BASELINE_YEAR}" in leading.where
+    def test_a_v002_grid_uses_the_mp2029_baseline(self):
+        dataset = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v002")
+        leading = self._leading_filter(500, dataset=dataset)
+        assert f"calendar_year = {MP2029_BASELINE_YEAR}" in leading.where
 
-    def test_a_straddling_pair_still_uses_the_lower_ones_era(self):
-        leading = self._leading_filter([650, 900])
-        assert f"calendar_year = {EARLY_BASELINE_YEAR}" in leading.where
+    def test_model_group_does_not_move_the_baseline(self):
+        for model_group_id in (0, 500, 705, 900, [650, 900], [0, 650]):
+            leading = self._leading_filter(model_group_id)
+            assert f"calendar_year = {MP2023_BASELINE_YEAR}" in leading.where
 
-    def test_an_overridden_model_group_ignores_the_breakpoint(self):
-        """`model_group_id` 0 sits below the breakpoint, so the era rule alone would give it
-        `EARLY_BASELINE_YEAR` -- a year its data does not carry, which reached a deployed
-        portal as a 500. `BASELINE_YEAR_OVERRIDES` is what says the breakpoint does not
-        describe this group at all.
-        """
-        # Named rather than iterated off the table: a loop over `BASELINE_YEAR_OVERRIDES`
-        # passes vacuously the moment the table is empty, which is exactly the regression
-        # this is here to catch.
-        assert BASELINE_YEAR_OVERRIDES[0] == 2025
-        leading = self._leading_filter(0)
-        assert f"calendar_year = {BASELINE_YEAR_OVERRIDES[0]}" in leading.where
-        assert f"calendar_year = {EARLY_BASELINE_YEAR}" not in leading.where
-
-        # Every override has to actually differ from what the era rule would derive,
-        # otherwise the row is dead weight that reads as a rule when it is a no-op.
-        for model_group_id, year in BASELINE_YEAR_OVERRIDES.items():
-            derived = (
-                EARLY_BASELINE_YEAR
-                if model_group_id < BASELINE_ERA_BREAKPOINT
-                else LATE_BASELINE_YEAR
-            )
-            assert year != derived, model_group_id
-
-    def test_the_override_wins_in_a_pair_it_is_the_lower_of(self):
-        """The `min()` rule and the override table compose in the one order that keeps the
-        year consistent with the data it is read from: `min()` picks the GROUP, then the
-        group picks the year. Taking the min of each group's YEAR instead would hand back
-        650's 2019 for this pair while the baseline branch reads group 0 -- which has no
-        2019. The pair is 0 and 650 rather than 0 and something past the breakpoint because
-        group 0's override coincides with `LATE_BASELINE_YEAR`, and a pair whose two years
-        agree cannot tell the orders apart.
-        """
-        leading = self._leading_filter([0, 650])
-        assert f"calendar_year = {BASELINE_YEAR_OVERRIDES[0]}" in leading.where
-        assert f"calendar_year = {EARLY_BASELINE_YEAR}" not in leading.where
-        assert "model_group_id = 0" in leading.where
+    def test_an_unversioned_grid_is_rejected(self):
+        with pytest.raises(InvalidAnalysisParametersError, match="parish_v2020"):
+            baseline_year("parish_v2020")
 
     def test_baseline_year_is_asking_the_same_question_the_pipeline_does(self):
         """The helper exists so a caller can know which year a selection will read without
         building an `Analysis`; if it ever stopped agreeing with `pipeline()`, it would be
         worse than not having it.
         """
-        for model_group_id in (0, BASELINE_ERA_BREAKPOINT - 50, BASELINE_ERA_BREAKPOINT, 900):
-            leading = self._leading_filter(model_group_id)
-            assert f"calendar_year = {baseline_year(model_group_id)}" in leading.where
+        leading = self._leading_filter(500)
+        assert f"calendar_year = {baseline_year(SSF_DATASET.grid)}" in leading.where
 
 
 class TestLandChangePipeline:
@@ -1064,7 +1028,7 @@ class TestLandChangePipeline:
         assert isinstance(baseline, FilterStep)
         assert baseline.input == "base"
         assert baseline.where == (
-            f"calendar_year = {LATE_BASELINE_YEAR} AND model_group_id = 705 "
+            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 "
             "AND percentile = 50 AND scenario_id = 7"
         )
         # THE BROADCAST. `calendar_year` is missing from `by`, so the group drops the
@@ -1112,7 +1076,7 @@ class TestLandChangePipeline:
             {"model_group_id": 705, "scenario_id": 7, "percentile": 50}
         )
         baseline, _, comparison, _, _ = pipeline.steps
-        assert f"calendar_year = {LATE_BASELINE_YEAR}" in baseline.where
+        assert f"calendar_year = {MP2023_BASELINE_YEAR}" in baseline.where
         assert "calendar_year" not in comparison.where
 
     def test_three_image_mode(self):
@@ -1127,7 +1091,7 @@ class TestLandChangePipeline:
         # negatively because there was one shared read to say it on.
         assert isinstance(baseline, FilterStep)
         assert baseline.where == (
-            f"calendar_year = {LATE_BASELINE_YEAR} AND model_group_id = 705 "
+            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 "
             "AND percentile = 50 AND scenario_id = 7"
         )
         assert "NOT" not in baseline.where

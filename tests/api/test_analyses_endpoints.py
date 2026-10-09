@@ -65,6 +65,7 @@ from rasterio.warp import transform, transform_bounds
 from shapely.geometry import box
 
 from cpra.mp.data import config
+from cpra.mp.data.analyses.lnd_chng import MP2023_BASELINE_YEAR
 from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
@@ -814,8 +815,8 @@ class TestLandChangeChainRoute:
     throughout and never had the defect) and that the values are land-type codes.
     """
 
-    # 705 is at or above `lnd_chng.BASELINE_ERA_BREAKPOINT`, so the derived baseline year is
-    # 2025 and 2040 is the one comparison year band-wide output allows.
+    # The raster stand-in's grid is a `_v001` one, so the derived baseline year is
+    # `MP2023_BASELINE_YEAR` and 2040 is the one comparison year band-wide output allows.
     QUERY = {
         "analysis": "lnd_chng,diff",
         **RASTER_DATASET,
@@ -838,10 +839,12 @@ class TestLandChangeChainRoute:
         for scenario_id, comparison in ((34, 1), (35, 2)):
             write_raster_dataset(
                 base_path,
-                years=(2025, 2040),
+                years=(MP2023_BASELINE_YEAR, 2040),
                 model_group_id=705,
                 scenario_id=scenario_id,
-                fill_fn=lambda year, comparison=comparison: 1 if year == 2025 else comparison,
+                fill_fn=lambda year, comparison=comparison: (
+                    1 if year == MP2023_BASELINE_YEAR else comparison
+                ),
             )
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         return base_path
@@ -908,25 +911,22 @@ class TestLandChangeMissingBaselineRoute:
     """The derived baseline year has no data for the selected model group -- reported from
     a deployed portal as a 500 on `analysis=lnd_chng` at `model_group_id=0`.
 
-    `lnd_chng` derives the baseline year from `model_group_id` alone (below
-    `BASELINE_ERA_BREAKPOINT`, `EARLY_BASELINE_YEAR`), and a caller can neither see nor
-    override it. When that year is absent from the dataset, the baseline branch resolves to
+    `lnd_chng` derives the baseline year from the grid version alone (`_v001`,
+    `MP2023_BASELINE_YEAR`), and a caller can neither see nor override it. When that year is absent from the dataset, the baseline branch resolves to
     zero bands while the comparison branch does not, and
     `execution.execute._open_band_wide_join_group`'s partial-zero guard fires -- correctly,
     but as a bare `ValueError`, which `api.boundary` has no mapping for and uvicorn turns
     into a 500 with a stack trace.
 
     It is a 404 now, carrying which operand came back empty and which dataset it selected.
-    Whether `model_group_id` 0 should derive a DIFFERENT baseline year is a separate,
-    still-open question -- this only pins that the answer is an answer rather than a crash.
     """
 
     QUERY = {
         "analysis": "lnd_chng",
         **RASTER_DATASET,
         "calendar_year": 2024,
-        # Below `lnd_chng.BASELINE_ERA_BREAKPOINT` (700), so the derived baseline year is
-        # `EARLY_BASELINE_YEAR` (2019) -- which the fixture below does not write.
+        # On a `_v001` grid, so the derived baseline year is `MP2023_BASELINE_YEAR` (2023)
+        # -- which the fixture below does not write.
         "model_group_id": 500,
         "scenario_id": RASTER_KWARGS["scenario_id"],
         "color_map": "lnd_chng",
@@ -950,33 +950,14 @@ class TestLandChangeMissingBaselineRoute:
         # pipeline and has never seen the name `base`.
         assert f"variable={RV}" in detail and f"grid={RG}" in detail
 
-    def test_model_group_zero_renders_against_its_own_overridden_baseline(
-        self, client, base_path, monkeypatch
-    ):
-        """The reported selection itself, now that `BASELINE_YEAR_OVERRIDES` gives
-        `model_group_id` 0 a 2025 baseline instead of the 2019 its position below the
-        breakpoint would derive. The fixture writes the selected 2024 and the overridden
-        2025 but NOT 2019 -- so it passes only because the derived year moved, and reverts
-        to the reported failure if the override is lost.
-        """
-        write_raster_dataset(base_path, years=(2024, 2025), model_group_id=0, fill_fn=lambda year: 1)
-        monkeypatch.setattr(config, "BASE_PATH", base_path)
-        tile = _tile_for_grid(base_path)
-        response = client.get(
-            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png",
-            params={**self.QUERY, "model_group_id": 0},
-        )
-        assert response.status_code == 200, response.text
-        assert response.headers["content-type"] == "image/png"
-
     def test_the_same_selection_works_once_the_baseline_year_is_present(
         self, client, base_path, monkeypatch
     ):
         """The other side of it -- the 404 above is about the MISSING year and nothing else,
-        so writing 2019 into the same fixture must turn it into an image.
+        so writing the baseline year into the same fixture must turn it into an image.
         """
         write_raster_dataset(
-            base_path, years=(2019, 2024), model_group_id=500, fill_fn=lambda year: 1
+            base_path, years=(MP2023_BASELINE_YEAR, 2024), model_group_id=500, fill_fn=lambda year: 1
         )
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         tile = _tile_for_grid(base_path)
