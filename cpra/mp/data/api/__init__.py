@@ -127,6 +127,22 @@ async def analysis_registry_error_handler(request: Request, exc: AnalysisRegistr
 install_analysis_boundary(app)
 
 
+# Liveness check for the container. Deliberately a plain `def`, not `async def`: FastAPI
+# runs sync routes on anyio's default thread limiter, the same pool every tile and data
+# read goes through (`anyio.to_thread.run_sync` in `api.pipeline`). When the data
+# filesystem (Lustre) hangs, reads block uninterruptibly and pile up there until the pool
+# is exhausted and every data route stops answering -- while async routes such as
+# /openapi.json, served straight off the event loop, keep responding. Answering here
+# therefore proves that both the event loop and a worker thread are free.
+#
+# It reads nothing from disk on purpose: one slow read is not a reason to restart, and a
+# filesystem that is down outright would not be fixed by a restart loop. Outside /v1 so
+# the ingress (which routes /v1 only) doesn't expose it.
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/v1/variables.json", tags=["Catalog"])
 def variables() -> list[Variable]:
     return [
