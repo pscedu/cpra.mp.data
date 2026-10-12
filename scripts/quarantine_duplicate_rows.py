@@ -30,6 +30,11 @@ Safety:
   beside the current one; a partition is only touched if that comes out to zero.
 * Partitions whose duplicates are all identical have no excess and are left alone.
 
+A full scan reads the keys of every partition in the tree.  ``--from-report`` limits the
+run to the partitions a ``repair_excess_rows.py --report`` CSV shows as still over (its
+``after_status``, or ``status`` for a check-only report), and prints each one's
+``over_rows`` beside the excess measured here -- they should match.
+
 Afterwards, re-run ``repair_excess_rows.py --execute`` to rebuild the affected output.
 
 Usage:
@@ -38,6 +43,12 @@ Usage:
     # Report only
     python scripts/quarantine_duplicate_rows.py \\
         --data-path /path/to/wide --quarantine-path /path/to/wide-quarantine
+
+\b
+    # Only the partitions a repair run left over
+    python scripts/quarantine_duplicate_rows.py \\
+        --data-path /path/to/wide --quarantine-path /path/to/wide-quarantine \\
+        --from-report repair_report.csv
 
 \b
     # Move the stale copies
@@ -220,12 +231,18 @@ def plan_partition(paths: list[Path]) -> dict | None:
     required=True,
     help="Where superseded files are moved, mirroring their path under --data-path. Must be outside it.",
 )
+@click.option(
+    "--from-report",
+    metavar="CSV",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Check only the partitions this repair_excess_rows.py --report CSV shows as still over.",
+)
 @click.option("--variable", help="Restrict to this variable.")
 @click.option("--grid", help="Restrict to this grid.")
 @click.option("--time-unit", help="Restrict to this time unit.")
 @click.option("--execute", is_flag=True, help="Actually move files. Without it, only report.")
 @click.option("--progress/--no-progress", default=True, help="Show a progress bar (use --no-progress for batch jobs).")
-def main(data_path, quarantine_path, variable, grid, time_unit, execute, progress):
+def main(data_path, quarantine_path, from_report, variable, grid, time_unit, execute, progress):
     base_path = Path(data_path).resolve()
     quarantine_path = Path(quarantine_path).resolve()
     if not base_path.is_dir():
@@ -233,13 +250,33 @@ def main(data_path, quarantine_path, variable, grid, time_unit, execute, progres
     if quarantine_path.is_relative_to(base_path):
         raise click.UsageError("--quarantine-path must be outside --data-path, or the migration would read it")
 
-    partitions = mig.find_partitions(base_path, variable, grid, time_unit)
+    reported: dict[str, int] = {}
+    if from_report:
+        if variable or grid or time_unit:
+            raise click.UsageError("--from-report can't be combined with --variable/--grid/--time-unit")
+        with from_report.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                if (row.get("after_status") or row["status"]) == "over":
+                    reported[row["partition"]] = int(row["over_rows"])
+        if not reported:
+            print(f"No partitions in {from_report} are still over.")
+            return
+        partitions = {}
+        for rel in reported:
+            paths = sorted((base_path / rel).glob("*.parquet"))
+            if paths:
+                partitions[base_path / rel] = paths
+            else:
+                print(f"  ERROR: no Parquet files in {base_path / rel}", file=sys.stderr)
+    else:
+        partitions = mig.find_partitions(base_path, variable, grid, time_unit)
     if not partitions:
         print("No tabular partitions found matching the given filters.")
         return
 
     plans: dict[str, dict] = {}
     identical = 0
+    unexplained = []  # reported partitions the duplicates here don't account for
     bar = tqdm(partitions.values(), desc="Checking", unit="partition", disable=not progress)
     for paths in bar:
         rel = str(paths[0].parent.relative_to(base_path))
@@ -249,19 +286,29 @@ def main(data_path, quarantine_path, variable, grid, time_unit, execute, progres
         except Exception as exc:
             tqdm.write(f"  ERROR checking {rel}: {exc}", file=sys.stderr)
             continue
-        if plan is None:
+        if plan is None or not plan["excess"]:
+            if rel in reported:
+                unexplained.append(rel)
+                tqdm.write(f"  WARNING: {rel} has no differing duplicates -- its excess has another cause")
+            if plan is not None:
+                identical += 1
             continue
-        if plan["excess"]:
-            plans[rel] = plan
-        else:
-            identical += 1
+        if rel in reported and plan["excess"] != reported[rel]:
+            unexplained.append(rel)
+            plan["unresolved"].append(
+                f"excess {plan['excess']:,} doesn't match the report's {reported[rel]:,} over -- something else is going on"
+            )
+        plans[rel] = plan
 
     print(f"\nChecked {len(partitions)} partition(s): {len(plans)} with differing duplicates, "
           f"{identical} with identical duplicates only (left alone).")
     unresolved = [rel for rel, plan in plans.items() if plan["unresolved"]]
     for rel, plan in plans.items():
         print(f"\n  {rel}")
-        print(f"    {plan['dup_keys']:,} duplicated key(s), excess {plan['excess']:,} -> {plan['after']:,}")
+        line = f"    {plan['dup_keys']:,} duplicated key(s), excess {plan['excess']:,} -> {plan['after']:,}"
+        if rel in reported:
+            line += f"  (report: {reported[rel]:,} over)"
+        print(line)
         for path in plan["move"]:
             mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(sep=" ", timespec="seconds")
             print(f"    move {path.name}  ({mtime})")
@@ -274,7 +321,7 @@ def main(data_path, quarantine_path, variable, grid, time_unit, execute, progres
         if n_files:
             print(f"\nDRY RUN -- nothing moved. {n_files} file(s) in {len(movable)} partition(s) would be "
                   f"moved to {quarantine_path}. Re-run with --execute to move them.")
-        if unresolved:
+        if unresolved or unexplained:
             sys.exit(1)
         return
 
@@ -302,7 +349,7 @@ def main(data_path, quarantine_path, variable, grid, time_unit, execute, progres
     print(f"\nMoved {moved} file(s) to {quarantine_path} (manifest: {manifest}).")
     if moved:
         print("Re-run repair_excess_rows.py --execute to rebuild the affected output.")
-    if unresolved:
+    if unresolved or unexplained:
         sys.exit(1)
 
 
