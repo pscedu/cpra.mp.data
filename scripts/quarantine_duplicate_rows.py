@@ -65,6 +65,9 @@ from cpra.mp.data.dimensions import DIMENSIONS  # noqa: E402
 
 FILE = "__file__"
 
+# Upper bound on long rows (key x grid cell x copy) unpivoted at once when measuring excess.
+CHUNK_LONG_ROWS = 5_000_000
+
 
 def key_columns(schema: dict, path: Path) -> list[str]:
     """The columns that identify one wide row: non-calendar dimensions, then the calendar."""
@@ -74,26 +77,76 @@ def key_columns(schema: dict, path: Path) -> list[str]:
     return [*other_dim_cols, cal_for(time_unit)]
 
 
-def excess_rows(paths: list[Path], schema: dict, key_cols: list[str], dup_keys: pl.DataFrame) -> int:
+def read_keys(paths: list[Path], key_cols: list[str]) -> pl.DataFrame:
+    """Every row's key, tagged with its file -- read one file at a time.
+
+    A wide file's footer describes every grid-cell column (~100k of them on the large
+    grids); scanning a whole partition at once holds all of those footers together.
+    """
+    return pl.concat(
+        [
+            pl.read_parquet(path, columns=key_cols, hive_partitioning=False).with_columns(
+                pl.lit(str(path)).alias(FILE)
+            )
+            for path in paths
+        ],
+        how="vertical_relaxed",
+    )
+
+
+def row_hashes(dups: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
+    """One hash of every non-key column per duplicated row, read file by file.
+
+    Copies of a key with equal hashes are identical and can't add excess, so the expensive
+    per-cell comparison only ever sees the keys whose copies actually differ.
+    """
+    frames = []
+    for (file,), file_keys in dups.group_by(FILE):
+        rows = (
+            pl.scan_parquet(file, hive_partitioning=False)
+            .join(file_keys.select(key_cols).unique().lazy(), on=key_cols, how="semi")
+            .collect(engine="streaming")
+        )
+        frames.append(
+            rows.select(key_cols).with_columns(
+                rows.drop(key_cols).hash_rows().alias("hash"), pl.lit(file).alias(FILE)
+            )
+        )
+        del rows
+    return pl.concat(frames, how="vertical_relaxed")
+
+
+def excess_rows(
+    schema: dict, key_cols: list[str], dups: pl.DataFrame, moved: set[str]
+) -> tuple[int, int]:
     """Long rows the conversion (with ``--unique-parquet-rows``) writes beyond one per key and grid cell.
 
-    Only rows with a duplicated key can contribute, so only those are read and unpivoted.
+    Returned for the partition as it is and as it would be without the ``moved`` files.
+    ``dups`` is the key/file rows of the keys whose copies differ; they are unpivoted a
+    slice of keys at a time, reading only the files that hold that slice.
     """
-    if not paths or dup_keys.is_empty():
-        return 0
     alpha_cols = [col for col in schema if not col[:1].isdigit()]
-    long = (
-        pl.scan_parquet(paths)
-        .join(dup_keys.lazy(), on=key_cols, how="semi")
-        .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
-    )
-    rows = long.unique().select(pl.len()).collect().item()
-    keys = long.select(*key_cols, "grid_cell").unique().select(pl.len()).collect().item()
-    return rows - keys
+    n_geo = len(schema) - len(alpha_cols)
+    keys = dups.select(key_cols).unique(maintain_order=True)
+    copies = dups.group_by(key_cols).len()["len"].max()
+    step = max(1, CHUNK_LONG_ROWS // (n_geo * copies))
+    def excess(long: pl.DataFrame) -> int:
+        return long.drop(FILE).unique().height - long.select(*key_cols, "grid_cell").unique().height
 
-
-def duplicated_keys(keys: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
-    return keys.filter(pl.len().over(key_cols) > 1)
+    before = after = 0
+    for offset in range(0, keys.height, step):
+        chunk = keys.slice(offset, step)
+        files = dups.join(chunk, on=key_cols, how="semi")[FILE].unique().to_list()
+        long = (
+            pl.scan_parquet(files, include_file_paths=FILE, hive_partitioning=False)
+            .join(chunk.lazy(), on=key_cols, how="semi")
+            .unpivot(index=[*alpha_cols, FILE], variable_name="grid_cell", value_name="value")
+            .collect(engine="streaming")
+        )
+        before += excess(long)
+        after += excess(long.filter(pl.col(FILE).is_in(moved).not_()))
+        del long
+    return before, after
 
 
 def plan_partition(paths: list[Path]) -> dict | None:
@@ -102,30 +155,19 @@ def plan_partition(paths: list[Path]) -> dict | None:
     if schema is None:
         return None
     key_cols = key_columns(schema, paths[0])
-    keys = pl.scan_parquet(paths, include_file_paths=FILE).select(*key_cols, FILE).collect()
-    dups = duplicated_keys(keys, key_cols)
+    keys = read_keys(paths, key_cols)
+    dups = keys.filter(pl.len().over(key_cols) > 1)
     if dups.is_empty():
         return None
-    dup_keys = dups.select(key_cols).unique()
-    plan = {
-        "excess": excess_rows(paths, schema, key_cols, dup_keys),
-        "move": [], "unresolved": [], "after": None, "dup_keys": dup_keys.height,
-    }
-    if not plan["excess"]:
-        return plan
 
-    # Per duplicated key, which copies differ, so a stuck file can be judged harmless or not.
-    alpha_cols = [col for col in schema if not col[:1].isdigit()]
-    differing = (
-        pl.scan_parquet(paths)
-        .join(dup_keys.lazy(), on=key_cols, how="semi")
-        .unpivot(index=alpha_cols, variable_name="grid_cell", value_name="value")
-        .unique()
-        .group_by(*key_cols, "grid_cell").len()
-        .filter(pl.col("len") > 1)
-        .select(key_cols).unique()
-        .collect()
-    )
+    hashes = row_hashes(dups, key_cols)
+    differing = hashes.filter(pl.col("hash").n_unique().over(key_cols) > 1).select(key_cols).unique()
+    plan = {
+        "excess": 0, "move": [], "unresolved": [], "after": None,
+        "dup_keys": dups.select(key_cols).unique().height,
+    }
+    if differing.is_empty():
+        return plan
 
     mtimes = pl.DataFrame(
         {FILE: list(set(dups[FILE])), "mtime": [Path(f).stat().st_mtime for f in set(dups[FILE])]},
@@ -159,10 +201,9 @@ def plan_partition(paths: list[Path]) -> dict | None:
             )
     plan["move"].sort(key=lambda path: path.stat().st_mtime)
 
-    remaining = [path for path in paths if path not in set(plan["move"])]
-    remaining_keys = keys.filter(pl.col(FILE).is_in([str(path) for path in remaining]))
-    plan["after"] = excess_rows(
-        remaining, schema, key_cols, duplicated_keys(remaining_keys, key_cols).select(key_cols).unique()
+    # Identical copies add no excess before or after, so only the differing keys are measured.
+    plan["excess"], plan["after"] = excess_rows(
+        schema, key_cols, dups.join(differing, on=key_cols, how="semi"), {str(path) for path in plan["move"]}
     )
     if plan["after"]:
         plan["unresolved"].append(f"{plan['after']:,} excess row(s) would remain")
@@ -199,8 +240,10 @@ def main(data_path, quarantine_path, variable, grid, time_unit, execute, progres
 
     plans: dict[str, dict] = {}
     identical = 0
-    for paths in tqdm(partitions.values(), desc="Checking", unit="partition", disable=not progress):
+    bar = tqdm(partitions.values(), desc="Checking", unit="partition", disable=not progress)
+    for paths in bar:
         rel = str(paths[0].parent.relative_to(base_path))
+        bar.set_postfix_str(rel, refresh=False)
         try:
             plan = plan_partition(paths)
         except Exception as exc:
