@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.55.0](https://github.com/pscedu/cpra.mp.data/compare/v0.54.0...v0.55.0) (2026-10-13)
+
+
+### Features
+
+* **scripts:** add duplicate row quarentine script ([12b08ed](https://github.com/pscedu/cpra.mp.data/commit/12b08ed1abb2d5e0bae65571e8ce6e29190c0b73))
+* **structure:** update lnd_conf_diff labels and colors ([e5a2886](https://github.com/pscedu/cpra.mp.data/commit/e5a288665ad0154cab0a48de6da6d35f335bcea3))
+
+
+### Performance Improvements
+
+* **scripts:** only check reported partitions for quarentine ([147b50d](https://github.com/pscedu/cpra.mp.data/commit/147b50dd302fc7a9e3ff3d5a0275e5a7aa457c50))
+* **scripts:** prevent OOM in quarentine script ([d8f42f9](https://github.com/pscedu/cpra.mp.data/commit/d8f42f93a1513a6efe53a1cf19b91c776172968a))
+
 ## [0.54.0](https://github.com/pscedu/cpra.mp.data/compare/v0.53.0...v0.54.0) (2026-10-09)
 
 
