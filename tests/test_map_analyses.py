@@ -219,7 +219,7 @@ class TestDifferenceRampVsNamedLegend:
         """
         metadata = self._map(analysis="lnd_conf,diff")._get_legend_metadata(False)
         assert metadata["type"] == "discrete"
-        assert [step["label"] for step in metadata["steps"]][:2] == ["No Data", "Likely Land Loss"]
+        assert [step["label"] for step in metadata["steps"]][:2] == ["No Data", "Land Loss, High Confidence"]
         assert metadata["steps"][0]["color"] == "#00000000"
         # Still named as a difference, from `Meta.label` plus the word -- not from the
         # chain's `title_suffix`, which would repeat "Confidence".

@@ -276,8 +276,8 @@ class TestRegistry:
         first bucket and is drawn in that bucket's color. Without a leading `No Data` band
         that was the darkest water color for `lnd_conf` -- the whole area outside the model
         domain rendered as a confident all-water answer -- and, once
-        `difference_legend` routes `lnd_conf,diff` onto `lnd_conf_diff`, would be "Likely
-        Land Loss" for the same pixels.
+        `difference_legend` routes `lnd_conf,diff` onto `lnd_conf_diff`, would be "Land
+        Loss, High Confidence" for the same pixels.
 
         Asserted through `colorize_pixels` rather than by reading the CSV, since the claim
         is about what a tile actually comes out as: alpha `0` in the RGBA it returns.

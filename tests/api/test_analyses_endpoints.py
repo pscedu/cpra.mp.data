@@ -753,8 +753,8 @@ class TestLandConfidenceLegendRoute:
 
     def test_differencing_switches_the_published_legend(self, client, ensemble_dataset):
         """`lnd_conf` classifies a weighted fraction on `[0, 1]`; its difference is a signed
-        change in that fraction, which `lnd_conf_diff` reads as "likely land gain"/"high
-        confidence no change"/... `diff` cannot name either -- it knows nothing about what it
+        change in that fraction, which `lnd_conf_diff` reads as "land gain, high confidence"/"no
+        change, high confidence"/... `diff` cannot name either -- it knows nothing about what it
         was chained onto -- so the name comes from `lnd_conf`'s own `Meta.difference_legend`
         (`analyses.resolve_analysis_chain`).
         """
@@ -787,7 +787,7 @@ class TestLandConfidenceLegendRoute:
         legend = style["state"]["legend"]["default"]["entries"][0]
         assert legend["type"] == "discrete"
         assert legend["title"] == "Land Confidence Difference"
-        assert [step["label"] for step in legend["steps"]][:2] == ["No Data", "Likely Land Loss"]
+        assert [step["label"] for step in legend["steps"]][:2] == ["No Data", "Land Loss, High Confidence"]
 
 
 class TestLandChangeChainRoute:

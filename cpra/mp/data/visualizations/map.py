@@ -958,8 +958,8 @@ class Map(DatasetVisualization):
         difference of an arbitrary variable has no classification anyone has written down:
         it is derived from the variable's own scale, and is the honest default for that.
         An analysis that HAS written one down (`lnd_conf,diff` ->
-        `lnd_conf_diff`, whose classes are "likely land gain"/"high confidence no
-        change"/... rather than a symmetric ramp) says something the limit cannot, so it
+        `lnd_conf_diff`, whose classes are "land gain, high confidence"/"no change,
+        high confidence"/... rather than a symmetric ramp) says something the limit cannot, so it
         wins -- and this is the one place that has to be decided, since all four coloring
         branches (`feature_colors`, the raster source, `_legend_fill_expr`, and the legend
         metadata) read it.

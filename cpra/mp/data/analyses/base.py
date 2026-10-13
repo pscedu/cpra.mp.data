@@ -391,7 +391,7 @@ class AnalysisMeta(BaseModel):
     # analysis whose differenced result has a reading of its own. `lnd_conf` is the case
     # it exists for: its own output is a weighted fraction on `[0, 1]` and `lnd_conf`
     # classifies that, while `lnd_conf,diff` is a signed `[-1, 1]` change in that fraction,
-    # which `lnd_conf_diff` classifies as "likely land gain"/"high confidence no change"/...
+    # which `lnd_conf_diff` classifies as "land gain, high confidence"/"no change, high confidence"/...
     # A `Meta.legend` cannot say both, and neither can `diff`, which knows nothing about
     # what it is chained onto -- so the LEADING analysis names the reading of its own
     # difference here, and the chain applies it.

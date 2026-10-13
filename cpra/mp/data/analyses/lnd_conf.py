@@ -47,8 +47,8 @@ answer at all.
 `difference_legend = "lnd_conf_diff"` is the reading of this analysis's output once a
 chained `diff` stage has differenced it. Its break points are
 `scripts/generate_video_frames.py`'s `CONFIDENCE_BREAKS`: they classify a SIGNED `[-1, 1]`
-difference of this fraction between two years ("likely land gain", "high confidence no
-change", ...), which is a statement about `lnd_conf,diff`'s output and not about this
+difference of this fraction between two years ("land gain, high confidence", "no change,
+high confidence", ...), which is a statement about `lnd_conf,diff`'s output and not about this
 analysis's own -- so the two legends are declared as the two separate fields they are
 rather than one field that would have to be wrong for one of the two requests. See
 `analyses.resolve_analysis_chain`, which applies it: a chained stage's own `legend` wins
