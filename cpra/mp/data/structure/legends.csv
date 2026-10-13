@@ -151,13 +151,13 @@ lnd_conf,0.4 to < 0.6,#f5f5f5,0.6
 lnd_conf,0.6 to < 0.8,#dfc27d,0.8
 lnd_conf,0.8 to 1.0,#a6611a,
 lnd_conf_diff,No Data,#00000000,-1.0
-lnd_conf_diff,Likely Land Loss,#256B84,-0.67
-lnd_conf_diff,Possible Land Loss,#4999B6,-0.42
-lnd_conf_diff,Likely Stays Land,#A0C7D4,-0.09
-lnd_conf_diff,High Confidence No Change,#00000000,0.17
-lnd_conf_diff,Likely Stays Water,#ABCB9F,0.5
-lnd_conf_diff,Possible Land Gain,#658859,0.75
-lnd_conf_diff,Likely Land Gain,#1F4314,
+lnd_conf_diff,"Land Loss, High Confidence",#226178,-0.67
+lnd_conf_diff,"Land Loss, Moderate Confidence",#66A9C2,-0.42
+lnd_conf_diff,"Stays Land, Moderate Confidence",#AFB9BD,-0.09
+lnd_conf_diff,"No Change, High Confidence",#00000000,0.17
+lnd_conf_diff,"Stays Water, Moderate Confidence",#E0EDD8,0.5
+lnd_conf_diff,"Land Gain, Moderate Confidence",#658859,0.75
+lnd_conf_diff,"Land Gain, High Confidence",#1F4314,
 lnd_type,No Data,#00000000,1.0
 lnd_type,Vegetated Wetland (value=1),#008000,2.0
 lnd_type,Open Water (value=2),#6495ed,3.0
