@@ -40,15 +40,19 @@ Data layers (--historic-data, the historic persistent-change raster):
      they describe the same ground. Without that data step 3 writes the group from the
      historic record alone, which stops in 2015.
 
-Confidence layers (--confidence-data, a directory of lnd_conf_chng rasters):
-  1. Symbolize each raster at its own 30 m resolution by classifying the signed value
-     against CONFIDENCE_BREAKS. An lnd_conf_chng value is a plain difference against the
-     base year, so its sign is the direction of change and the ramps read as "moved toward
-     water" (blue) and "moved toward land" (green), each running pale where the pixel has
-     barely moved to dark where it has flipped outright. The two bands either side of zero
-     are transparent, so the layer covers only ground whose confidence has actually moved.
-  2. Resample that image onto the target grid with bicubic interpolation, the same way the
-     categorical layers are, and write confidence_<year>.png per raster.
+Confidence layers (--confidence-data, the multiband COG data directory, with
+--model-group-id):
+  1. Run the lnd_conf named analysis (cpra/mp/data/analyses/lnd_conf.py) over the lnd_type
+     ensemble for the base year (--confidence-base-year) and for each frame's year, and
+     subtract the base year's confidence from the year's. The difference is signed, on
+     [-1, 1]: negative where the pixel has moved toward water, positive toward land.
+  2. Symbolize that difference at its own 30 m resolution by classifying it against
+     CONFIDENCE_BREAKS, so the ramps read as "moved toward water" (blue) and "moved toward
+     land" (green), each running pale where the pixel has barely moved to dark where it
+     has flipped outright. The two bands either side of zero are transparent, so the layer
+     covers only ground whose confidence has actually moved.
+  3. Resample that image onto the target grid with bicubic interpolation, the same way the
+     categorical layers are, and write confidence_<year>.png per year.
 
 With --save-full, every data layer also gets a <layer>_full.tif: the same colorized
 image, georeferenced, at the resolution it was colored on rather than the video grid. That
@@ -58,7 +62,7 @@ something missing from a frame was lost in the resample or was never in the data
 Stack the results in order — basemap_underlay, historic_<group> or confidence_<year>,
 basemap_overlay — to get one frame.
 
-Requires (installed in .venv): rasterio, numpy, Pillow, pyproj, playwright
+Requires (installed in .venv): cpra.mp.data (this repo), rasterio, numpy, Pillow, pyproj, playwright
 (+ `playwright install chromium` once). The render page (maplibre-gl loaded from
 a CDN) is embedded in this script and written out to render/render.html at runtime,
 so no local maplibre-gl / node_modules install is needed.
@@ -66,7 +70,7 @@ so no local maplibre-gl / node_modules install is needed.
 
 import http.server
 import json
-import re
+import tempfile
 import threading
 from pathlib import Path
 
@@ -78,6 +82,12 @@ from PIL import Image
 from pyproj import Transformer
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
+
+from cpra.mp.data import read_data
+from cpra.mp.data.analyses import resolve_analysis
+from cpra.mp.data.analyses.base import DatasetRef
+from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
+from cpra.mp.data.analysis.execution.execute import run_to_path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RENDER_DIR = PROJECT_DIR / "render"
@@ -183,10 +193,11 @@ def hex_to_rgba(color: str):
 
 
 # --- Land-change confidence layers -----------------------------------------------
-# Each confidence raster holds lnd_conf_chng (see scripts/calculate_land_change_confidence.py):
-# a year's land/water confidence minus the base year's, with no offset applied to either
-# side, so the value is a plain difference on [-1, 1] and its sign is the direction of
-# change:
+# The lnd_conf analysis reduces the lnd_type ensemble to a weighted fraction of members
+# calling a pixel land, on [0, 1]. Each confidence layer is a year's lnd_conf minus the
+# base year's, with no offset applied to either side, so the value is a plain difference
+# on [-1, 1] and its sign is the direction of change (the same reading as the
+# lnd_conf_diff legend, whose breaks are these):
 #
 #   -1  confidently land in the base year, confidently water now   (land lost)
 #    0  confidence unmoved since the base year                     (unchanged)
@@ -221,9 +232,10 @@ assert len(CONFIDENCE_BAND_COLORS) == len(CONFIDENCE_BREAKS), (
     f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors " f"for {len(CONFIDENCE_BREAKS)} breaks"
 )
 
-# Confidence outputs are labeled by the year their filename ends in, so a directory of
-# calendar_year=2025.tif ... calendar_year=2077.tif becomes confidence_2025.png ... etc.
-CONFIDENCE_YEAR_PATTERN = re.compile(r"(\d{4})$")
+# The lnd_type dataset lnd_conf runs over, and the year every other year's confidence is
+# measured against.
+LND_CONF_DATASET = DatasetRef(variable="lnd_type", time_unit="annual", grid="morph_pixel_v002")
+CONFIDENCE_BASE_YEAR = 2029
 
 # Pin to the version this project was developed against (see package.json).
 MAPLIBRE_VERSION = "5.24.0"
@@ -637,7 +649,7 @@ def write_land_water_group_png(
 
 
 def confidence_rgba(values: np.ndarray):
-    """Symbolize an lnd_conf_chng array against CONFIDENCE_BREAKS, as (4,H,W) RGBA bands to
+    """Symbolize a signed lnd_conf difference against CONFIDENCE_BREAKS, as (4,H,W) RGBA bands to
     match colorize().
 
     Classifies the signed value, so each band takes one color from CONFIDENCE_BAND_COLORS.
@@ -662,27 +674,94 @@ def confidence_rgba(values: np.ndarray):
     return rgba
 
 
-def confidence_label(path: Path):
-    """The output label for a confidence raster: the year its name ends in, or, failing
-    that, the whole file name."""
-    match = CONFIDENCE_YEAR_PATTERN.search(path.stem)
-    return match.group(1) if match else path.stem
+def lnd_conf_years(data_path: Path, model_group_id: int):
+    """The calendar years lnd_type has ensemble members for in this model group, sorted.
+
+    lnd_conf sums whichever members a year has without renormalizing their weights, so a
+    year missing some of them reads as low confidence rather than as a mean of what is
+    there. Such years are still returned, but reported so that isn't mistaken for change.
+    """
+    members = (
+        read_data(
+            variable=LND_CONF_DATASET.variable,
+            time_unit=LND_CONF_DATASET.time_unit,
+            grid=LND_CONF_DATASET.grid,
+            model_group_id=model_group_id,
+            base_path=data_path,
+        )
+        .select("calendar_year", "scenario_id")
+        .unique()
+        .collect()
+    )
+    scenarios_by_year: dict[int, set[int]] = {}
+    for year, scenario_id in members.iter_rows():
+        if scenario_id in SCENARIO_WEIGHTS:
+            scenarios_by_year.setdefault(year, set()).add(scenario_id)
+
+    partial = {year: s for year, s in scenarios_by_year.items() if s != set(SCENARIO_WEIGHTS)}
+    if partial:
+        print(
+            f"Warning: {len(partial)} year(s) are missing lnd_conf ensemble members and will read as low "
+            "confidence: " + ", ".join(f"{year} (has {sorted(s)})" for year, s in sorted(partial.items()))
+        )
+    return sorted(scenarios_by_year)
 
 
-def write_confidence_pngs(confidence_dir: Path, output_dir: Path, save_full: bool):
-    paths = sorted(confidence_dir.glob("*.tif"))
-    if not paths:
-        raise click.UsageError(f"no .tif files found in {confidence_dir}")
-    for path in paths:
-        label = confidence_label(path)
-        print(f"Symbolizing {path.name} at source resolution and resampling to target grid (cubic)...")
-        values, src_crs, src_transform = read_values(path)
-        bands = confidence_rgba(values)
-        if save_full:
-            write_full_tif(output_dir / f"confidence_{label}_full.tif", bands, src_crs, src_transform)
-        output_path = output_dir / f"confidence_{label}.png"
-        write_png(output_path, resample_image_to_target(bands, src_crs, src_transform))
-        print(f"Wrote {output_path}")
+def run_lnd_conf(data_path: Path, model_group_id: int, year: int, work_dir: Path):
+    """Run the lnd_conf analysis for one year and read the result back as (values, crs,
+    transform), nodata as NaN. One year per run keeps the analysis to the five member bands
+    it needs rather than the whole ensemble's time series at once."""
+    resolved = resolve_analysis(
+        "lnd_conf",
+        dataset=LND_CONF_DATASET,
+        filters={"model_group_id": model_group_id, "calendar_year": [year]},
+    )
+    path = work_dir / f"lnd_conf_{year}.tif"
+    if not run_to_path(resolved.pipeline, path, base_path=data_path):
+        raise click.ClickException(f"lnd_conf returned no data for model_group_id={model_group_id}, {year}")
+    try:
+        return read_values(path)
+    finally:
+        path.unlink()
+
+
+def write_confidence_pngs(
+    data_path: Path, model_group_id: int, base_year: int, years: tuple[int, ...], output_dir: Path, save_full: bool
+):
+    """Write confidence_<year>.png for each year (every year with lnd_type data, if `years`
+    is empty): that year's lnd_conf minus `base_year`'s, symbolized and resampled."""
+    available = lnd_conf_years(data_path, model_group_id)
+    if not available:
+        raise click.UsageError(
+            f"no {LND_CONF_DATASET.variable} data for model_group_id={model_group_id} under {data_path}"
+        )
+    missing = sorted({base_year, *years} - set(available))
+    if missing:
+        raise click.UsageError(
+            f"no {LND_CONF_DATASET.variable} data for year(s) {missing} in model_group_id={model_group_id} "
+            f"(available: {available[0]}-{available[-1]})"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="lnd_conf_") as tmp:
+        work_dir = Path(tmp)
+        print(f"Running lnd_conf for base year {base_year}...")
+        base, src_crs, src_transform = run_lnd_conf(data_path, model_group_id, base_year, work_dir)
+        for year in sorted(years) or available:
+            print(f"Running lnd_conf for {year} and differencing against {base_year}...")
+            if year == base_year:
+                conf = base
+            else:
+                conf, crs, transform = run_lnd_conf(data_path, model_group_id, year, work_dir)
+                assert (crs, transform, conf.shape) == (src_crs, src_transform, base.shape), (
+                    f"lnd_conf for {year} is on a different grid than {base_year}'s"
+                )
+            print("Symbolizing at source resolution and resampling to target grid (cubic)...")
+            bands = confidence_rgba(conf - base)
+            if save_full:
+                write_full_tif(output_dir / f"confidence_{year}_full.tif", bands, src_crs, src_transform)
+            output_path = output_dir / f"confidence_{year}.png"
+            write_png(output_path, resample_image_to_target(bands, src_crs, src_transform))
+            print(f"Wrote {output_path}")
 
 
 def write_historic_png(output_dir: Path, label: str, rgba_bands: np.ndarray):
@@ -758,9 +837,24 @@ def write_full_tif(path: Path, rgba_bands: np.ndarray, src_crs, src_transform):
 @click.option(
     "--confidence-data",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="path to a directory of lnd_conf_chng rasters, e.g. the scenario_id=0 directory written by "
-    "scripts/calculate_land_change_confidence.py; emits one confidence_<year>.png per .tif in it. "
+    help="path to the multiband COG data directory (the one holding variable=lnd_type/); runs the lnd_conf "
+    "analysis over it and emits one confidence_<year>.png per year. Requires --model-group-id. "
     "Omit to skip the confidence layers.",
+)
+@click.option("--model-group-id", type=int, help="model group to compute confidence for; required by --confidence-data")
+@click.option(
+    "--confidence-base-year",
+    type=int,
+    default=CONFIDENCE_BASE_YEAR,
+    show_default=True,
+    help="year every confidence frame is differenced against",
+)
+@click.option(
+    "--confidence-year",
+    "confidence_years",
+    type=int,
+    multiple=True,
+    help="only emit confidence frames for this year (repeatable); default is every year with lnd_type data",
 )
 @click.option("--output", help="output directory for the layer PNGs", required=True)
 @click.option(
@@ -780,6 +874,9 @@ def main(
     land_water_data,
     baseline_land_water_data,
     confidence_data,
+    model_group_id,
+    confidence_base_year,
+    confidence_years,
     output,
     save_full,
     scale,
@@ -793,6 +890,8 @@ def main(
         )
     if baseline_land_water_data is not None and land_water_data is None:
         raise click.UsageError("--baseline-land-water-data does nothing without --land-water-data")
+    if confidence_data is not None and model_group_id is None:
+        raise click.UsageError("--confidence-data needs --model-group-id")
     if basemap_style is None and historic_data is None and confidence_data is None:
         raise click.UsageError("nothing to do: pass --basemap-style, --historic-data and/or --confidence-data")
     if save_full and historic_data is None and confidence_data is None:
@@ -813,7 +912,9 @@ def main(
             write_land_water_group_png(historic_data, baseline_land_water_data, land_water_data, output_dir, save_full)
 
     if confidence_data is not None:
-        write_confidence_pngs(confidence_data, output_dir, save_full)
+        write_confidence_pngs(
+            confidence_data, model_group_id, confidence_base_year, confidence_years, output_dir, save_full
+        )
 
     if basemap_style is None:
         return
