@@ -267,11 +267,11 @@ a weighted sum:
 
 | `scenario_id` | Weight |
 |---|---|
-| 34 | 0.085 |
-| 35 | 0.25 |
-| 36 | 0.33 |
+| 34 | 0.33 |
+| 35 | 0.085 |
+| 36 | 0.085 |
 | 37 | 0.25 |
-| 38 | 0.085 |
+| 38 | 0.25 |
 
 The weights sum to exactly `1.0`, so the result is the weighted FRACTION of the ensemble
 calling a cell land: `0.0` = every member says water, `1.0` = every member says land,

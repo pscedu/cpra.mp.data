@@ -71,8 +71,10 @@ from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 
 # The ensemble members this analysis combines, and each one's weight. The weights sum to
 # exactly 1.0, which is what makes the trailing `group`/`sum` a weighted MEAN of the
-# members' land/water indicators rather than an unnormalized total.
-SCENARIO_WEIGHTS = {34: 0.085, 35: 0.25, 36: 0.33, 37: 0.25, 38: 0.085}
+# members' land/water indicators rather than an unnormalized total. These are the MP29
+# confidence weighting factors, by ESLR percentile: 36 (5th) and 35 (95th) 0.085, 37 (17th)
+# and 38 (83rd) 0.25, 34 (50th) 0.33.
+SCENARIO_WEIGHTS = {34: 0.33, 35: 0.085, 36: 0.085, 37: 0.25, 38: 0.25}
 
 # `lnd_type` codes that count as land, and as water. Everything else -- including nodata --
 # is dropped rather than mapped, since it has no land/water reading to contribute.

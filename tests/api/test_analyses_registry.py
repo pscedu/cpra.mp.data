@@ -538,14 +538,14 @@ class TestLandConfidenceExecution:
 
     def test_an_unmapped_code_contributes_nothing(self, base_path, tmp_path):
         """A code outside 1-5 is dropped by the value-domain filter rather than reaching
-        the sum as itself. Member 36 carries the largest weight, so its absence is the
+        the sum as itself. Member 34 carries the largest weight, so its absence is the
         most visible: had the 9 survived unmapped it would have added 9 * 0.33.
         """
         self._assert_confidence(
             base_path,
             tmp_path,
-            {34: 1, 35: 1, 36: 9, 37: 1, 38: 1},
-            1.0 - SCENARIO_WEIGHTS[36],
+            {34: 9, 35: 1, 36: 1, 37: 1, 38: 1},
+            1.0 - SCENARIO_WEIGHTS[34],
         )
 
     def test_a_scenario_outside_the_ensemble_is_excluded(self, base_path, tmp_path):

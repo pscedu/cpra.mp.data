@@ -1551,7 +1551,7 @@ class TestLandConfidencePipeline:
         assert query["step.3.cases.1.then"] == "1.0"
         assert query["step.3.cases.2.when"] == "value = 2 OR value = 5"
         assert query["step.4.cases.1.when"] == "scenario_id = 34"
-        assert query["step.4.cases.1.then"] == "value * 0.085"
+        assert query["step.4.cases.1.then"] == "value * 0.33"
 
 
 # ------------------------------------------------------------------------------------------
