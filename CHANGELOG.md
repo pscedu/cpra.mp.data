@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.56.0](https://github.com/pscedu/cpra.mp.data/compare/v0.55.0...v0.56.0) (2026-10-15)
+
+
+### Features
+
+* **scripts:** use analysis engine for CWS video frames ([d5e9d81](https://github.com/pscedu/cpra.mp.data/commit/d5e9d816d68962390cb932cb6393b9d572eee226))
+
+
+### Bug Fixes
+
+* **analyses:** fix scenario weights in lnd_conf ([3b24d2d](https://github.com/pscedu/cpra.mp.data/commit/3b24d2d3264806404bfed9a6ea1b0e54ca32180e))
+
 ## [0.55.0](https://github.com/pscedu/cpra.mp.data/compare/v0.54.0...v0.55.0) (2026-10-13)
 
 
