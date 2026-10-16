@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.57.0](https://github.com/pscedu/cpra.mp.data/compare/v0.56.0...v0.57.0) (2026-10-16)
+
+
+### Features
+
+* **scripts:** update PMTiles script to use lnd_type_plus analysis ([1a5a413](https://github.com/pscedu/cpra.mp.data/commit/1a5a41379c3c798795b457ca6b0fc19762db3150))
+
 ## [0.56.0](https://github.com/pscedu/cpra.mp.data/compare/v0.55.0...v0.56.0) (2026-10-15)
 
 
