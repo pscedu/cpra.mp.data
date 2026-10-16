@@ -752,9 +752,11 @@ def write_confidence_pngs(
                 conf = base
             else:
                 conf, crs, transform = run_lnd_conf(data_path, model_group_id, year, work_dir)
-                assert (crs, transform, conf.shape) == (src_crs, src_transform, base.shape), (
-                    f"lnd_conf for {year} is on a different grid than {base_year}'s"
-                )
+                assert (crs, transform, conf.shape) == (
+                    src_crs,
+                    src_transform,
+                    base.shape,
+                ), f"lnd_conf for {year} is on a different grid than {base_year}'s"
             print("Symbolizing at source resolution and resampling to target grid (cubic)...")
             bands = confidence_rgba(conf - base)
             if save_full:
