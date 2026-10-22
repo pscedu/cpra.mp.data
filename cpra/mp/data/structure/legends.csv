@@ -150,14 +150,23 @@ lnd_conf,0.2 to < 0.4,#80cdc1,0.4
 lnd_conf,0.4 to < 0.6,#f5f5f5,0.6
 lnd_conf,0.6 to < 0.8,#dfc27d,0.8
 lnd_conf,0.8 to 1.0,#a6611a,
-lnd_conf_diff,No Data,#00000000,-1.0
-lnd_conf_diff,"Land Loss, High Confidence",#226178,-0.67
-lnd_conf_diff,"Land Loss, Moderate Confidence",#66A9C2,-0.42
-lnd_conf_diff,"Stays Land, Moderate Confidence",#AFB9BD,-0.09
-lnd_conf_diff,"No Change, High Confidence",#00000000,0.17
-lnd_conf_diff,"Stays Water, Moderate Confidence",#E0EDD8,0.5
-lnd_conf_diff,"Land Gain, Moderate Confidence",#658859,0.75
-lnd_conf_diff,"Land Gain, High Confidence",#1F4314,
+lnd_conf_chng,No Data,#00000000,11.0
+lnd_conf_chng,"Stays Water, High Confidence",#FFFFFF,12.0
+lnd_conf_chng,"Stays Water, Moderate Confidence",#EDEDED,13.0
+lnd_conf_chng,"Land Gain, Moderate Confidence",#67955A,14.0
+lnd_conf_chng,"Land Gain, High Confidence",#38552F,21.0
+lnd_conf_chng,"Stays Water, Moderate Confidence",#EDEDED,22.0
+lnd_conf_chng,"Stays Water, Low Confidence",#DADADA,23.0
+lnd_conf_chng,"Land Gain, Low Confidence",#BED9B6,24.0
+lnd_conf_chng,"Land Gain, Moderate Confidence",#67955A,31.0
+lnd_conf_chng,"Land Loss, Moderate Confidence",#0893C6,32.0
+lnd_conf_chng,"Land Loss, Low Confidence",#A1DBF0,33.0
+lnd_conf_chng,"Stays Land, Low Confidence",#DAC2AF,34.0
+lnd_conf_chng,"Stays Land, Moderate Confidence",#C9AB91,41.0
+lnd_conf_chng,"Land Loss, High Confidence",#005574,42.0
+lnd_conf_chng,"Land Loss, Moderate Confidence",#0893C6,43.0
+lnd_conf_chng,"Stays Land, Moderate Confidence",#C9AB91,44.0
+lnd_conf_chng,"Stays Land, High Confidence",#B38F6F,
 lnd_type,No Data,#00000000,1.0
 lnd_type,Vegetated Wetland (value=1),#008000,2.0
 lnd_type,Open Water (value=2),#6495ed,3.0

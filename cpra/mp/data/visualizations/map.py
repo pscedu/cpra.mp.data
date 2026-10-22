@@ -953,16 +953,14 @@ class Map(DatasetVisualization):
         (`_difference_breaks`: red at `-limit`, white/transparent at `0`, blue at `+limit`,
         off the variable's `difference_legend_limit`) rather than a named legend?
 
-        A difference with no named legend, which is every difference there was until
-        `lnd_conf` declared a `Meta.difference_legend`. The ramp exists because a
+        A difference with no named legend -- including `lnd_conf,diff`, whose value legend
+        `resolve_analysis_chain` drops once it is differenced. The ramp exists because a
         difference of an arbitrary variable has no classification anyone has written down:
         it is derived from the variable's own scale, and is the honest default for that.
-        An analysis that HAS written one down (`lnd_conf,diff` ->
-        `lnd_conf_diff`, whose classes are "land gain, high confidence"/"no change,
-        high confidence"/... rather than a symmetric ramp) says something the limit cannot, so it
-        wins -- and this is the one place that has to be decided, since all four coloring
-        branches (`feature_colors`, the raster source, `_legend_fill_expr`, and the legend
-        metadata) read it.
+        A difference that still carries a legend (`lnd_type_plus,diff`, a category result)
+        uses it instead -- and this is the one place that has to be decided, since all four
+        coloring branches (`feature_colors`, the raster source, `_legend_fill_expr`, and the
+        legend metadata) read it.
 
         Distinct from `_is_difference`, which stays the plain question about the RESULT and
         still answers `True` here -- `difference_suffix` and the title still say
@@ -978,10 +976,8 @@ class Map(DatasetVisualization):
         Reads the resolved analysis's own declared `legend` when `analysis=` is selected
         (`lnd_chng`'s `Meta.legend = "lnd_chng"`; `diff` declares none); a map
         with no analysis selected has no override. For a CHAIN this is what
-        `resolve_analysis_chain` settled on, which is where a leading analysis's
-        `Meta.difference_legend` takes over once a stage has differenced its output
-        (`lnd_conf,diff` -> `lnd_conf_diff`) -- nothing about that resolution is redone
-        here.
+        `resolve_analysis_chain` settled on (`lnd_conf,diff` -> `None`, the ramp) --
+        nothing about that resolution is redone here.
         """
         resolved = self.resolved_analysis
         return resolved.legend if resolved is not None else None
@@ -1001,7 +997,7 @@ class Map(DatasetVisualization):
         Args:
             difference: Whether this map is colored by the synthesized diverging ramp --
                 `_uses_difference_ramp`, not `_is_difference`. A difference that names a
-                legend of its own (`lnd_conf,diff`) takes the branch below, so that the
+                legend of its own (`lnd_type_plus,diff`) takes the branch below, so that the
                 key the client renders matches the colors the tiles actually came back in.
 
         Returns:
@@ -1011,6 +1007,14 @@ class Map(DatasetVisualization):
         # Every `display.*` helper below is the identity for it, and `result_label` falls
         # back to the analysis's own `Meta.label` for the title.
         var = self.variable
+        # A `kind="variable"` analysis (`lnd_conf`) names its own result; otherwise the
+        # variable does.
+        resolved = self.resolved_analysis
+        title = (
+            resolved.meta.label
+            if resolved is not None and resolved.meta.kind == "variable"
+            else self.result_label
+        )
 
         if difference:
             # The client renders these as tick labels, so unlike `_difference_breaks` --
@@ -1026,7 +1030,7 @@ class Map(DatasetVisualization):
                 key=lambda s: s["value"],
             )
             return {
-                "title": f"{self.result_label} Difference",
+                "title": f"{title} Difference",
                 "subtitle": display_unit(var),
                 "type": "continuous",
                 "numberFormat": display_number_format(var),
@@ -1048,17 +1052,10 @@ class Map(DatasetVisualization):
                 step["value"] = to_display(var, row["upper_bound"])
             steps.append(step)
 
-        resolved = self.resolved_analysis
-        title = (
-            resolved.meta.label
-            if resolved is not None and resolved.meta.kind == "variable"
-            else self.result_label
-        )
         # A difference reaching THIS branch is one with a legend of its own, and its title
         # still has to say what the reader is looking at. `" Difference"` verbatim rather
-        # than `difference_suffix`: that is the chain's whole `title_suffix`, which for
-        # `lnd_conf,diff` is `" Confidence Difference"` and would repeat the word already
-        # inside `Meta.label` ("Land Confidence").
+        # than `difference_suffix`: that is the chain's whole `title_suffix`, which may
+        # repeat a word already inside `Meta.label`.
         if self._is_difference():
             title = f"{title} Difference"
         return {

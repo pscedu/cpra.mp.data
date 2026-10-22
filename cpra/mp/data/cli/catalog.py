@@ -65,7 +65,7 @@ def catalog():
 
 
 @catalog.command()
-@click.option("--base-path", default="data-long")
+@click.option("--base-path", default="data")
 @click.option("--out", default="catalog")
 def build(base_path, out):
     base = Path(base_path)

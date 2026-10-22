@@ -65,7 +65,7 @@ name -- which today can only happen by naming the same analysis twice.
 An analysis either reads the caller's dataset or fixes its own inputs, and this decides
 whether the request may carry a `variable`/`time_unit`/`grid` triple:
 
-- `diff`, `lnd_chng`, `lnd_conf`, `sediment_dynamics` **require** one. Omitting it is a 400.
+- `diff`, `lnd_chng`, `lnd_conf`, `lnd_conf_chng`, `sediment_dynamics` **require** one. Omitting it is a 400.
 - `lnd_type_plus`, `sal_veg_investigation` **reject** one -- they name their own inputs,
   across grids the triple could not describe. Sending one is a 400.
 
@@ -101,7 +101,7 @@ Returns the full list of registered analyses, each with:
 the old `type` field drew:
 
 - `"variable"` stands in for an input variable in a client's variable picker
-  (`lnd_conf`, `lnd_chng`, `lnd_type_plus`);
+  (`lnd_conf`, `lnd_conf_chng`, `lnd_chng`, `lnd_type_plus`);
 - `"dimension"` operates across one dimension of whatever it is given -- a plain dataset,
   or the output of a `"variable"` analysis it is chained after (`diff`). **Only this kind
   may appear as a non-leading stage of a chain.**
@@ -275,8 +275,8 @@ a weighted sum:
 
 The weights sum to exactly `1.0`, so the result is the weighted FRACTION of the ensemble
 calling a cell land: `0.0` = every member says water, `1.0` = every member says land,
-anything between = the weight of the members that disagree. Land is `lnd_type` `1`, `3`
-and `4`; water is `2` and `5`; anything else -- including nodata -- is dropped rather
+anything between = the weight of the members that disagree. Land is `lnd_type` `1`, `3`,
+`4` and `5` (flotant marsh); water is `2`; anything else -- including nodata -- is dropped rather
 than mapped, so an unrecognized code never reaches the sum as itself.
 
 This analysis declares **no parameters of its own**: the ensemble, the weights and the
@@ -301,6 +301,34 @@ the members that actually reported.
 ```
 GET /v1/data.tif?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_conf&model_group_id=705&calendar_year=2050
 GET /v1/data/{z}/{x}/{y}.png?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_conf&model_group_id=705&calendar_year=2050
+```
+
+A difference of it (`analysis=lnd_conf,diff`) has no legend of its own and is drawn with
+the ordinary red-white-blue difference ramp: the `lnd_conf` legend classifies the fraction,
+not a signed change in it.
+
+### `lnd_conf_chng`
+
+`kind="variable"`, reads the caller's dataset, `result_kind="category"`,
+`legend="lnd_conf_chng"`. A land-confidence transition code: `lnd_conf`'s fraction is
+computed for the initial-conditions year and for the selected `calendar_year`, each is
+classified, and the two class digits are concatenated as `initial * 10 + current`:
+
+| Class | `lnd_conf` fraction | Reading |
+|---|---|---|
+| 1 | `0` | water, high confidence |
+| 2 | `> 0` to `< 0.5` | water, low confidence |
+| 3 | `0.5` to `< 1` | land, low confidence |
+| 4 | `1` | land, high confidence |
+
+So `14` is water (high) becoming land (high), `41` the reverse, and `11`/`44` no change.
+The initial-conditions year is derived from the grid exactly as `lnd_chng`'s baseline is
+(`2029` on the MP2029 `_v002` grids). Like `lnd_conf`, it rejects a caller-supplied
+`scenario_id`; like `lnd_chng`, a raster image takes exactly one `calendar_year` (several
+are a series -- add a `grid_cell`).
+
+```
+GET /v1/data.tif?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_conf_chng&model_group_id=705&calendar_year=2040
 ```
 
 ### `sal_veg_investigation`

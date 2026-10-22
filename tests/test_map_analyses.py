@@ -174,8 +174,8 @@ class TestDifferenceRampVsNamedLegend:
     """`_uses_difference_ramp` -- which of the map's two colorings a difference gets.
 
     A difference used to have exactly one: the synthesized diverging ramp built from the
-    variable's `difference_legend_limit` (`_difference_breaks`). `lnd_conf` declaring a
-    `Meta.difference_legend` makes that a choice, and the choice is made in ONE place
+    variable's `difference_legend_limit` (`_difference_breaks`). A chain whose difference
+    still carries a legend (`lnd_type_plus,diff`) makes that a choice, and the choice is made in ONE place
     because four branches read it (`feature_colors`, the raster source, `_legend_fill_expr`,
     and the legend metadata) and a map whose tiles and whose key disagree is worse than
     either answer alone.
@@ -192,11 +192,11 @@ class TestDifferenceRampVsNamedLegend:
     def _map(self, **kwargs):
         return Map(calendar_year=[2040, 2050], dimension="calendar_year", order="asc", **self.RASTER, **kwargs)
 
-    def test_land_confidence_difference_uses_its_named_legend_not_the_ramp(self):
+    def test_land_confidence_difference_uses_the_ramp(self):
         m = self._map(analysis="lnd_conf,diff")
         assert m._is_difference() is True
-        assert m._legend_name() == "lnd_conf_diff"
-        assert m._uses_difference_ramp() is False
+        assert m._legend_name() is None
+        assert m._uses_difference_ramp() is True
 
     def test_a_difference_with_no_named_legend_still_uses_the_ramp(self):
         m = self._map(analysis="diff")
@@ -213,16 +213,13 @@ class TestDifferenceRampVsNamedLegend:
         assert m._uses_difference_ramp() is False
 
     def test_the_legend_key_matches_the_colors_the_tiles_come_back_in(self):
-        """The whole point of routing the metadata off the same predicate: a reader sees
-        `lnd_conf_diff`'s own classes, in its own colors, rather than a continuous
-        red/white/blue scale keyed to a limit these tiles were never colored by.
-        """
-        metadata = self._map(analysis="lnd_conf,diff")._get_legend_metadata(False)
-        assert metadata["type"] == "discrete"
-        assert [step["label"] for step in metadata["steps"]][:2] == ["No Data", "Land Loss, High Confidence"]
-        assert metadata["steps"][0]["color"] == "#00000000"
-        # Still named as a difference, from `Meta.label` plus the word -- not from the
-        # chain's `title_suffix`, which would repeat "Confidence".
+        """`lnd_conf,diff` is keyed by the same continuous red/white/blue ramp its tiles
+        are colored by, titled from the analysis's `Meta.label` rather than the input
+        variable's."""
+        m = self._map(analysis="lnd_conf,diff")
+        metadata = m._get_legend_metadata(m._uses_difference_ramp())
+        assert metadata["type"] == "continuous"
+        assert [step["value"] for step in metadata["steps"]] == [-1, 0, 1]
         assert metadata["title"] == "Land Confidence Difference"
 
 

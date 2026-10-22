@@ -196,8 +196,7 @@ def hex_to_rgba(color: str):
 # The lnd_conf analysis reduces the lnd_type ensemble to a weighted fraction of members
 # calling a pixel land, on [0, 1]. Each confidence layer is a year's lnd_conf minus the
 # base year's, with no offset applied to either side, so the value is a plain difference
-# on [-1, 1] and its sign is the direction of change (the same reading as the
-# lnd_conf_diff legend, whose breaks are these):
+# on [-1, 1] and its sign is the direction of change, classified by these breaks:
 #
 #   -1  confidently land in the base year, confidently water now   (land lost)
 #    0  confidence unmoved since the base year                     (unchanged)

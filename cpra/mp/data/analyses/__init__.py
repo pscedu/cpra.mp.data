@@ -37,6 +37,7 @@ from cpra.mp.data.analyses.base import (
 from cpra.mp.data.analyses.diff import Difference
 from cpra.mp.data.analyses.lnd_chng import LandChange
 from cpra.mp.data.analyses.lnd_conf import LandConfidence
+from cpra.mp.data.analyses.lnd_conf_chng import LandConfidenceChange
 from cpra.mp.data.analyses.lnd_type_plus import LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analyses.sediment_dynamics import SedimentDynamics
@@ -52,6 +53,7 @@ _REGISTERED = [
     Difference,
     LandChange,
     LandConfidence,
+    LandConfidenceChange,
     LndTypePlus,
     SedimentDynamics,
 ]
@@ -241,15 +243,14 @@ def resolve_analysis_chain(
     pipeline by then always ends in a real trailing `group` (every `_dimension_steps`
     appends one), so the union of everything every stage subsumed falls out on its own.
 
-    The published `legend` is resolved per stage, most specific first: the stage's own
-    `Meta.legend`, then -- for a stage that produces a DIFFERENCE -- the LEADING analysis's
-    `Meta.difference_legend`, then whatever the chain already had. That middle rung is what
-    lets `lnd_conf,diff` come back as `lnd_conf_diff`: `diff` cannot name a legend, since it
-    knows nothing about what it was chained onto, and `lnd_conf`'s own `legend` classifies
-    an undifferenced fraction on `[0, 1]` and would be the wrong key for a signed change in
-    it. See `analyses/lnd_conf.py`, and `visualizations.map._uses_difference_ramp`, which is
-    where this decides whether the map draws a named legend or the synthesized diverging
-    ramp.
+    The published `legend` is resolved per stage: the stage's own `Meta.legend` if it
+    declares one; otherwise, for a stage that produces a DIFFERENCE of a `result_kind="value"`
+    result, none at all; otherwise whatever the chain already had. The middle rung is what
+    sends `lnd_conf,diff` to the synthesized red-white-blue ramp
+    (`visualizations.map._uses_difference_ramp`): a value legend classifies absolute values
+    (`lnd_conf`'s fraction on `[0, 1]`), not a signed change in them. A `"category"` result
+    keeps its legend (`lnd_type_plus,diff`), since dropping it would silently discard a
+    legend the analysis did declare.
 
     Every stage's `Parameters` fields are checked pairwise for a name collision before any
     parameter is partitioned out of `params` -- today's registry has exactly one
@@ -337,23 +338,12 @@ def resolve_analysis_chain(
             ) from exc
         collapsed.add(dim)
         title_suffix += stage.title_suffix
-        # Three-way, most specific first. The STAGE's own `legend` wins where it declares
-        # one, because a stage that names a legend is naming the reading of its own output
-        # whatever it was given (none does today -- `diff` declares `None`). Failing that,
-        # a stage that produces a DIFFERENCE hands over to the leading analysis's
-        # `difference_legend`, which is where an analysis says how its own output reads once
-        # differenced: `lnd_conf` classifies a fraction on `[0, 1]` and `lnd_conf_diff` a
-        # signed change in that fraction, and only the analysis itself can pair the two.
-        # Failing both, the running legend carries through unchanged, as it always did.
-        #
-        # `resolved.meta` is stage 1's, not the running one, on purpose: `difference_legend`
-        # is a fact about what THIS analysis's values mean, and the leading stage is the
-        # only one that produced values of its own -- every later stage rewrites them.
-        legend = (
-            stage.legend
-            or (resolved.meta.difference_legend if stage.result_kind == "difference" else None)
-            or legend
-        )
+        # See the docstring's legend paragraph. `result_kind` here is still the running
+        # one, i.e. what this stage was handed.
+        if stage.legend:
+            legend = stage.legend
+        elif stage.result_kind == "difference" and result_kind == "value":
+            legend = None
         result_kind = stage.result_kind
 
     return ResolvedAnalysis(

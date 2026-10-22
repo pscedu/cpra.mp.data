@@ -386,20 +386,6 @@ class AnalysisMeta(BaseModel):
     # derives the rest and deliberately does not fold these in.
     legend: str | None = None
     result_kind: Literal["value", "difference", "category"] = "value"
-    # The legend `legend` gives way to once a chained `kind="dimension"` stage has turned
-    # this analysis's output into a DIFFERENCE (`analyses.resolve_analysis_chain`), for an
-    # analysis whose differenced result has a reading of its own. `lnd_conf` is the case
-    # it exists for: its own output is a weighted fraction on `[0, 1]` and `lnd_conf`
-    # classifies that, while `lnd_conf,diff` is a signed `[-1, 1]` change in that fraction,
-    # which `lnd_conf_diff` classifies as "land gain, high confidence"/"no change, high confidence"/...
-    # A `Meta.legend` cannot say both, and neither can `diff`, which knows nothing about
-    # what it is chained onto -- so the LEADING analysis names the reading of its own
-    # difference here, and the chain applies it.
-    #
-    # `None` -- every entry but `lnd_conf` today -- means a difference of this analysis has
-    # no named legend, and `visualizations.map` renders it as the synthesized diverging ramp
-    # off the variable's `difference_legend_limit`, exactly as it always has.
-    difference_legend: str | None = None
     # The dimensions this analysis removes from the caller's view, for the portal's
     # `subsumedFor(dataset)` lookup -- advisory catalog metadata only. It plays no role in
     # resolution or chaining, both of which read the runtime `collapsed_dimensions` instead

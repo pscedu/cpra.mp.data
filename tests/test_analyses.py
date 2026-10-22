@@ -92,6 +92,7 @@ class TestRegistry:
             "diff",
             "lnd_chng",
             "lnd_conf",
+            "lnd_conf_chng",
             "lnd_type_plus",
             "sediment_dynamics",
         }
@@ -211,73 +212,49 @@ class TestRegistry:
 
     def test_land_type_confidence_declares_the_undifferenced_legend(self):
         """`lnd_conf` outputs a weighted FRACTION on `[0, 1]`, so the legend it
-        declares has to classify that domain. `legends.csv` also carries `lnd_conf_diff`,
-        whose break points are signed (`scripts/generate_video_frames.py`'s
-        `CONFIDENCE_BREAKS`) because they classify a DIFFERENCE of that fraction between two
-        years. The two are one `Meta.legend` string apart, and neither
-        `test_every_declared_legend_is_a_real_one` (both names are real) nor
-        `test_structure.TestLegendsCsv`'s structural checks (both are well-formed) can tell
-        them apart -- picking the wrong one is silently wrong colors, never an error, so the
-        domain is asserted directly here.
-
-        Both are declared now, as the two separate fields they are: `legend` for this
-        analysis's own output and `difference_legend` for a `lnd_conf,diff` chain's -- see
-        `test_land_type_confidence_declares_the_differenced_legend` below, which asserts the
-        pairing, and `TestChainedLegendResolution` for the resolution that applies it.
+        declares has to classify that domain. A wrong legend name is silently wrong colors,
+        never an error, so the domain is asserted directly here.
         """
-
-        def bounds(legend_name):
-            return [b for b in LEGENDS[legend_name].break_points["upper_bound"].to_list() if b is not None]
-
-        declared = bounds(ANALYSES["lnd_conf"].Meta.legend)
+        declared = [
+            b
+            for b in LEGENDS[ANALYSES["lnd_conf"].Meta.legend].break_points["upper_bound"].to_list()
+            if b is not None
+        ]
         # `0.0` is the transparent `No Data` band's own upper bound, and the fraction's
         # floor: nothing this analysis outputs falls below it, so the band catches the
         # nodata sentinel alone (see the module docstring).
         assert all(0.0 <= b <= 1.0 for b in declared), declared
-        # The other one, for contrast: signed, and so not a reading of the fraction itself.
-        assert any(b < 0.0 for b in bounds("lnd_conf_diff"))
 
-    def test_land_type_confidence_declares_the_differenced_legend(self):
-        """The other half of the pair: `difference_legend` has to classify a SIGNED change
-        in that fraction, which is `[-1, 1]` -- a legend whose bounds were all non-negative
-        would color half the possible results out of range and is the mistake this field
-        exists to keep from being made silently.
+    def test_land_confidence_change_legend_covers_every_transition_code(self):
+        """Each of the 16 `initial * 10 + current` codes lands in a labelled, opaque band
+        of its own color class -- not the `No Data` band, and not a neighbor's."""
+        legend = LEGENDS[ANALYSES["lnd_conf_chng"].Meta.legend]
+        rows = legend.break_points.to_dicts()
+        codes = [i * 10 + c for i in range(1, 5) for c in range(1, 5)]
+        rgba = legend.colorize_pixels(np.array([[codes]], dtype=float))[0]
+        for code, color in zip(codes, rgba):
+            assert color[3] == 255, code
+        # Upper bounds are exclusive, so code N is in the row whose upper bound is the next
+        # code -- the label for code 14 sits on the row bounded by 21.
+        bounds = [r["upper_bound"] for r in rows]
+        label_of = {c: rows[int(np.digitize(c, [b for b in bounds if b is not None]))]["label"] for c in codes}
+        assert label_of[11] == "Stays Water, High Confidence"
+        assert label_of[14] == "Land Gain, High Confidence"
+        assert label_of[41] == "Land Loss, High Confidence"
+        assert label_of[44] == "Stays Land, High Confidence"
+        assert label_of[23] == "Land Gain, Low Confidence"
+        assert label_of[32] == "Land Loss, Low Confidence"
 
-        `lnd_conf` is the only entry declaring one; every other analysis's difference falls
-        back to `visualizations.map`'s synthesized diverging ramp, which is what a variable
-        with no written-down classification of its own can honestly offer.
-        """
-        meta = ANALYSES["lnd_conf"].Meta
-        assert meta.difference_legend == "lnd_conf_diff"
-        assert meta.difference_legend in LEGENDS
-        bounds = [
-            b
-            for b in LEGENDS[meta.difference_legend].break_points["upper_bound"].to_list()
-            if b is not None
-        ]
-        assert min(bounds) <= -1.0 and max(bounds) <= 1.0, bounds
-        assert [name for name, cls in ANALYSES.items() if cls.Meta.difference_legend] == ["lnd_conf"]
-
-    def test_every_declared_difference_legend_is_a_real_one(self):
-        """`test_every_declared_legend_is_a_real_one`'s counterpart for the second legend
-        field -- a typo here is invisible for exactly the same reason, and one rung further
-        from anything that runs, since only a CHAIN ever reaches it."""
-        for name, cls in ANALYSES.items():
-            if cls.Meta.difference_legend is not None:
-                assert cls.Meta.difference_legend in LEGENDS, name
-
-    @pytest.mark.parametrize("legend_name", ["lnd_conf", "lnd_conf_diff"])
+    @pytest.mark.parametrize("legend_name", ["lnd_conf", "lnd_conf_chng"])
     def test_the_confidence_legends_render_nodata_transparent(self, legend_name):
-        """The nodata sentinel has to fall in a transparent band on both.
+        """The nodata sentinel has to fall in a transparent band.
 
         `Legend.colorize_pixels` digitizes EVERY pixel a tile carries, the nodata fill
         included (`execution.sink.render_tile` fills nulls with `DEFAULT_NODATA` before the
         warp and never masks them again), so a value below the lowest break lands in the
         first bucket and is drawn in that bucket's color. Without a leading `No Data` band
         that was the darkest water color for `lnd_conf` -- the whole area outside the model
-        domain rendered as a confident all-water answer -- and, once
-        `difference_legend` routes `lnd_conf,diff` onto `lnd_conf_diff`, would be "Land
-        Loss, High Confidence" for the same pixels.
+        domain rendered as a confident all-water answer.
 
         Asserted through `colorize_pixels` rather than by reading the CSV, since the claim
         is about what a tile actually comes out as: alpha `0` in the RGBA it returns.
@@ -517,8 +494,8 @@ class TestResolveAnalysisChainContract:
 
 
 class TestChainedLegendResolution:
-    """Which legend a chain publishes -- `resolve_analysis_chain`'s three-way
-    stage-then-`difference_legend`-then-running resolution.
+    """Which legend a chain publishes -- `resolve_analysis_chain`'s stage legend, else none
+    for a differenced value result, else the running one.
 
     This is presentation metadata, so nothing about the compiled pipeline changes with it
     and no response-level test can notice it going wrong: `lnd_conf,diff` would still return
@@ -528,11 +505,10 @@ class TestChainedLegendResolution:
     CHAIN_FILTERS = {"model_group_id": 705, "calendar_year": [2040, 2050]}
     CHAIN_PARAMS = {"dimension": "calendar_year", "order": "asc"}
 
-    def test_differencing_land_confidence_switches_to_the_differenced_legend(self):
-        """The requested behavior: `lnd_conf,diff` publishes `lnd_conf_diff`, not
-        `lnd_conf`. `diff` declares no legend of its own and could not -- it has no idea
-        what it was chained onto -- so the name comes from the LEADING analysis's
-        `Meta.difference_legend`.
+    def test_differencing_land_confidence_drops_its_legend_for_the_ramp(self):
+        """`lnd_conf,diff` publishes no legend, so the map draws the synthesized
+        red-white-blue ramp: `lnd_conf`'s legend classifies an undifferenced fraction on
+        `[0, 1]` and would misread a signed change in it.
         """
         resolved = resolve_analysis_chain(
             ["lnd_conf", "diff"],
@@ -540,10 +516,9 @@ class TestChainedLegendResolution:
             filters=self.CHAIN_FILTERS,
             params=self.CHAIN_PARAMS,
         )
-        assert resolved.legend == "lnd_conf_diff"
+        assert resolved.legend is None
         assert resolved.result_kind == "difference"
-        # Undifferenced, the same analysis still publishes the fraction's own legend --
-        # `difference_legend` is reached by the chain and by nothing else.
+        # Undifferenced, the same analysis still publishes the fraction's own legend.
         assert (
             resolve_analysis(
                 "lnd_conf", dataset=LND_TYPE_DATASET, filters={"model_group_id": 705}, params={}
@@ -552,7 +527,7 @@ class TestChainedLegendResolution:
         )
 
     def test_a_leading_analysis_with_no_differenced_legend_keeps_its_own(self):
-        """`lnd_type_plus` declares `legend="lnd_type_plus"` and no `difference_legend`, so
+        """`lnd_type_plus` declares `legend="lnd_type_plus"` and a `"category"` result, so
         a difference of it keeps the legend it had. The alternative -- falling through to
         `None` because the result is now a difference -- would silently drop a legend an
         analysis did declare.
@@ -567,12 +542,8 @@ class TestChainedLegendResolution:
         assert resolved.result_kind == "difference"
 
     def test_a_plain_difference_still_publishes_no_legend(self):
-        """`diff` alone over an ordinary dataset is unchanged: no leading analysis means no
-        `difference_legend` to reach for, so the legend stays `None` and
-        `visualizations.map` draws the synthesized diverging ramp it always has. The new
-        field narrows nothing and widens nothing -- it only answers for the one analysis
-        that declares it.
-        """
+        """`diff` alone over an ordinary dataset: no leading analysis means no legend, so
+        `visualizations.map` draws the synthesized diverging ramp."""
         resolved = resolve_analysis(
             "diff",
             dataset=SSF_DATASET,
@@ -1458,8 +1429,8 @@ class TestLandConfidencePipeline:
         mapping = pipeline.steps[2]
         assert isinstance(mapping, CaseStep)
         assert [(arm.when, arm.then) for arm in mapping.cases] == [
-            ("value = 1 OR value = 3 OR value = 4", "1.0"),
-            ("value = 2 OR value = 5", "0.0"),
+            ("value = 1 OR value = 3 OR value = 4 OR value = 5", "1.0"),
+            ("value = 2", "0.0"),
         ]
         assert mapping.else_ is None
 
@@ -1549,7 +1520,7 @@ class TestLandConfidencePipeline:
         query = pipeline_to_query(self._build()[1])
         assert query["step.5.op"] == "group"
         assert query["step.3.cases.1.then"] == "1.0"
-        assert query["step.3.cases.2.when"] == "value = 2 OR value = 5"
+        assert query["step.3.cases.2.when"] == "value = 2"
         assert query["step.4.cases.1.when"] == "scenario_id = 34"
         assert query["step.4.cases.1.then"] == "value * 0.33"
 

@@ -695,7 +695,7 @@ class TestLandConfidenceRoute:
 
 class TestLandConfidenceLegendRoute:
     """The two legend facts about `lnd_conf`, end to end: nodata renders transparent, and
-    differencing it switches the published legend to `lnd_conf_diff`.
+    differencing it drops the published legend for the synthesized red-white-blue ramp.
 
     Both are presentation rather than arithmetic, so every test above passes either way --
     the surface is the same numbers under the wrong colors. They are asserted through the
@@ -751,43 +751,32 @@ class TestLandConfidenceLegendRoute:
         assert (alpha == 0).any(), "no transparent nodata"
         assert (alpha == 255).any(), "no opaque data -- the tile is blank"
 
-    def test_differencing_switches_the_published_legend(self, client, ensemble_dataset):
-        """`lnd_conf` classifies a weighted fraction on `[0, 1]`; its difference is a signed
-        change in that fraction, which `lnd_conf_diff` reads as "land gain, high confidence"/"no
-        change, high confidence"/... `diff` cannot name either -- it knows nothing about what it
-        was chained onto -- so the name comes from `lnd_conf`'s own `Meta.difference_legend`
-        (`analyses.resolve_analysis_chain`).
-        """
+    def test_differencing_drops_the_published_legend(self, client, ensemble_dataset):
+        """`lnd_conf`'s legend classifies a weighted fraction on `[0, 1]`, not a signed
+        change in it, so `lnd_conf,diff` publishes none (`analyses.resolve_analysis_chain`)
+        and the catalog falls back to the input variable's own legend, exactly as for any
+        plain difference -- the map then draws the ordinary difference ramp (below)."""
         response = client.get("/v1/catalog.json", params=self.DIFFERENCE_QUERY)
         assert response.status_code == 200, response.text
         output = response.json()["output"]
-        assert output["legend"] == "lnd_conf_diff"
+        assert output["legend"] == RV
         assert output["result_kind"] == "difference"
 
         # Undifferenced, the same selection still publishes the fraction's own legend.
         plain = client.get("/v1/catalog.json", params=LAND_TYPE_CONFIDENCE_QUERY)
         assert plain.json()["output"]["legend"] == "lnd_conf"
 
-    def test_the_map_style_draws_the_named_legend_rather_than_the_diverging_ramp(
-        self, client, ensemble_dataset
-    ):
-        """The other consumer, and the one a reader sees. Every other difference map colors
-        its tiles with a synthesized `continuous:` ramp off the variable's
-        `difference_legend_limit` and renders a matching continuous key; this one asks the
-        tile route for `lnd_conf_diff` by name and renders that legend's own classes. The
-        tile URL and the key are asserted together because agreeing is the whole point --
-        `visualizations.map` decides once, in `_uses_difference_ramp`.
-        """
+    def test_the_map_style_draws_the_diverging_ramp(self, client, ensemble_dataset):
+        """The tile URL and the key are asserted together because agreeing is the whole
+        point -- `visualizations.map` decides once, in `_uses_difference_ramp`."""
         response = client.get("/v1/visualizations/map.json", params=self.DIFFERENCE_QUERY)
         assert response.status_code == 200, response.text
         style = response.json()
-        assert "color_map=lnd_conf_diff" in style["sources"]["data"]["tiles"][0]
-        assert "continuous" not in style["sources"]["data"]["tiles"][0]
+        assert "continuous" in style["sources"]["data"]["tiles"][0]
 
         legend = style["state"]["legend"]["default"]["entries"][0]
-        assert legend["type"] == "discrete"
+        assert legend["type"] == "continuous"
         assert legend["title"] == "Land Confidence Difference"
-        assert [step["label"] for step in legend["steps"]][:2] == ["No Data", "Land Loss, High Confidence"]
 
 
 class TestLandChangeChainRoute:
@@ -1083,6 +1072,7 @@ class TestAnalysesCatalog:
             "lnd_chng",
             "sal_veg_investigation",
             "lnd_conf",
+            "lnd_conf_chng",
             "lnd_type_plus",
             "sediment_dynamics",
         }

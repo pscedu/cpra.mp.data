@@ -183,6 +183,7 @@ class TestRegistryDrift:
             "diff",
             "lnd_chng",
             "lnd_conf",
+            "lnd_conf_chng",
             "lnd_type_plus",
             "sediment_dynamics",
         }
@@ -523,18 +524,18 @@ class TestLandConfidenceExecution:
         self._assert_confidence(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), 0.0)
 
     def test_a_split_ensemble_sums_to_the_land_members_weight(self, base_path, tmp_path):
-        # 34 and 36 say land (codes 1 and 3), the rest water (codes 2 and 5).
+        # 34 and 36 say land (codes 1 and 3), the rest water (code 2).
         self._assert_confidence(
             base_path,
             tmp_path,
-            {34: 1, 35: 2, 36: 3, 37: 5, 38: 2},
+            {34: 1, 35: 2, 36: 3, 37: 2, 38: 2},
             SCENARIO_WEIGHTS[34] + SCENARIO_WEIGHTS[36],
         )
 
     def test_every_land_code_maps_the_same_way(self, base_path, tmp_path):
-        # Codes 1, 3 and 4 are all land, so an ensemble split across them is no different
-        # from an all-1 ensemble -- the mapping is by class, not by code.
-        self._assert_confidence(base_path, tmp_path, {34: 1, 35: 3, 36: 4, 37: 1, 38: 3}, 1.0)
+        # Codes 1, 3, 4 and 5 (flotant marsh) are all land, so an ensemble split across them
+        # is no different from an all-1 ensemble -- the mapping is by class, not by code.
+        self._assert_confidence(base_path, tmp_path, {34: 1, 35: 3, 36: 4, 37: 5, 38: 3}, 1.0)
 
     def test_an_unmapped_code_contributes_nothing(self, base_path, tmp_path):
         """A code outside 1-5 is dropped by the value-domain filter rather than reaching
@@ -566,6 +567,47 @@ class TestLandConfidenceExecution:
             assert src.count == 1
             assert "calendar_year=2050" in src.descriptions[0]
             assert src.read(1, masked=True).compressed() == pytest.approx(1.0)
+
+
+class TestLandConfidenceChangeExecution:
+    """`lnd_conf_chng`: each year's ensemble classified (1 all water, 2 `(0, 0.5)`, 3
+    `[0.5, 1)`, 4 all land) and concatenated as `initial * 10 + current`. The raster
+    stand-in grid is `_v001`, so the initial year is `MP2023_BASELINE_YEAR`.
+    """
+
+    def _run(self, base_path, tmp_path, initial, current, year=2050):
+        _write_ensemble(base_path, initial, years=(MP2023_BASELINE_YEAR,))
+        _write_ensemble(base_path, current, years=(year,))
+        resolved = resolve_analysis(
+            "lnd_conf_chng",
+            dataset=RASTER_DATASET,
+            filters={"model_group_id": RASTER_KWARGS["model_group_id"], "calendar_year": year},
+            params={},
+        )
+        validate_shapes(resolved.pipeline)
+        out = tmp_path / "confidence_change.tif"
+        run_to_path(resolved.pipeline, out, base_path=base_path)
+        with rio.open(out) as src:
+            assert src.count == 1
+            band = src.read(1, masked=True)
+        assert band.count(), "the analysis returned no valid pixels at all"
+        return band.compressed()
+
+    def test_all_water_to_all_land(self, base_path, tmp_path):
+        codes = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), dict.fromkeys(SCENARIO_WEIGHTS, 1))
+        assert codes == pytest.approx(14)
+
+    def test_flotant_counts_as_land(self, base_path, tmp_path):
+        codes = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 5), dict.fromkeys(SCENARIO_WEIGHTS, 2))
+        assert codes == pytest.approx(41)
+
+    def test_exactly_half_is_class_3_and_under_half_is_class_2(self, base_path, tmp_path):
+        """`0.33 + 0.085 + 0.085` is exactly the `0.5` boundary on paper and need not be in
+        floating point -- it must still read as class 3. Dropping one `0.085` member
+        (`0.415`) reads as class 2."""
+        half = {34: 1, 35: 1, 36: 1, 37: 2, 38: 2}
+        under_half = {34: 1, 35: 1, 36: 2, 37: 2, 38: 2}
+        assert self._run(base_path, tmp_path, half, under_half) == pytest.approx(32)
 
 
 class TestChainedAnalysisExecution:
