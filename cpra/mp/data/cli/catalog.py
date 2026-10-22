@@ -29,6 +29,9 @@ it's also used by the incremental catalog-sync hooks in
 ``tabular.write_parquet``/``compact_parquet`` and ``raster.write_cog``/
 ``compact_cog``.
 
+``--base-path``/``--out``/``--catalog`` default to the configured ``BASE_PATH``/
+``CATALOG_PATH`` (``cpra.mp.data.config``), resolved at call time.
+
 Usage:
 
 \b
@@ -39,7 +42,6 @@ Usage:
 
 import time
 import uuid
-from pathlib import Path
 
 import click
 import polars as pl
@@ -57,6 +59,7 @@ from cpra.mp.data.catalog import (
     unify_dtypes,
 )
 from cpra.mp.data.cli import cli
+from cpra.mp.data.config import get_base_path, get_catalog_path
 
 
 @cli.group()
@@ -65,10 +68,11 @@ def catalog():
 
 
 @catalog.command()
-@click.option("--base-path", default="data")
-@click.option("--out", default="catalog")
+@click.option("--base-path", default=None, help="Data root to scan (default: configured BASE_PATH).")
+@click.option("--out", default=None, help="Catalog root to write (default: configured CATALOG_PATH).")
 def build(base_path, out):
-    base = Path(base_path)
+    base = get_base_path(base_path)
+    out = get_catalog_path(out)
     t0 = time.time()
     parquet_dirs, tif_paths = {}, []
     for root, _dirs, files in base.walk():
@@ -102,9 +106,9 @@ def build(base_path, out):
 
 
 @catalog.command()
-@click.option("--catalog", "catalog_dir", default="catalog")
+@click.option("--catalog", "catalog_dir", default=None, help="Catalog root (default: configured CATALOG_PATH).")
 def compact(catalog_dir):
-    base = Path(catalog_dir)
+    base = get_catalog_path(catalog_dir)
     n_parts = n_before = n_after = 0
     for root, _dirs, files in base.walk():
         pqs = [f for f in files if f.endswith(".parquet")]
@@ -129,7 +133,7 @@ def compact(catalog_dir):
 
 
 @catalog.command()
-@click.option("--catalog", "catalog_dir", default="catalog")
+@click.option("--catalog", "catalog_dir", default=None, help="Catalog root (default: configured CATALOG_PATH).")
 @click.option("--variable", required=True)
 @click.option("--time-unit", required=True)
 @click.option("--grid", required=True)

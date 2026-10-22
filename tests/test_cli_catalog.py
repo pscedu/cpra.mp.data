@@ -7,10 +7,10 @@ production when `cli/__main__.py` imports it. See tests/test_cli.py for why that
 `cli.commands == {}` an order-dependent assertion elsewhere in the suite.
 
 All data lives under tmp_path -- never the real data/ directory (see repo CLAUDE.md).
-`build`'s `--base-path`/`--out` default to relative paths ("data-long"/"catalog"), so
-every invocation here passes explicit tmp_path-based values except the one test that
-specifically exercises the defaults, which uses `CliRunner.isolated_filesystem()` to
-sandbox the current working directory instead.
+`--base-path`/`--out`/`--catalog` default to the configured `BASE_PATH`/`CATALOG_PATH`
+(cpra/mp/data/config.py), so every invocation here passes explicit tmp_path-based values
+except the tests that specifically exercise the defaults, which monkeypatch the config
+values to tmp_path instead.
 """
 
 from pathlib import Path
@@ -20,6 +20,7 @@ import polars as pl
 from click.testing import CliRunner
 
 import cpra.mp.data.cli.catalog  # noqa: F401  (registers `catalog` on `cli`)
+from cpra.mp.data import config as cpra_config
 from cpra.mp.data.cli import cli
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
@@ -196,20 +197,20 @@ class TestBuild:
         assert "DONE: no valid datasets found" in result.output
         assert not out.exists()
 
-    def test_uses_relative_defaults_from_the_current_directory(self, tmp_path):
-        """`--base-path`/`--out` default to relative paths ("data-long"/"catalog"), so
-        an invocation with no options resolves them against the cwd -- sandboxed here
-        with `isolated_filesystem()` rather than the real repo cwd."""
-        runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
-            base = Path(cwd) / "data-long"
-            base.mkdir()
-            write_parquet(_tabular_frame([2030]), base_path=base, catalog_path=None, validate=False, **TABULAR_KWARGS)
+    def test_defaults_to_configured_base_and_catalog_paths(self, tmp_path, monkeypatch):
+        """With no options, `build` scans the configured BASE_PATH and writes to the
+        configured CATALOG_PATH, both read at call time so the patches here take effect."""
+        base = tmp_path / "data-long"
+        base.mkdir()
+        write_parquet(_tabular_frame([2030]), base_path=base, catalog_path=None, validate=False, **TABULAR_KWARGS)
+        out = tmp_path / "configured-catalog"
+        monkeypatch.setattr(cpra_config, "BASE_PATH", base)
+        monkeypatch.setattr(cpra_config, "CATALOG_PATH", out)
 
-            result = runner.invoke(cli, ["catalog", "build"])
+        result = invoke("build")
 
-            assert result.exit_code == 0
-            assert (Path(cwd) / "catalog").exists()
+        assert result.exit_code == 0
+        assert _read_catalog(out).height == 1
 
 
 class TestCompact:
@@ -254,6 +255,17 @@ class TestCompact:
         assert list(catalog_path.rglob("*.parquet")) == before
 
 
+    def test_defaults_to_configured_catalog_path(self, base_path, catalog_path, monkeypatch):
+        write_parquet(_tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(_tabular_frame([2021]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        monkeypatch.setattr(cpra_config, "CATALOG_PATH", catalog_path)
+
+        result = invoke("compact")
+
+        assert result.exit_code == 0
+        assert "DONE: 1 partitions, 2 -> 1 rows" in result.output
+
+
 class TestQuery:
     def test_reports_choices_and_results_for_a_tabular_dataset(self, base_path, catalog_path):
         write_parquet(_tabular_frame([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
@@ -292,3 +304,12 @@ class TestQuery:
 
         assert result.exit_code != 0
         assert isinstance(result.exception, ValueError)
+
+    def test_defaults_to_configured_catalog_path(self, base_path, catalog_path, monkeypatch):
+        write_parquet(_tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        monkeypatch.setattr(cpra_config, "CATALOG_PATH", catalog_path)
+
+        result = invoke("query", "--variable", "sal", "--time-unit", "annual", "--grid", "hydro_compartment_v001")
+
+        assert result.exit_code == 0
+        assert "scenario_id: choices=[7]  result=[7]" in result.output
