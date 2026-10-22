@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.57.0](https://github.com/pscedu/cpra.mp.data/compare/v0.56.0...v0.57.0) (2026-10-22)
+
+
+### Features
+
+* **analyses:** add land confidence change named analysis ([0afdff9](https://github.com/pscedu/cpra.mp.data/commit/0afdff9bc4146f8872e0882642c0faf60ff5106c))
+* **legends:** add ability to sort legend entries ([49fbd73](https://github.com/pscedu/cpra.mp.data/commit/49fbd73520e975ae864303f4e1748052625526d3))
+* **legends:** add legend layouts for simplified map legends ([4cce075](https://github.com/pscedu/cpra.mp.data/commit/4cce07540885d2adbcfe79cc04e3ab6105e04625))
+* **scripts:** update PMTiles script to use lnd_type_plus analysis ([1a5a413](https://github.com/pscedu/cpra.mp.data/commit/1a5a41379c3c798795b457ca6b0fc19762db3150))
+* **structure:** update lnd_conf breakpoints ([3a58fbb](https://github.com/pscedu/cpra.mp.data/commit/3a58fbbe5a0aac7e81bc95fdaf1796be48f231d2))
+
+
+### Bug Fixes
+
+* **cli:** use configured base and catalog paths ([f0b9254](https://github.com/pscedu/cpra.mp.data/commit/f0b9254da3d86a360533f16b2c36967458ea88b8))
+
 ## [0.56.0](https://github.com/pscedu/cpra.mp.data/compare/v0.55.0...v0.56.0) (2026-10-15)
 
 
