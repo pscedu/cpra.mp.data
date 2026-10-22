@@ -642,25 +642,25 @@ Legends determine the breakpoints and colors used to map a variable.
 
 ### `lnd_conf_chng` Legend
 
-| Label | Color | Upper Bound |
-| --- | --- | --- |
-| No Data | #00000000 | 11.0 |
-| Stays Water, High Confidence | #FFFFFF | 12.0 |
-| Stays Water, Moderate Confidence | #EDEDED | 13.0 |
-| Land Gain, Moderate Confidence | #67955A | 14.0 |
-| Land Gain, High Confidence | #38552F | 21.0 |
-| Stays Water, Moderate Confidence | #EDEDED | 22.0 |
-| Stays Water, Low Confidence | #DADADA | 23.0 |
-| Land Gain, Low Confidence | #BED9B6 | 24.0 |
-| Land Gain, Moderate Confidence | #67955A | 31.0 |
-| Land Loss, Moderate Confidence | #0893C6 | 32.0 |
-| Land Loss, Low Confidence | #A1DBF0 | 33.0 |
-| Stays Land, Low Confidence | #DAC2AF | 34.0 |
-| Stays Land, Moderate Confidence | #C9AB91 | 41.0 |
-| Land Loss, High Confidence | #005574 | 42.0 |
-| Land Loss, Moderate Confidence | #0893C6 | 43.0 |
-| Stays Land, Moderate Confidence | #C9AB91 | 44.0 |
-| Stays Land, High Confidence | #B38F6F |  |
+| Label | Color | Upper Bound | Sort |
+| --- | --- | --- | --- |
+| No Data | #00000000 | 11.0 | 0 |
+| Stays Water, High Confidence | #FFFFFF | 12.0 | 7 |
+| Stays Water, Moderate Confidence | #EDEDED | 13.0 | 8 |
+| Land Gain, Moderate Confidence | #67955A | 14.0 | 5 |
+| Land Gain, High Confidence | #38552F | 21.0 | 6 |
+| Stays Water, Moderate Confidence | #EDEDED | 22.0 | 8 |
+| Stays Water, Low Confidence | #DADADA | 23.0 | 9 |
+| Land Gain, Low Confidence | #BED9B6 | 24.0 | 4 |
+| Land Gain, Moderate Confidence | #67955A | 31.0 | 5 |
+| Land Loss, Moderate Confidence | #0893C6 | 32.0 | 2 |
+| Land Loss, Low Confidence | #A1DBF0 | 33.0 | 3 |
+| Stays Land, Low Confidence | #DAC2AF | 34.0 | 10 |
+| Stays Land, Moderate Confidence | #C9AB91 | 41.0 | 11 |
+| Land Loss, High Confidence | #005574 | 42.0 | 1 |
+| Land Loss, Moderate Confidence | #0893C6 | 43.0 | 2 |
+| Stays Land, Moderate Confidence | #C9AB91 | 44.0 | 11 |
+| Stays Land, High Confidence | #B38F6F |  | 12 |
 
 
 ### `lnd_type` Legend

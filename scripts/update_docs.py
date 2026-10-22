@@ -104,7 +104,7 @@ def update_docs():
 
     legends_content = "\n\n".join(
         [
-            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')))}"
+            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')).pipe(drop_empty_columns))}"
             for group, legend_df in sorted(legends.group_by("name"))
         ]
     )

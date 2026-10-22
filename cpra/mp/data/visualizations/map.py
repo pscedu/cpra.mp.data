@@ -1041,8 +1041,17 @@ class Map(DatasetVisualization):
         if legend is None:
             return {}
 
+        # `legends.csv`'s optional `sort` column orders the KEY only (`lnd_conf_chng`, whose
+        # codes run 11-44 but read as loss/gain/stays-water/stays-land); the tiles still
+        # colorize by `upper_bound`, which is why it is applied here and nowhere else. A
+        # stable sort, so rows sharing a label keep their relative order and the portal's
+        # first-seen dedup still picks the same one.
+        break_points = legend.break_points
+        if "sort" in break_points.columns and break_points["sort"].is_not_null().any():
+            break_points = break_points.sort("sort", nulls_last=True, maintain_order=True)
+
         steps = []
-        for row in legend.break_points.iter_rows(named=True):
+        for row in break_points.iter_rows(named=True):
             step = {"color": row["color"]}
             if "label" in row and row["label"] is not None:
                 step["label"] = row["label"]

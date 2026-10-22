@@ -26,5 +26,7 @@ class Legend:
 
 LEGENDS = {
     group[0]: Legend(group[0], df.select(pl.exclude("name")))
-    for group, df in read_structure_csv("legends").group_by("name")
+    # `sort` is empty on most rows, so the CSV reader's first-rows inference types it as a
+    # string -- which sorts "10" before "2".
+    for group, df in read_structure_csv("legends").with_columns(pl.col("sort").cast(pl.Int64)).group_by("name")
 }

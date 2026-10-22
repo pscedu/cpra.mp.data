@@ -31,6 +31,7 @@ import pytest
 
 from cpra.mp.data import config
 from cpra.mp.data.analyses import DatasetRef, resolve_analysis
+from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.visualizations.map import Map
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
@@ -221,6 +222,52 @@ class TestDifferenceRampVsNamedLegend:
         assert metadata["type"] == "continuous"
         assert [step["value"] for step in metadata["steps"]] == [-1, 0, 1]
         assert metadata["title"] == "Land Confidence Difference"
+
+
+class TestLegendSortOrder:
+    """`legends.csv`'s `sort` column reorders the legend KEY without touching the colors."""
+
+    def _metadata(self, analysis):
+        return Map(
+            analysis=analysis,
+            variable="lnd_type",
+            grid="morph_pixel_v002",
+            time_unit="annual",
+            model_group_id=[705],
+            calendar_year=[2040],
+        )._get_legend_metadata(False)
+
+    def test_land_confidence_change_key_reads_loss_gain_water_land(self):
+        metadata = self._metadata("lnd_conf_chng")
+        assert metadata["title"] == "Land Confidence Change"
+        # First-seen labels, as the portal renders them.
+        labels = list(dict.fromkeys(step["label"] for step in metadata["steps"]))
+        assert labels == [
+            "No Data",
+            "Land Loss, High Confidence",
+            "Land Loss, Moderate Confidence",
+            "Land Loss, Low Confidence",
+            "Land Gain, Low Confidence",
+            "Land Gain, Moderate Confidence",
+            "Land Gain, High Confidence",
+            "Stays Water, High Confidence",
+            "Stays Water, Moderate Confidence",
+            "Stays Water, Low Confidence",
+            "Stays Land, Low Confidence",
+            "Stays Land, Moderate Confidence",
+            "Stays Land, High Confidence",
+        ]
+
+    def test_sorting_the_key_leaves_the_legend_itself_in_break_point_order(self):
+        """Tile colorizing (`colorize_pixels`) and `/v1/legends.json` read
+        `break_points` directly, and need it ascending."""
+        bounds = LEGENDS["lnd_conf_chng"].break_points["upper_bound"].to_list()
+        assert bounds[:-1] == sorted(bounds[:-1])
+
+    def test_a_legend_without_sort_keeps_its_order(self):
+        metadata = self._metadata("lnd_chng")
+        expected = [row["label"] for row in LEGENDS["lnd_chng"].break_points.iter_rows(named=True)]
+        assert [step["label"] for step in metadata["steps"]] == expected
 
 
 class TestCompareDimensionsExclusion:

@@ -207,3 +207,12 @@ class TestLegendsCsv:
         for legend in LEGENDS.values():
             for color in legend.break_points["color"]:
                 assert pattern.match(color), f"{legend.name}: {color}"
+
+
+class TestLegendSort:
+    @pytest.mark.parametrize("legend_name", sorted(LEGENDS))
+    def test_sort_is_all_or_nothing(self, legend_name):
+        """`legends.csv`'s `sort` orders the map key; a partly-filled one would push the
+        unsorted rows to the end of it."""
+        sort = LEGENDS[legend_name].break_points["sort"]
+        assert sort.null_count() in (0, len(sort))
