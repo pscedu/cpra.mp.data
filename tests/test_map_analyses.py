@@ -269,6 +269,36 @@ class TestLegendSortOrder:
         expected = [row["label"] for row in LEGENDS["lnd_chng"].break_points.iter_rows(named=True)]
         assert [step["label"] for step in metadata["steps"]] == expected
 
+    def test_land_confidence_change_key_is_laid_out_like_the_design(self):
+        metadata = self._metadata("lnd_conf_chng")
+        # Still a discrete legend with its full step list, for a client that ignores `layout`.
+        assert metadata["type"] == "discrete"
+        assert len(metadata["steps"]) == len(LEGENDS["lnd_conf_chng"].break_points)
+
+        rows = metadata["layout"]["rows"]
+        assert [(row["kind"], row["left"], row["right"]) for row in rows] == [
+            ("swatches", "Land loss", "Land gain"),
+            ("arrows", "High confidence", "High confidence"),
+            ("swatches", "Stays water", "Stays land"),
+        ]
+        assert "steps" not in rows[1]
+        levels = ["High", "Moderate", "Low"]
+        assert [step["label"] for step in rows[0]["steps"]] == [
+            *(f"Land Loss, {level} Confidence" for level in levels),
+            *(f"Land Gain, {level} Confidence" for level in reversed(levels)),
+        ]
+        assert [step["label"] for step in rows[2]["steps"]] == [
+            *(f"Stays Water, {level} Confidence" for level in levels),
+            *(f"Stays Land, {level} Confidence" for level in reversed(levels)),
+        ]
+        # Each swatch is one of the key's own steps -- the color the tiles use for it.
+        colors = {step["label"]: step["color"] for step in metadata["steps"]}
+        for row in (rows[0], rows[2]):
+            assert all(step["color"] == colors[step["label"]] for step in row["steps"])
+
+    def test_a_legend_without_a_layout_has_no_layout_key(self):
+        assert "layout" not in self._metadata("lnd_chng")
+
 
 class TestCompareDimensionsExclusion:
     """`StackedBar.compare_dimensions`/`TimeSeriesLine.chart()`'s own local equivalent must

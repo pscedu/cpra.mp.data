@@ -216,3 +216,40 @@ class TestLegendSort:
         unsorted rows to the end of it."""
         sort = LEGENDS[legend_name].break_points["sort"]
         assert sort.null_count() in (0, len(sort))
+
+
+class TestLegendLayouts:
+    """`legend_layouts.csv` and `legends.csv`'s `row` column have to agree, or the map key
+    silently drops break points or draws empty strips."""
+
+    LAID_OUT = sorted(name for name, legend in LEGENDS.items() if legend.layout is not None)
+
+    def test_layouts_name_known_legends(self):
+        names = set(read_structure_csv("legend_layouts")["name"])
+        assert names <= set(LEGENDS)
+        assert names == set(self.LAID_OUT)
+
+    @pytest.mark.parametrize("legend_name", LAID_OUT)
+    def test_rows_are_unique_and_known_kinds(self, legend_name):
+        layout = LEGENDS[legend_name].layout
+        assert layout["row"].is_unique().all()
+        assert set(layout["kind"]) <= {"swatches", "arrows"}
+
+    @pytest.mark.parametrize("legend_name", LAID_OUT)
+    def test_break_point_rows_match_swatch_rows(self, legend_name):
+        """Every `swatches` row has break points, and every break point's `row` is one."""
+        legend = LEGENDS[legend_name]
+        swatch_rows = set(legend.layout.filter(kind="swatches")["row"])
+        assert set(legend.break_points["row"].drop_nulls()) == swatch_rows
+
+    @pytest.mark.parametrize("legend_name", LAID_OUT)
+    def test_a_label_has_one_color_and_one_row(self, legend_name):
+        """A strip shows each label once, so its duplicates must agree on what it shows."""
+        placed = LEGENDS[legend_name].break_points.filter(pl.col("row").is_not_null())
+        assert placed.group_by("label").agg(pl.col("color", "row").n_unique()).filter(
+            (pl.col("color") > 1) | (pl.col("row") > 1)
+        ).is_empty()
+
+    @pytest.mark.parametrize("legend_name", sorted(set(LEGENDS) - set(LAID_OUT)))
+    def test_a_legend_without_a_layout_places_nothing(self, legend_name):
+        assert LEGENDS[legend_name].break_points["row"].is_null().all()

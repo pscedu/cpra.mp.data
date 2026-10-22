@@ -1,0 +1,4 @@
+name,row,kind,left,right
+lnd_conf_chng,1,swatches,Land loss,Land gain
+lnd_conf_chng,2,arrows,High confidence,High confidence
+lnd_conf_chng,3,swatches,Stays water,Stays land

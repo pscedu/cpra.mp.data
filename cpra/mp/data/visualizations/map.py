@@ -2,6 +2,8 @@ from functools import cached_property
 from typing import Any, final
 from urllib.parse import quote, urlencode
 
+import polars as pl
+
 from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITE_NAME, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
@@ -1067,12 +1069,39 @@ class Map(DatasetVisualization):
         # repeat a word already inside `Meta.label`.
         if self._is_difference():
             title = f"{title} Difference"
-        return {
+        metadata = {
             "title": title,
             "subtitle": display_unit(var),
             "type": legend.type,
             "steps": steps,
         }
+        if legend.layout is not None:
+            metadata["layout"] = self._legend_layout(legend, break_points)
+        return metadata
+
+    @staticmethod
+    def _legend_layout(legend: Legend, break_points: pl.DataFrame) -> dict[str, Any]:
+        """`legend_layouts.csv`'s arrangement of a legend's key into labelled rows -- the
+        `lnd_conf_chng` design's loss/gain and stays-water/stays-land strips, with an
+        arrow row between them.
+
+        An ADDITION to `steps`, not a replacement: `type` stays `discrete` and `steps`
+        stays the full sorted list, so a client that doesn't know `layout` still draws the
+        key as a list. A `swatches` row takes the break points whose `row` names it, in
+        `break_points`' (sorted) order and one per label, since the tiles may color
+        several codes one class; a break point naming no row (`No Data`) is in no strip.
+        An `arrows` row carries only its two end captions.
+        """
+        rows = []
+        for layout_row in legend.layout.iter_rows(named=True):
+            row = {"kind": layout_row["kind"], "left": layout_row["left"], "right": layout_row["right"]}
+            if layout_row["kind"] == "swatches":
+                swatches = {}
+                for point in break_points.filter(pl.col("row") == layout_row["row"]).iter_rows(named=True):
+                    swatches.setdefault(point["label"], {"color": point["color"], "label": point["label"]})
+                row["steps"] = list(swatches.values())
+            rows.append(row)
+        return {"rows": rows}
 
     @property
     def spec(self):

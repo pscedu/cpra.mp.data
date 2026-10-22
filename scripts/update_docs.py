@@ -77,6 +77,7 @@ def update_docs():
     dimension_values = read_structure_csv("dimension_values")
     grids = read_structure_csv("grids")
     legends = read_structure_csv("legends")
+    legend_layouts = read_structure_csv("legend_layouts")
     variables = read_structure_csv("variables")
 
     markdown = replace_section("dimensions", table(dimensions), markdown)
@@ -102,9 +103,17 @@ def update_docs():
         "dimension_values", dimensions_values_content, markdown
     )
 
+    def legend_content(name, legend_df):
+        content = f"### `{name}` Legend\n\n{table(legend_df.select(cs.exclude('name')).pipe(drop_empty_columns))}"
+        layout_df = legend_layouts.filter(name=name).sort("row")
+        if len(layout_df):
+            # The map key's arrangement into rows; break points name theirs in `Row`.
+            content += f"\n\n#### `{name}` Layout\n\n{table(layout_df.select(cs.exclude('name')))}"
+        return content
+
     legends_content = "\n\n".join(
         [
-            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')).pipe(drop_empty_columns))}"
+            legend_content(group[0], legend_df)
             for group, legend_df in sorted(legends.group_by("name"))
         ]
     )
