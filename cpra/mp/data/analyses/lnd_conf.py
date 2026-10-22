@@ -34,11 +34,13 @@ the members that actually reported. That is the arithmetic `group`/`sum` gives; 
 mean-over-valid-members would need a matching count, which this shape has no way to
 carry.
 
-`legend = "lnd_conf"` colorizes that fraction directly: five even bands over `[0, 1]`,
-diverging about the `0.4`-`0.6` band that straddles an evenly-split ensemble, water-colored
-below it and land-colored above, under a transparent `No Data` band for everything below
-`0.0`. Nothing this analysis outputs is below `0.0` -- the fraction's domain starts there --
-so that band catches exactly one thing: the nodata sentinel
+`legend = "lnd_conf"` colorizes that fraction directly in the four classes
+`lnd_conf_chng` pairs into transition codes -- `0`, `> 0` to `< 0.5`, `0.5` to `< 1`, `1`,
+split at the same float-slack thresholds (`lnd_conf_chng.CONFIDENCE_CLASSES`), so a cell
+reads the same class in both -- water-colored toward `0` and land-colored toward `1`,
+under a transparent `No Data` band for everything below `0.0`. Nothing this analysis
+outputs is below `0.0` -- the fraction's domain starts there -- so that band catches
+exactly one thing: the nodata sentinel
 (`execution.sink.DEFAULT_NODATA`) a null pixel is filled with before the tile warp.
 `Legend.colorize_pixels` digitizes every pixel it is given, nodata included, so a legend
 with no under-band paints the whole out-of-domain area in its FIRST color; here that was

@@ -633,11 +633,10 @@ Legends determine the breakpoints and colors used to map a variable.
 | Label | Color | Upper Bound |
 | --- | --- | --- |
 | No Data | #00000000 | 0.0 |
-| 0 to < 0.2 | #018571 | 0.2 |
-| 0.2 to < 0.4 | #80cdc1 | 0.4 |
-| 0.4 to < 0.6 | #f5f5f5 | 0.6 |
-| 0.6 to < 0.8 | #dfc27d | 0.8 |
-| 0.8 to 1.0 | #a6611a |  |
+| 0 | #018571 | 0.001 |
+| > 0 to < 0.5 | #80cdc1 | 0.499 |
+| 0.5 to < 1 | #dfc27d | 0.999 |
+| 1 | #a6611a |  |
 
 
 ### `lnd_conf_chng` Legend

@@ -58,6 +58,7 @@ from cpra.mp.data.analyses.lnd_conf import (
     WATER_VALUES,
     LandConfidence,
 )
+from cpra.mp.data.analyses.lnd_conf_chng import CONFIDENCE_CLASSES
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.request.pipeline import (
@@ -224,6 +225,29 @@ class TestRegistry:
         # floor: nothing this analysis outputs falls below it, so the band catches the
         # nodata sentinel alone (see the module docstring).
         assert all(0.0 <= b <= 1.0 for b in declared), declared
+
+    def test_land_confidence_legend_bands_are_the_change_classes(self):
+        """`lnd_conf`'s map shows the same four classes `lnd_conf_chng` pairs up, so a cell
+        reads the same class in both -- including the float-slack fractions just off `0.5`
+        and `1.0`."""
+        legend = LEGENDS[ANALYSES["lnd_conf"].Meta.legend]
+        weights = SCENARIO_WEIGHTS.values()
+        fractions = [0.0, min(weights), 0.5 - 1e-7, 0.5, 0.5 + 1e-7, 1.0 - min(weights), 1.0 - 1e-7, 1.0]
+        labels = legend.break_points["label"].to_list()
+        bounds = [b for b in legend.break_points["upper_bound"].to_list() if b is not None]
+        assert [labels[int(np.digitize(f, bounds))] for f in fractions] == [
+            "0",
+            "> 0 to < 0.5",
+            "0.5 to < 1",
+            "0.5 to < 1",
+            "0.5 to < 1",
+            "0.5 to < 1",
+            "1",
+            "1",
+        ]
+        # And the same classes `lnd_conf_chng`'s `case` assigns.
+        thresholds = [float(when.split()[-1]) for when, _ in CONFIDENCE_CLASSES[:-1]]
+        assert bounds[1:] == thresholds
 
     def test_land_confidence_change_legend_covers_every_transition_code(self):
         """Each of the 16 `initial * 10 + current` codes lands in a labelled, opaque band
