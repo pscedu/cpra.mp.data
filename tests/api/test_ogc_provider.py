@@ -127,8 +127,14 @@ class TestBadRequests:
     """Each is a 400 whose message reaches the client, because pygeoapi hides the text of
     a plain provider error behind 'check logs'."""
 
-    def test_no_dataset_selected(self, salinity):
-        response = salinity.get(f"{ITEMS}?f=json")
+    def test_no_data_request_explains_the_export_flow(self, salinity):
+        response = salinity.get(f"{ITEMS}?f=json&limit=5")
+        assert response.status_code == 400
+        assert "Export" in response.json()["description"]
+        assert "mpdp.coastal.la.gov" in response.json()["description"]
+
+    def test_a_data_request_without_a_dataset_is_the_engines_own_400(self, salinity):
+        response = salinity.get(f"{ITEMS}?f=json&model_group_id=500")
         assert response.status_code == 400
         assert "no dataset selected" in response.json()["description"]
 

@@ -23,6 +23,14 @@ _OGC_PARAMS = {
 }
 
 
+EXPORT_HINT = (
+    "This collection serves one view of the data at a time, so each request must carry "
+    "that view as query parameters (variable, time_unit, grid and the other dimensions). "
+    "Use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov) to get a "
+    "link or QGIS layer file for the view you are looking at."
+)
+
+
 def _invalid(message):
     """A 400 whose message reaches the client (pygeoapi hides it by default)."""
     return ProviderInvalidQueryError(message, user_msg=message)
@@ -90,8 +98,12 @@ class MasterPlanDataProvider(BaseProvider):
         """
         from flask import request
 
+        items = data_request_items(request.args)
+        if not items:
+            raise _invalid(EXPORT_HINT)
+
         try:
-            decoded = decode_request_sync(data_request_items(request.args), format="parquet")
+            decoded = decode_request_sync(items, format="parquet")
             grid = decoded.descriptor.grid
             if GRIDS[grid].grid_type != "vector":
                 raise _invalid(

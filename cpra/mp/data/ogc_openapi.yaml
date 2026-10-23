@@ -229,7 +229,9 @@ info:
       - href: https://coastal.la.gov
         type: text/html
       name: Louisiana Coastal Protection and Restoration Authority
-  description: OGC API - Features endpoint for CPRA Master Plan vector grid data.
+  description: 'OGC API - Features endpoint for CPRA Master Plan vector grid data.
+    It serves one view of the data at a time and is not meant to be browsed: get a
+    link from the Export option in the Master Plan Data Portal (https://mpdp.coastal.la.gov).'
   license:
     name: CC-BY 4.0 license
     url: https://creativecommons.org/licenses/by/4.0
@@ -238,8 +240,8 @@ info:
   version: 0.23.0
   x-keywords:
   - Louisiana
-  - coastal
-  - master plan
+  - Coastal
+  - Master Plan
 openapi: 3.0.2
 paths:
   /:
@@ -278,7 +280,13 @@ paths:
       - server
   /collections/master_plan_data:
     get:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: describeMaster_plan_dataCollection
       parameters:
       - $ref: '#/components/parameters/f'
@@ -297,7 +305,13 @@ paths:
       - master_plan_data
   /collections/master_plan_data/items:
     get:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: getMaster_plan_dataFeatures
       parameters:
       - description: The optional f parameter indicates the output format which the
@@ -319,14 +333,14 @@ paths:
       - $ref: '#/components/parameters/lang'
       - $ref: '#/components/parameters/bbox'
       - description: The optional limit parameter limits the number of items that
-          are presented in the response document (maximum=10, default=10).
+          are presented in the response document (maximum=100000, default=50).
         explode: false
         in: query
         name: limit
         required: false
         schema:
-          default: 10
-          maximum: 10
+          default: 50
+          maximum: 100000
           minimum: 1
           type: integer
         style: form
@@ -361,7 +375,13 @@ paths:
       tags:
       - master_plan_data
     options:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: optionsMaster_plan_dataFeatures
       responses:
         '200':
@@ -370,7 +390,13 @@ paths:
       tags:
       - master_plan_data
     post:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: getCQL2Master_plan_dataFeatures
       requestBody:
         content:
@@ -391,7 +417,13 @@ paths:
       - master_plan_data
   /collections/master_plan_data/items/{featureId}:
     get:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: getMaster_plan_dataFeature
       parameters:
       - $ref: https://schemas.opengis.net/ogcapi/features/part1/1.0/openapi/ogcapi-features-1.yaml#/components/parameters/featureId
@@ -411,7 +443,13 @@ paths:
       tags:
       - master_plan_data
     options:
-      description: Vector grid data from Louisiana's Coastal Master Plan models.
+      description: 'Vector grid data from Louisiana''s Coastal Master Plan models,
+        joined to the model results for one view of the data. Every request must carry
+        that view as query parameters (variable, time_unit, grid and the other dimensions,
+        as in a portal URL), so this collection cannot be browsed on its own. To open
+        a view in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+        it gives a QGIS layer file (.qlr) already styled like the portal map, or an
+        items URL that loads as GeoJSON.'
       operationId: optionsMaster_plan_dataFeature
       parameters:
       - $ref: https://schemas.opengis.net/ogcapi/features/part1/1.0/openapi/ogcapi-features-1.yaml#/components/parameters/featureId
@@ -537,15 +575,25 @@ paths:
       tags:
       - server
 servers:
-- description: OGC API - Features endpoint for CPRA Master Plan vector grid data.
-  url: localhost
+- description: 'OGC API - Features endpoint for CPRA Master Plan vector grid data.
+    It serves one view of the data at a time and is not meant to be browsed: get a
+    link from the Export option in the Master Plan Data Portal (https://mpdp.coastal.la.gov).'
+  url: https://mpdp.coastal.la.gov/v1/ogc
 tags:
-- description: OGC API - Features endpoint for CPRA Master Plan vector grid data.
+- description: 'OGC API - Features endpoint for CPRA Master Plan vector grid data.
+    It serves one view of the data at a time and is not meant to be browsed: get a
+    link from the Export option in the Master Plan Data Portal (https://mpdp.coastal.la.gov).'
   externalDocs:
     description: information
     url: https://coastal.la.gov/our-plan/2023-coastal-master-plan/
   name: server
-- description: Vector grid data from Louisiana's Coastal Master Plan models.
+- description: 'Vector grid data from Louisiana''s Coastal Master Plan models, joined
+    to the model results for one view of the data. Every request must carry that view
+    as query parameters (variable, time_unit, grid and the other dimensions, as in
+    a portal URL), so this collection cannot be browsed on its own. To open a view
+    in a GIS, use Export in the Master Plan Data Portal (https://mpdp.coastal.la.gov):
+    it gives a QGIS layer file (.qlr) already styled like the portal map, or an items
+    URL that loads as GeoJSON.'
   name: master_plan_data
 - name: coverages
 - name: edr

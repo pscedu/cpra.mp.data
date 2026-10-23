@@ -4,11 +4,22 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 from xml.etree import ElementTree
 
+from types import SimpleNamespace
+
 import polars as pl
+import pytest
 import yaml
 
-from cpra.mp.data.api.qlr import ITEMS_LIMIT, build_qlr, items_url
-from cpra.mp.data.legends import Legend
+from cpra.mp.data.api.qlr import (
+    ITEMS_LIMIT,
+    build_qlr,
+    difference_legend,
+    export_legend,
+    items_url,
+    layer_label,
+)
+from cpra.mp.data.legends import LEGENDS, Legend
+from cpra.mp.data.variables import VARIABLES
 
 SALINITY = (
     "variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=500"
@@ -75,6 +86,86 @@ class TestBuildQlr:
         assert layer.find("renderer-v2") is None
 
 
+def decoded(variable=None, analysis=None):
+    """The two parts of a `UnifiedRequest` the legend and label choices read."""
+    return SimpleNamespace(descriptor=SimpleNamespace(variable=variable), analysis=analysis)
+
+
+def analysis(legend=None, result_kind="value", kind="analysis", label="Analysis", title_suffix=""):
+    return SimpleNamespace(
+        legend=legend,
+        result_kind=result_kind,
+        title_suffix=title_suffix,
+        meta=SimpleNamespace(kind=kind, label=label),
+    )
+
+
+class TestExportLegend:
+    """The same precedence the portal's map colors by."""
+
+    def test_the_variables_own_legend_by_default(self):
+        assert export_legend(decoded(VARIABLES["sal"])) is VARIABLES["sal"].legend
+
+    def test_an_analysis_legend_wins_over_the_variables(self):
+        assert export_legend(decoded(VARIABLES["sal"], analysis(legend="elev"))) is LEGENDS["elev"]
+
+    def test_a_difference_without_a_legend_gets_the_synthesized_ramp(self):
+        legend = export_legend(decoded(VARIABLES["sal"], analysis(result_kind="difference")))
+        assert legend.name == "difference"
+
+    def test_a_difference_with_a_legend_of_its_own_keeps_it(self):
+        legend = export_legend(decoded(VARIABLES["sal"], analysis(legend="elev", result_kind="difference")))
+        assert legend is LEGENDS["elev"]
+
+    def test_falls_back_to_the_default_legend_with_no_variable(self):
+        assert export_legend(decoded()) is LEGENDS["default"]
+
+
+class TestDifferenceLegend:
+    def test_ramp_is_symmetric_about_zero_with_a_white_middle_class(self):
+        legend = difference_legend(VARIABLES["damage"])
+        rows = legend.break_points.to_dicts()
+        bounds = [r["upper_bound"] for r in rows[:-1]]
+        assert rows[-1]["upper_bound"] is None
+        assert bounds == pytest.approx([-b for b in reversed(bounds)])
+        assert rows[len(rows) // 2]["color"] == "#ffffff"
+
+    def test_a_positive_limit_runs_red_to_blue_and_a_negative_one_blue_to_red(self):
+        positive = SimpleNamespace(difference_legend_limit=5, display_scale_factor=None)
+        negative = SimpleNamespace(difference_legend_limit=-5, display_scale_factor=None)
+        assert difference_legend(positive).break_points["color"][0] == "#d53e4f"
+        assert difference_legend(negative).break_points["color"][0] == "#3288bd"
+
+    def test_a_variable_with_no_limit_defaults_to_one(self):
+        legend = difference_legend(SimpleNamespace(difference_legend_limit=None, display_scale_factor=None))
+        assert max(b for b in legend.break_points["upper_bound"] if b is not None) == pytest.approx(7 / 9)
+
+    def test_labels_are_in_display_units_and_short(self):
+        variable = SimpleNamespace(difference_legend_limit=9000, display_scale_factor=1000)
+        labels = difference_legend(variable).break_points["label"].to_list()
+        assert labels[0] == "< -7"
+        assert labels[-1] == ">= 7"
+
+    def test_large_bounds_get_separators_not_exponents(self):
+        labels = difference_legend(VARIABLES["damage"]).break_points["label"].to_list()
+        assert labels[0] == "< -7,780,000"
+        assert not any("e+" in label for label in labels)
+
+
+class TestLayerLabel:
+    def test_the_variable_label_with_no_analysis(self):
+        assert layer_label(decoded(VARIABLES["sal"])) == "Salinity"
+
+    def test_an_analysis_that_names_its_own_result_is_called_that(self):
+        assert layer_label(decoded(VARIABLES["sal"], analysis(kind="variable", label="Land Type"))) == "Land Type"
+
+    def test_otherwise_the_variable_plus_the_title_suffix(self):
+        assert layer_label(decoded(VARIABLES["sal"], analysis(title_suffix=" Difference"))) == "Salinity Difference"
+
+    def test_a_generic_label_when_no_single_variable_resolves(self):
+        assert layer_label(decoded()) == "Master Plan data"
+
+
 class TestItemsUrl:
     def test_carries_the_data_request_and_a_limit_that_covers_a_whole_grid(self, monkeypatch):
         monkeypatch.setenv("PYGEOAPI_SERVER_URL", "https://example.org/v1/ogc/")
@@ -125,6 +216,18 @@ class TestViewQlrRoute:
         pairs = parse_qsl(urlparse(layer.find("datasource").text).query)
         assert [v for k, v in pairs if k == "f"] == ["json"]
         assert [v for k, v in pairs if k == "limit"] == [str(ITEMS_LIMIT)]
+
+    def test_a_difference_is_styled_with_the_diverging_ramp_and_named_for_it(self, client):
+        query = (
+            f"{SALINITY.rsplit('&calendar_day', 1)[0].replace('&model_group_id=500', '')}"
+            "&analysis=diff&dimension=model_group_id&order=asc&model_group_id=500&model_group_id=521"
+        )
+        response = client.get(f"/v1/view.qlr?{query}")
+        assert response.status_code == 200, response.text
+        layer = layer_of(response.text)
+        assert layer.find("layername").text.startswith("Salinity Difference")
+        labels = [r.get("label") for r in layer.findall("renderer-v2/ranges/range")]
+        assert len(labels) == 9 and labels[0].startswith("< -")
 
     def test_raster_grid_is_rejected(self, client):
         response = client.get("/v1/view.qlr?variable=vct&time_unit=annual&grid=veg_grid_cell_v001")

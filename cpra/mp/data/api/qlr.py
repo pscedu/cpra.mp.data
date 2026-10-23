@@ -11,8 +11,12 @@ import uuid
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
+import polars as pl
+
 # Imported for its side effect: it gives PYGEOAPI_SERVER_URL its default.
 from cpra.mp.data import config  # noqa: F401
+from cpra.mp.data.legends import LEGENDS, Legend
+from cpra.mp.data.visualizations.display import to_display
 
 # The first and last classes are open-ended in a legend (the last has no upper bound, and
 # the first needs to catch values below its upper bound), but QGIS ranges are closed.
@@ -38,6 +42,79 @@ def items_url(items):
     base = os.environ["PYGEOAPI_SERVER_URL"].rstrip("/")
     query = urlencode([("f", "json"), ("limit", ITEMS_LIMIT), *items])
     return f"{base}/collections/{COLLECTION}/items?{query}"
+
+
+# The synthesized difference ramp's colors and how finely it is stepped. The colors are
+# `visualizations.map`'s `_difference_breaks`; QGIS has no per-feature interpolation for a
+# categorized layer, so the ramp is drawn as steps, nine so that one of them is centered on 0.
+_DIFFERENCE_LOW, _DIFFERENCE_MID, _DIFFERENCE_HIGH = (213, 62, 79), (255, 255, 255), (50, 136, 189)
+_DIFFERENCE_STEPS = 9
+
+
+def _hex(rgb):
+    return "#" + "".join(f"{round(c):02x}" for c in rgb)
+
+
+def _format_bound(value):
+    """A legend bound to three significant figures, with thousands separators once it is large."""
+    rounded = float(f"{value:.3g}")
+    return f"{rounded:,.0f}" if abs(rounded) >= 1000 else f"{rounded:g}"
+
+
+def difference_legend(variable):
+    """The diverging legend a difference with no legend of its own is drawn with: red at
+    `-limit`, white at 0, blue at `+limit`, off the variable's `difference_legend_limit`.
+
+    Mirrors `visualizations.map`'s synthesized ramp (`_difference_breaks`), including its
+    flipped colors for a negative limit and its default limit of 1. Class bounds are in
+    storage units, like every legend's, since they are compared with the stored `value`;
+    labels are in display units.
+    """
+    limit = (variable.difference_legend_limit if variable is not None else None) or 1
+    low, high = (_DIFFERENCE_LOW, _DIFFERENCE_HIGH) if limit > 0 else (_DIFFERENCE_HIGH, _DIFFERENCE_LOW)
+    reach = abs(limit)
+    half = _DIFFERENCE_STEPS // 2
+    colors = []
+    for i in range(_DIFFERENCE_STEPS):
+        t = (i - half) / half
+        end = low if t < 0 else high
+        colors.append(_hex(tuple(m + (e - m) * abs(t) for m, e in zip(_DIFFERENCE_MID, end))))
+
+    bounds = [reach * (2 * i - _DIFFERENCE_STEPS + 2) / _DIFFERENCE_STEPS for i in range(_DIFFERENCE_STEPS - 1)]
+    shown = [_format_bound(to_display(variable, b)) for b in bounds]
+    labels = [f"< {shown[0]}"]
+    labels += [f"{lo} to < {hi}" for lo, hi in zip(shown, shown[1:])]
+    labels.append(f">= {shown[-1]}")
+    return Legend(
+        "difference",
+        pl.DataFrame({"label": labels, "color": colors, "upper_bound": [*bounds, None]}),
+    )
+
+
+def export_legend(decoded):
+    """The legend a request's layer is styled with, chosen the way the portal's map chooses
+    it: the analysis's own named legend, else a difference's synthesized ramp, else the
+    variable's legend, else the `default` one.
+
+    `decoded` is a `UnifiedRequest`. A difference that still names a legend (a category
+    result) keeps it; only one with none gets the ramp.
+    """
+    analysis, variable = decoded.analysis, decoded.descriptor.variable
+    named = LEGENDS.get(analysis.legend) if analysis is not None and analysis.legend else None
+    if named is None and analysis is not None and analysis.result_kind == "difference":
+        return difference_legend(variable)
+    return named or (variable.legend if variable is not None else None) or LEGENDS.get("default")
+
+
+def layer_label(decoded):
+    """What the layer is called, ahead of the selection: an analysis that names its own
+    result (`kind="variable"`) is called that, anything else by its variable plus the
+    analysis's title suffix (" Difference")."""
+    analysis, variable = decoded.analysis, decoded.descriptor.variable
+    if analysis is not None and analysis.meta.kind == "variable":
+        return analysis.meta.label
+    label = variable.label if variable is not None else "Master Plan data"
+    return label + (analysis.title_suffix if analysis is not None else "")
 
 
 def _rgba(color):

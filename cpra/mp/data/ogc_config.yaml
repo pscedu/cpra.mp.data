@@ -22,7 +22,6 @@ server:
     on_exceed: throttle  # throttle or error (default=throttle)
   map:
     url: https://api.mpdp.coastal.la.gov/tiles/basemap-raster/{z}/{x}/{y}
-  cors: true
 
 logging:
   level: ERROR
@@ -32,7 +31,10 @@ metadata:
     title:
       en: CPRA Master Plan Data – OGC API
     description:
-      en: OGC API - Features endpoint for CPRA Master Plan vector grid data.
+      en: >-
+        OGC API - Features endpoint for CPRA Master Plan vector grid data. It serves one view
+        of the data at a time and is not meant to be browsed: get a link from the Export
+        option in the Master Plan Data Portal (https://mpdp.coastal.la.gov).
     keywords:
       en:
         - Louisiana
@@ -62,7 +64,13 @@ resources:
   master_plan_data:
     type: collection
     title: Master Plan Data
-    description: Vector grid data from Louisiana's Coastal Master Plan models.
+    description: >-
+      Vector grid data from Louisiana's Coastal Master Plan models, joined to the model
+      results for one view of the data. Every request must carry that view as query
+      parameters (variable, time_unit, grid and the other dimensions, as in a portal URL),
+      so this collection cannot be browsed on its own. To open a view in a GIS, use Export in
+      the Master Plan Data Portal (https://mpdp.coastal.la.gov): it gives a QGIS layer file
+      (.qlr) already styled like the portal map, or an items URL that loads as GeoJSON.
     keywords:
       - Louisiana
       - coastal

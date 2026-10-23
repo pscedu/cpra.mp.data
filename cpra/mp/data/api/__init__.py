@@ -43,7 +43,7 @@ from cpra.mp.data.api.pipeline import (
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
 from cpra.mp.data.api.ogc_provider import strip_ogc_params
-from cpra.mp.data.api.qlr import build_qlr, items_url
+from cpra.mp.data.api.qlr import build_qlr, export_legend, items_url, layer_label
 from cpra.mp.data.api.unified import decode_request
 from cpra.mp.data.api.utils import (
     ANALYSES,
@@ -288,8 +288,8 @@ async def get_catalog(request: Request):
 
 @app.get("/v1/view.qlr", tags=["OGC"])
 async def get_qgis_layer(request: Request):
-    """A QGIS layer file for a data request: the OGC items URL for it plus the variable's
-    portal legend as the layer's style.
+    """A QGIS layer file for a data request: the OGC items URL for it plus the legend the
+    portal's map would color it with (the analysis's, a difference's ramp, or the variable's).
 
     Takes the same query string `get_data` does, so the portal's "export to GIS" link is
     its current data request pointed at this path. It is decoded exactly as the OGC
@@ -306,11 +306,10 @@ async def get_qgis_layer(request: Request):
             detail=f"grid '{descriptor.grid}' is a raster grid and cannot be exported to a QGIS layer",
         )
 
-    variable = descriptor.variable
     selection = ", ".join(f"{key}={value}" for key, value in items if key not in DATASET_DIMENSIONS)
-    label = variable.label if variable is not None else "Master Plan data"
+    label = layer_label(decoded)
     layer_name = f"{label} ({selection})" if selection else label
-    document = build_qlr(layer_name, items_url(items), variable.legend if variable is not None else None)
+    document = build_qlr(layer_name, items_url(items), export_legend(decoded))
     return Response(
         content=document,
         media_type="application/xml",
