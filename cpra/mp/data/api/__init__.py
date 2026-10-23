@@ -5,7 +5,7 @@ from typing import Annotated, Any
 import polars.selectors as cs
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlmodel import Session, create_engine, select
 
 from cpra.mp.data.analysis.request.descriptor import output_descriptor
@@ -42,6 +42,8 @@ from cpra.mp.data.api.pipeline import (
 )
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
+from cpra.mp.data.api.ogc_provider import strip_ogc_params
+from cpra.mp.data.api.qlr import build_qlr, export_legend, items_url, layer_label
 from cpra.mp.data.api.unified import decode_request
 from cpra.mp.data.api.utils import (
     ANALYSES,
@@ -92,6 +94,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
+from pygeoapi.flask_app import APP as pygeoapi_app  # noqa: E402
+
+app.mount("/v1/ogc", WSGIMiddleware(pygeoapi_app))
 
 
 # The translation point for `cpra.mp.data.analyses.resolve_analysis` --
@@ -277,6 +284,37 @@ async def get_catalog(request: Request):
         return JSONResponse(content=catalog_body(decoded))
     except ValueError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+
+
+@app.get("/v1/view.qlr", tags=["OGC"])
+async def get_qgis_layer(request: Request):
+    """A QGIS layer file for a data request: the OGC items URL for it plus the legend the
+    portal's map would color it with (the analysis's, a difference's ramp, or the variable's).
+
+    Takes the same query string `get_data` does, so the portal's "export to GIS" link is
+    its current data request pointed at this path. It is decoded exactly as the OGC
+    provider will decode it when QGIS fetches the items, so a request that would fail
+    there fails here, at export, and not in a QGIS dialog later. Only a request that
+    resolves to a vector grid can be exported: the OGC API serves features, not rasters.
+    """
+    items = strip_ogc_params(request.query_params.multi_items())
+    decoded = await decode_request(items, format="parquet")
+    descriptor = decoded.descriptor
+    if descriptor.grid_type != "vector":
+        raise HTTPException(
+            status_code=400,
+            detail=f"grid '{descriptor.grid}' is a raster grid and cannot be exported to a QGIS layer",
+        )
+
+    selection = ", ".join(f"{key}={value}" for key, value in items if key not in DATASET_DIMENSIONS)
+    label = layer_label(decoded)
+    layer_name = f"{label} ({selection})" if selection else label
+    document = build_qlr(layer_name, items_url(items), export_legend(decoded))
+    return Response(
+        content=document,
+        media_type="application/xml",
+        headers={"Content-Disposition": 'attachment; filename="master_plan.qlr"'},
+    )
 
 
 # ----------------------------------------------------------------------------------------

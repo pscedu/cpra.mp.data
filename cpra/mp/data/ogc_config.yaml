@@ -1,0 +1,88 @@
+server:
+  bind:
+    host: 0.0.0.0
+    port: 8000
+  # Set PYGEOAPI_SERVER_URL env var to the public base URL + /v1/ogc for each deployment.
+  # Default works for local development.
+  url: ${PYGEOAPI_SERVER_URL}
+  mimetype: application/json; charset=UTF-8
+  encoding: utf-8
+  gzip: false
+  languages:
+    - en-US
+  pretty_print: false
+  limits:
+    default_items: 50
+    # A portal export link loads a whole grid in one request, so this must exceed the
+    # largest vector grid's feature count.
+    max_items: 100000
+    max_distance_x: 25
+    max_distance_y: 25
+    max_distance_units: m
+    on_exceed: throttle  # throttle or error (default=throttle)
+  map:
+    url: https://api.mpdp.coastal.la.gov/tiles/basemap-raster/{z}/{x}/{y}
+
+logging:
+  level: ERROR
+
+metadata:
+  identification:
+    title:
+      en: CPRA Master Plan Data – OGC API
+    description:
+      en: >-
+        OGC API - Features endpoint for CPRA Master Plan vector grid data. It serves one view
+        of the data at a time and is not meant to be browsed: get a link from the Export
+        option in the Master Plan Data Portal (https://mpdp.coastal.la.gov).
+    keywords:
+      en:
+        - Louisiana
+        - Coastal
+        - Master Plan
+    keywords_type: theme
+    terms_of_service: https://creativecommons.org/licenses/by/4.0
+    url: https://coastal.la.gov/our-plan/2023-coastal-master-plan/
+  license:
+    name: CC-BY 4.0 license
+    url: https://creativecommons.org/licenses/by/4.0
+  provider:
+    name: Louisiana Coastal Protection and Restoration Authority
+    url: https://coastal.la.gov
+  contact:
+    name: Louisiana Coastal Protection and Restoration Authority
+    address: 150 Terrace Ave
+    city: Baton Rouge
+    stateorprovince: Louisiana
+    postalcode: '70802'
+    country: USA
+    email: coastal@la.gov
+    url: https://coastal.la.gov
+    role: pointOfContact
+
+resources:
+  master_plan_data:
+    type: collection
+    title: Master Plan Data
+    description: >-
+      Vector grid data from Louisiana's Coastal Master Plan models, joined to the model
+      results for one view of the data. Every request must carry that view as query
+      parameters (variable, time_unit, grid and the other dimensions, as in a portal URL),
+      so this collection cannot be browsed on its own. To open a view in a GIS, use Export in
+      the Master Plan Data Portal (https://mpdp.coastal.la.gov): it gives a QGIS layer file
+      (.qlr) already styled like the portal map, or an items URL that loads as GeoJSON.
+    keywords:
+      - Louisiana
+      - coastal
+      - master plan
+    links: []
+    extents:
+      spatial:
+        bbox: [-94.04, 28.85, -88.75, 30.65]
+        crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+    providers:
+      - type: feature
+        name: cpra.mp.data.api.ogc_provider.MasterPlanDataProvider
+        # Geometry is read from GRIDS_PATH/<grid>.fgb, chosen per request.
+        data: grids
+        id_field: id

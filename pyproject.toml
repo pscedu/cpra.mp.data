@@ -46,6 +46,7 @@ api = [
     "mapbox-vector-tile>=2.2.0",
     "psycopg2-binary",
     "sqlmodel",
+    "pygeoapi"
 ]
 bridges2 = [
     "anywidget",
