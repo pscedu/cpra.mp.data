@@ -2,12 +2,22 @@ from functools import cached_property
 from typing import Any, final
 from urllib.parse import quote, urlencode
 
-from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
+import polars as pl
+
+from cpra.mp.data.config import GLYPHS_BASE_URL, SPRITE_NAME, SPRITES_BASE_URL, STATIC_TILES_BASE_URL
 from cpra.mp.data.legends import LEGENDS, Legend
 from cpra.mp.data.variables import Variable
 from cpra.mp.data.visualizations.base import DatasetVisualization
+from cpra.mp.data.visualizations.display import (
+    display_number_format,
+    display_unit,
+    to_display,
+)
 
-VALUE_EXPR = ["get", ["to-string", ["id"]], ["global-state", "values"]]
+# Used when feature IDs are too sparse for array indexing.
+COLOR_OBJECT_EXPR = ["coalesce", ["get", ["to-string", ["id"]], ["global-state", "colors"]], "transparent"]
+# Used when feature IDs are compact integers (1..N); avoids string conversion and hash lookup.
+COLOR_ARRAY_EXPR = ["coalesce", ["at", ["id"], ["global-state", "colors"]], "transparent"]
 SELECTION_EXPR = ["get", ["to-string", ["id"]], ["global-state", "selectionColors"]]
 
 
@@ -25,68 +35,89 @@ class Map(DatasetVisualization):
     class Meta:
         name = "map"
         label = "Map Visualization"
+        # A VISUALIZATION's `Meta.type`, which is not the retired `AnalysisMeta.type`: it is
+        # still served by `/v1/visualizations.json` (`api.models.Visualization`). Route
+        # selection no longer reads it -- `get_visualization_class` lost its `type` argument,
+        # and the one visualization route tells a dataset visualization apart by
+        # `issubclass(..., DatasetVisualization)` -- but the catalog entry stays.
         type = "dataset"
-        max_geographies = 10
+        max_grid_cells = 10
+        # The only visualization here that does NOT plot time: a map draws one grid cell per
+        # pixel at whatever instant the filters pinned, so it is the one that can present an
+        # analysis whose output has no time column left (a `diff` over `calendar_year`).
+        # See `DatasetVisualization.validate_time_axis`, which rejects the
+        # combination everywhere else, and `api.models.Visualization`, which serves this so a
+        # client can offer the same chart types the server will accept.
+        time_axis = False
 
     @cached_property
-    def feature_values(self) -> dict[int, float]:
-        """Load feature values for vector grids.
+    def feature_colors(self) -> dict[str, str]:
+        """Pre-compute hex colors for all vector grid features.
 
-        Uses the Dataset class to apply filter dimensions, calculation
-        parameters (negate, multiply10, multiply100), and group/aggregate
-        operations, consistent with the API data pipeline.
+        Applies legend classification (step or linear interpolation) in Python
+        so the map style only needs a single global-state lookup per feature
+        rather than a full color expression evaluation per feature per frame.
+
+        Reads `self.decoded.pipeline` -- the SAME `Pipeline` `/v1/data.csv` would run for
+        this request, analysis or not, and the same one the tile URLs below re-request. There
+        is no fork here any more: the no-`analysis=` branch used to lower this map's own
+        dataset and filters onto a pipeline by hand (`_data_query_pipeline`, via
+        `request.data_query.build_data_query_pipeline`), which was a second place a filter
+        had to mean the same thing. The result then goes through EXACTLY the
+        `validate_shapes` -> `compile_plan` -> `execute` path every HTTP response does --
+        this reads data, so it must not be a second, quieter engine.
+
+        Synchronous throughout, unlike the routes: a visualization builds its spec from
+        cached properties with no event loop to await on. `execute` itself is sync (it
+        returns a lazy frame), and `decoded` resolves `grid_cell` through
+        `api.unified.decode_request_sync`.
+
+        Bug this replaces: the storage format is long (one row per grid cell, after
+        grouping/aggregation collapses every other dimension), not the wide,
+        one-numeric-named-column-per-grid-cell shape a `cs.matches(r"^[0-9]")` selector
+        used to assume -- which matched nothing here and silently returned `{}` for every
+        caller, analysis or not.
 
         Returns:
-            A dictionary mapping geography IDs to their values.
+            A dictionary mapping string grid cell IDs to hex color strings.
         """
         if self.grid.grid_type != "vector":
             return {}
 
-        import polars.selectors as cs
+        from cpra.mp.data.analysis.execution.execute import execute
+        from cpra.mp.data.analysis.execution.plan import compile_plan
+        from cpra.mp.data.analysis.request.ops import validate_shapes
 
-        from cpra.mp.data.api.dataset import Dataset
-        from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
+        pipeline = self.decoded.pipeline
 
-        dataset_dimensions = DatasetDimensions(
-            variable=self.variable.name,
-            grid=self.grid.name,
-            time_unit=self.time_unit,
-        )
+        # A vector grid's final frame is always long (a `project` INTO a raster grid is
+        # the only way to reach band-wide, and nothing here builds one), so `execute`
+        # returns a `LongFrame` -- a plain `pl.LazyFrame`, not the band-wide 3-tuple.
+        validate_shapes(pipeline)
+        df = execute(compile_plan(pipeline)).collect()
 
-        filter_fields = set(FilterDimensions.model_fields.keys())
-        filter_dimensions = FilterDimensions(
-            **{k: v for k, v in self.params.items() if k in filter_fields and v is not None}
-        )
-
-        options_fields = set(Options.model_fields.keys())
-        options = Options(**{k: v for k, v in self.params.items() if k in options_fields and v is not None})
-
-        dataset = Dataset(dataset_dimensions, filter_dimensions, options)
-        dataset._apply_calculate_params()
-        dataset._apply_group_params()
-
-        df = dataset.lf.collect()
-
-        if df.is_empty():
+        if df.is_empty() or "grid_cell" not in df.columns or "value" not in df.columns:
             return {}
 
-        value_cols = df.select(cs.matches(r"^[0-9]")).columns
-        if not value_cols:
+        values = {
+            int(row["grid_cell"]): row["value"]
+            for row in df.select("grid_cell", "value").iter_rows(named=True)
+            if row["value"] is not None
+        }
+        if not values:
             return {}
 
-        # Take the first row of values (single time point after grouping)
-        row = df.select(value_cols).row(0, named=True)
-        return {int(col): val for col, val in row.items() if val is not None}
+        if self._uses_difference_ramp():
+            stops = self._difference_breaks(self.variable)
+            return {str(fid): self._interpolate_stop_color(val, stops) for fid, val in values.items()}
 
-    def color_ramp(self, legend: Legend) -> list[Any]:
-        """Generate a step color ramp expression from a legend.
+        legend = self._get_legend()
+        if legend is None:
+            return {}
+        return {str(fid): self._classify_step_color(val, legend) for fid, val in values.items()}
 
-        Args:
-            legend: A Legend object with break_points.
-
-        Returns:
-            A MapLibre style step expression for color ramp.
-        """
+    def _classify_step_color(self, value: float, legend: Legend) -> str:
+        """Classify a value into a color bucket matching the step expression behavior."""
         ramp = []
         found_bound = False
         for row in legend.break_points.iter_rows(named=True):
@@ -98,38 +129,79 @@ class Map(DatasetVisualization):
             ramp.append(color)
             if upper_bound is not None:
                 ramp.append(upper_bound)
-        return ["step", VALUE_EXPR, *ramp]
 
-    def difference_breaks_colors(self, variable: Variable, zero_color: str = "#ffffff") -> list:
-        """Generate color breaks for difference visualization.
+        if not ramp:
+            return "#000000"
 
-        Args:
-            variable: A Variable object with difference_legend_limit.
-            zero_color: The color to use for zero values.
+        result = ramp[0]
+        i = 1
+        while i < len(ramp) - 1:
+            if value < ramp[i]:
+                return result
+            result = ramp[i + 1]
+            i += 2
+        return result
 
-        Returns:
-            A list of [value, color] pairs for interpolation.
-        """
-        limit = variable.difference_legend_limit or 1
-        if limit > 0:
-            return [-1 * limit, "#d53e4f", 0, zero_color, limit, "#3288bd"]
-        return [limit, "#3288bd", 0, zero_color, limit * -1, "#d53e4f"]
-
-    def difference_color_ramp(self, variable: Variable) -> list[Any]:
-        """Generate an interpolated color ramp for difference visualization.
+    def _interpolate_stop_color(self, value: float, stops: list) -> str:
+        """Linearly interpolate a hex color between value-color stops.
 
         Args:
-            variable: A Variable object with difference_legend_limit.
-
-        Returns:
-            A MapLibre style expression for linear color interpolation.
+            value: The numeric value to colorize.
+            stops: Flat list of alternating [v0, c0, v1, c1, ...] pairs sorted by value.
         """
-        return [
-            "interpolate",
-            ["linear"],
-            VALUE_EXPR,
-            *self.difference_breaks_colors(variable),
-        ]
+        pairs = list(zip(stops[::2], stops[1::2]))
+        if value <= pairs[0][0]:
+            return pairs[0][1]
+        if value >= pairs[-1][0]:
+            return pairs[-1][1]
+        for i in range(len(pairs) - 1):
+            v0, c0 = pairs[i]
+            v1, c1 = pairs[i + 1]
+            if v0 <= value <= v1:
+                t = (value - v0) / (v1 - v0)
+                return self._lerp_hex(c0, c1, t)
+        return pairs[-1][1]
+
+    def _lerp_hex(self, c0: str, c1: str, t: float) -> str:
+        """Linearly interpolate between two hex colors."""
+        r0, g0, b0 = int(c0[1:3], 16), int(c0[3:5], 16), int(c0[5:7], 16)
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r = round(r0 + t * (r1 - r0))
+        g = round(g0 + t * (g1 - g0))
+        b = round(b0 + t * (b1 - b0))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _id_step_expr(self, color_array: list[str | None]) -> list | None:
+        """Build a MapLibre step expression over feature ID from a pre-computed color array.
+
+        Compresses runs of the same color so sequential IDs with identical colors
+        are represented by a single entry rather than repeated array elements.
+        When used, the colors are baked into the style expression and no global-state
+        lookup is needed at render time — only a binary search through run boundaries.
+
+        Returns None if run compression is insufficient to justify the switch from
+        the array approach (i.e. step would be at least as large as the array).
+        """
+        first_id = next((i for i, c in enumerate(color_array) if c is not None), None)
+        if first_id is None:
+            return None
+
+        runs: list[tuple[int, str]] = []
+        for i in range(first_id, len(color_array)):
+            c = color_array[i] or "transparent"
+            if not runs or c != runs[-1][1]:
+                runs.append((i, c))
+
+        # Each additional run adds 2 elements (threshold + color) to the step expression.
+        # Only use step if it's meaningfully smaller than the array.
+        if len(runs) * 2 >= len(color_array):
+            return None
+
+        step: list[Any] = ["step", ["id"], runs[0][1]]
+        for start_id, color in runs[1:]:
+            step.append(start_id)
+            step.append(color)
+        return step
 
     def linear_zoom(self, min_val, max_val) -> list[Any]:
         """Generate a linear zoom interpolation expression.
@@ -182,18 +254,33 @@ class Map(DatasetVisualization):
         """Generate a raster source for difference visualization.
 
         Args:
-            variable: A Variable object with difference_legend_limit.
             **kwargs: Additional arguments passed to raster_source.
 
         Returns:
             A MapLibre raster source definition with difference color map.
         """
-        breaks = self.difference_breaks_colors(self.variable, "#00000000")
+        breaks = self._difference_breaks(self.variable, "#00000000")
         color_map = f"continuous:{','.join(str(b) for b in breaks)}"
         return self.raster_source(color_map=color_map, **kwargs)
 
+    def _difference_breaks(self, variable: Variable | None, zero_color: str = "#ffffff") -> list:
+        """Return flat [value, color, ...] stops for difference visualization.
+
+        `variable` is `None` for a result that carries no single presentation variable, which
+        has no declared limit of its own; the symmetric +/-1 default covers it, as it already
+        did for a variable that declares none.
+        """
+        limit = (variable.difference_legend_limit if variable is not None else None) or 1
+        if limit > 0:
+            return [-limit, "#d53e4f", 0, zero_color, limit, "#3288bd"]
+        return [limit, "#3288bd", 0, zero_color, -limit, "#d53e4f"]
+
     def vector_source(self, grid_name: str) -> dict[str, Any]:
         """Generate a vector source definition.
+
+        When a request context is available, points to the dynamic MVT endpoint
+        so tile geometry is joined to dataset values server-side. Falls back to
+        the static PMTiles URL for offline/notebook use.
 
         Args:
             grid_name: Name of the grid for the tile URL.
@@ -201,21 +288,90 @@ class Map(DatasetVisualization):
         Returns:
             A MapLibre vector source definition.
         """
+        if self.request:
+            return {
+                "type": "vector",
+                "tiles": [self._tile_url_template("pbf")],
+                "minzoom": 0,
+                "maxzoom": 14,
+            }
         return {
             "type": "vector",
             "url": f"{STATIC_TILES_BASE_URL}/{grid_name}",
         }
 
-    def projects_source(self, model_group_id: int) -> dict[str, Any]:
+    def _tile_url_template(self, format: str) -> str:
+        """The `/v1/data/{z}/{x}/{y}.{format}` template this map's tiles are fetched from.
+
+        One builder for both tile kinds now, and one route under both: `format="pbf"` is the
+        vector source's MVT endpoint and `format="png"` the raster source's. The four routes
+        this replaced (plain/analysis x vector/raster) differed only in which segments of the
+        request they carried in the path, and the whole request is in the query string here.
+
+        No field ALLOWLIST either. It existed because a follow-up request's target route
+        bound a DIFFERENT query model than the visualization route did, so the extra fields
+        had to be named and dropped; the two routes now run the same partition, and the only
+        category that is this route's alone is the render options `forward_query` subtracts.
+        Compression goes with them: a tile response carries none, and
+        `partition_query(allow_compression=False)` rejects one outright rather than ignoring
+        it -- while `Compression`'s fields have non-`None` defaults and so are always bound.
+        """
+        if self.request:
+            base_url = str(
+                self.request.url_for("get_data_tile", z="{z}", x="{x}", y="{y}", format=format)
+            )
+        else:
+            base_url = f"https://api.mpdp.coastal.la.gov/v1/data/{{z}}/{{x}}/{{y}}.{format}"
+
+        query_params = [*self.dataset_params, *self.forward_query(compression=False)]
+
+        if query_params:
+            return f"{base_url}?{urlencode(query_params)}"
+        return base_url
+
+    def _legend_fill_expr(self, is_difference: bool) -> list:
+        """Build a MapLibre color expression from the legend using the 'value' property.
+
+        Returns a 'case' expression that shows 'transparent' for features with
+        no data, and applies a step (or interpolate for difference maps) otherwise.
+        """
+        if is_difference:
+            stops = self._difference_breaks(self.variable)
+            fill_expr: list = ["interpolate", ["linear"], ["get", "value"]] + stops
+        else:
+            legend = self._get_legend()
+            if legend is None:
+                return "transparent"
+
+            ramp: list = []
+            found_bound = False
+            for row in legend.break_points.iter_rows(named=True):
+                color = row["color"]
+                upper_bound = row["upper_bound"]
+                found_bound = found_bound or upper_bound is not None
+                if not found_bound:
+                    continue
+                ramp.append(color)
+                if upper_bound is not None:
+                    ramp.append(upper_bound)
+
+            if not ramp:
+                return "transparent"
+
+            fill_expr = ["step", ["get", "value"]] + ramp
+
+        return ["case", ["has", "value"], fill_expr, "transparent"]
+
+    def projects_source(self, model_group_ids: list[int]) -> dict[str, Any]:
         """Generate a projects source definition.
 
         Args:
-            model_group_id: Model group ID for project filtering.
+            model_group_ids: Model group ID(s) for project filtering.
 
         Returns:
             A MapLibre vector source definition for projects.
         """
-        params = urlencode({"model_group_id": model_group_id})
+        params = urlencode({"model_group_id": model_group_ids}, doseq=True)
         return {
             "type": "vector",
             "url": f"{STATIC_TILES_BASE_URL}/f_generate_tile_element_project?{params}",
@@ -229,8 +385,8 @@ class Map(DatasetVisualization):
         """
         return {
             "version": 8,
-            "glyphs": f"{GLYPHS_BASE_URL}/{{fontstack}}/{{range}}.pbf",
-            "sprite": f"{SPRITES_BASE_URL}/sprite",
+            "glyphs": f"{GLYPHS_BASE_URL}/font/{{fontstack}}/{{range}}",
+            "sprite": f"{SPRITES_BASE_URL}/sprite/{SPRITE_NAME}",
             "sources": {
                 "basemap-raster": {
                     "type": "raster",
@@ -347,37 +503,26 @@ class Map(DatasetVisualization):
         self,
         layer_id: str,
         source_id: str,
-        difference: bool = False,
+        fill_color: list = COLOR_OBJECT_EXPR,
         line_colors: tuple[str, str] = ("#DDDDDD", "#666666"),
         line_widths: tuple[float, float] = (0.5, 3),
         show_grid_labels: bool = False,
         show_grid_lines: bool = False,
-        variable: Variable | None = None,
     ) -> list[dict[str, Any]]:
-        """Generate vector layer definitions with embedded feature values.
-
-        For vector grids, this method loads the data and pre-computes colors
-        for each geography ID, embedding them directly in the style using
-        match expressions.
+        """Generate vector layer definitions for a grid source.
 
         Args:
             layer_id: Base ID for the layers.
             source_id: The source ID for the vector data.
-            difference: Whether to use difference color ramp.
+            fill_color: MapLibre expression for the fill color.
             line_colors: Tuple of (min_zoom_color, max_zoom_color).
             line_widths: Tuple of (min_zoom_width, max_zoom_width).
             show_grid_labels: Whether to show grid labels.
             show_grid_lines: Whether to show grid lines.
-            variable: Variable object for color ramp (uses self.variable if None).
 
         Returns:
             A list of layer definitions for fill, line, selected, and label.
         """
-        var = variable or self.variable
-
-        legend = self._get_legend()
-        ramp = self.difference_color_ramp(var) if difference else self.color_ramp(legend)
-
         return [
             {
                 "id": f"{layer_id}-fill",
@@ -385,12 +530,7 @@ class Map(DatasetVisualization):
                 "source": source_id,
                 "source-layer": "boundary",
                 "paint": {
-                    "fill-color": [
-                        "case",
-                        ["==", VALUE_EXPR, None],
-                        "transparent",
-                        ramp,
-                    ],
+                    "fill-color": fill_color,
                 },
             },
             {
@@ -606,6 +746,32 @@ class Map(DatasetVisualization):
             },
             # Project labels
             {
+                "id": f"project-label-id{suffix}",
+                "type": "symbol",
+                "source": "projects",
+                "source-layer": "project_label",
+                "filter": [
+                    "all",
+                    ["!=", ["get", "project_type_code"], "OR"],
+                    year_filter,
+                ],
+                "maxzoom": 10,
+                "minzoom": 8,
+                "layout": {
+                    "text-anchor": "top",
+                    "text-field": ["get", "portal_id"],
+                    "text-offset": ["literal", [0, 0.75]],
+                    "text-size": 14,
+                    "text-font": ["literal", ["Franklin Gothic Demi Regular"]],
+                },
+                "paint": {
+                    "text-color": "#444444",
+                    "text-halo-blur": 1,
+                    "text-halo-color": "#ffffff",
+                    "text-halo-width": 2,
+                },
+            },
+            {
                 "id": f"project-label{suffix}",
                 "type": "symbol",
                 "source": "projects",
@@ -615,10 +781,10 @@ class Map(DatasetVisualization):
                     ["!=", ["get", "project_type_code"], "OR"],
                     year_filter,
                 ],
-                "minzoom": 9,
+                "minzoom": 10,
                 "layout": {
                     "text-anchor": "top",
-                    "text-field": ["get", "project_name"],
+                    "text-field": ["concat", ["get", "project_name"], " (", ["get", "portal_id"], ")"],
                     "text-offset": ["literal", [0, 0.75]],
                     "text-size": 14,
                     "text-font": ["literal", ["Franklin Gothic Demi Regular"]],
@@ -672,49 +838,6 @@ class Map(DatasetVisualization):
             },
         ]
 
-    def _get_tile_url_template(self) -> str:
-        """Generate the tile URL template for raster data.
-
-        Returns:
-            A tile URL template with {z}/{x}/{y} placeholders.
-        """
-        if self.request:
-            base_url = str(
-                self.request.url_for(
-                    "get_model_tile",
-                    variable=self.variable.name,
-                    grid=self.grid.name,
-                    time_unit=self.time_unit,
-                    z="{z}",
-                    x="{x}",
-                    y="{y}",
-                    format="png",
-                )
-            )
-        else:
-            base_url = (
-                f"https://api.mpdp.coastal.la.gov/v1/datasets"
-                f"/{self.variable.name}/{self.grid.name}/{self.time_unit}"
-                f"/data/{{z}}/{{x}}/{{y}}.png"
-            )
-
-        # Build query string from filter dimensions and options
-        query_params = []
-        for key, value in self.params.items():
-            if value is None:
-                continue
-            if key in ("height", "width", "start_date", "end_date", "request"):
-                continue
-            if isinstance(value, (list, tuple)):
-                for v in value:
-                    query_params.append((key, v))
-            else:
-                query_params.append((key, value))
-
-        if query_params:
-            return f"{base_url}?{urlencode(query_params)}"
-        return base_url
-
     def chart(self) -> dict[str, Any]:
         """Build the map visualization.
 
@@ -735,7 +858,7 @@ class Map(DatasetVisualization):
         calendar_day = self.params.get("calendar_day", [])
         model_group_id = self.params.get("model_group_id", [])
 
-        is_difference = self.params.get("negate") is not None
+        uses_ramp = self._uses_difference_ramp()
         is_overlay = self.params.get("is_overlay", True)
 
         # Insert data layers after "initial-conditions-water" so they render
@@ -746,20 +869,41 @@ class Map(DatasetVisualization):
         )
 
         if self.grid.grid_type == "raster":
-            tile_url = self._get_tile_url_template()
+            tile_url = self._tile_url_template("png")
             style["sources"]["data"] = (
                 self.difference_raster_source(tile_urls=[tile_url])
-                if is_difference
-                else self.raster_source(tile_urls=[tile_url], color_map=("lnd_chng" if self._is_lnd_chng() else None))
+                if uses_ramp
+                else self.raster_source(tile_urls=[tile_url], color_map=self._legend_name())
             )
             data_layers = self.raster_layers("data-layer", "data")
         else:
             style["sources"]["data"] = self.vector_source(self.grid.name)
-            style["state"]["values"] = {"default": self.feature_values}
+            if self.request:
+                # Dynamic MVT endpoint: colors derived from the 'value' property
+                # embedded in each tile, no global-state lookup needed.
+                fill_color = self._legend_fill_expr(uses_ramp)
+            else:
+                # Static PMTiles fallback: pre-compute colors server-side and
+                # pass via global state for the browser to look up per feature.
+                colors = self.feature_colors
+                max_id = max((int(k) for k in colors), default=0)
+                if colors and max_id < len(colors) * 10:
+                    color_array: list[str | None] = [None] * (max_id + 1)
+                    for k, v in colors.items():
+                        color_array[int(k)] = v
+                    step_expr = self._id_step_expr(color_array)
+                    if step_expr is not None:
+                        fill_color = step_expr
+                    else:
+                        style["state"]["colors"] = {"default": color_array}
+                        fill_color = COLOR_ARRAY_EXPR
+                else:
+                    style["state"]["colors"] = {"default": colors}
+                    fill_color = COLOR_OBJECT_EXPR
             data_layers = self.vector_layers(
                 layer_id="data-layer",
                 source_id="data",
-                difference=is_difference,
+                fill_color=fill_color,
                 show_grid_labels=show_grid_labels,
                 show_grid_lines=show_grid_lines,
             )
@@ -769,8 +913,9 @@ class Map(DatasetVisualization):
             style["layers"].insert(insert_idx + i, layer)
 
         # Add project overlay if requested (above data, below labels)
-        if show_projects and model_group_id and (calendar_year or calendar_day):
-            style["sources"]["projects"] = self.projects_source(model_group_id[0])
+        projects_model_group_id = self.params.get("projects_model_group_id") or model_group_id
+        if show_projects and projects_model_group_id and (calendar_year or calendar_day):
+            style["sources"]["projects"] = self.projects_source(projects_model_group_id)
             project_insert_idx = insert_idx + len(data_layers)
             project_year = calendar_year[0] if calendar_year else calendar_day[0].year
             for i, layer in enumerate(self.project_layers(project_year, is_overlay)):
@@ -783,23 +928,61 @@ class Map(DatasetVisualization):
             style["layers"].insert(water_insert_idx, style["layers"].pop(insert_idx - 1))
 
         # Include legend metadata for UI rendering
-        difference = self.params.get("negate") is not None
-        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(difference)]}}
+        style["state"]["legend"] = {"default": {"entries": [self._get_legend_metadata(uses_ramp)]}}
 
         # Set an empty object as the default value for selection colors.
         # TODO: Add support for setting initial selection colors based on the value
-        # of the geographies parameter.
+        # of the grid_cell parameter.
         style["state"]["selectionColors"] = {"default": {}}
 
         return style
 
-    def _is_lnd_chng(self) -> bool:
-        """Are we calculating land change?
+    def _is_difference(self) -> bool:
+        """Is this a difference result?
+
+        Reads the resolved analysis's own `result_kind` when `analysis=` is selected
+        (`diff`'s `Meta.result_kind = "difference"`); a map with no analysis
+        selected is never a difference.
 
         Returns:
-            Boolean indicating whether this is land change.
+            Boolean indicating whether this is a difference result.
         """
-        return self.variable.name == "lnd_type" and self.params.get("multiply10") is not None
+        resolved = self.resolved_analysis
+        return resolved is not None and resolved.result_kind == "difference"
+
+    def _uses_difference_ramp(self) -> bool:
+        """Should this map's coloring be the SYNTHESIZED diverging ramp
+        (`_difference_breaks`: red at `-limit`, white/transparent at `0`, blue at `+limit`,
+        off the variable's `difference_legend_limit`) rather than a named legend?
+
+        A difference with no named legend -- including `lnd_conf,diff`, whose value legend
+        `resolve_analysis_chain` drops once it is differenced. The ramp exists because a
+        difference of an arbitrary variable has no classification anyone has written down:
+        it is derived from the variable's own scale, and is the honest default for that.
+        A difference that still carries a legend (`lnd_type_plus,diff`, a category result)
+        uses it instead -- and this is the one place that has to be decided, since all four
+        coloring branches (`feature_colors`, the raster source, `_legend_fill_expr`, and the
+        legend metadata) read it.
+
+        Distinct from `_is_difference`, which stays the plain question about the RESULT and
+        still answers `True` here -- `difference_suffix` and the title still say
+        "Difference" for a difference that happens to have a legend of its own.
+        """
+        return self._is_difference() and self._legend_name() is None
+
+    def _legend_name(self) -> str | None:
+        """The named legend (a `cpra.mp.data.legends.LEGENDS` key) this map's coloring
+        should use, or `None` for "no override -- fall back to the variable's own
+        default legend" (see `_get_legend`, which does exactly that).
+
+        Reads the resolved analysis's own declared `legend` when `analysis=` is selected
+        (`lnd_chng`'s `Meta.legend = "lnd_chng"`; `diff` declares none); a map
+        with no analysis selected has no override. For a CHAIN this is what
+        `resolve_analysis_chain` settled on (`lnd_conf,diff` -> `None`, the ramp) --
+        nothing about that resolution is redone here.
+        """
+        resolved = self.resolved_analysis
+        return resolved.legend if resolved is not None else None
 
     def _get_legend(self) -> Legend | None:
         """Get the current legend.
@@ -807,25 +990,39 @@ class Map(DatasetVisualization):
         Returns:
             A Legend instance for the current map.
         """
-        # If we're doing digit concatenation on land type, use the land change
-        # as the variable.
-        if self._is_lnd_chng():
-            return LEGENDS.get("lnd_chng")
-        return self.variable.legend or LEGENDS.get("default")
+        variable_legend = self.variable.legend if self.variable is not None else None
+        return LEGENDS.get(self._legend_name()) or variable_legend or LEGENDS.get("default")
 
     def _get_legend_metadata(self, difference: bool = False) -> dict[str, Any]:
         """Generate legend metadata for the style response.
 
         Args:
-            difference: Whether this is a difference visualization.
+            difference: Whether this map is colored by the synthesized diverging ramp --
+                `_uses_difference_ramp`, not `_is_difference`. A difference that names a
+                legend of its own (`lnd_type_plus,diff`) takes the branch below, so that the
+                key the client renders matches the colors the tiles actually came back in.
 
         Returns:
             A dictionary with legend title, unit, type, and color steps.
         """
+        # `None` for a result carrying no single presentation variable (`lnd_type_plus`).
+        # Every `display.*` helper below is the identity for it, and `result_label` falls
+        # back to the analysis's own `Meta.label` for the title.
         var = self.variable
+        # A `kind="variable"` analysis (`lnd_conf`) names its own result; otherwise the
+        # variable does.
+        resolved = self.resolved_analysis
+        title = (
+            resolved.meta.label
+            if resolved is not None and resolved.meta.kind == "variable"
+            else self.result_label
+        )
 
         if difference:
-            limit = var.difference_legend_limit or 1
+            # The client renders these as tick labels, so unlike `_difference_breaks` --
+            # which colorizes storage-unit pixels server-side and stays in storage units --
+            # the limit is converted for display here.
+            limit = to_display(var, (var.difference_legend_limit if var is not None else None) or 1)
             steps = sorted(
                 [
                     {"color": "#d53e4f", "value": -1 * limit},
@@ -835,9 +1032,10 @@ class Map(DatasetVisualization):
                 key=lambda s: s["value"],
             )
             return {
-                "title": f"{var.label} Difference",
-                "subtitle": var.unit,
+                "title": f"{title} Difference",
+                "subtitle": display_unit(var),
                 "type": "continuous",
+                "numberFormat": display_number_format(var),
                 "steps": steps,
             }
 
@@ -845,21 +1043,65 @@ class Map(DatasetVisualization):
         if legend is None:
             return {}
 
+        # `legends.csv`'s optional `sort` column orders the KEY only (`lnd_conf_chng`, whose
+        # codes run 11-44 but read as loss/gain/stays-water/stays-land); the tiles still
+        # colorize by `upper_bound`, which is why it is applied here and nowhere else. A
+        # stable sort, so rows sharing a label keep their relative order and the portal's
+        # first-seen dedup still picks the same one.
+        break_points = legend.break_points
+        if "sort" in break_points.columns and break_points["sort"].is_not_null().any():
+            break_points = break_points.sort("sort", nulls_last=True, maintain_order=True)
+
         steps = []
-        for row in legend.break_points.iter_rows(named=True):
+        for row in break_points.iter_rows(named=True):
             step = {"color": row["color"]}
             if "label" in row and row["label"] is not None:
                 step["label"] = row["label"]
             if row["upper_bound"] is not None:
-                step["value"] = row["upper_bound"]
+                # Break points are stored in storage units (they colorize pixels); every
+                # value in this block is display units, matching `subtitle` below.
+                step["value"] = to_display(var, row["upper_bound"])
             steps.append(step)
 
-        return {
-            "title": "Land Change" if self._is_lnd_chng() else var.label,
-            "subtitle": var.unit,
+        # A difference reaching THIS branch is one with a legend of its own, and its title
+        # still has to say what the reader is looking at. `" Difference"` verbatim rather
+        # than `difference_suffix`: that is the chain's whole `title_suffix`, which may
+        # repeat a word already inside `Meta.label`.
+        if self._is_difference():
+            title = f"{title} Difference"
+        metadata = {
+            "title": title,
+            "subtitle": display_unit(var),
             "type": legend.type,
             "steps": steps,
         }
+        if legend.layout is not None:
+            metadata["layout"] = self._legend_layout(legend, break_points)
+        return metadata
+
+    @staticmethod
+    def _legend_layout(legend: Legend, break_points: pl.DataFrame) -> dict[str, Any]:
+        """`legend_layouts.csv`'s arrangement of a legend's key into labelled rows -- the
+        `lnd_conf_chng` design's loss/gain and stays-water/stays-land strips, with an
+        arrow row between them.
+
+        An ADDITION to `steps`, not a replacement: `type` stays `discrete` and `steps`
+        stays the full sorted list, so a client that doesn't know `layout` still draws the
+        key as a list. A `swatches` row takes the break points whose `row` names it, in
+        `break_points`' (sorted) order and one per label, since the tiles may color
+        several codes one class; a break point naming no row (`No Data`) is in no strip.
+        An `arrows` row carries only its two end captions.
+        """
+        rows = []
+        for layout_row in legend.layout.iter_rows(named=True):
+            row = {"kind": layout_row["kind"], "left": layout_row["left"], "right": layout_row["right"]}
+            if layout_row["kind"] == "swatches":
+                swatches = {}
+                for point in break_points.filter(pl.col("row") == layout_row["row"]).iter_rows(named=True):
+                    swatches.setdefault(point["label"], {"color": point["color"], "label": point["label"]})
+                row["steps"] = list(swatches.values())
+            rows.append(row)
+        return {"rows": rows}
 
     @property
     def spec(self):

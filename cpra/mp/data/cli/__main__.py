@@ -1,6 +1,3 @@
-from cpra.mp.data.cli import (
-    cli,
-    convert,  # noqa
-)
+from cpra.mp.data.cli import catalog, cli, crosswalk  # noqa: F401
 
 cli()

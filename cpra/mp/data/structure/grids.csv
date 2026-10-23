@@ -7,3 +7,7 @@ Block Group,block_group_v2020,vector,epsg:26915,,,,,,
 CLARA Community,clara_community_v001,vector,epsg:26915,,,,,,
 Parish,parish_v2020,vector,epsg:26915,,,,,,
 CLARA Grid Cell,clara_grid_cell_v001,vector,epsg:26915,1,126174,126174,,,
+Morphology Pixel,morph_pixel_v002,raster,epsg:26915,,,,"410470, 3199960, 909670, 3374680",5824,16640
+Vegetation Grid Cell,veg_grid_cell_v002,raster,epsg:26915,,,,"410470, 3199960, 909670, 3374680",364,1040
+Hydro Compartment,hydro_compartment_v002,vector,epsg:26915,1,1878,1878,,,
+Ecoregion,ecoregion_v002,vector,epsg:26915,1,32,32,,,

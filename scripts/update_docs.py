@@ -40,6 +40,12 @@ def table(df, column_aliases={}, format={}):
     )
 
 
+def drop_empty_columns(df):
+    """Drop columns that are null for every row."""
+
+    return df.select([col for col in df.columns if df[col].null_count() < len(df)])
+
+
 def replace_section(section_id, content, markdown):
     """Replace a dynamic section with a new version."""
     return re.sub(
@@ -71,6 +77,7 @@ def update_docs():
     dimension_values = read_structure_csv("dimension_values")
     grids = read_structure_csv("grids")
     legends = read_structure_csv("legends")
+    legend_layouts = read_structure_csv("legend_layouts")
     variables = read_structure_csv("variables")
 
     markdown = replace_section("dimensions", table(dimensions), markdown)
@@ -87,14 +94,26 @@ def update_docs():
         if not len(values_df):
             continue
         dimensions_values_content += f"\n\n## {pluralize(dim['label'])}"
-        dimensions_values_content += f"\n\n{table(values_df.select('value', 'label'))}"
+        # Only some dimensions color their values, so drop the column for the ones that
+        # don't rather than printing a blank one under every table.
+        dimensions_values_content += (
+            f"\n\n{table(values_df.select('value', 'label', 'color').pipe(drop_empty_columns))}"
+        )
     markdown = replace_section(
         "dimension_values", dimensions_values_content, markdown
     )
 
+    def legend_content(name, legend_df):
+        content = f"### `{name}` Legend\n\n{table(legend_df.select(cs.exclude('name')).pipe(drop_empty_columns))}"
+        layout_df = legend_layouts.filter(name=name).sort("row")
+        if len(layout_df):
+            # The map key's arrangement into rows; break points name theirs in `Row`.
+            content += f"\n\n#### `{name}` Layout\n\n{table(layout_df.select(cs.exclude('name')))}"
+        return content
+
     legends_content = "\n\n".join(
         [
-            f"### `{group[0]}` Legend\n\n{table(legend_df.select(cs.exclude('name')))}"
+            legend_content(group[0], legend_df)
             for group, legend_df in sorted(legends.group_by("name"))
         ]
     )

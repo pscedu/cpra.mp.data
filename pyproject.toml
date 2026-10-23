@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "cpra.mp.data"
-version = "0.37.0"
+version = "0.57.0"
 description = "Tools for reading and writing data from Louisiana's Coastal Master Plan"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,16 +28,28 @@ dependencies = [
     "mercantile",
     "numpy",
     "Pillow",
-    "polars==1.37.1",
+    "pmtiles>=3.7.0",
+    "polars>=1.41.2,<2",
     "pyarrow",
+    "pyogrio>=0.12.1",
+    "pyproj",
     "python-dotenv",
     "rasterio",
     "scipy",
+    "shapely",
 ]
 
 [project.optional-dependencies]
-api = ["fastapi[standard]>=0.115.0", "psycopg2-binary", "sqlmodel", "pygeoapi"]
+api = [
+    "fastapi[standard]>=0.115.0",
+    "geopandas>=0.14.4",
+    "mapbox-vector-tile>=2.2.0",
+    "psycopg2-binary",
+    "sqlmodel",
+    "pygeoapi"
+]
 bridges2 = [
+    "anywidget",
     "connectorx",
     "geojson",
     "geopandas",
@@ -45,14 +57,81 @@ bridges2 = [
     "pandas",
     "psycopg2-binary",
     "sqlalchemy",
-    "topojson"
+    "sympy",
+    "topojson",
+    "traitlets",
 ]
-scripts = ["fastexcel", "tippecanoe"]
+jupyter = [
+    "jupyterlab>=4.5.7",
+    "maplibre[all]"
+]
+# `pyproj` moved to the core dependencies with the crosswalk generators -- they are package
+# code now (see cpra.mp.data.crosswalks), not scripts. `tqdm` stays: the migration and
+# video-frame scripts still use it.
+scripts = ["affine", "fastexcel", "playwright", "tippecanoe", "tqdm"]
+
+[dependency-groups]
+dev = [
+    "fastapi[standard]>=0.115.0",
+    "mapbox-vector-tile>=2.2.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "sqlmodel",
+    # Also in the `scripts` extra, which is what actually needs it at runtime. It is here
+    # too because tests/test_migrate_to_long_format.py execs
+    # scripts/migrate_to_long_format.py, which imports it at module scope -- so without it
+    # the suite cannot even be collected under the `--extra api --group dev` set CI syncs.
+    "tqdm",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=cpra.mp.data --cov-report=term-missing --cov-report=xml --cov-fail-under=95 -m 'not memory'"
+# Deselected by default via `addopts` above; run with `pytest -m memory` (or `-m ''` for
+# everything). A `memory` test measures a subprocess's peak RSS, so its result depends on
+# the machine, the allocator, and what else is running -- real signal, but not something a
+# build should gate on. Deselecting costs no coverage: the measurement happens in a child
+# process, so these tests contribute none to begin with.
+markers = ["memory: measures peak RSS in a subprocess; environment-dependent, opt-in"]
+# Fail on deprecations this package is responsible for, so they get fixed rather than
+# accumulating. Deliberately narrow: a blanket "error" would break the build on unrelated
+# deprecations from rasterio/GDAL, Polars, or Starlette on any dependency bump.
+filterwarnings = [
+    # geopandas 0.14.4 imports the deprecated `shapely.geos` when it loads. Nothing in this
+    # package can fix that, and neither can a bump: `maplibre[all]` (the jupyter extra, a
+    # fork pinned by git) requires geopandas <0.15, while the import was dropped in
+    # geopandas 1.0. Revisit when that fork moves; `uv lock --upgrade-package geopandas`
+    # will keep resolving to 0.14.4 until it does.
+    #
+    # Listed first on purpose. pytest applies these in order and each one takes precedence
+    # over the ones before it, so the two rules below still turn this same warning into an
+    # error if it is ever *our* code importing `shapely.geos`.
+    "ignore:The 'shapely.geos' module is deprecated:DeprecationWarning",
+    "error::DeprecationWarning:cpra.*",
+    "error::DeprecationWarning:tests.*",
+    "error::pydantic.PydanticDeprecatedSince20",
+]
+
+[tool.coverage.run]
+source = ["cpra/mp/data"]
+omit = [
+    "cpra/mp/data/visualizations/*",
+    "cpra/mp/data/api/__main__.py",
+    "cpra/mp/data/cli/__main__.py",
+]
+
+[tool.ruff]
+line-length = 120
 
 [tool.basedpyright]
 reportAny = false
 reportExplicitAny = false
 typeCheckingMode = "off"
+
+[tool.uv.sources]
+maplibre = { git = "https://github.com/jpuerto-psc/py-maplibregl" }
 
 [tool.uv.build-backend]
 module-name = "cpra.mp.data"

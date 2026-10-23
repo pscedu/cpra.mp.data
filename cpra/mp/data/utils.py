@@ -1,54 +1,114 @@
+from math import floor
 from pathlib import Path
 
 import polars as pl
 from polars.exceptions import ColumnNotFoundError
 from scipy.io import FortranFile
 
-from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.config import get_base_path
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.variables import VARIABLES
 
+RANGE_FUNCTIONS = {"calendar_day": pl.date_range, "calendar_year": pl.arange}
+RANGE_KWARGS = {
+    "daily": {"interval": "1d"},
+    "monthly": {"interval": "1mo"},
+    "annual": {"step": 1},
+    "decadal": {"step": 10},
+}
+
+
+def calendar_run_offsets(values, calendar_dim, time_unit):
+    """Return an offset per value such that consecutive ``values`` sharing the same
+    offset form one maximal contiguous run (year/decade/month/day, per ``calendar_dim``
+    and ``time_unit``).
+
+    ``values`` must be a sorted (ascending), duplicate-free ``pl.Series`` of
+    ``calendar_year`` (Int) or ``calendar_day`` (Date) values.  Used by both the API
+    catalog's range compression (``catalog.py:CatalogQuery._compress``) and
+    ``compact_cog``'s file-merge grouping (``raster.py``) -- keep the two in sync.
+    """
+    range_function = RANGE_FUNCTIONS[calendar_dim]
+    range_kwargs = RANGE_KWARGS[time_unit]
+    # Account for decadal data that doesn't start on an even decade.
+    # TODO: Handle monthly data that doesn't start on the first of the month.
+    range_start = floor(values.min() / 10) * 10 if time_unit == "decadal" else values.min()
+    range_end = values.max() if calendar_dim == "calendar_day" else values.max() + 1
+    seq = range_function(range_start, range_end, eager=True, **range_kwargs)[: len(values)]
+    return values - seq
+
 
 def partition_columns(df, include_dataset=True):
     """Get a list of partition columns based on the values in the data frame."""
 
-    return [
-        col.name
-        for col in df.select(
+    result = (
+        df.lazy()
+        .select(
             **{
                 dim.name: dim.partition & dim.required
                 for dim in DIMENSIONS.values()
                 if (include_dataset or dim.name not in DATASET_DIMENSIONS)
             }
         )
-        if col.any()
-    ]
+        .limit(1)
+        .collect()
+    )
+    return [col.name for col in result if col.any()]
 
 
 def required_columns(
     df,
     include_dataset=True,
     include_metadata=True,
-    include_geography=False,
+    include_grid_cell=False,
     include_value=False,
 ):
     """Get a list of required columns based on the values in the data frame."""
 
+    result = (
+        df.lazy()
+        .select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
+        .limit(1)
+        .collect()
+    )
     return (
         [
             col.name
-            for col in df.select(
-                **{dim.name: dim.required for dim in DIMENSIONS.values()}
-            )
+            for col in result
             if col.any()
             and (include_dataset or col.name not in DATASET_DIMENSIONS)
             and (include_metadata or col.name not in METADATA_DIMENSIONS)
         ]
-        + (["geography"] if include_geography else [])
+        + (["grid_cell"] if include_grid_cell else [])
         + (["value"] if include_value else [])
     )
+
+
+def long_sort_expressions(outer_cols, time_unit):
+    """Return Polars sort expressions for the canonical long-format order.
+
+    ``outer_cols`` are the dimension column names that sort *outside* grid_cell
+    (every required column except calendar_* and grid_cell, in the desired
+    order).  The grid_cell/calendar tail is appended consistently for every
+    time unit:
+
+      outer_cols → grid_cell → calendar_day (daily/monthly)
+      outer_cols → grid_cell → calendar_year (annual/decadal)
+
+    Sorting grid_cell ahead of the calendar column clusters each grid cell's
+    full time series contiguously, which both compresses the value column well
+    and lets predicate pushdown skip row groups for grid_cell-filtered queries.
+    The calendar column is delta-encoded on write, so its compactness no longer
+    depends on the sort order.  Both ``write_parquet`` and the long-format
+    migration build their sort key through this helper so the global order
+    cannot drift between them.
+    """
+    exprs = [pl.col(col) for col in outer_cols]
+    time_col = "calendar_day" if time_unit in ("daily", "monthly") else "calendar_year"
+    exprs.extend([pl.col("grid_cell"), pl.col(time_col)])
+    return exprs
 
 
 def validate_data_frame(df, required_cols=None):
@@ -57,49 +117,40 @@ def validate_data_frame(df, required_cols=None):
     if required_cols is None:
         required_cols = required_columns(df)
 
+    # Resolve the schema once and take both the names and the dtypes from it: `df.columns`
+    # and `df.schema` each resolve a LazyFrame's schema separately, which Polars warns
+    # about as a potentially expensive operation.
+    schema = df.collect_schema()
+
     # Raise an exception if required columns are missing.
-    missing_cols = [col for col in required_cols if col not in df.columns]
+    missing_cols = [col for col in required_cols if col not in schema.names()]
     if missing_cols:
-        raise ValidationError(
-            f"Required columns are missing: {', '.join(missing_cols)}"
-        )
+        raise ValidationError(f"Required columns are missing: {', '.join(missing_cols)}")
 
     expressions = {}
 
     # Validate required columns, and add dimension validation expressions.
     for col in required_cols:
         dim = DIMENSIONS[col]
-        dim.validate_dtype(df[col])
+        dim.validate_dtype(pl.Series(name=col, values=[], dtype=schema[col]))
         expressions.update(dim.validation_expressions)
 
     # Add validation expressions for variable-geographic_unit and variable-time_unit.
     expressions["variable_matches_grid"] = pl.any_horizontal(
         *[
-            (
-                (pl.col("variable") == n)
-                & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units)
-            )
+            ((pl.col("variable") == n) & pl.col("grid").str.replace(r"_v[0-9.]+", "").is_in(v.geographic_units))
             for n, v in VARIABLES.items()
         ]
     )
     expressions["variable_matches_time_unit"] = pl.any_horizontal(
-        *[
-            ((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units))
-            for n, v in VARIABLES.items()
-        ]
+        *[((pl.col("variable") == n) & pl.col("time_unit").is_in(v.time_units)) for n, v in VARIABLES.items()]
     )
 
-    results = df.select(**expressions).with_columns(
-        valid=pl.all_horizontal(pl.col("*"))
-    )
+    results = df.lazy().select(**expressions).with_columns(valid=pl.all_horizontal(pl.col("*"))).collect()
 
     if not results["valid"].all():
         failed_row_count = results["valid"].len() - results["valid"].sum()
-        failed_cols = [
-            series.name
-            for series in results
-            if not series.all() and series.name != "valid"
-        ]
+        failed_cols = [series.name for series in results if not series.all() and series.name != "valid"]
         msg = f"{failed_row_count} rows failed validation: {', '.join(failed_cols)}"
         raise ValidationError(msg)
 
@@ -115,7 +166,7 @@ def extract_dimension_value(column, data=None, **kwargs):
 
     try:
         return data[column][0]
-    except (KeyError, IndexError, ValueError, ColumnNotFoundError):
+    except (KeyError, IndexError, TypeError, ValueError, ColumnNotFoundError):
         return None
 
 
@@ -133,6 +184,8 @@ def validate_grid(data=None, **kwargs):
     """Validate that there is a grid for the given geographic unit and plan version."""
 
     grid_name = extract_dimension_value("grid", data, **kwargs)
+    if isinstance(grid_name, (list, tuple)):
+        grid_name = grid_name[0] if grid_name else None
 
     if grid_name is None:
         msg = "Grid is required."
@@ -150,11 +203,7 @@ def cast_columns(df):
     """Cast all dimension columns in the given dataframe to the correct dtype."""
 
     return df.with_columns(
-        **{
-            dim.name: pl.col(dim.name).cast(dim.dtype)
-            for dim in DIMENSIONS.values()
-            if dim.name in df.columns
-        }
+        **{dim.name: pl.col(dim.name).cast(dim.dtype) for dim in DIMENSIONS.values() if dim.name in df.columns}
     )
 
 
@@ -178,8 +227,14 @@ def read_fortran_array(filename, dtype=None, variable=None):
         return array_file.read_record(dtype)
 
 
-def build_glob_pattern(required_cols, extension=None, **kwargs):
-    """Build a glob pattern for selecting files from a dataset directory."""
+def build_glob_pattern(required_cols, extension=None, nested=False, **kwargs):
+    """Build a glob pattern for selecting files from a dataset directory.
+
+    If ``nested`` is set, ``extension`` files are matched by an any-name wildcard inside
+    the directory built from ``required_cols`` (for datasets whose filenames don't
+    encode a dimension, e.g. UUID-named COGs/Parquet files) rather than being appended
+    directly onto the last dimension's own value.
+    """
     # The values of the keyword arguments can be lists or tuples that contain
     # multiple values, but for the glob pattern, we can only use single values.
     single_values = {
@@ -187,19 +242,19 @@ def build_glob_pattern(required_cols, extension=None, **kwargs):
         for k, v in kwargs.items()
         if not isinstance(v, (list, tuple)) or len(v) == 1
     }
-    dimension_patterns = [
-        f"{col}={str(single_values[col]) if col in single_values else '*'}"
-        for col in required_cols
-    ]
+    dimension_patterns = [f"{col}={str(single_values[col]) if col in single_values else '*'}" for col in required_cols]
+    if nested:
+        return "/".join(dimension_patterns) + (f"/*.{extension}" if extension else "/*")
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
 
 
-def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs):
+def glob_lazy_frame(
+    required_cols, base_path=None, extension=None, nested=False, include_file_paths="path", **kwargs
+):
     """Create a LazyFrame with information about matched paths."""
 
-    glob_pattern = build_glob_pattern(
-        required_cols=required_cols, extension=extension, **kwargs
-    )
+    base_path = get_base_path(base_path)
+    glob_pattern = build_glob_pattern(required_cols=required_cols, extension=extension, nested=nested, **kwargs)
     suffix = f"\\.{extension}" if extension else "$"
 
     return (
@@ -207,14 +262,11 @@ def glob_lazy_frame(required_cols, base_path=BASE_PATH, extension=None, **kwargs
         .with_columns(path=pl.col("path").cast(pl.String))
         .select(
             [
-                pl.col("path")
-                .str.extract(f"{dim.name}=([^/]+)(/|{suffix})", 1)
-                .cast(dim.dtype)
-                .alias(dim.name)
+                pl.col("path").str.extract(f"{dim.name}=([^/]+)(/|{suffix})", 1).cast(dim.dtype).alias(dim.name)
                 for dim in DIMENSIONS.values()
                 if dim.name in required_cols
             ]
-            + [pl.col("path")]
+            + ([pl.col("path").alias(include_file_paths)] if include_file_paths else [])
         )
         .sort(*required_cols)
         .lazy()
@@ -236,7 +288,9 @@ def get_input_data_frame(**kwargs):
 def get_filter_expressions(**kwargs):
     """Generate a list of Polars filter expressions."""
     return [
-        pl.col(k).is_in(v) if isinstance(v, (list, tuple)) else pl.col(k) == v
+        pl.col(k).is_in(pl.Series(list(v), dtype=DIMENSIONS[k].dtype).to_list())
+        if isinstance(v, (list, tuple))
+        else pl.col(k) == pl.lit(v).cast(DIMENSIONS[k].dtype)
         for k, v in kwargs.items()
         if k not in DATASET_DIMENSIONS
     ]

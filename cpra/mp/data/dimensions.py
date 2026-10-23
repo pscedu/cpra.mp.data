@@ -7,6 +7,21 @@ from cpra.mp.data.variables import VARIABLES
 
 
 class Dimension:
+    """One dimension of the data: what it's called, what type it is, what values it takes.
+
+    `values` is a DataFrame of `dimension`, `value`, `label` and `color`, or None for a
+    dimension whose values aren't enumerable up front. Two things about it are worth knowing
+    before changing one:
+
+    * `color` is null for most dimensions. It is set where a value carries a color of its own
+      everywhere it's drawn -- `veg_species_code`, whose colors are the vegetation model's
+      own map symbology, so a species reads the same in a chart as it does on the map.
+    * the row order is the order the structure CSV lists them in, and it is meaningful. It is
+      the order values are offered in, and for a colored dimension it is also the display
+      order: `SpeciesStackedBar` takes both its stacking order and its legend order from a
+      row's position here, so reordering the CSV reorders the chart.
+    """
+
     def __init__(
         self,
         name,
@@ -49,7 +64,9 @@ class Dimension:
             exprs[f"{self.name}_is_not_null"] = pl.col(self.name).is_not_null()
 
         if self.values is not None:
-            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"])
+            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(
+                self.values["value"].cast(self.dtype).to_list()
+            )
 
         if self.min_value is not None:
             exprs[f"{self.name}_minimum_value"] = pl.col(self.name) >= self.min_value
@@ -76,8 +93,13 @@ def make_dimensions():
     dimensions = []
 
     for row in read_structure_csv("dimensions").with_columns(pl.col("required").cast(pl.Boolean)).iter_rows(named=True):
+        # Float32 dimensions are cast to Float64 so that canonical values like
+        # "0.1" survive the round-trip intact for display. The storage dtype
+        # (Float32) is preserved on self.dtype and used when building filter
+        # and validation expressions.
+        display_dtype = pl.Float64 if row["dtype"].startswith("Float") else getattr(pl, row["dtype"])
         values = dim_values_df.filter(dimension=row["name"]).with_columns(
-            pl.col("value").cast(getattr(pl, row["dtype"]))
+            pl.col("value").cast(display_dtype)
         )
         if row["required"] is False:
             row["required"] = (
@@ -99,8 +121,11 @@ def values_df_from_dict(dimension, values_dict, attr="label"):
                 "label": [getattr(obj, attr) for obj in values_dict.values()],
             }
         )
-        .with_columns(pl.lit(dimension).alias("dimension"))
-        .select("dimension", "value", "label")
+        .with_columns(pl.lit(dimension).alias("dimension"), color=pl.lit(None, dtype=pl.String))
+        # `color` is null rather than absent so that every `Dimension.values` frame has the
+        # same columns whatever built it -- the CSV colors only some dimensions, and callers
+        # that read the column shouldn't have to know which ones came from where.
+        .select("dimension", "value", "label", "color")
     )
 
 

@@ -39,6 +39,22 @@ class RasterGrid(BaseGrid):
         self.width = width
 
 
+class CoordinateGrid(BaseGrid):
+    """A grid whose geographies are coordinates themselves.
+
+    Not one of the model's grids, and so not in `GRIDS`: it divides nothing up, holds no
+    data, and has no set of geographies to enumerate. It stands in for a grid where an API
+    needs to name where a bare coordinate lives — converting geographies from it means
+    converting the coordinates given, rather than the cells of some grid containing them.
+    """
+
+    grid_type = "coordinate"
+
+
+# The coordinates the API speaks everywhere else in, named as a grid so that they can be
+# converted from.
+WGS84 = CoordinateGrid(name="wgs84", label="Coordinates", crs="epsg:4326")
+
 GRIDS = {}
 
 

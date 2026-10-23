@@ -1,261 +1,313 @@
-name,label,color,upper_bound
-accr,0 to < 2,#feebe2,2.0
-accr,2 to < 4,#fbb4b9,4.0
-accr,4 to < 6,#f768a1,6.0
-accr,6 to < 8,#c51b8a,8.0
-accr,8 to 10,#7a0177,
-damage,$0 to < $1K,#edf8fb,1000.0
-damage,$1K to < $10K,#b3cde3,10000.0
-damage,$10K to < $100K,#8c96c6,100000.0
-damage,$100K to < $1M,#8856a7,1000000.0
-damage,$1M or more,#810f7c,
-default,0 to 49,#d53e4f,50.0
-default,50 to 99,#fc8d59,100.0
-default,100 to 249,#fee08b,250.0
-default,250 to 499,#ffffbf,500.0
-default,500 to 999,#e6f598,1000.0
-default,"1,000 to 4,999",#99d594,5000.0
-default,"5,000 or more",#3288bd,
-eadd,$0 to < $100,#feebe2,100.0
-eadd,$100 to < $1K,#fcc5c0,1000.0
-eadd,$1K to < $10K,#fa9fb5,10000.0
-eadd,$10K to < $100K,#f768a1,100000.0
-eadd,$100K to < $1M,#c51b8a,1000000.0
-eadd,$1M or more,#7a0177,
-easd,0 to < 0.0001,#ffffb2,0.0001
-easd,0.0001 to < 0.001,#fed976,0.001
-easd,0.001 to < 0.01,#feb24c,0.01
-easd,0.01 to < 0.1,#fd8d3c,0.1
-easd,0.1 to < 1,#f03b20,1.0
-easd,1 or more,#bd0026,
-elev,Less than -2.0,#d53e4f,-2.0
-elev,-2.0 to < -1.0,#f46d43,-1.0
-elev,-1.0 to < -0.5,#fdae61,-0.5
-elev,-0.5 to < 0.0,#fee08b,0.0
-elev,0.0 to < 0.5,#e6f598,0.5
-elev,0.5 to < 1.0,#abdda4,1.0
-elev,1.0 to < 2.0,#66c2a5,2.0
-elev,2.0 or greater,#3288bd,
-exposure_count_asset,0 to 9,#d53e4f,10.0
-exposure_count_asset,10 to 49,#f46d43,50.0
-exposure_count_asset,50 to 99,#fdae61,100.0
-exposure_count_asset,100 to 249,#fee08b,250.0
-exposure_count_asset,250 to 499,#e6f598,500.0
-exposure_count_asset,500 to 999,#abdda4,1000.0
-exposure_count_asset,"1,000 to 9,999",#66c2a5,10000.0
-exposure_count_asset,"10,000 or more",#3288bd,
-exposure_exposed_structures,No structures,#00000000,
-exposure_exposed_structures,0 structures exposed,#d53e4f,1.0
-exposure_exposed_structures,1 structure exposed,#fc8d59,2.0
-exposure_exposed_structures,2 structures exposed,#fee08b,3.0
-exposure_exposed_structures,3 to 5 structures exposed,#e6f598,6.0
-exposure_exposed_structures,6 to 9 structures exposed,#99d594,10.0
-exposure_exposed_structures,10 or more structures exposed,#3288bd,
-ffibs,No Data,#00000000,0.0
-ffibs,Fresh Forest,#5E823A,0.2
-ffibs,Fresh Marsh,#DAE86D,2.0
-ffibs,Intermediate Marsh,#92CBE8,5.0
-ffibs,Brackish Marsh,#735753,17.0
-ffibs,Saline Marsh,#0679D2,
-flood_depth,No Data,#00000000,1.0
-flood_depth,1 to < 4 feet,#728d97,4.0
-flood_depth,4 to < 7 feet,#73b7ea,7.0
-flood_depth,7 to < 10 feet,#99d9a7,10.0
-flood_depth,10 to < 13 feet,#f8d88b,13.0
-flood_depth,13 to < 16 feet,#e9b023,16.0
-flood_depth,16 to < 21 feet,#e56524,21.0
-flood_depth,21+ feet,#b73865,
-hsi,0 to < 0.1,#313695,0.1
-hsi,0.1 to < 0.2,#4575b4,0.2
-hsi,0.2 to < 0.3,#74add1,0.3
-hsi,0.3 to < 0.4,#abd9e9,0.4
-hsi,0.4 to < 0.5,#e0f3f8,0.5
-hsi,0.5 to < 0.6,#fee090,0.6
-hsi,0.6 to < 0.7,#fdae61,0.7
-hsi,0.7 to < 0.8,#f46d43,0.8
-hsi,0.8 to < 0.9,#d73027,0.9
-hsi,0.9 to 1,#a50026,
-inun,-2.00 to < -1.00,#d53e4f,-1.0
-inun,-1.00 to < -0.50,#f46d43,-0.5
-inun,-0.50 to < -0.25,#fdae61,-0.25
-inun,-0.25 to < 0.00,#fee08b,0.0
-inun,0.00 to < 0.25,#e6f598,0.25
-inun,0.25 to < 0.50,#abdda4,0.5
-inun,0.50 to < 1.00,#66c2a5,1.0
-inun,1.00 or more,#3288bd,
-lnd_chng,No Data,#00000000,12.0
-lnd_chng,Land Loss,#4591ac,13.0
-lnd_chng,No Data,#00000000,21.0
-lnd_chng,Land Gain,#265118,22.0
-lnd_chng,No Data,#00000000,23.0
-lnd_chng,Land Gain,#265118,31.0
-lnd_chng,No Data,#00000000,32.0
-lnd_chng,Land Loss,#4591ac,33.0
-lnd_chng,No Data,#00000000,52.0
-lnd_chng,Land Loss,#4591ac,55.0
-lnd_chng,No Data,#00000000,112.0
-lnd_chng,Induced Loss,#00f0f0,113.0
-lnd_chng,No Data,#00000000,121.0
-lnd_chng,Land Maintained,#99c104,122.0
-lnd_chng,Land Loss,#4591ac,123.0
-lnd_chng,Land Maintained,#99c104,131.0
-lnd_chng,No Data,#00000000,132.0
-lnd_chng,Induced Loss,#00f0f0,133.0
-lnd_chng,No Data,#00000000,211.0
-lnd_chng,Land Gain,#265118,212.0
-lnd_chng,Induced Loss,#00f0f0,213.0
-lnd_chng,Land Gain,#265118,222.0
-lnd_chng,No Data,#00000000,223.0
-lnd_chng,Land Gain,#265118,232.0
-lnd_chng,Induced Loss,#00f0f0,233.0
-lnd_chng,Land Gain,#265118,311.0
-lnd_chng,No Data,#00000000,312.0
-lnd_chng,Induced Loss,#00f0f0,313.0
-lnd_chng,No Data,#00000000,321.0
-lnd_chng,Land Maintained,#99c104,322.0
-lnd_chng,Land Loss,#4591ac,323.0
-lnd_chng,Land Maintained,#99c104,331.0
-lnd_chng,No Data,#00000000,332.0
-lnd_chng,Induced Loss,#00f0f0,333.0
-lnd_chng,No Data,#00000000,512.0
-lnd_chng,Induced Loss,#00f0f0,513.0
-lnd_chng,No Data,#00000000,521.0
-lnd_chng,Land Maintained,#99c104,522.0
-lnd_chng,Land Loss,#4591ac,523.0
-lnd_chng,Land Maintained,#99c104,531.0
-lnd_chng,No Data,#00000000,532.0
-lnd_chng,Induced Loss,#00f0f0,533.0
-lnd_chng,No Data,#00000000,552.0
-lnd_chng,Induced Loss,#00f0f0,553.0
-lnd_chng,No Data,#00000000,
-lnd_type,No Data,#00000000,1.0
-lnd_type,Vegetated Wetland,#008000,2.0
-lnd_type,Open Water,#6495ed,3.0
-lnd_type,Bare/Unvegetated Wetland,#8b4513,4.0
-lnd_type,Upland/Developed Areas,#999999,5.0
-lnd_type,Flotant Marsh,#afeeee,
-mnrl_dep,0 to < 1,#feebe2,1.0
-mnrl_dep,1 to < 10,#fbb4b9,10.0
-mnrl_dep,10 to < 100,#f768a1,100.0
-mnrl_dep,"100 to 1,000",#ae017e,
-omar,0.05 to < 0.07,#feebe2,0.07
-omar,0.07 to < 0.09,#fbb4b9,0.09
-omar,0.09 to < 0.11,#f768a1,0.11
-omar,0.11 to < 0.13,#c51b8a,0.13
-omar,0.13 to 0.15,#7a0177,
-population,"0 to 9,999",#9e0142,10000.0
-population,"10,000 to 19,999",#d53e4f,20000.0
-population,"20,000 to 29,999",#f46d43,30000.0
-population,"30,000 to 39,999",#fdae61,40000.0
-population,"40,000 to 49,999",#fee08b,50000.0
-population,"50,000 to 74,999",#ffffbf,75000.0
-population,"75,000 to 99,999",#e6f598,100000.0
-population,"100,000 to 199,999",#abdda4,200000.0
-population,"200,000 to 499,999",#66c2a5,500000.0
-population,"500,000 to 999,999",#3288bd,1000000.0
-population,"1,000,000 or more",#5e4fa2,
-population_change,0 to 9,#d53e4f,10.0
-population_change,10 to 29,#f46d43,30.0
-population_change,30 to 49,#fdae61,50.0
-population_change,50 to 99,#fee08b,100.0
-population_change,100 to 249,#ffffbf,250.0
-population_change,250 to 499,#e6f598,500.0
-population_change,500 to 999,#abdda4,1000.0
-population_change,"1,000 to 4,999",#66c2a5,5000.0
-population_change,"5,000 or more",#3288bd,
-sal,0 to < 0.1,#d53e4f,0.1
-sal,0.1 to < 0.5,#f46d43,0.5
-sal,0.5 to < 1.0,#fdae61,1.0
-sal,1.0 to < 2.0,#fee08b,2.0
-sal,2.0 to < 5.0,#e6f598,5.0
-sal,5.0 to < 10.0,#abdda4,10.0
-sal,10.0 to < 20.0,#66c2a5,20.0
-sal,20.0 to 35.0,#3288bd,
-sub,No Data,#00000000,0.0
-sub,0 to < 4,#feebe2,4.0
-sub,4 to < 8,#fbb4b9,8.0
-sub,8 to < 12,#f768a1,12.0
-sub,12 to < 16,#c51b8a,16.0
-sub,16 to 20,#7a0177,
-ssf,No Data,#00000000,0.0
-ssf,0 to < 2,#feebe2,2.0
-ssf,2 to < 4,#fbb4b9,4.0
-ssf,4 to < 6,#f768a1,6.0
-ssf,6 to < 8,#ae017e,
-surge_water_surface_elevations,0.09 or less,#d53e4f,0.1
-surge_water_surface_elevations,0.10 to 0.24,#f46d43,0.25
-surge_water_surface_elevations,0.25 to 0.49,#fdae61,0.5
-surge_water_surface_elevations,0.50 to 0.99,#fee08b,1.0
-surge_water_surface_elevations,1.00 to 1.49,#ffffbf,1.5
-surge_water_surface_elevations,1.50 to 1.99,#e6f598,2.0
-surge_water_surface_elevations,2.00 to 2.99,#abdda4,3.0
-surge_water_surface_elevations,3.00 to 4.99,#66c2a5,5.0
-surge_water_surface_elevations,5.00 or more,#3288bd,
-tmp,Less than 19,#d53e4f,19.0
-tmp,19 to < 20,#f46d43,20.0
-tmp,20 to < 21,#fdae61,21.0
-tmp,21 to < 22,#fee08b,22.0
-tmp,22 to < 23,#ffffbf,23.0
-tmp,23 to < 24,#e6f598,24.0
-tmp,24 to < 25,#abdda4,25.0
-tmp,25 to < 26,#66c2a5,26.0
-tmp,27 or more,#3288bd,
-tss,0 to < 10,#d53e4f,10.0
-tss,10 to < 50,#f46d43,50.0
-tss,50 to < 100,#fdae61,100.0
-tss,100 to < 200,#fee08b,200.0
-tss,200 to < 300,#e6f598,300.0
-tss,300 to < 400,#abdda4,400.0
-tss,400 to < 500,#66c2a5,500.0
-tss,500 or more,#3288bd,
-vct,No Data,#00000000,1.0
-vct,Maidencane,#a6cecf,2.0
-vct,Three-Square,#1f78b4,3.0
-vct,Rosseau Cane,#b2df8a,4.0
-vct,Paspalum,#5ba02c,5.0
-vct,Wiregrass,#fb9a99,6.0
-vct,Bulltongue,#e31a1c,7.0
-vct,Needlerush,#fdbf6f,8.0
-vct,Bulrush,#ff7f00,9.0
-vct,Brackish Mix,#cab2d6,10.0
-vct,Oystergrass,#6a3d9a,11.0
-vct,Saltgrass,#ffff99,12.0
-vct,Bottomland Hardwood Forest + Swamp Forest,#005a00,13.0
-vct,Barrier Island Vegetation,#ff80ff,14.0
-vct,No Data,#ffffff,300.0
-vct,Unvegetated,#7f5f1e,400.0
-vct,No Data,#00000000,500.0
-vct,Flotant,#8cf0f0,9999.0
-vct,No Data,#ffffff,
-veg_area,0,#9e0142,1.0
-veg_area,"1 to 2,499,999",#d53e4f,2500000.0
-veg_area,"2,500,000 to 4,999,999",#f46d43,5000000.0
-veg_area,"5,000,000 to 9,999,999",#fdae61,10000000.0
-veg_area,"10,000,000 to 19,999,999",#fee08b,20000000.0
-veg_area,"20,000,000 to 49,999,999",#ffffbf,50000000.0
-veg_area,"50,000,000 to 99,9999,999",#e6f598,100000000.0
-veg_area,"100,000,000 to 199,999,999",#abdda4,200000000.0
-veg_area,"200,000,000 to 399,999,999",#66c2a5,300000000.0
-veg_area,"300,000,000 to 499,999,999",#3288bd,500000000.0
-veg_area,"500,000,000 or more",#5e4fa2,
-stg,0 to < 0.2,#9e0142,0.2
-stg,0.2 to < 0.4,#d53e4f,0.4
-stg,0.4 to < 0.6,#f46d43,0.6
-stg,0.6 to < 0.8,#fdae61,0.8
-stg,0.8 to < 1.0,#fee08b,1.0
-stg,1.0 to < 1.5,#e6f598,1.5
-stg,1.5 to < 2.0,#abdda4,2.0
-stg,2.0 to < 3.0,#66c2a5,3.0
-stg,3.0 to < 5.0,#3288bd,5.0
-stg,5.0 or more,#5e4fa2,
-wlv,0.09 or less,#d53e4f,0.1
-wlv,0.10 to 0.19,#fc8d59,0.2
-wlv,0.20 to 0.29,#fee08b,0.3
-wlv,0.30 to 0.39,#e6f598,0.4
-wlv,0.40 to 0.49,#99d594,0.5
-wlv,0.50 or more,#3288bd,
-wave_heights,0.99 or less,#d7191c,1.0
-wave_heights,1.00 to 1.99,#fdae61,2.0
-wave_heights,2.00 to 4.99,#ffffbf,5.0
-wave_heights,5.00 to 9.99,#abdda4,10.0
-wave_heights,10.0 or more,#2b83ba,
+name,label,color,upper_bound,sort,row
+accr,0 to < 2,#feebe2,2.0,,
+accr,2 to < 4,#fbb4b9,4.0,,
+accr,4 to < 6,#f768a1,6.0,,
+accr,6 to < 8,#c51b8a,8.0,,
+accr,8 to 10,#7a0177,,,
+coverage,No Coverage Present,#00000000,1e-10,,
+coverage,> 0 to < 0.01,#fef2f2,0.01,,
+coverage,0.01 to < 0.05,#ffe2e2,0.05,,
+coverage,0.05 to < 0.1,#ffc9c9,0.1,,
+coverage,0.1 to < 0.2,#ffa2a2,0.2,,
+coverage,0.2 to < 0.4,#ff6467,0.4,,
+coverage,0.4 to < 0.6,#fb2c36,0.6,,
+coverage,0.6 to < 0.8,#c11007,0.8,,
+coverage,0.8 to 1.0,#82181a,,,
+damage,$0 to < $1K,#edf8fb,1000.0,,
+damage,$1K to < $10K,#b3cde3,10000.0,,
+damage,$10K to < $100K,#8c96c6,100000.0,,
+damage,$100K to < $1M,#8856a7,1000000.0,,
+damage,$1M or more,#810f7c,,,
+default,0 to 49,#d53e4f,50.0,,
+default,50 to 99,#fc8d59,100.0,,
+default,100 to 249,#fee08b,250.0,,
+default,250 to 499,#ffffbf,500.0,,
+default,500 to 999,#e6f598,1000.0,,
+default,"1,000 to 4,999",#99d594,5000.0,,
+default,"5,000 or more",#3288bd,,,
+eadd,$0 to < $100,#feebe2,100.0,,
+eadd,$100 to < $1K,#fcc5c0,1000.0,,
+eadd,$1K to < $10K,#fa9fb5,10000.0,,
+eadd,$10K to < $100K,#f768a1,100000.0,,
+eadd,$100K to < $1M,#c51b8a,1000000.0,,
+eadd,$1M or more,#7a0177,,,
+easd,0 to < 0.0001,#ffffb2,0.0001,,
+easd,0.0001 to < 0.001,#fed976,0.001,,
+easd,0.001 to < 0.01,#feb24c,0.01,,
+easd,0.01 to < 0.1,#fd8d3c,0.1,,
+easd,0.1 to < 1,#f03b20,1.0,,
+easd,1 or more,#bd0026,,,
+elev,Less than -2.0,#3288bd,-2000.0,,
+elev,-2.0 to < -1.0,#66c2a5,-1000.0,,
+elev,-1.0 to < -0.5,#abdda4,-500.0,,
+elev,-0.5 to < 0.0,#e6f598,0.0,,
+elev,0.0 to < 0.5,#fee08b,500.0,,
+elev,0.5 to < 1.0,#fdae61,1000.0,,
+elev,1.0 to < 2.0,#f46d43,2000.0,,
+elev,2.0 or greater,#d53e4f,,,
+exposure_count_asset,0 to 9,#d53e4f,10.0,,
+exposure_count_asset,10 to 49,#f46d43,50.0,,
+exposure_count_asset,50 to 99,#fdae61,100.0,,
+exposure_count_asset,100 to 249,#fee08b,250.0,,
+exposure_count_asset,250 to 499,#e6f598,500.0,,
+exposure_count_asset,500 to 999,#abdda4,1000.0,,
+exposure_count_asset,"1,000 to 9,999",#66c2a5,10000.0,,
+exposure_count_asset,"10,000 or more",#3288bd,,,
+exposure_exposed_structures,No structures,#00000000,0.0,,
+exposure_exposed_structures,0 structures exposed,#d53e4f,1.0,,
+exposure_exposed_structures,1 structure exposed,#fc8d59,2.0,,
+exposure_exposed_structures,2 structures exposed,#fee08b,3.0,,
+exposure_exposed_structures,3 to 5 structures exposed,#e6f598,6.0,,
+exposure_exposed_structures,6 to 9 structures exposed,#99d594,10.0,,
+exposure_exposed_structures,10 or more structures exposed,#3288bd,,,
+ffibs,No Data,#00000000,0.0,,
+ffibs,Fresh Forest,#337538,0.2,,
+ffibs,Fresh Marsh,#5DA899,2.0,,
+ffibs,Intermediate Marsh,#DCCD7D,5.0,,
+ffibs,Brackish Marsh,#C26A77,17.0,,
+ffibs,Saline Marsh,#7E2954,,,
+ffibs_alt,No Data,#00000000,0.0,,
+ffibs_alt,Fresh Forest,#346607,0.2,,
+ffibs_alt,Fresh Marsh,#528810,2.0,,
+ffibs_alt,Intermediate Marsh,#8BB219,5.0,,
+ffibs_alt,Brackish Marsh,#BCD017,17.0,,
+ffibs_alt,Saline Marsh,#E0E788,,,
+flood_depth,No Data,#00000000,1.0,,
+flood_depth,1 to < 4 feet,#728d97,4.0,,
+flood_depth,4 to < 7 feet,#73b7ea,7.0,,
+flood_depth,7 to < 10 feet,#99d9a7,10.0,,
+flood_depth,10 to < 13 feet,#f8d88b,13.0,,
+flood_depth,13 to < 16 feet,#e9b023,16.0,,
+flood_depth,16 to < 21 feet,#e56524,21.0,,
+flood_depth,21+ feet,#b73865,,,
+hsi,No Data,#00000000,0.0,,
+hsi,0 to < 0.1,#313695,0.1,,
+hsi,0.1 to < 0.2,#4575b4,0.2,,
+hsi,0.2 to < 0.3,#74add1,0.3,,
+hsi,0.3 to < 0.4,#abd9e9,0.4,,
+hsi,0.4 to < 0.5,#e0f3f8,0.5,,
+hsi,0.5 to < 0.6,#fee090,0.6,,
+hsi,0.6 to < 0.7,#fdae61,0.7,,
+hsi,0.7 to < 0.8,#f46d43,0.8,,
+hsi,0.8 to < 0.9,#d73027,0.9,,
+hsi,0.9 to 1,#a50026,,,
+inun,-2.00 to < -1.00,#d53e4f,-1.0,,
+inun,-1.00 to < -0.50,#f46d43,-0.5,,
+inun,-0.50 to < -0.25,#fdae61,-0.25,,
+inun,-0.25 to < 0.00,#fee08b,0.0,,
+inun,0.00 to < 0.25,#e6f598,0.25,,
+inun,0.25 to < 0.50,#abdda4,0.5,,
+inun,0.50 to < 1.00,#66c2a5,1.0,,
+inun,1.00 or more,#3288bd,,,
+lnd_chng,No Data,#00000000,12.0,,
+lnd_chng,Land Loss,#4591ac,13.0,,
+lnd_chng,No Data,#00000000,21.0,,
+lnd_chng,Land Gain,#265118,22.0,,
+lnd_chng,No Data,#00000000,23.0,,
+lnd_chng,Land Gain,#265118,31.0,,
+lnd_chng,No Data,#00000000,32.0,,
+lnd_chng,Land Loss,#4591ac,33.0,,
+lnd_chng,No Data,#00000000,52.0,,
+lnd_chng,Land Loss,#4591ac,55.0,,
+lnd_chng,No Data,#00000000,112.0,,
+lnd_chng,Induced Loss,#00f0f0,113.0,,
+lnd_chng,No Data,#00000000,121.0,,
+lnd_chng,Land Maintained,#99c104,122.0,,
+lnd_chng,Land Loss,#4591ac,123.0,,
+lnd_chng,Land Maintained,#99c104,131.0,,
+lnd_chng,No Data,#00000000,132.0,,
+lnd_chng,Induced Loss,#00f0f0,133.0,,
+lnd_chng,No Data,#00000000,211.0,,
+lnd_chng,Land Gain,#265118,212.0,,
+lnd_chng,Induced Loss,#00f0f0,213.0,,
+lnd_chng,Land Gain,#265118,222.0,,
+lnd_chng,No Data,#00000000,223.0,,
+lnd_chng,Land Gain,#265118,232.0,,
+lnd_chng,Induced Loss,#00f0f0,233.0,,
+lnd_chng,Land Gain,#265118,311.0,,
+lnd_chng,No Data,#00000000,312.0,,
+lnd_chng,Induced Loss,#00f0f0,313.0,,
+lnd_chng,No Data,#00000000,321.0,,
+lnd_chng,Land Maintained,#99c104,322.0,,
+lnd_chng,Land Loss,#4591ac,323.0,,
+lnd_chng,Land Maintained,#99c104,331.0,,
+lnd_chng,No Data,#00000000,332.0,,
+lnd_chng,Induced Loss,#00f0f0,333.0,,
+lnd_chng,No Data,#00000000,512.0,,
+lnd_chng,Induced Loss,#00f0f0,513.0,,
+lnd_chng,No Data,#00000000,521.0,,
+lnd_chng,Land Maintained,#99c104,522.0,,
+lnd_chng,Land Loss,#4591ac,523.0,,
+lnd_chng,Land Maintained,#99c104,531.0,,
+lnd_chng,No Data,#00000000,532.0,,
+lnd_chng,Induced Loss,#00f0f0,533.0,,
+lnd_chng,No Data,#00000000,552.0,,
+lnd_chng,Induced Loss,#00f0f0,553.0,,
+lnd_chng,No Data,#00000000,,,
+lnd_conf,No Data,#00000000,0.0,,
+lnd_conf,0,#018571,0.001,,
+lnd_conf,> 0 to < 0.5,#80cdc1,0.499,,
+lnd_conf,0.5 to < 1,#dfc27d,0.999,,
+lnd_conf,1,#a6611a,,,
+lnd_conf_chng,No Data,#00000000,11.0,0,
+lnd_conf_chng,"Stays Water, High Confidence",#FFFFFF,12.0,7,3
+lnd_conf_chng,"Stays Water, Moderate Confidence",#EDEDED,13.0,8,3
+lnd_conf_chng,"Land Gain, Moderate Confidence",#67955A,14.0,5,1
+lnd_conf_chng,"Land Gain, High Confidence",#38552F,21.0,6,1
+lnd_conf_chng,"Stays Water, Moderate Confidence",#EDEDED,22.0,8,3
+lnd_conf_chng,"Stays Water, Low Confidence",#DADADA,23.0,9,3
+lnd_conf_chng,"Land Gain, Low Confidence",#BED9B6,24.0,4,1
+lnd_conf_chng,"Land Gain, Moderate Confidence",#67955A,31.0,5,1
+lnd_conf_chng,"Land Loss, Moderate Confidence",#0893C6,32.0,2,1
+lnd_conf_chng,"Land Loss, Low Confidence",#A1DBF0,33.0,3,1
+lnd_conf_chng,"Stays Land, Low Confidence",#DAC2AF,34.0,10,3
+lnd_conf_chng,"Stays Land, Moderate Confidence",#C9AB91,41.0,11,3
+lnd_conf_chng,"Land Loss, High Confidence",#005574,42.0,1,1
+lnd_conf_chng,"Land Loss, Moderate Confidence",#0893C6,43.0,2,1
+lnd_conf_chng,"Stays Land, Moderate Confidence",#C9AB91,44.0,11,3
+lnd_conf_chng,"Stays Land, High Confidence",#B38F6F,,12,3
+lnd_type,No Data,#00000000,1.0,,
+lnd_type,Vegetated Wetland (value=1),#008000,2.0,,
+lnd_type,Open Water (value=2),#6495ed,3.0,,
+lnd_type,Bare/Unvegetated Wetland (value=3),#8b4513,4.0,,
+lnd_type,Upland/Developed Areas (value=4),#999999,5.0,,
+lnd_type,Flotant Marsh (value=5),#afeeee,,,
+lnd_type_plus,No Data,#00000000,1.0,,
+lnd_type_plus,Vegetated Wetland (value=1),#008000,2.0,,
+lnd_type_plus,Water - Deep (value=2),#6495ed,3.0,,
+lnd_type_plus,Bare/Unvegetated Wetland (value=3),#8b4513,4.0,,
+lnd_type_plus,Upland/Developed Areas (value=4),#999999,5.0,,
+lnd_type_plus,Flotant Marsh (value=5),#afeeee,6.0,,
+lnd_type_plus,Water - Shallow Intertidal (value = 6),#d1dffa,7.0,,
+lnd_type_plus,Water - Shallow Subtidal (value = 7),#93b5f2,,,
+mnrl_dep,0 to < 1,#feebe2,1.0,,
+mnrl_dep,1 to < 10,#fbb4b9,10.0,,
+mnrl_dep,10 to < 100,#f768a1,100.0,,
+mnrl_dep,"100 to 1,000",#ae017e,,,
+omar,0.05 to < 0.07,#feebe2,0.07,,
+omar,0.07 to < 0.09,#fbb4b9,0.09,,
+omar,0.09 to < 0.11,#f768a1,0.11,,
+omar,0.11 to < 0.13,#c51b8a,0.13,,
+omar,0.13 to 0.15,#7a0177,,,
+population,"0 to 9,999",#9e0142,10000.0,,
+population,"10,000 to 19,999",#d53e4f,20000.0,,
+population,"20,000 to 29,999",#f46d43,30000.0,,
+population,"30,000 to 39,999",#fdae61,40000.0,,
+population,"40,000 to 49,999",#fee08b,50000.0,,
+population,"50,000 to 74,999",#ffffbf,75000.0,,
+population,"75,000 to 99,999",#e6f598,100000.0,,
+population,"100,000 to 199,999",#abdda4,200000.0,,
+population,"200,000 to 499,999",#66c2a5,500000.0,,
+population,"500,000 to 999,999",#3288bd,1000000.0,,
+population,"1,000,000 or more",#5e4fa2,,,
+population_change,0 to 9,#d53e4f,10.0,,
+population_change,10 to 29,#f46d43,30.0,,
+population_change,30 to 49,#fdae61,50.0,,
+population_change,50 to 99,#fee08b,100.0,,
+population_change,100 to 249,#ffffbf,250.0,,
+population_change,250 to 499,#e6f598,500.0,,
+population_change,500 to 999,#abdda4,1000.0,,
+population_change,"1,000 to 4,999",#66c2a5,5000.0,,
+population_change,"5,000 or more",#3288bd,,,
+sal,0 to < 0.1,#3288bd,0.1,,
+sal,0.1 to < 0.5,#66c2a5,0.5,,
+sal,0.5 to < 1.0,#abdda4,1.0,,
+sal,1.0 to < 2.0,#e6f598,2.0,,
+sal,2.0 to < 5.0,#fee08b,5.0,,
+sal,5.0 to < 10.0,#fdae61,10.0,,
+sal,10.0 to < 20.0,#f46d43,20.0,,
+sal,20.0 to 35.0,#d53e4f,,,
+sub,No Data,#00000000,0.0,,
+sub,0 to < 4,#feebe2,4.0,,
+sub,4 to < 8,#fbb4b9,8.0,,
+sub,8 to < 12,#f768a1,12.0,,
+sub,12 to < 16,#c51b8a,16.0,,
+sub,16 to 20,#7a0177,,,
+ssf,No Data,#00000000,0.0,,
+ssf,0 to < 2,#feebe2,2.0,,
+ssf,2 to < 4,#fbb4b9,4.0,,
+ssf,4 to < 6,#f768a1,6.0,,
+ssf,6 to < 8,#ae017e,,,
+surge_water_surface_elevations,0.09 or less,#d53e4f,0.1,,
+surge_water_surface_elevations,0.10 to 0.24,#f46d43,0.25,,
+surge_water_surface_elevations,0.25 to 0.49,#fdae61,0.5,,
+surge_water_surface_elevations,0.50 to 0.99,#fee08b,1.0,,
+surge_water_surface_elevations,1.00 to 1.49,#ffffbf,1.5,,
+surge_water_surface_elevations,1.50 to 1.99,#e6f598,2.0,,
+surge_water_surface_elevations,2.00 to 2.99,#abdda4,3.0,,
+surge_water_surface_elevations,3.00 to 4.99,#66c2a5,5.0,,
+surge_water_surface_elevations,5.00 or more,#3288bd,,,
+tmp,Less than 19,#d53e4f,19.0,,
+tmp,19 to < 20,#f46d43,20.0,,
+tmp,20 to < 21,#fdae61,21.0,,
+tmp,21 to < 22,#fee08b,22.0,,
+tmp,22 to < 23,#ffffbf,23.0,,
+tmp,23 to < 24,#e6f598,24.0,,
+tmp,24 to < 25,#abdda4,25.0,,
+tmp,25 to < 26,#66c2a5,26.0,,
+trg,0 to < 0.33,#eff3ff,0.33,,
+trg,0.33 to < 0.67,#c6dbef,0.67,,
+trg,0.67 to < 1.00,#9ecae1,1.0,,
+trg,1.00 to < 1.33,#6baed6,1.33,,
+trg,1.33 to < 1.67,#3182bd,1.67,,
+trg,1.67 or more,#08519c,,,
+tmp,27 or more,#3288bd,,,
+tss,0 to < 10,#d53e4f,10.0,,
+tss,10 to < 50,#f46d43,50.0,,
+tss,50 to < 100,#fdae61,100.0,,
+tss,100 to < 200,#fee08b,200.0,,
+tss,200 to < 300,#e6f598,300.0,,
+tss,300 to < 400,#abdda4,400.0,,
+tss,400 to < 500,#66c2a5,500.0,,
+tss,500 or more,#3288bd,,,
+vct,No Data,#00000000,1.0,,
+vct,Maidencane,#a6cecf,2.0,,
+vct,Three-Square,#1f78b4,3.0,,
+vct,Rosseau Cane,#b2df8a,4.0,,
+vct,Paspalum,#5ba02c,5.0,,
+vct,Wiregrass,#fb9a99,6.0,,
+vct,Bulltongue,#e31a1c,7.0,,
+vct,Needlerush,#fdbf6f,8.0,,
+vct,Bulrush,#ff7f00,9.0,,
+vct,Brackish Mix,#cab2d6,10.0,,
+vct,Oystergrass,#6a3d9a,11.0,,
+vct,Saltgrass,#ffff99,12.0,,
+vct,Bottomland Hardwood Forest + Swamp Forest,#005a00,13.0,,
+vct,Barrier Island Vegetation,#ff80ff,14.0,,
+vct,No Data,#ffffff,300.0,,
+vct,Unvegetated,#7f5f1e,400.0,,
+vct,No Data,#00000000,500.0,,
+vct,Flotant,#8cf0f0,9999.0,,
+vct,No Data,#ffffff,,,
+veg_area,0,#9e0142,1.0,,
+veg_area,"1 to 2,499,999",#d53e4f,2500000.0,,
+veg_area,"2,500,000 to 4,999,999",#f46d43,5000000.0,,
+veg_area,"5,000,000 to 9,999,999",#fdae61,10000000.0,,
+veg_area,"10,000,000 to 19,999,999",#fee08b,20000000.0,,
+veg_area,"20,000,000 to 49,999,999",#ffffbf,50000000.0,,
+veg_area,"50,000,000 to 99,9999,999",#e6f598,100000000.0,,
+veg_area,"100,000,000 to 199,999,999",#abdda4,200000000.0,,
+veg_area,"200,000,000 to 399,999,999",#66c2a5,300000000.0,,
+veg_area,"300,000,000 to 499,999,999",#3288bd,500000000.0,,
+veg_area,"500,000,000 or more",#5e4fa2,,,
+stg,0 to < 0.2,#9e0142,0.2,,
+stg,0.2 to < 0.4,#d53e4f,0.4,,
+stg,0.4 to < 0.6,#f46d43,0.6,,
+stg,0.6 to < 0.8,#fdae61,0.8,,
+stg,0.8 to < 1.0,#fee08b,1.0,,
+stg,1.0 to < 1.5,#e6f598,1.5,,
+stg,1.5 to < 2.0,#abdda4,2.0,,
+stg,2.0 to < 3.0,#66c2a5,3.0,,
+stg,3.0 to < 5.0,#3288bd,5.0,,
+stg,5.0 or more,#5e4fa2,,,
+wlv,0.09 or less,#d53e4f,0.1,,
+wlv,0.10 to 0.19,#fc8d59,0.2,,
+wlv,0.20 to 0.29,#fee08b,0.3,,
+wlv,0.30 to 0.39,#e6f598,0.4,,
+wlv,0.40 to 0.49,#99d594,0.5,,
+wlv,0.50 or more,#3288bd,,,
+wave_heights,0.99 or less,#d7191c,1.0,,
+wave_heights,1.00 to 1.99,#fdae61,2.0,,
+wave_heights,2.00 to 4.99,#ffffbf,5.0,,
+wave_heights,5.00 to 9.99,#abdda4,10.0,,
+wave_heights,10.0 or more,#2b83ba,,,

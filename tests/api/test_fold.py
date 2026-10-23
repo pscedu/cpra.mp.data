@@ -1,0 +1,439 @@
+"""Tests for the tabular offset-batched fold (api/fold.py).
+
+`fold_group_by` and `should_fold_group_by` take and return plain values and raise
+`FoldError` (an ordinary `ValueError`), never `HTTPException` -- these tests exercise the
+library layer directly, with no `Dataset`/FastAPI involved, matching `api/expressions.py`'s
+"no FastAPI below the translation layer" design constraint (see `test_expressions.py` for
+the same pattern applied to that module).
+"""
+
+import json
+import subprocess
+import sys
+
+import numpy as np
+import polars as pl
+import pytest
+
+from cpra.mp.data.analysis.execution.fold import (
+    FoldError,
+    fold_count_by_value,
+    fold_group_by,
+    should_fold_group_by,
+)
+from cpra.mp.data.analysis.request.aggregates import DECOMPOSABLE_AGGREGATES
+from cpra.mp.data.analysis.request.errors import AggregateError
+
+AGGREGATES = sorted(DECOMPOSABLE_AGGREGATES)
+
+
+@pytest.fixture
+def scattered_nulls_frame():
+    """Four groups, one ("c") entirely null-valued, values otherwise real -- exercises
+    every aggregate's null-skipping behavior in the same fixture, including the
+    all-null-group edge case Polars itself treats specially (`sum` -> 0.0, `min`/`max`
+    -> null, `count` -> 0)."""
+    return pl.DataFrame(
+        {
+            "key": ["a", "a", "a", "b", "b", "c", "c", "c", "c", "d"],
+            "value": [1.0, 2.0, None, 5.0, 5.0, None, None, None, None, 10.0],
+        }
+    )
+
+
+class TestFoldGroupByMatchesPlainGroupBy:
+    """Numeric equality against a single, unfolded `group_by` -- the fold is only useful
+    if a caller can never tell, from the result, that it ran in more than one piece."""
+
+    @pytest.mark.parametrize("aggregate", AGGREGATES)
+    @pytest.mark.parametrize("step", [1, 3, 100])
+    def test_matches_plain_group_by(self, scattered_nulls_frame, aggregate, step):
+        """`step=1` forces ten single-row chunks (the maximum possible number of merges
+        for this fixture); `step=3` forces uneven chunk boundaries that don't line up
+        with group boundaries; `step=100` exceeds the fixture's ten rows, so the whole
+        frame lands in one chunk -- the single-chunk degenerate case, which must be exact
+        because it IS the plain `group_by`, reached through one extra `.slice(0, 100)`
+        that takes everything."""
+        expected = (
+            scattered_nulls_frame.group_by("key")
+            .agg(getattr(pl.col("value"), aggregate)().alias("value"))
+            .sort("key")
+        )
+        actual = fold_group_by(
+            lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=step
+        ).sort("key")
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
+
+    @pytest.mark.parametrize("aggregate", AGGREGATES)
+    def test_all_null_group_matches_plain_group_by(self, scattered_nulls_frame, aggregate):
+        """Pinned separately from the parametrized sweep above so a future change to the
+        fixture can't accidentally drop the all-null group ("c") without a test noticing."""
+        expected_row = (
+            scattered_nulls_frame.group_by("key")
+            .agg(getattr(pl.col("value"), aggregate)().alias("value"))
+            .filter(pl.col("key") == "c")
+        )
+        actual_row = fold_group_by(
+            lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=1
+        ).filter(pl.col("key") == "c")
+        assert actual_row.to_dict(as_series=False) == expected_row.to_dict(as_series=False)
+
+
+class TestFoldGroupByEmptyChunk:
+    def test_a_filter_that_empties_a_middle_chunk_is_not_a_special_case(self):
+        """`chunk_transform` (applied after the slice, per the module docstring -- the
+        crosswalk reaggregation site's join/scale uses this same hook) filters out an
+        entire contiguous row range that lines up exactly with one chunk's slice window,
+        so that chunk's partial `group_by` collects zero rows before ever reaching a
+        merge. `pl.concat` against that empty, schema-matching partial must be a no-op,
+        not a special case needing its own branch.
+        """
+        df = pl.DataFrame(
+            {
+                "key": ["x", "y"] * 6,
+                "value": [float(i) for i in range(12)],
+                # Rows 4-7 (the whole second step=4 chunk) are dropped by chunk_transform.
+                "keep": [True] * 4 + [False] * 4 + [True] * 4,
+            }
+        )
+        expected = (
+            df.filter(pl.col("keep"))
+            .group_by("key")
+            .agg(pl.col("value").sum().alias("value"))
+            .sort("key")
+        )
+        actual = fold_group_by(
+            lambda: df.lazy(),
+            ["key"],
+            "sum",
+            step=4,
+            chunk_transform=lambda chunk: chunk.filter(pl.col("keep")),
+        ).sort("key")
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
+
+    def test_an_empty_source_still_returns_the_correct_empty_schema(self):
+        df = pl.DataFrame({"key": [], "value": []}, schema={"key": pl.String, "value": pl.Float64})
+        actual = fold_group_by(lambda: df.lazy(), ["key"], "sum")
+        assert actual.height == 0
+        assert set(actual.columns) == {"key", "value"}
+
+
+class TestMeanOfMeansTrap:
+    def test_mean_is_the_true_weighted_mean_not_a_mean_of_chunk_means(self):
+        """Nine rows of 10.0 land in the first `step=9` chunk, one row of 100.0 lands
+        alone in the second -- a mean of per-chunk means would average 10.0 and 100.0
+        into 55.0, silently wrong the moment two chunks contribute unequal counts for the
+        same key. The true mean, carried here as (sum, count) and divided exactly once,
+        is (9*10 + 100) / 10 = 19.0.
+        """
+        df = pl.DataFrame({"key": ["p"] * 10, "value": [10.0] * 9 + [100.0]})
+        result = fold_group_by(lambda: df.lazy(), ["key"], "mean", step=9)
+        assert result["value"].item() == pytest.approx(19.0)
+        assert result["value"].item() != pytest.approx(55.0)
+
+
+class TestFoldGroupByWeightColumn:
+    """`weight_column` -- the area-weighted mean a vector-to-vector `project` needs
+    (`execution/project.py`) -- rides through the same fold as the plain mean, carrying a
+    different (numerator, denominator) pair. See `_weighted_mean_exprs` in
+    `execution/project.py` for the same rule stated once for the unfolded path."""
+
+    @pytest.fixture
+    def weighted_frame(self):
+        """Two destinations, unequal weights, and one null-valued contributor to "x" --
+        an all-1.0-weight fixture can't distinguish a weighted mean from a plain one, and
+        an all-non-null fixture can't catch the denominator restriction below."""
+        return pl.DataFrame(
+            {
+                "dst": ["x", "x", "x", "y", "y"],
+                "value": [10.0, None, 20.0, 5.0, 15.0],
+                "weight": [0.75, 1.0, 0.25, 0.5, 0.5],
+            }
+        )
+
+    @pytest.mark.parametrize("step", [1, 2, 100])
+    def test_weighted_mean_matches_hand_computation(self, weighted_frame, step):
+        # dst "x": numerator = 10*0.75 + 20*0.25 = 12.5; denominator is sum(weight)
+        # restricted to non-null-value rows = 0.75 + 0.25 = 1.0 -- the null row's own
+        # weight (1.0) is excluded, not folded into the denominator -> mean = 12.5.
+        # dst "y": numerator = 5*0.5 + 15*0.5 = 10.0; denominator = 0.5 + 0.5 = 1.0.
+        actual = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=step
+        ).sort("dst")
+        assert actual["dst"].to_list() == ["x", "y"]
+        assert actual["value"].to_list() == pytest.approx([12.5, 10.0])
+
+    def test_batched_matches_unbatched(self, weighted_frame):
+        """step=1 (five single-row chunks, the maximum number of merges this fixture can
+        force) and step=100 (one chunk -- the direct, unfolded answer) must agree exactly:
+        the resume contract's batched-vs-unbatched equality requirement for `mean`."""
+        batched = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=1
+        ).sort("dst")
+        unbatched = fold_group_by(
+            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=100
+        ).sort("dst")
+        assert batched.to_dict(as_series=False) == unbatched.to_dict(as_series=False)
+
+    def test_a_group_with_every_value_null_folds_to_null_not_nan(self):
+        """Both halves of the pair sum to 0.0 for an all-null-valued group (Polars sums
+        an empty/all-null selection to 0.0, not null) -- dividing those directly gives
+        NaN; the finalize step must guard that case to null instead, matching what a
+        "no data reached this destination" answer should report."""
+        df = pl.DataFrame({"dst": ["z", "z"], "value": [None, None], "weight": [0.5, 0.5]})
+        actual = fold_group_by(lambda: df.lazy(), ["dst"], "mean", weight_column="weight", step=1)
+        assert actual["value"].item() is None
+
+    def test_unweighted_mean_is_unaffected_by_the_new_parameter(self, scattered_nulls_frame):
+        """`weight_column` defaults to `None` -- every existing caller that doesn't pass
+        it must see bit-for-bit the same behavior as before this parameter existed."""
+        default = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], "mean").sort("key")
+        explicit_none = fold_group_by(
+            lambda: scattered_nulls_frame.lazy(), ["key"], "mean", weight_column=None
+        ).sort("key")
+        assert default.to_dict(as_series=False) == explicit_none.to_dict(as_series=False)
+
+
+class TestFoldCountByValue:
+    """The `count_by_value` counterpart of `TestFoldGroupByMatchesPlainGroupBy`: a
+    per-chunk `(group, distinct value)` count table, merged by summing matching keys --
+    the same associative-count argument `fold_group_by` makes for plain `count`, with one
+    more column riding along in the key."""
+
+    @pytest.fixture
+    def categorical_frame(self):
+        return pl.DataFrame(
+            {
+                "key": ["a", "a", "a", "a", "b", "b", "b"],
+                "value": ["x", "x", "y", None, "x", "x", None],
+            }
+        )
+
+    @pytest.mark.parametrize("step", [1, 2, 100])
+    def test_matches_plain_group_by(self, categorical_frame, step):
+        expected = (
+            categorical_frame.group_by("key", pl.col("value").alias("value_category"))
+            .agg(pl.len().alias("value"))
+            .sort(["key", "value_category"])
+        )
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=step
+        ).sort(["key", "value_category"])
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
+
+    def test_null_is_kept_as_its_own_category(self, categorical_frame):
+        # Group "a" carries one null-valued row -- it must survive as its own
+        # (key="a", value_category=None) row with count 1, not be dropped.
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=1
+        )
+        null_row = actual.filter(pl.col("key") == "a").filter(pl.col("value_category").is_null())
+        assert null_row["value"].to_list() == [1]
+
+    def test_exceeding_max_distinct_raises(self, categorical_frame):
+        with pytest.raises(AggregateError, match="distinct"):
+            fold_count_by_value(lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=1, step=1)
+
+    def test_non_positive_step_is_rejected(self, categorical_frame):
+        with pytest.raises(FoldError, match="step"):
+            fold_count_by_value(
+                lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=0
+            )
+
+    def test_chunk_transform_is_applied_per_chunk(self, categorical_frame):
+        """Mirrors `TestFoldGroupByEmptyChunk`'s contract for `fold_group_by` -- a
+        `chunk_transform` (the crosswalk join site's use, in real callers) applies to
+        every chunk, and the folded result must still match grouping the transformed
+        frame directly."""
+        actual = fold_count_by_value(
+            lambda: categorical_frame.lazy(),
+            ["key"],
+            "value",
+            max_distinct=10,
+            step=2,
+            chunk_transform=lambda chunk: chunk.filter(pl.col("key") == "a"),
+        ).sort(["key", "value_category"])
+        expected = (
+            categorical_frame.filter(pl.col("key") == "a")
+            .group_by("key", pl.col("value").alias("value_category"))
+            .agg(pl.len().alias("value"))
+            .sort(["key", "value_category"])
+        )
+        assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
+
+
+class TestValidateDecomposableRejection:
+    def test_non_decomposable_aggregate_is_rejected(self):
+        with pytest.raises(FoldError, match="median"):
+            fold_group_by(lambda: pl.DataFrame({"key": ["a"], "value": [1.0]}).lazy(), ["key"], "median")
+
+    def test_rejection_happens_before_lf_source_is_ever_called(self):
+        """Plan-time rejection, matching `api/expressions.py`'s "reject before parsing"
+        discipline -- `lf_source` here raises if called at all, so this test fails loudly
+        (an `AssertionError`, not a `FoldError`) if `validate_decomposable` ever moves
+        after the first `lf_source()` call.
+        """
+
+        def boom():
+            raise AssertionError("lf_source must not be called for a non-decomposable aggregate")
+
+        with pytest.raises(FoldError, match="n_unique"):
+            fold_group_by(boom, ["key"], "n_unique")
+
+    def test_non_positive_step_is_rejected(self):
+        with pytest.raises(FoldError, match="step"):
+            fold_group_by(lambda: pl.DataFrame({"key": ["a"], "value": [1.0]}).lazy(), ["key"], "sum", step=0)
+
+
+class TestShouldFoldGroupBy:
+    """Pure-function routing tests -- no Dataset, no Polars schema inspection; see the
+    function's own docstring for the exact rule this pins."""
+
+    def test_high_cardinality_key_without_a_filter_folds(self):
+        assert should_fold_group_by(["grid_cell"], has_selective_filter=False) is True
+
+    def test_high_cardinality_key_with_a_selective_filter_does_not_fold(self):
+        assert should_fold_group_by(["grid_cell"], has_selective_filter=True) is False
+
+    def test_low_cardinality_key_without_a_filter_does_not_fold(self):
+        assert should_fold_group_by(["calendar_year"], has_selective_filter=False) is False
+
+    def test_low_cardinality_key_with_a_filter_does_not_fold(self):
+        assert should_fold_group_by(["calendar_year"], has_selective_filter=True) is False
+
+    def test_a_non_string_key_is_harmless_alongside_grid_cell(self):
+        """No caller in this package produces a non-string key any more -- a `group` step
+        collapsing to a single row spells it `by: []`, not with the `[True]` literal
+        sentinel Polars also accepts (which leaked a meaningless "literal" column into
+        every such response) -- but `group_by_keys` is a plain `Sequence[Any]` here, so a
+        non-string key from some other future caller must still not break the rule: it can
+        never match a high-cardinality column name, but its presence in the key list must
+        not stop `grid_cell` (also in the list) from tripping it."""
+        assert should_fold_group_by([True, "grid_cell"], has_selective_filter=False) is True
+
+    def test_a_custom_high_cardinality_set_is_honored(self):
+        assert (
+            should_fold_group_by(
+                ["zone"], has_selective_filter=False, high_cardinality_columns=frozenset({"zone"})
+            )
+            is True
+        )
+
+
+# Runs in a subprocess so each measurement gets its own `ru_maxrss` high-water mark
+# (a single process's peak only grows, so folded-then-unfolded in one process would
+# report the unfolded run's peak for both).
+_MEMORY_WORKER = """
+import json
+import resource
+import sys
+
+import polars as pl
+
+from cpra.mp.data.analysis.execution.fold import fold_group_by
+
+mode, path, step = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if mode == "folded":
+    result = fold_group_by(lambda: pl.scan_parquet(path), ["key"], "sum", step=step)
+    result = result.sort("key")
+    payload = {
+        "peak_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "keys": result["key"].to_list(),
+        "values": result["value"].to_list(),
+    }
+elif mode == "plain":
+    result = pl.scan_parquet(path).group_by("key").agg(pl.col("value").sum()).collect(engine="streaming")
+    result = result.sort("key")
+    payload = {
+        "peak_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "keys": result["key"].to_list(),
+        "values": result["value"].to_list(),
+    }
+else:
+    # "floor" -- import Polars and read the parquet fixture, but never group by.
+    # This measures the fixed cost neither figure above is trying to isolate:
+    # interpreter startup, the Polars import, and materializing the 6M-row frame.
+    result = pl.scan_parquet(path).collect()
+    payload = {"peak_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+print(json.dumps(payload))
+"""
+
+
+@pytest.mark.memory
+class TestMemoryRegression:
+    """Deselected by default (`pyproject.toml`'s `addopts` carries `-m 'not memory'`); run
+    with `pytest -m memory`. What this class measures is real and worth keeping -- peak RSS
+    is the entire point of folding, and no deterministic proxy captures it -- but the
+    measurement depends on the machine, the allocator, and what else is running, which is
+    not something a build should gate on. It already needs `preexec_fn` (below) to stop
+    `ru_maxrss` reading back the parent's high-water mark; that is the kind of fragility
+    that belongs behind an opt-in rather than in front of every commit.
+    """
+
+    def test_folded_peak_rss_is_lower_than_unfolded_on_a_high_cardinality_group_by(self, tmp_path):
+        """Reproduces, at a size a test suite can afford, the same mechanism measured at
+        production scale in `api/fold.py`'s module docstring and `config.TABULAR_FOLD_STEP`
+        (~9.7 GB unfolded vs ~1.0 GB folded on the real 1.04B-row damage file,
+        `group_by("grid_cell").sum("value")`):
+        peak memory in a `group_by` scales with the group key's cardinality, not with the
+        size of its hash table. 6M rows over ~126,174 distinct keys (the real
+        `clara_grid_cell_v001` cardinality) reliably shows folded peak RSS well under
+        unfolded's on this machine (measured directly while writing this test).
+
+        At this fixture size, both the folded and unfolded peaks are dominated by a
+        constant floor that has nothing to do with the group-by: interpreter startup, the
+        Polars import, and materializing the 6M-row parquet read. That floor is large
+        enough relative to the group-by's own footprint that comparing the two raw peaks
+        understates the mechanism -- anything that raises the floor (a busier machine, a
+        different libc, coverage instrumentation upstream) shrinks the apparent gap without
+        the group-by itself changing at all. A third subprocess mode ("floor") measures
+        that constant directly -- it imports Polars and reads the parquet fixture but never
+        groups by anything -- and the assertion below compares `peak - floor` for each side,
+        which is the part of each peak the group-by is actually responsible for. At
+        production scale the floor is negligible next to the multi-gigabyte group-by cost,
+        which is why subtracting it here does not change what the test means, only how
+        cleanly it measures it at this fixture's much smaller scale.
+
+        `preexec_fn=lambda: None` forces Python's classic `fork()`+`exec()` path for each
+        subprocess rather than the `posix_spawn`/`vfork`-based fast path `subprocess.run`
+        otherwise prefers -- without it, `ru_maxrss` for a child spawned from an already
+        memory-heavy pytest process (e.g. after `test_dataset_raster.py`'s rasterio/GDAL
+        tests have run first) was observed to read back the PARENT's own high-water mark
+        instead of the child's, making the folded and unfolded measurements numerically
+        identical and this test spuriously fail depending on run order. `preexec_fn`
+        being non-`None` is documented as incompatible with `subprocess`'s fast-path
+        optimizations, which is exactly the point here.
+        """
+        n_rows = 6_000_000
+        n_keys = 126_174
+        rng = np.random.default_rng(0)
+        path = tmp_path / "fold_mem_fixture.parquet"
+        pl.DataFrame(
+            {
+                "key": rng.integers(0, n_keys, size=n_rows).astype("int64"),
+                "value": rng.random(n_rows),
+            }
+        ).write_parquet(path)
+
+        def run(mode, step):
+            proc = subprocess.run(
+                [sys.executable, "-c", _MEMORY_WORKER, mode, str(path), str(step)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+                preexec_fn=lambda: None,
+            )
+            return json.loads(proc.stdout)
+
+        unfolded = run("plain", 0)
+        folded = run("folded", 50_000)
+        floor = run("floor", 0)["peak_kb"]
+
+        assert (folded["peak_kb"] - floor) < (unfolded["peak_kb"] - floor) * 0.9
+        assert folded["keys"] == unfolded["keys"]
+        # Floating-point summation order differs between one big sum and many partial
+        # sums merged back together -- the *answer* must still agree to a tight tolerance,
+        # not bit-for-bit (see the mean-of-means trap test for the failure this is NOT).
+        diffs = [abs(a - b) for a, b in zip(folded["values"], unfolded["values"])]
+        assert max(diffs) < 1e-6
