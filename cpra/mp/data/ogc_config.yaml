@@ -13,7 +13,9 @@ server:
   pretty_print: false
   limits:
     default_items: 50
-    max_items: 1000
+    # A portal export link loads a whole grid in one request, so this must exceed the
+    # largest vector grid's feature count.
+    max_items: 100000
     max_distance_x: 25
     max_distance_y: 25
     max_distance_units: m
@@ -73,12 +75,6 @@ resources:
     providers:
       - type: feature
         name: cpra.mp.data.api.ogc_provider.MasterPlanDataProvider
-        data:
-          source_type: FlatGeobuf
-          source: /Users/jpuerto/jpuerto_scratch_dirs/cpra_data/grids/hydro_compartment_v001.fgb
-          source_capabilities:
-            paging: True
-          gdal_ogr_options:
-            EMPTY_AS_NULL: NO
+        # Geometry is read from GRIDS_PATH/<grid>.fgb, chosen per request.
+        data: grids
         id_field: id
-        layer: hydro_compartment_v001

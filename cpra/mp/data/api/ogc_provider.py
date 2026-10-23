@@ -1,191 +1,147 @@
-import asyncio
+import pyogrio
+from pygeoapi.provider.base import (
+    BaseProvider,
+    ProviderInvalidQueryError,
+    ProviderItemNotFoundError,
+)
+from pyproj import Transformer
+from shapely.geometry import mapping
 
-from pygeoapi.provider.base import ProviderQueryError
-from pygeoapi.provider.ogr import OGRProvider
-from pydantic import ValidationError
-
-from cpra.mp.data.api.dataset import Dataset
-from cpra.mp.data.api.models import DatasetDimensions, FilterDimensions, Options
-from cpra.mp.data.config import GRIDS_PATH
-from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
+from cpra.mp.data.analysis.execution.execute import execute
+from cpra.mp.data.analysis.execution.plan import compile_plan
+from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.api.unified import decode_request_sync
+from cpra.mp.data import config
 from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.variables import VARIABLES
 
-_DATASET_DIM_NAMES = set(DATASET_DIMENSIONS.keys())
-_FILTER_DIM_NAMES = {
-    name for name, dim in DIMENSIONS.items()
-    if dim.type not in ("dataset", "metadata")
+# Query params that belong to the OGC API itself rather than to the data request. They
+# are dropped before the rest of the query string is decoded as a portal data request.
+_OGC_PARAMS = {
+    "f", "lang", "limit", "offset", "startindex", "bbox", "bbox-crs", "crs", "datetime",
+    "resulttype", "skipgeometry", "properties", "sortby", "filter", "filter-lang",
+    "filter-crs", "q",
 }
-_OPTION_FIELDS = set(Options.model_fields.keys())
 
 
-def parse_ogc_params(args):
-    """Parse flask.request.args into (DatasetDimensions, FilterDimensions, Options).
-
-    Raises ProviderQueryError on Pydantic validation failure.
-    """
-    try:
-        dataset_dims = DatasetDimensions(
-            **{k: args.get(k) for k in _DATASET_DIM_NAMES if args.get(k) is not None}
-        )
-    except ValidationError as exc:
-        raise ProviderQueryError(str(exc))
-
-    missing = [k for k in _DATASET_DIM_NAMES if getattr(dataset_dims, k, None) is None]
-    if missing:
-        raise ProviderQueryError(
-            f"Missing required query parameters: {', '.join(sorted(missing))}"
-        )
-
-    try:
-        filter_kwargs = {}
-        for k in _FILTER_DIM_NAMES:
-            values = args.getlist(k)
-            if values:
-                filter_kwargs[k] = values
-        filter_dims = FilterDimensions(**filter_kwargs)
-    except ValidationError as exc:
-        raise ProviderQueryError(str(exc))
-
-    try:
-        option_kwargs = {k: args.get(k) for k in _OPTION_FIELDS if args.get(k) is not None}
-        if "unpivot" in option_kwargs:
-            option_kwargs["unpivot"] = option_kwargs["unpivot"].lower() in ("1", "true", "yes")
-        options = Options(**option_kwargs)
-    except ValidationError as exc:
-        raise ProviderQueryError(str(exc))
-
-    return dataset_dims, filter_dims, options
+def _invalid(message):
+    """A 400 whose message reaches the client (pygeoapi hides it by default)."""
+    return ProviderInvalidQueryError(message, user_msg=message)
 
 
-def validate_cardinality(filter_dims, required_dimensions, group_by):
-    """Raise ProviderQueryError if any required dimension outside group_by lacks exactly one value."""
-    violations = []
-    for dim_name in (required_dimensions or []):
-        if dim_name in group_by:
-            continue
-        values = getattr(filter_dims, dim_name, None)
-        if not values or len(values) != 1:
-            violations.append(dim_name)
-    if violations:
-        raise ProviderQueryError(
-            f"Each required dimension must have exactly one value. "
-            f"Missing or ambiguous: {', '.join(violations)}"
-        )
+def strip_ogc_params(items):
+    """`(key, value)` query pairs minus the OGC API's own parameters."""
+    return [(k, v) for k, v in items if k.lower() not in _OGC_PARAMS]
 
 
-def _join_values(features, df, group_by_dims):
-    """Attach a 'value' property to each GeoJSON feature from a polars DataFrame.
-
-    df columns: dimension columns (alpha start) + geography ID columns (digit start).
-    group_by_dims: list of dimension column names used as group keys.
-    """
-    value_cols = [c for c in df.columns if c[0].isdigit() or c[0] == "-"]
-
-    if not group_by_dims:
-        row = df.row(0, named=True) if len(df) > 0 else {}
-        lookup = {col: row.get(col) for col in value_cols}
-        for feature in features:
-            fid = str(feature["id"])
-            feature["properties"]["value"] = lookup.get(fid)
-    else:
-        lookup = {col: {} for col in value_cols}
-        for row in df.iter_rows(named=True):
-            group_key = "_".join(str(row[d]) for d in group_by_dims)
-            for col in value_cols:
-                lookup[col][group_key] = row[col]
-        for feature in features:
-            fid = str(feature["id"])
-            feature["properties"]["value"] = lookup.get(fid)
-
-    return features
+def data_request_items(args):
+    """The data request carried in a Flask request's query string."""
+    return strip_ogc_params(args.items(multi=True))
 
 
-class MasterPlanDataProvider(OGRProvider):
+class MasterPlanDataProvider(BaseProvider):
     """OGC API - Features provider for CPRA Master Plan vector grid data.
 
-    Reads geometry from FlatGeoBuf files and joins attribute data from Parquet
-    via the Dataset class. The grid, variable, time_unit, and all dimension
-    filters are supplied as extra query string parameters on each request.
+    Geometry comes from the grid's FlatGeoBuf file, read with pyogrio. Each feature's
+    `value` is the result of the data request carried in the query string -- the same
+    parameters the portal puts in its URL -- run through the analysis engine, so a link
+    exported from the portal loads the same view in a GIS.
     """
 
-    def query(self, offset=0, limit=10, resulttype="results", bbox=[], datetime_=None,
-              properties=[], sortby=[], select_properties=[], skip_geometry=False,
-              q=None, filterq=None, **kwargs):
-        from flask import request
-        args = request.args
+    def get_fields(self):
+        return {"id": {"type": "integer"}, "label": {"type": "string"}}
 
-        dataset_dims, filter_dims, options = parse_ogc_params(args)
-        self._validate_vector_grid(dataset_dims.grid)
-
-        variable = VARIABLES.get(dataset_dims.variable)
-        if variable is None:
-            raise ProviderQueryError(f"Unknown variable: {dataset_dims.variable}")
-
-        group_by_dims = (
-            [d.strip() for d in options.group_by.split(",")]
-            if options.group_by else []
-        )
-        validate_cardinality(filter_dims, variable.required_dimensions, set(group_by_dims))
-
-        self.data_def['source'] = str(GRIDS_PATH / f"{dataset_dims.grid}.fgb")
-        self.layer_name = dataset_dims.grid
-
-        dataset = Dataset(dataset_dims, filter_dims, options)
-        asyncio.run(dataset.apply_params())
-        df = dataset.lf.collect()
-
-        feature_collection = super().query(
-            offset=offset, limit=limit, resulttype=resulttype,
-            bbox=bbox, datetime_=datetime_, properties=properties,
-            sortby=sortby, select_properties=select_properties,
-            skip_geometry=skip_geometry, q=q, filterq=filterq,
-            **kwargs,
-        )
+    def query(self, offset=0, limit=10, resulttype="results", bbox=[], skip_geometry=False,
+              **kwargs):
+        path, values = self._prepare()
+        storage_bbox = _to_storage_bbox(bbox, path)
+        matched = _count(path, storage_bbox)
 
         if resulttype == "hits":
-            return feature_collection
+            return {"type": "FeatureCollection", "numberMatched": matched, "features": []}
 
-        feature_collection["features"] = _join_values(
-            feature_collection["features"], df, group_by_dims
+        gdf = pyogrio.read_dataframe(
+            path,
+            bbox=storage_bbox,
+            skip_features=offset,
+            max_features=limit,
+            read_geometry=not skip_geometry,
         )
-        return feature_collection
+        return {
+            "type": "FeatureCollection",
+            "numberMatched": matched,
+            "features": _to_features(gdf, values, skip_geometry),
+        }
 
     def get(self, identifier, **kwargs):
+        path, values = self._prepare()
+        try:
+            where = f"id = {int(identifier)}"
+        except ValueError:
+            raise ProviderItemNotFoundError(f"Feature not found: {identifier}")
+        gdf = pyogrio.read_dataframe(path, where=where)
+        if gdf.empty:
+            raise ProviderItemNotFoundError(f"Feature not found: {identifier}")
+        return _to_features(gdf, values, False)[0]
+
+    def _prepare(self):
+        """Run the request's data query.
+
+        Returns (fgb path, {grid_cell id: value}).
+        """
         from flask import request
-        args = request.args
 
-        dataset_dims, filter_dims, options = parse_ogc_params(args)
-        self._validate_vector_grid(dataset_dims.grid)
+        try:
+            decoded = decode_request_sync(data_request_items(request.args), format="parquet")
+            grid = decoded.descriptor.grid
+            if GRIDS[grid].grid_type != "vector":
+                raise _invalid(
+                    f"Grid '{grid}' is a raster grid and is not available "
+                    "through the OGC Features API."
+                )
+            df = execute(compile_plan(decoded.pipeline)).collect()
+        except RequestError as exc:
+            raise _invalid(str(exc))
 
-        variable = VARIABLES.get(dataset_dims.variable)
-        if variable is None:
-            raise ProviderQueryError(f"Unknown variable: {dataset_dims.variable}")
-
-        group_by_dims = (
-            [d.strip() for d in options.group_by.split(",")]
-            if options.group_by else []
-        )
-        validate_cardinality(filter_dims, variable.required_dimensions, set(group_by_dims))
-
-        self.data_def['source'] = str(GRIDS_PATH / f"{dataset_dims.grid}.fgb")
-        self.layer_name = dataset_dims.grid
-
-        dataset = Dataset(dataset_dims, filter_dims, options)
-        asyncio.run(dataset.apply_params())
-        df = dataset.lf.collect()
-
-        feature = super().get(identifier, **kwargs)
-        if feature:
-            _join_values([feature], df, group_by_dims)
-        return feature
-
-    def _validate_vector_grid(self, grid_name):
-        grid = GRIDS.get(grid_name)
-        if grid is None:
-            raise ProviderQueryError(f"Unknown grid: {grid_name}")
-        if grid.grid_type != "vector":
-            raise ProviderQueryError(
-                f"Grid '{grid_name}' is a raster grid and is not available "
-                "through the OGC Features API."
+        if df["grid_cell"].n_unique() != len(df):
+            raise _invalid(
+                "The selection returns more than one value per grid cell; "
+                "narrow it so each dimension has a single value."
             )
+        values = dict(zip(df["grid_cell"].to_list(), df["value"].to_list()))
+        return str(config.GRIDS_PATH / f"{grid}.fgb"), values
+
+
+def _to_storage_bbox(bbox, path):
+    """Transform a CRS84 bbox from the request into the FlatGeoBuf's CRS."""
+    if not bbox:
+        return None
+    storage_crs = pyogrio.read_info(path)["crs"]
+    return Transformer.from_crs("OGC:CRS84", storage_crs, always_xy=True).transform_bounds(
+        *bbox[:4]
+    )
+
+
+def _count(path, storage_bbox):
+    if storage_bbox is None:
+        return pyogrio.read_info(path)["features"]
+    return len(
+        pyogrio.read_dataframe(path, bbox=storage_bbox, columns=["id"], read_geometry=False)
+    )
+
+
+def _to_features(gdf, values, skip_geometry):
+    """Convert a GeoDataFrame in the storage CRS to GeoJSON features in CRS84 carrying
+    each cell's `value`."""
+    if not skip_geometry:
+        gdf = gdf.to_crs("OGC:CRS84")
+    geometries = [None] * len(gdf) if skip_geometry else [mapping(g) for g in gdf.geometry]
+    rows = gdf.drop(columns="geometry", errors="ignore").to_dict("records")
+    return [
+        {
+            "type": "Feature",
+            "id": int(row["id"]),
+            "properties": {**row, "value": values.get(int(row["id"]))},
+            "geometry": geometry,
+        }
+        for row, geometry in zip(rows, geometries)
+    ]
