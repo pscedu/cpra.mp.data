@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.57.1](https://github.com/pscedu/cpra.mp.data/compare/v0.57.0...v0.57.1) (2026-10-26)
+
+
+### Performance Improvements
+
+* **api:** set tile concurrency limit to prevent OOM ([d4453fd](https://github.com/pscedu/cpra.mp.data/commit/d4453fd4930c7b2e4a5366c0cc7c992c5c01522a))
+
 ## [0.57.0](https://github.com/pscedu/cpra.mp.data/compare/v0.56.0...v0.57.0) (2026-10-22)
 
 
