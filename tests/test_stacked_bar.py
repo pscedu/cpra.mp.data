@@ -33,11 +33,11 @@ from cpra.mp.data.visualizations.stacked_bar import COMPARE_CHANNELS, StackedBar
 
 # A vector grid queried by ID needs no geometry on disk, and a raster grid never has any, so
 # every chart here builds from the structure CSVs alone.
-ANNUAL = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", grid_cell="1,2")
-DAILY = dict(variable="sal", grid="hydro_compartment_v001", time_unit="daily", grid_cell="1")
-VEG_SPECIES = dict(
-    variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual", grid_cell="-91.5,29.5"
-)
+ANNUAL = {"variable": "ssf", "grid": "ecoregion_v001", "time_unit": "annual", "grid_cell": "1,2"}
+DAILY = {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily", "grid_cell": "1"}
+VEG_SPECIES = {
+    "variable": "veg_species", "grid": "veg_grid_cell_v001", "time_unit": "annual", "grid_cell": "-91.5,29.5"
+}
 
 
 def stacked_bar(**params):
@@ -77,7 +77,7 @@ def evaluate(expression, **fields):
     in both languages, so this really does compute what Vega will compute, rather than
     restating the formula the chart used to build it.
     """
-    return eval(expression.replace("datum.", "row."), {"row": _Row(fields)})  # noqa: S307
+    return eval(expression.replace("datum.", "row."), {"row": _Row(fields)})
 
 
 class TestSharedSkeleton:

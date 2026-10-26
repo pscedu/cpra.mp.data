@@ -201,7 +201,7 @@ class TestResolveRasterPixel:
         `resolve_vector_grid_cell` uses for a point outside every polygon, not an error.
         """
         grid = GRIDS[RASTER_GRID]
-        minx, miny, maxx, maxy = grid.bounds
+        minx, miny, maxx, _maxy = grid.bounds
         center_x = (minx + maxx) / 2
         lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [center_x], [miny - 10_000])]
         assert resolve_raster_pixel(RASTER_GRID, [lng], [lat]) == [None]
@@ -211,7 +211,7 @@ class TestResolveRasterPixel:
         affect another point in the same call that lands inside it.
         """
         grid = GRIDS[RASTER_GRID]
-        minx, miny, maxx, maxy = grid.bounds
+        minx, miny, maxx, _maxy = grid.bounds
         lng_in, lat_in = _raster_pixel_lng_lat(0, 0)
         center_x = (minx + maxx) / 2
         lng_out, lat_out = [
@@ -350,7 +350,7 @@ class TestResolveRasterPointLabels:
         point simply does not appear in the returned map at all.
         """
         grid = GRIDS[RASTER_GRID]
-        minx, miny, maxx, maxy = grid.bounds
+        minx, miny, maxx, _maxy = grid.bounds
         center_x = (minx + maxx) / 2
         lng, lat = [c[0] for c in transform(CRS.from_epsg(26915), CRS.from_epsg(4326), [center_x], [miny - 10_000])]
 
@@ -363,7 +363,7 @@ class TestResolveRasterPointLabels:
         not drop another point's label from the result.
         """
         grid = GRIDS[RASTER_GRID]
-        minx, miny, maxx, maxy = grid.bounds
+        minx, miny, maxx, _maxy = grid.bounds
         in_lng_token, in_lat_token = _raster_point_label(0, 0)
         center_x = (minx + maxx) / 2
         out_lng, out_lat = [

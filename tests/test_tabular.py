@@ -147,7 +147,7 @@ class TestWriteParquetValidation:
             write_parquet(df, base_path=base_path)
 
     def test_grid_cell_id_below_min_raises(self, base_path):
-        df = annual_frame(geo_ids=tuple(range(0, 32)))
+        df = annual_frame(geo_ids=tuple(range(32)))
         with pytest.raises(ValidationError, match="Grid cell ID below minimum"):
             write_parquet(df, base_path=base_path)
 

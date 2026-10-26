@@ -50,7 +50,6 @@ from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from PIL import Image
 from rasterio.enums import Resampling
 
-from cpra.mp.data.analysis.execution import plan as plan_module
 from cpra.mp.data.analysis.execution import run_to_path
 from cpra.mp.data.analysis.execution import sink as sink_module
 from cpra.mp.data.analysis.execution.execute import execute
@@ -236,10 +235,14 @@ class TestWriteRaster:
             # differs between these two strings is the dimension that actually differs
             # between the two bands.
             assert src.descriptions == (
-                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
-                "model_group_id=500, scenario_id=7, calendar_year=2030",
-                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
-                "model_group_id=500, scenario_id=7, calendar_year=2040",
+                (
+                    "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                    "model_group_id=500, scenario_id=7, calendar_year=2030"
+                ),
+                (
+                    "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                    "model_group_id=500, scenario_id=7, calendar_year=2040"
+                ),
             )
 
     def test_group_by_a_real_column_collapses_to_one_band(self, base_path):

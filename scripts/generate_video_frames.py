@@ -957,8 +957,8 @@ def main(
     finally:
         httpd.shutdown()
 
-    under_bands, under_crs, under_tf, uw, uh = georeference_render(under_png, under_bounds)
-    over_bands, over_crs, over_tf, ow, oh = georeference_render(over_png, over_bounds)
+    under_bands, under_crs, under_tf, _uw, _uh = georeference_render(under_png, under_bounds)
+    over_bands, over_crs, over_tf, _ow, _oh = georeference_render(over_png, over_bounds)
 
     if keep_intermediate:
         Image.fromarray(np.moveaxis(under_bands, 0, 2)).save(PROJECT_DIR / "_underlay_raw.png")

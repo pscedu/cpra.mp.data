@@ -425,17 +425,15 @@ class TestCatalogEndpoint:
         `api.models.CatalogOutput`."""
         self._write(base_path, _catalog_path)
         self._write(base_path, _catalog_path, variable="ffibs_score")
-        query = "&".join(
-            [
-                "input.vct.variable=vct&input.vct.time_unit=annual&input.vct.grid=veg_grid_cell_v001",
-                "input.ffibs_score.variable=ffibs_score",
-                "input.ffibs_score.time_unit=annual",
-                "input.ffibs_score.grid=veg_grid_cell_v001",
-                "step.1.op=join&step.1.type=spatial&step.1.inputs=vct,ffibs_score&step.1.as=j",
-                "step.2.op=filter&step.2.input=j&step.2.where=grid_cell%20%3D%205&step.2.as=pt",
-                "step.3.op=unpivot&step.3.input=pt&step.3.as=stacked",
-                "output.format=csv",
-            ]
+        query = (
+            "input.vct.variable=vct&input.vct.time_unit=annual&input.vct.grid=veg_grid_cell_v001&"
+            "input.ffibs_score.variable=ffibs_score&"
+            "input.ffibs_score.time_unit=annual&"
+            "input.ffibs_score.grid=veg_grid_cell_v001&"
+            "step.1.op=join&step.1.type=spatial&step.1.inputs=vct,ffibs_score&step.1.as=j&"
+            "step.2.op=filter&step.2.input=j&step.2.where=grid_cell%20%3D%205&step.2.as=pt&"
+            "step.3.op=unpivot&step.3.input=pt&step.3.as=stacked&"
+            "output.format=csv"
         )
         output = client.get(f"/v1/catalog.json?{query}").json()["output"]
         assert output["folded_into"] == "variable"

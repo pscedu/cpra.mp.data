@@ -206,7 +206,7 @@ class LandChange(Analysis):
         if three_image:
             # The 2x2 grid's fourth corner (`mg1` in the baseline year) is redundant, and
             # here it is simply not read: the baseline is `mg0`'s.
-            mg0, mg1 = sorted(mg_values)
+            mg0, _mg1 = sorted(mg_values)
             baseline_filters["model_group_id"] = [mg0]
 
         required = required_dataset_dimensions(dataset)

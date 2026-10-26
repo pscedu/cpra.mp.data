@@ -16,11 +16,11 @@ from datetime import date
 
 import pytest
 
-from cpra.mp.data.analysis.request.parameters import DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.expressions import PredicateKind, classify_where_kinds
 from cpra.mp.data.analysis.request.ops import validate_shapes
+from cpra.mp.data.analysis.request.parameters import DataOptions, DatasetDimensions, FilterDimensions
 from cpra.mp.data.analysis.request.pipeline import FilterStep, Pipeline
 from cpra.mp.data.grids import GRIDS
 

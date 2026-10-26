@@ -69,10 +69,11 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-import migrate_to_long_format as mig  # noqa: E402
-from cpra.mp.data.catalog import cal_for  # noqa: E402
-from cpra.mp.data.config import BASE_PATH  # noqa: E402
-from cpra.mp.data.dimensions import DIMENSIONS  # noqa: E402
+import migrate_to_long_format as mig
+
+from cpra.mp.data.catalog import cal_for
+from cpra.mp.data.config import BASE_PATH
+from cpra.mp.data.dimensions import DIMENSIONS
 
 FILE = "__file__"
 
@@ -82,7 +83,7 @@ CHUNK_LONG_ROWS = 5_000_000
 
 def key_columns(schema: dict, path: Path) -> list[str]:
     """The columns that identify one wide row: non-calendar dimensions, then the calendar."""
-    alpha_cols = set(col for col in schema if not col[:1].isdigit())
+    alpha_cols = {col for col in schema if not col[:1].isdigit()}
     other_dim_cols = [col for col in DIMENSIONS if col in alpha_cols and not col.startswith("calendar_")]
     time_unit = str(mig._dimension_cols_from_hive(path).get("time_unit", ""))
     return [*other_dim_cols, cal_for(time_unit)]

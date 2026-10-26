@@ -41,7 +41,6 @@ from rasterio.warp import transform_bounds
 from cpra.mp.data.analysis.execution.band_ops import group_band_wide
 from cpra.mp.data.analysis.io import raster_io as utils_module
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
-from cpra.mp.data.analysis.io.geography import straddling_feature_bounds
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import (
     TILE_CRS,
@@ -807,7 +806,7 @@ class TestStraddlingFeatureWidensTheWindow:
             bounds = _tile_bounds(mercantile.tile(*_tile_centre(), 12))
             plain_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
 
-            west, south, east, north = GRID.bounds
+            west, south, _east, _north = GRID.bounds
             far_feature = box(west, south, west + 480, south + 480)
             write_grid_geometry(geometry_path, "hydro_compartment_v001", [(1, far_feature)])
 

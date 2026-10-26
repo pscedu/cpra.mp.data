@@ -53,6 +53,7 @@ no single grid to resolve against.
 """
 
 import io
+from typing import ClassVar
 
 import mercantile
 import numpy as np
@@ -704,7 +705,7 @@ class TestLandConfidenceLegendRoute:
     key from `output.legend`).
     """
 
-    DIFFERENCE_QUERY = {
+    DIFFERENCE_QUERY: ClassVar[dict] = {
         "analysis": "lnd_conf,diff",
         **RASTER_DATASET,
         "dimension": "calendar_year",
@@ -806,7 +807,7 @@ class TestLandChangeChainRoute:
 
     # The raster stand-in's grid is a `_v001` one, so the derived baseline year is
     # `MP2023_BASELINE_YEAR` and 2040 is the one comparison year band-wide output allows.
-    QUERY = {
+    QUERY: ClassVar[dict] = {
         "analysis": "lnd_chng,diff",
         **RASTER_DATASET,
         "dimension": "scenario_id",
@@ -910,7 +911,7 @@ class TestLandChangeMissingBaselineRoute:
     It is a 404 now, carrying which operand came back empty and which dataset it selected.
     """
 
-    QUERY = {
+    QUERY: ClassVar[dict] = {
         "analysis": "lnd_chng",
         **RASTER_DATASET,
         "calendar_year": 2024,

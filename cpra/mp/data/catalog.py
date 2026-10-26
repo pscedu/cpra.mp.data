@@ -90,7 +90,7 @@ def cast_str(name, value):
 def parse_path_dims(rel_path):
     dims = {}
     for seg in Path(rel_path).parts:
-        seg = seg[:-4] if seg.endswith(".tif") else seg
+        seg = seg.removesuffix(".tif")
         name, sep, val = seg.partition("=")
         if sep and name in DIMENSIONS:
             dims[name] = val

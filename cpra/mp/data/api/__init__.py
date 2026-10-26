@@ -37,8 +37,14 @@ from cpra.mp.data.api.models import (
 )
 from cpra.mp.data.api.pipeline import (
     respond_to_analysis as respond_to_analysis_pipeline,
+)
+from cpra.mp.data.api.pipeline import (
     respond_to_analysis_tile as respond_to_analysis_pipeline_tile,
+)
+from cpra.mp.data.api.pipeline import (
     respond_to_analysis_vector_tile as respond_to_analysis_pipeline_vector_tile,
+)
+from cpra.mp.data.api.pipeline import (
     tile_renders_stalled,
 )
 from cpra.mp.data.api.sources import LazyFrameSource
@@ -188,7 +194,7 @@ def dimensions(session: MPDSession) -> list[Dimension]:
             label=dim.label,
             type=dim.type,
             dtype=str(dim.dtype),
-            required=(True if dim.required is True else False),
+            required=(dim.required is True),
             null=dim.null,
             min_value=dim.min_value,
             max_value=dim.max_value,
@@ -348,7 +354,7 @@ async def get_data(format: DataFormat, request: Request):
 async def post_data(
     format: DataFormat,
     compression: Annotated[Compression, Query()],
-    body: dict[str, Any] = Body(...),
+    body: Annotated[dict[str, Any], Body()],
 ):
     """The same output as `get_data` above, for a `Pipeline` written directly as JSON.
 

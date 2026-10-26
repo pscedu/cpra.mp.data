@@ -28,6 +28,7 @@ SHAPES, not real-world variable semantics.
 import copy
 import io
 import json
+from typing import ClassVar
 
 import mercantile
 import numpy as np
@@ -505,7 +506,7 @@ class TestSingleInputEndToEnd:
     input's own dict key, so predicates and expressions below reference `"value"`.
     """
 
-    VECTOR_PIPELINE = {
+    VECTOR_PIPELINE: ClassVar[dict] = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
         "steps": [
             {"op": "filter", "input": "eco", "where": "value > 2035"},
@@ -626,7 +627,7 @@ class TestInputGridCellEndToEnd:
     which already covers the `IN` spelling.
     """
 
-    PIPELINE = {
+    PIPELINE: ClassVar[dict] = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
         "steps": [{"op": "filter", "input": "eco", "where": "grid_cell = 5 OR grid_cell = 6"}],
         "output": {"format": "csv"},
@@ -941,7 +942,7 @@ class TestWeightedCaseEndToEnd:
     every expression below references `"value"`.
     """
 
-    WEIGHTED_PIPELINE = {
+    WEIGHTED_PIPELINE: ClassVar[dict] = {
         "inputs": {"eco": {k: ANNUAL_KWARGS[k] for k in ("variable", "grid", "time_unit")}},
         "steps": [
             {

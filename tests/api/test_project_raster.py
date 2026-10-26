@@ -19,6 +19,8 @@ tiny (2x2 or 2x3) by design -- a distinguishing, hand-checkable fixture beats a 
 "probably right" one for a zonal aggregate or a broadcast join.
 """
 
+from typing import ClassVar
+
 import numpy as np
 import polars as pl
 import pytest
@@ -150,7 +152,7 @@ class TestRasterToVectorZonalAggregate:
     _DATA = np.array([[1, 5, 9], [2, 100, 999]], dtype="float32")
     _ZONES = np.array([[100, 100, 100], [200, 200, -1]], dtype="int32")
 
-    _EXPECTED = {
+    _EXPECTED: ClassVar[dict] = {
         "sum": {100: 15.0, 200: 102.0},
         "mean": {100: 5.0, 200: 51.0},
         "min": {100: 1.0, 200: 2.0},
@@ -393,7 +395,7 @@ class TestVectorToRasterBroadcastAndNodata:
         ).lazy()
         frames = {"v": lf}
 
-        out_lf, metadata_out, window = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
+        out_lf, metadata_out, _window = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
         out = out_lf.collect()
 
         assert metadata_out["calendar_year"].to_list() == [2030, 2040]
@@ -637,7 +639,7 @@ class TestVectorToRasterOrderPreservationLargeScale:
         lf = pl.DataFrame({"grid_cell": grid_cells, "value": grid_cells.cast(pl.Float64) * 2.0}).lazy()
         frames = {"v": lf}
 
-        out_lf, metadata_out, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
+        out_lf, _metadata_out, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types())
         out = out_lf.collect()
 
         assert out.height == self._N

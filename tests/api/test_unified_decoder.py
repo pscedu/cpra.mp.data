@@ -17,6 +17,7 @@ from rasterio.transform import xy as raster_xy
 from rasterio.warp import transform
 from shapely.geometry import box
 
+from cpra.mp.data.analyses.base import InvalidAnalysisParametersError
 from cpra.mp.data.analysis.request.data_query import build_data_query_pipeline
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.analysis.request.parameters import (
@@ -26,7 +27,6 @@ from cpra.mp.data.analysis.request.parameters import (
 )
 from cpra.mp.data.analysis.request.pipeline import pipeline_to_query
 from cpra.mp.data.api.unified import decode_request, decode_request_sync
-from cpra.mp.data.analyses.base import InvalidAnalysisParametersError
 from cpra.mp.data.grids import GRIDS
 from tests.factories import write_grid_geometry
 

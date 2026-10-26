@@ -17,6 +17,7 @@ filter, `grid_cell`, and caller-written `where` is composed into the pipeline's 
 
 import json
 from datetime import date
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -61,6 +62,7 @@ from cpra.mp.data.analyses.lnd_conf import (
 from cpra.mp.data.analyses.lnd_conf_chng import CONFIDENCE_CLASSES
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
+from cpra.mp.data.analysis.execution.sink import DEFAULT_NODATA
 from cpra.mp.data.analysis.request.pipeline import (
     CalculateStep,
     CaseStep,
@@ -70,7 +72,6 @@ from cpra.mp.data.analysis.request.pipeline import (
     ProjectStep,
     pipeline_to_query,
 )
-from cpra.mp.data.analysis.execution.sink import DEFAULT_NODATA
 from cpra.mp.data.legends import LEGENDS
 
 SSF_DATASET = DatasetRef(variable="ssf", time_unit="annual", grid="ecoregion_v001")
@@ -382,7 +383,7 @@ class TestResolveOverADateDimension:
     a helper in isolation.
     """
 
-    FILTERS = {
+    FILTERS: ClassVar[dict] = {
         "calendar_day": [date(2019, 1, 1), date(2070, 12, 31)],
         "model_group_id": 500,
         "scenario_id": 7,
@@ -526,8 +527,8 @@ class TestChainedLegendResolution:
     the same numbers under the wrong legend, colored as an undifferenced `[0, 1]` fraction.
     """
 
-    CHAIN_FILTERS = {"model_group_id": 705, "calendar_year": [2040, 2050]}
-    CHAIN_PARAMS = {"dimension": "calendar_year", "order": "asc"}
+    CHAIN_FILTERS: ClassVar[dict] = {"model_group_id": 705, "calendar_year": [2040, 2050]}
+    CHAIN_PARAMS: ClassVar[dict] = {"dimension": "calendar_year", "order": "asc"}
 
     def test_differencing_land_confidence_drops_its_legend_for_the_ramp(self):
         """`lnd_conf,diff` publishes no legend, so the map draws the synthesized
@@ -1579,7 +1580,7 @@ class TestLndTypePlusParameters:
 
 class TestLndTypePlusPipeline:
     # The selection a caller writes, which used to be three `Parameters` fields.
-    FILTERS = {"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050}
+    FILTERS: ClassVar[dict] = {"model_group_id": 705, "scenario_id": 7, "calendar_year": 2050}
 
     def _build(self, **overrides):
         filters = {key: value for key, value in {**self.FILTERS, **overrides}.items() if value is not None}

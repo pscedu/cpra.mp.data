@@ -43,11 +43,10 @@ def _fastapi_imports(source, path):
             for alias in node.names:
                 if alias.name == "fastapi" or alias.name.startswith("fastapi."):
                     yield f"{path}:{node.lineno}: import {alias.name}"
-        elif isinstance(node, ast.ImportFrom):
-            if node.module is not None and (
-                node.module == "fastapi" or node.module.startswith("fastapi.")
-            ):
-                yield f"{path}:{node.lineno}: from {node.module} import ..."
+        elif isinstance(node, ast.ImportFrom) and (
+            node.module is not None and (node.module == "fastapi" or node.module.startswith("fastapi."))
+        ):
+            yield f"{path}:{node.lineno}: from {node.module} import ..."
 
 
 def test_no_module_under_analysis_imports_fastapi():

@@ -443,7 +443,7 @@ class Analysis:
         *,
         dataset: DatasetRef | None,
         filters: dict[str, Any],
-        parameters: "Analysis.Parameters",
+        parameters: Analysis.Parameters,
         grid_cell_where: str | None = None,
     ):
         self.dataset = dataset
@@ -456,7 +456,7 @@ class Analysis:
         self.grid_cell_where = grid_cell_where
 
     @classmethod
-    def validate_selection(cls, parameters: "Analysis.Parameters", filters: dict[str, Any]) -> None:
+    def validate_selection(cls, parameters: Analysis.Parameters, filters: dict[str, Any]) -> None:
         """A cardinality/consistency rule that needs `filters` alongside `parameters` --
         raise `InvalidAnalysisParametersError` to reject. The default performs no extra
         check (an analysis whose `Parameters` model alone is a sufficient validity check,

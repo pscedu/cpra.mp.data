@@ -16,7 +16,7 @@ from cpra.mp.data.exceptions import ValidationError
 
 
 def make_dimension(**overrides):
-    kwargs = dict(name="test_dim", label="Test", type="partition", dtype="Int32")
+    kwargs = {"name": "test_dim", "label": "Test", "type": "partition", "dtype": "Int32"}
     kwargs.update(overrides)
     return Dimension(**kwargs)
 

@@ -76,6 +76,9 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
+    # Exact: a ruff minor release can change which rules are on by default (0.16 did).
+    # Must match required-version under [tool.ruff]. Dev-only, so the images never get it.
+    "ruff==0.17.2",
     "sqlmodel",
     # Also in the `scripts` extra, which is what actually needs it at runtime. It is here
     # too because tests/test_migrate_to_long_format.py execs
@@ -123,6 +126,14 @@ omit = [
 
 [tool.ruff]
 line-length = 120
+# Same pin as the dev group: any other ruff (an editor's bundled one, `uvx ruff`) refuses
+# to run instead of silently checking a different rule set.
+required-version = "==0.17.2"
+
+[tool.ruff.lint.per-file-ignores]
+# Batch maintenance scripts: catching everything per file or partition, recording it and
+# moving on to the next is the design, not an oversight.
+"scripts/**" = ["BLE001"]
 
 [tool.basedpyright]
 reportAny = false

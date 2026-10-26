@@ -22,9 +22,9 @@ from pydantic import ValidationError
 
 from cpra.mp.data.analyses.base import (
     Analysis,
-    AnalysisMeta,
     AnalysisChainError,
     AnalysisDatasetMismatchError,
+    AnalysisMeta,
     AnalysisRegistryError,
     DatasetRef,
     InvalidAnalysisParametersError,

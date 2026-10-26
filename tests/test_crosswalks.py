@@ -338,7 +338,7 @@ class TestWriteVectorCrosswalk:
         """`PAIR_CHUNK` bounds how many intersections are computed at once; slicing at a
         size smaller than the pair count must produce the same table, just across more
         record batches."""
-        src_features = _tiles(list(range(0, 11)), list(range(0, 11)), start_id=1)  # 100 cells
+        src_features = _tiles(list(range(11)), list(range(11)), start_id=1)  # 100 cells
         dst_features = [(1, box(0, 0, 5.5, 11)), (2, box(5.5, 0, 11, 11))]
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)

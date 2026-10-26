@@ -24,25 +24,25 @@ from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import _cog_profile, compact_cog, write_cog
 from cpra.mp.data.tabular import compact_parquet, write_parquet
 
-TABULAR_KWARGS = dict(
-    variable="sal",
-    grid="hydro_compartment_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    aggregate_type="mean",
-    model="icm_v2023.0.0",
-)
+TABULAR_KWARGS = {
+    "variable": "sal",
+    "grid": "hydro_compartment_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "aggregate_type": "mean",
+    "model": "icm_v2023.0.0",
+}
 
-RASTER_KWARGS = dict(
-    variable="hsi",
-    grid="veg_grid_cell_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    species_code="allig",
-    model="icm_v2023.0.0",
-)
+RASTER_KWARGS = {
+    "variable": "hsi",
+    "grid": "veg_grid_cell_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "species_code": "allig",
+    "model": "icm_v2023.0.0",
+}
 
 
 def _tabular_data(years, grid_cells=(1, 2)):

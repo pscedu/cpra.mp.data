@@ -920,30 +920,31 @@ def validate_shapes(pipeline: Pipeline) -> None:
             "(or whose aggregate) say which operand the one surviving value comes from"
         )
 
-    if pipeline.output.format == TileFormat.pbf.value:
-        # The `pbf` rule, and the one sink rule that tests the final frame's GRID rather
-        # than only its shape. A vector tile's geometry is the grid's own PMTiles boundary
-        # archive (`execution.sink.sink_vector_tile`), into which this pipeline's values are
-        # injected by `grid_cell` -- so the frame has to be long (rows to inject) AND
-        # addressed against a grid that has polygons to inject them into. A raster point
-        # query satisfies the first half and fails the second: its `grid_cell`s are pixel
-        # ids of a grid with no boundary archive at all.
-        #
-        # Rejecting here, rather than letting `sink_vector_tile` return its `None`, is what
-        # keeps "this pipeline could never have had a boundary archive" (a client error)
-        # from collapsing into the 204 that means "no data at this location."
-        #
-        # Declared before the two rules below, which `pbf` would otherwise fall through
-        # into: `pbf` is not a `RASTER_OUTPUT_FORMATS` member, so a band-wide final frame
-        # would trip the "needs a tabular sink" rule and be told to add a spatial filter --
-        # advice that produces a long frame still on a raster grid, which this rule rejects
-        # anyway.
-        if final.shape != Shape.long or GRIDS[final.grid].grid_type != "vector":
-            raise ShapeError(
-                f"pipeline's final frame (grid={final.grid!r}, shape={final.shape.value!r}) "
-                "is not a long frame on a vector grid -- a .pbf vector tile needs the final "
-                "result addressed against a vector grid's polygons, not a raster's pixels"
-            )
+    # The `pbf` rule, and the one sink rule that tests the final frame's GRID rather
+    # than only its shape. A vector tile's geometry is the grid's own PMTiles boundary
+    # archive (`execution.sink.sink_vector_tile`), into which this pipeline's values are
+    # injected by `grid_cell` -- so the frame has to be long (rows to inject) AND
+    # addressed against a grid that has polygons to inject them into. A raster point
+    # query satisfies the first half and fails the second: its `grid_cell`s are pixel
+    # ids of a grid with no boundary archive at all.
+    #
+    # Rejecting here, rather than letting `sink_vector_tile` return its `None`, is what
+    # keeps "this pipeline could never have had a boundary archive" (a client error)
+    # from collapsing into the 204 that means "no data at this location."
+    #
+    # Declared before the two rules below, which `pbf` would otherwise fall through
+    # into: `pbf` is not a `RASTER_OUTPUT_FORMATS` member, so a band-wide final frame
+    # would trip the "needs a tabular sink" rule and be told to add a spatial filter --
+    # advice that produces a long frame still on a raster grid, which this rule rejects
+    # anyway.
+    if pipeline.output.format == TileFormat.pbf.value and (
+        final.shape != Shape.long or GRIDS[final.grid].grid_type != "vector"
+    ):
+        raise ShapeError(
+            f"pipeline's final frame (grid={final.grid!r}, shape={final.shape.value!r}) "
+            "is not a long frame on a vector grid -- a .pbf vector tile needs the final "
+            "result addressed against a vector grid's polygons, not a raster's pixels"
+        )
 
     if final.shape == Shape.long and pipeline.output.format in RASTER_OUTPUT_FORMATS:
         # Same rejection either way; the two messages differ only in what they tell the

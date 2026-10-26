@@ -40,39 +40,39 @@ def query(catalog_path, dimensions, **filters):
 
 # vct/veg_grid_cell_v001 needs no extra required dimensions beyond the always-required
 # model_group_id/scenario_id/model, so it's the simplest raster fixture.
-RASTER_KWARGS = dict(
-    variable="vct",
-    grid="veg_grid_cell_v001",
-    time_unit="annual",
-    model="icm_v2023.0.0",
-)
+RASTER_KWARGS = {
+    "variable": "vct",
+    "grid": "veg_grid_cell_v001",
+    "time_unit": "annual",
+    "model": "icm_v2023.0.0",
+}
 
 # ssf/ecoregion_v001 requires `percentile`, and ecoregion_v001 is small (32 grid cells).
-ANNUAL_KWARGS = dict(
-    variable="ssf",
-    grid="ecoregion_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    model="icm_v2023.0.0",
-)
+ANNUAL_KWARGS = {
+    "variable": "ssf",
+    "grid": "ecoregion_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "model": "icm_v2023.0.0",
+}
 
 # damage/clara_grid_cell_v001 is the decadal CLARA variable, and the one with a Float32
 # `aep` dimension.
-DAMAGE_KWARGS = dict(
-    variable="damage",
-    grid="clara_grid_cell_v001",
-    time_unit="decadal",
-    model_group_id=500,
-    scenario_id=7,
-    model="clara_v2023.0.0",
-    pumping_id=0.5,
-    fragility_scenario=0,
-    population_variant=0,
-    clara_variant=0,
-    asset_type=3,
-    percentile=50,
-)
+DAMAGE_KWARGS = {
+    "variable": "damage",
+    "grid": "clara_grid_cell_v001",
+    "time_unit": "decadal",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "model": "clara_v2023.0.0",
+    "pumping_id": 0.5,
+    "fragility_scenario": 0,
+    "population_variant": 0,
+    "clara_variant": 0,
+    "asset_type": 3,
+    "percentile": 50,
+}
 DAMAGE_DIMENSIONS = {k: DAMAGE_KWARGS[k] for k in ("variable", "grid", "time_unit")}
 
 

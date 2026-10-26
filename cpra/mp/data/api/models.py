@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
 
 from cpra.mp.data.analysis.request.parameters import (
-    Compression,  # noqa: F401 -- re-exported; the routes below and api/utils.py bind it from here
+    Compression,  # also re-exported; the routes and api/utils.py bind it from here
     DataOptions,
     DatasetDimensions,  # noqa: F401 -- re-exported; imported from here by cli/, visualizations/ and tests
     FilterDimensions,

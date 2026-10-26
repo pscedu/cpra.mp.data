@@ -13,7 +13,6 @@ except the tests that specifically exercise the defaults, which monkeypatch the 
 values to tmp_path instead.
 """
 
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -26,24 +25,24 @@ from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import write_cog
 from cpra.mp.data.tabular import write_parquet
 
-TABULAR_KWARGS = dict(
-    variable="sal",
-    grid="hydro_compartment_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    aggregate_type="mean",
-    model="icm_v2023.0.0",
-)
+TABULAR_KWARGS = {
+    "variable": "sal",
+    "grid": "hydro_compartment_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "aggregate_type": "mean",
+    "model": "icm_v2023.0.0",
+}
 
-RASTER_KWARGS = dict(
-    variable="vct",
-    grid="veg_grid_cell_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    model="icm_v2023.0.0",
-)
+RASTER_KWARGS = {
+    "variable": "vct",
+    "grid": "veg_grid_cell_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "model": "icm_v2023.0.0",
+}
 
 
 def _tabular_frame(years, grid_cells=(1, 2)):

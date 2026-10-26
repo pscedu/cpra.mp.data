@@ -931,7 +931,7 @@ class TestRetiredParams:
         """`reject_retired_params` is wired onto the tile/visualization routes as well as
         the flat data route (see `api.get_model_tile`/`get_vector_tile`); spot-checked
         here on `.tif` rather than repeated per retired name."""
-        response = client.get(f"/v1/data/8/0/0.png", params={**RASTER_PARAMS, "group_aggregate": "sum"})
+        response = client.get("/v1/data/8/0/0.png", params={**RASTER_PARAMS, "group_aggregate": "sum"})
         assert response.status_code == 400
         assert "group_aggregate" in response.json()["detail"]
 

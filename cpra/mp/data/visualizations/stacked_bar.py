@@ -67,7 +67,7 @@ class StackedBar(DatasetVisualization):
 
         compared = {
             d: self.params[d]
-            for d in DIMENSIONS.keys()
+            for d in DIMENSIONS
             if isinstance(self.params.get(d), (list, tuple))
             and len(self.params.get(d)) > 1
             and d not in excluded_dimensions

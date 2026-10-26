@@ -29,36 +29,36 @@ from cpra.mp.data.tabular import write_parquet
 from cpra.mp.data.variables import VARIABLES
 
 # Annual vector dataset: ssf on ecoregion_v001, which requires `percentile`.
-ANNUAL_KWARGS = dict(
-    variable="ssf",
-    grid="ecoregion_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    percentile=50,
-    model="icm_v2023.0.0",
-)
+ANNUAL_KWARGS = {
+    "variable": "ssf",
+    "grid": "ecoregion_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "percentile": 50,
+    "model": "icm_v2023.0.0",
+}
 
 # Daily vector dataset: sal on hydro_compartment_v001, which requires `aggregate_type`.
-DAILY_KWARGS = dict(
-    variable="sal",
-    grid="hydro_compartment_v001",
-    time_unit="daily",
-    model_group_id=500,
-    scenario_id=7,
-    aggregate_type="mean",
-    model="icm_v2023.0.0",
-)
+DAILY_KWARGS = {
+    "variable": "sal",
+    "grid": "hydro_compartment_v001",
+    "time_unit": "daily",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "aggregate_type": "mean",
+    "model": "icm_v2023.0.0",
+}
 
 # Annual raster dataset: vct on veg_grid_cell_v001, which requires no extra dimensions.
-RASTER_KWARGS = dict(
-    variable="vct",
-    grid="veg_grid_cell_v001",
-    time_unit="annual",
-    model_group_id=500,
-    scenario_id=7,
-    model="icm_v2023.0.0",
-)
+RASTER_KWARGS = {
+    "variable": "vct",
+    "grid": "veg_grid_cell_v001",
+    "time_unit": "annual",
+    "model_group_id": 500,
+    "scenario_id": 7,
+    "model": "icm_v2023.0.0",
+}
 
 ECOREGION_IDS = tuple(range(1, 33))
 

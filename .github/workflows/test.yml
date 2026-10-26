@@ -30,6 +30,11 @@ jobs:
       - name: Run tests
         run: uv run --python 3.13 pytest
 
+      # After the tests, and run even if they fail, so a lint error never hides test results.
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: uv run --python 3.13 ruff check .
+
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4

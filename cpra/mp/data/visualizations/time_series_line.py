@@ -38,7 +38,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         compare_dimensions = {
             d: self.params[d]
-            for d in DIMENSIONS.keys()
+            for d in DIMENSIONS
             if isinstance(self.params.get(d), (list, tuple))
             and len(self.params.get(d)) > 1
             and d not in excluded_dimensions
@@ -69,7 +69,7 @@ class TimeSeriesLine(DatasetVisualization):
         # is what actually identifies the values being drawn. The row index doubles as the
         # tooltip's column key below, so both label lists line up with it.
         grid_cell_label_df = pl.DataFrame(
-            dict(grid_cell=self.grid_cells, grid_cell_label=self.grid_cell_labels)
+            {"grid_cell": self.grid_cells, "grid_cell_label": self.grid_cell_labels}
         ).with_row_index(name="grid_cell_label_idx")
 
         main_line_encodings = [
@@ -108,7 +108,7 @@ class TimeSeriesLine(DatasetVisualization):
 
         points = main_line.mark_point().encode(opacity=when_near.then(alt.value(1)).otherwise(alt.value(0)))
 
-        grid_cell_df = pl.DataFrame(dict(grid_cell=self.grid_cells)).with_row_index(name="grid_cell_idx")
+        grid_cell_df = pl.DataFrame({"grid_cell": self.grid_cells}).with_row_index(name="grid_cell_idx")
         tooltips = [self.get_time_tooltip(self.time_column)] + [
             alt.Tooltip(
                 "_".join([str(c) for c in [i] + list(idx_choices)]),
@@ -135,7 +135,7 @@ class TimeSeriesLine(DatasetVisualization):
                 " : ".join([f"datum.{dim_name} == {json.dumps(v)} ? {i}" for i, v in enumerate(dim_values)]) + " : null"
             )
             rules = rules.transform_calculate(**{f"{dim_name}_idx": idx_expr})
-        pivot_key_parts = ["grid_cell_idx"] + [f"{d}_idx" for d in compare_dimensions.keys()]
+        pivot_key_parts = ["grid_cell_idx"] + [f"{d}_idx" for d in compare_dimensions]
         rules = (
             rules.transform_calculate(tooltip=" + '_' + ".join([f"datum.{col}" for col in pivot_key_parts]))
             .transform_pivot("tooltip", value="value", groupby=["date", self.time_column])

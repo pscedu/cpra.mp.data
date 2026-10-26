@@ -144,7 +144,7 @@ def main(output_dir):
     }
 
     # Historic data (model_group_id=0, scenario_id=0)
-    hist_inputs = (
+    hist_inputs = (  # noqa: F841 -- read by the historic loop commented out below
         read_cog(
             variable="lnd_type",
             grid=SOURCE_GRID,

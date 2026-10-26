@@ -183,10 +183,14 @@ class TestPipelineRaster:
             # single-input request like this one and are exactly what distinguishes the
             # bands once a `join` has put two datasets in one file.
             assert src.descriptions == (
-                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
-                "model_group_id=500, scenario_id=7, calendar_year=2030",
-                "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
-                "model_group_id=500, scenario_id=7, calendar_year=2040",
+                (
+                    "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                    "model_group_id=500, scenario_id=7, calendar_year=2030"
+                ),
+                (
+                    "variable=vct, time_unit=annual, grid=veg_grid_cell_v001, "
+                    "model_group_id=500, scenario_id=7, calendar_year=2040"
+                ),
             )
 
     async def test_a_tif_selection_matching_nothing_raises_rather_than_returning_a_missing_path(

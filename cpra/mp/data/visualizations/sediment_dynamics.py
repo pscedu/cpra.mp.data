@@ -40,6 +40,8 @@ a pivot has no second source to fetch and no key to agree on, and it runs AFTER 
 scaling, which is what fixes the tooltip's long-standing wrong `elev`.
 """
 
+from typing import ClassVar
+
 import altair as alt
 import polars as pl
 
@@ -72,7 +74,7 @@ class SedimentDynamics(DatasetVisualization):
         max_grid_cells = 1
         # The five the analysis reads, and the five datasets a client should offer this
         # chart for. Same list as `analyses.sediment_dynamics.VARIABLE_NAMES`.
-        variables = ["elev", "inun", LND_TYPE, "test_mnrl_accr", "test_org_accr"]
+        variables: ClassVar[list] = ["elev", "inun", LND_TYPE, "test_mnrl_accr", "test_org_accr"]
         # The named analysis this chart is the presentation of. Read by
         # `BaseVisualization.request_items` (the route's decode) and by `__init__` below
         # (the data URLs this spec emits); no other visualization declares one.

@@ -1,5 +1,5 @@
 from functools import cached_property
-from typing import Any, final
+from typing import Any, ClassVar, final
 from urllib.parse import quote, urlencode
 
 import polars as pl
@@ -24,7 +24,7 @@ SELECTION_EXPR = ["get", ["to-string", ["id"]], ["global-state", "selectionColor
 class Map(DatasetVisualization):
     """Map visualization for a dataset using MapLibre GL style specification."""
 
-    DEFAULT_BOUNDS = [
+    DEFAULT_BOUNDS: ClassVar[list] = [
         -94.00080091962352,
         28.70426878930118,
         -87.51148588666453,

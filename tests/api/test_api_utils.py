@@ -15,8 +15,7 @@ from rasterio.crs import CRS
 from rasterio.env import get_gdal_config
 from rasterio.transform import from_bounds
 
-import cpra.mp.data.analysis.io.raster_io as raster_io
-from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
+from cpra.mp.data.analysis.io import raster_io
 from cpra.mp.data.analysis.io.raster_io import (
     enum_value,
     parallel_read_rasters,
@@ -26,15 +25,16 @@ from cpra.mp.data.analysis.io.raster_io import (
     unpack_values,
 )
 from cpra.mp.data.analysis.request.errors import RequestError
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, OutputType
 from cpra.mp.data.api.boundary import resolve_status
-from cpra.mp.data.api.models import Compression, DatasetDimensions, FilterDimensions
+from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.utils import (
     get_visualization_class,
     validate_compression,
     validate_format,
 )
-from tests.factories import RASTER_KWARGS, write_raster_dataset
+from tests.factories import write_raster_dataset
 
 
 class TestEnumValue:

@@ -106,6 +106,7 @@ def test_module_entry_point_registers_its_command_modules():
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     assert result.returncode == 0
     assert "catalog" in result.stdout

@@ -18,6 +18,8 @@ file has to exist to read them from. Everything else about a tile-scoped compile
 window itself included -- comes off the grid registry with nothing opened.
 """
 
+from typing import ClassVar
+
 import mercantile
 import polars as pl
 import pytest
@@ -819,13 +821,13 @@ class TestPointSampleThroughABandWideJoin:
     is reading it.
     """
 
-    OPERANDS = {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")}
-    JOIN = {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"}
+    OPERANDS: ClassVar[dict] = {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")}
+    JOIN: ClassVar[dict] = {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"}
     # The pixel and the fold that follows it -- `sediment_dynamics`' own shape, and the
     # only one that reaches a sink without throwing an operand away: a join's output
     # carries one value column per operand and every sink wants exactly one.
-    SAMPLE = {"op": "filter", "input": "j", "where": "grid_cell = 7", "as": "s"}
-    STACK = {"op": "unpivot", "input": "s"}
+    SAMPLE: ClassVar[dict] = {"op": "filter", "input": "j", "where": "grid_cell = 7", "as": "s"}
+    STACK: ClassVar[dict] = {"op": "unpivot", "input": "s"}
 
     @pytest.fixture(autouse=True)
     def _bands(self, monkeypatch):
@@ -931,7 +933,7 @@ class TestDimensionPushdownAcrossJoinsAndFanOut:
     (`raster_band_metadata`) and into a `scan_vector` predicate.
     """
 
-    _YEARS = [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
+    _YEARS: ClassVar[list] = [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
 
     def _join_pipeline(self, steps):
         return {
@@ -1250,7 +1252,7 @@ class TestPostJoinNarrowingAtProductionScale:
 
     # 180 (model_group_id, scenario_id, calendar_year) combinations, sliced to the two
     # datasets' real band counts: `elev` 178, `lnd_type` 179, 357 together.
-    _COMBINATIONS = [
+    _COMBINATIONS: ClassVar[list] = [
         {"model_group_id": model_group, "scenario_id": scenario, "calendar_year": year}
         for model_group in (1, 2)
         for scenario in (1, 2, 3)
@@ -1279,8 +1281,8 @@ class TestPostJoinNarrowingAtProductionScale:
             )
         )
 
-    _JOIN = {"op": "join", "type": "spatial", "inputs": ["elev", "land"], "as": "j"}
-    _SINK = {"op": "group", "by": [], "aggregate": "sum"}
+    _JOIN: ClassVar[dict] = {"op": "join", "type": "spatial", "inputs": ["elev", "land"], "as": "j"}
+    _SINK: ClassVar[dict] = {"op": "group", "by": [], "aggregate": "sum"}
 
     def test_with_nothing_declared_both_origins_are_read_whole(self, monkeypatch):
         plan = self._compile(monkeypatch, [self._JOIN, self._SINK])

@@ -236,13 +236,13 @@ def write_parquet(
     # Derive partition columns from the metadata row.
     partition_cols = partition_columns(meta)
 
-    common = dict(
-        base_path=Path(base_path),
-        partition_cols=partition_cols,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_size=row_group_size,
-    )
+    common = {
+        "base_path": Path(base_path),
+        "partition_cols": partition_cols,
+        "compression": compression,
+        "compression_level": compression_level,
+        "row_group_size": row_group_size,
+    }
     if temp_dir is _TEMP_DIR_UNSET:
         _write_via_sink_batches(lf, **common)
     else:

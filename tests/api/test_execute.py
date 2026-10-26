@@ -38,8 +38,8 @@ from rasterio.windows import Window
 
 from cpra.mp.data.analysis.execution import project
 from cpra.mp.data.analysis.execution.execute import (
-    LoweringNotImplementedError,
     _LOWERINGS,
+    LoweringNotImplementedError,
     _point_sample_overrides,
     _shared_point_sample_window,
     _shared_tile_window,
@@ -55,11 +55,11 @@ from cpra.mp.data.analysis.execution.point_sample import parse_point_sample_ids,
 from cpra.mp.data.analysis.io.raster_io import raster_grid_geometry, tile_source_window
 from cpra.mp.data.analysis.request.ops import (
     FILTER_LOWERING_TABLE,
-    FrameType,
     JOIN_LOWERING_TABLE,
     PROJECT_LOWERING_TABLE,
-    Shape,
     UNPIVOT_LOWERING_TABLE,
+    FrameType,
+    Shape,
     validate_shapes,
 )
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
@@ -527,7 +527,7 @@ class TestBandWideEndToEnd:
         final = plan.ops[-1].output
         assert plan.frame_types[final].shape is Shape.band_wide
 
-        lf, metadata_df, window = execute(plan, base_path=base_path)
+        lf, metadata_df, _window = execute(plan, base_path=base_path)
         df = lf.collect()
 
         assert df.columns == ["b0"]
@@ -787,7 +787,7 @@ class TestBandWideEndToEnd:
 
         monkeypatch.setattr(execute_module, "scan_raster", counting_scan_raster)
 
-        lf, metadata_df, window = execute(plan, base_path=base_path)
+        lf, _metadata_df, _window = execute(plan, base_path=base_path)
         df = lf.collect()
 
         assert len(calls) == 1
@@ -1156,7 +1156,7 @@ class TestBandWideEndToEnd:
 
         monkeypatch.setattr(execute_module, "scan_raster", _fail_if_called)
 
-        lf, metadata_df, window = execute(plan, base_path=base_path)
+        _lf, metadata_df, window = execute(plan, base_path=base_path)
 
         assert metadata_df.is_empty()
         assert window.source == ()
@@ -1283,7 +1283,7 @@ class TestBandWideEndToEnd:
                 "output": {"format": "tif"},
             }
         )
-        lf, metadata_df, window = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
+        lf, metadata_df, _window = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
         df = lf.collect()
 
         assert metadata_df["calendar_year"].to_list() == [2030]
@@ -1506,7 +1506,7 @@ class TestBandWideEndToEnd:
         assert plan.inputs["a"].straddling_vector_grid == "ecoregion_v001"
         assert plan.frame_types["c"].shape is Shape.band_wide
 
-        lf, metadata_df, window = execute(plan, base_path=base_path)
+        lf, _metadata_df, _window = execute(plan, base_path=base_path)
         df = lf.collect()
 
         assert project.ZONE_COLUMN not in df.columns

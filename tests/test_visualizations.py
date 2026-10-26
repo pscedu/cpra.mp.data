@@ -11,6 +11,8 @@ drew the same grid cell with.
 The stacked bars have their own file, `test_stacked_bar.py`.
 """
 
+from typing import ClassVar
+
 import pytest
 from rasterio.crs import CRS
 from rasterio.warp import transform
@@ -31,8 +33,8 @@ from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 from tests.factories import write_grid_geometry
 
-ANNUAL_VECTOR = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual")
-ANNUAL_RASTER = dict(variable="vct", grid="veg_grid_cell_v001", time_unit="annual")
+ANNUAL_VECTOR = {"variable": "ssf", "grid": "ecoregion_v001", "time_unit": "annual"}
+ANNUAL_RASTER = {"variable": "vct", "grid": "veg_grid_cell_v001", "time_unit": "annual"}
 
 # Two coordinates inside cell 7, one inside cell 8, and one in neither.
 INSIDE = (-91.5, 29.5)
@@ -362,8 +364,8 @@ class TestTimeAxisGate:
     reading a field the response did not carry.
     """
 
-    COLLAPSES_TIME = dict(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2050, 2060])
-    KEEPS_TIME = dict(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[705, 706])
+    COLLAPSES_TIME: ClassVar[dict] = {"analysis": "diff", "dimension": "calendar_year", "order": "asc", "calendar_year": [2050, 2060]}
+    KEEPS_TIME: ClassVar[dict] = {"analysis": "diff", "dimension": "model_group_id", "order": "asc", "model_group_id": [705, 706]}
 
     def test_a_time_series_line_rejects_a_collapsed_time_column(self):
         viz = TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
@@ -394,7 +396,7 @@ class TestTimeAxisGate:
         """Checked in `spec` rather than in each `chart()`, so a notebook caller reaches it
         the same way the route does."""
         with pytest.raises(RequestError, match="Use the map visualization"):
-            TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).spec
+            _ = TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME).spec
 
     def test_lnd_chng_keeps_its_time_column(self):
         """The reported case, and it is no longer a rejection.

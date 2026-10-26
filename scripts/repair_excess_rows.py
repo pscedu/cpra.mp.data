@@ -67,11 +67,12 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-import migrate_to_long_format as mig  # noqa: E402
-from cpra.mp.data.catalog import Catalog, cal_for, parse_path_dims  # noqa: E402
-from cpra.mp.data.config import BASE_PATH, CATALOG_PATH  # noqa: E402
-from cpra.mp.data.dimensions import DIMENSIONS  # noqa: E402
-from cpra.mp.data.tabular import read_parquet  # noqa: E402
+import migrate_to_long_format as mig
+
+from cpra.mp.data.catalog import Catalog, cal_for, parse_path_dims
+from cpra.mp.data.config import BASE_PATH, CATALOG_PATH
+from cpra.mp.data.dimensions import DIMENSIONS
+from cpra.mp.data.tabular import read_parquet
 
 DATASET_DIMS = ("variable", "time_unit", "grid")
 
@@ -124,7 +125,7 @@ def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: b
         return {**record, "status": NOT_WIDE}
 
     geo_cols = [col for col in schema if col[:1].isdigit()]
-    alpha_cols = set(col for col in schema if not col[:1].isdigit())
+    alpha_cols = {col for col in schema if not col[:1].isdigit()}
     other_dim_cols = [col for col in DIMENSIONS if col in alpha_cols and not col.startswith("calendar_")]
     hive_dims = mig._dimension_cols_from_hive(paths[0])
     cal_col = cal_for(str(hive_dims.get("time_unit", "")))

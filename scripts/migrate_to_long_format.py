@@ -56,8 +56,8 @@ After verifying correctness on one dataset, run without --dry-run to apply.
 
 import csv
 import multiprocessing
-import queue
 import os
+import queue
 import resource
 import signal
 import sys

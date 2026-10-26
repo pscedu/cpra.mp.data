@@ -27,10 +27,12 @@ migrated call sites care about grid TYPE and pipeline SHAPE, not real-world vari
 semantics.
 """
 
+from typing import ClassVar
+
 import pytest
 
 from cpra.mp.data import config
-from cpra.mp.data.analyses import DatasetRef, resolve_analysis
+from cpra.mp.data.analyses import DatasetRef
 from cpra.mp.data.legends import LEGENDS
 from cpra.mp.data.visualizations.map import Map
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
@@ -150,7 +152,7 @@ class TestResolvedAnalysisMetadataHooks:
     `base_path`/`monkeypatch`/written data.
     """
 
-    ANNUAL = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", **COMMON_ANNUAL_FILTER_LISTS)
+    ANNUAL: ClassVar[dict] = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", **COMMON_ANNUAL_FILTER_LISTS)
 
     def test_difference_result_kind_is_reported_as_a_difference(self):
         m = Map(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2030, 2040], **self.ANNUAL)
@@ -188,7 +190,7 @@ class TestDifferenceRampVsNamedLegend:
 
     # `lnd_conf`'s real dataset. No `scenario_id`: the analysis fixes its own ensemble and
     # `validate_selection` rejects a caller-supplied one outright.
-    RASTER = dict(variable="lnd_type", grid="morph_pixel_v002", time_unit="annual", model_group_id=[705])
+    RASTER: ClassVar[dict] = {"variable": "lnd_type", "grid": "morph_pixel_v002", "time_unit": "annual", "model_group_id": [705]}
 
     def _map(self, **kwargs):
         return Map(calendar_year=[2040, 2050], dimension="calendar_year", order="asc", **self.RASTER, **kwargs)

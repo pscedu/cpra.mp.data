@@ -20,16 +20,16 @@ from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_I
 
 
 def make_window(**overrides) -> frame.ReadWindow:
-    defaults = dict(
-        source="veg_grid_cell_v001/elev.tif",
-        col_off=0,
-        row_off=0,
-        width=10,
-        height=10,
-        transform=Affine.identity(),
-        crs=CRS.from_epsg(6478),
-        decimation=(1, 1),
-    )
+    defaults = {
+        "source": "veg_grid_cell_v001/elev.tif",
+        "col_off": 0,
+        "row_off": 0,
+        "width": 10,
+        "height": 10,
+        "transform": Affine.identity(),
+        "crs": CRS.from_epsg(6478),
+        "decimation": (1, 1),
+    }
     defaults.update(overrides)
     return frame.ReadWindow(**defaults)
 

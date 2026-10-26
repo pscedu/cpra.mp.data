@@ -38,7 +38,6 @@ from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.io import raster_io
 from cpra.mp.data.analysis.io.catalog import resolve_raster_bands
 from cpra.mp.data.analysis.io.raster import scan_raster
-from cpra.mp.data.analysis.io.raster_io import raster_blocks_per_batch
 from cpra.mp.data.analysis.request.errors import NotFoundError
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import InputSelection, parse_pipeline

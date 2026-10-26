@@ -88,7 +88,7 @@ def build(base_path, out):
         rel = d.relative_to(base)
         try:
             cat = unify_dtypes(tabular_catalog_from_files(base, d, files))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- one unreadable directory shouldn't stop the build
             click.echo(f"tabular: {rel}  ->  SKIPPED ({type(exc).__name__}: {exc})", err=True)
             continue
         click.echo(f"tabular: {rel}  ->  {cat.height:,} rows")

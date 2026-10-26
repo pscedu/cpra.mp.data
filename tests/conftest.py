@@ -24,9 +24,9 @@ os.environ["CPRA_MP_DATA_GRIDS_PATH"] = str(_SANDBOX / "geometry")
 os.environ["CPRA_MP_DATA_MPD_URI"] = "sqlite://"
 os.environ["CPRA_MP_DATA_DEBUG"] = "False"
 
-import pytest  # noqa: E402
+import pytest
 
-from cpra.mp.data import config as cpra_config  # noqa: E402
+from cpra.mp.data import config as cpra_config
 
 
 def pytest_configure(config):

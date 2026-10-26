@@ -49,7 +49,6 @@ import pyarrow.parquet as pq
 import pytest
 import rasterio as rio
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from PIL import Image
 from polars.exceptions import ColumnNotFoundError
@@ -471,7 +470,7 @@ class TestFourRoutesEndToEnd:
         assert response.status_code == 400
         assert response.headers["content-type"].startswith("text/csv")
         assert "no_such_column" in response.text
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             response.json()
 
     def test_unknown_sort_column_is_400_not_500(self, client, base_path, monkeypatch):

@@ -11,8 +11,10 @@ def table_row(values):
     return f"| {' | '.join([str(v) for v in values])} |\n"
 
 
-def table(df, column_aliases={}, format={}):
+def table(df, column_aliases=None, format=None):
     """Create a Markdown table."""
+    column_aliases = column_aliases or {}
+    format = format or {}
 
     return "".join(
         [

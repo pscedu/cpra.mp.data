@@ -8,6 +8,7 @@ overrides only the field its scenario cares about.
 """
 
 import dataclasses
+from typing import ClassVar
 
 import polars as pl
 import pytest
@@ -38,16 +39,16 @@ from cpra.mp.data.analysis.request.pipeline import CaseWhen
 
 
 def _window(**overrides):
-    defaults = dict(
-        source=("fixture.tif",),
-        col_off=0,
-        row_off=0,
-        width=1,
-        height=3,
-        transform=Affine.identity(),
-        crs=CRS.from_epsg(4326),
-        decimation=(1, 1),
-    )
+    defaults = {
+        "source": ("fixture.tif",),
+        "col_off": 0,
+        "row_off": 0,
+        "width": 1,
+        "height": 3,
+        "transform": Affine.identity(),
+        "crs": CRS.from_epsg(4326),
+        "decimation": (1, 1),
+    }
     defaults.update(overrides)
     return ReadWindow(**defaults)
 
@@ -899,7 +900,7 @@ class TestCaseAgreesWithTheRewriteChainItReplaced:
     # The depths either side of each class bound, plus the domain floor and a nodata
     # pixel. `DEPTH_CLASSES` is `((0.46, 6), (1.0, 7), (None, 0))`, every interval closed
     # at its upper bound.
-    DEPTHS = [0.01, 0.46, 0.47, 1.0, 1.01, 12.5, 0.0, -3.2, None]
+    DEPTHS: ClassVar[list] = [0.01, 0.46, 0.47, 1.0, 1.01, 12.5, 0.0, -3.2, None]
 
     def _band_wide(self):
         lf = pl.LazyFrame({"b0": self.DEPTHS}, schema={"b0": pl.Float64})

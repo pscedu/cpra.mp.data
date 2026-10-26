@@ -1,5 +1,6 @@
 import tempfile
 from threading import Thread
+from typing import ClassVar
 
 import anyio
 from starlette.responses import Response
@@ -8,7 +9,6 @@ from starlette.types import Receive, Scope, Send
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.models import Compression
 from cpra.mp.data.api.sources import LazyFrameSource
-
 
 # Poll pacing for the temp-file read loop in `PolarsStreamingResponse.__call__` below, and
 # for `api.pipeline.PipelineTabularResponse`'s copy of that loop. Only `sleep_between_polls`
@@ -89,14 +89,14 @@ class StreamingThread(Thread):
     def run(self):
         try:
             super().run()
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 -- the response turns it into its status code
             self.exception = err
 
 
 class PolarsStreamingResponse(Response):
     background = None
     chunk_size = 64 * 1024
-    mime_types = {
+    mime_types: ClassVar[dict] = {
         "csv": "text/csv",
         "ndjson": "application/x-ndjson",
         "parquet": "application/vnd.apache.parquet",

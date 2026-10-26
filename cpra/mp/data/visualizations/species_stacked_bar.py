@@ -29,7 +29,7 @@ follow it rather than to be enumerated up front:
 
 import json
 from functools import cached_property
-from typing import final
+from typing import ClassVar, final
 
 import altair as alt
 import polars as pl
@@ -118,7 +118,7 @@ class SpeciesStackedBar(StackedBar):
         max_grid_cells = 1
         # `veg_species` is the only variable `veg_species_code` describes, and this chart
         # is built entirely around that dimension -- the catalog offers it for no other.
-        variables = ["veg_species"]
+        variables: ClassVar[list] = ["veg_species"]
 
     def validate(self):
         """This chart is a breakdown of ONE variable's species, so it needs that variable.
@@ -164,7 +164,7 @@ class SpeciesStackedBar(StackedBar):
         """
 
         params = {name: value for name, value in self.source_params.items() if name != SPECIES_DIMENSION}
-        params["select"] = ",".join([self.time_column, SPECIES_DIMENSION, "grid_cell", "value"])
+        params["select"] = f"{self.time_column},{SPECIES_DIMENSION},grid_cell,value"
         return self.get_data_source(self.variable.name, self.grid.name, self.time_unit, **params)
 
     @cached_property
