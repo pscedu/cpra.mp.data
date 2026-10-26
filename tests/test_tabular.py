@@ -231,17 +231,13 @@ class TestReadParquet:
 
     def test_list_filter(self, base_path):
         write_parquet(annual_frame(years=(2030, 2040, 2050)), base_path=base_path)
-        result = read_parquet(
-            base_path=base_path, calendar_year=[2030, 2050], **DATASET_KWARGS
-        ).collect()
+        result = read_parquet(base_path=base_path, calendar_year=[2030, 2050], **DATASET_KWARGS).collect()
         assert sorted(result["calendar_year"].unique().to_list()) == [2030, 2050]
         assert result.height == len(ECOREGION_IDS) * 2
 
     def test_include_file_paths(self, base_path):
         write_parquet(annual_frame(), base_path=base_path)
-        result = read_parquet(
-            base_path=base_path, include_file_paths="src", **DATASET_KWARGS
-        ).collect()
+        result = read_parquet(base_path=base_path, include_file_paths="src", **DATASET_KWARGS).collect()
         assert result["src"].str.ends_with(".parquet").all()
 
     def test_missing_dataset_raises_on_collect(self, base_path):
@@ -290,9 +286,7 @@ class TestCompactParquetGlob:
 
     def test_daily_pattern_covers_the_partition_dimensions(self):
         """calendar_day is a nonpartition dimension, so it is never a directory."""
-        assert self._glob(**DAILY_DATASET_KWARGS) == (
-            "model_group_id=*/scenario_id=*/aggregate_type=*/*.parquet"
-        )
+        assert self._glob(**DAILY_DATASET_KWARGS) == ("model_group_id=*/scenario_id=*/aggregate_type=*/*.parquet")
 
     def test_written_annual_layout_is_flat(self, base_path):
         write_parquet(annual_frame(), base_path=base_path)
@@ -469,4 +463,3 @@ class TestCompactParquetSummary:
             validate=False,
             sort=False,
         )
-

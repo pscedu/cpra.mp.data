@@ -548,9 +548,7 @@ class ExecutionPlan:
     ops: list[Op]
     frame_types: dict[str, FrameType]
     band_wide_join_scans: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
-    band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = dataclasses.field(
-        default_factory=dict
-    )
+    band_wide_join_zone_crosswalks: dict[str, tuple[ZoneCrosswalk, ...]] = dataclasses.field(default_factory=dict)
     vector_band_metadata: dict[int, pl.DataFrame] = dataclasses.field(default_factory=dict)
     tile: TileRequest | None = None
 
@@ -632,9 +630,7 @@ def _dimension_survivors(
     for origin in sorted(surviving):
         frame = metadata[origin]
         carried = [
-            name
-            for name in frame.columns
-            if name in standing[origin] and name not in PAIRING_KEY_EXCLUDED_COLUMNS
+            name for name in frame.columns if name in standing[origin] and name not in PAIRING_KEY_EXCLUDED_COLUMNS
         ]
         column = f"{_ORIGIN_POSITION_PREFIX}{len(positions)}"
         positions.append((origin, column))
@@ -826,9 +822,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     for op in ops:
         if isinstance(op, JoinOp):
             zone_crosswalks_upstream_of[op.output] = tuple(
-                dict.fromkeys(
-                    crosswalk for operand in op.inputs for crosswalk in zone_crosswalks_upstream_of[operand]
-                )
+                dict.fromkeys(crosswalk for operand in op.inputs for crosswalk in zone_crosswalks_upstream_of[operand])
             )
             continue
         if isinstance(op, ProjectOp):
@@ -907,10 +901,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         # other one -- including a `project` in any direction, which changes which grid the
         # rows address, not which observation each row is of -- passes the sets through.
         frame_origin_dimensions[op.output] = (
-            {
-                name: columns & frozenset(op.by)
-                for name, columns in frame_origin_dimensions[op.input].items()
-            }
+            {name: columns & frozenset(op.by) for name, columns in frame_origin_dimensions[op.input].items()}
             if isinstance(op, GroupOp)
             else frame_origin_dimensions[op.input]
         )
@@ -920,9 +911,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         # reader -- where `marsh` is not a source column at all, but the name `join_long`
         # gave that operand's `value`.
         kinds = (
-            classify_where_kinds(op.where, frame_types[op.input].value_columns)
-            if isinstance(op, FilterOp)
-            else None
+            classify_where_kinds(op.where, frame_types[op.input].value_columns) if isinstance(op, FilterOp) else None
         )
         if kinds is not None:
             frame_dimension_conjuncts[op.output] = tuple(kinds[PredicateKind.dimension])
@@ -951,11 +940,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             # principle carry the group forward, but a `group` or a `project` in between
             # does not, and distinguishing them is a second forward pass for a shape no
             # analysis here writes. Not narrowing is always correct, only slower.
-            if (
-                isinstance(op, FilterOp)
-                and kinds[PredicateKind.spatial]
-                and reference_count[op.input] == 1
-            ):
+            if isinstance(op, FilterOp) and kinds[PredicateKind.spatial] and reference_count[op.input] == 1:
                 group = band_wide_join_origin_groups.get(op.input, ())
                 if all(reference_count[origin] == 1 for origin in group):
                     for origin in group:
@@ -981,9 +966,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                     None if open_dimensions >= origin_dimension_columns[incoming.origin] else open_dimensions,
                     op.to,
                 )
-                states[op.output] = _Validity(
-                    origin=incoming.origin, value=incoming.value, grid_cell=False
-                )
+                states[op.output] = _Validity(origin=incoming.origin, value=incoming.value, grid_cell=False)
             else:
                 states[op.output] = None
             continue
@@ -1241,9 +1224,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
                 united.setdefault(origin, set()).update(positions)
         carried = {origin: frozenset(positions) for origin, positions in united.items()}
         for conjunct in frame_dimension_conjuncts.get(op.output, ()):
-            carried = _dimension_survivors(
-                carried, origin_band_metadata, frame_origin_dimensions[op.output], conjunct
-            )
+            carried = _dimension_survivors(carried, origin_band_metadata, frame_origin_dimensions[op.output], conjunct)
         surviving[op.output] = carried
 
     # What each origin's read must actually cover: the union over every TERMINAL frame --
@@ -1315,9 +1296,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
         # A step absent from `vector_band_metadata` contributes an unknown number of bands
         # rather than zero; nothing here can size it, which is the cost of the fan-out or
         # join that made it unenumerable, not something to pretend away with a guess.
-        steps = tuple(
-            step for step in band_wide_join_vector_steps.get(join_output, ()) if step in vector_band_metadata
-        )
+        steps = tuple(step for step in band_wide_join_vector_steps.get(join_output, ()) if step in vector_band_metadata)
         total = sum(raster_band_metadata[name].height for name in origins) + sum(
             vector_band_metadata[step].height for step in steps
         )
@@ -1476,7 +1455,5 @@ def _resolve_tile_window(
         return None, True, (1, 1)
     if not overview_permitted:
         return window, False, (1, 1)
-    factors = tile_decimation_factors(
-        window, tile.tile_size, buffer_px=resampling_buffer_px(tile.resampling)
-    )
+    factors = tile_decimation_factors(window, tile.tile_size, buffer_px=resampling_buffer_px(tile.resampling))
     return window, False, factors

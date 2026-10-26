@@ -203,7 +203,7 @@ class TestChaining:
             parse_pipeline(data)
 
     def test_group_naming_its_input_can_be_first_step(self):
-        """"Read one dataset and collapse it" is a whole pipeline, and naming the input
+        """ "Read one dataset and collapse it" is a whole pipeline, and naming the input
         on the `group` is what expresses it -- no filter in front purely to chain from.
         """
         data = simple_pipeline()
@@ -351,9 +351,7 @@ class TestCaseStep:
     @staticmethod
     def _with(**overrides):
         data = simple_pipeline()
-        data["steps"].append(
-            {"op": "case", "cases": [{"when": "value > 0", "then": "1"}], **overrides}
-        )
+        data["steps"].append({"op": "case", "cases": [{"when": "value > 0", "then": "1"}], **overrides})
         return data
 
     def test_ordinary_case_accepted(self):
@@ -723,9 +721,7 @@ class TestQueryCodec:
         # `else` defaults to null and null is what MASKS an unmatched cell, so an encoder
         # that emitted an empty string would turn "leave it nodata" into `0` on decode.
         data = simple_pipeline()
-        data["steps"] = [
-            {"op": "case", "input": "marsh", "cases": [{"when": "value > 0", "then": "1"}]}
-        ]
+        data["steps"] = [{"op": "case", "input": "marsh", "cases": [{"when": "value > 0", "then": "1"}]}]
         query = pipeline_to_query(parse_pipeline(data))
         assert "step.1.else" not in query
         assert pipeline_from_query(query).steps[0].else_ is None

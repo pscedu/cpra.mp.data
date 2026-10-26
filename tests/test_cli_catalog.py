@@ -13,7 +13,6 @@ except the tests that specifically exercise the defaults, which monkeypatch the 
 values to tmp_path instead.
 """
 
-
 import numpy as np
 import polars as pl
 from click.testing import CliRunner
@@ -153,9 +152,7 @@ class TestBuild:
 
         broken = base / "variable=broken" / "grid=ecoregion_v001"
         broken.mkdir(parents=True)
-        pl.DataFrame({"grid_cell": [1], "calendar_year": [2020], "value": [1.0]}).write_parquet(
-            broken / "x.parquet"
-        )
+        pl.DataFrame({"grid_cell": [1], "calendar_year": [2020], "value": [1.0]}).write_parquet(broken / "x.parquet")
         out = tmp_path / "catalog"
 
         result = invoke("build", "--base-path", str(base), "--out", str(out))
@@ -184,9 +181,7 @@ class TestBuild:
         base = tmp_path / "data-long"
         broken = base / "variable=broken" / "grid=ecoregion_v001"
         broken.mkdir(parents=True)
-        pl.DataFrame({"grid_cell": [1], "calendar_year": [2020], "value": [1.0]}).write_parquet(
-            broken / "x.parquet"
-        )
+        pl.DataFrame({"grid_cell": [1], "calendar_year": [2020], "value": [1.0]}).write_parquet(broken / "x.parquet")
         out = tmp_path / "catalog"
 
         result = invoke("build", "--base-path", str(base), "--out", str(out))
@@ -214,8 +209,20 @@ class TestBuild:
 
 class TestCompact:
     def test_merges_adjacent_runs_into_one_file(self, base_path, catalog_path):
-        write_parquet(_tabular_frame([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
-        write_parquet(_tabular_frame([2023, 2024]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020, 2021, 2022]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
+        write_parquet(
+            _tabular_frame([2023, 2024]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
         assert _read_catalog(catalog_path).height == 2
 
         result = invoke("compact", "--catalog", str(catalog_path))
@@ -229,8 +236,20 @@ class TestCompact:
         assert (row["calendar_year_min"], row["calendar_year_max"], row["calendar_year_count"]) == (2020, 2024, 5)
 
     def test_preserves_a_real_gap_as_two_rows(self, base_path, catalog_path):
-        write_parquet(_tabular_frame([2020, 2021]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
-        write_parquet(_tabular_frame([2025, 2026]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020, 2021]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
+        write_parquet(
+            _tabular_frame([2025, 2026]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
 
         result = invoke("compact", "--catalog", str(catalog_path))
 
@@ -244,7 +263,13 @@ class TestCompact:
         """`build` (and each write_parquet call) already emits minimal per-run files, so
         a partition with only one file needs no merge -- `compact` should report it as
         untouched (0 partitions) rather than rewriting it."""
-        write_parquet(_tabular_frame([2020, 2021]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020, 2021]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
         before = list(catalog_path.rglob("*.parquet"))
 
         result = invoke("compact", "--catalog", str(catalog_path))
@@ -253,10 +278,13 @@ class TestCompact:
         assert "DONE: 0 partitions, 0 -> 0 rows" in result.output
         assert list(catalog_path.rglob("*.parquet")) == before
 
-
     def test_defaults_to_configured_catalog_path(self, base_path, catalog_path, monkeypatch):
-        write_parquet(_tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
-        write_parquet(_tabular_frame([2021]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        )
+        write_parquet(
+            _tabular_frame([2021]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        )
         monkeypatch.setattr(cpra_config, "CATALOG_PATH", catalog_path)
 
         result = invoke("compact")
@@ -267,7 +295,13 @@ class TestCompact:
 
 class TestQuery:
     def test_reports_choices_and_results_for_a_tabular_dataset(self, base_path, catalog_path):
-        write_parquet(_tabular_frame([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020, 2021, 2022]),
+            base_path=base_path,
+            catalog_path=catalog_path,
+            validate=False,
+            **TABULAR_KWARGS,
+        )
 
         result = invoke(
             "query",
@@ -305,7 +339,9 @@ class TestQuery:
         assert isinstance(result.exception, ValueError)
 
     def test_defaults_to_configured_catalog_path(self, base_path, catalog_path, monkeypatch):
-        write_parquet(_tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS)
+        write_parquet(
+            _tabular_frame([2020]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        )
         monkeypatch.setattr(cpra_config, "CATALOG_PATH", catalog_path)
 
         result = invoke("query", "--variable", "sal", "--time-unit", "annual", "--grid", "hydro_compartment_v001")

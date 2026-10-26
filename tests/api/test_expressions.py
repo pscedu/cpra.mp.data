@@ -223,9 +223,10 @@ class TestSplitWhereHalves:
         is the value conjunct it looks like -- not a dimension one routed to an
         unrestricted SQL path for want of being spelled `value`.
         """
-        assert split_where_halves(
-            "marsh > 0.5 AND calendar_year = 2025", allowed_columns=("marsh", "sal")
-        ) == ("(calendar_year = 2025)", "(marsh > 0.5)")
+        assert split_where_halves("marsh > 0.5 AND calendar_year = 2025", allowed_columns=("marsh", "sal")) == (
+            "(calendar_year = 2025)",
+            "(marsh > 0.5)",
+        )
 
 
 class TestRewriteValueColumn:
@@ -250,8 +251,7 @@ class TestRewriteValueColumn:
 class TestRewriteValueColumns:
     def test_rewrites_every_named_column_in_one_pass(self):
         assert (
-            rewrite_value_columns("marsh > 0.5 AND sal > 5.5", {"marsh": "b0", "sal": "b2"})
-            == "b0 > 0.5 AND b2 > 5.5"
+            rewrite_value_columns("marsh > 0.5 AND sal > 5.5", {"marsh": "b0", "sal": "b2"}) == "b0 > 0.5 AND b2 > 5.5"
         )
 
     def test_one_pass_not_sequential(self):

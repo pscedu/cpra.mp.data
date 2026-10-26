@@ -127,9 +127,7 @@ class TestResolveGridCellVector:
     async def test_an_unmatched_point_does_not_suppress_a_matched_one(self, ecoregion_geometry):
         lng_in, lat_in = _lng_lat(500500, 3300500)
         lng_out, lat_out = _lng_lat(400000, 3200000)
-        where, _relabel = await resolve_grid_cell(
-            VECTOR_GRID, f"{lng_in},{lat_in},{lng_out},{lat_out}"
-        )
+        where, _relabel = await resolve_grid_cell(VECTOR_GRID, f"{lng_in},{lat_in},{lng_out},{lat_out}")
         assert where == "grid_cell = 1"
 
     async def test_whitespace_around_tokens_is_tolerated(self, ecoregion_geometry):
@@ -173,13 +171,9 @@ class TestResolveGridCellRaster:
         first = _lng_lat(x - pixel_width / 4, y)
         second = _lng_lat(x + pixel_width / 4, y)
         expected_id = 10 * grid.width + 20
-        where, relabel = await resolve_grid_cell(
-            RASTER_GRID, f"{first[0]},{first[1]},{second[0]},{second[1]}"
-        )
+        where, relabel = await resolve_grid_cell(RASTER_GRID, f"{first[0]},{first[1]},{second[0]},{second[1]}")
         assert where == f"grid_cell = {expected_id}"
-        assert relabel == {
-            expected_id: [f"{first[0]},{first[1]}", f"{second[0]},{second[1]}"]
-        }
+        assert relabel == {expected_id: [f"{first[0]},{first[1]}", f"{second[0]},{second[1]}"]}
 
     async def test_two_points_on_different_pixels_resolve_to_an_in_list(self):
         grid = GRIDS[RASTER_GRID]

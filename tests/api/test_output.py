@@ -208,4 +208,3 @@ class TestResolveLegend:
     def test_no_color_map_and_no_variable_legend_falls_back_to_default(self):
         assert resolve_legend(None, None) is LEGENDS["default"]
         assert resolve_legend("not-a-real-legend-name", None) is LEGENDS["default"]
-

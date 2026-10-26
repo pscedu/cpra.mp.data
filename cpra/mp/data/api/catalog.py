@@ -73,19 +73,13 @@ def output_body(descriptor: OutputDescriptor, analysis: ResolvedAnalysis | None)
         value_columns=list(descriptor.value_columns),
         variables=[None if var is None else var.name for var in descriptor.variables],
         folded_into=descriptor.folded_into,
-        label=(
-            analysis.meta.label
-            if analysis is not None
-            else (variable.label if variable is not None else None)
-        ),
+        label=(analysis.meta.label if analysis is not None else (variable.label if variable is not None else None)),
         legend=(
             (analysis.legend if analysis is not None else None)
             or (variable.legend.name if variable is not None and variable.legend else None)
         ),
         result_kind=analysis.result_kind if analysis is not None else "value",
-        collapsed_dimensions=sorted(
-            analysis.collapsed_dimensions if analysis is not None else ()
-        ),
+        collapsed_dimensions=sorted(analysis.collapsed_dimensions if analysis is not None else ()),
     )
 
 

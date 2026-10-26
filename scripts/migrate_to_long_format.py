@@ -105,9 +105,20 @@ def _dimension_cols_from_hive(path: Path) -> dict:
 
 
 def _convert_batched(
-    parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-    progress_cb=None, temp_path=None, catalog_path=None, unique_parquet_rows=False,
-    group_filter=None, existing_keys=None,
+    parquet_paths,
+    output_path,
+    schema,
+    geo_cols,
+    hive_dims,
+    time_unit,
+    est,
+    memory_limit,
+    progress_cb=None,
+    temp_path=None,
+    catalog_path=None,
+    unique_parquet_rows=False,
+    group_filter=None,
+    existing_keys=None,
 ) -> list[str]:
     """Batched conversion via temp files, bounded to roughly one batch in memory.
 
@@ -156,9 +167,7 @@ def _convert_batched(
     """
     messages: list[str] = []
     alpha_cols = [col for col in schema if not col[:1].isdigit()]
-    other_dim_cols = [
-        col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
-    ]
+    other_dim_cols = [col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")]
     wide_lf = pl.scan_parquet(parquet_paths)
     if group_filter is not None and other_dim_cols:
         wide_lf = wide_lf.join(group_filter.lazy(), on=other_dim_cols, how="semi")
@@ -247,9 +256,22 @@ def _convert_batched(
 
 
 def _append_missing(
-    parquet_paths, output_path, existing_files, schema, geo_cols, hive_dims, time_unit,
-    rel_dir, wide_rows, n_files, dry_run=False, memory_limit=None, progress_cb=None,
-    temp_path=None, catalog_path=None, unique_parquet_rows=False,
+    parquet_paths,
+    output_path,
+    existing_files,
+    schema,
+    geo_cols,
+    hive_dims,
+    time_unit,
+    rel_dir,
+    wide_rows,
+    n_files,
+    dry_run=False,
+    memory_limit=None,
+    progress_cb=None,
+    temp_path=None,
+    catalog_path=None,
+    unique_parquet_rows=False,
 ) -> tuple[dict, list[str]]:
     """Append the long rows a partition's existing output is missing, as one extra file.
 
@@ -290,9 +312,7 @@ def _append_missing(
     """
     messages: list[str] = []
     alpha_cols = [col for col in schema if not col[:1].isdigit()]
-    other_dim_cols = [
-        col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")
-    ]
+    other_dim_cols = [col for col in DIMENSIONS if col in set(alpha_cols) and not col.startswith("calendar_")]
     cal_col = cal_for(time_unit)
     n_geo = len(geo_cols)
     group_dtypes = {col: DIMENSIONS[col].dtype for col in other_dim_cols}
@@ -388,8 +408,18 @@ def _append_missing(
     # cost a little time, too-large ones cost the worker.
     est = _peak_estimates(schema, wide_rows)
     messages += _convert_batched(
-        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-        progress_cb, temp_path, catalog_path, unique_parquet_rows,
+        parquet_paths,
+        output_path,
+        schema,
+        geo_cols,
+        hive_dims,
+        time_unit,
+        est,
+        memory_limit,
+        progress_cb,
+        temp_path,
+        catalog_path,
+        unique_parquet_rows,
         group_filter=short.select(other_dim_cols) if other_dim_cols else None,
         existing_keys=existing_keys,
     )
@@ -400,8 +430,12 @@ def _append_missing(
     messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
     return (
         {
-            "appended": True, "files": n_files, "geo_cols": n_geo, "long_rows": missing_rows,
-            "elapsed_s": elapsed, "peak_bytes": peak_bytes,
+            "appended": True,
+            "files": n_files,
+            "geo_cols": n_geo,
+            "long_rows": missing_rows,
+            "elapsed_s": elapsed,
+            "peak_bytes": peak_bytes,
         },
         messages,
     )
@@ -481,9 +515,21 @@ def migrate_partition(
 
     if existing_files and append_missing:
         return _append_missing(
-            parquet_paths, output_path, existing_files, schema, geo_cols, hive_dims, time_unit,
-            rel_dir, wide_rows, n, dry_run=dry_run, memory_limit=memory_limit,
-            progress_cb=progress_cb, temp_path=temp_path, catalog_path=catalog_path,
+            parquet_paths,
+            output_path,
+            existing_files,
+            schema,
+            geo_cols,
+            hive_dims,
+            time_unit,
+            rel_dir,
+            wide_rows,
+            n,
+            dry_run=dry_run,
+            memory_limit=memory_limit,
+            progress_cb=progress_cb,
+            temp_path=temp_path,
+            catalog_path=catalog_path,
             unique_parquet_rows=unique_parquet_rows,
         )
 
@@ -514,8 +560,18 @@ def migrate_partition(
     # less memory on large partitions, with byte-identical output.  memory_limit
     # tunes the per-batch budget.
     messages += _convert_batched(
-        parquet_paths, output_path, schema, geo_cols, hive_dims, time_unit, est, memory_limit,
-        progress_cb, temp_path, catalog_path, unique_parquet_rows,
+        parquet_paths,
+        output_path,
+        schema,
+        geo_cols,
+        hive_dims,
+        time_unit,
+        est,
+        memory_limit,
+        progress_cb,
+        temp_path,
+        catalog_path,
+        unique_parquet_rows,
     )
 
     elapsed = time.perf_counter() - t0
@@ -523,7 +579,13 @@ def migrate_partition(
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
     messages.append(f"    done in {elapsed:.1f}s, peak RSS {_fmt_bytes(peak_bytes)}")
-    return {"files": n, "geo_cols": len(geo_cols), "long_rows": row_count, "elapsed_s": elapsed, "peak_bytes": peak_bytes}, messages
+    return {
+        "files": n,
+        "geo_cols": len(geo_cols),
+        "long_rows": row_count,
+        "elapsed_s": elapsed,
+        "peak_bytes": peak_bytes,
+    }, messages
 
 
 # --- elev: Float32 meters -> Int32 millimeters -------------------------------------------
@@ -711,7 +773,10 @@ def migrate_raster_dataset(
 
     if dry_run:
         return {
-            "data_type": "raster", "files": n_src, "geo_cols": 0, "long_rows": 0,
+            "data_type": "raster",
+            "files": n_src,
+            "geo_cols": 0,
+            "long_rows": 0,
             **({"appended": True} if append_missing else {}),
         }, messages
 
@@ -729,9 +794,7 @@ def migrate_raster_dataset(
     n_out = len(result["outputs"])
     peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     peak_bytes = peak_rss * (1 if sys.platform == "darwin" else 1024)
-    messages.append(
-        f"    done in {elapsed:.1f}s, {n_src} -> {n_out} COG(s), peak RSS {_fmt_bytes(peak_bytes)}"
-    )
+    messages.append(f"    done in {elapsed:.1f}s, {n_src} -> {n_out} COG(s), peak RSS {_fmt_bytes(peak_bytes)}")
     return {
         "data_type": "raster",
         "files": n_src,
@@ -955,8 +1018,16 @@ def _run_partition(args, result_queue):
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     (
-        task, base_path, output_path, catalog_path, dry_run, memory_limit, progress, temp_path,
-        unique_parquet_rows, append_missing,
+        task,
+        base_path,
+        output_path,
+        catalog_path,
+        dry_run,
+        memory_limit,
+        progress,
+        temp_path,
+        unique_parquet_rows,
+        append_missing,
     ) = args
     kind, rel, payload = task
     pid = os.getpid()
@@ -971,7 +1042,11 @@ def _run_partition(args, result_queue):
             )
         else:
             result, messages = migrate_partition(
-                payload, base_path, output_path, catalog_path, dry_run,
+                payload,
+                base_path,
+                output_path,
+                catalog_path,
+                dry_run,
                 memory_limit=memory_limit,
                 progress_cb=progress_cb if progress else None,
                 temp_path=temp_path,
@@ -984,8 +1059,18 @@ def _run_partition(args, result_queue):
 
 
 LOG_FIELDS = [
-    "partition", "data_type", "status", "files", "geo_cols", "long_rows",
-    "elapsed_s", "peak_bytes", "source_bytes", "memory_limit", "error", "completed_at",
+    "partition",
+    "data_type",
+    "status",
+    "files",
+    "geo_cols",
+    "long_rows",
+    "elapsed_s",
+    "peak_bytes",
+    "source_bytes",
+    "memory_limit",
+    "error",
+    "completed_at",
 ]
 
 # Log statuses that mean the output was left matching its source: found to match, or
@@ -1206,10 +1291,7 @@ def _print_progress(
     grid_w = max([len(k[2]) for k in summary] + [len("Grid")])
 
     def _row(variable_, time_unit_, grid_, converted, total, pct):
-        return (
-            f"{variable_:<{var_w}}  {time_unit_:<{tu_w}}  {grid_:<{grid_w}}  "
-            f"{converted:>10}  {total:>10}  {pct:>5}"
-        )
+        return f"{variable_:<{var_w}}  {time_unit_:<{tu_w}}  {grid_:<{grid_w}}  {converted:>10}  {total:>10}  {pct:>5}"
 
     header = _row("Variable", "Time unit", "Grid", "Converted", "Total", "Pct")
     sep = "-" * len(header)
@@ -1251,9 +1333,7 @@ def _print_progress(
 @click.option("--grid", help="Migrate only this grid.")
 @click.option("--time-unit", help="Migrate only this time unit.")
 @click.option("--dry-run", is_flag=True, help="Show what would be migrated without writing.")
-@click.option(
-    "--progress/--no-progress", default=True, help="Show progress bar (use --no-progress for batch jobs)."
-)
+@click.option("--progress/--no-progress", default=True, help="Show progress bar (use --no-progress for batch jobs).")
 @click.option("--data-path", default=str(BASE_PATH), show_default=True, help="Base data path.")
 @click.option(
     "--workers",
@@ -1329,9 +1409,24 @@ def _print_progress(
     "Tabular data only; no equivalent is applied to raster (COG) output.",
 )
 def main(
-    output_path, catalog_path, estimate, unconverted_only, variable, grid, time_unit, dry_run, progress,
-    data_path, workers, show_progress, log_path, memory_limit, temp_path,
-    unique_parquet_rows, append_missing, skip_unchanged,
+    output_path,
+    catalog_path,
+    estimate,
+    unconverted_only,
+    variable,
+    grid,
+    time_unit,
+    dry_run,
+    progress,
+    data_path,
+    workers,
+    show_progress,
+    log_path,
+    memory_limit,
+    temp_path,
+    unique_parquet_rows,
+    append_missing,
+    skip_unchanged,
 ):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: sys.exit(1))
 
@@ -1371,9 +1466,7 @@ def main(
         tasks = [("tabular", str(paths[0].parent.relative_to(base_path)), paths) for paths in partitions.values()]
         tasks += [("raster", _raster_rel(d), d) for d in raster_datasets]
         completed = _catalog_completed(catalog_path, tasks)
-        partitions = {
-            p: paths for p, paths in partitions.items() if str(p.relative_to(base_path)) not in completed
-        }
+        partitions = {p: paths for p, paths in partitions.items() if str(p.relative_to(base_path)) not in completed}
         raster_datasets = [d for d in raster_datasets if _raster_rel(d) not in completed]
 
     if not partitions and not raster_datasets:
@@ -1434,11 +1527,16 @@ def main(
                 kept.append(t)
             elif _vouches_for(prior, source_bytes[t[1]]):
                 unchanged_skipped += 1
-                carried.append({
-                    **{field: prior.get(field, "") for field in LOG_FIELDS},
-                    "status": "unchanged", "elapsed_s": 0.0, "peak_bytes": 0, "error": "",
-                    "completed_at": datetime.now().isoformat(timespec="seconds"),
-                })
+                carried.append(
+                    {
+                        **{field: prior.get(field, "") for field in LOG_FIELDS},
+                        "status": "unchanged",
+                        "elapsed_s": 0.0,
+                        "peak_bytes": 0,
+                        "error": "",
+                        "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                )
             elif _oom_again(prior, memory_limit):
                 # Carried as-is (memory_limit included), so later runs keep skipping it
                 # until one is given a larger limit.
@@ -1482,8 +1580,7 @@ def main(
         summary += f" ({unchanged_skipped} unchanged since {skip_unchanged.name}, skipped.)"
     if oom_skipped:
         summary += (
-            f" ({oom_skipped} OOM-killed in an earlier run at a --memory-limit no smaller than "
-            "this one, skipped.)"
+            f" ({oom_skipped} OOM-killed in an earlier run at a --memory-limit no smaller than this one, skipped.)"
         )
     if over_limit_skipped:
         summary += f" ({over_limit_skipped} skipped: estimated peak exceeds --memory-limit.)"
@@ -1493,9 +1590,7 @@ def main(
     errors: list[str] = []
     touched_datasets: set[tuple] = set()  # (variable, time_unit, grid) to compact in the catalog
 
-    log = _ResultLog(
-        log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv", memory_limit
-    )
+    log = _ResultLog(log_path or Path.cwd() / f"migration_{datetime.now():%Y%m%d_%H%M%S}.csv", memory_limit)
     print(f"Writing per-partition results to {log.path}")
     for row in carried:
         log.write(row)
@@ -1511,8 +1606,16 @@ def main(
     desc = "[DRY RUN]" if dry_run else ("Appending" if append_missing else "Migrating")
     packed = [
         (
-            task, base_path, output_path, write_catalog_path, dry_run, memory_limit, progress, temp_path,
-            unique_parquet_rows, append_missing,
+            task,
+            base_path,
+            output_path,
+            write_catalog_path,
+            dry_run,
+            memory_limit,
+            progress,
+            temp_path,
+            unique_parquet_rows,
+            append_missing,
         )
         for task in tasks
     ]
@@ -1543,7 +1646,7 @@ def main(
     used_positions: set[int] = set()
 
     def _short(rel: str, width: int = 48) -> str:
-        return rel if len(rel) <= width else "…" + rel[-(width - 1):]
+        return rel if len(rel) <= width else "…" + rel[-(width - 1) :]
 
     def _update_inner(pid: int, rel: str, done: int, total: int) -> None:
         if not progress or total <= 1:
@@ -1592,15 +1695,20 @@ def main(
                                 tqdm.write(f"  ERROR: {msg}", file=sys.stderr)
                                 # SIGKILL is what the OOM killer (kernel or cgroup) sends.
                                 oom = p.exitcode == -signal.SIGKILL
-                                log.write({
-                                    "partition": rel,
-                                    "data_type": "raster" if kind == "raster" else "tabular",
-                                    "status": "oom" if oom else "failed",
-                                    "files": "", "geo_cols": "", "long_rows": "",
-                                    "elapsed_s": "", "peak_bytes": "",
-                                    "error": f"exit code {p.exitcode}",
-                                    "completed_at": datetime.now().isoformat(timespec="seconds"),
-                                })
+                                log.write(
+                                    {
+                                        "partition": rel,
+                                        "data_type": "raster" if kind == "raster" else "tabular",
+                                        "status": "oom" if oom else "failed",
+                                        "files": "",
+                                        "geo_cols": "",
+                                        "long_rows": "",
+                                        "elapsed_s": "",
+                                        "peak_bytes": "",
+                                        "error": f"exit code {p.exitcode}",
+                                        "completed_at": datetime.now().isoformat(timespec="seconds"),
+                                    }
+                                )
                                 _spawn_next()
                                 bar.update(1)
                                 bar.set_postfix(migrated=migrated, skipped=skipped)
@@ -1630,11 +1738,20 @@ def main(
                 if error:
                     errors.append(f"{rel}: {error}")
                     tqdm.write(f"  ERROR migrating {rel}: {error}", file=sys.stderr)
-                    log.write({
-                        "partition": rel, "data_type": "", "status": "failed",
-                        "files": "", "geo_cols": "", "long_rows": "", "elapsed_s": "", "peak_bytes": "",
-                        "error": error, "completed_at": completed_at,
-                    })
+                    log.write(
+                        {
+                            "partition": rel,
+                            "data_type": "",
+                            "status": "failed",
+                            "files": "",
+                            "geo_cols": "",
+                            "long_rows": "",
+                            "elapsed_s": "",
+                            "peak_bytes": "",
+                            "error": error,
+                            "completed_at": completed_at,
+                        }
+                    )
                 elif result is None:
                     skipped += 1  # not wide format
                 else:
@@ -1644,31 +1761,54 @@ def main(
                         touched_datasets.add((dims["variable"], dims["time_unit"], dims["grid"]))
                     if result.get("skipped"):
                         skipped += 1  # already in long format on disk
-                        log.write({
-                            "partition": rel, "data_type": data_type, "status": "skipped",
-                            "files": result["files"], "geo_cols": result["geo_cols"],
-                            "long_rows": result["long_rows"], "elapsed_s": 0.0, "peak_bytes": 0,
-                            "source_bytes": source_bytes[rel], "error": "", "completed_at": completed_at,
-                        })
+                        log.write(
+                            {
+                                "partition": rel,
+                                "data_type": data_type,
+                                "status": "skipped",
+                                "files": result["files"],
+                                "geo_cols": result["geo_cols"],
+                                "long_rows": result["long_rows"],
+                                "elapsed_s": 0.0,
+                                "peak_bytes": 0,
+                                "source_bytes": source_bytes[rel],
+                                "error": "",
+                                "completed_at": completed_at,
+                            }
+                        )
                     elif "elapsed_s" in result:
                         migrated += 1
-                        log.write({
-                            "partition": rel, "data_type": data_type,
-                            "status": "appended" if result.get("appended") else "migrated",
-                            "files": result["files"], "geo_cols": result["geo_cols"],
-                            "long_rows": result["long_rows"], "elapsed_s": result["elapsed_s"],
-                            "peak_bytes": result["peak_bytes"], "source_bytes": source_bytes[rel],
-                            "error": "", "completed_at": completed_at,
-                        })
+                        log.write(
+                            {
+                                "partition": rel,
+                                "data_type": data_type,
+                                "status": "appended" if result.get("appended") else "migrated",
+                                "files": result["files"],
+                                "geo_cols": result["geo_cols"],
+                                "long_rows": result["long_rows"],
+                                "elapsed_s": result["elapsed_s"],
+                                "peak_bytes": result["peak_bytes"],
+                                "source_bytes": source_bytes[rel],
+                                "error": "",
+                                "completed_at": completed_at,
+                            }
+                        )
                     else:
                         migrated += 1  # dry run
-                        log.write({
-                            "partition": rel, "data_type": data_type,
-                            "status": "would_append" if result.get("appended") else "would_migrate",
-                            "files": result["files"], "geo_cols": result["geo_cols"],
-                            "long_rows": result["long_rows"], "elapsed_s": "", "peak_bytes": "",
-                            "error": "", "completed_at": completed_at,
-                        })
+                        log.write(
+                            {
+                                "partition": rel,
+                                "data_type": data_type,
+                                "status": "would_append" if result.get("appended") else "would_migrate",
+                                "files": result["files"],
+                                "geo_cols": result["geo_cols"],
+                                "long_rows": result["long_rows"],
+                                "elapsed_s": "",
+                                "peak_bytes": "",
+                                "error": "",
+                                "completed_at": completed_at,
+                            }
+                        )
                 bar.update(1)
                 bar.set_postfix(migrated=migrated, skipped=skipped)
     except KeyboardInterrupt:

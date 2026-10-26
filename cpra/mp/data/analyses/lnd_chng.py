@@ -228,18 +228,14 @@ class LandChange(Analysis):
             {
                 "op": "filter",
                 "input": "base",
-                "where": selection_filter_where(
-                    baseline_filters, grid_cell_where=self.grid_cell_where
-                ),
+                "where": selection_filter_where(baseline_filters, grid_cell_where=self.grid_cell_where),
                 "as": "baseline_year",
             },
             {"op": "group", "by": baseline_by, "aggregate": "sum", "as": "baseline"},
             {
                 "op": "filter",
                 "input": "years",
-                "where": selection_filter_where(
-                    comparison_filters, grid_cell_where=self.grid_cell_where
-                ),
+                "where": selection_filter_where(comparison_filters, grid_cell_where=self.grid_cell_where),
                 # A join operand's name IS the value column name the `calculate` below
                 # reads, so in two-image mode this filter's output is the operand itself.
                 "as": "comparison_years" if three_image else "comparison",
@@ -264,19 +260,13 @@ class LandChange(Analysis):
                     "as": "scaled",
                 }
             )
-            steps.append(
-                {"op": "group", "by": comparison_by, "aggregate": "sum", "as": "comparison"}
-            )
-        steps.append(
-            {"op": "join", "type": "spatial", "inputs": ["baseline", "comparison"], "as": "paired"}
-        )
+            steps.append({"op": "group", "by": comparison_by, "aggregate": "sum", "as": "comparison"})
+        steps.append({"op": "join", "type": "spatial", "inputs": ["baseline", "comparison"], "as": "paired"})
         # The hundreds digit (three-image) or the tens digit (two-image), and the single
         # value column the sink rule requires: a `calculate` always produces exactly one,
         # whatever the join handed it. A null on either operand carries through as a null,
         # which is the right answer -- a grid cell with no baseline has no change to report.
-        steps.append(
-            {"op": "calculate", "expression": f"baseline * {100 if three_image else 10} + comparison"}
-        )
+        steps.append({"op": "calculate", "expression": f"baseline * {100 if three_image else 10} + comparison"})
 
         data = {
             # The same dataset twice, once per branch. `execution.plan` narrows each origin

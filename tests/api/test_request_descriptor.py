@@ -67,9 +67,7 @@ class TestTimeUnit:
         [("annual", "calendar_year"), ("decadal", "calendar_year"), ("daily", "calendar_day")],
     )
     def test_time_column_follows_the_unit(self, time_unit, expected_column):
-        pipeline = parse_pipeline(
-            {"inputs": {"data": vector_input(time_unit=time_unit)}, "output": {"format": "csv"}}
-        )
+        pipeline = parse_pipeline({"inputs": {"data": vector_input(time_unit=time_unit)}, "output": {"format": "csv"}})
         descriptor = output_descriptor(pipeline)
         assert descriptor.time_unit == time_unit
         assert descriptor.time_column == expected_column

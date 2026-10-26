@@ -273,8 +273,7 @@ def partition_query(
         elif key in COMPRESSION_OPTIONS:
             if not allow_compression:
                 raise RequestError(
-                    f"{key!r} is not accepted on a tile route -- a tile response carries "
-                    "no compression of its own"
+                    f"{key!r} is not accepted on a tile route -- a tile response carries no compression of its own"
                 )
             partition["compression"][key] = value
         elif key in OUTPUT_OPTIONS:
@@ -349,8 +348,7 @@ def _renumber_steps(dotted: Mapping[str, str], offset: int) -> dict[str, str]:
         index, _, tail = rest.partition(".")
         if not index.isdigit() or not tail:
             raise RequestError(
-                f"{key!r} is not a step parameter -- steps are 1-based indices with a "
-                "field, e.g. step.1.op=filter"
+                f"{key!r} is not a step parameter -- steps are 1-based indices with a field, e.g. step.1.op=filter"
             )
         shifted[f"step.{int(index) + offset}.{tail}"] = value
     return shifted

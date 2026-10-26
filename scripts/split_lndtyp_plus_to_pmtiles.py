@@ -88,8 +88,7 @@ def run_lnd_type_plus(model_group_id: int, scenario_id: int, year: int, path: Pa
     )
     if not run_to_path(resolved.pipeline, path):
         raise click.ClickException(
-            f"lnd_type_plus returned no data for model_group_id={model_group_id}, "
-            f"scenario_id={scenario_id}, {year}"
+            f"lnd_type_plus returned no data for model_group_id={model_group_id}, scenario_id={scenario_id}, {year}"
         )
 
 

@@ -73,7 +73,9 @@ def _check_alignment(multiband_profile, source_profile, source_path):
 @click.command()
 @click.argument("multiband_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.argument("source_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--scale-factor", default=1000, show_default=True, help="Storage units per source unit (meters to millimeters).")
+@click.option(
+    "--scale-factor", default=1000, show_default=True, help="Storage units per source unit (meters to millimeters)."
+)
 @click.option("--max-examples", default=5, show_default=True, help="Mismatching pixels to print per band.")
 def compare(multiband_path, source_dir, scale_factor, max_examples):
     """Compare every band of MULTIBAND_PATH to its single-band source file in SOURCE_DIR."""
@@ -102,10 +104,7 @@ def compare(multiband_path, source_dir, scale_factor, max_examples):
             if count:
                 rows, cols = np.nonzero(mismatch)
                 max_abs_diff = float(np.max(np.abs(expected[mismatch] - multiband[mismatch])))
-                click.echo(
-                    f"MISMATCH {description}: {count} pixel(s) differ "
-                    f"(max abs diff {max_abs_diff:.0f})"
-                )
+                click.echo(f"MISMATCH {description}: {count} pixel(s) differ (max abs diff {max_abs_diff:.0f})")
                 for row, col in zip(rows[:max_examples], cols[:max_examples]):
                     click.echo(
                         f"    ({row}, {col}): source={source[row, col]!r} "

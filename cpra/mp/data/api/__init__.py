@@ -407,9 +407,7 @@ async def get_data_tile(format: TileFormat, z: int, x: int, y: int, request: Req
     rejects that request against a raster tile format before a renderer is reached, so
     there is no tile response with a `grid_cell` column left to relabel.
     """
-    decoded = await decode_request(
-        request.query_params.multi_items(), format=format.value, allow_compression=False
-    )
+    decoded = await decode_request(request.query_params.multi_items(), format=format.value, allow_compression=False)
     if format is TileFormat.pbf:
         return await respond_to_analysis_pipeline_vector_tile(decoded.pipeline, x, y, z)
     return await respond_to_analysis_pipeline_tile(decoded.pipeline, x, y, z, format.value)
@@ -509,15 +507,16 @@ def analyses_catalog() -> list[Analysis]:
     # own `pipeline()` rather than declared beside it, which is the whole point (see
     # `unrequested_output`).
     return [
-        Analysis(**analysis.Meta.model_dump(), output=unrequested_output(name))
-        for name, analysis in ANALYSES.items()
+        Analysis(**analysis.Meta.model_dump(), output=unrequested_output(name)) for name, analysis in ANALYSES.items()
     ]
 
 
 # A single registered name, or a comma-separated chain (e.g. `lnd_conf,diff`) -- see
 # `analyses.resolve_analysis_chain`. The path segment accepts either form unchanged, since
 # a comma is not `/` and needs no extra URL-encoding, and the decoder splits it.
-AnalysisName = Annotated[str, Path(description="A registered analysis name, or a comma-separated chain of them (e.g. `lnd_conf,diff`).")]
+AnalysisName = Annotated[
+    str, Path(description="A registered analysis name, or a comma-separated chain of them (e.g. `lnd_conf,diff`).")
+]
 
 
 @app.get("/v1/analyses/{analysis}.json", tags=["Analyses"])

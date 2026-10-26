@@ -161,12 +161,8 @@ class TestGridCellLabels:
     def test_labels_stay_aligned_with_grid_cells(self, ecoregion_geometry):
         """The chart zips them together by position, so dropping and collapsing have to
         happen to all three lists at once."""
-        viz = DatasetVisualization(
-            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
-        )
-        assert (
-            len(viz.grid_cell_labels) == len(viz.grid_cell_short_labels) == len(viz.grid_cells) == 2
-        )
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8))
+        assert len(viz.grid_cell_labels) == len(viz.grid_cell_short_labels) == len(viz.grid_cells) == 2
 
 
 class TestGridCellShortLabels:
@@ -218,9 +214,7 @@ class TestGridCellColors:
     def test_a_pin_sharing_a_cell_does_not_shift_the_next_cell(self, ecoregion_geometry):
         """The bug this guards: cell 8 is the third pin, so it's the third color, even though
         it's the second series. Pairing the palette with the series would make it cyan."""
-        viz = DatasetVisualization(
-            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE, IN_CELL_8)
-        )
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, ALSO_INSIDE, IN_CELL_8))
         assert viz.grid_cells == [7, 8]
         assert viz.grid_cell_colors == [MAP_SELECTION[0], MAP_SELECTION[2]]
 
@@ -231,9 +225,7 @@ class TestGridCellColors:
         assert viz.grid_cell_colors == [MAP_SELECTION[1]]
 
     def test_colors_stay_aligned_with_grid_cells(self, ecoregion_geometry):
-        viz = DatasetVisualization(
-            **ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8)
-        )
+        viz = DatasetVisualization(**ANNUAL_VECTOR, grid_cell=_grid_cell(INSIDE, OUTSIDE, ALSO_INSIDE, IN_CELL_8))
         assert len(viz.grid_cell_colors) == len(viz.grid_cells) == 2
 
     def test_a_selection_past_the_palette_is_drawn_black(self):
@@ -315,9 +307,7 @@ class TestAnalysisChain:
         """A caller who names it explicitly -- an old permalink, a notebook copying a URL
         out of a spec -- gets one of it, not two. Chaining an analysis onto itself is a
         different request, and not the one they asked for."""
-        assert analysis_chain("sediment_dynamics", "sediment_dynamics,diff") == (
-            "sediment_dynamics,diff"
-        )
+        assert analysis_chain("sediment_dynamics", "sediment_dynamics,diff") == ("sediment_dynamics,diff")
 
 
 class TestRequestItems:
@@ -339,17 +329,15 @@ class TestRequestItems:
         ]
 
     def test_a_callers_analysis_is_chained_onto_it(self):
-        assert SedimentDynamics.request_items([("analysis", "diff")]) == [
-            ("analysis", "sediment_dynamics,diff")
-        ]
+        assert SedimentDynamics.request_items([("analysis", "diff")]) == [("analysis", "sediment_dynamics,diff")]
 
     def test_repeated_analysis_parameters_are_one_chain(self):
         """`analysis=a&analysis=b` and `analysis=a,b` are the same request -- the decoder
         joins repeats the same way (`request.unified.partition_query`), and this runs before
         it."""
-        assert SedimentDynamics.request_items(
-            [("analysis", "diff"), ("analysis", "lnd_chng")]
-        ) == [("analysis", "sediment_dynamics,diff,lnd_chng")]
+        assert SedimentDynamics.request_items([("analysis", "diff"), ("analysis", "lnd_chng")]) == [
+            ("analysis", "sediment_dynamics,diff,lnd_chng")
+        ]
 
 
 class TestTimeAxisGate:
@@ -364,8 +352,18 @@ class TestTimeAxisGate:
     reading a field the response did not carry.
     """
 
-    COLLAPSES_TIME: ClassVar[dict] = {"analysis": "diff", "dimension": "calendar_year", "order": "asc", "calendar_year": [2050, 2060]}
-    KEEPS_TIME: ClassVar[dict] = {"analysis": "diff", "dimension": "model_group_id", "order": "asc", "model_group_id": [705, 706]}
+    COLLAPSES_TIME: ClassVar[dict] = {
+        "analysis": "diff",
+        "dimension": "calendar_year",
+        "order": "asc",
+        "calendar_year": [2050, 2060],
+    }
+    KEEPS_TIME: ClassVar[dict] = {
+        "analysis": "diff",
+        "dimension": "model_group_id",
+        "order": "asc",
+        "model_group_id": [705, 706],
+    }
 
     def test_a_time_series_line_rejects_a_collapsed_time_column(self):
         viz = TimeSeriesLine(**ANNUAL_VECTOR, **self.COLLAPSES_TIME)
@@ -440,9 +438,7 @@ class TestSpeciesStackedBarNeedsItsVariable:
             viz.validate()
 
     def test_its_own_variable_is_accepted(self):
-        SpeciesStackedBar(
-            variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual"
-        ).validate()
+        SpeciesStackedBar(variable="veg_species", grid="veg_grid_cell_v001", time_unit="annual").validate()
 
 
 class TestMapBaseStyle:

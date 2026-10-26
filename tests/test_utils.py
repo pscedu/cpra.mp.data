@@ -156,9 +156,7 @@ class TestValidateDataFrame:
             validate_data_frame(df)
 
     def test_error_reports_failed_row_count(self):
-        df = annual_frame(years=(2030, 2040)).with_columns(
-            calendar_year=pl.Series([1800, 1801], dtype=pl.Int32)
-        )
+        df = annual_frame(years=(2030, 2040)).with_columns(calendar_year=pl.Series([1800, 1801], dtype=pl.Int32))
         with pytest.raises(ValidationError, match="^2 rows failed validation"):
             validate_data_frame(df)
 
@@ -198,9 +196,7 @@ class TestDatasetPath:
         assert path == tmp_path / "variable=ssf" / "time_unit=annual" / "grid=ecoregion_v001"
 
     def test_ignores_extra_kwargs(self, tmp_path):
-        path = dataset_path(
-            tmp_path, variable="ssf", grid="ecoregion_v001", time_unit="annual", scenario_id=7
-        )
+        path = dataset_path(tmp_path, variable="ssf", grid="ecoregion_v001", time_unit="annual", scenario_id=7)
         assert "scenario_id" not in str(path)
 
     def test_missing_dataset_dimension_raises(self, tmp_path):
@@ -298,15 +294,11 @@ class TestGlobLazyFrame:
         assert "path" in df.columns
 
     def test_path_column_can_be_suppressed(self, tree):
-        df = glob_lazy_frame(
-            ["variable"], base_path=tree, extension="tif", include_file_paths=None
-        ).collect()
+        df = glob_lazy_frame(["variable"], base_path=tree, extension="tif", include_file_paths=None).collect()
         assert "path" not in df.columns
 
     def test_path_column_can_be_renamed(self, tree):
-        df = glob_lazy_frame(
-            ["variable"], base_path=tree, extension="tif", include_file_paths="src"
-        ).collect()
+        df = glob_lazy_frame(["variable"], base_path=tree, extension="tif", include_file_paths="src").collect()
         assert "src" in df.columns
 
     def test_filters_narrow_the_glob(self, tree):

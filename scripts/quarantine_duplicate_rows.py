@@ -97,9 +97,7 @@ def read_keys(paths: list[Path], key_cols: list[str]) -> pl.DataFrame:
     """
     return pl.concat(
         [
-            pl.read_parquet(path, columns=key_cols, hive_partitioning=False).with_columns(
-                pl.lit(str(path)).alias(FILE)
-            )
+            pl.read_parquet(path, columns=key_cols, hive_partitioning=False).with_columns(pl.lit(str(path)).alias(FILE))
             for path in paths
         ],
         how="vertical_relaxed",
@@ -120,17 +118,13 @@ def row_hashes(dups: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
             .collect(engine="streaming")
         )
         frames.append(
-            rows.select(key_cols).with_columns(
-                rows.drop(key_cols).hash_rows().alias("hash"), pl.lit(file).alias(FILE)
-            )
+            rows.select(key_cols).with_columns(rows.drop(key_cols).hash_rows().alias("hash"), pl.lit(file).alias(FILE))
         )
         del rows
     return pl.concat(frames, how="vertical_relaxed")
 
 
-def excess_rows(
-    schema: dict, key_cols: list[str], dups: pl.DataFrame, moved: set[str]
-) -> tuple[int, int]:
+def excess_rows(schema: dict, key_cols: list[str], dups: pl.DataFrame, moved: set[str]) -> tuple[int, int]:
     """Long rows the conversion (with ``--unique-parquet-rows``) writes beyond one per key and grid cell.
 
     Returned for the partition as it is and as it would be without the ``moved`` files.
@@ -142,6 +136,7 @@ def excess_rows(
     keys = dups.select(key_cols).unique(maintain_order=True)
     copies = dups.group_by(key_cols).len()["len"].max()
     step = max(1, CHUNK_LONG_ROWS // (n_geo * copies))
+
     def excess(long: pl.DataFrame) -> int:
         return long.drop(FILE).unique().height - long.select(*key_cols, "grid_cell").unique().height
 
@@ -175,7 +170,10 @@ def plan_partition(paths: list[Path]) -> dict | None:
     hashes = row_hashes(dups, key_cols)
     differing = hashes.filter(pl.col("hash").n_unique().over(key_cols) > 1).select(key_cols).unique()
     plan = {
-        "excess": 0, "move": [], "unresolved": [], "after": None,
+        "excess": 0,
+        "move": [],
+        "unresolved": [],
+        "after": None,
         "dup_keys": dups.select(key_cols).unique().height,
     }
     if differing.is_empty():
@@ -301,8 +299,10 @@ def main(data_path, quarantine_path, from_report, variable, grid, time_unit, exe
             )
         plans[rel] = plan
 
-    print(f"\nChecked {len(partitions)} partition(s): {len(plans)} with differing duplicates, "
-          f"{identical} with identical duplicates only (left alone).")
+    print(
+        f"\nChecked {len(partitions)} partition(s): {len(plans)} with differing duplicates, "
+        f"{identical} with identical duplicates only (left alone)."
+    )
     unresolved = [rel for rel, plan in plans.items() if plan["unresolved"]]
     for rel, plan in plans.items():
         print(f"\n  {rel}")
@@ -320,8 +320,10 @@ def main(data_path, quarantine_path, from_report, variable, grid, time_unit, exe
     n_files = sum(len(plan["move"]) for plan in movable.values())
     if not execute:
         if n_files:
-            print(f"\nDRY RUN -- nothing moved. {n_files} file(s) in {len(movable)} partition(s) would be "
-                  f"moved to {quarantine_path}. Re-run with --execute to move them.")
+            print(
+                f"\nDRY RUN -- nothing moved. {n_files} file(s) in {len(movable)} partition(s) would be "
+                f"moved to {quarantine_path}. Re-run with --execute to move them."
+            )
         if unresolved or unexplained:
             sys.exit(1)
         return

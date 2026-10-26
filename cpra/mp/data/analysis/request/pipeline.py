@@ -125,9 +125,7 @@ def _validate_name(name: str, kind: str, *, allow_dimension: bool = False) -> No
             "underscore; must not start with a digit)"
         )
     if name in RESERVED_NAMES:
-        raise RequestError(
-            f"{kind} name {name!r} collides with a reserved column name {sorted(RESERVED_NAMES)}"
-        )
+        raise RequestError(f"{kind} name {name!r} collides with a reserved column name {sorted(RESERVED_NAMES)}")
     if name == RESERVED_BAND_INDEX_COLUMN or BAND_NAME_RE.match(name):
         raise RequestError(
             f"{kind} name {name!r} matches the positional band-name pattern (b0, b1, ...) "
@@ -548,10 +546,7 @@ def validate_pipeline(pipeline: Pipeline) -> None:
         if as_name is not None:
             _validate_name(as_name, "step 'as'")
             if as_name in known_names:
-                raise RequestError(
-                    f"step {i} 'as' name {as_name!r} collides with an existing input or "
-                    "step name"
-                )
+                raise RequestError(f"step {i} 'as' name {as_name!r} collides with an existing input or step name")
             known_names.add(as_name)
 
 
@@ -572,9 +567,7 @@ def _validate_step_rules(i: int, step: Any) -> None:
         try:
             parse_calculate_expression(step.expression, allowed_columns=None)
         except ExpressionError as exc:
-            raise RequestError(
-                f"step {i} (calculate) expression {step.expression!r} is invalid: {exc}"
-            ) from exc
+            raise RequestError(f"step {i} (calculate) expression {step.expression!r} is invalid: {exc}") from exc
     elif isinstance(step, CaseStep):
         for position, case in enumerate(step.cases, start=1):
             _validate_where_structurally(i, case.when, op=f"case arm {position}")
@@ -687,6 +680,7 @@ def append_steps(pipeline: Pipeline, extra_steps: Sequence[Step], output: Output
 # The dotted GET/tile query codec
 # --------------------------------------------------------------------------------------
 
+
 def _query_fields(model: type[BaseModel]) -> frozenset[str]:
     """The names a dotted query may spell for `model`'s fields: the ALIAS where one is
     declared, the field name otherwise. The alias is what matters -- `as_` is a Python
@@ -751,9 +745,7 @@ def _list_element_model(annotation: Any) -> type[BaseModel] | None:
     list or its elements are scalars. Looks through a union the same way
     `_is_list_annotation` does.
     """
-    candidates = (
-        get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
-    )
+    candidates = get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
     for candidate in candidates:
         if get_origin(candidate) is not list:
             continue
@@ -797,10 +789,7 @@ def _insert_dotted(tree: dict[str, Any], segments: list[str], value: str, full_k
     seg = segments[0]
     if len(segments) == 1:
         if isinstance(tree.get(seg), dict):
-            raise RequestError(
-                f"parameter {full_key!r} conflicts with other parameter(s) nested under "
-                "the same path"
-            )
+            raise RequestError(f"parameter {full_key!r} conflicts with other parameter(s) nested under the same path")
         tree[seg] = value
         return
     child = tree.get(seg)
@@ -809,8 +798,7 @@ def _insert_dotted(tree: dict[str, Any], segments: list[str], value: str, full_k
         tree[seg] = child
     elif not isinstance(child, dict):
         raise RequestError(
-            f"parameter {full_key!r} conflicts with a leaf value already set at a shorter "
-            "path with the same prefix"
+            f"parameter {full_key!r} conflicts with a leaf value already set at a shorter path with the same prefix"
         )
     _insert_dotted(child, segments[1:], value, full_key)
 
@@ -850,9 +838,7 @@ def _listify(node: Any, path: str) -> Any:
 
 def _decode_input(name: str, raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        raise RequestError(
-            f"input {name!r} must have named sub-keys, e.g. input.{name}.variable=..."
-        )
+        raise RequestError(f"input {name!r} must have named sub-keys, e.g. input.{name}.variable=...")
     unknown = set(raw) - _INPUT_FIELDS
     if unknown:
         raise RequestError(f"input {name!r} has unknown field(s): {sorted(unknown)}")

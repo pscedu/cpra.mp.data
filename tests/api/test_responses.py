@@ -39,9 +39,7 @@ def serve(response_factory):
 class TestPolarsStreamingResponse:
     def _client(self, source, format="csv", compression=None, collect_in_memory=False):
         compression = compression or Compression()
-        return serve(
-            lambda: PolarsStreamingResponse(source, format, compression, collect_in_memory)
-        )
+        return serve(lambda: PolarsStreamingResponse(source, format, compression, collect_in_memory))
 
     def test_streams_csv(self):
         source = LazyFrameSource(pl.LazyFrame({"a": [1, 2]}))

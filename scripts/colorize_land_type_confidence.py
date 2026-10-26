@@ -11,11 +11,14 @@ TILE_SIZE = 512
 # Gradient breakpoints: (value, (R, G, B))
 # 0.0 → #6495ed (water), 0.5 → #ffffbf (mixed), 1.0 → #008000 (land)
 STOPS = np.array([0.0, 0.5, 1.0])
-COLORS = np.array([
-    [100, 149, 237],  # #6495ed
-    [255, 255, 191],  # #ffffbf
-    [  0, 128,   0],  # #008000
-], dtype=np.float32)
+COLORS = np.array(
+    [
+        [100, 149, 237],  # #6495ed
+        [255, 255, 191],  # #ffffbf
+        [0, 128, 0],  # #008000
+    ],
+    dtype=np.float32,
+)
 
 
 def colorize(arr):

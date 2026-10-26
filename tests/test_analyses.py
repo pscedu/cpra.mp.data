@@ -218,9 +218,7 @@ class TestRegistry:
         never an error, so the domain is asserted directly here.
         """
         declared = [
-            b
-            for b in LEGENDS[ANALYSES["lnd_conf"].Meta.legend].break_points["upper_bound"].to_list()
-            if b is not None
+            b for b in LEGENDS[ANALYSES["lnd_conf"].Meta.legend].break_points["upper_bound"].to_list() if b is not None
         ]
         # `0.0` is the transparent `No Data` band's own upper bound, and the fraction's
         # floor: nothing this analysis outputs falls below it, so the band catches the
@@ -444,10 +442,7 @@ class TestResolveOverADateDimension:
 
         dumped = result.pipeline.model_dump(mode="json")
         json.dumps(dumped)  # must not raise -- a bare `date` is not JSON-encodable
-        assert (
-            "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)"
-            in dumped["steps"][0]["where"]
-        )
+        assert "calendar_day IN ('2019-01-01'::date, '2070-12-31'::date)" in dumped["steps"][0]["where"]
 
 
 # ------------------------------------------------------------------------------------------
@@ -545,9 +540,7 @@ class TestChainedLegendResolution:
         assert resolved.result_kind == "difference"
         # Undifferenced, the same analysis still publishes the fraction's own legend.
         assert (
-            resolve_analysis(
-                "lnd_conf", dataset=LND_TYPE_DATASET, filters={"model_group_id": 705}, params={}
-            ).legend
+            resolve_analysis("lnd_conf", dataset=LND_TYPE_DATASET, filters={"model_group_id": 705}, params={}).legend
             == "lnd_conf"
         )
 
@@ -636,9 +629,7 @@ class TestSharedHelpers:
         assert one == other == "calendar_year = 2030 AND scenario_id = 7"
 
     def test_selection_filter_where_puts_the_spatial_conjunct_after_the_dimensions(self):
-        assert selection_filter_where({"scenario_id": 7, "grid_cell": "4"}) == (
-            "scenario_id = 7 AND grid_cell = 4"
-        )
+        assert selection_filter_where({"scenario_id": 7, "grid_cell": "4"}) == ("scenario_id = 7 AND grid_cell = 4")
 
     def test_selection_filter_where_rejects_a_coordinate_grid_cell(self):
         """Resolving coordinates to ids needs the catalog, which this package cannot
@@ -650,9 +641,7 @@ class TestSharedHelpers:
             selection_filter_where({"grid_cell": "-90.1,29.5"})
 
     def test_selection_filter_where_accepts_the_reserved_keys(self):
-        assert selection_filter_where({"grid_cell": "1", "where": "value > 3"}) == (
-            "grid_cell = 1 AND (value > 3)"
-        )
+        assert selection_filter_where({"grid_cell": "1", "where": "value > 3"}) == ("grid_cell = 1 AND (value > 3)")
 
     def test_selection_filter_where_rejects_a_dataset_typed_dimension(self):
         # `variable`/`time_unit`/`grid` select the dataset; they are not filters.
@@ -772,9 +761,7 @@ class TestDifferencePipeline:
         _, pipeline = self._build("asc")
         case = pipeline.steps[1]
         assert isinstance(case, CaseStep)
-        assert [(arm.when, arm.then) for arm in case.cases] == [
-            ("calendar_year = 2040", "value * -1")
-        ]
+        assert [(arm.when, arm.then) for arm in case.cases] == [("calendar_year = 2040", "value * -1")]
         # The un-negated side has to reach the `sum` unchanged for the subtraction to come
         # out, so the pass-through is written rather than left implicit.
         assert case.else_ == "value"
@@ -872,19 +859,13 @@ class TestDifferencePipeline:
             parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
             grid_cell_where="grid_cell IN (11, 12)",
         )
-        assert analysis.pipeline().steps[0].where == (
-            "calendar_year IN (2030, 2040) AND grid_cell IN (11, 12)"
-        )
+        assert analysis.pipeline().steps[0].where == ("calendar_year IN (2030, 2040) AND grid_cell IN (11, 12)")
 
     def test_a_callers_own_where_is_split_and_parenthesized_conjunct_by_conjunct(self):
-        _, pipeline = self._build(
-            "asc", filters={"calendar_year": [2030, 2040], "where": "value > 1 AND value < 9"}
-        )
+        _, pipeline = self._build("asc", filters={"calendar_year": [2030, 2040], "where": "value > 1 AND value < 9"})
         # Split FIRST, then parenthesized: one paren pair per top-level conjunct, so the
         # AND seam the engine classifies each predicate's kind against survives intact.
-        assert pipeline.steps[0].where == (
-            "calendar_year IN (2030, 2040) AND (value > 1) AND (value < 9)"
-        )
+        assert pipeline.steps[0].where == ("calendar_year IN (2030, 2040) AND (value > 1) AND (value < 9)")
 
     def test_an_unrecognized_filter_name_is_rejected(self):
         analysis = Difference(
@@ -914,36 +895,28 @@ class TestLandChangeCardinality:
     params = LandChange.Parameters()
 
     def test_accepts_a_missing_calendar_year(self):
-        """"Every year against the derived baseline" -- the series a chart asks for, which
+        """ "Every year against the derived baseline" -- the series a chart asks for, which
         is how the portal sends one (`getSpecUrl` sets `includeTimeDimension` false as soon
         as the request names a grid cell, so no `calendar_year` reaches the API at all).
         """
         LandChange.validate_selection(self.params, {"model_group_id": 500})  # no raise
 
     def test_accepts_several_calendar_years(self):
-        LandChange.validate_selection(
-            self.params, {"calendar_year": [2030, 2040], "model_group_id": 500}
-        )  # no raise
+        LandChange.validate_selection(self.params, {"calendar_year": [2030, 2040], "model_group_id": 500})  # no raise
 
     def test_rejects_missing_model_group_id(self):
         with pytest.raises(InvalidAnalysisParametersError):
             LandChange.validate_selection(self.params, {"calendar_year": 2040})
 
     def test_accepts_one_calendar_year_with_one_model_group(self):
-        LandChange.validate_selection(
-            self.params, {"calendar_year": 2040, "model_group_id": 500}
-        )  # no raise
+        LandChange.validate_selection(self.params, {"calendar_year": 2040, "model_group_id": 500})  # no raise
 
     def test_accepts_one_calendar_year_with_two_model_groups(self):
-        LandChange.validate_selection(
-            self.params, {"calendar_year": 2040, "model_group_id": [500, 520]}
-        )  # no raise
+        LandChange.validate_selection(self.params, {"calendar_year": 2040, "model_group_id": [500, 520]})  # no raise
 
     def test_rejects_three_model_groups(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            LandChange.validate_selection(
-                self.params, {"calendar_year": 2040, "model_group_id": [500, 510, 520]}
-            )
+            LandChange.validate_selection(self.params, {"calendar_year": 2040, "model_group_id": [500, 510, 520]})
 
 
 class TestLandChangeBaselineYear:
@@ -1024,8 +997,7 @@ class TestLandChangePipeline:
         assert isinstance(baseline, FilterStep)
         assert baseline.input == "base"
         assert baseline.where == (
-            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 "
-            "AND percentile = 50 AND scenario_id = 7"
+            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 AND percentile = 50 AND scenario_id = 7"
         )
         # THE BROADCAST. `calendar_year` is missing from `by`, so the group drops the
         # column, and `join_long`/`_pair_band_groups` then have nothing to match it
@@ -1039,8 +1011,7 @@ class TestLandChangePipeline:
         assert isinstance(comparison, FilterStep)
         assert comparison.input == "years"
         assert comparison.where == (
-            "calendar_year IN (2040, 2050) AND model_group_id = 705 "
-            "AND percentile = 50 AND scenario_id = 7"
+            "calendar_year IN (2040, 2050) AND model_group_id = 705 AND percentile = 50 AND scenario_id = 7"
         )
         assert comparison.as_ == "comparison"
 
@@ -1057,9 +1028,7 @@ class TestLandChangePipeline:
 
     def test_two_image_mode_with_exactly_one_model_group_selected(self):
         # model_group_id present but pinned to a single value: still two-image.
-        _, pipeline = self._build(
-            {"calendar_year": 2040, "model_group_id": [705], "scenario_id": 7, "percentile": 50}
-        )
+        _, pipeline = self._build({"calendar_year": 2040, "model_group_id": [705], "scenario_id": 7, "percentile": 50})
         assert len(pipeline.steps) == 5
         assert pipeline.steps[-1].expression == "baseline * 10 + comparison"
 
@@ -1068,9 +1037,7 @@ class TestLandChangePipeline:
         branch then writes no year conjunct and reads the lot, while the baseline branch
         still pins the derived year -- which is the whole series against one baseline.
         """
-        _, pipeline = self._build(
-            {"model_group_id": 705, "scenario_id": 7, "percentile": 50}
-        )
+        _, pipeline = self._build({"model_group_id": 705, "scenario_id": 7, "percentile": 50})
         baseline, _, comparison, _, _ = pipeline.steps
         assert f"calendar_year = {MP2023_BASELINE_YEAR}" in baseline.where
         assert "calendar_year" not in comparison.where
@@ -1087,8 +1054,7 @@ class TestLandChangePipeline:
         # negatively because there was one shared read to say it on.
         assert isinstance(baseline, FilterStep)
         assert baseline.where == (
-            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 "
-            "AND percentile = 50 AND scenario_id = 7"
+            f"calendar_year = {MP2023_BASELINE_YEAR} AND model_group_id = 705 AND percentile = 50 AND scenario_id = 7"
         )
         assert "NOT" not in baseline.where
         # The baseline drops `model_group_id` as well as `calendar_year`: the comparison
@@ -1101,17 +1067,14 @@ class TestLandChangePipeline:
         # 705)` out, matching `request.data_query`'s own conjunct assembly.
         assert isinstance(comparison, FilterStep)
         assert comparison.where == (
-            "calendar_year = 2040 AND model_group_id IN (720, 705) "
-            "AND percentile = 50 AND scenario_id = 7"
+            "calendar_year = 2040 AND model_group_id IN (720, 705) AND percentile = 50 AND scenario_id = 7"
         )
 
         # The tens and ones digits, packed on the comparison branch alone so the baseline
         # stays free to broadcast: the lower model group's land type is multiplied by 10
         # and the higher one's passes through, and the `group` sums the pair per year.
         assert isinstance(case, CaseStep)
-        assert [(arm.when, arm.then) for arm in case.cases] == [
-            ("model_group_id = 705", "value * 10")
-        ]
+        assert [(arm.when, arm.then) for arm in case.cases] == [("model_group_id = 705", "value * 10")]
         # The ones digit: the model group no arm names keeps its value through the `sum`.
         assert case.else_ == "value"
 
@@ -1188,9 +1151,7 @@ class TestLandChangePipeline:
 
     def test_missing_model_group_id_is_rejected_by_resolve_analysis(self):
         with pytest.raises(InvalidAnalysisParametersError):
-            resolve_analysis(
-                "lnd_chng", dataset=SSF_DATASET, filters={"calendar_year": 2040}, params={}
-            )
+            resolve_analysis("lnd_chng", dataset=SSF_DATASET, filters={"calendar_year": 2040}, params={})
 
 
 # ------------------------------------------------------------------------------------------
@@ -1305,9 +1266,7 @@ class TestSalinityVegInvestigationPipeline:
         # The threshold test collapses the pairing and says what survives it, which a
         # `filter` has no way to state.
         assert isinstance(case_step, CaseStep)
-        assert [(arm.when, arm.then) for arm in case_step.cases] == [
-            ("marsh > 0.5 AND sal > 5.5", "marsh")
-        ]
+        assert [(arm.when, arm.then) for arm in case_step.cases] == [("marsh > 0.5 AND sal > 5.5", "marsh")]
         assert case_step.else_ is None
 
         assert isinstance(group_step, GroupStep)
@@ -1358,9 +1317,7 @@ class TestSalinityVegInvestigationPipeline:
             filters={"grid_cell": "1,2"},
             parameters=SalinityVegInvestigation.Parameters(),
         )
-        selection = next(
-            step for step in analysis.pipeline().steps if step.op == "filter" and step.input is None
-        )
+        selection = next(step for step in analysis.pipeline().steps if step.op == "filter" and step.input is None)
         assert selection.where == "grid_cell IN (1, 2)"
 
     def test_collapsed_dimensions_union_both_inputs(self):
@@ -1394,9 +1351,7 @@ class TestLandConfidenceSelection:
     params = LandConfidence.Parameters()
 
     def test_accepts_filters_that_do_not_name_scenario_id(self):
-        LandConfidence.validate_selection(
-            self.params, {"model_group_id": 705, "calendar_year": 2050}
-        )  # no raise
+        LandConfidence.validate_selection(self.params, {"model_group_id": 705, "calendar_year": 2050})  # no raise
 
     def test_rejects_a_caller_selected_scenario_id(self):
         with pytest.raises(InvalidAnalysisParametersError, match="fixed ensemble"):
@@ -1406,9 +1361,7 @@ class TestLandConfidenceSelection:
         # Even the exact member set is rejected: the analysis supplies it itself, and
         # accepting it here would mean accepting a SUBSET next.
         with pytest.raises(InvalidAnalysisParametersError):
-            LandConfidence.validate_selection(
-                self.params, {"scenario_id": sorted(SCENARIO_WEIGHTS)}
-            )
+            LandConfidence.validate_selection(self.params, {"scenario_id": sorted(SCENARIO_WEIGHTS)})
 
 
 class TestLandConfidenceWeights:
@@ -1795,9 +1748,7 @@ class TestLndTypePlusPipeline:
         assert analysis.title_suffix == ""
 
     def test_resolves_through_resolve_analysis(self):
-        resolved = resolve_analysis(
-            "lnd_type_plus", dataset=None, filters=dict(self.FILTERS), params={}
-        )
+        resolved = resolve_analysis("lnd_type_plus", dataset=None, filters=dict(self.FILTERS), params={})
         assert isinstance(resolved, ResolvedAnalysis)
         assert resolved.pipeline.steps[-1].else_ == "land_type"
         assert resolved.collapsed_dimensions == frozenset({"aggregate_type"})
@@ -1836,9 +1787,7 @@ class TestLndTypePlusPipeline:
         `validate_shapes` rejects because a spatial filter lowers the frame to long -- a
         judgement about the SINK, not about the filter, and one this method never makes.
         """
-        analysis = LndTypePlus(
-            dataset=None, filters={"grid_cell": "3,5"}, parameters=LndTypePlus.Parameters()
-        )
+        analysis = LndTypePlus(dataset=None, filters={"grid_cell": "3,5"}, parameters=LndTypePlus.Parameters())
         assert analysis.pipeline().steps[-2].where == "grid_cell IN (3, 5)"
 
 

@@ -121,9 +121,7 @@ async def resolve_grid_cell(grid_name: str, grid_cell: str | None):
     if not isinstance(resolved, _VectorPoints):
         return resolved
 
-    return _vector_point_where(
-        await resolve_vector_grid_cell(grid_name, resolved.lngs, resolved.lats)
-    )
+    return _vector_point_where(await resolve_vector_grid_cell(grid_name, resolved.lngs, resolved.lats))
 
 
 def resolve_grid_cell_sync(grid_name: str, grid_cell: str | None):
@@ -140,6 +138,4 @@ def resolve_grid_cell_sync(grid_name: str, grid_cell: str | None):
     if not isinstance(resolved, _VectorPoints):
         return resolved
 
-    return _vector_point_where(
-        resolve_vector_grid_cell_sync(grid_name, resolved.lngs, resolved.lats)
-    )
+    return _vector_point_where(resolve_vector_grid_cell_sync(grid_name, resolved.lngs, resolved.lats))

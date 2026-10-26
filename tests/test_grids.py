@@ -60,9 +60,7 @@ class TestRasterGrid:
         assert not hasattr(grid, "id_min")
         assert not hasattr(grid, "id_count")
 
-    @pytest.mark.parametrize(
-        "name", [n for n, g in GRIDS.items() if g.grid_type == "raster"]
-    )
+    @pytest.mark.parametrize("name", [n for n, g in GRIDS.items() if g.grid_type == "raster"])
     def test_transform_is_derivable(self, name):
         """write_cog builds a transform from bounds/width/height, so it must be valid."""
         from rasterio.transform import from_bounds

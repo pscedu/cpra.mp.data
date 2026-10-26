@@ -240,7 +240,13 @@ class TestCountByValueCalculateOrdering:
             {
                 "inputs": {"a": vector_input()},
                 "steps": [
-                    {"op": "project", "input": "a", "to": VECTOR_GRID_2, "aggregate": "count_by_value", "as": "counted"},
+                    {
+                        "op": "project",
+                        "input": "a",
+                        "to": VECTOR_GRID_2,
+                        "aggregate": "count_by_value",
+                        "as": "counted",
+                    },
                     {"op": "calculate", "input": "counted", "expression": "value * 2"},
                 ],
                 "output": {"format": "csv"},

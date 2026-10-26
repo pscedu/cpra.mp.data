@@ -88,9 +88,7 @@ class TestPushdownSeam:
     """
 
     def test_predicate_narrows_rows(self, annual_dataset):
-        df = scan_vector(
-            SELECTION, base_path=annual_dataset, predicate=pl.col("calendar_year") == 2030
-        ).collect()
+        df = scan_vector(SELECTION, base_path=annual_dataset, predicate=pl.col("calendar_year") == 2030).collect()
         assert df.height == 32
         assert set(df["calendar_year"].unique().to_list()) == {2030}
 

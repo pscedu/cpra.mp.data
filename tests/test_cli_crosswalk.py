@@ -208,9 +208,7 @@ class TestMissingGeometry:
         assert not (destinations / f"{RASTER_SRC}.fgb").exists()
         assert (crosswalk_path / f"{RASTER_SRC}__{DST_A}.tif").exists()
 
-    def test_a_destination_without_geometry_is_skipped_with_a_warning(
-        self, vector_src, destinations, crosswalk_path
-    ):
+    def test_a_destination_without_geometry_is_skipped_with_a_warning(self, vector_src, destinations, crosswalk_path):
         result = runner.invoke(cli, ["crosswalk", "--from", VECTOR_SRC, "--to", DST_A, "--to", DST_C])
 
         assert result.exit_code == 0, result.output
@@ -318,9 +316,7 @@ class TestOverwrite:
         assert first.exit_code == 0, first.output
         assert _zone_ids(out) == "1"
 
-        write_grid_geometry(
-            geometry_path, DST_A, [(1, box(minx, miny, midx, maxy)), (2, box(midx, miny, maxx, maxy))]
-        )
+        write_grid_geometry(geometry_path, DST_A, [(1, box(minx, miny, midx, maxy)), (2, box(midx, miny, maxx, maxy))])
         second = runner.invoke(cli, ["crosswalk", "--from", RASTER_SRC, "--to", DST_A, "--overwrite"])
         assert second.exit_code == 0, second.output
         assert _zone_ids(out) == "1,2"
@@ -351,9 +347,7 @@ class TestFailures:
     def test_a_failing_source_does_not_abort_the_others(self, vector_src, destinations, crosswalk_path):
         (destinations / f"{VECTOR_SRC_B}.fgb").write_bytes(b"not a flatgeobuf")
 
-        result = runner.invoke(
-            cli, ["crosswalk", "--from", VECTOR_SRC_B, "--from", VECTOR_SRC, "--to", DST_A]
-        )
+        result = runner.invoke(cli, ["crosswalk", "--from", VECTOR_SRC_B, "--from", VECTOR_SRC, "--to", DST_A])
 
         assert result.exit_code == 1
         assert (crosswalk_path / f"{VECTOR_SRC}__{DST_A}.parquet").exists()

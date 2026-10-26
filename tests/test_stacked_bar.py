@@ -36,7 +36,10 @@ from cpra.mp.data.visualizations.stacked_bar import COMPARE_CHANNELS, StackedBar
 ANNUAL = {"variable": "ssf", "grid": "ecoregion_v001", "time_unit": "annual", "grid_cell": "1,2"}
 DAILY = {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily", "grid_cell": "1"}
 VEG_SPECIES = {
-    "variable": "veg_species", "grid": "veg_grid_cell_v001", "time_unit": "annual", "grid_cell": "-91.5,29.5"
+    "variable": "veg_species",
+    "grid": "veg_grid_cell_v001",
+    "time_unit": "annual",
+    "grid_cell": "-91.5,29.5",
 }
 
 
@@ -132,9 +135,7 @@ class TestSharedSkeleton:
         """Vega-Lite stacks negative segments below zero, so without this the baseline a
         difference is read against is wherever the axis happens to start."""
         spec = (
-            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
-            .chart()
-            .to_dict()
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520]).chart().to_dict()
         )
         assert {"datum": 0} in [rule["encoding"].get("y") for rule in layers(spec, "rule")]
 
@@ -144,9 +145,7 @@ class TestSharedSkeleton:
     def test_the_zero_rule_is_drawn_under_the_bars(self, viz):
         """It's a reference line, not an annotation on top of the data."""
         spec = (
-            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520])
-            .chart()
-            .to_dict()
+            viz(analysis="diff", dimension="model_group_id", order="asc", model_group_id=[500, 520]).chart().to_dict()
         )
         marks = [layer["mark"]["type"] for layer in spec["layer"]]
         assert marks.index("rule") < marks.index("bar")
@@ -188,9 +187,7 @@ class TestCompareDimensions:
         may_name_a_value_too` and `test_no_negate_parameter_leaves_no_negate_dimension`,
         which pinned that property directly, were deleted rather than converted, since
         there is nothing left on `StackedBar` for them to call."""
-        viz = stacked_bar(
-            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
-        )
+        viz = stacked_bar(model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc")
         assert viz.compare_dimensions == {}
 
     def test_a_collapsed_dimension_does_not_exclude_the_others(self):
@@ -206,9 +203,7 @@ class TestCompareDimensions:
     def test_only_as_many_as_there_are_channels(self):
         """Vega-Lite would stack by the combination of every discrete channel present, so a
         third dimension has nowhere to go that stays readable -- it's dropped, not merged."""
-        viz = stacked_bar(
-            model_group_id=[500, 520], scenario_id=[7, 8], aggregate_type=["mean", "max"]
-        )
+        viz = stacked_bar(model_group_id=[500, 520], scenario_id=[7, 8], aggregate_type=["mean", "max"])
         assert len(viz.compare_dimensions) == len(COMPARE_CHANNELS)
 
     def test_the_dimension_registry_decides_which_channel(self):
@@ -219,9 +214,7 @@ class TestCompareDimensions:
         forwards = stacked_bar(model_group_id=[500, 520], scenario_id=[7, 8])
         backwards = stacked_bar(scenario_id=[7, 8], model_group_id=[500, 520])
         assert list(forwards.compare_dimensions) == list(backwards.compare_dimensions)
-        assert list(forwards.compare_dimensions) == sorted(
-            forwards.compare_dimensions, key=order.index
-        )
+        assert list(forwards.compare_dimensions) == sorted(forwards.compare_dimensions, key=order.index)
 
 
 class TestSeriesChannels:
@@ -301,8 +294,7 @@ class TestSeriesTransforms:
         viz = stacked_bar(model_group_id=[500, 520])
         bars = layers(viz.chart().to_dict(), "bar")[0]
         produced = [
-            evaluate(calculated(bars, "order_idx"), model_group_id_idx=index)
-            for (index,) in viz.compare_choice_indices
+            evaluate(calculated(bars, "order_idx"), model_group_id_idx=index) for (index,) in viz.compare_choice_indices
         ]
         assert produced == [0, 1]
 
@@ -339,9 +331,7 @@ class TestTooltip:
         key_expression = calculated(rule, "tooltip")
         pivoted_dimensions = re.findall(r"datum\.(\w+)_idx", key_expression)
         viz = stacked_bar(model_group_id=[500, 520], scenario_id=[7, 8])
-        expected = [
-            "_".join(str(index) for index in indices) for indices in viz.compare_choice_indices
-        ]
+        expected = ["_".join(str(index) for index in indices) for indices in viz.compare_choice_indices]
         assert [row["field"] for row in rule["encoding"]["tooltip"][1:]] == expected
         assert pivoted_dimensions == list(viz.compare_dimensions)
 
@@ -408,11 +398,7 @@ class TestBrushedTimeAxis:
     def test_given_dates_set_the_initial_brush(self):
         """The UI reads the brush back out into the URL, so it has to be able to put one back
         in -- see `base-chart.tsx`'s `date_range` signal listener."""
-        spec = (
-            StackedBar(**DAILY, start_date=dt.date(2025, 3, 1), end_date=dt.date(2025, 9, 1))
-            .chart()
-            .to_dict()
-        )
+        spec = StackedBar(**DAILY, start_date=dt.date(2025, 3, 1), end_date=dt.date(2025, 9, 1)).chart().to_dict()
         assert self._brush(spec) == [
             {"year": 2025, "month": 3, "date": 1},
             {"year": 2025, "month": 9, "date": 1},
@@ -580,9 +566,7 @@ class TestSpeciesStackedBarChart:
     def test_a_difference_axis_keeps_the_suffix_last(self):
         """The word belongs to the variable, so it goes in front of the suffix -- appending it
         to `variable_label` would read "... Species Difference Coverage"."""
-        viz = species_bar(
-            model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc"
-        )
+        viz = species_bar(model_group_id=[500, 520], analysis="diff", dimension="model_group_id", order="asc")
         assert viz.variable_label == "Vegetation Type: Species Coverage Difference"
 
 

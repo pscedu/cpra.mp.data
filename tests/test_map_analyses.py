@@ -152,7 +152,9 @@ class TestResolvedAnalysisMetadataHooks:
     `base_path`/`monkeypatch`/written data.
     """
 
-    ANNUAL: ClassVar[dict] = dict(variable="ssf", grid="ecoregion_v001", time_unit="annual", **COMMON_ANNUAL_FILTER_LISTS)
+    ANNUAL: ClassVar[dict] = dict(
+        variable="ssf", grid="ecoregion_v001", time_unit="annual", **COMMON_ANNUAL_FILTER_LISTS
+    )
 
     def test_difference_result_kind_is_reported_as_a_difference(self):
         m = Map(analysis="diff", dimension="calendar_year", order="asc", calendar_year=[2030, 2040], **self.ANNUAL)
@@ -190,7 +192,12 @@ class TestDifferenceRampVsNamedLegend:
 
     # `lnd_conf`'s real dataset. No `scenario_id`: the analysis fixes its own ensemble and
     # `validate_selection` rejects a caller-supplied one outright.
-    RASTER: ClassVar[dict] = {"variable": "lnd_type", "grid": "morph_pixel_v002", "time_unit": "annual", "model_group_id": [705]}
+    RASTER: ClassVar[dict] = {
+        "variable": "lnd_type",
+        "grid": "morph_pixel_v002",
+        "time_unit": "annual",
+        "model_group_id": [705],
+    }
 
     def _map(self, **kwargs):
         return Map(calendar_year=[2040, 2050], dimension="calendar_year", order="asc", **self.RASTER, **kwargs)
@@ -375,10 +382,7 @@ class TestCompareDimensionsExclusion:
         # about aren't necessarily on `layer[0]` anymore; scan every layer's encoding
         # rather than assuming which index the main line lands on.
         fields = [
-            enc.get("field")
-            for layer in spec["layer"]
-            for enc in layer["encoding"].values()
-            if isinstance(enc, dict)
+            enc.get("field") for layer in spec["layer"] for enc in layer["encoding"].values() if isinstance(enc, dict)
         ]
         assert "calendar_year" not in fields
         assert "model_group_id" in fields

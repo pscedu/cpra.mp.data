@@ -300,10 +300,7 @@ def catalog_matches(catalog_path: Path, datasets: list[dict], targets: set) -> l
     results = []
     for dims in datasets:
         directory = (
-            catalog_path
-            / f"variable={dims['variable']}"
-            / f"time_unit={dims['time_unit']}"
-            / f"grid={dims['grid']}"
+            catalog_path / f"variable={dims['variable']}" / f"time_unit={dims['time_unit']}" / f"grid={dims['grid']}"
         )
         dataset = "/".join(f"{name}={dims[name]}" for name in ("variable", "time_unit", "grid"))
         for path in sorted(directory.glob("*.parquet")):
@@ -424,8 +421,17 @@ def write_manifest(path: Path, matches: list[dict], selected: set) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
-            ["action", "kind", "classification", "source", "dataset", "path",
-             "model_groups_matched", "model_groups_collateral", "size_bytes"]
+            [
+                "action",
+                "kind",
+                "classification",
+                "source",
+                "dataset",
+                "path",
+                "model_groups_matched",
+                "model_groups_collateral",
+                "size_bytes",
+            ]
         )
         for match in matches:
             writer.writerow(
@@ -448,24 +454,32 @@ def report(matches: list[dict], selected: set) -> None:
     exclusive = [m for m in matches if m["classification"] == EXCLUSIVE]
     mixed = [m for m in matches if m["classification"] == MIXED]
 
-    print(f"\nFound {len(matches)} file(s) carrying the requested model group(s), "
-          f"{_fmt_bytes(sum(m['size_bytes'] for m in matches))} total.")
+    print(
+        f"\nFound {len(matches)} file(s) carrying the requested model group(s), "
+        f"{_fmt_bytes(sum(m['size_bytes'] for m in matches))} total."
+    )
 
     if exclusive:
-        print(f"\n  {len(exclusive)} file(s) hold only the requested group(s) "
-              f"({_fmt_bytes(sum(m['size_bytes'] for m in exclusive))}):")
+        print(
+            f"\n  {len(exclusive)} file(s) hold only the requested group(s) "
+            f"({_fmt_bytes(sum(m['size_bytes'] for m in exclusive))}):"
+        )
         by_dataset: dict[str, list[dict]] = {}
         for match in exclusive:
             by_dataset.setdefault(match["dataset"], []).append(match)
         for dataset in sorted(by_dataset):
             group = by_dataset[dataset]
             kinds = sorted({m["kind"] for m in group})
-            print(f"    {dataset}: {len(group)} {'/'.join(kinds)} file(s), "
-                  f"{_fmt_bytes(sum(m['size_bytes'] for m in group))}")
+            print(
+                f"    {dataset}: {len(group)} {'/'.join(kinds)} file(s), "
+                f"{_fmt_bytes(sum(m['size_bytes'] for m in group))}"
+            )
 
     if mixed:
-        print(f"\n  {len(mixed)} file(s) ALSO hold other model groups "
-              f"({_fmt_bytes(sum(m['size_bytes'] for m in mixed))}).")
+        print(
+            f"\n  {len(mixed)} file(s) ALSO hold other model groups "
+            f"({_fmt_bytes(sum(m['size_bytes'] for m in mixed))})."
+        )
         print("    The requested group cannot be removed from these without removing the")
         print("    file, so re-running the migration regenerates every group listed below.")
         for match in sorted(mixed, key=lambda m: m["dataset"]):
@@ -487,7 +501,9 @@ def report(matches: list[dict], selected: set) -> None:
     required=True,
     help="Model group to purge. Repeat the flag to purge more than one.",
 )
-@click.option("--data-path", default=str(BASE_PATH), show_default=True, help="Migrated (long-format) data tree to scan.")
+@click.option(
+    "--data-path", default=str(BASE_PATH), show_default=True, help="Migrated (long-format) data tree to scan."
+)
 @click.option(
     "--catalog-path",
     metavar="DIR",
@@ -537,8 +553,18 @@ def report(matches: list[dict], selected: set) -> None:
 )
 @click.option("--progress/--no-progress", default=True, help="Show a progress bar (use --no-progress for batch jobs).")
 def main(
-    model_group_ids, data_path, catalog_path, variable, grid, time_unit, skip_mixed,
-    manifest, execute, prune_catalog_rows, prune_empty, progress,
+    model_group_ids,
+    data_path,
+    catalog_path,
+    variable,
+    grid,
+    time_unit,
+    skip_mixed,
+    manifest,
+    execute,
+    prune_catalog_rows,
+    prune_empty,
+    progress,
 ):
     catalog_path = Path(catalog_path) if catalog_path else CATALOG_PATH
     if not catalog_path:
@@ -561,16 +587,15 @@ def main(
         print("No datasets in the catalog match the given filters.")
         return
 
-    print(f"{'DELETING' if execute else 'DRY RUN -- nothing will be deleted'}: "
-          f"{DIMENSION} in {{{_fmt_groups(targets)}}}")
+    print(
+        f"{'DELETING' if execute else 'DRY RUN -- nothing will be deleted'}: {DIMENSION} in {{{_fmt_groups(targets)}}}"
+    )
     print(f"  data:    {base_path}")
     print(f"  catalog: {catalog_path}")
     print(f"  {len(datasets)} dataset(s) to scan.")
 
     matches = find_matches(base_path, datasets, targets, progress=progress)
-    selected = {
-        m["path"] for m in matches if not (skip_mixed and m["classification"] == MIXED)
-    }
+    selected = {m["path"] for m in matches if not (skip_mixed and m["classification"] == MIXED)}
 
     # Checked even when no data file matched: a tree whose files were already removed by
     # hand still has catalog rows saying otherwise, and those rows alone are enough to make
@@ -588,20 +613,23 @@ def main(
 
     if catalog_entries:
         rows = sum(entry["matched"] for entry in catalog_entries)
-        print(f"\nCatalog: {rows} row(s) for the requested model group(s) across "
-              f"{len(catalog_entries)} file(s).")
+        print(f"\nCatalog: {rows} row(s) for the requested model group(s) across {len(catalog_entries)} file(s).")
     elif not matches:
         print("Catalog has no rows for them either. Nothing to do.")
         return
 
     if not execute:
-        print(f"\nWould delete {len(selected)} file(s), "
-              f"{_fmt_bytes(sum(m['size_bytes'] for m in matches if m['path'] in selected))}.")
+        print(
+            f"\nWould delete {len(selected)} file(s), "
+            f"{_fmt_bytes(sum(m['size_bytes'] for m in matches if m['path'] in selected))}."
+        )
         if skip_mixed:
             held = [m for m in matches if m["path"] not in selected]
             if held:
-                print(f"Would leave {len(held)} mixed file(s) in place (--skip-mixed), so the "
-                      "model group's data would still be present in them.")
+                print(
+                    f"Would leave {len(held)} mixed file(s) in place (--skip-mixed), so the "
+                    "model group's data would still be present in them."
+                )
         if catalog_entries and not prune_catalog_rows:
             print("\nNOTE: without --prune-catalog the catalog still lists this model group as")
             print("      converted, and migrate_to_long_format will skip those partitions --")

@@ -325,7 +325,5 @@ async def analyze_data(pipeline, *, base_path=None, output_path=None, lazy=False
     # `apply_output_shaping` rather than a bare `execute`, so `output.sort`/`output.select`
     # mean the same thing here as they do over HTTP -- `run_to_path`'s tabular branch
     # applies exactly this, once, last.
-    frame = apply_output_shaping(
-        execute(compile_plan(parsed, base_path=base_path), base_path=base_path), parsed.output
-    )
+    frame = apply_output_shaping(execute(compile_plan(parsed, base_path=base_path), base_path=base_path), parsed.output)
     return frame if lazy else frame.collect()

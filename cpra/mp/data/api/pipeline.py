@@ -245,9 +245,7 @@ class PipelineTabularResponse(Response):
             return
 
         with tempfile.NamedTemporaryFile() as fp:
-            write_thread = StreamingThread(
-                self.source, fp.name, self.format, self.compression, collect_in_memory=False
-            )
+            write_thread = StreamingThread(self.source, fp.name, self.format, self.compression, collect_in_memory=False)
             write_thread.start()
             sent_headers = False
             async with await anyio.open_file(fp.name, mode="rb") as file:
@@ -354,9 +352,7 @@ async def respond_to_analysis(
     """
     if format == "tif":
         return PipelineRasterResponse(pipeline, compression, base_path=base_path)
-    source = PipelineTabularSource(
-        pipeline, base_path=base_path, relabel=relabel, float_precision=float_precision
-    )
+    source = PipelineTabularSource(pipeline, base_path=base_path, relabel=relabel, float_precision=float_precision)
     return PipelineTabularResponse(source, format, compression)
 
 

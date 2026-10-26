@@ -219,9 +219,7 @@ class TestDatasetMismatchRejection:
         assert "reads the dataset you choose" in response.json()["detail"]
 
     def test_an_analysis_with_fixed_inputs_says_so_when_given_a_dataset(self, client):
-        response = client.get(
-            "/v1/data.csv", params={"analysis": "sal_veg_investigation", **DATASET}
-        )
+        response = client.get("/v1/data.csv", params={"analysis": "sal_veg_investigation", **DATASET})
         assert response.status_code == 400
         assert "takes no dataset" in response.json()["detail"]
 
@@ -308,9 +306,7 @@ class TestDatasetAnalysisData:
         rejection path `get_analysis_class` cannot pre-empt, since both the name and the
         `Meta.type` are fine.
         """
-        response = client.get(
-            "/v1/data.csv", params={**DIFFERENCE_QUERY, "calendar_year": [2030]}
-        )
+        response = client.get("/v1/data.csv", params={**DIFFERENCE_QUERY, "calendar_year": [2030]})
         assert response.status_code == 400
         assert "exactly 2" in response.json()["detail"]
 
@@ -380,9 +376,7 @@ class TestDatasetAnalysisGridCell:
             params={**SALINITY_VEG_QUERY, "grid_cell": "-91.5,29.5", "output.format": "csv"},
         )
         assert response.status_code == 200, response.text
-        assert any(
-            "grid_cell" in (step.get("where") or "") for step in response.json()["steps"]
-        )
+        assert any("grid_cell" in (step.get("where") or "") for step in response.json()["steps"])
 
 
 class TestDatasetAnalysisVectorTile:
@@ -419,9 +413,7 @@ class TestDatasetAnalysisRasterTile:
 
     def test_serves_a_real_png(self, client, raster_dataset):
         tile = _tile_for_grid(raster_dataset)
-        response = client.get(
-            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=RASTER_DIFFERENCE_QUERY
-        )
+        response = client.get(f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=RASTER_DIFFERENCE_QUERY)
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
         assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
@@ -562,9 +554,7 @@ class TestCustomAnalysisVectorTileRejection:
     """
 
     def test_rejects_a_raster_output_grid(self, client):
-        response = client.get(
-            "/v1/data/3/1/2.pbf", params=SALINITY_VEG_QUERY
-        )
+        response = client.get("/v1/data/3/1/2.pbf", params=SALINITY_VEG_QUERY)
         assert response.status_code == 400
         assert "not a long frame on a vector grid" in response.json()["detail"]
 
@@ -719,9 +709,7 @@ class TestLandConfidenceLegendRoute:
         """The five ensemble members over two years, every one holding a land code, so the
         weighted sum is 1.0 at every pixel in both -- and their difference is 0.0."""
         for scenario_id in SCENARIO_WEIGHTS:
-            write_raster_dataset(
-                base_path, years=(2030, 2050), scenario_id=scenario_id, fill_fn=lambda year: 1
-            )
+            write_raster_dataset(base_path, years=(2030, 2050), scenario_id=scenario_id, fill_fn=lambda year: 1)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         return base_path
 
@@ -832,9 +820,7 @@ class TestLandChangeChainRoute:
                 years=(MP2023_BASELINE_YEAR, 2040),
                 model_group_id=705,
                 scenario_id=scenario_id,
-                fill_fn=lambda year, comparison=comparison: (
-                    1 if year == MP2023_BASELINE_YEAR else comparison
-                ),
+                fill_fn=lambda year, comparison=comparison: 1 if year == MP2023_BASELINE_YEAR else comparison,
             )
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         return base_path
@@ -872,8 +858,7 @@ class TestLandChangeChainRoute:
         """
         response = client.get(
             "/v1/data.tif",
-            params={k: v for k, v in self.QUERY.items() if k not in ("dimension", "order")}
-            | {"analysis": "lnd_chng"},
+            params={k: v for k, v in self.QUERY.items() if k not in ("dimension", "order")} | {"analysis": "lnd_chng"},
         )
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
@@ -882,9 +867,7 @@ class TestLandChangeChainRoute:
                 "model_group_id=705, scenario_id=35, calendar_year=2040",
             )
 
-    def test_the_chained_by_still_names_the_year_the_pairing_dropped(
-        self, client, land_change_dataset
-    ):
+    def test_the_chained_by_still_names_the_year_the_pairing_dropped(self, client, land_change_dataset):
         """The published pipeline is the other half: the narrowing happens at execution, so
         `by` must still ARRIVE naming `calendar_year`. If it stopped doing so, the fix above
         would be untested by anything and this chain would quietly stop grouping on a
@@ -930,9 +913,7 @@ class TestLandChangeMissingBaselineRoute:
 
     def test_the_tile_answers_404_rather_than_500(self, client, comparison_year_only):
         tile = _tile_for_grid(comparison_year_only)
-        response = client.get(
-            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=self.QUERY
-        )
+        response = client.get(f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=self.QUERY)
         assert response.status_code == 404, response.text
         detail = response.json()["detail"]
         assert "no data for 'base'" in detail
@@ -940,20 +921,14 @@ class TestLandChangeMissingBaselineRoute:
         # pipeline and has never seen the name `base`.
         assert f"variable={RV}" in detail and f"grid={RG}" in detail
 
-    def test_the_same_selection_works_once_the_baseline_year_is_present(
-        self, client, base_path, monkeypatch
-    ):
+    def test_the_same_selection_works_once_the_baseline_year_is_present(self, client, base_path, monkeypatch):
         """The other side of it -- the 404 above is about the MISSING year and nothing else,
         so writing the baseline year into the same fixture must turn it into an image.
         """
-        write_raster_dataset(
-            base_path, years=(MP2023_BASELINE_YEAR, 2024), model_group_id=500, fill_fn=lambda year: 1
-        )
+        write_raster_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2024), model_group_id=500, fill_fn=lambda year: 1)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         tile = _tile_for_grid(base_path)
-        response = client.get(
-            f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=self.QUERY
-        )
+        response = client.get(f"{DATA_URL}/{tile.z}/{tile.x}/{tile.y}.png", params=self.QUERY)
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "image/png"
 
@@ -1025,9 +1000,7 @@ class TestLndTypePlusRoute:
         assert not any("calendar_year" in (step.where or "") for step in expanded.steps if step.op == "filter")
         assert not any(step.op == "group" for step in expanded.steps)
 
-    def test_omitting_a_dimension_widens_the_selection_rather_than_failing(
-        self, client, lnd_type_plus_data
-    ):
+    def test_omitting_a_dimension_widens_the_selection_rather_than_failing(self, client, lnd_type_plus_data):
         """There is no required parameter left to omit -- `LndTypePlus.Parameters` is empty,
         and every name this analysis is steered by is a dimension. A dimension left out of
         the query is therefore not a missing argument, it is an unconstrained axis: it drops
@@ -1041,9 +1014,7 @@ class TestLndTypePlusRoute:
         assert "model_group_id" not in selection
         assert "calendar_year = 2050" in selection
 
-    def test_a_grid_cell_is_rejected_under_the_raster_format_this_analysis_publishes(
-        self, client, lnd_type_plus_data
-    ):
+    def test_a_grid_cell_is_rejected_under_the_raster_format_this_analysis_publishes(self, client, lnd_type_plus_data):
         """`grid_cell` no longer meets an analysis-specific refusal -- it is resolved against
         whatever grid the pipeline's OWN output descriptor names (this analysis names no
         dataset, so there is nothing else it could resolve against), and only then does the

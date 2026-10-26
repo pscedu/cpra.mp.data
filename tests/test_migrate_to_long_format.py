@@ -135,8 +135,10 @@ class TestElevMmVrt:
         """gdalbuildvrt emits a ComplexSource itself for sources that need one; it already
         supports ScaleRatio, so it is scaled rather than promoted -- and its existing
         children are replaced rather than duplicated."""
-        vrt_text = _vrt_of().replace("SimpleSource", "ComplexSource").replace(
-            "</ComplexSource>", "<NODATA>-1</NODATA></ComplexSource>"
+        vrt_text = (
+            _vrt_of()
+            .replace("SimpleSource", "ComplexSource")
+            .replace("</ComplexSource>", "<NODATA>-1</NODATA></ComplexSource>")
         )
         source = ET.fromstring(migrate._elev_mm_vrt(vrt_text, "float32")[0]).find("VRTRasterBand/ComplexSource")
         assert [child.text for child in source.findall("NODATA")] == [str(NODATA)]

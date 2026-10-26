@@ -175,9 +175,7 @@ def _assemble(
         # `csv` there is a pipeline that cannot run: a raster dataset's final frame is
         # band-wide, and `validate_shapes` rejects it against a tabular sink.
         base = (
-            None
-            if dataset is None
-            else download_pipeline(partition.dataset, format or dataset_output_format(dataset))
+            None if dataset is None else download_pipeline(partition.dataset, format or dataset_output_format(dataset))
         )
         analysis = None
     else:
@@ -190,14 +188,10 @@ def _assemble(
         )
         base = analysis.pipeline
 
-    pipeline = build_pipeline(
-        base, partition.pipeline_params, partition.output, format=format
-    )
+    pipeline = build_pipeline(base, partition.pipeline_params, partition.output, format=format)
 
     if analysis is None:
-        pipeline = append_selection(
-            pipeline, selection_filter_where(filters, grid_cell_where=grid_cell_where)
-        )
+        pipeline = append_selection(pipeline, selection_filter_where(filters, grid_cell_where=grid_cell_where))
 
     return pipeline, analysis
 
@@ -277,20 +271,12 @@ async def decode_request(
     class's own render options, bound only on that route; `allow_compression=False` is the
     tile routes; `validate_sink=False` is the visualization route (see `_finish`).
     """
-    partition = partition_query(
-        items, render_fields=render_fields, allow_compression=allow_compression
-    )
+    partition = partition_query(items, render_fields=render_fields, allow_compression=allow_compression)
     if not partition.filters.get("grid_cell"):
-        return _finish(
-            partition, *_assemble(partition, format, partition.filters), None, validate_sink
-        )
+        return _finish(partition, *_assemble(partition, format, partition.filters), None, validate_sink)
 
-    probe, _ = _assemble(
-        partition, format, _probe_filters(partition), PROBE_GRID_CELL_WHERE
-    )
-    grid_cell_where, relabel = await resolve_grid_cell(
-        output_descriptor(probe).grid, partition.filters["grid_cell"]
-    )
+    probe, _ = _assemble(partition, format, _probe_filters(partition), PROBE_GRID_CELL_WHERE)
+    grid_cell_where, relabel = await resolve_grid_cell(output_descriptor(probe).grid, partition.filters["grid_cell"])
     return _finish(
         partition,
         *_assemble(partition, format, partition.filters, grid_cell_where),
@@ -315,20 +301,12 @@ def decode_request_sync(
     for, one and two layers down. Everything but the vector point lookup is shared, so the
     two forms differ in exactly the one `await`.
     """
-    partition = partition_query(
-        items, render_fields=render_fields, allow_compression=allow_compression
-    )
+    partition = partition_query(items, render_fields=render_fields, allow_compression=allow_compression)
     if not partition.filters.get("grid_cell"):
-        return _finish(
-            partition, *_assemble(partition, format, partition.filters), None, validate_sink
-        )
+        return _finish(partition, *_assemble(partition, format, partition.filters), None, validate_sink)
 
-    probe, _ = _assemble(
-        partition, format, _probe_filters(partition), PROBE_GRID_CELL_WHERE
-    )
-    grid_cell_where, relabel = resolve_grid_cell_sync(
-        output_descriptor(probe).grid, partition.filters["grid_cell"]
-    )
+    probe, _ = _assemble(partition, format, _probe_filters(partition), PROBE_GRID_CELL_WHERE)
+    grid_cell_where, relabel = resolve_grid_cell_sync(output_descriptor(probe).grid, partition.filters["grid_cell"])
     return _finish(
         partition,
         *_assemble(partition, format, partition.filters, grid_cell_where),

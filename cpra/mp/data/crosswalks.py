@@ -163,9 +163,10 @@ def _iter_features(path, batch_size=65536, bbox=None):
     out the bogus empty-bbox batch described in `_valid_geometries`. A batch left with no
     valid features after filtering is skipped entirely rather than yielded empty."""
 
-    with pyogrio.open_arrow(
-        str(path), columns=["id"], use_pyarrow=True, batch_size=batch_size, bbox=bbox
-    ) as (_meta, reader):
+    with pyogrio.open_arrow(str(path), columns=["id"], use_pyarrow=True, batch_size=batch_size, bbox=bbox) as (
+        _meta,
+        reader,
+    ):
         for batch in reader:
             wkb = batch.column("wkb_geometry").to_numpy(zero_copy_only=False)
             ids = batch.column("id").to_numpy(zero_copy_only=False)
@@ -246,9 +247,10 @@ def write_vector_crosswalk(
     row_count = 0
     writer = None
     try:
-        with pyogrio.open_arrow(
-            str(dst_path), columns=["id"], use_pyarrow=True, batch_size=batch_size
-        ) as (meta, reader):
+        with pyogrio.open_arrow(str(dst_path), columns=["id"], use_pyarrow=True, batch_size=batch_size) as (
+            meta,
+            reader,
+        ):
             dst_id_type = _id_arrow_type(meta["dtypes"][0])
             schema = pa.schema(
                 [

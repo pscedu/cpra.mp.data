@@ -88,9 +88,7 @@ def annual_frame(years=(2030, 2040), geo_ids=ECOREGION_IDS, value_fn=None, **ove
         "model": pl.Series([kwargs["model"]] * len(years), dtype=pl.String),
     }
     for geo_id in geo_ids:
-        columns[str(geo_id)] = pl.Series(
-            [value_fn(year, geo_id) for year in years], dtype=pl.Float32
-        )
+        columns[str(geo_id)] = pl.Series([value_fn(year, geo_id) for year in years], dtype=pl.Float32)
 
     return pl.DataFrame(columns)
 
@@ -260,18 +258,13 @@ def write_lnd_type_plus_datasets(
     """
     selection = {**LND_TYPE_PLUS_SELECTION, **overrides}
 
-    elevations = [
-        VARIABLES["elev"].nodata if depth is None else round((stage - depth) * 1000)
-        for depth in depths
-    ]
+    elevations = [VARIABLES["elev"].nodata if depth is None else round((stage - depth) * 1000) for depth in depths]
     land = [VARIABLES["lnd_type"].nodata if code is None else code for code in land_types]
     for values, variable in ((elevations, "elev"), (land, "lnd_type")):
         write_raster_dataset(
             base_path,
             years=(year,),
-            data_fn=lambda _year, values=values: np.array(values, dtype="int32").reshape(
-                LND_TYPE_PLUS_SHAPE
-            ),
+            data_fn=lambda _year, values=values: np.array(values, dtype="int32").reshape(LND_TYPE_PLUS_SHAPE),
             variable=variable,
             grid="morph_pixel_v002",
             time_unit="annual",
@@ -289,9 +282,7 @@ def write_lnd_type_plus_datasets(
     if zones is None:
         zone_ids = np.full(LND_TYPE_PLUS_SHAPE, LND_TYPE_PLUS_ZONE, dtype="int32")
     else:
-        zone_ids = np.array([0 if zone is None else zone for zone in zones], dtype="int32").reshape(
-            LND_TYPE_PLUS_SHAPE
-        )
+        zone_ids = np.array([0 if zone is None else zone for zone in zones], dtype="int32").reshape(LND_TYPE_PLUS_SHAPE)
     write_raster_crosswalk(crosswalk_path, "morph_pixel_v002", "hydro_compartment_v002", zone_ids)
     return selection
 
@@ -373,9 +364,7 @@ def _stg_rows_exist(base_path, selection):
     (``Dimension.partition`` is `(time_unit == "daily").any()` for the partition-typed
     dimensions), so every selection shares one directory and the rest is a row filter.
     """
-    directory = (
-        Path(base_path) / "variable=stg" / "time_unit=annual" / "grid=hydro_compartment_v002"
-    )
+    directory = Path(base_path) / "variable=stg" / "time_unit=annual" / "grid=hydro_compartment_v002"
     if not directory.exists():
         return False
     matching = pl.scan_parquet(directory / "*.parquet").filter(
@@ -505,9 +494,7 @@ def write_grid_geometry(geometry_path, grid_name, features):
     grid = GRIDS[grid_name]
     path = geometry_path / f"{grid_name}.fgb"
     ids, geometries = zip(*features)
-    gpd.GeoDataFrame({"id": list(ids)}, geometry=list(geometries), crs=grid.crs).to_file(
-        path, driver="FlatGeobuf"
-    )
+    gpd.GeoDataFrame({"id": list(ids)}, geometry=list(geometries), crs=grid.crs).to_file(path, driver="FlatGeobuf")
     return path
 
 
@@ -536,9 +523,7 @@ def write_pmtiles(tiles_path, grid_name, tile, feature_ids):
     path = tiles_path / f"{grid_name}.pmtiles"
     with open(path, "wb") as f:
         writer = Writer(f)
-        writer.write_tile(
-            _zxy_to_tileid(tile.z, tile.x, tile.y), gzip.compress(vt.SerializeToString())
-        )
+        writer.write_tile(_zxy_to_tileid(tile.z, tile.x, tile.y), gzip.compress(vt.SerializeToString()))
         writer.finalize(
             {
                 "tile_type": TileType.MVT,

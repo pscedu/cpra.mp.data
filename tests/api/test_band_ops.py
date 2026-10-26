@@ -147,9 +147,7 @@ class TestSelectDimensionBandWide:
         metadata_df = pl.DataFrame({"label": ["keep", "drop"]})
         band_wide = (lf, metadata_df, _window(height=2))
 
-        out_lf, out_metadata, _window_out = select_dimension_band_wide(
-            band_wide, "label = 'keep'", extra_columns=[]
-        )
+        out_lf, out_metadata, _window_out = select_dimension_band_wide(band_wide, "label = 'keep'", extra_columns=[])
 
         assert out_metadata["label"].to_list() == ["keep"]
         assert out_lf.collect()["b0"].to_list() == [1, 2]
@@ -190,9 +188,7 @@ def _long_equivalent_survivors(where: str) -> set[tuple[str, int]]:
     hand-written expectation, so the two shapes are compared against each other rather
     than both against my reading of the semantics.
     """
-    elev = pl.LazyFrame(
-        {"grid_cell": [1, 1, 1], "calendar_year": [2025, 2035, 2045], "value": [10.0, 20.0, 30.0]}
-    )
+    elev = pl.LazyFrame({"grid_cell": [1, 1, 1], "calendar_year": [2025, 2035, 2045], "value": [10.0, 20.0, 30.0]})
     stg = pl.LazyFrame(
         {
             "grid_cell": [1, 1, 1],
@@ -281,9 +277,7 @@ class TestSelectDimensionBandWideOverAJoin:
         elev, stg = _joined_fixture()
         joined = join_band_wide([elev, stg], ["elev", "stg"], extra_columns=[])
 
-        out_lf, _metadata, _window_out = select_dimension_band_wide(
-            joined, "aggregate_type = 'mean'", extra_columns=[]
-        )
+        out_lf, _metadata, _window_out = select_dimension_band_wide(joined, "aggregate_type = 'mean'", extra_columns=[])
         result = out_lf.collect()
 
         # Renumbered contiguously, and each surviving band still holds the pixels of the
@@ -428,9 +422,7 @@ class TestHeightAndWindowPreserved:
         # The same hazard at its emptiest: every arm dropped out and there is no `else`, so
         # the expression is a bare `pl.lit(None)`.
         band_wide = _two_band_fixture()
-        out_lf, _metadata, window = case_band_wide(
-            band_wide, _case_op(("calendar_year = 1900", "6")), extra_columns=[]
-        )
+        out_lf, _metadata, window = case_band_wide(band_wide, _case_op(("calendar_year = 1900", "6")), extra_columns=[])
         assert out_lf.collect().height == 3
         assert window == band_wide[2]
 
@@ -463,10 +455,7 @@ class TestSampleGridCellsBandWide:
         # 2 surviving pixels (grid_cell 0 and 1) x 2 bands = 4 long rows.
         assert result.height == 4
         assert set(result["grid_cell"].to_list()) == {0, 1}
-        rows = {
-            (row["grid_cell"], row["calendar_year"]): row["value"]
-            for row in result.to_dicts()
-        }
+        rows = {(row["grid_cell"], row["calendar_year"]): row["value"] for row in result.to_dicts()}
         assert rows[(0, 2020)] == 1
         assert rows[(0, 2021)] == 10
         assert rows[(1, 2020)] == 2
@@ -737,9 +726,7 @@ class TestFilterBandWide:
         metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         band_wide = (lf, metadata_df, _window(height=2))
 
-        out_lf, out_metadata, _window_out = filter_band_wide(
-            band_wide, "__zone__ = 7", extra_columns=["__zone__"]
-        )
+        out_lf, out_metadata, _window_out = filter_band_wide(band_wide, "__zone__ = 7", extra_columns=["__zone__"])
         result = out_lf.collect()
         assert out_metadata["calendar_year"].to_list() == [2020, 2021]
         assert result["b0"].to_list() == [1, None]
@@ -788,9 +775,7 @@ class TestLoweredCalculateBandWide:
         metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         band_wide = (lf, metadata_df, _window(height=2))
 
-        out_lf, out_metadata, _window_out = case_band_wide(
-            band_wide, self._calculate("value * 10"), extra_columns=[]
-        )
+        out_lf, out_metadata, _window_out = case_band_wide(band_wide, self._calculate("value * 10"), extra_columns=[])
         result = out_lf.collect()
 
         assert result["b0"].to_list() == [10, 20]
@@ -810,9 +795,7 @@ class TestLoweredCalculateBandWide:
         lf = pl.LazyFrame({"b0": [1, None]})
         metadata_df = pl.DataFrame({"calendar_year": [2020]})
         band_wide = (lf, metadata_df, _window(height=2))
-        out_lf, _metadata, _window_out = case_band_wide(
-            band_wide, self._calculate("value + 1"), extra_columns=[]
-        )
+        out_lf, _metadata, _window_out = case_band_wide(band_wide, self._calculate("value + 1"), extra_columns=[])
         assert out_lf.collect()["b0"].to_list() == [2, None]
 
 
@@ -837,9 +820,7 @@ class TestCaseBandWideUnpaired:
         metadata_df = pl.DataFrame({"calendar_year": [2020, 2021]})
         op = _case_op(("value > 3", "100"), ("value > 1", "10"))
 
-        out_lf, out_metadata, out_window = case_band_wide(
-            (lf, metadata_df, _window(height=2)), op, extra_columns=[]
-        )
+        out_lf, out_metadata, out_window = case_band_wide((lf, metadata_df, _window(height=2)), op, extra_columns=[])
         result = out_lf.collect()
 
         assert result["b0"].to_list() == [None, 10.0]
@@ -856,15 +837,11 @@ class TestCaseBandWideUnpaired:
         lf = pl.LazyFrame({"b0": [1.0, None]})
         metadata_df = pl.DataFrame({"calendar_year": [2020]})
         op = _case_op(("value > 5", "1"), else_="0")
-        out_lf, _metadata, _window_out = case_band_wide(
-            (lf, metadata_df, _window(height=2)), op, extra_columns=[]
-        )
+        out_lf, _metadata, _window_out = case_band_wide((lf, metadata_df, _window(height=2)), op, extra_columns=[])
         assert out_lf.collect()["b0"].to_list() == [0.0, 0.0]
 
         guarded = _case_op(("value IS NULL", "value"), ("value > 5", "1"), else_="0")
-        out_lf, _metadata, _window_out = case_band_wide(
-            (lf, metadata_df, _window(height=2)), guarded, extra_columns=[]
-        )
+        out_lf, _metadata, _window_out = case_band_wide((lf, metadata_df, _window(height=2)), guarded, extra_columns=[])
         assert out_lf.collect()["b0"].to_list() == [0.0, None]
 
     def test_extra_columns_are_reachable_from_both_the_when_and_the_then(self):
@@ -1146,9 +1123,7 @@ class TestCaseBandWidePaired:
         the whole pair says `AND sal IS NOT NULL`.
         """
         lf = pl.LazyFrame({"b0": [1.0, 2.0], "b1": [10.0, None]})
-        metadata_df = pl.DataFrame(
-            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "sal"]}
-        )
+        metadata_df = pl.DataFrame({"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "sal"]})
         op = _case_op(("marsh > 0", "marsh"), else_="0")
         out_lf, _metadata, _window_out = case_band_wide(
             (lf, metadata_df, _window(height=2)), op, extra_columns=[], value_columns=("marsh", "sal")
@@ -1188,9 +1163,7 @@ class TestCaseBandWidePaired:
         because the group is the right SIZE here, just not the right shape.
         """
         lf = pl.LazyFrame({"b0": [1.0], "b1": [2.0]})
-        metadata_df = pl.DataFrame(
-            {"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "marsh"]}
-        )
+        metadata_df = pl.DataFrame({"calendar_year": [2030, 2030], JOIN_OPERAND_COLUMN: ["marsh", "marsh"]})
         out_lf, out_metadata, out_window = case_band_wide(
             (lf, metadata_df, _window(height=1)),
             _case_op(("marsh > sal", "marsh")),
@@ -1240,9 +1213,7 @@ class TestCaseBandWidePaired:
         uses for `by == []`.
         """
         lf = pl.LazyFrame({"b0": [5.0], "b1": [50.0]})
-        metadata_df = pl.DataFrame(
-            {"variable": ["marsh", "sal"], JOIN_OPERAND_COLUMN: ["marsh", "sal"]}
-        )
+        metadata_df = pl.DataFrame({"variable": ["marsh", "sal"], JOIN_OPERAND_COLUMN: ["marsh", "sal"]})
         out_lf, out_metadata, _window_out = case_band_wide(
             (lf, metadata_df, _window(height=1)),
             _case_op(("marsh > 1 AND sal > 1", "marsh")),

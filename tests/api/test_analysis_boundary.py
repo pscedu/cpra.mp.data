@@ -103,6 +103,5 @@ def test_every_module_is_independently_importable_first(module_name):
         check=False,
     )
     assert result.returncode == 0, (
-        f"import {module_name} failed when run first, alone, in a fresh interpreter:\n"
-        f"{result.stderr}"
+        f"import {module_name} failed when run first, alone, in a fresh interpreter:\n{result.stderr}"
     )

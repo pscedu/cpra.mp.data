@@ -167,9 +167,7 @@ class TestRasterToVectorZonalAggregate:
         metadata_df = _metadata([(data_path, 1)])
 
         frames = _open_raster_frame(metadata_df)
-        out = project_raster_to_vector(
-            frames, _raster_op(aggregate=aggregate), _raster_frame_types()
-        ).collect()
+        out = project_raster_to_vector(frames, _raster_op(aggregate=aggregate), _raster_frame_types()).collect()
 
         got = dict(zip(out["grid_cell"].to_list(), out["value"].to_list()))
         assert got == pytest.approx(self._EXPECTED[aggregate])
@@ -196,10 +194,7 @@ class TestRasterToVectorDimensionCarrying:
         frames = _open_raster_frame(metadata_df)
         out = project_raster_to_vector(frames, _raster_op(aggregate="sum"), _raster_frame_types()).collect()
 
-        rows = {
-            (row["grid_cell"], row["calendar_year"]): row["value"]
-            for row in out.iter_rows(named=True)
-        }
+        rows = {(row["grid_cell"], row["calendar_year"]): row["value"] for row in out.iter_rows(named=True)}
         assert out.height == 4
         assert rows == pytest.approx({(100, 2030): 3.0, (100, 2040): 30.0, (200, 2030): 7.0, (200, 2040): 70.0})
 
@@ -259,9 +254,7 @@ class TestRasterToVectorCountByValue:
         data_path = _write_tif(tmp_path / "data.tif", self._DATA, nodata=-1)
         metadata_df = _metadata([(data_path, 1)])
         frames = _open_raster_frame(metadata_df)
-        out = project_raster_to_vector(
-            frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
-        ).collect()
+        out = project_raster_to_vector(frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()).collect()
         return {(row["grid_cell"], row["value_category"]): row["value"] for row in out.iter_rows(named=True)}
 
     def test_one_row_per_zone_and_distinct_value(self, tmp_path, crosswalk_path):
@@ -294,9 +287,7 @@ class TestRasterToVectorCountByValue:
         metadata_df = _metadata([(path_2030, 1), (path_2040, 1)], calendar_year=[2030, 2040])
 
         frames = _open_raster_frame(metadata_df)
-        out = project_raster_to_vector(
-            frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
-        ).collect()
+        out = project_raster_to_vector(frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()).collect()
 
         rows = {
             (row["calendar_year"], row["grid_cell"], row["value_category"]): row["value"]
@@ -317,9 +308,7 @@ class TestRasterToVectorCountByValue:
         frames = _open_raster_frame(metadata_df)
 
         with pytest.raises(AggregateError, match="count_by_value"):
-            project_raster_to_vector(
-                frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()
-            ).collect()
+            project_raster_to_vector(frames, _raster_op(aggregate="count_by_value"), _raster_frame_types()).collect()
 
 
 class TestRasterToVectorMissingCrosswalk:
@@ -565,9 +554,7 @@ class TestVectorToRasterPlannerSuppliedBands:
         frames = {"v": pl.DataFrame({"grid_cell": [1, 2], "value": [5.0, 6.0]}).lazy()}
         bands = pl.DataFrame({RESERVED_BAND_INDEX_COLUMN: pl.Series([0], dtype=pl.UInt32)})
 
-        out_lf, metadata_out, _ = project_vector_to_raster(
-            frames, _vector_op(), _vector_frame_types(), None, bands
-        )
+        out_lf, metadata_out, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types(), None, bands)
         out = out_lf.collect()
 
         assert metadata_out.equals(bands)
@@ -606,9 +593,7 @@ class TestVectorToRasterPivotStaysLazy:
         frames = {"v": self._armed_lf()}
         bands = pl.DataFrame({"calendar_year": pl.Series([2030, 2040], dtype=pl.Int64)})
 
-        out_lf, metadata_out, _ = project_vector_to_raster(
-            frames, _vector_op(), _vector_frame_types(), None, bands
-        )
+        out_lf, metadata_out, _ = project_vector_to_raster(frames, _vector_op(), _vector_frame_types(), None, bands)
 
         assert metadata_out["calendar_year"].to_list() == [2030, 2040]
         # The output's own width and names are known without executing anything, which is

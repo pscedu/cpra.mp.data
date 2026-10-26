@@ -131,17 +131,13 @@ class TestLoweredCalculateLong:
 
     def test_rewrites_value_everywhere(self):
         df = (
-            case_long(_frame(), self._calculate("value * 2"), VALUE_ONLY)
-            .collect()
-            .sort(["calendar_year", "grid_cell"])
+            case_long(_frame(), self._calculate("value * 2"), VALUE_ONLY).collect().sort(["calendar_year", "grid_cell"])
         )
         assert df["value"].to_list() == [20.0, 40.0, 60.0, 80.0]
         assert df.height == 4
 
     def test_null_value_is_left_null(self):
-        lf = pl.LazyFrame(
-            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]}
-        )
+        lf = pl.LazyFrame({"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]})
         df = case_long(lf, self._calculate("value * 2"), VALUE_ONLY).collect().sort("calendar_year")
         assert df["value"].to_list() == [20.0, None]
 
@@ -176,23 +172,13 @@ class TestLoweredCalculateLongAfterJoin:
         return CaseOp(step_no=2, input="j", cases=[], else_=expression, output="c")
 
     def test_expression_over_operand_columns_collapses_to_one_value(self):
-        df = (
-            case_long(self._joined(), self._calculate("a - b"), frozenset({"a", "b"}))
-            .collect()
-            .sort("calendar_year")
-        )
+        df = case_long(self._joined(), self._calculate("a - b"), frozenset({"a", "b"})).collect().sort("calendar_year")
         assert df["value"].to_list() == [6.0, 25.0]
         assert set(df.columns) == {"calendar_year", "grid_cell", "value"}
 
     def test_null_in_either_operand_leaves_value_null(self):
-        lf = pl.LazyFrame(
-            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, None], "b": [4.0, 5.0]}
-        )
-        df = (
-            case_long(lf, self._calculate("a - b"), frozenset({"a", "b"}))
-            .collect()
-            .sort("calendar_year")
-        )
+        lf = pl.LazyFrame({"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, None], "b": [4.0, 5.0]})
+        df = case_long(lf, self._calculate("a - b"), frozenset({"a", "b"})).collect().sort("calendar_year")
         assert df["value"].to_list() == [6.0, None]
 
     def test_expression_naming_a_column_outside_the_value_namespace_is_rejected(self):
@@ -207,9 +193,7 @@ class TestLoweredCalculateLongAfterJoin:
         # column the frame has -- a dimension inside an expression is rejected here for
         # the same reason it always was.
         with pytest.raises(ExpressionError, match="not in the allowed namespace"):
-            case_long(
-                self._joined(), self._calculate("a * calendar_year"), frozenset({"a", "b"})
-            ).collect()
+            case_long(self._joined(), self._calculate("a * calendar_year"), frozenset({"a", "b"})).collect()
 
 
 def _case(*arms, else_=None):
@@ -268,9 +252,7 @@ class TestCaseLong:
         states the intent in one conjunct, and an arm that tests nullity WORKS, which it
         could not while a blanket guard discarded its answer.
         """
-        lf = pl.LazyFrame(
-            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]}
-        )
+        lf = pl.LazyFrame({"calendar_year": [2030, 2040], "grid_cell": [1, 1], "value": [10.0, None]})
         op = _case(("value > 25", "1"), else_="0")
         df = case_long(lf, op, VALUE_ONLY).collect().sort("calendar_year")
         assert df["value"].to_list() == [0.0, 0.0]
@@ -329,9 +311,7 @@ class TestCaseLongDimensionArms:
         assert df["value"].to_list() == [2.5, 5.0, 22.5, 30.0]
 
     def test_a_null_dimension_fails_the_arm_rather_than_nulling_the_condition(self):
-        lf = pl.LazyFrame(
-            {"calendar_year": [2030, None], "grid_cell": [1, 2], "value": [10.0, 20.0]}
-        )
+        lf = pl.LazyFrame({"calendar_year": [2030, None], "grid_cell": [1, 2], "value": [10.0, 20.0]})
         op = _case(("calendar_year = 2030", "1"), else_="0")
         df = case_long(lf, op, VALUE_ONLY).collect().sort("grid_cell")
         assert df["value"].to_list() == [1.0, 0.0]
@@ -392,9 +372,7 @@ class TestCaseLongAfterJoin:
         A pipeline that really does want both operands present says so, and the second
         half pins that it still can.
         """
-        lf = pl.LazyFrame(
-            {"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, 30.0], "b": [4.0, None]}
-        )
+        lf = pl.LazyFrame({"calendar_year": [2030, 2040], "grid_cell": [1, 1], "a": [10.0, 30.0], "b": [4.0, None]})
         op = _case(("a > 1", "a"), else_="0")
         df = case_long(lf, op, frozenset({"a", "b"})).collect().sort("calendar_year")
         assert df["value"].to_list() == [10.0, 30.0]

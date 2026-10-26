@@ -193,9 +193,7 @@ class TestVectorToVector:
         df = await Crosswalk(VECTOR_GRID).execute()
         assert df.select("src_id", "dst_id").rows() == [(1, 10), (1, 11), (2, 11)]
 
-    async def test_a_coordinate_selects_the_geography_containing_it(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_a_coordinate_selects_the_geography_containing_it(self, vector_crosswalk, vector_geometry):
         """A vector source accepts coordinates on the same terms as the data API's
         grid_cell filter, and reports the cell they resolved to."""
         grid_cell = _geography((500500, 3300500), grid_name=VECTOR_GRID)
@@ -211,9 +209,7 @@ class TestVectorToRaster:
         x, y = _projected(df["dst_lng"][0], df["dst_lat"][0])
         assert box(500000, 3300000, 501000, 3301000).contains(Point(x, y))
 
-    async def test_a_concave_geography_still_gets_a_point_inside_itself(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_a_concave_geography_still_gets_a_point_inside_itself(self, vector_crosswalk, vector_geometry):
         """The reason for a point on surface rather than a centroid: compartment 2's
         centroid lands in the gap between its arms, and would name a location the
         grid_cell doesn't cover."""
@@ -223,9 +219,7 @@ class TestVectorToRaster:
         df = await Crosswalk(VECTOR_GRID, grid_cell="2", to_grid=[RASTER_GRID]).execute()
         assert shape.contains(Point(*_projected(df["dst_lng"][0], df["dst_lat"][0])))
 
-    async def test_the_destination_raster_grid_does_not_change_the_point(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_the_destination_raster_grid_does_not_change_the_point(self, vector_crosswalk, vector_geometry):
         """The point comes from the source polygon; every raster grid covers it."""
         crosswalk = Crosswalk(VECTOR_GRID, grid_cell="1", to_grid=[RASTER_GRID, "morph_pixel_v001"])
         assert crosswalk.destination_grids == [RASTER_GRID, "morph_pixel_v001"]
@@ -240,18 +234,14 @@ class TestVectorToRaster:
         df = await Crosswalk(VECTOR_GRID, grid_cell="99", to_grid=[RASTER_GRID]).execute()
         assert df.height == 0
 
-    async def test_coordinates_that_match_nothing_convert_to_nothing(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_coordinates_that_match_nothing_convert_to_nothing(self, vector_crosswalk, vector_geometry):
         """The coordinates resolve to no source grid_cell at all, so there is nothing left
         to look up a point for."""
         grid_cell = _geography((400000, 3200000), grid_name=VECTOR_GRID)
         df = await Crosswalk(VECTOR_GRID, grid_cell=grid_cell, to_grid=[RASTER_GRID]).execute()
         assert df.height == 0
 
-    async def test_every_geography_is_converted_when_none_is_given(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_every_geography_is_converted_when_none_is_given(self, vector_crosswalk, vector_geometry):
         df = await Crosswalk(VECTOR_GRID, to_grid=[RASTER_GRID]).execute()
         assert df["src_id"].to_list() == [1, 2]
 
@@ -389,9 +379,7 @@ class TestWGS84ToVector:
         already the grid_cell, and no geometry is read to say so."""
         crosswalk = Crosswalk(WGS84.name, grid_cell="-91.5,29.5", to_grid=[RASTER_GRID])
         df = await crosswalk.execute()
-        assert df.select("src_lng", "src_lat", "dst_lng", "dst_lat").rows() == [
-            (-91.5, 29.5, -91.5, 29.5)
-        ]
+        assert df.select("src_lng", "src_lat", "dst_lng", "dst_lat").rows() == [(-91.5, 29.5, -91.5, 29.5)]
 
 
 class TestOutputTable:
@@ -406,9 +394,7 @@ class TestOutputTable:
         df = await crosswalk.execute()
         assert df["dst_grid"].to_list() == [RASTER_GRID, "ecoregion_v001"]
 
-    async def test_the_column_types_do_not_depend_on_the_grids(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_the_column_types_do_not_depend_on_the_grids(self, vector_crosswalk, vector_geometry):
         """The whole point of separate ID and coordinate columns: a raster destination adds
         coordinates without changing what the ID column holds for the vector one."""
         vector_only = await Crosswalk(VECTOR_GRID, grid_cell="2").execute()
@@ -421,9 +407,7 @@ class TestOutputTable:
         assert both.schema["dst_lng"] == pl.Float64
         assert both.schema["scale_factor"] == pl.Float64
 
-    async def test_only_the_columns_a_conversion_uses_are_populated(
-        self, vector_crosswalk, vector_geometry
-    ):
+    async def test_only_the_columns_a_conversion_uses_are_populated(self, vector_crosswalk, vector_geometry):
         """Compartment 2 to an ecoregion and to a raster grid: the first names a cell, the
         second a location, and neither fills in the other's columns."""
         crosswalk = Crosswalk(VECTOR_GRID, grid_cell="2", to_grid=["ecoregion_v001", RASTER_GRID])
@@ -438,9 +422,7 @@ class TestOutputTable:
         assert df.height == 0
         assert df.columns == COLUMNS
 
-    async def test_every_conversion_produces_the_same_columns(
-        self, vector_crosswalk, zone_crosswalk, vector_geometry
-    ):
+    async def test_every_conversion_produces_the_same_columns(self, vector_crosswalk, zone_crosswalk, vector_geometry):
         vector_source = Crosswalk(VECTOR_GRID, grid_cell="1", to_grid=["ecoregion_v001", RASTER_GRID])
         raster_source = Crosswalk(
             RASTER_GRID, grid_cell=_geography(NORTH), to_grid=["ecoregion_v001", "morph_pixel_v001"]
@@ -458,9 +440,7 @@ class TestOutputTable:
 class TestParallelConversion:
     """Destinations are independent of each other, so they don't wait on each other."""
 
-    async def test_destinations_are_converted_at_the_same_time(
-        self, monkeypatch, zone_crosswalk, crosswalk_path
-    ):
+    async def test_destinations_are_converted_at_the_same_time(self, monkeypatch, zone_crosswalk, crosswalk_path):
         """A barrier only two conversions together can clear: were they run one after the
         other, the first would block waiting for a partner that hadn't started yet, and
         time out rather than pass."""
@@ -473,9 +453,7 @@ class TestParallelConversion:
             return convert(self, dst_grid_name)
 
         monkeypatch.setattr(Crosswalk, "_raster_to_vector", _wait_for_the_other)
-        crosswalk = Crosswalk(
-            RASTER_GRID, grid_cell=_geography(NORTH), to_grid=["ecoregion_v001", "parish_v2020"]
-        )
+        crosswalk = Crosswalk(RASTER_GRID, grid_cell=_geography(NORTH), to_grid=["ecoregion_v001", "parish_v2020"])
         df = await crosswalk.execute()
         assert df["dst_grid"].to_list() == ["ecoregion_v001", "parish_v2020"]
 
@@ -497,9 +475,7 @@ class TestParallelConversion:
         assert reads == [VECTOR_GRID]
         assert df.height == 2
 
-    async def test_the_geometry_file_is_left_alone_without_a_raster_destination(
-        self, monkeypatch, vector_crosswalk
-    ):
+    async def test_the_geometry_file_is_left_alone_without_a_raster_destination(self, monkeypatch, vector_crosswalk):
         def _fail(*args, **kwargs):
             raise AssertionError("geometry should not be read for a vector destination")
 
@@ -542,16 +518,12 @@ class TestCrosswalkEndpoint:
         assert df.schema["dst_lng"] == pl.Float64
 
     def test_to_grid_can_be_repeated(self, client, vector_crosswalk, vector_geometry):
-        response = self._get(
-            client, VECTOR_GRID, grid_cell="2", to_grid=["ecoregion_v001", RASTER_GRID]
-        )
+        response = self._get(client, VECTOR_GRID, grid_cell="2", to_grid=["ecoregion_v001", RASTER_GRID])
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["dst_grid"].to_list() == ["ecoregion_v001", RASTER_GRID]
 
     def test_a_raster_source_converts_coordinates(self, client, zone_crosswalk):
-        response = self._get(
-            client, RASTER_GRID, grid_cell=_geography(NORTH), to_grid="ecoregion_v001"
-        )
+        response = self._get(client, RASTER_GRID, grid_cell=_geography(NORTH), to_grid="ecoregion_v001")
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["dst_id"].to_list() == [1]
 

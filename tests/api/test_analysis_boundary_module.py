@@ -140,9 +140,7 @@ class TestResolveDetail:
         assert resolve_detail(ColumnNotFoundError("no such column")) == "no such column"
 
     def test_file_not_found_is_overridden_and_drops_the_path(self):
-        exc = FileNotFoundError(
-            "No such file or directory (os error 2): /ocean/projects/x/variable=marsh/p.parquet"
-        )
+        exc = FileNotFoundError("No such file or directory (os error 2): /ocean/projects/x/variable=marsh/p.parquet")
         assert resolve_detail(exc) == "Dataset does not exist"
 
     def test_a_subclass_of_an_overridden_type_cannot_route_around_the_override(self):
@@ -239,9 +237,7 @@ class TestInstallAnalysisBoundary:
             ("/raise/column-not-found", 400, "no such column"),
         ],
     )
-    def test_each_registered_type_maps_to_its_own_status_and_body(
-        self, boundary_client, path, status, message
-    ):
+    def test_each_registered_type_maps_to_its_own_status_and_body(self, boundary_client, path, status, message):
         response = boundary_client.get(path)
         assert response.status_code == status
         # Every handler returns exactly {"detail": str(exc)} -- if a handler leaked a
@@ -395,9 +391,7 @@ class TestFourRoutesEndToEnd:
         codec = metadata.row_group(0).column(0).compression
         assert codec.upper() == "GZIP"
 
-    def test_a_missing_dataset_is_404_without_disclosing_the_path(
-        self, client, base_path, monkeypatch
-    ):
+    def test_a_missing_dataset_is_404_without_disclosing_the_path(self, client, base_path, monkeypatch):
         """Deliberately no `write_parquet`: the combo is legal but nothing is on disk, so
         the reader raises `FileNotFoundError` inside the sink's writer thread. That thread
         SWALLOWS the exception rather than letting it reach FastAPI's dispatch, so the
@@ -419,9 +413,7 @@ class TestFourRoutesEndToEnd:
         assert str(base_path) not in response.text
         assert "parquet" not in response.text
 
-    def test_an_exception_the_boundary_does_not_know_is_500_on_the_tabular_route(
-        self, client, base_path, monkeypatch
-    ):
+    def test_an_exception_the_boundary_does_not_know_is_500_on_the_tabular_route(self, client, base_path, monkeypatch):
         """`resolve_status` answers `None` for a type this module has no mapping for, and
         the tabular route -- which cannot fall back on FastAPI's own dispatch, since its
         sink raises inside a background thread -- has to decide for itself what to do with

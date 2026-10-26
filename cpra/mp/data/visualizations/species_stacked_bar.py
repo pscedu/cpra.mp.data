@@ -88,20 +88,17 @@ def _species_series():
     """
 
     position = pl.int_range(pl.len())
-    return (
-        SPECIES_VALUES.select(
-            pl.col("value").alias(SPECIES_DIMENSION),
+    return SPECIES_VALUES.select(
+        pl.col("value").alias(SPECIES_DIMENSION),
+        pl.col("label"),
+        species_color=pl.col("color"),
+        species_order=position,
+        species_key=pl.format(
+            "{} {}",
+            (pl.len() - 1 - position).cast(pl.String).str.pad_start(KEY_DIGITS, "0"),
             pl.col("label"),
-            species_color=pl.col("color"),
-            species_order=position,
-            species_key=pl.format(
-                "{} {}",
-                (pl.len() - 1 - position).cast(pl.String).str.pad_start(KEY_DIGITS, "0"),
-                pl.col("label"),
-            ),
-        )
-        .sort("species_order", descending=True)
-    )
+        ),
+    ).sort("species_order", descending=True)
 
 
 SPECIES = _species_series()
@@ -195,8 +192,7 @@ class SpeciesStackedBar(StackedBar):
         for row in SPECIES.iter_rows(named=True):
             field = f"datum[{json.dumps(row[SPECIES_DIMENSION])}]"
             entries.append(
-                f"{json.dumps(row['label'])}: isValid({field})"
-                f" ? format({field}, {json.dumps(number_format)}) : {field}"
+                f"{json.dumps(row['label'])}: isValid({field}) ? format({field}, {json.dumps(number_format)}) : {field}"
             )
         return "{" + ", ".join(entries) + "}"
 
@@ -237,7 +233,8 @@ class SpeciesStackedBar(StackedBar):
             # the legend down to the species being drawn, and listing all 47 here would put
             # every one of them back. The colors ride along in the data instead, as the
             # `species_color` the lookup attached to each row.
-            .scale(range=alt.FieldRange(field="species_color")).legend(
+            .scale(range=alt.FieldRange(field="species_color"))
+            .legend(
                 title=DIMENSIONS[SPECIES_DIMENSION].label,
                 labelExpr=f"slice(datum.label, {KEY_DIGITS + 1})",
                 labelLimit=400,
@@ -256,9 +253,9 @@ class SpeciesStackedBar(StackedBar):
         `veg_species` is annual-only, so `time_field` and `time_column` are the same column.
         """
 
-        return base.transform_pivot(
-            SPECIES_DIMENSION, value="value", groupby=[self.time_column]
-        ).transform_calculate(**{TOOLTIP_FIELD: self.tooltip_expr})
+        return base.transform_pivot(SPECIES_DIMENSION, value="value", groupby=[self.time_column]).transform_calculate(
+            **{TOOLTIP_FIELD: self.tooltip_expr}
+        )
 
     @cached_property
     def tooltip_encoding(self):

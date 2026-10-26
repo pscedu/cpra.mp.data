@@ -68,7 +68,11 @@ def _read_catalog(catalog_path):
 
 def test_write_parquet_appends_catalog_row(base_path, catalog_path):
     write_parquet(
-        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        _tabular_data([2020, 2021, 2022]),
+        base_path=base_path,
+        catalog_path=catalog_path,
+        validate=False,
+        **TABULAR_KWARGS,
     )
 
     catalog = _read_catalog(catalog_path)
@@ -80,10 +84,18 @@ def test_write_parquet_appends_catalog_row(base_path, catalog_path):
 
 def test_write_parquet_gap_then_compact_preserves_gap(base_path, catalog_path):
     write_parquet(
-        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        _tabular_data([2020, 2021, 2022]),
+        base_path=base_path,
+        catalog_path=catalog_path,
+        validate=False,
+        **TABULAR_KWARGS,
     )
     write_parquet(
-        _tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        _tabular_data([2025, 2026, 2027]),
+        base_path=base_path,
+        catalog_path=catalog_path,
+        validate=False,
+        **TABULAR_KWARGS,
     )
 
     assert _read_catalog(catalog_path).height == 2
@@ -98,10 +110,18 @@ def test_write_parquet_gap_then_compact_preserves_gap(base_path, catalog_path):
 
 def test_write_parquet_fill_gap_then_compact_merges(base_path, catalog_path):
     write_parquet(
-        _tabular_data([2020, 2021, 2022]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        _tabular_data([2020, 2021, 2022]),
+        base_path=base_path,
+        catalog_path=catalog_path,
+        validate=False,
+        **TABULAR_KWARGS,
     )
     write_parquet(
-        _tabular_data([2025, 2026, 2027]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
+        _tabular_data([2025, 2026, 2027]),
+        base_path=base_path,
+        catalog_path=catalog_path,
+        validate=False,
+        **TABULAR_KWARGS,
     )
     write_parquet(
         _tabular_data([2023, 2024]), base_path=base_path, catalog_path=catalog_path, validate=False, **TABULAR_KWARGS
@@ -272,9 +292,7 @@ class TestCatalogQueryPreloadedCatalog:
         (e.g. a legacy/partial catalog row), CatalogQuery skips it rather than reporting
         an empty choice list or crashing."""
         dd = InputSelection(variable="ssf", grid="ecoregion_v001", time_unit="annual")
-        query = CatalogQuery(
-            [dd], {}, catalog=self._catalog_frame(percentile=None), catalog_path=tmp_path / "missing"
-        )
+        query = CatalogQuery([dd], {}, catalog=self._catalog_frame(percentile=None), catalog_path=tmp_path / "missing")
 
         result = query.execute()
 

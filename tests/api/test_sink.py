@@ -102,9 +102,7 @@ class TestApplyOutputShaping:
     """
 
     def _lf(self):
-        return pl.DataFrame(
-            {"grid_cell": [1, 1, 2], "value": [5, 1, 9], "extra": ["a", "b", "c"]}
-        ).lazy()
+        return pl.DataFrame({"grid_cell": [1, 1, 2], "value": [5, 1, 9], "extra": ["a", "b", "c"]}).lazy()
 
     def test_sort_ascending_by_default(self):
         out = apply_output_shaping(self._lf(), Output(format="csv", sort="value")).collect()
@@ -132,9 +130,7 @@ class TestApplyOutputShaping:
         # (or silently no-op); running `sort` first, then `select`, is what makes this
         # combination possible at all. Expected order (value desc: 9, 5, 1) is read off
         # `extra`'s corresponding letters, since `value` itself is no longer in the output.
-        out = apply_output_shaping(
-            self._lf(), Output(format="csv", sort="-value", select="extra")
-        ).collect()
+        out = apply_output_shaping(self._lf(), Output(format="csv", sort="-value", select="extra")).collect()
         assert out.columns == ["extra"]
         assert out["extra"].to_list() == ["c", "a", "b"]
 
@@ -810,9 +806,7 @@ class TestRunToPath:
             }
         )
         out_path = base_path.parent / "out.parquet"
-        assert run_to_path(
-            pipeline, out_path, base_path=base_path, compression="gzip", compression_level=9
-        ) is True
+        assert run_to_path(pipeline, out_path, base_path=base_path, compression="gzip", compression_level=9) is True
         metadata = pq.ParquetFile(out_path).metadata
         codec = metadata.row_group(0).column(0).compression
         assert codec.upper() == "GZIP"

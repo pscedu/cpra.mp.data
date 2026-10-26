@@ -144,16 +144,12 @@ class TestVectorPredicatePushdown:
         pipeline = _pipeline(
             {
                 "inputs": {"a": vector_input()},
-                "steps": [
-                    {"op": "filter", "input": "a", "where": "value > 1 and calendar_year = 2035"}
-                ],
+                "steps": [{"op": "filter", "input": "a", "where": "value > 1 and calendar_year = 2035"}],
                 "output": {"format": "csv"},
             }
         )
         resolved = compile_plan(pipeline).inputs["a"]
-        df = pl.DataFrame(
-            {"value": [0, 2, 2], "calendar_year": [2035, 2030, 2035]}
-        )
+        df = pl.DataFrame({"value": [0, 2, 2], "calendar_year": [2035, 2030, 2035]})
         assert df.filter(resolved.predicate)["calendar_year"].to_list() == [2035]
 
     def test_a_value_conjunct_after_a_calculate_does_not_push(self):
@@ -501,16 +497,12 @@ class TestProjectPushdown:
 
 class TestShapeAnnotation:
     def test_a_vector_input_is_long(self):
-        pipeline = _pipeline(
-            {"inputs": {"a": vector_input()}, "steps": [], "output": {"format": "csv"}}
-        )
+        pipeline = _pipeline({"inputs": {"a": vector_input()}, "steps": [], "output": {"format": "csv"}})
         plan = compile_plan(pipeline)
         assert plan.frame_types["a"].shape == Shape.long
 
     def test_a_raster_input_is_band_wide(self):
-        pipeline = _pipeline(
-            {"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}}
-        )
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline)
         assert plan.frame_types["a"].shape == Shape.band_wide
 
@@ -651,9 +643,7 @@ class TestRasterBandPushdown:
         monkeypatch.setattr(
             plan_module,
             "resolve_raster_bands",
-            _fake_resolve_raster_bands(
-                [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
-            ),
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]),
         )
         pipeline = _pipeline(
             {
@@ -673,9 +663,7 @@ class TestRasterBandPushdown:
         monkeypatch.setattr(
             plan_module,
             "resolve_raster_bands",
-            _fake_resolve_raster_bands(
-                [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
-            ),
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]),
         )
         pipeline = _pipeline(
             {
@@ -699,9 +687,7 @@ class TestRasterBandPushdown:
         monkeypatch.setattr(
             plan_module,
             "resolve_raster_bands",
-            _fake_resolve_raster_bands(
-                [{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]
-            ),
+            _fake_resolve_raster_bands([{"calendar_year": 2030}, {"calendar_year": 2035}, {"calendar_year": 2040}]),
         )
         pipeline = _pipeline(
             {
@@ -738,9 +724,7 @@ class TestRasterBandPushdown:
         assert resolved.band_metadata.height == 2
 
     def test_a_spatial_filter_records_the_point_sample_step(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -781,9 +765,7 @@ class TestRasterBandPushdown:
         assert resolved.point_sample_step == 3  # the filter's own step_no
 
     def test_no_spatial_filter_means_no_point_sample_step(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         assert compile_plan(pipeline).inputs["a"].point_sample_step is None
 
@@ -841,9 +823,7 @@ class TestPointSampleThroughABandWideJoin:
         # `fmt` follows the final frame's shape, which is what `validate_shapes` checks it
         # against: `csv` for a chain that ends folded and long, `tif` for one that never
         # leaves band-wide because nothing in it named a pixel.
-        return compile_plan(
-            _pipeline({"inputs": dict(self.OPERANDS), "steps": steps, "output": {"format": fmt}})
-        )
+        return compile_plan(_pipeline({"inputs": dict(self.OPERANDS), "steps": steps, "output": {"format": fmt}}))
 
     def _steps(self):
         return [dict(self.JOIN), dict(self.SAMPLE), dict(self.STACK)]
@@ -958,9 +938,7 @@ class TestDimensionPushdownAcrossJoinsAndFanOut:
         for name in ("a", "b"):
             assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2035, 2040]
 
-    def test_a_conjunct_on_one_operands_own_dimension_narrows_the_other_through_a_shared_one(
-        self, monkeypatch
-    ):
+    def test_a_conjunct_on_one_operands_own_dimension_narrows_the_other_through_a_shared_one(self, monkeypatch):
         # The case the symbolic pass cannot reach and the unified metadata frame exists
         # for: `ffibs_type` is a dimension only `a`'s dataset has, so nothing about it can
         # be handed to `b`'s read as a predicate. But the join pairs their bands on
@@ -993,9 +971,7 @@ class TestDimensionPushdownAcrossJoinsAndFanOut:
         assert plan.inputs["a"].band_metadata["calendar_year"].to_list() == [2030]
         assert plan.inputs["b"].band_metadata["calendar_year"].to_list() == [2030]
 
-    def test_a_band_with_no_counterpart_in_the_other_operand_is_not_dropped_by_the_pairing(
-        self, monkeypatch
-    ):
+    def test_a_band_with_no_counterpart_in_the_other_operand_is_not_dropped_by_the_pairing(self, monkeypatch):
         # The unified frame is a FULL outer join, not an inner one, and this is where that
         # shows: `b`'s 2040 band pairs with no `a` band at all, so an inner join would drop
         # it for that reason alone -- making a trivially-true conjunct narrow the read.
@@ -1264,9 +1240,7 @@ class TestPostJoinNarrowingAtProductionScale:
         monkeypatch.setattr(
             plan_module,
             "resolve_raster_bands",
-            _fake_raster_bands_per_variable(
-                {"elev": self._COMBINATIONS[:178], "lnd_type": self._COMBINATIONS[:179]}
-            ),
+            _fake_raster_bands_per_variable({"elev": self._COMBINATIONS[:178], "lnd_type": self._COMBINATIONS[:179]}),
         )
         return compile_plan(
             _pipeline(
@@ -1389,7 +1363,12 @@ class TestVectorDimensionPushdownAcrossJoins:
                     "inputs": {"a": vector_input(variable="sal"), "b": vector_input(variable="stg")},
                     "steps": [
                         {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                        {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}], "as": "d"},
+                        {
+                            "op": "case",
+                            "input": "j",
+                            "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}],
+                            "as": "d",
+                        },
                         {"op": "calculate", "input": "d", "expression": "a + b"},
                     ],
                     "output": {"format": "csv"},
@@ -1653,7 +1632,12 @@ class TestBandWideJoinCeiling:
                     "inputs": inputs,
                     "steps": [
                         {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
-                        {"op": "case", "input": "j", "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}], "as": "m"},
+                        {
+                            "op": "case",
+                            "input": "j",
+                            "cases": [{"when": "a > 0.5 AND b > 0.5", "then": "a"}],
+                            "as": "m",
+                        },
                         {"op": "join", "type": "spatial", "inputs": ["m", "c"], "as": "j2"},
                         {"op": "case", "input": "j2", "cases": [{"when": "m > 0.5 AND c > 0.5", "then": "m"}]},
                     ],
@@ -2029,9 +2013,7 @@ class TestOverviewEligibility:
         # A raster-to-vector project redistributes pixels onto polygons an overview level
         # can blur across or shrink below one pixel of, so the origin feeding it must never
         # be served a decimated read.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -2051,9 +2033,7 @@ class TestOverviewEligibility:
         # a fan-out clears): "a" is read by two steps here, so its own pushdown state is
         # gone by the time the project runs, but it still IS the raster that project reads
         # from -- overview eligibility has to follow provenance, not validity.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -2080,9 +2060,7 @@ class TestOverviewEligibility:
         # open with" -- `compile_plan` rejects it outright, at compile time, rather than
         # picking one target arbitrarily (`setdefault`-style) and silently ignoring the
         # other `project`'s destination.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -2101,9 +2079,7 @@ class TestOverviewEligibility:
     def test_a_point_sample_forbids_the_overview(self, monkeypatch):
         # An overview pixel is a real value, but not necessarily the one under the sampled
         # coordinate -- a point sample needs the exact pixel, never a decimated stand-in.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -2149,9 +2125,7 @@ class TestOverviewEligibility:
         assert plan.inputs["c"].overview_permitted is True
 
     def test_no_project_and_no_point_sample_means_the_default_permits_it(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         resolved = compile_plan(pipeline).inputs["a"]
         assert resolved.straddling_vector_grid is None
@@ -2189,9 +2163,7 @@ class TestTileReadWindow:
     """
 
     def test_no_tile_means_read_every_origin_whole(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline)
         assert plan.tile is None
@@ -2199,9 +2171,7 @@ class TestTileReadWindow:
         assert plan.inputs["a"].tile_disjoint is False
 
     def test_a_tile_narrows_the_window_to_a_sub_rectangle(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         tile = TileRequest(*_tile_over_the_raster_grid())
         plan = compile_plan(pipeline, tile=tile)
@@ -2219,17 +2189,13 @@ class TestTileReadWindow:
         # The opposite z=1 quadrant -- eastern/southern hemisphere, nowhere near this Gulf
         # Coast grid. `tile_disjoint` rather than a zero-sized window, because `None` on
         # `read_window` already means "read it whole" and a miss is the opposite of that.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline, tile=TileRequest(1, 1, 1))
         assert plan.inputs["a"].tile_disjoint is True
         assert plan.inputs["a"].read_window is None
 
-    def test_an_origin_feeding_a_raster_to_vector_project_reads_a_wider_window(
-        self, monkeypatch, geometry_path
-    ):
+    def test_an_origin_feeding_a_raster_to_vector_project_reads_a_wider_window(self, monkeypatch, geometry_path):
         # The decision this whole arrangement exists to make reachable. "a" feeds a project
         # onto VECTOR_GRID, whose one feature here extends 3 pixels west of the tile's own
         # footprint; every pixel under that feature has to be read or the aggregate silently
@@ -2238,9 +2204,7 @@ class TestTileReadWindow:
         # below distinguishes "the widening ran" from "this tile is just large".
         from shapely.geometry import box
 
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         tile = TileRequest(*_tile_over_the_raster_grid())
         grid = GRIDS[RASTER_GRID]
         # veg_grid_cell_v001's pixels are exactly 480m square, so a feature extended by a
@@ -2307,9 +2271,7 @@ class TestTileDecimation:
     """
 
     def test_no_tile_means_full_resolution(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         assert compile_plan(pipeline).inputs["a"].decimation == (1, 1)
 
@@ -2317,18 +2279,14 @@ class TestTileDecimation:
         # Nothing to read, so nothing to decimate -- and the zero-band frame this becomes
         # is compared field by field against its join partners, which must not see a factor
         # no read ever applied.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         plan = compile_plan(pipeline, tile=TileRequest(1, 1, 1))
         assert plan.inputs["a"].tile_disjoint is True
         assert plan.inputs["a"].decimation == (1, 1)
 
     def test_an_eligible_origin_is_decimated_to_the_tile_read_rule(self, monkeypatch):
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         tile = TileRequest(*_tile_over_the_raster_grid(zoom=6), tile_size=_DECIMATING_TILE_SIZE)
         resolved = compile_plan(pipeline, tile=tile).inputs["a"]
@@ -2346,14 +2304,10 @@ class TestTileDecimation:
         """
         from shapely.geometry import box
 
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         tile = TileRequest(*_tile_over_the_raster_grid(zoom=6), tile_size=_DECIMATING_TILE_SIZE)
         grid = GRIDS[RASTER_GRID]
-        write_grid_geometry(
-            geometry_path, VECTOR_GRID, [(1, box(*transform_bounds(TILE_CRS, grid.crs, *tile.bounds)))]
-        )
+        write_grid_geometry(geometry_path, VECTOR_GRID, [(1, box(*transform_bounds(TILE_CRS, grid.crs, *tile.bounds)))])
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input(), "b": raster_input(variable="sal")},
@@ -2373,9 +2327,7 @@ class TestTileDecimation:
     def test_a_point_sample_origin_stays_full_resolution(self, monkeypatch):
         # The other half of the gate: an overview pixel is a real value, but not necessarily
         # the one under the sampled coordinate.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input()},
@@ -2393,9 +2345,7 @@ class TestTileDecimation:
         # The threshold is real, not a formality: at 256px the target is 528 source pixels,
         # which this grid never exceeds by a factor of two on either axis. A rule that
         # decimated here would be decimating reads that are already tile-sized.
-        monkeypatch.setattr(
-            plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}])
-        )
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         tile = TileRequest(*_tile_over_the_raster_grid(zoom=6))
         assert compile_plan(pipeline, tile=tile).inputs["a"].decimation == (1, 1)

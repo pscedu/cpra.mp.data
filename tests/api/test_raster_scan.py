@@ -274,9 +274,7 @@ class TestDecimatedWindowedRead:
     def test_a_per_axis_factor_decimates_only_that_axis(self, tmp_path):
         path, _ = self._gradient(tmp_path)
 
-        _, _, read_window = scan_raster(
-            _metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=(4, 1)
-        )
+        _, _, read_window = scan_raster(_metadata([(path, 1)]), window=Window(0, 0, 8, 8), decimation=(4, 1))
 
         assert read_window.read_shape == (2, 8)
 

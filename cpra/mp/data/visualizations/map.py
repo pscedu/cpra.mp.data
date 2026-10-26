@@ -317,9 +317,7 @@ class Map(DatasetVisualization):
         it -- while `Compression`'s fields have non-`None` defaults and so are always bound.
         """
         if self.request:
-            base_url = str(
-                self.request.url_for("get_data_tile", z="{z}", x="{x}", y="{y}", format=format)
-            )
+            base_url = str(self.request.url_for("get_data_tile", z="{z}", x="{x}", y="{y}", format=format))
         else:
             base_url = f"https://api.mpdp.coastal.la.gov/v1/data/{{z}}/{{x}}/{{y}}.{format}"
 
@@ -1012,11 +1010,7 @@ class Map(DatasetVisualization):
         # A `kind="variable"` analysis (`lnd_conf`) names its own result; otherwise the
         # variable does.
         resolved = self.resolved_analysis
-        title = (
-            resolved.meta.label
-            if resolved is not None and resolved.meta.kind == "variable"
-            else self.result_label
-        )
+        title = resolved.meta.label if resolved is not None and resolved.meta.kind == "variable" else self.result_label
 
         if difference:
             # The client renders these as tick labels, so unlike `_difference_breaks` --

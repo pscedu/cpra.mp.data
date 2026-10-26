@@ -329,9 +329,7 @@ def _pair_band_groups(
             pl.col("__pos"), pl.col(JOIN_OPERAND_COLUMN).alias("__operands")
         )
     else:
-        grouped = indexed.select(
-            pl.col("__pos").implode(), pl.col(JOIN_OPERAND_COLUMN).implode().alias("__operands")
-        )
+        grouped = indexed.select(pl.col("__pos").implode(), pl.col(JOIN_OPERAND_COLUMN).implode().alias("__operands"))
 
     pairs: list[tuple[int, list[int], dict[str, str]]] = []
     for row_index, (positions, row_operands) in enumerate(
@@ -650,9 +648,7 @@ def _sample_grid_cells_joined(
         long_part = indexed.unpivot(
             index=["grid_cell", *carried], on=band_names, variable_name="__band", value_name="value"
         )
-        identity = pl.DataFrame({"__band": pl.Series(band_names, dtype=pl.String)}).hstack(
-            part.drop(position_column)
-        )
+        identity = pl.DataFrame({"__band": pl.Series(band_names, dtype=pl.String)}).hstack(part.drop(position_column))
         frames.append(long_part.join(identity.lazy(), on="__band", how="left").drop("__band"))
 
     joined = long_ops.join_long(frames, operands)
@@ -762,8 +758,7 @@ def filter_band_wide(
     if kinds[PredicateKind.spatial]:
         if grid_width is None:
             raise ValueError(
-                f"filter_band_wide needs grid_width to decode the spatial conjunct in {where!r} "
-                "into absolute pixel ids"
+                f"filter_band_wide needs grid_width to decode the spatial conjunct in {where!r} into absolute pixel ids"
             )
         return sample_grid_cells_band_wide(
             band_wide, where, extra_columns, grid_width=grid_width, value_columns=value_columns
@@ -797,9 +792,7 @@ def _band_applicability(metadata_df: pl.DataFrame) -> Callable[[str], list[bool]
     def applicable(text: str) -> list[bool]:
         if text not in cache:
             cache[text] = (
-                metadata_df.select(pl.sql_expr(text).fill_null(False).alias("__ok"))
-                .get_column("__ok")
-                .to_list()
+                metadata_df.select(pl.sql_expr(text).fill_null(False).alias("__ok")).get_column("__ok").to_list()
             )
         return cache[text]
 
@@ -1118,9 +1111,7 @@ def join_band_wide(operands: list[BandWideFrame], names: list[str], extra_column
     unclaimed = list(extra_columns)
     for (lf, metadata_df, _window), name in zip(operands, names):
         local_names = band_column_names(metadata_df)
-        select_cols = [
-            pl.col(local_name).alias(f"b{next_position + i}") for i, local_name in enumerate(local_names)
-        ]
+        select_cols = [pl.col(local_name).alias(f"b{next_position + i}") for i, local_name in enumerate(local_names)]
         next_position += len(local_names)
         # First operand that carries it wins, and it is then off the list -- taking a
         # second copy would put two columns of the same name into the horizontal concat.
@@ -1137,9 +1128,7 @@ def join_band_wide(operands: list[BandWideFrame], names: list[str], extra_column
         # docstring describes. A zero-band operand contributes zero band rows; that is the
         # whole of its contribution.
         renamed_metadatas.append(
-            metadata_df.with_columns(pl.lit(name).alias(JOIN_OPERAND_COLUMN))
-            if metadata_df.height
-            else metadata_df
+            metadata_df.with_columns(pl.lit(name).alias(JOIN_OPERAND_COLUMN)) if metadata_df.height else metadata_df
         )
 
     combined = pl.concat(aligned, how="horizontal")

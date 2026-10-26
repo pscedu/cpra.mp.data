@@ -148,9 +148,7 @@ class Crosswalk:
             return
 
         resolved = await resolve_vector_grid_cell(self.grid.name, lngs, lats)
-        self.source_ids = list(
-            dict.fromkeys(grid_cell_id for grid_cell_id in resolved if grid_cell_id is not None)
-        )
+        self.source_ids = list(dict.fromkeys(grid_cell_id for grid_cell_id in resolved if grid_cell_id is not None))
 
     def _frame(self, **columns):
         """Build a crosswalk frame from the grid cell columns a conversion populates.
@@ -173,13 +171,9 @@ class Crosswalk:
         float holds either without rounding one to the other.
         """
         missing = [
-            pl.lit(None, dtype=dtype).alias(name)
-            for name, dtype in GRID_CELL_COLUMNS.items()
-            if name not in df.columns
+            pl.lit(None, dtype=dtype).alias(name) for name, dtype in GRID_CELL_COLUMNS.items() if name not in df.columns
         ]
-        return df.with_columns(missing).select(
-            *GRID_CELL_COLUMNS, pl.col("scale_factor").cast(pl.Float64)
-        )
+        return df.with_columns(missing).select(*GRID_CELL_COLUMNS, pl.col("scale_factor").cast(pl.Float64))
 
     def _vector_to_vector(self, dst_grid_name):
         """Convert vector grid cells with a crosswalk table, returned as it is stored.
@@ -219,9 +213,7 @@ class Crosswalk:
         """
         points = self._representative_points
         source_ids = self.source_ids if self.source_ids is not None else sorted(points)
-        matched = [
-            (grid_cell_id, *points[grid_cell_id]) for grid_cell_id in source_ids if grid_cell_id in points
-        ]
+        matched = [(grid_cell_id, *points[grid_cell_id]) for grid_cell_id in source_ids if grid_cell_id in points]
         src_ids, lngs, lats = _columns(matched, 3)
         return self._frame(src_id=src_ids, dst_lng=lngs, dst_lat=lats)
 
@@ -304,9 +296,7 @@ class Crosswalk:
         if not any(GRIDS[name].grid_type == "raster" for name in self.destination_grids):
             return
 
-        self._representative_points = await asyncio.to_thread(
-            representative_points, self.grid.name, self.source_ids
-        )
+        self._representative_points = await asyncio.to_thread(representative_points, self.grid.name, self.source_ids)
 
     async def execute(self):
         """Convert the source grid cells to every destination grid, as one table.

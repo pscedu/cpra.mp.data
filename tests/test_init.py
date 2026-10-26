@@ -210,9 +210,7 @@ class TestRoundTrip:
         # Long format stores one grid_cell/value pair per row instead of one column per
         # cell, so pull each cell's time series back out by filtering on grid_cell.
         for col in ("1", "16", "32"):
-            values = (
-                result.filter(pl.col("grid_cell") == int(col)).sort("calendar_year")["value"].to_list()
-            )
+            values = result.filter(pl.col("grid_cell") == int(col)).sort("calendar_year")["value"].to_list()
             assert values == pytest.approx(original[col].to_list())
 
     def test_raster_values_survive(self, base_path):

@@ -300,9 +300,7 @@ def _write_via_temp_file(lf, temp_dir, row_group_size, **kwargs):
         lf.sink_parquet(tmp_sorted, row_group_size=row_group_size)
         parquet_file = pq.ParquetFile(tmp_sorted)
         schema = parquet_file.schema_arrow
-        reader = pa.RecordBatchReader.from_batches(
-            schema, parquet_file.iter_batches(batch_size=row_group_size)
-        )
+        reader = pa.RecordBatchReader.from_batches(schema, parquet_file.iter_batches(batch_size=row_group_size))
         _write_dataset(reader, schema, row_group_size=row_group_size, **kwargs)
 
 
@@ -320,6 +318,7 @@ def _write_via_sink_batches(lf, row_group_size, **kwargs):
                 return True
             batch_queue.put(df.to_arrow())
             return None
+
         try:
             lf.sink_batches(_emit, chunk_size=row_group_size, maintain_order=True, engine="streaming")
         finally:

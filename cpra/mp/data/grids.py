@@ -1,4 +1,3 @@
-
 import polars as pl
 
 from cpra.mp.data.structure import read_structure_csv
@@ -18,9 +17,7 @@ class VectorGrid(BaseGrid):
 
     grid_type = "vector"
 
-    def __init__(
-        self, name, label, id_min=None, id_max=None, id_count=None, crs="epsg:26915"
-    ):
+    def __init__(self, name, label, id_min=None, id_max=None, id_count=None, crs="epsg:26915"):
         super().__init__(name=name, label=label, crs=crs)
         self.id_min = id_min
         self.id_max = id_max

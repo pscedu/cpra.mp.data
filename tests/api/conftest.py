@@ -44,15 +44,11 @@ def mpd_engine():
     raises a ResourceWarning attributed to whatever code happened to trigger the GC,
     which is both noisy and misleading.
     """
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         for dimension, value_int, label in MPD_ROWS:
-            session.add(
-                MPDDimensionValue(dimension=dimension, value_int=value_int, label=label)
-            )
+            session.add(MPDDimensionValue(dimension=dimension, value_int=value_int, label=label))
         session.commit()
     yield engine
     engine.dispose()

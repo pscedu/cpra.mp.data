@@ -189,9 +189,7 @@ class TestAppendMissingTabular:
         before = _output_files(output_path)
         _write_annual(base_path, model_group_id=501)
 
-        result, messages = _run(
-            base_path, output_path, catalog_path=None, append_missing=True, dry_run=True
-        )
+        result, messages = _run(base_path, output_path, catalog_path=None, append_missing=True, dry_run=True)
 
         assert result["long_rows"] == 2 * N_CELLS
         assert _output_files(output_path) == before
@@ -208,9 +206,7 @@ class TestAppendMissingTabular:
         _write_annual(base_path, model_group_id=501)
         _run(base_path, output_path, out_catalog, append_missing=True)
 
-        rows = pl.concat(
-            [pl.read_parquet(p) for p in out_catalog.rglob("*.parquet")], how="diagonal_relaxed"
-        )
+        rows = pl.concat([pl.read_parquet(p) for p in out_catalog.rglob("*.parquet")], how="diagonal_relaxed")
         assert sorted(rows["model_group_id"].unique()) == [500, 501]
 
 
@@ -290,8 +286,15 @@ class TestAppendMissingCli:
         --append-missing deliberately re-examines what it has. Asking for both is a typo."""
         result = CliRunner().invoke(
             migrate.main,
-            ["--output-path", str(tmp_path / "out"), "--catalog-path", str(tmp_path / "cat"),
-             "--estimate", "--unconverted-only", "--append-missing"],
+            [
+                "--output-path",
+                str(tmp_path / "out"),
+                "--catalog-path",
+                str(tmp_path / "cat"),
+                "--estimate",
+                "--unconverted-only",
+                "--append-missing",
+            ],
         )
 
         assert result.exit_code != 0
@@ -314,10 +317,25 @@ class TestAppendMissingCli:
                 "CPRA_MP_DATA_CATALOG_PATH": str(catalog_path),
             }
             completed = subprocess.run(
-                [sys.executable, str(SCRIPT_PATH), "--data-path", str(base_path),
-                 "--output-path", str(output_path), "--catalog-path", str(catalog_path),
-                 "--no-progress", "--log-path", str(tmp_path / "log.csv"), *extra],
-                capture_output=True, text=True, cwd=SCRIPT_PATH.parent.parent, env=env, check=False,
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--data-path",
+                    str(base_path),
+                    "--output-path",
+                    str(output_path),
+                    "--catalog-path",
+                    str(catalog_path),
+                    "--no-progress",
+                    "--log-path",
+                    str(tmp_path / "log.csv"),
+                    *extra,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=SCRIPT_PATH.parent.parent,
+                env=env,
+                check=False,
             )
             assert completed.returncode == 0, completed.stderr
             return completed.stdout
@@ -344,10 +362,23 @@ def _run_cli(base_path, output_path, catalog_path, *extra):
         "CPRA_MP_DATA_CATALOG_PATH": str(catalog_path),
     }
     completed = subprocess.run(
-        [sys.executable, str(SCRIPT_PATH), "--data-path", str(base_path),
-         "--output-path", str(output_path), "--catalog-path", str(catalog_path),
-         "--no-progress", *extra],
-        capture_output=True, text=True, cwd=SCRIPT_PATH.parent.parent, env=env, check=False,
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--data-path",
+            str(base_path),
+            "--output-path",
+            str(output_path),
+            "--catalog-path",
+            str(catalog_path),
+            "--no-progress",
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=SCRIPT_PATH.parent.parent,
+        env=env,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout
@@ -380,8 +411,14 @@ class TestSkipUnchanged:
             path.unlink()
 
         stdout = _run_cli(
-            base_path, output_path, catalog_path, "--append-missing",
-            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+            base_path,
+            output_path,
+            catalog_path,
+            "--append-missing",
+            "--skip-unchanged",
+            str(tmp_path / "1.csv"),
+            "--log-path",
+            str(tmp_path / "2.csv"),
         )
 
         assert "1 unchanged since 1.csv" in stdout
@@ -395,8 +432,14 @@ class TestSkipUnchanged:
         _write_annual(base_path, model_group_id=501)
 
         stdout = _run_cli(
-            base_path, output_path, catalog_path, "--append-missing",
-            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+            base_path,
+            output_path,
+            catalog_path,
+            "--append-missing",
+            "--skip-unchanged",
+            str(tmp_path / "1.csv"),
+            "--log-path",
+            str(tmp_path / "2.csv"),
         )
 
         assert "Appended to 1 unit" in stdout
@@ -411,8 +454,14 @@ class TestSkipUnchanged:
         log = str(tmp_path / "1.csv")
         for _ in range(2):
             stdout = _run_cli(
-                base_path, output_path, catalog_path, "--append-missing",
-                "--skip-unchanged", log, "--log-path", log,
+                base_path,
+                output_path,
+                catalog_path,
+                "--append-missing",
+                "--skip-unchanged",
+                log,
+                "--log-path",
+                log,
             )
             assert "1 unchanged since 1.csv" in stdout
         assert [row["status"] for row in _log(log)] == ["unchanged"]
@@ -426,8 +475,14 @@ class TestSkipUnchanged:
         assert int(row["source_bytes"]) == sum(p.stat().st_size for p in base_path.rglob("*.tif"))
 
         stdout = _run_cli(
-            base_path, output_path, catalog_path, "--append-missing",
-            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"),
+            base_path,
+            output_path,
+            catalog_path,
+            "--append-missing",
+            "--skip-unchanged",
+            str(tmp_path / "1.csv"),
+            "--log-path",
+            str(tmp_path / "2.csv"),
         )
         assert "1 unchanged since 1.csv" in stdout
 
@@ -449,15 +504,30 @@ class TestSkipOom:
     def _setup(self, base_path, tmp_path, memory_limit):
         _write_annual(base_path, model_group_id=500)
         (rel,) = (str(p.relative_to(base_path)) for p in migrate.find_partitions(base_path))
-        return _write_log(tmp_path / "1.csv", [{
-            "partition": rel, "data_type": "tabular", "status": "oom",
-            "memory_limit": memory_limit, "error": "exit code -9",
-        }])
+        return _write_log(
+            tmp_path / "1.csv",
+            [
+                {
+                    "partition": rel,
+                    "data_type": "tabular",
+                    "status": "oom",
+                    "memory_limit": memory_limit,
+                    "error": "exit code -9",
+                }
+            ],
+        )
 
     def _run(self, base_path, tmp_path, *extra):
         return _run_cli(
-            base_path, tmp_path / "out", tmp_path / "cat", "--append-missing",
-            "--skip-unchanged", str(tmp_path / "1.csv"), "--log-path", str(tmp_path / "2.csv"), *extra,
+            base_path,
+            tmp_path / "out",
+            tmp_path / "cat",
+            "--append-missing",
+            "--skip-unchanged",
+            str(tmp_path / "1.csv"),
+            "--log-path",
+            str(tmp_path / "2.csv"),
+            *extra,
         )
 
     def test_skipped_at_the_same_limit_and_carried_forward(self, base_path, tmp_path):
@@ -490,8 +560,12 @@ class TestLogRows:
     def test_rows_from_partitions_this_run_does_not_process_are_kept(self, base_path, tmp_path):
         """Reusing one log path across e.g. --variable-filtered runs must not forget anything."""
         _write_annual(base_path, model_group_id=500)
-        elsewhere = {"partition": "variable=other/grid=g/time_unit=annual", "status": "migrated",
-                     "source_bytes": 10, "memory_limit": ""}
+        elsewhere = {
+            "partition": "variable=other/grid=g/time_unit=annual",
+            "status": "migrated",
+            "source_bytes": 10,
+            "memory_limit": "",
+        }
         log = _write_log(tmp_path / "log.csv", [elsewhere])
 
         _run_cli(base_path, tmp_path / "out", tmp_path / "cat", "--skip-unchanged", str(log), "--log-path", str(log))
@@ -518,17 +592,28 @@ class TestLogRows:
 
 class TestLogPredicates:
     def test_a_later_row_supersedes_an_earlier_one(self, tmp_path):
-        path = _write_log(tmp_path / "log.csv", [
-            {"partition": "a", "status": "migrated", "source_bytes": 10},
-            {"partition": "a", "status": "failed"},
-        ])
+        path = _write_log(
+            tmp_path / "log.csv",
+            [
+                {"partition": "a", "status": "migrated", "source_bytes": 10},
+                {"partition": "a", "status": "failed"},
+            ],
+        )
         assert migrate._read_log(path)["a"]["status"] == "failed"
 
     def test_only_matching_or_written_partitions_vouch(self):
         vouching = [
             status
-            for status in ("skipped", "migrated", "appended", "unchanged", "would_append", "would_migrate",
-                           "failed", "oom")
+            for status in (
+                "skipped",
+                "migrated",
+                "appended",
+                "unchanged",
+                "would_append",
+                "would_migrate",
+                "failed",
+                "oom",
+            )
             if migrate._vouches_for({"status": status, "source_bytes": "10"}, 10)
         ]
         assert vouching == ["skipped", "migrated", "appended", "unchanged"]

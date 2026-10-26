@@ -516,9 +516,7 @@ def sink_vector_tile(lf: LongFrame, grid_name: str, tile, *, grid_cell_ids=None,
         return None
 
     id_values = {
-        cell: value
-        for cell, value in zip(df["grid_cell"].to_list(), df["value"].to_list())
-        if value is not None
+        cell: value for cell, value in zip(df["grid_cell"].to_list(), df["value"].to_list()) if value is not None
     }
     if not id_values:
         return None

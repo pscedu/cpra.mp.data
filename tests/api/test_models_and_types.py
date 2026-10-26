@@ -62,9 +62,7 @@ class TestEnums:
         # it collapses to one row per (group, distinct value) and only `project` has
         # somewhere to put the extra rows. That rejection lives in
         # `request/aggregates.py::validate_group_aggregate`, not in this set.
-        assert {m.value for m in AggregateFunction} == {
-            "count", "count_by_value", "max", "mean", "min", "sum"
-        }
+        assert {m.value for m in AggregateFunction} == {"count", "count_by_value", "max", "mean", "min", "sum"}
 
     def test_output_types(self):
         assert {m.value for m in OutputType} == {"raster", "vector"}

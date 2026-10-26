@@ -38,6 +38,7 @@ _ALLOWED_SIBLING_IMPORTS = {
     "execution": frozenset({"request", "io"}),
 }
 
+
 def _dotted_module_name(path: Path) -> str:
     relative = path.relative_to(ANALYSIS_PACKAGE_DIR)
     parts = [ANALYSIS_PACKAGE_NAME, *relative.with_suffix("").parts]
@@ -124,11 +125,7 @@ def test_every_analysis_module_is_under_a_layer():
     importable from all three subpackages, in any direction, without tripping a single
     assertion. Failing here instead makes "put it in a layer" the only way forward.
     """
-    stray = sorted(
-        p.name
-        for p in ANALYSIS_PACKAGE_DIR.glob("*.py")
-        if p.name != "__init__.py"
-    )
+    stray = sorted(p.name for p in ANALYSIS_PACKAGE_DIR.glob("*.py") if p.name != "__init__.py")
     assert not stray, (
         f"module(s) directly under `analysis/`: {stray} -- move each into `request/`, "
         f"`io/`, or `execution/` so the layering rules apply to it"

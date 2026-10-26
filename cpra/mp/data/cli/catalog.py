@@ -95,14 +95,14 @@ def build(base_path, out):
         frames.append(cat)
 
     if not frames:
-        click.echo(f"\nDONE: no valid datasets found under {base} in {time.time()-t0:.1f}s")
+        click.echo(f"\nDONE: no valid datasets found under {base} in {time.time() - t0:.1f}s")
         return
 
     catalog_df = pl.concat(frames, how="diagonal_relaxed")
     ordered = [c for c in CATALOG_DIMS if c in catalog_df.columns and c not in CAL_DIMS] + EXTENT_COLS + ["data_type"]
     catalog_df = catalog_df.select([c for c in ordered if c in catalog_df.columns])
     Catalog(out).append(catalog_df)
-    click.echo(f"\nDONE: {catalog_df.height:,} rows -> {out}/ in {time.time()-t0:.1f}s")
+    click.echo(f"\nDONE: {catalog_df.height:,} rows -> {out}/ in {time.time() - t0:.1f}s")
 
 
 @catalog.command()
@@ -152,6 +152,6 @@ def query(catalog_dir, variable, time_unit, grid):
 
     t = time.time()
     out = CatalogQuery([dataset], {}, catalog_path=catalog_dir).execute()
-    click.echo(f"[table] {(time.time()-t)*1000:.1f} ms")
+    click.echo(f"[table] {(time.time() - t) * 1000:.1f} ms")
     for k, v in out["choices"].items():
         click.echo(f"  {k}: choices={v}  result={out['results'][k]}")

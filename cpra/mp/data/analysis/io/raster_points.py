@@ -72,10 +72,7 @@ def _pixel_positions(grid_name: str, grid_cells: Sequence[int]) -> list[tuple[in
     for cell in grid_cells:
         row, col = divmod(int(cell), grid.width)
         if not (0 <= row < grid.height) or not (0 <= col < grid.width):
-            raise ValueError(
-                f"grid_cell {cell} does not name a pixel of {grid_name!r} "
-                f"({grid.height}x{grid.width})"
-            )
+            raise ValueError(f"grid_cell {cell} does not name a pixel of {grid_name!r} ({grid.height}x{grid.width})")
         positions.append((row, col))
     return positions
 

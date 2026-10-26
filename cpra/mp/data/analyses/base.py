@@ -217,9 +217,7 @@ def dataset_output_format(dataset: DatasetRef) -> str:
     return "tif" if GRIDS[dataset.grid].grid_type == "raster" else "csv"
 
 
-def selection_filter_where(
-    filters: dict[str, Any], *, grid_cell_where: str | None = None
-) -> str | None:
+def selection_filter_where(filters: dict[str, Any], *, grid_cell_where: str | None = None) -> str | None:
     """Compose `filters` into the single `where` string a leading `filter` step takes, or
     `None` when there is nothing to filter on. This is the named-analysis counterpart of
     `request.data_query.build_data_query_pipeline`'s own conjunct assembly, and composes
@@ -247,11 +245,7 @@ def selection_filter_where(
     """
     conjuncts: list[str] = []
 
-    unknown = [
-        key
-        for key in filters
-        if key not in RESERVED_FILTER_KEYS and not is_filterable_dimension(key)
-    ]
+    unknown = [key for key in filters if key not in RESERVED_FILTER_KEYS and not is_filterable_dimension(key)]
     if unknown:
         raise InvalidAnalysisParametersError(
             f"unrecognized filter name(s): {', '.join(sorted(unknown))} -- expected a "
@@ -290,9 +284,7 @@ def pipeline_input_dimensions(pipeline: Pipeline) -> list[str]:
     seen: dict[str, None] = {}
     for selection in pipeline.inputs.values():
         for dim in required_columns(
-            get_input_data_frame(
-                variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
-            ),
+            get_input_data_frame(variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid),
             include_dataset=False,
             include_metadata=False,
         ):

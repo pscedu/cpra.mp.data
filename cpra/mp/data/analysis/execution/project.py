@@ -305,9 +305,7 @@ def _weighted_mean_exprs() -> tuple[pl.Expr, pl.Expr]:
     why both callers below guard the division rather than performing it directly.
     """
     numerator = (pl.col("value") * pl.col("scale_factor")).sum()
-    denominator = (
-        pl.when(pl.col("value").is_not_null()).then(pl.col("scale_factor")).otherwise(None).sum()
-    )
+    denominator = pl.when(pl.col("value").is_not_null()).then(pl.col("scale_factor")).otherwise(None).sum()
     return numerator, denominator
 
 
@@ -350,9 +348,7 @@ def _count_by_value(lf: pl.LazyFrame, crosswalk_lf: pl.LazyFrame, dim_cols: list
     joined = lf.join(crosswalk_lf, left_on="grid_cell", right_on="src_id", how="inner").with_columns(
         pl.col("dst_id").alias("grid_cell")
     )
-    return joined.group_by(*dim_cols, "grid_cell", pl.col("value").alias("value_category")).agg(
-        pl.len().alias("value")
-    )
+    return joined.group_by(*dim_cols, "grid_cell", pl.col("value").alias("value_category")).agg(pl.len().alias("value"))
 
 
 def project_vector_to_vector(
@@ -440,9 +436,7 @@ def project_vector_to_vector(
 
     if aggregate == "sum":
         return _readdress(
-            joined.group_by(*group_key).agg(
-                (pl.col("value") * pl.col("scale_factor")).sum().alias("value")
-            ),
+            joined.group_by(*group_key).agg((pl.col("value") * pl.col("scale_factor")).sum().alias("value")),
             op.to,
         )
     if aggregate == "mean":
@@ -522,9 +516,7 @@ def _zonal_count_by_value(in_zone: pl.LazyFrame, names: list[str]) -> pl.LazyFra
     it is checked against is `config.COUNT_BY_VALUE_MAX_DISTINCT`, read directly for the
     same reason `_count_by_value` reads it directly -- see that function's docstring.
     """
-    per_pixel = in_zone.unpivot(
-        index=[ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value"
-    )
+    per_pixel = in_zone.unpivot(index=[ZONE_COLUMN], on=names, variable_name=_BAND_IDENTITY_COLUMN, value_name="value")
     n_unique = per_pixel.select(pl.col("value").approx_n_unique()).collect(engine="streaming").item()
     validate_count_by_value_cardinality(n_unique, "value", COUNT_BY_VALUE_MAX_DISTINCT)
     return per_pixel.group_by(
@@ -625,9 +617,7 @@ def project_raster_to_vector(
     band_identity = pl.DataFrame({_BAND_IDENTITY_COLUMN: pl.Series(names, dtype=pl.String)}).hstack(
         carried.select(dim_columns)
     )
-    with_metadata = long_lf.join(band_identity.lazy(), on=_BAND_IDENTITY_COLUMN, how="left").drop(
-        _BAND_IDENTITY_COLUMN
-    )
+    with_metadata = long_lf.join(band_identity.lazy(), on=_BAND_IDENTITY_COLUMN, how="left").drop(_BAND_IDENTITY_COLUMN)
     return _readdress(with_metadata, op.to)
 
 
@@ -784,9 +774,7 @@ def project_vector_to_raster(
     )
     wide = wide.rename({str(k): f"b{k}" for k in range(band_count)})
 
-    broadcast = zone_lf.join(
-        wide, left_on=ZONE_COLUMN, right_on="grid_cell", how="left", maintain_order="left"
-    )
+    broadcast = zone_lf.join(wide, left_on=ZONE_COLUMN, right_on="grid_cell", how="left", maintain_order="left")
     # The zone itself rides along as `DOMAIN_COLUMN` -- see that constant's own comment.
     # It is the zone COLUMN, not a derived boolean, because null-vs-not is the entire
     # question and the zone already answers it: a pixel the crosswalk raster's nodata
@@ -794,7 +782,5 @@ def project_vector_to_raster(
     # Kept distinct from `ZONE_COLUMN`, which the raster-to-vector direction carries for a
     # different purpose (a groupable key, not a domain mask) and which a single pipeline
     # can legitimately carry at the same time as this one.
-    out_lf = broadcast.select(
-        [*(f"b{k}" for k in range(band_count)), pl.col(ZONE_COLUMN).alias(DOMAIN_COLUMN)]
-    )
+    out_lf = broadcast.select([*(f"b{k}" for k in range(band_count)), pl.col(ZONE_COLUMN).alias(DOMAIN_COLUMN)])
     return out_lf, metadata_out, window

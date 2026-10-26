@@ -55,13 +55,9 @@ class TestFoldGroupByMatchesPlainGroupBy:
         because it IS the plain `group_by`, reached through one extra `.slice(0, 100)`
         that takes everything."""
         expected = (
-            scattered_nulls_frame.group_by("key")
-            .agg(getattr(pl.col("value"), aggregate)().alias("value"))
-            .sort("key")
+            scattered_nulls_frame.group_by("key").agg(getattr(pl.col("value"), aggregate)().alias("value")).sort("key")
         )
-        actual = fold_group_by(
-            lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=step
-        ).sort("key")
+        actual = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=step).sort("key")
         assert actual.to_dict(as_series=False) == expected.to_dict(as_series=False)
 
     @pytest.mark.parametrize("aggregate", AGGREGATES)
@@ -73,9 +69,9 @@ class TestFoldGroupByMatchesPlainGroupBy:
             .agg(getattr(pl.col("value"), aggregate)().alias("value"))
             .filter(pl.col("key") == "c")
         )
-        actual_row = fold_group_by(
-            lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=1
-        ).filter(pl.col("key") == "c")
+        actual_row = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], aggregate, step=1).filter(
+            pl.col("key") == "c"
+        )
         assert actual_row.to_dict(as_series=False) == expected_row.to_dict(as_series=False)
 
 
@@ -96,12 +92,7 @@ class TestFoldGroupByEmptyChunk:
                 "keep": [True] * 4 + [False] * 4 + [True] * 4,
             }
         )
-        expected = (
-            df.filter(pl.col("keep"))
-            .group_by("key")
-            .agg(pl.col("value").sum().alias("value"))
-            .sort("key")
-        )
+        expected = df.filter(pl.col("keep")).group_by("key").agg(pl.col("value").sum().alias("value")).sort("key")
         actual = fold_group_by(
             lambda: df.lazy(),
             ["key"],
@@ -157,9 +148,9 @@ class TestFoldGroupByWeightColumn:
         # restricted to non-null-value rows = 0.75 + 0.25 = 1.0 -- the null row's own
         # weight (1.0) is excluded, not folded into the denominator -> mean = 12.5.
         # dst "y": numerator = 5*0.5 + 15*0.5 = 10.0; denominator = 0.5 + 0.5 = 1.0.
-        actual = fold_group_by(
-            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=step
-        ).sort("dst")
+        actual = fold_group_by(lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=step).sort(
+            "dst"
+        )
         assert actual["dst"].to_list() == ["x", "y"]
         assert actual["value"].to_list() == pytest.approx([12.5, 10.0])
 
@@ -167,9 +158,9 @@ class TestFoldGroupByWeightColumn:
         """step=1 (five single-row chunks, the maximum number of merges this fixture can
         force) and step=100 (one chunk -- the direct, unfolded answer) must agree exactly:
         the resume contract's batched-vs-unbatched equality requirement for `mean`."""
-        batched = fold_group_by(
-            lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=1
-        ).sort("dst")
+        batched = fold_group_by(lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=1).sort(
+            "dst"
+        )
         unbatched = fold_group_by(
             lambda: weighted_frame.lazy(), ["dst"], "mean", weight_column="weight", step=100
         ).sort("dst")
@@ -188,9 +179,9 @@ class TestFoldGroupByWeightColumn:
         """`weight_column` defaults to `None` -- every existing caller that doesn't pass
         it must see bit-for-bit the same behavior as before this parameter existed."""
         default = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], "mean").sort("key")
-        explicit_none = fold_group_by(
-            lambda: scattered_nulls_frame.lazy(), ["key"], "mean", weight_column=None
-        ).sort("key")
+        explicit_none = fold_group_by(lambda: scattered_nulls_frame.lazy(), ["key"], "mean", weight_column=None).sort(
+            "key"
+        )
         assert default.to_dict(as_series=False) == explicit_none.to_dict(as_series=False)
 
 
@@ -224,9 +215,7 @@ class TestFoldCountByValue:
     def test_null_is_kept_as_its_own_category(self, categorical_frame):
         # Group "a" carries one null-valued row -- it must survive as its own
         # (key="a", value_category=None) row with count 1, not be dropped.
-        actual = fold_count_by_value(
-            lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=1
-        )
+        actual = fold_count_by_value(lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=1)
         null_row = actual.filter(pl.col("key") == "a").filter(pl.col("value_category").is_null())
         assert null_row["value"].to_list() == [1]
 
@@ -236,9 +225,7 @@ class TestFoldCountByValue:
 
     def test_non_positive_step_is_rejected(self, categorical_frame):
         with pytest.raises(FoldError, match="step"):
-            fold_count_by_value(
-                lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=0
-            )
+            fold_count_by_value(lambda: categorical_frame.lazy(), ["key"], "value", max_distinct=10, step=0)
 
     def test_chunk_transform_is_applied_per_chunk(self, categorical_frame):
         """Mirrors `TestFoldGroupByEmptyChunk`'s contract for `fold_group_by` -- a
@@ -313,9 +300,7 @@ class TestShouldFoldGroupBy:
 
     def test_a_custom_high_cardinality_set_is_honored(self):
         assert (
-            should_fold_group_by(
-                ["zone"], has_selective_filter=False, high_cardinality_columns=frozenset({"zone"})
-            )
+            should_fold_group_by(["zone"], has_selective_filter=False, high_cardinality_columns=frozenset({"zone"}))
             is True
         )
 

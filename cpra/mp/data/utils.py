@@ -67,12 +67,7 @@ def required_columns(
 ):
     """Get a list of required columns based on the values in the data frame."""
 
-    result = (
-        df.lazy()
-        .select(**{dim.name: dim.required for dim in DIMENSIONS.values()})
-        .limit(1)
-        .collect()
-    )
+    result = df.lazy().select(**{dim.name: dim.required for dim in DIMENSIONS.values()}).limit(1).collect()
     return (
         [
             col.name
@@ -248,9 +243,7 @@ def build_glob_pattern(required_cols, extension=None, nested=False, **kwargs):
     return "/".join(dimension_patterns) + (f".{extension}" if extension else "")
 
 
-def glob_lazy_frame(
-    required_cols, base_path=None, extension=None, nested=False, include_file_paths="path", **kwargs
-):
+def glob_lazy_frame(required_cols, base_path=None, extension=None, nested=False, include_file_paths="path", **kwargs):
     """Create a LazyFrame with information about matched paths."""
 
     base_path = get_base_path(base_path)

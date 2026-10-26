@@ -100,9 +100,7 @@ def frame_types(grid, **shapes):
     lowering the grid participates in selecting.
     """
     return {
-        name: FrameType(
-            shape=shape, grid=grid, has_count_by_value=False, value_columns=frozenset({"value"})
-        )
+        name: FrameType(shape=shape, grid=grid, has_count_by_value=False, value_columns=frozenset({"value"}))
         for name, shape in shapes.items()
     }
 
@@ -250,7 +248,9 @@ class TestEndToEnd:
     def _run(self, base_path, steps):
         pipeline = _pipeline(
             {
-                "inputs": {"a": {"variable": ANNUAL_KWARGS["variable"], "time_unit": "annual", "grid": ANNUAL_KWARGS["grid"]}},
+                "inputs": {
+                    "a": {"variable": ANNUAL_KWARGS["variable"], "time_unit": "annual", "grid": ANNUAL_KWARGS["grid"]}
+                },
                 "steps": steps,
                 "output": {"format": "csv"},
             }
@@ -359,10 +359,16 @@ class TestEndToEnd:
         monkeypatch.setattr(execute_module, "scan_vector", fake_scan_vector)
 
         sel_a = parse_pipeline(
-            {"inputs": {"a": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}}, "output": {"format": "csv"}}
+            {
+                "inputs": {"a": {"variable": "ssf", "time_unit": "annual", "grid": "ecoregion_v001"}},
+                "output": {"format": "csv"},
+            }
         ).inputs["a"]
         sel_b = parse_pipeline(
-            {"inputs": {"b": {"variable": "sal", "time_unit": "annual", "grid": "ecoregion_v001"}}, "output": {"format": "csv"}}
+            {
+                "inputs": {"b": {"variable": "sal", "time_unit": "annual", "grid": "ecoregion_v001"}},
+                "output": {"format": "csv"},
+            }
         ).inputs["b"]
         plan = ExecutionPlan(
             inputs={"a": ResolvedInput(selection=sel_a), "b": ResolvedInput(selection=sel_b)},
@@ -449,9 +455,7 @@ class TestEndToEnd:
         assert not {"a", "b"} & set(df.columns)
         # ssf = year + geo_id/100, omar = geo_id, so every row's answer is distinct per
         # (year, cell) -- a mispairing across cells or years would not reproduce this.
-        expected = sorted(
-            year + geo_id / 100 - geo_id for year in (2030, 2040) for geo_id in range(1, 33)
-        )
+        expected = sorted(year + geo_id / 100 - geo_id for year in (2030, 2040) for geo_id in range(1, 33))
         assert sorted(df["value"].to_list()) == pytest.approx(expected, abs=1e-3)
 
     def test_project_runs_as_a_whole_json_pipeline(self, annual_dataset, crosswalk_path):
@@ -466,9 +470,7 @@ class TestEndToEnd:
         # join drops them, and the resulting frame has exactly one destination cell per
         # year. `ssf`'s fixture value is `year + geo_id / 100`, so:
         #   sum = 0.5*(year + 0.01) + 0.5*(year + 0.02) = year + 0.015
-        write_vector_crosswalk(
-            crosswalk_path, "ecoregion_v001", "parish_v2020", [(1, 900, 0.5), (2, 900, 0.5)]
-        )
+        write_vector_crosswalk(crosswalk_path, "ecoregion_v001", "parish_v2020", [(1, 900, 0.5), (2, 900, 0.5)])
         pipeline = _pipeline(
             {
                 "inputs": {
@@ -580,9 +582,7 @@ class TestBandWideEndToEnd:
 
         assert df.columns == ["b0"]
         assert band_column_names(metadata_df) == ["b0"]
-        stats = df.select(
-            pl.col("b0").min().alias("min"), pl.col("b0").max().alias("max")
-        ).row(0, named=True)
+        stats = df.select(pl.col("b0").min().alias("min"), pl.col("b0").max().alias("max")).row(0, named=True)
         assert stats["min"] == pytest.approx(3)
         assert stats["max"] == pytest.approx(3)
 
@@ -719,9 +719,7 @@ class TestBandWideEndToEnd:
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input(variable=RASTER_KWARGS["variable"])},
-                "steps": [
-                    {"op": "filter", "input": "a", "where": f"grid_cell IN ({cell_id_a}, {cell_id_b})"}
-                ],
+                "steps": [{"op": "filter", "input": "a", "where": f"grid_cell IN ({cell_id_a}, {cell_id_b})"}],
                 "output": {"format": "csv"},
             }
         )
@@ -821,12 +819,8 @@ class TestBandWideEndToEnd:
 
             return data_fn
 
-        write_raster_dataset(
-            base_path, years=(2030,), variable="vct", data_fn=_fill(1, 77, "int32")
-        )
-        write_raster_dataset(
-            base_path, years=(2030,), variable="ffibs_score", data_fn=_fill(2, 88, "float32")
-        )
+        write_raster_dataset(base_path, years=(2030,), variable="vct", data_fn=_fill(1, 77, "int32"))
+        write_raster_dataset(base_path, years=(2030,), variable="ffibs_score", data_fn=_fill(2, 88, "float32"))
         pipeline = _pipeline(
             {
                 "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
@@ -863,13 +857,9 @@ class TestBandWideEndToEnd:
         # Both operands' own values, under the folded labels the operand names became, at
         # the ABSOLUTE id the caller named -- the narrowing is invisible in all three.
         assert df["grid_cell"].unique().to_list() == [cell_id]
-        assert {row["variable"]: row["value"] for row in df.to_dicts()} == pytest.approx(
-            {"a": 77.0, "b": 88.0}
-        )
+        assert {row["variable"]: row["value"] for row in df.to_dicts()} == pytest.approx({"a": 77.0, "b": 88.0})
 
-    def test_one_shared_scan_still_aligns_operands_narrowed_by_different_amounts(
-        self, base_path, monkeypatch
-    ):
+    def test_one_shared_scan_still_aligns_operands_narrowed_by_different_amounts(self, base_path, monkeypatch):
         # The shared scan above, with the symmetry that made it obviously safe taken away.
         # `_merge_shared_origin_groups` fuses a join's origins into one `scan_raster` call
         # because chunking follows band count and `join_band_wide` aligns positionally --
@@ -886,17 +876,13 @@ class TestBandWideEndToEnd:
             base_path,
             years=(2030, 2040),
             variable="vct",
-            data_fn=lambda year: raster_array(
-                fill=10 if year == 2030 else 20, grid_name=RASTER_GRID, dtype="int32"
-            ),
+            data_fn=lambda year: raster_array(fill=10 if year == 2030 else 20, grid_name=RASTER_GRID, dtype="int32"),
         )
         write_raster_dataset(
             base_path,
             years=(2030, 2040),
             variable="ffibs_score",
-            data_fn=lambda year: raster_array(
-                fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"
-            ),
+            data_fn=lambda year: raster_array(fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"),
         )
         pipeline = _pipeline(
             {
@@ -954,9 +940,7 @@ class TestBandWideEndToEnd:
             base_path,
             years=(2030, 2040),
             variable="ffibs_score",
-            data_fn=lambda year: raster_array(
-                fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"
-            ),
+            data_fn=lambda year: raster_array(fill=5 if year == 2030 else 7, grid_name=RASTER_GRID, dtype="float32"),
         )
         pipeline = _pipeline(
             {
@@ -1118,9 +1102,7 @@ class TestBandWideEndToEnd:
         assert df["grid_cell"].to_list() == [900]
         assert df["value"].to_list() == pytest.approx([10.0])
 
-    def test_a_join_group_whose_operands_all_resolve_to_zero_bands_opens_nothing(
-        self, base_path, monkeypatch
-    ):
+    def test_a_join_group_whose_operands_all_resolve_to_zero_bands_opens_nothing(self, base_path, monkeypatch):
         # The all-zero counterpart to the partial-mismatch case: when EVERY operand of a
         # shared-scan group is narrowed to zero bands by pushdown there is nothing to read
         # and nothing to mismatch, so the group is built from the grid's own geometry with
@@ -1162,9 +1144,7 @@ class TestBandWideEndToEnd:
         assert window.source == ()
         assert window.width == GRIDS[RASTER_GRID].width
 
-    def test_a_project_off_a_shared_scan_join_reads_the_crosswalk_from_that_same_scan(
-        self, base_path, crosswalk_path
-    ):
+    def test_a_project_off_a_shared_scan_join_reads_the_crosswalk_from_that_same_scan(self, base_path, crosswalk_path):
         # The one pipeline shape where the crosswalk attachment and the shared-scan
         # prelude have to cooperate: two raster origins joined band-wide, then projected
         # onto a vector grid. Both origins are reachable from the `project`, so BOTH carry
@@ -1221,9 +1201,7 @@ class TestBandWideEndToEnd:
         # the shared scan is that they stay internal to it.
         assert not [name for name in df.columns if "zone" in name]
 
-    def test_a_project_after_a_by_nothing_group_does_not_leak_the_band_index_column(
-        self, base_path, crosswalk_path
-    ):
+    def test_a_project_after_a_by_nothing_group_does_not_leak_the_band_index_column(self, base_path, crosswalk_path):
         # `group by=[]` collapses both bands to one and leaves the reserved band-index
         # column standing on the metadata (that lowering's own docstring says so). A
         # raster-to-vector `project` then turns every remaining metadata column into a
@@ -1235,9 +1213,7 @@ class TestBandWideEndToEnd:
         # rather than only of the column list: 30 and 40 summed horizontally is 70, and a
         # `project` that re-read raw pixels instead of the grouped frame would report the
         # two original bands separately rather than one row of 70.
-        write_raster_dataset(
-            base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40
-        )
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 30 if year == 2030 else 40)
         grid = GRIDS[RASTER_GRID]
         zones = np.full((grid.height, grid.width), 900, dtype="int32")
         write_raster_crosswalk(crosswalk_path, RASTER_GRID, "ecoregion_v001", zones)
@@ -1392,11 +1368,7 @@ class TestBandWideEndToEnd:
                 "output": {"format": "csv"},
             }
         )
-        df = (
-            execute(compile_plan(pipeline, base_path=base_path), base_path=base_path)
-            .collect()
-            .sort("calendar_year")
-        )
+        df = execute(compile_plan(pipeline, base_path=base_path), base_path=base_path).collect().sort("calendar_year")
 
         assert df["calendar_year"].to_list() == [2030, 2040]
         values = df["value"].to_list()
@@ -1852,9 +1824,7 @@ class TestTileScopedReads:
         path = next(base_path.rglob("*.tif"))
         with rasterio.open(path) as src:
             expected = src.read(1, window=compiled)
-        np.testing.assert_array_equal(
-            df["b0"].to_numpy().reshape(window.height, window.width), expected
-        )
+        np.testing.assert_array_equal(df["b0"].to_numpy().reshape(window.height, window.width), expected)
 
     def test_a_tile_that_misses_the_grid_opens_nothing(self, base_path, monkeypatch):
         # `tile_disjoint` is settled at compile time, so the reader is never reached at all
@@ -2007,10 +1977,7 @@ class TestTileScopedReads:
         window = Window(800, 200, 1, 1)
         assert _shared_point_sample_window(("a", "b"), {"a": window, "b": window}) is window
         assert _shared_point_sample_window(("a", "b"), {"a": window}) is None
-        assert (
-            _shared_point_sample_window(("a", "b"), {"a": window, "b": Window(801, 200, 1, 1)})
-            is None
-        )
+        assert _shared_point_sample_window(("a", "b"), {"a": window, "b": Window(801, 200, 1, 1)}) is None
 
     def test_a_tile_scoped_project_reads_whole_features_across_the_tile_edge(
         self, base_path, crosswalk_path, geometry_path
@@ -2071,9 +2038,7 @@ class TestTileScopedReads:
         # makes the 100 above mean something. It answers 50, a plausible-looking number no
         # caller could tell apart from a correct one, which is the whole reason the widening
         # is a compile-time decision rather than something the sink could fix up later.
-        unwidened = dataclasses.replace(
-            plan, inputs={"a": dataclasses.replace(plan.inputs["a"], read_window=plain)}
-        )
+        unwidened = dataclasses.replace(plan, inputs={"a": dataclasses.replace(plan.inputs["a"], read_window=plain)})
         df_unwidened = execute(unwidened, base_path=base_path).collect()
 
         assert df_unwidened["value"].to_list() == pytest.approx([float(inside_the_tile)])

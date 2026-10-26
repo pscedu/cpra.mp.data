@@ -185,7 +185,7 @@ def main(output_dir):
         .filter(pl.col("calendar_year") == BASE_YEAR)
     )
     if base_row.height == 0:
-        raise ValueError(f"No data found for base year {BASE_YEAR} " "(model_group_id=0, scenario_id=0).")
+        raise ValueError(f"No data found for base year {BASE_YEAR} (model_group_id=0, scenario_id=0).")
     base_array = compute_historic_array(base_row["path"][0], grid)
 
     # for row in hist_inputs.iter_rows(named=True):

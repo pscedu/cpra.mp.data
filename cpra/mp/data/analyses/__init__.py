@@ -90,9 +90,7 @@ def _register(classes: list[type[Analysis]]) -> dict[str, type[Analysis]]:
                 f"{cls.__name__} must declare `Meta = AnalysisMeta(...)`; got "
                 f"{type(meta).__name__ if meta is not None else 'no Meta of its own'}"
             )
-        dimension_named = sorted(
-            field for field in cls.Parameters.model_fields if is_filterable_dimension(field)
-        )
+        dimension_named = sorted(field for field in cls.Parameters.model_fields if is_filterable_dimension(field))
         if dimension_named:
             raise AnalysisRegistryError(
                 f"{cls.__name__}.Parameters declares dimension-named field(s) "
@@ -187,15 +185,12 @@ def resolve_analysis(
 
     analysis_class.validate_selection(parameters, filters)
 
-    analysis = analysis_class(
-        dataset=dataset, filters=filters, parameters=parameters, grid_cell_where=grid_cell_where
-    )
+    analysis = analysis_class(dataset=dataset, filters=filters, parameters=parameters, grid_cell_where=grid_cell_where)
     try:
         pipeline = analysis.pipeline()
     except RequestError as exc:
         raise InvalidAnalysisParametersError(
-            f"analysis {name!r} could not build a pipeline from the given parameters/"
-            f"filters: {exc}"
+            f"analysis {name!r} could not build a pipeline from the given parameters/filters: {exc}"
         ) from exc
 
     return ResolvedAnalysis(

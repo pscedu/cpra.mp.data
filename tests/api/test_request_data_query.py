@@ -225,7 +225,9 @@ class TestCallerWhere:
 
 class TestGridCell:
     def test_single_digit_id(self):
-        pipeline = build_data_query_pipeline(_dataset_dimensions(), FilterDimensions(), DataOptions(grid_cell="1"), "csv")
+        pipeline = build_data_query_pipeline(
+            _dataset_dimensions(), FilterDimensions(), DataOptions(grid_cell="1"), "csv"
+        )
         assert pipeline.steps[0].where == "grid_cell = 1"
 
     def test_multiple_digit_ids(self):

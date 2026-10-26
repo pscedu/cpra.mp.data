@@ -349,9 +349,7 @@ class TestNotebookQueryEndToEnd:
         assert response.status_code == 400, response.text
         assert "is not a long frame on a vector grid" in response.json()["detail"]
 
-    def test_raster_tile_pipeline_error_is_a_400_not_a_500(
-        self, client, notebook_query_data, monkeypatch
-    ):
+    def test_raster_tile_pipeline_error_is_a_400_not_a_500(self, client, notebook_query_data, monkeypatch):
         """The sibling of the `.pbf` case above, for the RASTER tile route: a `RequestError`
         raised while rendering a tile must reach the caller as 400, not an unhandled 500.
 
@@ -590,16 +588,12 @@ class TestFilterWhereDimensionNot:
         }
         pipeline_response = client.post("/v1/data.csv", json=pipeline)
         assert pipeline_response.status_code == 200, pipeline_response.text
-        pipeline_df = pl.read_csv(io.BytesIO(pipeline_response.content)).sort(
-            ["calendar_year", "grid_cell"]
-        )
+        pipeline_df = pl.read_csv(io.BytesIO(pipeline_response.content)).sort(["calendar_year", "grid_cell"])
 
         # One row -- (calendar_year=2030, grid_cell=5) -- is excluded out of 64 total
         # (32 grid cells x 2 years); every other combination is kept.
         assert pipeline_df.height == 63
-        assert not (
-            (pipeline_df["calendar_year"] == 2030) & (pipeline_df["grid_cell"] == 5)
-        ).any()
+        assert not ((pipeline_df["calendar_year"] == 2030) & (pipeline_df["grid_cell"] == 5)).any()
 
         flat_response = client.get(
             "/v1/data.csv",
@@ -648,9 +642,7 @@ class TestInputGridCellEndToEnd:
 
         query = pipeline_to_query(parse_pipeline(self.PIPELINE))
         assert query["step.1.where"] == "grid_cell = 5 OR grid_cell = 6"
-        post_df = pl.read_csv(
-            io.BytesIO(client.post("/v1/data.csv", json=self.PIPELINE).content)
-        ).sort("grid_cell")
+        post_df = pl.read_csv(io.BytesIO(client.post("/v1/data.csv", json=self.PIPELINE).content)).sort("grid_cell")
         get_response = client.get("/v1/data.csv", params=query)
         assert get_response.status_code == 200, get_response.text
         get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
@@ -764,8 +756,7 @@ class TestProjectAggregateCountByValue:
         # `execution.project`'s `_zonal_count_by_value` names its output columns
         # `grid_cell` / `value_category` (the distinct SOURCE value) / `value` (the count).
         actual = {
-            (int(row["grid_cell"]), float(row["value_category"])): int(row["value"])
-            for row in df.iter_rows(named=True)
+            (int(row["grid_cell"]), float(row["value_category"])): int(row["value"]) for row in df.iter_rows(named=True)
         }
         assert actual == expected
 
@@ -841,9 +832,7 @@ class TestPostProjectGridCellFilterEndToEnd:
         df = pl.read_csv(io.BytesIO(response.content))
         assert sorted(df["grid_cell"].to_list()) == [1, 2]
 
-    def test_two_post_project_grid_cell_filters_intersect(
-        self, client, base_path, crosswalk_path, monkeypatch
-    ):
+    def test_two_post_project_grid_cell_filters_intersect(self, client, base_path, crosswalk_path, monkeypatch):
         """Two sequential post-project `grid_cell` filters AND together, as declared --
         `IN (1, 2)` then `IN (2, 3)` keeps zone 2 alone. A hand-computed correctness check:
         an implementation that absorbed both filters into a single last-write-wins zone
@@ -975,9 +964,9 @@ class TestWeightedCaseEndToEnd:
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
         query = pipeline_to_query(parse_pipeline(self.WEIGHTED_PIPELINE))
-        post_df = pl.read_csv(
-            io.BytesIO(client.post("/v1/data.csv", json=self.WEIGHTED_PIPELINE).content)
-        ).sort("grid_cell")
+        post_df = pl.read_csv(io.BytesIO(client.post("/v1/data.csv", json=self.WEIGHTED_PIPELINE).content)).sort(
+            "grid_cell"
+        )
         get_response = client.get("/v1/data.csv", params=query)
         assert get_response.status_code == 200, get_response.text
         get_df = pl.read_csv(io.BytesIO(get_response.content)).sort("grid_cell")
@@ -1191,9 +1180,7 @@ class TestRejections:
         assert response.status_code == 400
         assert "output.format='csv'" in response.json()["detail"]
 
-    def test_url_format_overwrite_is_not_only_a_rejection(
-        self, client, base_path, monkeypatch
-    ):
+    def test_url_format_overwrite_is_not_only_a_rejection(self, client, base_path, monkeypatch):
         """The positive half of the rule the two tests above only see reject: a pipeline
         that declares `csv` and is fetched as `.ndjson` is SERVED, as ndjson.
 

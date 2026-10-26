@@ -201,9 +201,7 @@ class StackedBar(DatasetVisualization):
             .properties(title=self.title, width=self.chart_width)
         )
 
-        nearest = alt.selection_point(
-            "hover", nearest=True, on="pointerover", fields=[self.time_field], empty=False
-        )
+        nearest = alt.selection_point("hover", nearest=True, on="pointerover", fields=[self.time_field], empty=False)
         rules = self.hover_rules(base, alt.when(nearest)).add_params(nearest)
 
         layer = [bars, rules]

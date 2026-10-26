@@ -410,9 +410,7 @@ def wide_unique_pixel_raster(tmp_path_factory):
         count=1,
         dtype="int32",
         crs=GRID.crs,
-        transform=from_bounds(
-            centre_x - half, centre_y - half, centre_x + half, centre_y + half, WIDE_SIZE, WIDE_SIZE
-        ),
+        transform=from_bounds(centre_x - half, centre_y - half, centre_x + half, centre_y + half, WIDE_SIZE, WIDE_SIZE),
         nodata=NODATA,
         tiled=True,
         blockxsize=256,
@@ -482,9 +480,7 @@ class TestDecimatedTileReads:
                             f"z={zoom} reads {read_height}x{read_width}, past the {limit}px bound -- "
                             "a tile read is growing with the zoom again"
                         )
-                        best_saving = max(
-                            best_saving, (window.height * window.width) / (read_height * read_width)
-                        )
+                        best_saving = max(best_saving, (window.height * window.width) / (read_height * read_width))
 
         # ... and it is actually buying something at the outermost zoom, rather than the
         # bound above holding vacuously because nothing was ever big enough to decimate.
@@ -565,9 +561,7 @@ class TestDecimatedTileReads:
                 if tile_read_shape(window, TILE_SIZE) is not None:
                     continue
                 identical_tiles += 1
-                assert np.array_equal(
-                    _window_then_warp_decimated(src, bounds), _window_then_warp(src, bounds)
-                )
+                assert np.array_equal(_window_then_warp_decimated(src, bounds), _window_then_warp(src, bounds))
 
         assert identical_tiles >= 20, f"only {identical_tiles} tiles read whole -- nothing was compared"
 
@@ -829,9 +823,7 @@ class TestStraddlingFeatureWidensTheWindow:
             write_grid_geometry(geometry_path, "hydro_compartment_v001", [(1, feature)])
 
             no_grid_window = tile_source_window(src, bounds, resampling=Resampling.nearest)
-            plain_window = tile_source_window(
-                src, bounds, resampling=Resampling.nearest, straddling_vector_grid=None
-            )
+            plain_window = tile_source_window(src, bounds, resampling=Resampling.nearest, straddling_vector_grid=None)
 
             assert no_grid_window == plain_window
 
@@ -969,9 +961,7 @@ class TestResamplingBufferSizing:
             "derived buffer still disagree with the generously-buffered reference"
         )
 
-    def test_the_derived_buffer_is_not_sufficient_where_the_warp_downsamples(
-        self, wide_unique_pixel_raster
-    ):
+    def test_the_derived_buffer_is_not_sufficient_where_the_warp_downsamples(self, wide_unique_pixel_raster):
         """The boundary of the property above, pinned as a measurement rather than left to
         be discovered by whoever first renders a non-nearest tile at low zoom.
 
@@ -997,15 +987,9 @@ class TestResamplingBufferSizing:
             for zoom in (13, 14):
                 for resampling in (Resampling.nearest, Resampling.bilinear):
                     disagreement = compared = 0
-                    for bounds, _reference in _sweep(
-                        src, zooms=[zoom], centre_lon_lat=_wide_centre(src)
-                    ):
-                        derived = _window_then_warp_resampled(
-                            src, bounds, resampling, decimate=True
-                        )
-                        generous = _window_then_warp_resampled(
-                            src, bounds, resampling, buffer_px=20, decimate=True
-                        )
+                    for bounds, _reference in _sweep(src, zooms=[zoom], centre_lon_lat=_wide_centre(src)):
+                        derived = _window_then_warp_resampled(src, bounds, resampling, decimate=True)
+                        generous = _window_then_warp_resampled(src, bounds, resampling, buffer_px=20, decimate=True)
                         both = (derived != NODATA) & (generous != NODATA)
                         disagreement += int(((derived != generous) & both).sum())
                         compared += int(both.sum())
@@ -1118,8 +1102,12 @@ def _warp_first_then_collapse(metadata_df, tile_bounds, tile_size, aggregate):
             arrays.append(vrt.read(1))
 
     columns = {f"b{i}": arr.ravel() for i, arr in enumerate(arrays)}
-    lf = pl.DataFrame(columns).lazy().with_columns(
-        [pl.when(pl.col(name) == NODATA).then(None).otherwise(pl.col(name)).alias(name) for name in columns]
+    lf = (
+        pl.DataFrame(columns)
+        .lazy()
+        .with_columns(
+            [pl.when(pl.col(name) == NODATA).then(None).otherwise(pl.col(name)).alias(name) for name in columns]
+        )
     )
     fake_window = ReadWindow(
         source=tuple(paths),
@@ -1138,12 +1126,7 @@ def _warp_first_then_collapse(metadata_df, tile_bounds, tile_size, aggregate):
         extra_columns=[],
     )
     return (
-        collapsed_lf.select("b0")
-        .collect()
-        .get_column("b0")
-        .fill_null(NODATA)
-        .to_numpy()
-        .reshape(tile_size, tile_size)
+        collapsed_lf.select("b0").collect().get_column("b0").fill_null(NODATA).to_numpy().reshape(tile_size, tile_size)
     )
 
 
@@ -1216,6 +1199,5 @@ class TestCollapseThenWarpMatchesWarpThenCollapse:
         assert reference.shape == (TILE_SIZE, TILE_SIZE)
         assert (reference != NODATA).sum() > 1000, "the reference tile is empty -- nothing compared"
         assert np.array_equal(ported, reference), (
-            f"aggregate={aggregate} z={zoom}: collapse-then-warp differs from "
-            "warp-then-collapse"
+            f"aggregate={aggregate} z={zoom}: collapse-then-warp differs from warp-then-collapse"
         )

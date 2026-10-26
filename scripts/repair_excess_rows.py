@@ -99,10 +99,15 @@ def output_files(output_path: Path, hive_dims: dict) -> list[Path]:
     """
     dataset_dir = output_path.joinpath(*(f"{name}={hive_dims[name]}" for name in DATASET_DIMS))
     if dataset_dir not in _output_index:
-        _output_index[dataset_dir] = [
-            (parse_path_dims(path.parent.relative_to(output_path)), path)
-            for path in sorted(dataset_dir.rglob("*.parquet")) if path.is_file()
-        ] if dataset_dir.is_dir() else []
+        _output_index[dataset_dir] = (
+            [
+                (parse_path_dims(path.parent.relative_to(output_path)), path)
+                for path in sorted(dataset_dir.rglob("*.parquet"))
+                if path.is_file()
+            ]
+            if dataset_dir.is_dir()
+            else []
+        )
     wanted = {name: str(value) for name, value in hive_dims.items()}
     return [path for dims, path in _output_index[dataset_dir] if all(dims.get(k) == v for k, v in wanted.items())]
 
@@ -117,8 +122,14 @@ def check_partition(paths: list[Path], output_path: Path, unique_parquet_rows: b
     ``files``.
     """
     record = {
-        "status": OK, "expected": 0, "existing": 0, "over_rows": 0, "short_rows": 0,
-        "over_groups": 0, "short_groups": 0, "files": [],
+        "status": OK,
+        "expected": 0,
+        "existing": 0,
+        "over_rows": 0,
+        "short_rows": 0,
+        "over_groups": 0,
+        "short_groups": 0,
+        "files": [],
     }
     schema = mig._wide_schema(paths[0])
     if schema is None:
@@ -233,7 +244,15 @@ def catalog_prune_partition(catalog_path: Path, rel: str) -> tuple[int, int]:
 
 
 def rebuild(
-    tasks, base_path, output_path, catalog_path, memory_limit, temp_path, unique_parquet_rows, workers, progress=True,
+    tasks,
+    base_path,
+    output_path,
+    catalog_path,
+    memory_limit,
+    temp_path,
+    unique_parquet_rows,
+    workers,
+    progress=True,
 ):
     """Re-migrate ``tasks`` (``("tabular", rel, paths)``), each in its own spawned process.
 
@@ -252,8 +271,16 @@ def rebuild(
         if task is None:
             return
         args = (
-            task, base_path, output_path, catalog_path, False, memory_limit, False, temp_path,
-            unique_parquet_rows, False,
+            task,
+            base_path,
+            output_path,
+            catalog_path,
+            False,
+            memory_limit,
+            False,
+            temp_path,
+            unique_parquet_rows,
+            False,
         )
         process = ctx.Process(target=mig._run_partition, args=(args, result_queue), daemon=True)
         process.start()
@@ -293,8 +320,19 @@ def rebuild(
 
 
 REPORT_FIELDS = [
-    "partition", "status", "expected", "existing", "over_rows", "over_groups",
-    "short_rows", "short_groups", "files", "action", "after_status", "after_existing", "error",
+    "partition",
+    "status",
+    "expected",
+    "existing",
+    "over_rows",
+    "over_groups",
+    "short_rows",
+    "short_groups",
+    "files",
+    "action",
+    "after_status",
+    "after_existing",
+    "error",
 ]
 
 
@@ -341,8 +379,20 @@ REPORT_FIELDS = [
 @click.option("--execute", is_flag=True, help="Actually purge and rebuild. Without it, only check and report.")
 @click.option("--progress/--no-progress", default=True, help="Show progress bars (use --no-progress for batch jobs).")
 def main(
-    data_path, output_path, catalog_path, variable, grid, time_unit, include_short, unique_parquet_rows,
-    memory_limit, temp_path, workers, report, execute, progress,
+    data_path,
+    output_path,
+    catalog_path,
+    variable,
+    grid,
+    time_unit,
+    include_short,
+    unique_parquet_rows,
+    memory_limit,
+    temp_path,
+    workers,
+    report,
+    execute,
+    progress,
 ):
     catalog_path = Path(catalog_path) if catalog_path else CATALOG_PATH
     if not catalog_path:
@@ -398,7 +448,11 @@ def main(
     print(f"\nChecked {len(records)} partition(s): " + ", ".join(f"{n} {s}" for s, n in sorted(tally.items())))
     for status, note in (
         (SHARED, "output file(s) also hold other partitions' rows -- left alone"),
-        (SHORT, "short of the source" + ("" if include_short else " -- not flagged (see --append-missing / --include-short)")),
+        (
+            SHORT,
+            "short of the source"
+            + ("" if include_short else " -- not flagged (see --append-missing / --include-short)"),
+        ),
     ):
         rels = [rel for rel, rec in records.items() if rec["status"] == status]
         if rels:
@@ -464,7 +518,14 @@ def main(
     # --- rebuild -------------------------------------------------------------------------
     tasks = [("tabular", rel, records[rel]["paths"]) for rel in purged]
     outcome = rebuild(
-        tasks, base_path, output_path, catalog_path, memory_limit, temp_path, unique_parquet_rows, max(1, workers),
+        tasks,
+        base_path,
+        output_path,
+        catalog_path,
+        memory_limit,
+        temp_path,
+        unique_parquet_rows,
+        max(1, workers),
         progress=progress,
     )
 

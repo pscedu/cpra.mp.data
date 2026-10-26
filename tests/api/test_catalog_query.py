@@ -396,9 +396,7 @@ class TestDailyCompression:
             model="icm_v2023.0.0",
         )
 
-        result = query(
-            catalog_path, {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily"}
-        )
+        result = query(catalog_path, {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily"})
         assert result["choices"]["calendar_day"] == [["2030-01-01", "2030-01-05"]]
 
     def test_selected_days_are_stringified(self, base_path, catalog_path):
@@ -418,9 +416,7 @@ class TestDailyCompression:
             model="icm_v2023.0.0",
         )
 
-        result = query(
-            catalog_path, {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily"}
-        )
+        result = query(catalog_path, {"variable": "sal", "grid": "hydro_compartment_v001", "time_unit": "daily"})
         assert all(isinstance(v, str) for v in result["results"]["calendar_day"])
 
 
@@ -484,8 +480,7 @@ class TestSeveralInputs:
 
     def _inputs(self, *variables):
         return [
-            InputSelection(variable=variable, grid=RASTER_KWARGS["grid"], time_unit="annual")
-            for variable in variables
+            InputSelection(variable=variable, grid=RASTER_KWARGS["grid"], time_unit="annual") for variable in variables
         ]
 
     @pytest.fixture
@@ -507,9 +502,7 @@ class TestSeveralInputs:
         assert 7 not in both["choices"]["scenario_id"]
 
     def test_selecting_the_common_value_is_exact(self, overlapping):
-        result = CatalogQuery(
-            self._inputs("vct", "veg_area"), {"scenario_id": [8]}, catalog_path=overlapping
-        ).execute()
+        result = CatalogQuery(self._inputs("vct", "veg_area"), {"scenario_id": [8]}, catalog_path=overlapping).execute()
         assert result["results"]["scenario_id"] == [8]
 
     def test_the_same_dataset_twice_is_scanned_once(self, overlapping):

@@ -74,9 +74,7 @@ def vector_data(base_path, monkeypatch):
 @pytest.fixture
 def ecoregion_geometry(geometry_path):
     """A single 1km square at ecoregion_v001 cell 1, for coordinate lookups."""
-    return write_grid_geometry(
-        geometry_path, "ecoregion_v001", [(1, box(500000, 3300000, 501000, 3301000))]
-    )
+    return write_grid_geometry(geometry_path, "ecoregion_v001", [(1, box(500000, 3300000, 501000, 3301000))])
 
 
 @pytest.fixture
@@ -269,9 +267,7 @@ class TestVectorData:
         df = pl.read_csv(io.BytesIO(response.content))
         assert {"grid_cell", "value"} <= set(df.columns)
 
-    def test_reports_cell_ids_for_a_coordinate_selection(
-        self, client, vector_data, ecoregion_geometry
-    ):
+    def test_reports_cell_ids_for_a_coordinate_selection(self, client, vector_data, ecoregion_geometry):
         """The shape every visualization requests: long format, and still keyed by ID, so
         the caller can join it against anything else the vector grid keys that way."""
         label = _lng_lat(500500, 3300500)
@@ -281,16 +277,12 @@ class TestVectorData:
         df = pl.read_csv(io.BytesIO(response.content))
         assert df["grid_cell"].unique().to_list() == [1]
 
-    def test_coordinates_sharing_a_cell_report_it_once(
-        self, client, vector_data, ecoregion_geometry
-    ):
+    def test_coordinates_sharing_a_cell_report_it_once(self, client, vector_data, ecoregion_geometry):
         """Two coordinates in one cell describe one series — there's a single value, so
         reporting it twice under one ID would only be ambiguous."""
         first, second = _lng_lat(500400, 3300400), _lng_lat(500600, 3300600)
 
-        response = client.get(
-            f"/v1/data.csv?{VECTOR}&grid_cell={first},{second}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/data.csv?{VECTOR}&grid_cell={first},{second}&calendar_year=2030")
         assert response.status_code == 200
         df = pl.read_csv(io.BytesIO(response.content))
         assert dict(zip(df["grid_cell"], df["value"])) == {1: pytest.approx(2030.01)}
@@ -352,7 +344,7 @@ class TestVectorData:
         assert "group_by" in response.json()["detail"]
 
     def test_conditional_count_is_one_request(self, client, vector_data):
-        """"Count cells where value > x" -- one `where` value conjunct +
+        """ "Count cells where value > x" -- one `where` value conjunct +
         `group_aggregate=count` request, no separate fetch-then-filter-then-count round
         trip on the client side. Cell (year, geo) holds year + geo/100 (see
         `annual_frame`), so a threshold between the two written years isolates exactly
@@ -416,7 +408,7 @@ class TestVectorData:
         assert df["value"].to_list() == pytest.approx(expected, rel=1e-5)
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_vector_data):
-        """"How many cells carry each distinct value per zone" -- one `project`-to-a-
+        """ "How many cells carry each distinct value per zone" -- one `project`-to-a-
         coarser-grid step with `aggregate=count_by_value`, through the `POST /v1/data.csv`
         pipeline route (`summarize_by`/`summarize_aggregate` have no flat spelling
         anymore -- `project`+`aggregate` is their pipeline equivalent).
@@ -664,9 +656,7 @@ class TestRasterData:
             from rasterio.warp import transform
 
             minx, miny, maxx, _maxy = src.bounds
-            lng, lat = [
-                c[0] for c in transform(src.crs, "EPSG:4326", [(minx + maxx) / 2], [miny - 10_000])
-            ]
+            lng, lat = [c[0] for c in transform(src.crs, "EPSG:4326", [(minx + maxx) / 2], [miny - 10_000])]
 
         response = client.get("/v1/data.csv", params={**RASTER_PARAMS, "grid_cell": f"{lng},{lat}"})
         assert response.status_code == 200
@@ -684,8 +674,7 @@ class TestRasterData:
             from rasterio.warp import transform
 
             points = [
-                [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])]
-                for x, y in (src.xy(10, 20), src.xy(5, 5))
+                [c[0] for c in transform(src.crs, "EPSG:4326", [x], [y])] for x, y in (src.xy(10, 20), src.xy(5, 5))
             ]
 
         grid_cell = ",".join(f"{lng},{lat}" for lng, lat in points)
@@ -708,7 +697,7 @@ class TestRasterData:
         assert client.get(f"/v1/data.tif?{RASTER}").status_code == 404
 
     def test_conditional_count_per_zone_is_one_request(self, client, gradient_raster_with_zones):
-        """"Count pixels per compartment where value > X" expressed as one
+        """ "Count pixels per compartment where value > X" expressed as one
         `POST /v1/data.csv` pipeline request: a LEADING `filter` step
         (naming its `input` explicitly, since it is step 1 -- see `FilterStep.input`'s
         docstring) followed by a `project`-to-a-coarser-grid step with `aggregate=count`.
@@ -749,7 +738,7 @@ class TestRasterData:
             assert actual == expected
 
     def test_count_by_value_per_zone_is_one_request(self, client, categorical_raster_with_zones):
-        """"How many pixels of each land-type value per hydro compartment" -- one
+        """ "How many pixels of each land-type value per hydro compartment" -- one
         `project`-to-a-coarser-grid step with `aggregate=count_by_value`, through the
         `POST /v1/data.csv` pipeline route (`summarize_by`/`summarize_aggregate` are
         retired flat-query parameters with no pipeline-step equivalent by that name --
@@ -840,9 +829,7 @@ class TestRasterTiles:
 
     def test_color_map_is_accepted(self, client, raster_data):
         tile = self._tile(raster_data)
-        response = client.get(
-            f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png?{RASTER}&color_map=lnd_type"
-        )
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.png?{RASTER}&color_map=lnd_type")
         assert response.status_code == 200
 
 
@@ -919,7 +906,8 @@ class TestRetiredParams:
     def test_indexed_calculate_parameters_are_retired(self, client, vector_data):
         response = client.get(
             "/v1/data.csv",
-            params={**VECTOR_PARAMS, 
+            params={
+                **VECTOR_PARAMS,
                 "calculate.1.expression": "value * 0.5",
                 "calculate.1.where": "calendar_year = 2030",
             },
@@ -941,9 +929,7 @@ class TestVectorTiles:
         tile = mercantile.Tile(x=1, y=2, z=3)
         write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
 
-        response = client.get(
-            f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf?{VECTOR}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf?{VECTOR}&calendar_year=2030")
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
 
@@ -985,9 +971,7 @@ class TestVectorTiles:
         tile = mercantile.Tile(x=1, y=2, z=3)
         write_pmtiles(tiles_path, "ecoregion_v001", tile, [1, 2])
 
-        response = client.get(
-            f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf?{VECTOR}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/data/{tile.z}/{tile.x}/{tile.y}.pbf?{VECTOR}&calendar_year=2030")
         assert response.status_code == 200
         assert response.headers["content-type"] == "application/vnd.mapbox-vector-tile"
 
@@ -1009,9 +993,7 @@ class TestCatalogEndpoint:
         body = client.get(f"/v1/catalog.json?{VECTOR}").json()
         assert body["choices"]["calendar_year"] == [2030, 2040]
 
-    def test_contiguous_years_are_compressed_into_a_range(
-        self, client, base_path, monkeypatch
-    ):
+    def test_contiguous_years_are_compressed_into_a_range(self, client, base_path, monkeypatch):
         write_parquet(annual_frame(years=(2030, 2031, 2032)), base_path=base_path)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
         body = client.get(f"/v1/catalog.json?{VECTOR}").json()
@@ -1034,22 +1016,16 @@ class TestCatalogEndpoint:
 
 class TestVisualizationEndpoints:
     def test_dataset_visualization_returns_a_vega_spec(self, client, vector_data):
-        response = client.get(
-            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1&calendar_year=2030"
-        )
+        response = client.get(f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1&calendar_year=2030")
         assert response.status_code == 200
         assert "$schema" in response.json()
 
-    def test_dataset_visualization_accepts_coordinates_on_a_vector_grid(
-        self, client, vector_data, ecoregion_geometry
-    ):
+    def test_dataset_visualization_accepts_coordinates_on_a_vector_grid(self, client, vector_data, ecoregion_geometry):
         """The spec has to describe the data.csv it points at, which reports the resolved
         cell ID however the caller selected it — a number, whatever the request looked
         like. The coordinate survives only as a label."""
         label = _lng_lat(500500, 3300500)
-        response = client.get(
-            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell={label}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell={label}&calendar_year=2030")
         assert response.status_code == 200
         spec = response.json()
         assert label.replace(",", ", ") in json.dumps(spec)
@@ -1059,16 +1035,12 @@ class TestVisualizationEndpoints:
             "calendar_year": "number",
         }
 
-    def test_time_series_line_labels_a_coordinate_with_its_grid_cell(
-        self, client, vector_data, ecoregion_geometry
-    ):
+    def test_time_series_line_labels_a_coordinate_with_its_grid_cell(self, client, vector_data, ecoregion_geometry):
         """The legend and tooltips report the cell the coordinate resolved to, since that's
         what the values describe, while the data stays keyed by the coordinate itself. Only
         the legend repeats the coordinate — a tooltip row has no width to spare."""
         label = _lng_lat(500500, 3300500)
-        response = client.get(
-            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell={label}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell={label}&calendar_year=2030")
         assert response.status_code == 200
         spec = response.json()
 
@@ -1086,13 +1058,9 @@ class TestVisualizationEndpoints:
         assert [t["title"] for t in tooltips[1:]] == ["1: "]
 
     @pytest.mark.parametrize("name", ["map", "stacked-bar", "time-series-line"])
-    def test_every_dataset_visualization_accepts_coordinates(
-        self, client, vector_data, ecoregion_geometry, name
-    ):
+    def test_every_dataset_visualization_accepts_coordinates(self, client, vector_data, ecoregion_geometry, name):
         label = _lng_lat(500500, 3300500)
-        response = client.get(
-            f"/v1/visualizations/{name}.json?{VECTOR}&grid_cell={label}&calendar_year=2030"
-        )
+        response = client.get(f"/v1/visualizations/{name}.json?{VECTOR}&grid_cell={label}&calendar_year=2030")
         assert response.status_code == 200
 
     def test_dataset_visualization_parses_grid_cell_ids_as_numbers(self, client, vector_data):
@@ -1127,8 +1095,7 @@ class TestVisualizationEndpoints:
         derived baseline, one row apiece; so `calendar_year` survives into the result and is
         in the data URL's `select` rather than dropped from it as a collapsed dimension."""
         response = client.get(
-            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1&analysis=lnd_chng"
-            "&model_group_id=705"
+            f"/v1/visualizations/time-series-line.json?{VECTOR}&grid_cell=1&analysis=lnd_chng&model_group_id=705"
         )
         assert response.status_code == 200
         assert "calendar_year" in response.json()["data"]["url"]
@@ -1148,9 +1115,7 @@ class TestVisualizationEndpoints:
         route with an `AttributeError` for what is an ordinary bad request. The catalog says
         which variable it draws (`Meta.variables`) and the portal's picker honors it, but the
         route is public."""
-        response = client.get(
-            f"/v1/visualizations/species-stacked-bar.json?{VECTOR}&grid_cell=1"
-        )
+        response = client.get(f"/v1/visualizations/species-stacked-bar.json?{VECTOR}&grid_cell=1")
         assert response.status_code == 400
         assert "can only draw 'veg_species'" in response.json()["detail"]
 
@@ -1190,8 +1155,7 @@ class TestSedimentDynamicsVisualization:
     @classmethod
     def _spec(cls, client, query=""):
         response = client.get(
-            f"/v1/visualizations/sediment-dynamics.json?{MORPH}"
-            f"&grid_cell={_lng_lat(500500, 3300500)}{query}"
+            f"/v1/visualizations/sediment-dynamics.json?{MORPH}&grid_cell={_lng_lat(500500, 3300500)}{query}"
         )
         assert response.status_code == 200, response.text
         return response.json()
@@ -1254,9 +1218,7 @@ class TestSedimentDynamicsVisualization:
             for year in SEDIMENT_DYNAMICS_DATA_YEARS
         }
 
-    def test_elev_is_scaled_into_metres_before_the_tooltip_pivots(
-        self, client, sediment_dynamics_data
-    ):
+    def test_elev_is_scaled_into_metres_before_the_tooltip_pivots(self, client, sediment_dynamics_data):
         """One source has one `value` column, so `display_scale_factor` cannot be applied per
         source the way it is for an unfolded chart -- it is a conditional `transform_calculate`
         on the label column instead, and `elev` (NAVD88 millimetres) is the only variable that
@@ -1272,11 +1234,7 @@ class TestSedimentDynamicsVisualization:
             if any("pivot" in transform for transform in layer.get("transform", []))
         )
         kinds = [next(iter(transform)) for transform in rule["transform"]]
-        scale = next(
-            transform
-            for transform in rule["transform"]
-            if transform.get("as") == "value"
-        )
+        scale = next(transform for transform in rule["transform"] if transform.get("as") == "value")
         assert "datum.variable === 'elev' ? datum.value / 1000" in scale["calculate"]
         assert kinds.index("pivot") > kinds.index("calculate")
         assert [tip["field"] for tip in rule["encoding"]["tooltip"]] == [
@@ -1331,9 +1289,7 @@ class TestMapAnalysisTileRouting:
     style spec's `sources.data.tiles[0]` URL, the same thing a MapLibre client would fetch.
     """
 
-    def test_raster_map_states_the_analysis_on_the_one_tile_route(
-        self, client, two_year_raster_data
-    ):
+    def test_raster_map_states_the_analysis_on_the_one_tile_route(self, client, two_year_raster_data):
         response = client.get(
             f"/v1/visualizations/map.json?{RASTER}"
             "&analysis=diff&dimension=calendar_year&order=asc"
@@ -1357,9 +1313,7 @@ class TestMapAnalysisTileRouting:
         assert "/v1/data/{z}/{x}/{y}.png" in tile_url
         assert "analysis=" not in tile_url
 
-    def test_vector_map_states_the_analysis_on_the_same_route_with_a_pbf_extension(
-        self, client, vector_data
-    ):
+    def test_vector_map_states_the_analysis_on_the_same_route_with_a_pbf_extension(self, client, vector_data):
         """The one thing that still distinguishes a vector tile from a raster one: the
         format extension. It used to be a different route with a different path shape.
         """
@@ -1403,9 +1357,7 @@ class TestMapAnalysisTileRouting:
         assert "/v1/data/{z}/{x}/{y}.pbf" in tile_url
         assert "analysis=" not in tile_url
 
-    def test_time_series_line_data_csv_url_also_forwards_the_analysis_parameters(
-        self, client, vector_data
-    ):
+    def test_time_series_line_data_csv_url_also_forwards_the_analysis_parameters(self, client, vector_data):
         """`get_data_uri` (base.py) has the exact same forwarding requirement as the tile
         URL template above -- covered separately here since it's a different call site
         (the chart's own `data.csv` source, not a tile), reached through a visualization
@@ -1470,9 +1422,7 @@ class TestChartDataUrlIsFetchable:
         assert "analysis=diff" in data_url
         assert client.get(data_url).status_code == 200
 
-    def test_the_collapsed_dimension_is_not_selected_back(
-        self, client, two_model_group_salinity_data
-    ):
+    def test_the_collapsed_dimension_is_not_selected_back(self, client, two_model_group_salinity_data):
         """It still has to be SENT -- the two values are what the difference is taken
         between -- so this pins the asymmetry, not just the absence."""
         data_url = self._data_url(

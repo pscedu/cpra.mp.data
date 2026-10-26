@@ -99,9 +99,7 @@ def _tiles(x_edges, y_edges, start_id):
     zone_id = start_id
     for xi in range(len(x_edges) - 1):
         for yi in range(len(y_edges) - 1):
-            features.append(
-                (np.int32(zone_id), box(x_edges[xi], y_edges[yi], x_edges[xi + 1], y_edges[yi + 1]))
-            )
+            features.append((np.int32(zone_id), box(x_edges[xi], y_edges[yi], x_edges[xi + 1], y_edges[yi + 1])))
             zone_id += 1
     return features
 
@@ -232,9 +230,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == 2
         assert _rows(out_path) == {(1, 10): 1.0, (2, 20): 1.0}
@@ -258,9 +254,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == 4
         assert _rows(out_path) == pytest.approx({(1, 1): 0.3, (1, 2): 0.7, (2, 1): 0.75, (2, 2): 0.25})
@@ -274,9 +268,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == len(dst_features)
         assert sum(_rows(out_path).values()) == pytest.approx(1.0)
@@ -290,9 +282,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, _row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, _row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert _rows(out_path) == pytest.approx({(1, 1): 0.25})
 
@@ -309,9 +299,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == 1
         assert _rows(out_path) == {(1, 1): 1.0}
@@ -327,9 +315,7 @@ class TestWriteVectorCrosswalk:
         write_grid_geometry(geometry_path, VECTOR_SRC_NAME, src_features)
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, dst_features)
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == 1
         assert _rows(out_path) == {(2, 10): 1.0}
@@ -348,9 +334,7 @@ class TestWriteVectorCrosswalk:
         whole_dir.mkdir()
         chunked_dir.mkdir()
 
-        whole_path, whole_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, whole_dir
-        )
+        whole_path, whole_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, whole_dir)
         assert whole_count > 7, "test needs more pairs than the chunk size below"
 
         with pytest.MonkeyPatch.context() as mp:
@@ -367,12 +351,8 @@ class TestWriteVectorCrosswalk:
     def test_schema_column_names_and_types_for_small_ids(self, geometry_path, crosswalk_path):
         """api/dataset.py and api/crosswalk.py both hard-depend on these exact column
         names; the id columns must match tests/factories.py's canonical schema."""
-        write_grid_geometry(
-            geometry_path, VECTOR_SRC_NAME, [(np.int32(1), box(0, 0, 2, 2))]
-        )
-        write_grid_geometry(
-            geometry_path, VECTOR_DST_NAME, [(np.int32(10), box(0, 0, 5, 5))]
-        )
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, [(np.int32(1), box(0, 0, 2, 2))])
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, [(np.int32(10), box(0, 0, 5, 5))])
 
         out_path, _ = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
@@ -385,16 +365,10 @@ class TestWriteVectorCrosswalk:
     def test_large_source_ids_widen_to_int64(self, geometry_path, crosswalk_path):
         """FIPS-scale source ids (int64 at the OGR layer) must widen src_id to int64,
         independent of the destination grid's own id width."""
-        write_grid_geometry(
-            geometry_path, VECTOR_SRC_NAME, [(220510001001, box(0, 0, 2, 2))]
-        )
-        write_grid_geometry(
-            geometry_path, VECTOR_DST_NAME, [(np.int32(10), box(0, 0, 5, 5))]
-        )
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, [(220510001001, box(0, 0, 2, 2))])
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, [(np.int32(10), box(0, 0, 5, 5))])
 
-        out_path, row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         assert row_count == 1
         schema = pq.ParquetFile(out_path).schema_arrow
@@ -404,16 +378,10 @@ class TestWriteVectorCrosswalk:
         assert table.column("src_id").to_pylist() == [220510001001]
 
     def test_large_destination_ids_widen_to_int64(self, geometry_path, crosswalk_path):
-        write_grid_geometry(
-            geometry_path, VECTOR_SRC_NAME, [(np.int32(1), box(0, 0, 2, 2))]
-        )
-        write_grid_geometry(
-            geometry_path, VECTOR_DST_NAME, [(220510001001, box(0, 0, 5, 5))]
-        )
+        write_grid_geometry(geometry_path, VECTOR_SRC_NAME, [(np.int32(1), box(0, 0, 2, 2))])
+        write_grid_geometry(geometry_path, VECTOR_DST_NAME, [(220510001001, box(0, 0, 5, 5))])
 
-        out_path, _row_count = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, _row_count = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         schema = pq.ParquetFile(out_path).schema_arrow
         assert schema.field("src_id").type == pa.int32()
@@ -445,9 +413,7 @@ class TestWriteVectorCrosswalk:
         without_tree_dir.mkdir()
         with_tree_dir.mkdir()
 
-        out_a, count_a = write_vector_crosswalk(
-            VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, without_tree_dir
-        )
+        out_a, count_a = write_vector_crosswalk(VECTOR_SRC_NAME, VECTOR_DST_NAME, geometry_path, without_tree_dir)
 
         prebuilt_tree = read_geometry_tree(geometry_path / f"{VECTOR_SRC_NAME}.fgb")
         out_b, count_b = write_vector_crosswalk(
@@ -543,9 +509,7 @@ class TestWriteRasterCrosswalkOutputProfile:
         write_grid_geometry(geometry_path, VECTOR_DST_NAME, FULL_TILES)
         raster_grid = GRIDS[RASTER_NAME]
 
-        out_path, window_count = write_raster_crosswalk(
-            RASTER_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path
-        )
+        out_path, window_count = write_raster_crosswalk(RASTER_NAME, VECTOR_DST_NAME, geometry_path, crosswalk_path)
 
         # Default block_size (512) is bigger than the whole 50x37 grid: a single window.
         assert window_count == 1

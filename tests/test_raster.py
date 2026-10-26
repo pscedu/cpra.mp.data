@@ -50,9 +50,7 @@ class TestWriteCog:
         file itself is named with a UUID, not a dimension value."""
         write_cog(raster_array(fill=1), base_path=base_path, calendar_year=2030, **RASTER_KWARGS)
         expected_dir = (
-            base_path
-            / "variable=vct/time_unit=annual/grid=veg_grid_cell_v001"
-            / "model_group_id=500/scenario_id=7"
+            base_path / "variable=vct/time_unit=annual/grid=veg_grid_cell_v001" / "model_group_id=500/scenario_id=7"
         )
         assert list(expected_dir.glob("*.tif"))
 
@@ -429,9 +427,7 @@ class TestCompactCogIncludeValues:
         output_path = tmp_path / "out"
         write_raster_dataset(base_path, years=(2030,))
 
-        result = compact_cog(
-            base_path=base_path, output_base_path=output_path, catalog_path=None, **RASTER_KWARGS
-        )
+        result = compact_cog(base_path=base_path, output_base_path=output_path, catalog_path=None, **RASTER_KWARGS)
 
         assert len(result["outputs"]) == 1
         assert self._band_values(result["outputs"][0]) == [2030]
@@ -476,9 +472,7 @@ class TestCompactCogIncludeValues:
             **RASTER_KWARGS,
         )
 
-        rows = pl.concat(
-            [pl.read_parquet(p) for p in out_catalog.rglob("*.parquet")], how="diagonal_relaxed"
-        )
+        rows = pl.concat([pl.read_parquet(p) for p in out_catalog.rglob("*.parquet")], how="diagonal_relaxed")
         assert rows.height == 1
         assert rows["calendar_year_min"][0] == 2032
         assert rows["calendar_year_max"][0] == 2032

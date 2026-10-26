@@ -104,21 +104,13 @@ class TestEquivalenceWithTheBandWideReader:
         # a file boundary -- the one place the point reader's per-file grouping could
         # scramble what the band-wide reader's flat VRT source list keeps in order.
         targets = {(200, 800): 11, (205, 810): 7, (11, 1051): 22, (364, 0): 33}
-        path_a = _write_grid_tif(
-            tmp_path / "a.tif", [targets, {pixel: value * 2 for pixel, value in targets.items()}]
-        )
-        path_b = _write_grid_tif(
-            tmp_path / "b.tif", [{pixel: value * 3 for pixel, value in targets.items()}, {}]
-        )
-        metadata_df = _metadata(
-            [(path_a, 1), (path_a, 2), (path_b, 1), (path_b, 2)], years=[2030, 2040, 2050, 2060]
-        )
+        path_a = _write_grid_tif(tmp_path / "a.tif", [targets, {pixel: value * 2 for pixel, value in targets.items()}])
+        path_b = _write_grid_tif(tmp_path / "b.tif", [{pixel: value * 3 for pixel, value in targets.items()}, {}])
+        metadata_df = _metadata([(path_a, 1), (path_a, 2), (path_b, 1), (path_b, 2)], years=[2030, 2040, 2050, 2060])
         cells = [_cell(row, col) for row, col in targets]
         where = f"grid_cell IN ({', '.join(str(cell) for cell in cells)})"
 
-        band_wide = sample_grid_cells_band_wide(
-            scan_raster(metadata_df), where, (), grid_width=GRIDS[GRID].width
-        )
+        band_wide = sample_grid_cells_band_wide(scan_raster(metadata_df), where, (), grid_width=GRIDS[GRID].width)
         # No `where` applied to the point reader's own output: it read exactly those pixels
         # and nothing else, which is the whole claim. The walk applies the `where` to both
         # in production; applying it here would only hide a reader that over-read.

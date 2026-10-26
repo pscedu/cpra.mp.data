@@ -57,8 +57,7 @@ class Difference(Analysis):
         values = normalized_filter_values(dim, raw)
         if len(values) != 2:
             raise InvalidAnalysisParametersError(
-                f"diff on dimension {dim!r} requires exactly 2 distinct selected "
-                f"values, got {len(values)}: {raw!r}"
+                f"diff on dimension {dim!r} requires exactly 2 distinct selected values, got {len(values)}: {raw!r}"
             )
 
     def _dimension_steps(self, group_by: list[str]) -> list[dict]:

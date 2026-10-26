@@ -111,9 +111,7 @@ class SalinityVegInvestigation(Analysis):
         # Between the join and the threshold `case`, for the same reason `lnd_type_plus`
         # puts its own there: a dimension filter leaves the pairing standing, and the `case`
         # is what collapses it. `None` when the caller selected nothing, which is now legal.
-        selection_steps = (
-            [] if selection_where is None else [{"op": "filter", "where": selection_where}]
-        )
+        selection_steps = [] if selection_where is None else [{"op": "filter", "where": selection_where}]
         data = {
             "inputs": {
                 "coverage": {

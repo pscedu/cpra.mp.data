@@ -1,4 +1,5 @@
 """Analysis-layer helpers (the former api/utils.py, HTTP-free half). Nothing here may import FastAPI."""
+
 import asyncio
 import dataclasses
 import itertools
@@ -323,9 +324,7 @@ def tile_disjoint_from_source(src, tile_bounds) -> bool:
     return disjoint_bounds(BoundingBox(*source_bounds), BoundingBox(*tile_bounds))
 
 
-def tile_source_window(
-    src, tile_bounds, buffer_px=None, resampling=Resampling.nearest, straddling_vector_grid=None
-):
+def tile_source_window(src, tile_bounds, buffer_px=None, resampling=Resampling.nearest, straddling_vector_grid=None):
     """The window of `src` (in its OWN CRS) covering the Web Mercator `tile_bounds`, as
     whole source pixels clipped to the source's extent -- or `None` when the tile's
     footprint lands entirely outside the source.

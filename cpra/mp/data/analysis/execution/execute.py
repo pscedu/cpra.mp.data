@@ -356,9 +356,7 @@ def _run_join_band_wide(
     # documented "each column taken from the first operand that carries it" contract:
     # a vector-to-raster `project` operand brings `DOMAIN_COLUMN` that no other operand
     # has, and reading `op.inputs[0]`'s alone would drop it.
-    return band_ops.join_band_wide(
-        [frames[name] for name in op.inputs], list(op.inputs), extra_columns=extra_columns
-    )
+    return band_ops.join_band_wide([frames[name] for name in op.inputs], list(op.inputs), extra_columns=extra_columns)
 
 
 def _run_project_raster_to_vector(frames: dict[str, BandWideFrame], op, frame_types) -> LongFrame:
@@ -461,10 +459,8 @@ def _bind_band_wide_lowerings(
     bands ahead of the read, so the lowering enumerates them from the data itself.
     """
     lowerings = dict(_LOWERINGS)
-    lowerings[("project", ("vector", "raster"))] = (
-        lambda frames, op, frame_types: project.project_vector_to_raster(
-            frames, op, frame_types, zone_sources.get(op.step_no), vector_band_metadata.get(op.step_no)
-        )
+    lowerings[("project", ("vector", "raster"))] = lambda frames, op, frame_types: project.project_vector_to_raster(
+        frames, op, frame_types, zone_sources.get(op.step_no), vector_band_metadata.get(op.step_no)
     )
     lowerings[("filter", Shape.band_wide)] = lambda frames, op, frame_types: _run_filter_band_wide(
         frames, op, frame_types, extra_columns.get(op.input, ())
@@ -809,9 +805,7 @@ def _empty_zone_sources(
     against an equally empty frame here.
     """
     return {
-        zone_crosswalk.step_no: project.ZoneSource(
-            pl.LazyFrame(schema={project.ZONE_COLUMN: pl.Int32}), window
-        )
+        zone_crosswalk.step_no: project.ZoneSource(pl.LazyFrame(schema={project.ZONE_COLUMN: pl.Int32}), window)
         for zone_crosswalk in zone_crosswalks
     }
 
@@ -948,9 +942,7 @@ def _open_band_wide_join_group(
         crosswalks.append((column, str(crosswalk_path)))
         project_zone_columns[zone_crosswalk.step_no] = column
 
-    lf, out_metadata, window = scan_raster(
-        combined, crosswalks=crosswalks, window=read_window, decimation=decimation
-    )
+    lf, out_metadata, window = scan_raster(combined, crosswalks=crosswalks, window=read_window, decimation=decimation)
 
     zone_sources = {
         step_no: project.ZoneSource(lf.select(pl.col(column).alias(project.ZONE_COLUMN)), window)

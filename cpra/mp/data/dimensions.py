@@ -64,9 +64,7 @@ class Dimension:
             exprs[f"{self.name}_is_not_null"] = pl.col(self.name).is_not_null()
 
         if self.values is not None:
-            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(
-                self.values["value"].cast(self.dtype).to_list()
-            )
+            exprs[f"{self.name}_values"] = pl.col(self.name).is_in(self.values["value"].cast(self.dtype).to_list())
 
         if self.min_value is not None:
             exprs[f"{self.name}_minimum_value"] = pl.col(self.name) >= self.min_value
@@ -98,9 +96,7 @@ def make_dimensions():
         # (Float32) is preserved on self.dtype and used when building filter
         # and validation expressions.
         display_dtype = pl.Float64 if row["dtype"].startswith("Float") else getattr(pl, row["dtype"])
-        values = dim_values_df.filter(dimension=row["name"]).with_columns(
-            pl.col("value").cast(display_dtype)
-        )
+        values = dim_values_df.filter(dimension=row["name"]).with_columns(pl.col("value").cast(display_dtype))
         if row["required"] is False:
             row["required"] = (
                 pl.col("variable")

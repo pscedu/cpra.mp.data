@@ -274,10 +274,7 @@ def fold_group_by(
             if weight_column is not None:
                 sum_expr = (pl.col(value_column) * pl.col(weight_column)).sum()
                 denom_expr = (
-                    pl.when(pl.col(value_column).is_not_null())
-                    .then(pl.col(weight_column))
-                    .otherwise(None)
-                    .sum()
+                    pl.when(pl.col(value_column).is_not_null()).then(pl.col(weight_column)).otherwise(None).sum()
                 )
             else:
                 sum_expr = pl.col(value_column).sum()
@@ -310,9 +307,7 @@ def fold_group_by(
         elif aggregate == "count":
             acc = merged.group_by(*key_columns).agg(pl.col(value_column).sum().alias(value_column))
         else:
-            acc = merged.group_by(*key_columns).agg(
-                getattr(pl.col(value_column), aggregate)().alias(value_column)
-            )
+            acc = merged.group_by(*key_columns).agg(getattr(pl.col(value_column), aggregate)().alias(value_column))
 
     if aggregate == "mean":
         acc = acc.with_columns(

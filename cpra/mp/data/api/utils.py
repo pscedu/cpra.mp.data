@@ -46,6 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover -- exercised once the registry p
     class InvalidAnalysisParametersError(AnalysisRegistryError):
         pass
 
+
 RASTER_COMPRESSION_ALGORITHMS = [
     CompressionAlgorithm.deflate,
     CompressionAlgorithm.lzw,

@@ -15,6 +15,7 @@ except ImportError:
     MapOptions = None  # type: ignore[assignment,misc]
     MapWidget = None  # type: ignore[assignment,misc]
 
+
 def _ensure_legend_env() -> None:
     """Point legend env vars at bundled legend.js/css if not already set.
 
@@ -23,7 +24,9 @@ def _ensure_legend_env() -> None:
     so no browser URL resolution or CORS is needed.
     """
     os.environ.setdefault("PYMAPLIBREGL_LEGEND_JS", str((Path(__file__).parent / "jupyter_assets/legend.js").resolve()))
-    os.environ.setdefault("PYMAPLIBREGL_LEGEND_CSS", str((Path(__file__).parent / "jupyter_assets/legend.css").resolve()))
+    os.environ.setdefault(
+        "PYMAPLIBREGL_LEGEND_CSS", str((Path(__file__).parent / "jupyter_assets/legend.css").resolve())
+    )
 
 
 class JupyterMap:
@@ -104,8 +107,7 @@ class JupyterMap:
         """
         if MapWidget is None or MapOptions is None:
             raise ImportError(
-                "maplibre is required for Jupyter rendering. "
-                "Install it with: pip install 'cpra.mp.data[jupyter]'"
+                "maplibre is required for Jupyter rendering. Install it with: pip install 'cpra.mp.data[jupyter]'"
             )
         return self._make_widget()._repr_mimebundle_(**kwargs)
 
@@ -118,8 +120,7 @@ class JupyterMap:
         """
         if MapWidget is None or MapOptions is None:
             raise ImportError(
-                "maplibre is required for Jupyter rendering. "
-                "Install it with: pip install 'cpra.mp.data[jupyter]'"
+                "maplibre is required for Jupyter rendering. Install it with: pip install 'cpra.mp.data[jupyter]'"
             )
         from IPython.display import display
 

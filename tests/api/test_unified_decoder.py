@@ -58,9 +58,7 @@ def ecoregion_geometry(geometry_path):
     """A single 1km square at ecoregion_v001 cell 1, for coordinate lookups -- the same
     fixture `test_endpoints_data.py` uses, redeclared rather than shared because it is two
     lines and importing a fixture across test modules is not something pytest does."""
-    return write_grid_geometry(
-        geometry_path, "ecoregion_v001", [(1, box(500000, 3300000, 501000, 3301000))]
-    )
+    return write_grid_geometry(geometry_path, "ecoregion_v001", [(1, box(500000, 3300000, 501000, 3301000))])
 
 
 class TestDownloadSentinel:
@@ -80,9 +78,7 @@ class TestDownloadSentinel:
         assert pipeline_to_query(decoded.pipeline) == pipeline_to_query(old)
 
     async def test_a_selection_becomes_one_trailing_filter(self):
-        decoded = await decode_request(
-            _items(calendar_year="2030", where="value > 3", **VECTOR), format="csv"
-        )
+        decoded = await decode_request(_items(calendar_year="2030", where="value > 3", **VECTOR), format="csv")
         assert len(decoded.pipeline.steps) == 1
         assert decoded.pipeline.steps[0].where == "calendar_year = 2030 AND (value > 3)"
         assert decoded.pipeline.steps[0].input == "data"
@@ -117,9 +113,7 @@ class TestDownloadSentinel:
             await decode_request(_items(variable="ssf", time_unit="annual"), format="csv")
 
     async def test_the_url_format_wins_over_a_dotted_one(self):
-        decoded = await decode_request(
-            _items(**VECTOR, **{"output.format": "tif"}), format="csv"
-        )
+        decoded = await decode_request(_items(**VECTOR, **{"output.format": "tif"}), format="csv")
         assert decoded.pipeline.output.format == "csv"
 
     async def test_compression_is_decoded_but_left_for_the_route_to_validate(self):

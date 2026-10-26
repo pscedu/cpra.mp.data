@@ -171,9 +171,7 @@ def dataset_dimension_columns(selection: InputSelection) -> frozenset[str]:
     """
     return frozenset(
         required_columns(
-            get_input_data_frame(
-                variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
-            ),
+            get_input_data_frame(variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid),
             include_dataset=False,
         )
     )

@@ -61,9 +61,25 @@ ALLOWED_FUNCTIONS = frozenset({"abs", "round", "floor", "ceil", "sqrt", "coalesc
 # from `pl.sql_expr` at all -- this list guards the SQL spelling, `MIN(x)`.)
 AGGREGATE_FUNCTION_NAMES = frozenset(
     {
-        "min", "max", "sum", "avg", "mean", "count", "median", "stddev", "stddev_samp",
-        "std", "var", "var_samp", "variance", "quantile", "first", "last", "mode",
-        "array_agg", "string_agg",
+        "min",
+        "max",
+        "sum",
+        "avg",
+        "mean",
+        "count",
+        "median",
+        "stddev",
+        "stddev_samp",
+        "std",
+        "var",
+        "var_samp",
+        "variance",
+        "quantile",
+        "first",
+        "last",
+        "mode",
+        "array_agg",
+        "string_agg",
     }
 )
 
@@ -435,9 +451,7 @@ def parse_calculate_expression(expr_str, allowed_columns=("value",)):
             f"the functions {sorted(ALLOWED_FUNCTIONS)} are"
         )
     if _SELECT_KEYWORD_RE.search(expr_str):
-        raise ExpressionError(
-            f"subquery ('select') is not allowed in a calculate expression: {expr_str!r}"
-        )
+        raise ExpressionError(f"subquery ('select') is not allowed in a calculate expression: {expr_str!r}")
 
     _check_streaming_closed(expr_str)
     _check_no_aggregate_calls(expr_str)
@@ -624,9 +638,7 @@ def classify_predicate_kind(conjunct: str, value_columns: Iterable[str] = ("valu
     return PredicateKind.dimension
 
 
-def classify_where_kinds(
-    where_str: str, value_columns: Iterable[str] = ("value",)
-) -> dict[PredicateKind, list[str]]:
+def classify_where_kinds(where_str: str, value_columns: Iterable[str] = ("value",)) -> dict[PredicateKind, list[str]]:
     """The three-way counterpart of `classify_where`: split `where_str` into its
     top-level AND conjuncts (`split_top_level_and`) and sort each into one of the three
     `PredicateKind`s (`classify_predicate_kind`), rather than the dimension/value split

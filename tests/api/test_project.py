@@ -81,14 +81,10 @@ class TestPerAggregateSplitCell:
             ("count", 1, 2),
         ],
     )
-    def test_aggregate_matches_hand_computation(
-        self, crosswalk_path, aggregate, expected_100, expected_200
-    ):
+    def test_aggregate_matches_hand_computation(self, crosswalk_path, aggregate, expected_100, expected_200):
         _crosswalk_frame(crosswalk_path)
         frames = {"a": _source_lf()}
-        result = project_vector_to_vector(frames, _op(aggregate), _frame_types()).collect().sort(
-            "grid_cell"
-        )
+        result = project_vector_to_vector(frames, _op(aggregate), _frame_types()).collect().sort("grid_cell")
         assert result["grid_cell"].to_list() == [100, 200]
         assert result["value"].to_list() == pytest.approx([expected_100, expected_200])
 
@@ -99,12 +95,12 @@ class TestPerAggregateSplitCell:
         `project_vector_to_vector` exists to get right."""
         _crosswalk_frame(crosswalk_path)
         frames = {"a": _source_lf()}
-        sums = project_vector_to_vector(frames, _op("sum"), _frame_types()).collect().sort(
-            "grid_cell"
-        )["value"].to_list()
-        maxes = project_vector_to_vector(frames, _op("max"), _frame_types()).collect().sort(
-            "grid_cell"
-        )["value"].to_list()
+        sums = (
+            project_vector_to_vector(frames, _op("sum"), _frame_types()).collect().sort("grid_cell")["value"].to_list()
+        )
+        maxes = (
+            project_vector_to_vector(frames, _op("max"), _frame_types()).collect().sort("grid_cell")["value"].to_list()
+        )
         assert sums != pytest.approx(maxes)
 
 
@@ -120,11 +116,7 @@ class TestBatchedMatchesUnbatched:
         frames = {"a": _source_lf()}
         for step in (1, 1000):
             monkeypatch.setattr(fold_module, "TABULAR_FOLD_STEP", step)
-            result = (
-                project_vector_to_vector(frames, _op("mean"), _frame_types())
-                .collect()
-                .sort("grid_cell")
-            )
+            result = project_vector_to_vector(frames, _op("mean"), _frame_types()).collect().sort("grid_cell")
             assert result["value"].to_list() == pytest.approx([10.0, 18.0])
 
 
@@ -134,16 +126,12 @@ class TestDimensionColumnsSurviveAsGroupKeys:
         lf = pl.concat([_source_lf(2030), _source_lf(2040)])
         frames = {"a": lf}
         result = (
-            project_vector_to_vector(frames, _op("sum"), _frame_types())
-            .collect()
-            .sort(["calendar_year", "grid_cell"])
+            project_vector_to_vector(frames, _op("sum"), _frame_types()).collect().sort(["calendar_year", "grid_cell"])
         )
         assert result.height == 4
         # Same per-year answer as the single-year case, once for each year -- proof the
         # two years never merged into one group.
-        expected = sorted(
-            [(2030, 100, 7.5), (2030, 200, 22.5), (2040, 100, 7.5), (2040, 200, 22.5)]
-        )
+        expected = sorted([(2030, 100, 7.5), (2030, 200, 22.5), (2040, 100, 7.5), (2040, 200, 22.5)])
         actual = sorted(
             zip(result["calendar_year"].to_list(), result["grid_cell"].to_list(), result["value"].to_list())
         )
@@ -176,9 +164,7 @@ class TestCountByValue:
         monkeypatch.setattr(project_module, "COUNT_BY_VALUE_MAX_DISTINCT", 1)
         frames = {"a": _source_lf()}
         with pytest.raises(AggregateError, match="distinct"):
-            project_vector_to_vector(
-                frames, _op("count_by_value"), _frame_types()
-            ).collect()
+            project_vector_to_vector(frames, _op("count_by_value"), _frame_types()).collect()
 
 
 class TestGridColumnIsReaddressed:
@@ -267,9 +253,7 @@ class TestDirectPathMatchesFoldedPath:
         monkeypatch.setattr(project_module, "should_fold_group_by", lambda *args, **kwargs: False)
         _crosswalk_frame(crosswalk_path)
         frames = {"a": _source_lf()}
-        result = (
-            project_vector_to_vector(frames, _op(aggregate), _frame_types()).collect().sort("grid_cell")
-        )
+        result = project_vector_to_vector(frames, _op(aggregate), _frame_types()).collect().sort("grid_cell")
         assert result["grid_cell"].to_list() == [100, 200]
         assert result["value"].to_list() == pytest.approx([expected_100, expected_200])
 

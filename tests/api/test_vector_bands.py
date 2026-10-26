@@ -101,9 +101,7 @@ class TestResolveVectorBands:
 
         # A `group` is what makes the plan project the scan's columns; a dimension left out
         # of that projection is not read, so it cannot split bands here either.
-        bands = resolve_vector_bands(
-            SELECTION, base_path=base_path, columns=["calendar_year", "grid_cell", "value"]
-        )
+        bands = resolve_vector_bands(SELECTION, base_path=base_path, columns=["calendar_year", "grid_cell", "value"])
 
         assert bands.columns == ["calendar_year"]
         assert bands["calendar_year"].to_list() == [2030, 2040]

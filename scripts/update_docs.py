@@ -19,22 +19,12 @@ def table(df, column_aliases=None, format=None):
     return "".join(
         [
             table_row(
-                [
-                    column_aliases[col]
-                    if col in column_aliases
-                    else col.replace("_", " ").title()
-                    for col in df.columns
-                ]
+                [column_aliases[col] if col in column_aliases else col.replace("_", " ").title() for col in df.columns]
             ),
             table_row(["---"] * len(df.columns)),
             "".join(
                 [
-                    table_row(
-                        [
-                            format[k](v) if k in format else ("" if v is None else v)
-                            for k, v in row.items()
-                        ]
-                    )
+                    table_row([format[k](v) if k in format else ("" if v is None else v) for k, v in row.items()])
                     for row in df.iter_rows(named=True)
                 ]
             ),
@@ -83,12 +73,8 @@ def update_docs():
     variables = read_structure_csv("variables")
 
     markdown = replace_section("dimensions", table(dimensions), markdown)
-    markdown = replace_section(
-        "variables", table(variables, column_aliases={"dtype": "Data Type"}), markdown
-    )
-    markdown = replace_section(
-        "grids", table(grids, column_aliases={"crs": "CRS"}), markdown
-    )
+    markdown = replace_section("variables", table(variables, column_aliases={"dtype": "Data Type"}), markdown)
+    markdown = replace_section("grids", table(grids, column_aliases={"crs": "CRS"}), markdown)
 
     dimensions_values_content = ""
     for dim in dimensions.iter_rows(named=True):
@@ -101,9 +87,7 @@ def update_docs():
         dimensions_values_content += (
             f"\n\n{table(values_df.select('value', 'label', 'color').pipe(drop_empty_columns))}"
         )
-    markdown = replace_section(
-        "dimension_values", dimensions_values_content, markdown
-    )
+    markdown = replace_section("dimension_values", dimensions_values_content, markdown)
 
     def legend_content(name, legend_df):
         content = f"### `{name}` Legend\n\n{table(legend_df.select(cs.exclude('name')).pipe(drop_empty_columns))}"
@@ -114,10 +98,7 @@ def update_docs():
         return content
 
     legends_content = "\n\n".join(
-        [
-            legend_content(group[0], legend_df)
-            for group, legend_df in sorted(legends.group_by("name"))
-        ]
+        [legend_content(group[0], legend_df) for group, legend_df in sorted(legends.group_by("name"))]
     )
 
     markdown = replace_section("legends", legends_content, markdown)

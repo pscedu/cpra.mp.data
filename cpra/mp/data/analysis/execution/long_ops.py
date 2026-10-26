@@ -214,9 +214,7 @@ def case_expression(
         if value_where is not None:
             value_mask = _compile_case_part(what, value_predicate_mask, rewrite(value_where), allowed_columns)
             mask = value_mask if mask is None else mask & value_mask
-        then = _compile_case_part(
-            f"{label} arm {position} then", parse_value_expr, rewrite(arm.then), allowed_columns
-        )
+        then = _compile_case_part(f"{label} arm {position} then", parse_value_expr, rewrite(arm.then), allowed_columns)
         # `mask is None` is an arm whose `when` was PURELY dimensional and applies to this
         # band: nothing per-pixel is left to test, so the arm matches the whole band -- and
         # every later arm is then unreachable, which is what first-match-wins means.
@@ -279,9 +277,7 @@ def case_long(lf: LongFrame, op: CaseOp, value_columns: frozenset[str]) -> LongF
         return expr.fill_null(False)
 
     value = case_expression(op, namespace, resolve_dimension=resolve_dimension)
-    return lf.with_columns(value.alias("value")).drop(
-        [column for column in namespace if column != "value"]
-    )
+    return lf.with_columns(value.alias("value")).drop([column for column in namespace if column != "value"])
 
 
 def group_long(lf: LongFrame, op: GroupOp) -> LongFrame:
@@ -352,9 +348,7 @@ def join_long(frames: list[LongFrame], names: Sequence[str]) -> LongFrame:
     """
     renamed = [frame.rename({"value": name}) for name, frame in zip(names, frames)]
     carried = [
-        frame.drop(
-            [column for column in frame.collect_schema().names() if column in DATASET_SELECTION_COLUMNS]
-        )
+        frame.drop([column for column in frame.collect_schema().names() if column in DATASET_SELECTION_COLUMNS])
         for frame in renamed
     ]
     key_columns = [set(frame.collect_schema().names()) - {name} for name, frame in zip(names, carried)]

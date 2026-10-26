@@ -102,6 +102,7 @@ Since the `LazyFrame` returned by `read_data` has not yet been materialized, add
 import polars as pl
 from cpra.mp.data import read_data
 from datetime import date
+
 g520_ip1 = p.col("model_group_id") == 520 & pl.col("calendar_day") < date(2040, 1, 1)
 g521_ip2 = p.col("model_group_id") == 521 & pl.col("calendar_day") >= date(2040, 1, 1)
 lf2 = read_data(
@@ -190,18 +191,21 @@ The return value depends on the pipeline's own `output.format`:
 from cpra.mp.data import analyze_data
 
 # Count the days each hydro compartment's salinity exceeded 5.5 in one scenario.
-df = await analyze_data({
-    "inputs": {
-        "sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}
-    },
-    "steps": [
-        {"op": "filter", "input": "sal",
-         "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = 'mean'"},
-        {"op": "filter", "where": "value > 5.5"},
-        {"op": "group", "by": [], "aggregate": "count"},
-    ],
-    "output": {"format": "csv"},
-})
+df = await analyze_data(
+    {
+        "inputs": {"sal": {"variable": "sal", "time_unit": "daily", "grid": "hydro_compartment_v001"}},
+        "steps": [
+            {
+                "op": "filter",
+                "input": "sal",
+                "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = 'mean'",
+            },
+            {"op": "filter", "where": "value > 5.5"},
+            {"op": "group", "by": [], "aggregate": "count"},
+        ],
+        "output": {"format": "csv"},
+    }
+)
 # → one row per grid_cell (an empty group.by collapses every day into one count).
 ```
 
@@ -218,17 +222,17 @@ columns, so there is no band bookkeeping:
 
 ```python
 # Mean elevation per hydro compartment, per year, averaged across two scenarios.
-df = await analyze_data({
-    "inputs": {
-        "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
-    },
-    "steps": [
-        {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
-        {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
-        {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
-    ],
-    "output": {"format": "csv"},
-})
+df = await analyze_data(
+    {
+        "inputs": {"elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}},
+        "steps": [
+            {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
+            {"op": "project", "to": "hydro_compartment_v001", "aggregate": "mean"},
+            {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
+        ],
+        "output": {"format": "csv"},
+    }
+)
 # columns: grid_cell, calendar_year, value — one row per (compartment, year)
 ```
 
@@ -240,9 +244,7 @@ not the only record of which band is which:
 ```python
 path = await analyze_data(
     {
-        "inputs": {
-            "elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}
-        },
+        "inputs": {"elev": {"variable": "elev", "time_unit": "annual", "grid": "morph_pixel_v001"}},
         "steps": [
             {"op": "filter", "input": "elev", "where": "model_group_id = 500 AND scenario_id IN (7, 8)"},
             {"op": "group", "by": ["calendar_year"], "aggregate": "mean"},
@@ -267,19 +269,29 @@ path = await analyze_data(
     {
         "inputs": {
             "coverage": {
-                "variable": "ffibs_coverage_ratio", "time_unit": "annual",
+                "variable": "ffibs_coverage_ratio",
+                "time_unit": "annual",
                 "grid": "veg_grid_cell_v001",
             },
             "salinity": {
-                "variable": "sal", "time_unit": "annual",
+                "variable": "sal",
+                "time_unit": "annual",
                 "grid": "hydro_compartment_v001",
             },
         },
         "steps": [
-            {"op": "filter", "input": "coverage", "as": "marsh",
-             "where": "model_group_id = 500 AND scenario_id = 7 AND ffibs_type = 'pl_fm'"},
-            {"op": "filter", "input": "salinity", "as": "selected_salinity",
-             "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = '2_wk_max'"},
+            {
+                "op": "filter",
+                "input": "coverage",
+                "as": "marsh",
+                "where": "model_group_id = 500 AND scenario_id = 7 AND ffibs_type = 'pl_fm'",
+            },
+            {
+                "op": "filter",
+                "input": "salinity",
+                "as": "selected_salinity",
+                "where": "model_group_id = 500 AND scenario_id = 7 AND aggregate_type = '2_wk_max'",
+            },
             {"op": "project", "input": "selected_salinity", "to": "veg_grid_cell_v001", "as": "sal"},
             {"op": "join", "type": "spatial", "inputs": ["marsh", "sal"], "as": "paired"},
             {"op": "filter", "where": "marsh > 0.5 AND sal > 5.5"},

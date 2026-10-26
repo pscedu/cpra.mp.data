@@ -175,9 +175,7 @@ async def resolve_vector_grid_cell(grid_name: str, lngs: list[float], lats: list
     fgb_path, points = _projected_points(grid_name, lngs, lats)
 
     loop = asyncio.get_running_loop()
-    return await asyncio.gather(
-        *[loop.run_in_executor(None, _resolve_point, fgb_path, x, y) for x, y in points]
-    )
+    return await asyncio.gather(*[loop.run_in_executor(None, _resolve_point, fgb_path, x, y) for x, y in points])
 
 
 def resolve_raster_pixel(grid_name: str, lngs: list[float], lats: list[float]) -> list[tuple[int, int] | None]:
@@ -340,9 +338,7 @@ def relabel_raster_grid_cell(lf: pl.LazyFrame, id_to_labels: dict[int, list[str]
         schema={"grid_cell": pl.Int64, "__grid_cell_label": pl.Utf8},
     )
     return (
-        lf.join(labels_frame, on="grid_cell", how="inner")
-        .drop("grid_cell")
-        .rename({"__grid_cell_label": "grid_cell"})
+        lf.join(labels_frame, on="grid_cell", how="inner").drop("grid_cell").rename({"__grid_cell_label": "grid_cell"})
     )
 
 

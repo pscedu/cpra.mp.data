@@ -208,9 +208,7 @@ class TestReservedBandIndexDegenerateShape:
         # `by=[]` group leaves the reserved column as the ONLY column, and `drop` of a
         # frame's last column reports height 0 no matter how many rows went in.
         collapsed = pl.DataFrame({"scenario": ["a"]}).select([])
-        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(
-            RESERVED_BAND_INDEX_COLUMN
-        )
+        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(RESERVED_BAND_INDEX_COLUMN)
 
         assert collapsed.shape == (0, 0)
         assert sole.height == 1
@@ -219,9 +217,7 @@ class TestReservedBandIndexDegenerateShape:
     def test_released_band_metadata_keeps_a_sole_reserved_index_so_the_band_count_survives(self):
         # One band in, one band out. Dropping here would report zero bands for a result
         # that has one, which a raster sink reads as "this request matched no data".
-        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(
-            RESERVED_BAND_INDEX_COLUMN
-        )
+        sole = frame.add_reserved_band_index(pl.DataFrame({"scenario": ["a"]})).select(RESERVED_BAND_INDEX_COLUMN)
 
         released = frame.released_band_metadata(sole)
 

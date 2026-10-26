@@ -293,9 +293,7 @@ def compile_ops(pipeline: Pipeline) -> list[Op]:
             )
 
         if isinstance(step, ProjectStep):
-            op = ProjectOp(
-                step_no=step_no, input=input_name, to=step.to, aggregate=step.aggregate, output=output
-            )
+            op = ProjectOp(step_no=step_no, input=input_name, to=step.to, aggregate=step.aggregate, output=output)
         elif isinstance(step, FilterStep):
             op = FilterOp(step_no=step_no, input=input_name, where=step.where, output=output)
         elif isinstance(step, CalculateStep):
@@ -731,9 +729,7 @@ def _type_join(step_no: int, step: JoinStep | JoinOp, operand_states: list[Frame
         )
     grid = next(iter(grids))
 
-    already_paired = [
-        name for name, state in zip(step.inputs, operand_states) if len(state.value_columns) > 1
-    ]
+    already_paired = [name for name, state in zip(step.inputs, operand_states) if len(state.value_columns) > 1]
     if already_paired:
         raise ShapeError(
             f"step {step_no} (join): operand(s) {already_paired} already carry more than "

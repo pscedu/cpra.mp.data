@@ -63,9 +63,7 @@ class TestPartition:
         pushes one pair per value), so the partition has to consume `multi_items()` rather
         than a flattened dict -- a `dict(query)` would keep only the last year and answer
         200 with one year's data for a two-year `diff`."""
-        partition = partition_query(
-            [("calendar_year", "2030"), ("calendar_year", "2040"), ("scenario_id", "7")]
-        )
+        partition = partition_query([("calendar_year", "2030"), ("calendar_year", "2040"), ("scenario_id", "7")])
         assert partition.filters == {"calendar_year": ["2030", "2040"], "scenario_id": ["7"]}
 
     def test_a_repeated_scalar_key_is_last_wins(self):

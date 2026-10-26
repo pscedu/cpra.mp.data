@@ -7,6 +7,4 @@ from cpra.mp.data.visualizations.species_stacked_bar import SpeciesStackedBar
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 
-VISUALIZATIONS = {
-    viz.Meta.name: viz for viz in [SedimentDynamics, TimeSeriesLine, StackedBar, SpeciesStackedBar, Map]
-}
+VISUALIZATIONS = {viz.Meta.name: viz for viz in [SedimentDynamics, TimeSeriesLine, StackedBar, SpeciesStackedBar, Map]}

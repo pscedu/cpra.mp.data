@@ -137,9 +137,9 @@ HISTORIC_GROUPS = [
 ]
 
 _group_ends = [last for _, last in HISTORIC_GROUPS]
-assert (
-    _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS
-), f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
+assert _group_ends == sorted(set(_group_ends)) and _group_ends[-1] == N_HISTORIC_PERIODS, (
+    f"HISTORIC_GROUPS must partition periods 1..{N_HISTORIC_PERIODS} in order, got {_group_ends}"
+)
 
 # Color depends on a period's role in the frame being drawn rather than on which period it
 # is (see historical_colors_revised.png): the group the frame is "on" is the current
@@ -228,7 +228,7 @@ TRANSPARENT_BAND = None
 CONFIDENCE_BAND_COLORS = CONFIDENCE_LOSS_RAMP[::-1] + [TRANSPARENT_BAND, TRANSPARENT_BAND] + CONFIDENCE_GAIN_RAMP
 
 assert len(CONFIDENCE_BAND_COLORS) == len(CONFIDENCE_BREAKS), (
-    f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors " f"for {len(CONFIDENCE_BREAKS)} breaks"
+    f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors for {len(CONFIDENCE_BREAKS)} breaks"
 )
 
 # The lnd_type dataset lnd_conf runs over, and the year every other year's confidence is
@@ -323,7 +323,7 @@ def split_style(style_path: Path):
     assert over_idx == under_idx + 1, (
         f"expected '{OVERLAY_FIRST_LAYER}' to immediately follow "
         f"'{UNDERLAY_LAST_LAYER}', found layers in between: "
-        f"{ids[under_idx + 1:over_idx]}"
+        f"{ids[under_idx + 1 : over_idx]}"
     )
 
     underlay_style = {**style, "layers": layers[: under_idx + 1]}

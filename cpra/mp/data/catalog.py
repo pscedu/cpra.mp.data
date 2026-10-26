@@ -281,9 +281,7 @@ class Catalog:
         # pl.read_parquet(files) -- older files may predate a fix to tabular_catalog_rows
         # and lack the unused calendar dim's extent columns entirely, which pl.read_parquet
         # rejects as a schema mismatch across a file list.
-        merged = merge_partition(
-            pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed"), time_unit
-        )
+        merged = merge_partition(pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed"), time_unit)
         tmp = directory / f"{uuid.uuid4()}-0.parquet"
         merged.write_parquet(tmp)
         for f in files:
@@ -427,13 +425,14 @@ class CatalogQuery:
             # input (0.1) and its float32 repr (0.10000000149011612) resolve
             # to the same canonical value as the one stored in choices.
             if dimension.values is not None and str(dimension.dtype).startswith("Float"):
-                canonical_map = dict(zip(
-                    dimension.values["value"].cast(dimension.dtype).to_list(),
-                    dimension.values["value"].to_list(),
-                ))
+                canonical_map = dict(
+                    zip(
+                        dimension.values["value"].cast(dimension.dtype).to_list(),
+                        dimension.values["value"].to_list(),
+                    )
+                )
                 prop_value = [
-                    canonical_map.get(pl.Series([v], dtype=dimension.dtype).to_list()[0], v)
-                    for v in prop_value
+                    canonical_map.get(pl.Series([v], dtype=dimension.dtype).to_list()[0], v) for v in prop_value
                 ]
             choices_set = set(self._choices[dimension_name])
             selected_values = sorted([val for val in prop_value if val in choices_set])
@@ -458,9 +457,7 @@ class CatalogQuery:
             if dimension_name in ("calendar_day", "calendar_year"):
                 if not isinstance(values, pl.Series):
                     values = pl.Series(values)
-                offsets = calendar_run_offsets(
-                    values, dimension_name, self._calendar_time_unit[dimension_name]
-                )
+                offsets = calendar_run_offsets(values, dimension_name, self._calendar_time_unit[dimension_name])
                 groups = (
                     pl.DataFrame({"value": values, "offset": offsets})
                     .group_by("offset")

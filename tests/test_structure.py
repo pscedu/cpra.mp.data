@@ -100,9 +100,7 @@ class TestDimensionsCsv:
         csv_dimensions = set(read_structure_csv("dimension_values")["dimension"].unique())
         assert csv_dimensions <= set(DIMENSIONS)
 
-    @pytest.mark.parametrize(
-        "dim_name", [name for name, dim in DIMENSIONS.items() if dim.example_value is not None]
-    )
+    @pytest.mark.parametrize("dim_name", [name for name, dim in DIMENSIONS.items() if dim.example_value is not None])
     def test_example_values_satisfy_their_own_constraints(self, dim_name):
         """A dimension's documented example must pass that dimension's own validation."""
         dim = DIMENSIONS[dim_name]
@@ -114,9 +112,7 @@ class TestDimensionsCsv:
 # The colors are the vegetation model's own map symbology, and `SpeciesStackedBar` reads
 # both them and their row order straight out of this CSV -- so an edit here is an edit to
 # that chart, and these are the invariants it relies on.
-COLORED_DIMENSIONS = sorted(
-    read_structure_csv("dimension_values").drop_nulls("color")["dimension"].unique()
-)
+COLORED_DIMENSIONS = sorted(read_structure_csv("dimension_values").drop_nulls("color")["dimension"].unique())
 
 
 class TestDimensionValueColors:
@@ -246,9 +242,12 @@ class TestLegendLayouts:
     def test_a_label_has_one_color_and_one_row(self, legend_name):
         """A strip shows each label once, so its duplicates must agree on what it shows."""
         placed = LEGENDS[legend_name].break_points.filter(pl.col("row").is_not_null())
-        assert placed.group_by("label").agg(pl.col("color", "row").n_unique()).filter(
-            (pl.col("color") > 1) | (pl.col("row") > 1)
-        ).is_empty()
+        assert (
+            placed.group_by("label")
+            .agg(pl.col("color", "row").n_unique())
+            .filter((pl.col("color") > 1) | (pl.col("row") > 1))
+            .is_empty()
+        )
 
     @pytest.mark.parametrize("legend_name", sorted(set(LEGENDS) - set(LAID_OUT)))
     def test_a_legend_without_a_layout_places_nothing(self, legend_name):

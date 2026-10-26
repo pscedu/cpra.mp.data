@@ -113,6 +113,7 @@ PLAIN_RASTER = {
     "step.1.where": "calendar_year = 2030",
 }
 
+
 # `diff`'s own three steps, with the caller's two-year selection lowered into the leading
 # filter rather than appended: `Difference` states its own selection, and `group.by` is the
 # dimensions it did NOT collapse, which differ per grid (a raster dataset has no
@@ -217,9 +218,7 @@ SAL_VEG_PROJECTED = {
     "step.8.to": "ecoregion_v001",
 }
 
-DOTTED_PIPELINE = (
-    "step.1.op=filter&step.1.input=data&step.1.where=calendar_year+%3D+2030"
-)
+DOTTED_PIPELINE = "step.1.op=filter&step.1.input=data&step.1.where=calendar_year+%3D+2030"
 
 FAMILIES = [
     Family(
@@ -227,17 +226,13 @@ FAMILIES = [
         query=f"{VECTOR}&calendar_year=2030&sort=grid_cell",
         spellings=(
             Spelling("/v1/datasets/{v}/{t}/{g}/data.{format}", "/v1/data.csv", "csv"),
-            Spelling(
-                "/v1/datasets/{v}/{t}/{g}/tiles/{z}/{x}/{y}.pbf", "/v1/data/3/1/2.pbf", "pbf"
-            ),
+            Spelling("/v1/datasets/{v}/{t}/{g}/tiles/{z}/{x}/{y}.pbf", "/v1/data/3/1/2.pbf", "pbf"),
             Spelling(
                 "/v1/datasets/{v}/{t}/{g}/visualization/{name}.json",
                 "/v1/visualizations/time-series-line.json",
                 "csv",
             ),
-            Spelling(
-                "/v1/datasets/{v}/{t}/{g}/catalog.json", "/v1/catalog.json", "csv"
-            ),
+            Spelling("/v1/datasets/{v}/{t}/{g}/catalog.json", "/v1/catalog.json", "csv"),
         ),
         pipeline=PLAIN_VECTOR,
     ),
@@ -246,9 +241,7 @@ FAMILIES = [
         query=f"{RASTER}&calendar_year=2030",
         spellings=(
             Spelling("/v1/datasets/{v}/{t}/{g}/data.{format}", "/v1/data.tif", "tif"),
-            Spelling(
-                "/v1/datasets/{v}/{t}/{g}/data/{z}/{x}/{y}.{format}", "/v1/data/3/1/2.png", "png"
-            ),
+            Spelling("/v1/datasets/{v}/{t}/{g}/data/{z}/{x}/{y}.{format}", "/v1/data/3/1/2.png", "png"),
         ),
         pipeline=PLAIN_RASTER,
     ),
@@ -256,9 +249,7 @@ FAMILIES = [
         id="dataset-analysis-vector",
         query=f"{VECTOR}&{DIFFERENCE}",
         spellings=(
-            Spelling(
-                "/v1/datasets/{v}/{t}/{g}/analyses/{a}/data.{format}", "/v1/data.csv", "csv"
-            ),
+            Spelling("/v1/datasets/{v}/{t}/{g}/analyses/{a}/data.{format}", "/v1/data.csv", "csv"),
             Spelling(
                 "/v1/datasets/{v}/{t}/{g}/analyses/{a}/tiles/{z}/{x}/{y}.pbf",
                 "/v1/data/3/1/2.pbf",
@@ -276,9 +267,7 @@ FAMILIES = [
         id="dataset-analysis-raster",
         query=f"{RASTER}&{DIFFERENCE}",
         spellings=(
-            Spelling(
-                "/v1/datasets/{v}/{t}/{g}/analyses/{a}/data.{format}", "/v1/data.tif", "tif"
-            ),
+            Spelling("/v1/datasets/{v}/{t}/{g}/analyses/{a}/data.{format}", "/v1/data.tif", "tif"),
             Spelling(
                 "/v1/datasets/{v}/{t}/{g}/analyses/{a}/data/{z}/{x}/{y}.{format}",
                 "/v1/data/3/1/2.png",
@@ -311,10 +300,7 @@ FAMILIES = [
     ),
     Family(
         id="dotted-vector",
-        query=(
-            "input.data.variable=ssf&input.data.time_unit=annual"
-            f"&input.data.grid=ecoregion_v001&{DOTTED_PIPELINE}"
-        ),
+        query=(f"input.data.variable=ssf&input.data.time_unit=annual&input.data.grid=ecoregion_v001&{DOTTED_PIPELINE}"),
         spellings=(
             Spelling("GET /v1/analysis.{format}", "/v1/data.csv", "csv"),
             Spelling("POST /v1/analysis.{format}", "POST /v1/data.csv", "csv"),
@@ -324,8 +310,7 @@ FAMILIES = [
     Family(
         id="dotted-raster",
         query=(
-            "input.data.variable=vct&input.data.time_unit=annual"
-            f"&input.data.grid=veg_grid_cell_v001&{DOTTED_PIPELINE}"
+            f"input.data.variable=vct&input.data.time_unit=annual&input.data.grid=veg_grid_cell_v001&{DOTTED_PIPELINE}"
         ),
         spellings=(
             Spelling("GET /v1/analysis.{format}", "/v1/data.tif", "tif"),
@@ -353,13 +338,9 @@ def _decode(spelling: Spelling, query: str):
     path, _, extension = spelling.new.rpartition(".")
 
     if path == "/v1/catalog":
-        return decode_request_sync(
-            parse_qsl(query), format=None, allow_compression=False, validate_sink=False
-        )
+        return decode_request_sync(parse_qsl(query), format=None, allow_compression=False, validate_sink=False)
     if path.startswith("/v1/visualizations/"):
-        return decode_request_sync(
-            parse_qsl(query), format="csv", render_fields=RENDER_OPTIONS, validate_sink=False
-        )
+        return decode_request_sync(parse_qsl(query), format="csv", render_fields=RENDER_OPTIONS, validate_sink=False)
     if path.startswith("/v1/analyses/"):
         return decode_request_sync(parse_qsl(query), format=None)
     if path.startswith("/v1/data/"):
@@ -367,9 +348,7 @@ def _decode(spelling: Spelling, query: str):
     return decode_request_sync(parse_qsl(query), format=extension)
 
 
-@pytest.mark.parametrize(
-    ("family", "spelling"), CASES, ids=[f"{f.id}:{s.route}" for f, s in CASES]
-)
+@pytest.mark.parametrize(("family", "spelling"), CASES, ids=[f"{f.id}:{s.route}" for f, s in CASES])
 def test_the_new_spelling_resolves_to_what_the_old_route_did(family, spelling):
     assert pipeline_to_query(_decode(spelling, family.query).pipeline) == {
         **family.pipeline,
@@ -409,9 +388,7 @@ def test_the_encoding_is_canonical_not_merely_reversible(family):
     the same object the dotted query form decodes to.
     """
     pipeline = _decode(family.spellings[0], family.query).pipeline
-    assert pipeline_to_query(parse_pipeline(pipeline.model_dump(mode="json"))) == (
-        pipeline_to_query(pipeline)
-    )
+    assert pipeline_to_query(parse_pipeline(pipeline.model_dump(mode="json"))) == (pipeline_to_query(pipeline))
 
 
 @pytest.mark.parametrize(

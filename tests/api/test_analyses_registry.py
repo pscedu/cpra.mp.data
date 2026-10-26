@@ -140,9 +140,7 @@ LND_TYPE_PLUS_FILTERS = {**LND_TYPE_PLUS_SELECTION, "calendar_year": 2050}
 # and its `variable` only says which of the five the caller was looking at. `elev` here is
 # therefore arbitrary among the five -- `test_the_callers_variable_does_not_choose_the_inputs`
 # below is what pins that it makes no difference.
-SEDIMENT_DYNAMICS_DATASET = DatasetRef(
-    variable="elev", time_unit="annual", grid="morph_pixel_v002"
-)
+SEDIMENT_DYNAMICS_DATASET = DatasetRef(variable="elev", time_unit="annual", grid="morph_pixel_v002")
 # The shrunk `morph_pixel_v002` is 2x4, so a pixel's row-major cell id IS its index into
 # the flat value sequences `tests.factories.sediment_dynamics_value` is written against.
 SEDIMENT_DYNAMICS_PIXEL = 5
@@ -264,12 +262,8 @@ class TestRegistryDrift:
         assert compile_plan(resolved.pipeline, base_path=base_path) is not None
 
     def test_lnd_type_plus_compiles(self, morph_pixel_v002_shrunk, base_path, crosswalk_path):
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[0.2] * 8, land_types=[1] * 8
-        )
-        resolved = resolve_analysis(
-            "lnd_type_plus", dataset=None, filters=LND_TYPE_PLUS_FILTERS, params={}
-        )
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.2] * 8, land_types=[1] * 8)
+        resolved = resolve_analysis("lnd_type_plus", dataset=None, filters=LND_TYPE_PLUS_FILTERS, params={})
         # Band-wide end to end (the one `project` lands ON the raster grid), so `tif` is
         # the only sink `validate_shapes` accepts -- and it is what `pipeline.json`
         # publishes.
@@ -311,9 +305,7 @@ class TestRegistryDrift:
 
 class TestDifferenceExecution:
     def test_asc_order_produces_a_negative_later_value(self, base_path):
-        write_annual_dataset(
-            base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id
-        )
+        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: 100.0 + geo_id)
         resolved = resolve_analysis(
             "diff",
             dataset=SSF_DATASET,
@@ -327,9 +319,7 @@ class TestDifferenceExecution:
         assert set(df["value"].to_list()) == {0.0}
 
     def test_desc_order_negates_the_earlier_value_instead(self, base_path):
-        write_annual_dataset(
-            base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year)
-        )
+        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year))
         resolved = resolve_analysis(
             "diff",
             dataset=SSF_DATASET,
@@ -345,9 +335,7 @@ class TestDifferenceExecution:
         part of the input selection -- so a third year present on disk but absent from
         `filters` must not contribute to the sum.
         """
-        write_annual_dataset(
-            base_path, years=(2030, 2040, 2050), value_fn=lambda year, geo_id: float(year)
-        )
+        write_annual_dataset(base_path, years=(2030, 2040, 2050), value_fn=lambda year, geo_id: float(year))
         resolved = resolve_analysis(
             "diff",
             dataset=SSF_DATASET,
@@ -359,9 +347,7 @@ class TestDifferenceExecution:
         assert set(df["value"].to_list()) == {-10.0}
 
     def test_a_grid_cell_filter_narrows_the_result(self, base_path):
-        write_annual_dataset(
-            base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year)
-        )
+        write_annual_dataset(base_path, years=(2030, 2040), value_fn=lambda year, geo_id: float(year))
         resolved = resolve_analysis(
             "diff",
             dataset=SSF_DATASET,
@@ -374,9 +360,7 @@ class TestDifferenceExecution:
 
 class TestLandChangeExecution:
     def test_two_image_mode_multiplies_t0_by_ten(self, base_path):
-        write_annual_dataset(
-            base_path, years=(MP2023_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0
-        )
+        write_annual_dataset(base_path, years=(MP2023_BASELINE_YEAR, 2040), value_fn=lambda year, geo_id: 1.0)
         resolved = resolve_analysis(
             "lnd_chng",
             dataset=SSF_DATASET,
@@ -491,9 +475,7 @@ class TestLandConfidenceExecution:
 
     def _run_confidence(self, base_path, tmp_path, dataset=RASTER_DATASET):
         """Resolve the analysis over what's already on disk and run it to a GeoTIFF."""
-        resolved = resolve_analysis(
-            "lnd_conf", dataset=dataset, filters=ENSEMBLE_FILTERS, params={}
-        )
+        resolved = resolve_analysis("lnd_conf", dataset=dataset, filters=ENSEMBLE_FILTERS, params={})
         validate_shapes(resolved.pipeline)
         out = tmp_path / "confidence.tif"
         run_to_path(resolved.pipeline, out, base_path=base_path)
@@ -671,12 +653,8 @@ class TestChainedAnalysisExecution:
         instead -- proof the chain generalizes to whichever remaining dimension the
         caller names, not just the one the plan happened to illustrate with.
         """
-        _write_ensemble(
-            base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2050,), model_group_id=700
-        )
-        _write_ensemble(
-            base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2050,), model_group_id=720
-        )
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), years=(2050,), model_group_id=700)
+        _write_ensemble(base_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), years=(2050,), model_group_id=720)
         out = self._run_chain(
             base_path,
             tmp_path,
@@ -714,7 +692,13 @@ class TestChainedAnalysisExecution:
         # then `diff`'s negate-and-sum pair. The differencing dimension survives into the
         # filter as an `IN`, which is what `Difference` needs two of.
         assert [step.op for step in resolved.pipeline.steps] == [
-            "filter", "project", "join", "filter", "case", "case", "group"
+            "filter",
+            "project",
+            "join",
+            "filter",
+            "case",
+            "case",
+            "group",
         ]
         assert resolved.pipeline.steps[3].where == (
             "calendar_year IN (2040, 2050) AND model_group_id = 705 AND scenario_id = 7"
@@ -777,9 +761,7 @@ class TestSalinityVegInvestigationExecution:
         from tests.factories import write_raster_dataset
 
         write_ffibs_coverage_dataset(base_path, {2030: 0.3, 2040: 0.7})
-        write_raster_dataset(
-            base_path, years=(2030, 2040), fill_fn=lambda year: 4.0 if year == 2030 else 6.0
-        )
+        write_raster_dataset(base_path, years=(2030, 2040), fill_fn=lambda year: 4.0 if year == 2030 else 6.0)
         monkeypatch.setattr(config, "BASE_PATH", base_path)
 
         pipeline = parse_pipeline(
@@ -839,9 +821,7 @@ class TestLndTypePlusExecution:
         run_to_path(resolved.pipeline, out, base_path=base_path)
         return out
 
-    def test_every_reclassification_case_at_once(
-        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
-    ):
+    def test_every_reclassification_case_at_once(self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path):
         """One pixel per rule. Every pixel is open water (`2`), which is the only land type
         a depth class can reach at all -- `test_only_open_water_gets_a_shallow_class` is
         where that restriction is pinned, and here it is held constant so the table is the
@@ -875,9 +855,7 @@ class TestLndTypePlusExecution:
             assert src.count == 1
             assert src.read(1).ravel().tolist() == [6, 7, 2, 6, 7, 7, 2, 6]
 
-    def test_only_open_water_gets_a_shallow_class(
-        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
-    ):
+    def test_only_open_water_gets_a_shallow_class(self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path):
         """The water restriction, across every land type at ONE shallow depth. `max` alone
         would put a `6` over all eight pixels -- `6` outranks every `lnd_type` code -- so
         anything but `[…, 6, …]` at the two water pixels and the land type everywhere else
@@ -1013,19 +991,13 @@ class TestLndTypePlusExecution:
             assert band.mask.ravel().tolist() == [True] + [False] * 6 + [True]
             assert band.ravel().tolist()[1:7] == [6] * 6
 
-    def test_an_unselected_year_is_excluded(
-        self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
-    ):
+    def test_an_unselected_year_is_excluded(self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path):
         """`calendar_year` is a parameter rather than a filter here, but it still lands on
         the same trailing `filter` step -- and the `group` past it KEEPS the dimension, so a
         leaked year would surface as a second band rather than corrupting 2050's.
         """
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040
-        )
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[0.70] * 8, land_types=[2] * 8, year=2050
-        )
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040)
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.70] * 8, land_types=[2] * 8, year=2050)
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
             assert src.count == 1
             assert "calendar_year=2050" in src.descriptions[0]
@@ -1038,12 +1010,8 @@ class TestLndTypePlusExecution:
         model group and scenario, and the `case`'s pairing still keys on the year -- so each
         year is reclassified against its OWN counterpart bands rather than across years.
         """
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040
-        )
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[1.50] * 8, land_types=[4] * 8, year=2050
-        )
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=2040)
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[1.50] * 8, land_types=[4] * 8, year=2050)
         filters = {k: v for k, v in LND_TYPE_PLUS_FILTERS.items() if k != "calendar_year"}
         with rio.open(self._run_plus(base_path, tmp_path, filters=filters)) as src:
             assert src.count == 2
@@ -1061,10 +1029,8 @@ class TestLndTypePlusExecution:
             # `join_long` carries a one-sided column through), so the GeoTIFF omitting them
             # was the two shapes disagreeing rather than the download being tidier.
             assert {d: set(v) for d, v in by_year.items()} == {
-                "model_group_id=705, scenario_id=7, aggregate_type=mean, "
-                "calendar_year=2040, model=icm_v2023.0.0": {6},
-                "model_group_id=705, scenario_id=7, aggregate_type=mean, "
-                "calendar_year=2050, model=icm_v2023.0.0": {4},
+                "model_group_id=705, scenario_id=7, aggregate_type=mean, calendar_year=2040, model=icm_v2023.0.0": {6},
+                "model_group_id=705, scenario_id=7, aggregate_type=mean, calendar_year=2050, model=icm_v2023.0.0": {4},
             }
 
     def test_another_scenario_on_disk_does_not_reach_the_join(
@@ -1074,12 +1040,8 @@ class TestLndTypePlusExecution:
         scenario is neither collapsed into 7's band nor added as a band of its own. It is
         written with values that would be unmistakable either way.
         """
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[0.20] * 8, land_types=[4] * 8, scenario_id=8
-        )
-        write_lnd_type_plus_datasets(
-            base_path, crosswalk_path, depths=[1.50] * 8, land_types=[2] * 8
-        )
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.20] * 8, land_types=[4] * 8, scenario_id=8)
+        write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[1.50] * 8, land_types=[2] * 8)
         with rio.open(self._run_plus(base_path, tmp_path)) as src:
             assert src.count == 1
             assert set(src.read(1).ravel().tolist()) == {2}
@@ -1109,9 +1071,7 @@ class TestLndTypePlusNarrowsItsReads:
     @staticmethod
     def _write_two_years(base_path, crosswalk_path):
         for year in (2040, 2050):
-            write_lnd_type_plus_datasets(
-                base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=year
-            )
+            write_lnd_type_plus_datasets(base_path, crosswalk_path, depths=[0.20] * 8, land_types=[2] * 8, year=year)
 
     def test_a_selection_declared_after_the_join_still_narrows_both_raster_reads(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
@@ -1127,9 +1087,7 @@ class TestLndTypePlusNarrowsItsReads:
         plan = self._compile(base_path, crosswalk_path, LND_TYPE_PLUS_FILTERS)
         for name in ("elevation", "land_type"):
             assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2050]
-        assert [
-            metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()
-        ] == [[2050]]
+        assert [metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()] == [[2050]]
 
     def test_omitting_the_year_leaves_both_raster_reads_whole(
         self, morph_pixel_v002_shrunk, base_path, crosswalk_path, tmp_path
@@ -1143,9 +1101,9 @@ class TestLndTypePlusNarrowsItsReads:
         plan = self._compile(base_path, crosswalk_path, filters)
         for name in ("elevation", "land_type"):
             assert plan.inputs[name].band_metadata["calendar_year"].to_list() == [2040, 2050]
-        assert [
-            metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()
-        ] == [[2040, 2050]]
+        assert [metadata["calendar_year"].to_list() for metadata in plan.vector_band_metadata.values()] == [
+            [2040, 2050]
+        ]
 
 
 class TestSedimentDynamicsExecution:
@@ -1165,9 +1123,7 @@ class TestSedimentDynamicsExecution:
             params={},
         )
 
-    def test_five_variables_at_one_pixel_come_back_as_five_rows_per_year(
-        self, morph_pixel_v002_shrunk, base_path
-    ):
+    def test_five_variables_at_one_pixel_come_back_as_five_rows_per_year(self, morph_pixel_v002_shrunk, base_path):
         """The whole analysis, end to end and value by value. Two years and five variables
         is ten rows, each carrying its own variable's own number at the selected pixel --
         `sediment_dynamics_value` writes a distinct value per (variable, year, pixel), so a
@@ -1183,9 +1139,7 @@ class TestSedimentDynamicsExecution:
         # The operand names are GONE as columns -- that is what the fold did to the frame.
         assert not set(SEDIMENT_DYNAMICS_DTYPES) & set(df.columns)
         assert dict(zip(zip(df["variable"], df["calendar_year"]), df["value"])) == {
-            (variable, year): pytest.approx(
-                sediment_dynamics_value(variable, year, SEDIMENT_DYNAMICS_PIXEL)
-            )
+            (variable, year): pytest.approx(sediment_dynamics_value(variable, year, SEDIMENT_DYNAMICS_PIXEL))
             for variable in SEDIMENT_DYNAMICS_DTYPES
             for year in SEDIMENT_DYNAMICS_YEARS
         }
@@ -1216,9 +1170,7 @@ class TestSedimentDynamicsExecution:
         assert df["calendar_year"].unique().to_list() == [2050]
         assert df.height == len(SEDIMENT_DYNAMICS_DTYPES)
 
-    def test_the_callers_variable_does_not_choose_the_inputs(
-        self, morph_pixel_v002_shrunk, base_path
-    ):
+    def test_the_callers_variable_does_not_choose_the_inputs(self, morph_pixel_v002_shrunk, base_path):
         """The triple's `variable` says which of the five the caller was looking at; the
         analysis reads all five regardless. Resolving against a different one of the five
         has to produce the identical pipeline, or `Meta.variables` would be five entry
@@ -1237,12 +1189,8 @@ class TestSedimentDynamicsExecution:
         really supplies, so naming the other morphology grid moves every one of the five
         inputs onto it.
         """
-        resolved = self._resolve(
-            dataset=DatasetRef(variable="elev", time_unit="annual", grid="morph_pixel_v001")
-        )
-        assert {selection.grid for selection in resolved.pipeline.inputs.values()} == {
-            "morph_pixel_v001"
-        }
+        resolved = self._resolve(dataset=DatasetRef(variable="elev", time_unit="annual", grid="morph_pixel_v001"))
+        assert {selection.grid for selection in resolved.pipeline.inputs.values()} == {"morph_pixel_v001"}
 
     def test_without_a_pixel_it_is_rejected_with_a_message_naming_grid_cell(self):
         """A band-wide frame cannot be unpivoted, and the `grid_cell` filter is what lowers
@@ -1281,9 +1229,7 @@ class TestSedimentDynamicsExecution:
         descriptor = output_descriptor(resolved.pipeline)
         assert descriptor.folded_into == "variable"
         assert list(descriptor.value_columns) == sorted(SEDIMENT_DYNAMICS_DTYPES)
-        assert [variable.name for variable in descriptor.variables] == sorted(
-            SEDIMENT_DYNAMICS_DTYPES
-        )
+        assert [variable.name for variable in descriptor.variables] == sorted(SEDIMENT_DYNAMICS_DTYPES)
         assert descriptor.variable is None
         assert resolved.legend is None
         assert resolved.meta.label == "Sediment Dynamics"

@@ -452,7 +452,10 @@ def write_cog(
 
     grid = GRIDS[kwargs["grid"]]
     profile = _cog_profile(
-        grid, data.dtype, compression=compression, compression_level=compression_level,
+        grid,
+        data.dtype,
+        compression=compression,
+        compression_level=compression_level,
         nodata=VARIABLES[kwargs["variable"]].nodata,
     )
 
@@ -507,8 +510,17 @@ def scale_vrt_bands(vrt_text, factors):
 
 
 def _write_run(
-    run, out_path, grid, dtype, calendar_dim, values, is_legacy, compression, compression_level,
-    vrt_transform=None, nodata=-9999,
+    run,
+    out_path,
+    grid,
+    dtype,
+    calendar_dim,
+    values,
+    is_legacy,
+    compression,
+    compression_level,
+    vrt_transform=None,
+    nodata=-9999,
 ):
     """Consolidate one contiguous run into the multi-band COG at ``out_path``.
 
@@ -533,7 +545,11 @@ def _write_run(
         vrt_path.write_text(vrt_text)
 
         profile = _cog_profile(
-            grid, dtype, count=len(run), compression=compression, compression_level=compression_level,
+            grid,
+            dtype,
+            count=len(run),
+            compression=compression,
+            compression_level=compression_level,
             nodata=nodata,
         )
         profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
@@ -801,9 +817,17 @@ def compact_cog(
                 out_path = out_directory / f"{uuid.uuid4()}.tif"
 
                 _write_run(
-                    sub_run, out_path, grid, dtype, calendar_dim, sub_values,
-                    run_is_legacy, compression, compression_level,
-                    vrt_transform, nodata=VARIABLES[kwargs["variable"]].nodata,
+                    sub_run,
+                    out_path,
+                    grid,
+                    dtype,
+                    calendar_dim,
+                    sub_values,
+                    run_is_legacy,
+                    compression,
+                    compression_level,
+                    vrt_transform,
+                    nodata=VARIABLES[kwargs["variable"]].nodata,
                 )
                 outputs.append(out_path)
                 consumed_paths |= unique_paths
