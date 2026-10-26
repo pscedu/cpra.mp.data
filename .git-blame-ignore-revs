@@ -1,0 +1,6 @@
+# Bulk reformatting commits, skipped by `git blame` so it shows the commit that last
+# changed a line's meaning rather than its layout. GitHub's blame view reads this file
+# automatically; locally, run once: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style: run ruff format
+dc919b88d6fcd9cab4ca067cef190d113a1c55e7

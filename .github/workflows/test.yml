@@ -35,6 +35,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: uv run --python 3.13 ruff check .
 
+      - name: Check formatting
+        if: ${{ !cancelled() }}
+        run: uv run --python 3.13 ruff format --check .
+
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
