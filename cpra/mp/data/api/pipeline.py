@@ -36,22 +36,83 @@ caller for `render_tile`/`sink_vector_tile` directly.
 """
 
 import tempfile
+import time
 from functools import partial
 
 import anyio.to_thread
+from anyio.lowlevel import RunVar
 from fastapi import HTTPException
 from starlette.responses import FileResponse, Response
 from starlette.types import Receive, Scope, Send
 
+from cpra.mp.data import config
+from cpra.mp.data.analysis.execution import sink
 from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
-from cpra.mp.data.analysis.execution import sink
 from cpra.mp.data.analysis.io import output
 from cpra.mp.data.analysis.request.ops import final_frame_name
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
 from cpra.mp.data.api.tabular import StreamingThread, sleep_between_polls
 from cpra.mp.data.variables import VARIABLES
+
+# Tile renders get their own limiter rather than anyio's default one, so a burst of tile
+# requests queues here instead of filling the default pool -- see
+# `config.TILE_RENDER_CONCURRENCY` for the OOM this prevents. A RunVar, like anyio's own
+# default limiter, because a limiter belongs to one event loop and tests run many.
+_tile_render_limiter: RunVar[anyio.CapacityLimiter] = RunVar("tile_render_limiter")
+
+# Seconds a saturated tile limiter may go without a render finishing before `/healthz`
+# reports the process as stuck. Tiles finish in about a second; a minute with every slot
+# held and none freed is a hung read, not load.
+TILE_RENDER_STALL_SECONDS = 60.0
+
+# Liveness bookkeeping for `tile_renders_stalled`, which `/healthz` reads from a worker
+# thread. Only the event loop writes these, and a stale read only shifts the verdict by
+# one probe period, so no lock.
+_tiles_in_flight = 0
+_last_tile_progress = time.monotonic()
+
+
+def _tile_limiter() -> anyio.CapacityLimiter:
+    try:
+        return _tile_render_limiter.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(config.TILE_RENDER_CONCURRENCY)
+        _tile_render_limiter.set(limiter)
+        return limiter
+
+
+def tile_renders_stalled() -> bool:
+    """Whether every tile-render slot is held and none has freed up for
+    `TILE_RENDER_STALL_SECONDS`.
+
+    `/healthz` used to catch a hung data filesystem purely by the default thread pool
+    filling up. Tile renders no longer use that pool, so tiles stuck on a hung read would
+    hold only their own few slots and leave `/healthz` green while every map tile
+    hangs. This is the replacement signal. Progress is stamped when a slot is taken as
+    well as when one is freed, so a burst arriving after an idle hour is not mistaken
+    for a stall.
+    """
+    return (
+        _tiles_in_flight >= config.TILE_RENDER_CONCURRENCY
+        and time.monotonic() - _last_tile_progress > TILE_RENDER_STALL_SECONDS
+    )
+
+
+async def _run_tile_render(render):
+    global _tiles_in_flight, _last_tile_progress
+    async with _tile_limiter():
+        _tiles_in_flight += 1
+        _last_tile_progress = time.monotonic()
+        try:
+            # The tile slot is already held, so the default limiter's token taken here is
+            # bounded by TILE_RENDER_CONCURRENCY too.
+            return await anyio.to_thread.run_sync(render)
+        finally:
+            _tiles_in_flight -= 1
+            _last_tile_progress = time.monotonic()
+
 
 # The rasterio profile key each compression algorithm spells its level with. Only the
 # three that HAVE a level appear -- `lzw`/`none` are absent rather than mapped to `None`,
@@ -322,10 +383,12 @@ async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str
 
     Compiles the plan for this one tile (`compile_plan(pipeline, tile=...)`), executes it,
     and renders it (`sink.render_tile`) -- all off the event loop in one `anyio.to_thread.
-    run_sync` call, since every step does real file I/O. A `None` render (nothing to show:
-    see `render_tile`'s own docstring for the two cases this covers) is a BODILESS 204,
-    returned directly as this function's `Response` rather than as a raised
-    `HTTPException`, which always carries a JSON body and so cannot express one.
+    run_sync` call, since every step does real file I/O, and under the tile limiter
+    (`_run_tile_render`), so a map's burst of tiles queues instead of rendering all at
+    once. A `None` render (nothing to show: see `render_tile`'s own docstring for the two
+    cases this covers) is a BODILESS 204, returned directly as this function's `Response`
+    rather than as a raised `HTTPException`, which always carries a JSON body and so
+    cannot express one.
 
     A `FileNotFoundError` is caught into the same 204, and is the reason the `try` wraps the
     thread call rather than living inside `_render`. App-wide it means 404
@@ -355,7 +418,7 @@ async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str
         )
 
     try:
-        body = await anyio.to_thread.run_sync(_render)
+        body = await _run_tile_render(_render)
     except FileNotFoundError:
         body = None
     if body is None:
@@ -409,7 +472,7 @@ async def respond_to_analysis_vector_tile(pipeline, x: int, y: int, z: int, *, b
         return sink.sink_vector_tile(result, grid_name, (x, y, z))
 
     try:
-        body = await anyio.to_thread.run_sync(_render)
+        body = await _run_tile_render(_render)
     except FileNotFoundError:
         body = None
     if body is None:

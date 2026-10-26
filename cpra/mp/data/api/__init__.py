@@ -39,6 +39,7 @@ from cpra.mp.data.api.pipeline import (
     respond_to_analysis as respond_to_analysis_pipeline,
     respond_to_analysis_tile as respond_to_analysis_pipeline_tile,
     respond_to_analysis_vector_tile as respond_to_analysis_pipeline_vector_tile,
+    tile_renders_stalled,
 )
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
@@ -128,18 +129,24 @@ install_analysis_boundary(app)
 
 
 # Liveness check for the container. Deliberately a plain `def`, not `async def`: FastAPI
-# runs sync routes on anyio's default thread limiter, the same pool every tile and data
-# read goes through (`anyio.to_thread.run_sync` in `api.pipeline`). When the data
-# filesystem (Lustre) hangs, reads block uninterruptibly and pile up there until the pool
-# is exhausted and every data route stops answering -- while async routes such as
+# runs sync routes on anyio's default thread limiter, the same pool every data read goes
+# through (`anyio.to_thread.run_sync` in `api.pipeline`). When the data filesystem
+# (Lustre) hangs, reads block uninterruptibly and pile up there until the pool is
+# exhausted and every data route stops answering -- while async routes such as
 # /openapi.json, served straight off the event loop, keep responding. Answering here
 # therefore proves that both the event loop and a worker thread are free.
+#
+# Tile renders are the exception: they queue on their own small limiter, so hung tiles
+# never exhaust the default pool. `tile_renders_stalled` covers them instead, answering
+# 503 when every tile slot has been held with none freed for a minute.
 #
 # It reads nothing from disk on purpose: one slow read is not a reason to restart, and a
 # filesystem that is down outright would not be fixed by a restart loop. Outside /v1 so
 # the ingress (which routes /v1 only) doesn't expose it.
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict[str, str]:
+    if tile_renders_stalled():
+        raise HTTPException(status_code=503, detail="tile renders stalled")
     return {"status": "ok"}
 
 

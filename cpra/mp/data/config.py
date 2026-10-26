@@ -103,6 +103,14 @@ RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", "64"))
 _raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
 RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
 
+# How many map tiles (`png`/`jpg`/`pbf`, api.pipeline) render at once. Without a cap they
+# share anyio's default 40-thread limiter, and a map view's burst of a few dozen tile
+# requests renders all at once: measured in production at 0.2 -> 5.7 GB of anonymous
+# memory in 12 s, OOM-killing a 6 GB pod. More concurrent renders than CPUs buys no
+# throughput, only memory, so keep this a small multiple of the pod's CPU limit (some
+# overlap with I/O waits pays off; dozens does not), not its request rate.
+TILE_RENDER_CONCURRENCY = int(get_config("TILE_RENDER_CONCURRENCY", "4"))
+
 # Ceiling on the number of distinct values `count_by_value` may enumerate (per grid, not
 # per zone -- the probe runs on the source frame's own `value` column, before the
 # crosswalk join, in both analysis.execution.project and analysis.execution.fold).
