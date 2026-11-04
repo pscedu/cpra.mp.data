@@ -42,15 +42,14 @@ Data layers (--historic-data, the historic persistent-change raster):
 
 Confidence layers (--confidence-data, the multiband COG data directory, with
 --model-group-id):
-  1. Run the lnd_conf named analysis (cpra/mp/data/analyses/lnd_conf.py) over the lnd_type
-     ensemble for the base year (--confidence-base-year) and for each frame's year, and
-     subtract the base year's confidence from the year's. The difference is signed, on
-     [-1, 1]: negative where the pixel has moved toward water, positive toward land.
-  2. Symbolize that difference at its own 30 m resolution by classifying it against
-     CONFIDENCE_BREAKS, so the ramps read as "moved toward water" (blue) and "moved toward
-     land" (green), each running pale where the pixel has barely moved to dark where it
-     has flipped outright. The two bands either side of zero are transparent, so the layer
-     covers only ground whose confidence has actually moved.
+  1. Run the lnd_conf_chng named analysis (cpra/mp/data/analyses/lnd_conf_chng.py) over
+     the lnd_type ensemble for each frame's year. It classifies the ensemble's land
+     confidence in the grid's initial-conditions year (2029 for the _v002 grids) and in the
+     frame's year into four classes each, and returns the pair as a two-digit transition
+     code (initial * 10 + current, 11..44).
+  2. Symbolize the codes at their own 30 m resolution with the lnd_conf_chng legend from
+     cpra/mp/data/structure/legends.csv (land loss / land gain / stays water / stays land,
+     each at low, moderate, or high confidence).
   3. Resample that image onto the target grid with bicubic interpolation, the same way the
      categorical layers are, and write confidence_<year>.png per year.
 
@@ -86,8 +85,11 @@ from rasterio.warp import reproject
 from cpra.mp.data import read_data
 from cpra.mp.data.analyses import resolve_analysis
 from cpra.mp.data.analyses.base import DatasetRef
+from cpra.mp.data.analyses.lnd_chng import baseline_year
 from cpra.mp.data.analyses.lnd_conf import SCENARIO_WEIGHTS
+from cpra.mp.data.analyses.lnd_conf_chng import LandConfidenceChange
 from cpra.mp.data.analysis.execution.execute import run_to_path
+from cpra.mp.data.legends import LEGENDS
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RENDER_DIR = PROJECT_DIR / "render"
@@ -193,48 +195,16 @@ def hex_to_rgba(color: str):
 
 
 # --- Land-change confidence layers -----------------------------------------------
-# The lnd_conf analysis reduces the lnd_type ensemble to a weighted fraction of members
-# calling a pixel land, on [0, 1]. Each confidence layer is a year's lnd_conf minus the
-# base year's, with no offset applied to either side, so the value is a plain difference
-# on [-1, 1] and its sign is the direction of change, classified by these breaks:
-#
-#   -1  confidently land in the base year, confidently water now   (land lost)
-#    0  confidence unmoved since the base year                     (unchanged)
-#   +1  confidently water in the base year, confidently land now   (land gained)
-#
-# The bins classify that signed value, so the ramps read as direction of change: blue for
-# pixels that have moved toward water, green for pixels that have moved toward land, each
-# running pale where the pixel has barely moved to dark where it has flipped outright.
-# Each band runs from its own break up to the next, so the breaks are closed lower bounds
-# and the last band has no upper bound.
-# Opt3
-CONFIDENCE_BREAKS = [-1, -0.67, -0.42, -0.09, 0, 0.17, 0.50, 0.75]
-# Opt4
-# CONFIDENCE_BREAKS = [-1, -0.75, -0.42, -0.09, 0, 0.17, 0.50, 0.83]
+# The lnd_conf_chng analysis returns a categorical transition code per pixel (see its
+# module docstring), colored here with the same legend the portal uses for it, so the
+# frames and the map stay in step when legends.csv changes.
+CONFIDENCE_LEGEND = LEGENDS[LandConfidenceChange.Meta.legend]
 
-# The 3-stop ramps from the earlier symbology (data-input/confidence_groups.png), pale to
-# dark, used as given rather than resampled to a longer ramp.
-CONFIDENCE_LOSS_RAMP = ["#AFB9BD", "#66A9C2", "#226178"]
-CONFIDENCE_GAIN_RAMP = ["#E0EDD8", "#658859", "#1F4314"]
-
-# The two bands either side of zero, [-0.09, 0) and [0, 0.17). A pixel this close to its
-# base-year confidence has not meaningfully moved, so it is left out of the layer rather
-# than given a color of its own.
-TRANSPARENT_BAND = None
-
-# One color per band, in break order. The loss ramp is reversed because the bands run from
-# the most negative value up: the first band is the far "now water" end and so takes the
-# darkest blue, and the third is the edge of the transparent middle and takes the palest.
-CONFIDENCE_BAND_COLORS = CONFIDENCE_LOSS_RAMP[::-1] + [TRANSPARENT_BAND, TRANSPARENT_BAND] + CONFIDENCE_GAIN_RAMP
-
-assert len(CONFIDENCE_BAND_COLORS) == len(CONFIDENCE_BREAKS), (
-    f"expected one color per band, got {len(CONFIDENCE_BAND_COLORS)} colors for {len(CONFIDENCE_BREAKS)} breaks"
-)
-
-# The lnd_type dataset lnd_conf runs over, and the year every other year's confidence is
-# measured against.
+# The lnd_type dataset lnd_conf_chng runs over, and the initial-conditions year every
+# other year is compared against -- fixed by the analysis for the dataset's grid, not
+# chosen here.
 LND_CONF_DATASET = DatasetRef(variable="lnd_type", time_unit="annual", grid="morph_pixel_v002")
-CONFIDENCE_BASE_YEAR = 2029
+CONFIDENCE_BASE_YEAR = baseline_year(LND_CONF_DATASET.grid)
 
 # Pin to the version this project was developed against (see package.json).
 MAPLIBRE_VERSION = "5.24.0"
@@ -647,38 +617,36 @@ def write_land_water_group_png(
     )
 
 
-def confidence_rgba(values: np.ndarray):
-    """Symbolize a signed lnd_conf difference against CONFIDENCE_BREAKS, as (4,H,W) RGBA bands to
-    match colorize().
+def hex8_to_rgba(color: str):
+    """legends.csv colors are #RRGGBB or #RRGGBBAA; the alpha byte defaults to opaque."""
+    h = color.lstrip("#")
+    return (*hex_to_rgb(h), int(h[6:8], 16) if len(h) == 8 else 255)
 
-    Classifies the signed value, so each band takes one color from CONFIDENCE_BAND_COLORS.
-    Each band includes its lower break and excludes the next. The two bands either side of
-    zero are TRANSPARENT_BAND and are simply left at the array's transparent zeros, so the
-    layer drops out over ground whose confidence has barely moved and the frame beneath it
-    shows through there.
 
-    The first band's lower bound is left open rather than closed at CONFIDENCE_BREAKS[0], so
-    that a value sitting exactly on the -1 floor cannot fall out of the classification on a
-    float comparison. Nodata arrives as NaN and stays transparent, since every comparison
-    against NaN is False.
+def confidence_rgba(codes: np.ndarray):
+    """Symbolize lnd_conf_chng transition codes with CONFIDENCE_LEGEND, as (4,H,W) RGBA bands
+    to match colorize().
+
+    Classified the way the portal's map steps a legend: each row's color covers values
+    below its upper_bound and at or above the previous row's, and the last row, with no
+    upper bound, covers everything above. Nodata arrives as NaN and is left transparent --
+    np.digitize would otherwise put it past the last break, in the last row's color.
     """
-    rgba = np.zeros((4,) + values.shape, dtype=np.uint8)
-    lowers = [-np.inf] + CONFIDENCE_BREAKS[1:]
-    uppers = CONFIDENCE_BREAKS[1:] + [np.inf]
-    for lower, upper, color in zip(lowers, uppers, CONFIDENCE_BAND_COLORS):
-        if color is TRANSPARENT_BAND:
-            continue
-        band = (values >= lower) & (values < upper)
-        rgba[:, band] = np.array(hex_to_rgba(color), dtype=np.uint8)[:, None]
+    rows = CONFIDENCE_LEGEND.break_points
+    bounds = rows["upper_bound"].drop_nulls().to_numpy()
+    colors = np.array([hex8_to_rgba(c) for c in rows["color"]], dtype=np.uint8)
+    rgba = np.zeros((4,) + codes.shape, dtype=np.uint8)
+    valid = ~np.isnan(codes)
+    rgba[:, valid] = colors[np.digitize(codes[valid], bounds)].T
     return rgba
 
 
 def lnd_conf_years(data_path: Path, model_group_id: int):
     """The calendar years lnd_type has ensemble members for in this model group, sorted.
 
-    lnd_conf sums whichever members a year has without renormalizing their weights, so a
-    year missing some of them reads as low confidence rather than as a mean of what is
-    there. Such years are still returned, but reported so that isn't mistaken for change.
+    lnd_conf (and so lnd_conf_chng) sums whichever members a year has without renormalizing
+    their weights, so a year missing some of them reads as low confidence rather than as a
+    mean of what is there. Such years are still returned, but reported so that isn't mistaken for change.
     """
     members = (
         read_data(
@@ -706,18 +674,18 @@ def lnd_conf_years(data_path: Path, model_group_id: int):
     return sorted(scenarios_by_year)
 
 
-def run_lnd_conf(data_path: Path, model_group_id: int, year: int, work_dir: Path):
-    """Run the lnd_conf analysis for one year and read the result back as (values, crs,
-    transform), nodata as NaN. One year per run keeps the analysis to the five member bands
-    it needs rather than the whole ensemble's time series at once."""
+def run_lnd_conf_chng(data_path: Path, model_group_id: int, year: int, work_dir: Path):
+    """Run the lnd_conf_chng analysis for one comparison year and read the result back as
+    (codes, crs, transform), nodata as NaN. The analysis takes exactly one calendar_year on
+    a raster grid -- it draws one image per comparison year."""
     resolved = resolve_analysis(
-        "lnd_conf",
+        "lnd_conf_chng",
         dataset=LND_CONF_DATASET,
         filters={"model_group_id": model_group_id, "calendar_year": [year]},
     )
-    path = work_dir / f"lnd_conf_{year}.tif"
+    path = work_dir / f"lnd_conf_chng_{year}.tif"
     if not run_to_path(resolved.pipeline, path, base_path=data_path):
-        raise click.ClickException(f"lnd_conf returned no data for model_group_id={model_group_id}, {year}")
+        raise click.ClickException(f"lnd_conf_chng returned no data for model_group_id={model_group_id}, {year}")
     try:
         return read_values(path)
     finally:
@@ -725,39 +693,31 @@ def run_lnd_conf(data_path: Path, model_group_id: int, year: int, work_dir: Path
 
 
 def write_confidence_pngs(
-    data_path: Path, model_group_id: int, base_year: int, years: tuple[int, ...], output_dir: Path, save_full: bool
+    data_path: Path, model_group_id: int, years: tuple[int, ...], output_dir: Path, save_full: bool
 ):
     """Write confidence_<year>.png for each year (every year with lnd_type data, if `years`
-    is empty): that year's lnd_conf minus `base_year`'s, symbolized and resampled."""
+    is empty): lnd_conf_chng's transition from CONFIDENCE_BASE_YEAR to that year,
+    symbolized and resampled."""
     available = lnd_conf_years(data_path, model_group_id)
     if not available:
         raise click.UsageError(
             f"no {LND_CONF_DATASET.variable} data for model_group_id={model_group_id} under {data_path}"
         )
-    missing = sorted({base_year, *years} - set(available))
+    missing = sorted({CONFIDENCE_BASE_YEAR, *years} - set(available))
     if missing:
         raise click.UsageError(
             f"no {LND_CONF_DATASET.variable} data for year(s) {missing} in model_group_id={model_group_id} "
-            f"(available: {available[0]}-{available[-1]})"
+            f"(available: {available[0]}-{available[-1]}); lnd_conf_chng compares every year against "
+            f"{CONFIDENCE_BASE_YEAR}"
         )
 
-    with tempfile.TemporaryDirectory(prefix="lnd_conf_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="lnd_conf_chng_") as tmp:
         work_dir = Path(tmp)
-        print(f"Running lnd_conf for base year {base_year}...")
-        base, src_crs, src_transform = run_lnd_conf(data_path, model_group_id, base_year, work_dir)
         for year in sorted(years) or available:
-            print(f"Running lnd_conf for {year} and differencing against {base_year}...")
-            if year == base_year:
-                conf = base
-            else:
-                conf, crs, transform = run_lnd_conf(data_path, model_group_id, year, work_dir)
-                assert (crs, transform, conf.shape) == (
-                    src_crs,
-                    src_transform,
-                    base.shape,
-                ), f"lnd_conf for {year} is on a different grid than {base_year}'s"
+            print(f"Running lnd_conf_chng for {CONFIDENCE_BASE_YEAR} -> {year}...")
+            codes, src_crs, src_transform = run_lnd_conf_chng(data_path, model_group_id, year, work_dir)
             print("Symbolizing at source resolution and resampling to target grid (cubic)...")
-            bands = confidence_rgba(conf - base)
+            bands = confidence_rgba(codes)
             if save_full:
                 write_full_tif(output_dir / f"confidence_{year}_full.tif", bands, src_crs, src_transform)
             output_path = output_dir / f"confidence_{year}.png"
@@ -838,18 +798,11 @@ def write_full_tif(path: Path, rgba_bands: np.ndarray, src_crs, src_transform):
 @click.option(
     "--confidence-data",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="path to the multiband COG data directory (the one holding variable=lnd_type/); runs the lnd_conf "
+    help="path to the multiband COG data directory (the one holding variable=lnd_type/); runs the lnd_conf_chng "
     "analysis over it and emits one confidence_<year>.png per year. Requires --model-group-id. "
     "Omit to skip the confidence layers.",
 )
 @click.option("--model-group-id", type=int, help="model group to compute confidence for; required by --confidence-data")
-@click.option(
-    "--confidence-base-year",
-    type=int,
-    default=CONFIDENCE_BASE_YEAR,
-    show_default=True,
-    help="year every confidence frame is differenced against",
-)
 @click.option(
     "--confidence-year",
     "confidence_years",
@@ -876,7 +829,6 @@ def main(
     baseline_land_water_data,
     confidence_data,
     model_group_id,
-    confidence_base_year,
     confidence_years,
     output,
     save_full,
@@ -913,9 +865,7 @@ def main(
             write_land_water_group_png(historic_data, baseline_land_water_data, land_water_data, output_dir, save_full)
 
     if confidence_data is not None:
-        write_confidence_pngs(
-            confidence_data, model_group_id, confidence_base_year, confidence_years, output_dir, save_full
-        )
+        write_confidence_pngs(confidence_data, model_group_id, confidence_years, output_dir, save_full)
 
     if basemap_style is None:
         return
@@ -937,7 +887,16 @@ def main(
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--use-gl=swiftshader", "--enable-webgl", "--ignore-gpu-blocklist"],
+                args=[
+                    "--use-gl=swiftshader",
+                    "--enable-webgl",
+                    "--ignore-gpu-blocklist",
+                    # The render page is served from 127.0.0.1 on a random port, and Martin
+                    # only sends CORS headers for the portal origins (cors.origin in the
+                    # gitops martin helmrelease), so every tile/sprite/glyph fetch would be
+                    # blocked as "Failed to fetch (0)". This browser only loads our own page.
+                    "--disable-web-security",
+                ],
             )
             context = browser.new_context(
                 viewport={"width": TARGET_WIDTH, "height": TARGET_HEIGHT},
