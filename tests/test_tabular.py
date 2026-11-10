@@ -413,6 +413,51 @@ class TestCompactParquet:
         daily_files = list((base_path / "variable=sal").rglob("*.parquet"))
         assert len(daily_files) == 2
 
+    @pytest.mark.parametrize("extra", [{"model_group_id": 500}, {"scenario_id": 7}, {"calendar_year": 2030}])
+    def test_column_filter_on_annual_data_is_refused(self, base_path, extra):
+        """Regression: annual files hold every run, so compacting with model_group_id=500
+        rewrote only 500's rows and then deleted the files holding everyone else's."""
+        self._write_two_annual_files(base_path)
+        write_parquet(annual_frame(years=(2030,), model_group_id=501), base_path=base_path)
+        before = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
+
+        with pytest.raises(ValidationError, match="can only narrow by partition directories"):
+            compact_parquet(base_path=base_path, **DATASET_KWARGS, **extra)
+
+        assert len(list(base_path.rglob("*.parquet"))) == 3
+        after = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
+        assert after.sort(after.columns).equals(before.sort(before.columns))
+
+    def test_partition_filter_on_daily_data_is_allowed(self, base_path):
+        self._write_two_daily_files(base_path)
+        write_parquet(
+            daily_frame(days=[datetime.date(2030, 1, 3)], scenario_id=8),
+            base_path=base_path,
+            validate=False,
+            sort=False,
+        )
+        write_parquet(
+            daily_frame(days=[datetime.date(2030, 1, 4)], scenario_id=8),
+            base_path=base_path,
+            validate=False,
+            sort=False,
+        )
+
+        result = compact_parquet(base_path=base_path, sort=False, scenario_id=7, **DAILY_DATASET_KWARGS)
+
+        assert result["sources_merged"] == 2
+        assert len(list(base_path.rglob("scenario_id=8/**/*.parquet"))) == 2
+
+    def test_non_partition_filter_on_daily_data_is_refused(self, base_path):
+        self._write_two_daily_files(base_path)
+
+        with pytest.raises(ValidationError, match="calendar_day"):
+            compact_parquet(
+                base_path=base_path, sort=False, calendar_day=datetime.date(2030, 1, 1), **DAILY_DATASET_KWARGS
+            )
+
+        assert len(list(base_path.rglob("*.parquet"))) == 2
+
 
 class TestCompactParquetSummary:
     """compact_parquet reports what it did, mirroring raster.compact_cog's contract."""

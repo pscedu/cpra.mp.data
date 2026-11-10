@@ -365,6 +365,11 @@ def compact_parquet(
     and rewritten as a single file, and the originals are then removed. A directory that
     already holds one file is left untouched.
 
+    Beyond ``variable``/``time_unit``/``grid``, kwargs may only name dims that are
+    partition directories for this dataset (``model_group_id``/``scenario_id``/... on
+    daily data, nothing on annual/decadal); anything else raises ``ValidationError``
+    rather than silently deleting the rows it would filter out.
+
     Returns ``{"outputs": [Path, ...], "sources_merged": int}`` -- the newly written
     Parquet files and the number of source files they consumed (both empty/zero when
     every partition was already a single file), so callers don't have to re-scan the
@@ -387,6 +392,21 @@ def compact_parquet(
     # time_unit == "daily", see Dimension.partition; files are UUID-named, never
     # named after a dimension, so the match must be nested with a wildcard).
     partition_cols = partition_columns(input_df, include_dataset=False)
+
+    # Each multi-file directory is read back filtered by kwargs, rewritten, and then
+    # every original file in it is deleted. A filter on a dim that is a column rather
+    # than a directory (model_group_id on annual data, calendar_year, model, ...) would
+    # drop the other rows from the rewrite, and the deletion would then destroy them.
+    unsafe = sorted(k for k in kwargs if k not in DATASET_DIMENSIONS and k not in partition_cols)
+    if unsafe:
+        msg = (
+            f"compact_parquet can only narrow by partition directories "
+            f"({', '.join(partition_cols) or 'none for this time_unit'}); got {', '.join(unsafe)}. "
+            f"Compaction rewrites whole directories, so filtering by a column would delete "
+            f"the rows it excludes."
+        )
+        raise ValidationError(msg)
+
     glob_pattern = (
         build_glob_pattern(required_cols=partition_cols, extension="parquet", nested=True, **kwargs)
         if partition_cols
