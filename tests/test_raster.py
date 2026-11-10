@@ -441,6 +441,26 @@ class TestCompactCogIncludeValues:
         assert result == {"outputs": [], "sources_merged": 0}
         assert len(list(base_path.rglob("*.tif"))) == 1
 
+    def test_copy_uses_the_configured_thread_count(self, base_path, monkeypatch):
+        """RASTER_NUM_THREADS reaches the merged COG's CreateCopy. Each GDAL thread holds
+        its own buffers, so ALL_CPUS (the machine's count, not a container's limit) can
+        push a memory-limited compaction over its limit."""
+        write_raster_dataset(base_path, years=(2030, 2031))
+        monkeypatch.setattr(raster, "RASTER_NUM_THREADS", "3")
+        seen = []
+        original = raster.copy
+
+        def recording(*args, **kwargs):
+            if kwargs.get("driver") == "COG":  # not the in-memory VRTs read along the way
+                seen.append(kwargs.get("num_threads"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(raster, "copy", recording)
+
+        compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
+
+        assert seen == ["3"]
+
     def test_a_killed_compaction_leaves_the_sources_alone(self, base_path, monkeypatch):
         """The merged COG is written in a staging directory outside the dataset (see
         cpra.mp.data.staging), so dying before it is moved into place changes nothing."""

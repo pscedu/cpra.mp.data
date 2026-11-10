@@ -25,6 +25,7 @@ from cpra.mp.data.catalog import (
 )
 from cpra.mp.data.config import (
     CATALOG_PATH_UNSET,
+    RASTER_NUM_THREADS,
     get_base_path,
     get_write_catalog_path,
 )
@@ -553,10 +554,16 @@ def _write_run(
             compression_level=compression_level,
             nodata=nodata,
         )
-        profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
+        profile.update(interleave="PIXEL", num_threads=RASTER_NUM_THREADS, bigtiff="YES")
         # out_path is a fresh UUID in the caller's staging directory (compact_cog moves it
-        # into place once written).  Each CreateCopy already runs with
-        # num_threads=ALL_CPUS, so parallelizing runs would only contend.
+        # into place once written).  Each CreateCopy already runs multi-threaded, so
+        # parallelizing runs would only contend.
+        #
+        # num_threads costs memory, not just CPU: each thread holds its own buffers.
+        # Measured merging 44 single-band 16640x5824 int32 COGs with a 51 MB block cache:
+        # 642 MB peak at 1 thread, 835 at 2, 918 at 4, 1101 at 8. GDAL resolves ALL_CPUS
+        # (RASTER_NUM_THREADS' default) from the machine's CPU count, never a container's
+        # CPU limit, so a memory-limited container must set RASTER_NUM_THREADS.
         #
         # GDAL_PAM_ENABLED=NO stops GDAL from writing a .aux.xml sidecar for the per-band
         # Description/ColorInterp that CreateCopy carries over from the VRT -- the COG
