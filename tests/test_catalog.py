@@ -15,6 +15,7 @@ import rasterio
 
 from cpra.mp.data.analysis.request.pipeline import InputSelection
 from cpra.mp.data.catalog import (
+    Catalog,
     CatalogQuery,
     contiguous_runs,
     raster_catalog_from_paths,
@@ -436,3 +437,60 @@ class TestCatalogQueryHeterogeneousPartitionFiles:
 
         assert result["choices"]["scenario_id"] == [7]
         assert not {"variable", "time_unit", "grid"} & set(result["choices"])
+
+
+class TestCompactPartition:
+    """``Catalog.compact_partition`` stages its output like data compaction does (see
+    ``cpra.mp.data.staging``)."""
+
+    PARTITION = ("ssf", "annual", "ecoregion_v001")
+
+    def _write(self, tmp_path, years):
+        from tests.factories import annual_frame
+
+        catalog_path = tmp_path / "catalog"
+        for year in years:
+            write_parquet(annual_frame(years=(year,)), base_path=tmp_path / "data", catalog_path=catalog_path)
+        return catalog_path, catalog_path / "variable=ssf/time_unit=annual/grid=ecoregion_v001"
+
+    def test_merges_the_partition_into_one_file(self, tmp_path):
+        catalog_path, directory = self._write(tmp_path, (2030, 2031, 2032))
+
+        result = Catalog(catalog_path).compact_partition(*self.PARTITION)
+
+        assert result["files"] == 3
+        assert result["rows_after"] <= result["rows_before"]
+        [merged] = directory.glob("*.parquet")
+        assert pl.read_parquet(merged).height == result["rows_after"]
+        assert [p.name for p in catalog_path.iterdir() if p.name.startswith(".")] == []
+
+    def test_leaves_a_single_file_alone(self, tmp_path):
+        catalog_path, directory = self._write(tmp_path, (2030,))
+        before = sorted(directory.iterdir())
+
+        assert Catalog(catalog_path).compact_partition(*self.PARTITION) is None
+        assert sorted(directory.iterdir()) == before
+
+    def test_a_killed_compaction_leaves_the_sources_alone(self, tmp_path, monkeypatch):
+        from cpra.mp.data import staging
+
+        catalog_path, _ = self._write(tmp_path, (2030, 2031))
+        before = sorted(catalog_path.rglob("*"))
+
+        def killed(*args, **kwargs):
+            raise MemoryError
+
+        monkeypatch.setattr(staging, "publish", killed)
+        with pytest.raises(MemoryError):
+            Catalog(catalog_path).compact_partition(*self.PARTITION)
+
+        assert sorted(catalog_path.rglob("*")) == before
+
+    def test_removes_staging_left_by_a_killed_compaction(self, tmp_path):
+        catalog_path, _ = self._write(tmp_path, (2030, 2031))
+        (catalog_path / ".compact-dead").mkdir()
+        (catalog_path / ".compact-dead" / "merged.parquet").write_bytes(b"truncated")
+
+        Catalog(catalog_path).compact_partition(*self.PARTITION)
+
+        assert not (catalog_path / ".compact-dead").exists()

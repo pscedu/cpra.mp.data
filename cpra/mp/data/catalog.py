@@ -44,6 +44,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.dataset as pads
 
+from cpra.mp.data import staging
 from cpra.mp.data.config import get_catalog_path
 from cpra.mp.data.dimensions import DIMENSIONS, METADATA_DIMENSIONS
 from cpra.mp.data.utils import (
@@ -250,8 +251,7 @@ class Catalog:
     variable/time_unit/grid partition. ``cpra.mp.data.cli.catalog``'s ``build`` command
     uses ``append`` for its one-time/backfill full rescan of a data tree
     (``raster_catalog_from_paths``/``tabular_catalog_from_files``); its ``compact``
-    command walks the whole catalog tree directly rather than through this class, since
-    it doesn't know each partition's dimension values in advance.
+    command runs ``compact_partition`` over every one of ``partitions()``.
     """
 
     def __init__(self, catalog_path):
@@ -270,22 +270,41 @@ class Catalog:
             basename_template=f"{uuid.uuid4()}-{{i}}.parquet",
         )
 
+    def partitions(self):
+        """``(variable, time_unit, grid)`` for every partition directory, in path order."""
+        for directory in sorted(self.catalog_path.glob("variable=*/time_unit=*/grid=*")):
+            if directory.is_dir():
+                dims = parse_path_dims(directory.relative_to(self.catalog_path))
+                yield dims["variable"], dims["time_unit"], dims["grid"]
+
     def compact_partition(self, variable, time_unit, grid):
         """Coalesce all rows for one variable/time_unit/grid partition into minimal
-        contiguous-run rows."""
+        contiguous-run rows, in one file.
+
+        The new file is staged and moved into place before the old ones are removed, the
+        same way data compaction does it (``cpra.mp.data.staging``), so a compaction killed
+        part-way never leaves a truncated catalog file. Returns ``{"files", "rows_before",
+        "rows_after"}``, or ``None`` when the partition is already one file (or absent).
+        """
         directory = self.catalog_path / f"variable={variable}" / f"time_unit={time_unit}" / f"grid={grid}"
-        files = list(directory.glob("*.parquet")) if directory.exists() else []
+        files = sorted(directory.glob("*.parquet")) if directory.exists() else []
         if len(files) <= 1:
-            return
+            return None
         # Read files individually and concat with diagonal_relaxed rather than
         # pl.read_parquet(files) -- older files may predate a fix to tabular_catalog_rows
         # and lack the unused calendar dim's extent columns entirely, which pl.read_parquet
         # rejects as a schema mismatch across a file list.
-        merged = merge_partition(pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed"), time_unit)
-        tmp = directory / f"{uuid.uuid4()}-0.parquet"
-        merged.write_parquet(tmp)
+        frame = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+        merged = merge_partition(frame, time_unit)
+        staging.remove_stale(self.catalog_path)
+        with staging.area(self.catalog_path) as staging_dir:
+            final = directory / f"{uuid.uuid4()}-0.parquet"
+            staged = staging_dir / final.name
+            merged.write_parquet(staged)
+            staging.publish(staged, final)
         for f in files:
             f.unlink()
+        return {"files": len(files), "rows_before": frame.height, "rows_after": merged.height}
 
 
 def _unique_datasets(datasets):

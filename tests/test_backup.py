@@ -1,5 +1,6 @@
-"""Tests for run backup/restore -- cpra/mp/data/backup.py and the `backup`/`restore`
-commands in cpra/mp/data/cli/backup.py.
+"""Tests for run backup/restore/compaction -- cpra/mp/data/backup.py, the `backup`/`restore`
+commands in cpra/mp/data/cli/backup.py and the `data compact` command
+in cpra/mp/data/cli/data.py.
 
 Every run here is written to three datasets, one of each shape the archive handles
 differently: a raster (COGs, archived as-is), daily Parquet (partitioned by run, archived
@@ -16,8 +17,10 @@ import tarfile
 import polars as pl
 import pytest
 from click.testing import CliRunner
+from polars.testing import assert_frame_equal
 
-import cpra.mp.data.cli.backup  # noqa: F401  (registers `backup`/`restore` on `cli`)
+import cpra.mp.data.cli.backup  # (registers `backup`/`restore` on `cli`)
+import cpra.mp.data.cli.data  # noqa: F401  (registers `data compact` on `cli`)
 from cpra.mp.data.backup import MANIFEST_NAME, ArchiveError, inventory_run, restore_archive
 from cpra.mp.data.cli import cli
 from cpra.mp.data.tabular import write_parquet
@@ -250,6 +253,20 @@ class TestBackup:
         assert not out.exists()
         assert sorted(p for p in base.rglob("*") if p.is_file()) == files
 
+    def test_run_can_come_from_the_environment(self, tree, tmp_path):
+        base, catalog = tree
+        out = tmp_path / "out"
+        result = CliRunner().invoke(
+            cli,
+            ["backup", "-o", str(out), "--base-path", str(base), "--catalog", str(catalog)],
+            env={"MODEL_GROUP_ID": str(RUN["model_group_id"]), "SCENARIO_ID": str(RUN["scenario_id"])},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert [p.name[: p.name.rindex("-")] for p in out.glob("*.tar")] == [
+            f"g{RUN['model_group_id']}-s{RUN['scenario_id']}"
+        ]
+
     def test_unknown_run_is_an_error(self, tree, tmp_path):
         base, catalog = tree
         result = CliRunner().invoke(
@@ -260,3 +277,146 @@ class TestBackup:
         assert result.exit_code == 1
         assert "no data or catalog rows found for g999-s7" in result.output
         assert not (tmp_path / "out").exists()
+
+
+def _crowded(root, suffix):
+    """Directories under ``root`` still holding more than one ``suffix`` file."""
+    return [d for d in [root, *root.rglob("*")] if d.is_dir() and len(list(d.glob(f"*{suffix}"))) > 1]
+
+
+def _compact(base, catalog, *extra, env=None):
+    result = CliRunner().invoke(
+        cli,
+        ["data", "compact", "--base-path", str(base), "--catalog", str(catalog), *map(str, extra)],
+        env=env,
+        catch_exceptions=False,
+    )
+    return result
+
+
+class TestCompact:
+    def test_compacts_like_backup_compact(self, tree, tmp_path):
+        base, catalog = tree
+        twin = tmp_path / "twin"
+        shutil.copytree(base.parent, twin)
+        annual_before = _read(base, ANNUAL_DIR)
+
+        result = _compact(base, catalog, "--model-group-id", 500, "--scenario-id", 7)
+        assert result.exit_code == 0, result.output
+        _backup(twin / "data", twin / "catalog", tmp_path / "out", "--compact")
+
+        def layout(root):
+            return sorted((p.parent.relative_to(root), p.suffix) for p in root.rglob("*") if p.is_file())
+
+        assert layout(base) == layout(twin / "data")
+        assert layout(catalog) == layout(twin / "catalog")
+        assert _read(base, ANNUAL_DIR).equals(annual_before)
+
+    def test_dry_run_changes_nothing(self, tree):
+        base, catalog = tree
+        files = sorted(p for p in base.parent.rglob("*") if p.is_file())
+
+        result = _compact(base, catalog, "--model-group-id", 500, "--scenario-id", 7, "--dry-run")
+
+        assert result.exit_code == 0, result.output
+        assert f"{ANNUAL_DIR}: would merge 6 files (all runs)" in result.output
+        assert RASTER_DIR in result.output
+        assert sorted(p for p in base.parent.rglob("*") if p.is_file()) == files
+
+    def test_run_can_come_from_the_environment(self, tree):
+        base, catalog = tree
+        result = _compact(base, catalog, env={"MODEL_GROUP_ID": "500", "SCENARIO_ID": "7"})
+        assert result.exit_code == 0, result.output
+        assert len(list((base / ANNUAL_DIR).glob("*.parquet"))) == 1
+
+    def test_compacts_the_whole_tree_by_default(self, tree):
+        base, catalog = tree
+        before = {d: _read(base, d) for d in (ANNUAL_DIR, DAILY_DIR)}
+        # The fixture writes each run's daily frame twice; the catalog keeps one row each.
+        catalog_before = _read(catalog, DAILY_DIR).unique(maintain_order=True)
+        n_tifs = len(list((base / RASTER_DIR).rglob("*.tif")))
+
+        result = _compact(base, catalog)
+
+        assert result.exit_code == 0, result.output
+        assert "compacting everything (3 dataset(s))" in result.output
+        assert _crowded(base, ".parquet") == []
+        assert _crowded(catalog, ".parquet") == []
+        assert len(list((base / RASTER_DIR).rglob("*.tif"))) < n_tifs
+        for dataset_dir, frame in before.items():
+            assert _read(base, dataset_dir).equals(frame)
+        assert_frame_equal(_read(catalog, DAILY_DIR), catalog_before, check_column_order=False, check_dtypes=False)
+
+    def test_whole_tree_dry_run_changes_nothing(self, tree):
+        base, catalog = tree
+        files = sorted(p for p in base.parent.rglob("*") if p.is_file())
+
+        result = _compact(base, catalog, "--dry-run")
+
+        assert result.exit_code == 0, result.output
+        assert f"{ANNUAL_DIR}: would merge 6 files in 1 directory(ies)" in result.output
+        assert f"{DAILY_DIR}: would merge" in result.output
+        assert f"{RASTER_DIR}: would check" in result.output
+        assert sorted(p for p in base.parent.rglob("*") if p.is_file()) == files
+
+    def test_dataset_filters_leave_other_datasets_alone(self, tree):
+        base, catalog = tree
+        untouched = {d: sorted((base / d).rglob("*")) for d in (ANNUAL_DIR, RASTER_DIR)}
+        untouched_catalog = sorted((catalog / ANNUAL_DIR).rglob("*"))
+
+        result = _compact(base, catalog, "--variable", "sal", "--time-unit", "daily")
+
+        assert result.exit_code == 0, result.output
+        assert _crowded(base / DAILY_DIR, ".parquet") == []
+        assert _crowded(catalog / DAILY_DIR, ".parquet") == []
+        for dataset_dir, paths in untouched.items():
+            assert sorted((base / dataset_dir).rglob("*")) == paths
+        assert sorted((catalog / ANNUAL_DIR).rglob("*")) == untouched_catalog
+
+    def test_a_run_and_a_dataset_filter_combine(self, tree):
+        base, catalog = tree
+        other = OTHER_RUNS[0]
+        other_files = _files(base, DAILY_DIR, other)
+
+        result = _compact(base, catalog, "--model-group-id", 500, "--scenario-id", 7, "--variable", "sal")
+
+        assert result.exit_code == 0, result.output
+        assert "compacting g500-s7, variable=sal (1 dataset(s))" in result.output
+        assert _crowded(base / DAILY_DIR / "model_group_id=500" / "scenario_id=7", ".parquet") == []
+        assert _files(base, DAILY_DIR, other) == other_files
+        assert len(list((base / ANNUAL_DIR).glob("*.parquet"))) == 6
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            (["--model-group-id", "500"], "--model-group-id and --scenario-id go together"),
+            (["--variable", "nope"], "no datasets match variable=nope"),
+            (
+                ["--model-group-id", "500", "--scenario-id", "7", "--grid", "nope"],
+                "no datasets match g500-s7, grid=nope",
+            ),
+        ],
+    )
+    def test_bad_selections_are_errors(self, tree, args, message):
+        base, catalog = tree
+        files = sorted(p for p in base.parent.rglob("*") if p.is_file())
+
+        result = CliRunner().invoke(
+            cli, ["data", "compact", "--base-path", str(base), "--catalog", str(catalog), *args]
+        )
+
+        assert result.exit_code != 0
+        assert message in result.output
+        assert sorted(p for p in base.parent.rglob("*") if p.is_file()) == files
+
+    def test_unknown_run_is_an_error(self, tree):
+        base, catalog = tree
+        files = sorted(p for p in base.parent.rglob("*") if p.is_file())
+        result = CliRunner().invoke(
+            cli,
+            ["data", "compact", "--model-group-id", "999", "--scenario-id", "7",
+             "--base-path", str(base), "--catalog", str(catalog)],
+        )  # fmt: skip
+        assert result.exit_code == 1
+        assert "no data or catalog rows found for g999-s7" in result.output
+        assert sorted(p for p in base.parent.rglob("*") if p.is_file()) == files

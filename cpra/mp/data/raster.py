@@ -14,6 +14,7 @@ from rasterio.io import MemoryFile
 from rasterio.shutil import copy
 from rasterio.transform import from_bounds
 
+from cpra.mp.data import staging
 from cpra.mp.data.catalog import (
     CAL_DIMS,
     Catalog,
@@ -553,9 +554,9 @@ def _write_run(
             nodata=nodata,
         )
         profile.update(interleave="PIXEL", num_threads="ALL_CPUS", bigtiff="YES")
-        # out_path is a fresh UUID that can't collide with any existing source file, so the
-        # copy can be written directly -- no temp-file/rename needed.  Each CreateCopy
-        # already runs with num_threads=ALL_CPUS, so parallelizing runs would only contend.
+        # out_path is a fresh UUID in the caller's staging directory (compact_cog moves it
+        # into place once written).  Each CreateCopy already runs with
+        # num_threads=ALL_CPUS, so parallelizing runs would only contend.
         #
         # GDAL_PAM_ENABLED=NO stops GDAL from writing a .aux.xml sidecar for the per-band
         # Description/ColorInterp that CreateCopy carries over from the VRT -- the COG
@@ -713,132 +714,140 @@ def compact_cog(
             canonical_dir = dataset_dir / path.parent.relative_to(legacy_dataset_dir)
             groups.setdefault(canonical_dir, []).append(path)
 
+    # Each merged COG is written in a hidden staging directory under the output root (see
+    # cpra.mp.data.staging) and moved into place once complete, so neither a reader nor a
+    # compaction killed part-way can leave a truncated .tif among the sources.
+    output_base_path.mkdir(parents=True, exist_ok=True)
+    staging.remove_stale(output_base_path)
+
     outputs = []  # newly written multi-band COGs, across every directory/run
     sources_merged = 0  # source COGs consumed by those writes
-    for directory, tifs in groups.items():
-        # Pool every band of every file (regardless of existing band count) into one
-        # sorted sequence of (value, path, band) triples.
-        triples = []
-        dtype = None
-        legacy_paths = set()  # LEGACY COG SHIM (see _read_cog_metadata); remove with it.
-        tif_tags = {}
-        for tif, band_idx, _name, value, tif_dtype, is_legacy, tags in _read_cog_band_rows(tifs):
-            dtype = tif_dtype
-            if is_legacy:
-                legacy_paths.add(tif)
-            tif_tags[tif] = {k: v for k, v in tags.items() if k in METADATA_DIMENSIONS}
-            triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
+    with staging.area(output_base_path) as staging_dir:
+        for directory, tifs in groups.items():
+            # Pool every band of every file (regardless of existing band count) into one
+            # sorted sequence of (value, path, band) triples.
+            triples = []
+            dtype = None
+            legacy_paths = set()  # LEGACY COG SHIM (see _read_cog_metadata); remove with it.
+            tif_tags = {}
+            for tif, band_idx, _name, value, tif_dtype, is_legacy, tags in _read_cog_band_rows(tifs):
+                dtype = tif_dtype
+                if is_legacy:
+                    legacy_paths.add(tif)
+                tif_tags[tif] = {k: v for k, v in tags.items() if k in METADATA_DIMENSIONS}
+                triples.append((_calendar_value(value, calendar_dim), tif, band_idx))
 
-        if include_values is not None:
-            # Before the sort/run detection, so an excluded band can't join a run and
-            # drag its neighbours into a rewrite -- and so a gap left by an excluded
-            # band ends the run around it, exactly as a genuinely absent band would.
-            triples = [triple for triple in triples if triple[0] in include_values]
-            if not triples:
-                continue
-
-        triples.sort(key=lambda triple: triple[0])
-        values = pl.Series([value for value, _tif, _band in triples])
-        offsets = calendar_run_offsets(values, calendar_dim, time_unit).to_list()
-
-        runs = {}
-        run_values = {}  # LEGACY COG SHIM (see below); remove alongside it.
-        for (value, tif, band_idx), offset in zip(triples, offsets):
-            runs.setdefault(offset, []).append((tif, band_idx))
-            run_values.setdefault(offset, []).append(value)
-
-        # Self-heal the catalog for this directory regardless of whether a physical
-        # merge happens below -- this recomputes every run's rows from what was just
-        # read, so directories containing legacy/pre-write_cog-hook files (which never
-        # got a catalog row of their own) are backfilled as a side effect of compacting.
-        if catalog_path:
-            path_dims = parse_path_dims(directory.relative_to(Path(base_path)))
-            directory_rows = pl.concat(
-                [
-                    raster_catalog_rows(
-                        {k: cast_str(k, v) for k, v in {**path_dims, **tif_tags[run[0][0]]}.items()},
-                        calendar_dim,
-                        run_values[offset],
-                    )
-                    for offset, run in runs.items()
-                ],
-                how="diagonal_relaxed",
-            )
-            Catalog(catalog_path).append(directory_rows)
-
-        for offset, run in runs.items():
-            values_in_run = run_values[offset]
-            # Period grouping only means anything for annual calendars -- a decade/pentad
-            # boundary isn't meaningful for daily, monthly, or already-decadal data, so
-            # those are always written as one group (the run as a whole).
-            if group_years and time_unit == "annual" and calendar_dim == "calendar_year":
-                subgroup_indices = _period_subgroups(values_in_run, group_years)
-            else:
-                subgroup_indices = [list(range(len(run)))]
-
-            # A single source file's bands can land in more than one subgroup (e.g.
-            # re-grouping an existing 52-band file at a different group_years), so a
-            # source can't be unlinked until every subgroup referencing it has been
-            # written -- collect the union across the whole run before unlinking below.
-            # path_band_counts tallies each source's total contribution to the *whole*
-            # run (every subgroup, not just one) -- a subgroup is only "already optimal"
-            # when its one file contributes *exactly* those bands and nothing else,
-            # otherwise that file also feeds a different subgroup and must be split.
-            path_band_counts = Counter(tif for tif, _band in run)
-            consumed_paths = set()
-            for indices in subgroup_indices:
-                sub_run = [run[i] for i in indices]
-                sub_values = [values_in_run[i] for i in indices]
-                unique_paths = {tif for tif, _band in sub_run}
-                run_is_legacy = bool(unique_paths & legacy_paths)  # LEGACY COG SHIM
-                # A group already living entirely in one up-to-date file, with none of
-                # that file's bands split off into a different group, is already
-                # optimal; nothing to gain from rewriting it. A legacy group is
-                # rewritten regardless of file count -- that's its only path into the
-                # new format. Out-of-place, nothing is "already" anything: the group is
-                # not in the output tree at all yet, so it is always written.
-                already_optimal = (
-                    output_base_path == base_path
-                    and not run_is_legacy
-                    and len(unique_paths) == 1
-                    and path_band_counts[next(iter(unique_paths))] == len(sub_run)
-                )
-                if already_optimal:
+            if include_values is not None:
+                # Before the sort/run detection, so an excluded band can't join a run and
+                # drag its neighbours into a rewrite -- and so a gap left by an excluded
+                # band ends the run around it, exactly as a genuinely absent band would.
+                triples = [triple for triple in triples if triple[0] in include_values]
+                if not triples:
                     continue
 
-                # The output directory mirrors `directory`'s canonical dimensions but
-                # roots at output_base_path (== base_path for in-place compaction).
-                # LEGACY COG SHIM: `directory` is always pre-existing once every source
-                # is already canonical, but a legacy-only group's canonical directory
-                # may not exist on disk yet; an out-of-place output directory never
-                # exists up front.
-                out_directory = output_base_path / directory.relative_to(base_path)
-                out_directory.mkdir(parents=True, exist_ok=True)
-                out_path = out_directory / f"{uuid.uuid4()}.tif"
+            triples.sort(key=lambda triple: triple[0])
+            values = pl.Series([value for value, _tif, _band in triples])
+            offsets = calendar_run_offsets(values, calendar_dim, time_unit).to_list()
 
-                _write_run(
-                    sub_run,
-                    out_path,
-                    grid,
-                    dtype,
-                    calendar_dim,
-                    sub_values,
-                    run_is_legacy,
-                    compression,
-                    compression_level,
-                    vrt_transform,
-                    nodata=VARIABLES[kwargs["variable"]].nodata,
+            runs = {}
+            run_values = {}  # LEGACY COG SHIM (see below); remove alongside it.
+            for (value, tif, band_idx), offset in zip(triples, offsets):
+                runs.setdefault(offset, []).append((tif, band_idx))
+                run_values.setdefault(offset, []).append(value)
+
+            # Self-heal the catalog for this directory regardless of whether a physical
+            # merge happens below -- this recomputes every run's rows from what was just
+            # read, so directories containing legacy/pre-write_cog-hook files (which never
+            # got a catalog row of their own) are backfilled as a side effect of compacting.
+            if catalog_path:
+                path_dims = parse_path_dims(directory.relative_to(Path(base_path)))
+                directory_rows = pl.concat(
+                    [
+                        raster_catalog_rows(
+                            {k: cast_str(k, v) for k, v in {**path_dims, **tif_tags[run[0][0]]}.items()},
+                            calendar_dim,
+                            run_values[offset],
+                        )
+                        for offset, run in runs.items()
+                    ],
+                    how="diagonal_relaxed",
                 )
-                outputs.append(out_path)
-                consumed_paths |= unique_paths
+                Catalog(catalog_path).append(directory_rows)
 
-            sources_merged += len(consumed_paths)
+            for offset, run in runs.items():
+                values_in_run = run_values[offset]
+                # Period grouping only means anything for annual calendars -- a decade/pentad
+                # boundary isn't meaningful for daily, monthly, or already-decadal data, so
+                # those are always written as one group (the run as a whole).
+                if group_years and time_unit == "annual" and calendar_dim == "calendar_year":
+                    subgroup_indices = _period_subgroups(values_in_run, group_years)
+                else:
+                    subgroup_indices = [list(range(len(run)))]
 
-            # Out-of-place output leaves the source tree untouched; only an in-place
-            # merge consumes and removes its sources.
-            if output_base_path == base_path:
-                for path in consumed_paths:
-                    path.unlink()
+                # A single source file's bands can land in more than one subgroup (e.g.
+                # re-grouping an existing 52-band file at a different group_years), so a
+                # source can't be unlinked until every subgroup referencing it has been
+                # written -- collect the union across the whole run before unlinking below.
+                # path_band_counts tallies each source's total contribution to the *whole*
+                # run (every subgroup, not just one) -- a subgroup is only "already optimal"
+                # when its one file contributes *exactly* those bands and nothing else,
+                # otherwise that file also feeds a different subgroup and must be split.
+                path_band_counts = Counter(tif for tif, _band in run)
+                consumed_paths = set()
+                for indices in subgroup_indices:
+                    sub_run = [run[i] for i in indices]
+                    sub_values = [values_in_run[i] for i in indices]
+                    unique_paths = {tif for tif, _band in sub_run}
+                    run_is_legacy = bool(unique_paths & legacy_paths)  # LEGACY COG SHIM
+                    # A group already living entirely in one up-to-date file, with none of
+                    # that file's bands split off into a different group, is already
+                    # optimal; nothing to gain from rewriting it. A legacy group is
+                    # rewritten regardless of file count -- that's its only path into the
+                    # new format. Out-of-place, nothing is "already" anything: the group is
+                    # not in the output tree at all yet, so it is always written.
+                    already_optimal = (
+                        output_base_path == base_path
+                        and not run_is_legacy
+                        and len(unique_paths) == 1
+                        and path_band_counts[next(iter(unique_paths))] == len(sub_run)
+                    )
+                    if already_optimal:
+                        continue
+
+                    # The output directory mirrors `directory`'s canonical dimensions but
+                    # roots at output_base_path (== base_path for in-place compaction).
+                    # LEGACY COG SHIM: `directory` is always pre-existing once every source
+                    # is already canonical, but a legacy-only group's canonical directory
+                    # may not exist on disk yet; an out-of-place output directory never
+                    # exists up front.
+                    out_directory = output_base_path / directory.relative_to(base_path)
+                    out_directory.mkdir(parents=True, exist_ok=True)
+                    out_path = out_directory / f"{uuid.uuid4()}.tif"
+                    staged = staging_dir / out_path.name
+
+                    _write_run(
+                        sub_run,
+                        staged,
+                        grid,
+                        dtype,
+                        calendar_dim,
+                        sub_values,
+                        run_is_legacy,
+                        compression,
+                        compression_level,
+                        vrt_transform,
+                        nodata=VARIABLES[kwargs["variable"]].nodata,
+                    )
+                    outputs.append(staging.publish(staged, out_path))
+                    consumed_paths |= unique_paths
+
+                sources_merged += len(consumed_paths)
+
+                # Out-of-place output leaves the source tree untouched; only an in-place
+                # merge consumes and removes its sources.
+                if output_base_path == base_path:
+                    for path in consumed_paths:
+                        path.unlink()
 
     # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
     # partition (the self-healed rows appended above, plus any older, more-fragmented

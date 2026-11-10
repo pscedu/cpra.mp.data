@@ -38,17 +38,14 @@ from pathlib import Path, PurePosixPath
 
 import polars as pl
 
-from cpra.mp.data.catalog import Catalog, parse_path_dims
+from cpra.mp.data.compaction import datasets_under, mixed_parquet_files, run_dir
 from cpra.mp.data.dimensions import DIMENSIONS
-from cpra.mp.data.grids import GRIDS
-from cpra.mp.data.raster import compact_cog
-from cpra.mp.data.tabular import _DEFAULT_ROW_GROUP_SIZE, compact_parquet
+from cpra.mp.data.tabular import _DEFAULT_ROW_GROUP_SIZE
 
 FORMAT_VERSION = 1
 MANIFEST_NAME = "MANIFEST.json"
 DATA_PREFIX = "data"
 CATALOG_PREFIX = "catalog"
-DATASET_DIMS = ("variable", "time_unit", "grid")
 _CHUNK_SIZE = 1 << 20
 
 
@@ -95,32 +92,8 @@ def _run_filter(model_group_id, scenario_id) -> pl.Expr:
     return (pl.col("model_group_id") == model_group_id) & (pl.col("scenario_id") == scenario_id)
 
 
-def _dataset_key(dims: dict) -> str:
-    return "/".join(f"{name}={dims[name]}" for name in DATASET_DIMS)
-
-
-def _datasets_under(root: Path) -> dict[str, dict]:
-    """The ``variable``/``time_unit``/``grid`` dataset directories under ``root``."""
-    datasets = {}
-    for directory in root.glob("variable=*/time_unit=*/grid=*"):
-        if directory.is_dir():
-            dims = parse_path_dims(directory.relative_to(root))
-            datasets[_dataset_key(dims)] = dims
-    return datasets
-
-
-def _run_dir(base_path: Path, dataset: str, model_group_id, scenario_id) -> Path:
-    return base_path / dataset / f"model_group_id={model_group_id}" / f"scenario_id={scenario_id}"
-
-
 def _kind(path: Path) -> str:
     return {".tif": "cog", ".parquet": "parquet"}.get(path.suffix, "other")
-
-
-def _mixed_parquet_files(directory: Path) -> list[Path]:
-    """The Parquet files sitting directly in a dataset directory -- the unpartitioned kind
-    that holds every run in one file."""
-    return sorted(path for path in directory.glob("*.parquet") if path.is_file())
 
 
 def _count_run_rows(paths: list[Path], model_group_id, scenario_id) -> int:
@@ -163,8 +136,8 @@ def inventory_run(base_path, catalog_path, model_group_id, scenario_id) -> RunIn
     model_group_id, scenario_id = _cast_run(model_group_id, scenario_id)
     inventory = RunInventory(model_group_id, scenario_id)
 
-    data_datasets = _datasets_under(base_path)
-    catalog_datasets = _datasets_under(catalog_path) if catalog_path.is_dir() else {}
+    data_datasets = datasets_under(base_path)
+    catalog_datasets = datasets_under(catalog_path) if catalog_path.is_dir() else {}
 
     # LEGACY COG SHIM (see raster._LEGACY_DATASET_DIMENSION_ORDER): pre-migration COGs sit
     # under variable/grid/time_unit. Nothing here reads that layout, so say so rather than
@@ -175,9 +148,9 @@ def inventory_run(base_path, catalog_path, model_group_id, scenario_id) -> RunIn
     for dataset in sorted(data_datasets.keys() | catalog_datasets.keys()):
         has_data = False
 
-        run_dir = _run_dir(base_path, dataset, model_group_id, scenario_id)
-        if run_dir.is_dir():
-            for path in sorted(p for p in run_dir.rglob("*") if p.is_file()):
+        run_directory = run_dir(base_path, dataset, model_group_id, scenario_id)
+        if run_directory.is_dir():
+            for path in sorted(p for p in run_directory.rglob("*") if p.is_file()):
                 inventory.members.append(
                     Member(
                         arcname=f"{DATA_PREFIX}/{path.relative_to(base_path).as_posix()}",
@@ -192,7 +165,7 @@ def inventory_run(base_path, catalog_path, model_group_id, scenario_id) -> RunIn
 
         counts = {
             path: _count_run_rows([path], model_group_id, scenario_id)
-            for path in _mixed_parquet_files(base_path / dataset)
+            for path in mixed_parquet_files(base_path / dataset)
         }
         if sources := [path for path, rows in counts.items() if rows]:
             inventory.members.append(
@@ -226,53 +199,6 @@ def inventory_run(base_path, catalog_path, model_group_id, scenario_id) -> RunIn
             inventory.warnings.append(f"{dataset}: catalog rows but no data files")
 
     return inventory
-
-
-def compact_run(base_path, catalog_path, model_group_id, scenario_id, datasets, echo=print) -> None:
-    """Compact the run's data and catalog files in ``datasets``, skipping what is already
-    compact.
-
-    Every compactor called here already leaves compact data alone: ``compact_cog`` skips a
-    calendar run living in one optimal file, ``compact_parquet`` skips a directory with one
-    file, and ``Catalog.compact_partition`` skips a partition with one file.
-
-    COGs and daily Parquet are compacted for this run only. Annual/decadal Parquet holds
-    every run in one directory, so that directory is compacted as a whole -- which rewrites
-    the other runs' rows too, and reads the whole dataset into memory to do it.
-
-    The data compactors are called with ``catalog_path=None``: merging files changes no
-    dimension combination, so the rows already in the catalog stay correct, and the
-    catalog partition is compacted separately afterwards.
-    """
-    base_path, catalog_path = Path(base_path), Path(catalog_path)
-    model_group_id, scenario_id = _cast_run(model_group_id, scenario_id)
-
-    for dataset in datasets:
-        dims = parse_path_dims(dataset)
-        grid = GRIDS.get(dims["grid"])
-        if grid is None:
-            echo(f"  {dataset}: unknown grid, not compacted")
-            continue
-
-        run_kwargs = {**dims, "model_group_id": model_group_id, "scenario_id": scenario_id}
-        if _run_dir(base_path, dataset, model_group_id, scenario_id).is_dir():
-            compactor = compact_cog if grid.grid_type == "raster" else compact_parquet
-            result = compactor(base_path=base_path, catalog_path=None, **run_kwargs)
-            if result["sources_merged"]:
-                echo(f"  {dataset}: merged {result['sources_merged']} files into {len(result['outputs'])}")
-
-        # Never pass the run's dimensions here: this directory has no partition
-        # directories, so compact_parquet would read back only the run's rows and then
-        # delete every source file, taking every other run's rows with them.
-        if len(_mixed_parquet_files(base_path / dataset)) > 1:
-            result = compact_parquet(base_path=base_path, catalog_path=None, **dims)
-            echo(f"  {dataset}: merged {result['sources_merged']} files into {len(result['outputs'])} (all runs)")
-
-        catalog_dir = catalog_path / dataset
-        n_catalog = len(list(catalog_dir.glob("*.parquet"))) if catalog_dir.is_dir() else 0
-        if n_catalog > 1:
-            Catalog(catalog_path).compact_partition(dims["variable"], dims["time_unit"], dims["grid"])
-            echo(f"  {dataset}: compacted {n_catalog} catalog files")
 
 
 class _HashingReader:

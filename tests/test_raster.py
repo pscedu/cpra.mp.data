@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 import rasterio as rio
 
-from cpra.mp.data import config, raster
+from cpra.mp.data import config, raster, staging
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.raster import cog_path_expression, compact_cog, read_cog, vrt, write_cog
@@ -439,6 +439,31 @@ class TestCompactCogIncludeValues:
         result = compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
 
         assert result == {"outputs": [], "sources_merged": 0}
+        assert len(list(base_path.rglob("*.tif"))) == 1
+
+    def test_a_killed_compaction_leaves_the_sources_alone(self, base_path, monkeypatch):
+        """The merged COG is written in a staging directory outside the dataset (see
+        cpra.mp.data.staging), so dying before it is moved into place changes nothing."""
+        write_raster_dataset(base_path, years=(2030, 2031))
+        before = sorted(base_path.rglob("*"))
+
+        def killed(*args, **kwargs):
+            raise MemoryError
+
+        monkeypatch.setattr(staging, "publish", killed)
+        with pytest.raises(MemoryError):
+            compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
+
+        assert sorted(base_path.rglob("*")) == before
+
+    def test_removes_staging_left_by_a_killed_compaction(self, base_path):
+        write_raster_dataset(base_path, years=(2030, 2031))
+        (base_path / ".compact-dead").mkdir()
+        (base_path / ".compact-dead" / "merged.tif").write_bytes(b"truncated")
+
+        compact_cog(base_path=base_path, catalog_path=None, **RASTER_KWARGS)
+
+        assert not (base_path / ".compact-dead").exists()
         assert len(list(base_path.rglob("*.tif"))) == 1
 
     def test_refuses_to_filter_an_in_place_merge(self, base_path):

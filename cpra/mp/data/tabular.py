@@ -1,3 +1,4 @@
+import itertools
 import queue
 import tempfile
 import threading
@@ -9,6 +10,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+from cpra.mp.data import staging
 from cpra.mp.data.catalog import CAL_DIMS, EXCLUDE, Catalog, tabular_catalog_rows
 from cpra.mp.data.config import (
     CATALOG_PATH_UNSET,
@@ -17,6 +19,7 @@ from cpra.mp.data.config import (
 )
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 from cpra.mp.data.exceptions import ValidationError
+from cpra.mp.data.merge import MAX_OPEN_FILES, common_schema, merge_sorted_files
 from cpra.mp.data.utils import (
     build_glob_pattern,
     dataset_path,
@@ -42,6 +45,9 @@ _TEMP_DIR_UNSET = object()
 # the default dictionary/RLE.  grid_cell leads the sort; the calendar columns
 # are consecutive within each grid cell.
 _DELTA_COLUMNS = ("grid_cell", "calendar_day", "calendar_year")
+
+# The dims identifying one model run, which lead the sort key.
+_RUN_COLUMNS = ("model_group_id", "scenario_id")
 
 
 def _row_group_size(grid, time_unit):
@@ -255,6 +261,18 @@ def write_parquet(
         Catalog(catalog_path).append(rows)
 
 
+def _write_options(file_cols, compression, compression_level):
+    """Parquet writer options for a file holding ``file_cols``: shared by write_parquet and
+    compact_parquet so a compacted file is encoded like a freshly written one."""
+    delta_cols = [col for col in _DELTA_COLUMNS if col in file_cols]
+    return {
+        "compression": compression,
+        "compression_level": compression_level,
+        "use_dictionary": [col for col in file_cols if col not in delta_cols and col != "value"],
+        "column_encoding": {col: "DELTA_BINARY_PACKED" for col in delta_cols},
+    }
+
+
 def _write_dataset(reader, schema, base_path, partition_cols, compression, compression_level, row_group_size):
     """Write an ordered batch stream to a Hive-partitioned, delta-encoded dataset.
 
@@ -264,14 +282,8 @@ def _write_dataset(reader, schema, base_path, partition_cols, compression, compr
     the reader's global sort order in the on-disk layout.
     """
     file_cols = [name for name in schema.names if name not in partition_cols]
-    delta_cols = [col for col in _DELTA_COLUMNS if col in file_cols]
-    dict_cols = [col for col in file_cols if col not in delta_cols and col != "value"]
-
     write_options = ds.ParquetFileFormat().make_write_options(
-        compression=compression,
-        compression_level=compression_level,
-        use_dictionary=dict_cols,
-        column_encoding={col: "DELTA_BINARY_PACKED" for col in delta_cols},
+        **_write_options(file_cols, compression, compression_level)
     )
     partitioning = (
         ds.partitioning(pa.schema([schema.field(col) for col in partition_cols]), flavor="hive")
@@ -357,13 +369,29 @@ def compact_parquet(
     compression="zstd",
     compression_level=6,
     row_group_size=None,
+    max_open_files=MAX_OPEN_FILES,
+    temp_dir=None,
     **kwargs,
 ):
     """Rewrite Parquet datasets with one file per partition directory.
 
-    Every partition directory holding more than one Parquet file is read back as a whole
-    and rewritten as a single file, and the originals are then removed. A directory that
-    already holds one file is left untouched.
+    Every partition directory holding more than one Parquet file is rewritten as a single
+    file, and the originals are then removed. A directory that already holds one file is
+    left untouched.
+
+    The files are streamed, never loaded whole: each is already sorted (as
+    ``write_parquet`` writes it), so ``merge.merge_sorted_files`` copies, interleaves or
+    merges them into the same order a full sort would give, reading at most
+    ``max_open_files`` at a time. Peak memory depends on that and ``row_group_size``, not
+    on the amount of data; see ``cpra.mp.data.merge``. A cluster of more than
+    ``max_open_files`` overlapping files is merged in rounds through temporary files in a
+    hidden directory under ``temp_dir`` (default: the staging directory below). With
+    ``sort=False`` the files are concatenated as they are.
+
+    The merged file is written in a hidden staging directory under ``base_path`` (see
+    ``cpra.mp.data.staging``), and only moved into place, and the originals removed, once
+    its row count matches theirs. Staging left by a compaction that was killed part-way is
+    removed first, from ``base_path`` and ``temp_dir``.
 
     Beyond ``variable``/``time_unit``/``grid``, kwargs may only name dims that are
     partition directories for this dataset (``model_group_id``/``scenario_id``/... on
@@ -414,6 +442,12 @@ def compact_parquet(
     )
     paths = list(dataset_dir.glob(glob_pattern))
 
+    # Clear out what an interrupted compaction left behind. The sources are only removed
+    # once the merged file is in place, so nothing in staging is the only copy of anything.
+    staging.remove_stale(base_path)
+    if temp_dir is not None:
+        staging.remove_stale(temp_dir)
+
     # Bail out before building the frame below: with no paths its columns would have a
     # Null dtype, which str.extract rejects.
     if not paths:
@@ -441,39 +475,62 @@ def compact_parquet(
         )
     )
 
-    # Iterate over the directories, read the data, and rewrite it
-    # as a single file.
+    # The files' sort key: write_parquet's, minus the dims stored as directories rather
+    # than columns (dataset dims, and partition dims on daily data).
+    time_unit = kwargs["time_unit"]
+    required_cols = required_columns(input_df)
+    outer_cols = [col for col in required_cols if not col.startswith("calendar_")]
+    key = [
+        name
+        for name in (expr.meta.output_name() for expr in long_sort_expressions(outer_cols, time_unit))
+        if name not in DATASET_DIMENSIONS and name not in partition_cols
+    ]
+    # A model run's rows are contiguous in every file and never interleave with another
+    # run's, so the merge handles each run on its own. On daily data the run is the
+    # directory, so the whole key is within one run.
+    run_cols = list(itertools.takewhile(lambda col: col in _RUN_COLUMNS, key))
+    group_cols = [col for col in required_cols if col not in EXCLUDE and col not in CAL_DIMS]
+    dataset_exprs = [pl.lit(kwargs[dim.name]).cast(dim.dtype).alias(dim.name) for dim in DATASET_DIMENSIONS.values()]
+
+    # Merge each directory's files into one.
     outputs = []
     sources_merged = 0
-    for partition in partitions_df.iter_rows(named=True):
-        # variable/time_unit/grid never appear as partition_cols (they're baked into
-        # dataset_dir already, never re-extracted from the directory string), so start
-        # from kwargs for those and layer in whichever dims varied per directory.
-        read_kwargs = {**kwargs, **{k: v for k, v in partition.items() if k not in ("directory", "file")}}
+    with staging.area(base_path) as staging_dir:
+        for partition in partitions_df.iter_rows(named=True):
+            directory = Path(partition["directory"])
+            sources = [directory / file for file in sorted(partition["file"])]
 
-        # write_parquet names its output with a UUID, so diff the directory to find out
-        # what it produced rather than trying to predict the name.
-        directory = Path(partition["directory"])
-        before = set(directory.iterdir())
+            # write_parquet's naming scheme, so the result looks like any other written file.
+            final = directory / f"{uuid.uuid4()}-0.parquet"
+            staged = staging_dir / final.name
+            merge_sorted_files(
+                sources,
+                staged,
+                key,
+                run_cols=run_cols,
+                sort=sort,
+                max_open_files=max_open_files,
+                row_group_size=row_group_size or _DEFAULT_ROW_GROUP_SIZE,
+                write_options=_write_options(common_schema(sources).names, compression, compression_level),
+                temp_dir=temp_dir if temp_dir is not None else staging_dir,
+            )
+            outputs.append(staging.publish(staged, final))
 
-        write_parquet(
-            read_parquet(base_path=base_path, **read_kwargs).collect(),
-            base_path=base_path,
-            catalog_path=catalog_path,
-            validate=False,
-            sort=sort,
-            compression=compression,
-            compression_level=compression_level,
-            row_group_size=row_group_size,
-        )
+            # merge_sorted_files has checked the row counts, so the sources can go.
+            for source in sources:
+                source.unlink()
+                sources_merged += 1
 
-        outputs.extend(sorted(set(directory.iterdir()) - before))
-
-        # Delete the original files from the partition directory. Deleting only after
-        # the write means a failure part-way through leaves the sources intact.
-        for file in partition["file"]:
-            (directory / file).unlink()
-            sources_merged += 1
+            # Catalog rows for the merged file -- the sources' rows plus any that were never
+            # cataloged -- computed by a streaming scan.
+            if catalog_path:
+                partition_exprs = [
+                    pl.lit(partition[dim.name]).cast(dim.dtype).alias(dim.name)
+                    for dim in DIMENSIONS.values()
+                    if dim.name in partition_cols
+                ]
+                lf = pl.scan_parquet(final, hive_partitioning=False).with_columns(*dataset_exprs, *partition_exprs)
+                Catalog(catalog_path).append(tabular_catalog_rows(lf, group_cols, time_unit))
 
     # Coalesce whatever catalog rows now exist for this variable/time_unit/grid
     # partition (the fresh rows from the write_parquet calls above, plus any older,

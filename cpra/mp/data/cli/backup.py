@@ -5,7 +5,8 @@ Commands:
 
 \b
   backup   write every file and catalog row belonging to one run to
-           <output-dir>/g<id>-s<id>-<UTC timestamp>.tar
+           <output-dir>/g<id>-s<id>-<UTC timestamp>.tar, optionally compacting first
+           (the same as `data compact` for the run beforehand; see cli/data.py)
   restore  put an archive's files and catalog rows back in place; refuses if any of
            the run is still present
 
@@ -26,7 +27,8 @@ import time
 
 import click
 
-from cpra.mp.data.backup import ArchiveError, compact_run, inventory_run, restore_archive, run_name, write_archive
+from cpra.mp.data import compaction
+from cpra.mp.data.backup import ArchiveError, inventory_run, restore_archive, run_name, write_archive
 from cpra.mp.data.cli import cli
 from cpra.mp.data.config import get_base_path, get_catalog_path
 
@@ -58,8 +60,10 @@ def _report(inventory) -> None:
 
 
 @cli.command()
-@click.option("--model-group-id", type=int, required=True)
-@click.option("--scenario-id", type=int, required=True)
+# Also read from the environment, so a Kubernetes Job can be started from one suspended
+# CronJob template with just the run set (kubectl set env MODEL_GROUP_ID=... SCENARIO_ID=...).
+@click.option("--model-group-id", type=int, required=True, envvar="MODEL_GROUP_ID", show_envvar=True)
+@click.option("--scenario-id", type=int, required=True, envvar="SCENARIO_ID", show_envvar=True)
 @click.option(
     "--output-dir",
     "-o",
@@ -91,11 +95,17 @@ def backup(model_group_id, scenario_id, output_dir, base_path, catalog_dir, comp
         raise click.ClickException(f"no data or catalog rows found for {name} under {base} / {catalog}")
 
     if compact:
-        if dry_run:
-            click.echo(f"would compact {len(inventory.datasets)} dataset(s) first (--dry-run)")
-        else:
-            click.echo(f"compacting {name}:")
-            compact_run(base, catalog, model_group_id, scenario_id, inventory.datasets, echo=click.echo)
+        click.echo(f"{'would compact' if dry_run else 'compacting'} {name}:")
+        compaction.compact(
+            base,
+            catalog,
+            inventory.datasets,
+            model_group_id=model_group_id,
+            scenario_id=scenario_id,
+            dry_run=dry_run,
+            echo=click.echo,
+        )
+        if not dry_run:
             # Compaction replaces files, so find them again.
             inventory = inventory_run(base, catalog, model_group_id, scenario_id)
 

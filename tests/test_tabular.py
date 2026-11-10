@@ -6,12 +6,14 @@ a ``value`` column, one row per cell x time step) before writing. ``read_parquet
 returns long-format data."""
 
 import datetime
+import tempfile
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
-from cpra.mp.data import config
+from cpra.mp.data import config, merge, staging, tabular
 from cpra.mp.data.exceptions import ValidationError
 from cpra.mp.data.tabular import compact_parquet, read_parquet, write_parquet
 from tests.factories import (
@@ -457,6 +459,201 @@ class TestCompactParquet:
             )
 
         assert len(list(base_path.rglob("*.parquet"))) == 2
+
+
+def _forbid_windowed_merge(monkeypatch):
+    """Runs never interleave with each other, so these cases must not need the slow path."""
+
+    def forbidden(*args):
+        raise AssertionError("the windowed merge was used")
+
+    monkeypatch.setattr(merge, "_window_merge", forbidden)
+
+
+class TestCompactParquetStreaming:
+    """compact_parquet merges the already-sorted files rather than re-sorting them, and must
+    end up with exactly the file a single write_parquet of all the data would have made."""
+
+    @staticmethod
+    def _single_write(tmp_path, frames):
+        reference = tmp_path / "reference"
+        reference.mkdir()
+        write_parquet(pl.concat(frames), base_path=reference)
+        (file,) = reference.rglob("*.parquet")
+        return pl.read_parquet(file)
+
+    @staticmethod
+    def _compacted(base_path):
+        (file,) = base_path.rglob("*.parquet")
+        return pl.read_parquet(file)
+
+    def test_one_year_at_a_time_matches_a_single_write(self, base_path, tmp_path):
+        frames = [annual_frame(years=(year,)) for year in (2033, 2030, 2032, 2031)]
+        for frame in frames:
+            write_parquet(frame, base_path=base_path)
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        assert self._compacted(base_path).equals(self._single_write(tmp_path, frames))
+
+    def test_a_new_run_inside_a_compacted_file(self, base_path, tmp_path, monkeypatch):
+        _forbid_windowed_merge(monkeypatch)
+        frames = [annual_frame(years=(year,), model_group_id=mg) for mg in (400, 600) for year in (2030, 2031)]
+        for frame in frames:
+            write_parquet(frame, base_path=base_path)
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+        new = [annual_frame(years=(year,), model_group_id=500) for year in (2030, 2031)]
+        for frame in new:
+            write_parquet(frame, base_path=base_path)
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        assert self._compacted(base_path).equals(self._single_write(tmp_path, frames + new))
+
+    def test_years_added_to_a_compacted_run(self, base_path, tmp_path, monkeypatch):
+        _forbid_windowed_merge(monkeypatch)
+        frames = [annual_frame(years=(2030,), model_group_id=mg) for mg in (500, 600)]
+        for frame in frames:
+            write_parquet(frame, base_path=base_path)
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+        added = [annual_frame(years=(year,), model_group_id=500) for year in (2031, 2032)]
+        for frame in added:
+            write_parquet(frame, base_path=base_path)
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        assert self._compacted(base_path).equals(self._single_write(tmp_path, frames + added))
+
+    def test_file_cap_leaves_no_temporary_files(self, base_path, tmp_path):
+        frames = [annual_frame(years=(year,)) for year in range(2030, 2037)]
+        for frame in frames:
+            write_parquet(frame, base_path=base_path)
+
+        compact_parquet(base_path=base_path, max_open_files=2, **DATASET_KWARGS)
+
+        assert self._compacted(base_path).equals(self._single_write(tmp_path, frames))
+        assert [p for p in base_path.rglob("*") if p.name.startswith(".")] == []
+
+    def test_leftovers_of_an_interrupted_compaction_are_removed(self, base_path, tmp_path):
+        frames = [annual_frame(years=(year,)) for year in (2030, 2031)]
+        for frame in frames:
+            write_parquet(frame, base_path=base_path)
+        (base_path / ".compact-dead").mkdir()
+        (base_path / ".compact-dead" / "merged.parquet").write_bytes(b"truncated")
+        keep = base_path / ".compact-not-a-dir"
+        keep.write_bytes(b"")
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        assert self._compacted(base_path).equals(self._single_write(tmp_path, frames))
+        assert not (base_path / ".compact-dead").exists()
+        assert keep.exists()
+
+    def test_leftovers_are_removed_from_temp_dir(self, base_path, tmp_path):
+        temp_dir = tmp_path / "scratch"
+        (temp_dir / ".compact-dead").mkdir(parents=True)
+        (temp_dir / "other").mkdir()
+        write_parquet(annual_frame(years=(2030,)), base_path=base_path)
+
+        compact_parquet(base_path=base_path, temp_dir=temp_dir, **DATASET_KWARGS)
+
+        assert [p.name for p in temp_dir.iterdir()] == ["other"]
+
+    def test_dataset_stays_readable_while_compacting(self, base_path, monkeypatch):
+        """Polars takes every file under a scanned directory, so nothing unfinished may sit
+        in the dataset directory -- not even under a hidden name."""
+        for year in (2030, 2031):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path)
+        expected = read_parquet(base_path=base_path, **DATASET_KWARGS).collect()
+        original = tabular.merge_sorted_files
+        during = []
+
+        def checking(paths, out_path, *args, **kwargs):
+            stats = original(paths, out_path, *args, **kwargs)
+            during.append(read_parquet(base_path=base_path, **DATASET_KWARGS).collect())
+            return stats
+
+        monkeypatch.setattr(tabular, "merge_sorted_files", checking)
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        (frame,) = during
+        assert frame.equals(expected)
+
+    def test_a_killed_compaction_leaves_the_sources_alone(self, base_path, monkeypatch):
+        for year in (2030, 2031):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path)
+        before = sorted(base_path.rglob("*"))
+
+        def killed(*args, **kwargs):
+            raise MemoryError
+
+        monkeypatch.setattr(staging, "publish", killed)
+        with pytest.raises(MemoryError):
+            compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        assert sorted(base_path.rglob("*")) == before
+
+    def test_temp_dir_is_used_and_cleaned(self, base_path, tmp_path, monkeypatch):
+        temp_dir = tmp_path / "scratch"
+        temp_dir.mkdir()
+        seen = []
+        original = tempfile.TemporaryDirectory
+
+        def recording(*args, **kwargs):
+            seen.append(kwargs.get("dir"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(tempfile, "TemporaryDirectory", recording)
+        for year in range(2030, 2035):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path)
+
+        compact_parquet(base_path=base_path, max_open_files=2, temp_dir=temp_dir, **DATASET_KWARGS)
+
+        assert temp_dir in seen
+        assert list(temp_dir.iterdir()) == []
+        assert [p for p in base_path.iterdir() if p.name.startswith(".")] == []
+
+    def test_compacted_file_is_encoded_like_a_written_one(self, base_path):
+        for year in (2030, 2031):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path)
+
+        compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        (file,) = base_path.rglob("*.parquet")
+        metadata = pq.read_metadata(file)
+        columns = {metadata.schema.column(i).name: metadata.row_group(0).column(i) for i in range(metadata.num_columns)}
+        assert "DELTA_BINARY_PACKED" in columns["grid_cell"].encodings
+        assert "DELTA_BINARY_PACKED" in columns["calendar_year"].encodings
+        assert columns["value"].compression == "ZSTD"
+
+    def test_failure_leaves_the_sources_and_no_partial_file(self, base_path, monkeypatch):
+        for year in (2030, 2031):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path)
+        before = {p: p.read_bytes() for p in base_path.rglob("*") if p.is_file()}
+
+        def failing_write(self, table):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(merge._Writer, "write", failing_write)
+
+        with pytest.raises(OSError, match="disk full"):
+            compact_parquet(base_path=base_path, **DATASET_KWARGS)
+
+        after = {p: p.read_bytes() for p in base_path.rglob("*") if p.is_file()}
+        assert after == before
+        assert [p for p in base_path.rglob("*") if p.name.startswith(".")] == []
+
+    def test_catalog_rows_cover_the_merged_file(self, base_path, catalog_path):
+        for year in (2030, 2031, 2032):
+            write_parquet(annual_frame(years=(year,)), base_path=base_path, catalog_path=catalog_path)
+
+        compact_parquet(base_path=base_path, catalog_path=catalog_path, **DATASET_KWARGS)
+
+        rows = pl.read_parquet(catalog_path / "**" / "*.parquet", hive_partitioning=True)
+        assert rows.height == 1
+        assert rows.row(0, named=True)["calendar_year_min"] == 2030
+        assert rows.row(0, named=True)["calendar_year_max"] == 2032
 
 
 class TestCompactParquetSummary:

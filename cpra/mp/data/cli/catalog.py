@@ -41,7 +41,6 @@ Usage:
 """
 
 import time
-import uuid
 
 import click
 import polars as pl
@@ -52,8 +51,6 @@ from cpra.mp.data.catalog import (
     EXTENT_COLS,
     Catalog,
     CatalogQuery,
-    merge_partition,
-    parse_path_dims,
     raster_catalog_from_paths,
     tabular_catalog_from_files,
     unify_dtypes,
@@ -75,7 +72,10 @@ def build(base_path, out):
     out = get_catalog_path(out)
     t0 = time.time()
     parquet_dirs, tif_paths = {}, []
-    for root, _dirs, files in base.walk():
+    for root, dirs, files in base.walk():
+        # Skip hidden directories: a compaction's staging (cpra.mp.data.staging) holds
+        # unfinished files.
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
         if pq := [f for f in files if f.endswith(".parquet")]:
             parquet_dirs[root] = pq
         tif_paths.extend(root / f for f in files if f.endswith(".tif"))
@@ -109,25 +109,18 @@ def build(base_path, out):
 @click.option("--catalog", "catalog_dir", default=None, help="Catalog root (default: configured CATALOG_PATH).")
 def compact(catalog_dir):
     base = get_catalog_path(catalog_dir)
+    catalog = Catalog(base)
     n_parts = n_before = n_after = 0
-    for root, _dirs, files in base.walk():
-        pqs = [f for f in files if f.endswith(".parquet")]
-        if len(pqs) <= 1:
+    for variable, time_unit, grid in catalog.partitions():
+        result = catalog.compact_partition(variable, time_unit, grid)
+        if result is None:
             continue  # build emits minimal runs; a single file needs no merge
-        time_unit = parse_path_dims(root.relative_to(base))["time_unit"]
-        # Concat files individually with diagonal_relaxed rather than pl.read_parquet(pqs) --
-        # older files may predate a fix to tabular_catalog_rows and lack the unused calendar
-        # dim's extent columns entirely, which pl.read_parquet rejects as a schema mismatch.
-        df = pl.concat([pl.read_parquet(root / f) for f in pqs], how="diagonal_relaxed")
-        merged = merge_partition(df, time_unit)
-        merged.write_parquet(root / f"{uuid.uuid4()}-0.parquet")
-        for f in pqs:
-            (root / f).unlink()
         n_parts += 1
-        n_before += df.height
-        n_after += merged.height
+        n_before += result["rows_before"]
+        n_after += result["rows_after"]
         click.echo(
-            f"compacted {root.relative_to(base)}: {len(pqs)} files / {df.height:,} rows -> 1 file / {merged.height:,} rows"
+            f"compacted variable={variable}/time_unit={time_unit}/grid={grid}: {result['files']} files / "
+            f"{result['rows_before']:,} rows -> 1 file / {result['rows_after']:,} rows"
         )
     click.echo(f"\nDONE: {n_parts} partitions, {n_before:,} -> {n_after:,} rows")
 
