@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.58.0](https://github.com/pscedu/cpra.mp.data/compare/v0.57.1...v0.58.0) (2026-11-11)
+
+
+### Features
+
+* **cli:** add backup and restore commands ([377d2b6](https://github.com/pscedu/cpra.mp.data/commit/377d2b658ee9e736879a8f8a9223b4cb71c98888))
+* **scripts:** use lnd_conf_chng analysis in video frames ([7089f22](https://github.com/pscedu/cpra.mp.data/commit/7089f2207f191fede6459229f6525984728235e3))
+
+
+### Performance Improvements
+
+* **raster:** use configured thead count for compacting COGs ([344c172](https://github.com/pscedu/cpra.mp.data/commit/344c172755e8aa15a7f7782e9a6dc245be62d5c4))
+* **tabular:** optimize Parquet compact for memory usage ([ef3e896](https://github.com/pscedu/cpra.mp.data/commit/ef3e8965ba85e65fa096e928ddacacd9bba33ef4))
+
 ## [0.57.1](https://github.com/pscedu/cpra.mp.data/compare/v0.57.0...v0.57.1) (2026-10-26)
 
 
