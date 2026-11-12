@@ -34,3 +34,6 @@ coverage.xml
 /.*-scratch/
 /.verify-scratch/
 /.claude/
+
+
+.idea/
