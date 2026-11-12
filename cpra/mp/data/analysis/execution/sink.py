@@ -45,6 +45,7 @@ import rasterio
 from mapbox_vector_tile.Mapbox.vector_tile_pb2 import tile as VectorTile
 from PIL import Image
 from pmtiles.reader import MmapSource, Reader
+from rasterio.windows import Window
 
 from cpra.mp.data import config
 from cpra.mp.data.analysis.execution.frame import (
@@ -180,7 +181,7 @@ def sink_tabular(lf: LongFrame, out_path, data_format, *, float_precision=None, 
 # ----------------------------------------------------------------------------------------
 
 
-def _resolve_write_dtype(df: pl.DataFrame, band_names: list[str], dtype: str | None) -> str:
+def _resolve_write_dtype(schema: pl.Schema, band_names: list[str], dtype: str | None) -> str:
     """The numpy dtype string `write_raster` should declare the file's bands as, when the
     caller did not pass one explicitly.
 
@@ -197,7 +198,6 @@ def _resolve_write_dtype(df: pl.DataFrame, band_names: list[str], dtype: str | N
     """
     if dtype is not None:
         return dtype
-    schema = df.schema
     polars_dtypes = {schema[name] for name in band_names}
     if len(polars_dtypes) == 1:
         numpy_dtype = _POLARS_TO_NUMPY.get(next(iter(polars_dtypes)))
@@ -259,10 +259,23 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     client holding only the bytes has nothing else to read a band's calendar value off.
 
     Row order in `band_wide`'s `LazyFrame` is the READ's emission order, not necessarily
-    row-major (see `execution/frame.py`'s band-wide invariants) -- `row_major_grid_cell`
-    recovers each row's true pixel position and this sorts by it before reshaping, which
-    is what makes the reshape below correct regardless of how the original read was
-    batched.
+    row-major (see `execution/frame.py`'s band-wide invariants): batch after batch, each
+    one row-major over its own sub-rectangle, as `window.batch_layout` records. So the
+    frame is written back the same way, one batch at a time into that batch's window of
+    the file, rather than sorted into raster order first.
+
+    **Memory.** This used to label every row with its `grid_cell`, sort the whole frame
+    by it, and collect it with the default in-memory engine, which materializes every
+    intermediate column of the walk at full raster height at once: a full-extent
+    `lnd_conf` download (five Int32 bands in, one Float64 band out, 97M pixels) peaked at
+    10.6 GiB, and `lnd_conf_chng` (ten in) at up to 16.8 GiB, for a 0.4-0.75 GB result.
+    The streaming engine evaluates the walk a morsel at a time, so only the result itself
+    is held -- 2.2 and 1.5 GiB peak for the same two. Rows come out of
+    `collect(engine="streaming")` in the frame's order, which is what the batch-by-batch
+    write relies on. `collect_batches`, which would also bound the result, is NOT safe to
+    substitute: on Polars 1.41.2 it returned rows out of order for `lnd_conf_chng` (a
+    `calculate` after a band-wide `join`), in different places from run to run, while
+    `collect(engine="streaming")` of the same frame matched the in-memory engine exactly.
 
     `dtype`/`nodata` are explicit, caller-supplied parameters rather than derived from a
     `Variable` lookup or a source file's own profile: `band_wide` is the END of a walk
@@ -286,17 +299,21 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
         return False
 
     band_names = band_column_names(metadata_df)
-    ordered = row_major_grid_cell(lf, window).sort("grid_cell").select(band_names)
-    df = ordered.collect()
+    df = lf.select(band_names).collect(engine="streaming")
 
     # `read_shape`, not `height`/`width`: those are the window's SOURCE extent, which is the
     # array's shape only when the read was undecimated. `window.transform` is already scaled
     # to match, so the written file is georeferenced correctly either way.
     read_height, read_width = window.read_shape
-    out_dtype = _resolve_write_dtype(df, band_names, dtype)
-    data = np.stack(
-        [df.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False) for name in band_names]
-    ).reshape(len(band_names), read_height, read_width)
+    out_dtype = _resolve_write_dtype(df.schema, band_names, dtype)
+    # An empty layout is one batch covering the whole read, in array units -- the same
+    # fallback `row_major_grid_cell` takes, and the only layout a decimated read has.
+    layout = window.batch_layout or ((window.col_off, window.row_off, read_width, read_height),)
+    if df.height != sum(width * height for _c, _r, width, height in layout):
+        raise ValueError(
+            f"write_raster: the frame has {df.height} rows, but its window's batch layout covers "
+            f"{sum(width * height for _c, _r, width, height in layout)} pixels"
+        )
 
     profile = {
         "driver": "GTiff",
@@ -311,7 +328,17 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     profile.update(profile_options)
 
     with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(data)
+        offset = 0
+        for col, row, width, height in layout:
+            batch = df.slice(offset, width * height)
+            offset += width * height
+            data = np.stack(
+                [
+                    batch.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False)
+                    for name in band_names
+                ]
+            ).reshape(len(band_names), height, width)
+            dst.write(data, window=Window(col - window.col_off, row - window.row_off, width, height))
         for index, description in enumerate(_band_descriptions(metadata_df), start=1):
             if description:
                 dst.set_band_description(index, description)

@@ -65,6 +65,8 @@ from cpra.mp.data.analysis.execution.sink import (
     sink_vector_tile,
     write_raster,
 )
+from cpra.mp.data.analysis.io import raster_io
+from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import tile_read_shape, tile_source_window, warp_window_to_tile
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import Output, parse_pipeline
@@ -350,15 +352,102 @@ class TestResolveWriteDtype:
 
     def test_explicit_dtype_wins_outright(self):
         df = pl.DataFrame({"b0": pl.Series([1], dtype=pl.Int8)})
-        assert _resolve_write_dtype(df, ["b0"], "float64") == "float64"
+        assert _resolve_write_dtype(df.schema, ["b0"], "float64") == "float64"
 
     def test_shared_dtype_is_inferred(self):
         df = pl.DataFrame({"b0": pl.Series([1], dtype=pl.Float32), "b1": pl.Series([2], dtype=pl.Float32)})
-        assert _resolve_write_dtype(df, ["b0", "b1"], None) == "float32"
+        assert _resolve_write_dtype(df.schema, ["b0", "b1"], None) == "float32"
 
     def test_mixed_dtypes_fall_back_to_float64(self):
         df = pl.DataFrame({"b0": pl.Series([1], dtype=pl.Float32), "b1": pl.Series([2], dtype=pl.Int32)})
-        assert _resolve_write_dtype(df, ["b0", "b1"], None) == "float64"
+        assert _resolve_write_dtype(df.schema, ["b0", "b1"], None) == "float64"
+
+
+class TestWriteRasterPlacesEveryPixel:
+    """`write_raster` writes the frame back one read batch at a time, into each batch's own
+    window of the file. `TestWriteRaster`'s fixtures are a single value per band, so a
+    pixel landing in the wrong place would pass there; here every pixel is distinct, and
+    the read is cut into several batches (or windowed, or decimated), so the file must
+    equal the source pixel for pixel.
+    """
+
+    _SIZE = (256, 384)  # rows, cols: 2 x 3 blocks of 128
+
+    @pytest.fixture
+    def source(self, tmp_path):
+        data = np.arange(2 * self._SIZE[0] * self._SIZE[1], dtype="int32").reshape(2, *self._SIZE)
+        data[:, :5, :7] = DEFAULT_NODATA
+        path = tmp_path / "source.tif"
+        profile = {
+            "driver": "GTiff",
+            "dtype": "int32",
+            "count": 2,
+            "height": self._SIZE[0],
+            "width": self._SIZE[1],
+            "crs": "EPSG:26915",
+            "transform": rasterio.transform.from_origin(0, 10, 1, 1),
+            "tiled": True,
+            "blockxsize": 128,
+            "blockysize": 128,
+            "nodata": DEFAULT_NODATA,
+        }
+        with rasterio.open(path, "w", **profile) as dst:
+            dst.write(data)
+            dst.build_overviews([2, 4], Resampling.nearest)
+        return path, data
+
+    @staticmethod
+    def _metadata(path):
+        return pl.DataFrame({"path": [str(path)] * 2, "band": [1, 2]})
+
+    def _write_and_read(self, band_wide, tmp_path):
+        out_path = tmp_path / "out.tif"
+        assert write_raster(band_wide, out_path)
+        with rasterio.open(out_path) as written:
+            return written.read()
+
+    def test_a_batched_full_read_is_written_back_in_place(self, source, tmp_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 2)
+        path, data = source
+        band_wide = scan_raster(self._metadata(path))
+
+        assert len(band_wide[2].batch_layout) == 4  # 2 block rows x (2 blocks + 1 block)
+        np.testing.assert_array_equal(self._write_and_read(band_wide, tmp_path), data)
+
+    def test_a_computed_join_is_written_back_in_place(self, source, tmp_path, monkeypatch):
+        # The shape that `collect_batches` misordered (see `write_raster`'s docstring): two
+        # column groups of one batched scan put side by side, then an expression over both.
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 2)
+        path, data = source
+        lf, metadata_df, window = scan_raster(self._metadata(path))
+        joined = pl.concat([lf.select("b0"), lf.select(pl.col("b1").alias("other"))], how="horizontal")
+        computed = joined.select((pl.col("other") - pl.col("b0")).alias("b0"))
+
+        written = self._write_and_read((computed, metadata_df.head(1), window), tmp_path)
+
+        expected = np.where(data[0] == DEFAULT_NODATA, DEFAULT_NODATA, data[1] - data[0])
+        np.testing.assert_array_equal(written, expected[None])
+
+    def test_a_windowed_read_is_written_back_in_place(self, source, tmp_path):
+        path, data = source
+        band_wide = scan_raster(self._metadata(path), window=rasterio.windows.Window(3, 2, 371, 250))
+
+        np.testing.assert_array_equal(self._write_and_read(band_wide, tmp_path), data[:, 2:252, 3:374])
+
+    def test_a_decimated_read_is_written_back_in_place(self, source, tmp_path):
+        path, _data = source
+        band_wide = scan_raster(self._metadata(path), window=rasterio.windows.Window(0, 0, 384, 256), decimation=(4, 4))
+
+        with rasterio.open(path) as src:
+            expected = src.read(out_shape=(2, self._SIZE[0] // 4, self._SIZE[1] // 4))
+        np.testing.assert_array_equal(self._write_and_read(band_wide, tmp_path), expected)
+
+    def test_a_frame_that_does_not_fill_its_layout_raises(self, source, tmp_path):
+        path, _data = source
+        lf, metadata_df, window = scan_raster(self._metadata(path))
+
+        with pytest.raises(ValueError, match="batch layout covers"):
+            write_raster((lf.head(10), metadata_df, window), tmp_path / "out.tif")
 
 
 class TestBandDescriptions:
