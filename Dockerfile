@@ -4,6 +4,16 @@ LABEL org.opencontainers.image.source="https://github.com/pscedu/cpra.mp.data"
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.15 /uv /bin/uv
 
+# jemalloc, for deployments to LD_PRELOAD in place of glibc malloc. glibc keeps
+# memory freed after a tile burst instead of returning it to the OS, so the
+# API's footprint ratchets up; jemalloc gives it back within seconds. Nothing
+# in the image preloads it -- the API's helmrelease does, by this path, so the
+# test fails the build if the path ever moves.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libjemalloc2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
 # Compile bytecode at build time, since the pod runs with a read-only root
 # filesystem and can't write .pyc files later. Copy rather than hardlink out of
 # the cache mount, which isn't part of the image. Use the image's Python, never
