@@ -51,7 +51,7 @@ TestLoweringNotImplemented` for the concrete pipeline this covers.
 **Opening a band-wide input.** A raster-shaped `ResolvedInput` is opened via
 `io.raster.scan_raster` over its already-resolved `band_metadata`, except when a dimension
 predicate pushed down at compile time narrowed that metadata to zero bands: `scan_raster`
-raises on an empty band list (it derives its window from the VRT it opens, and a zero-band
+raises on an empty band list (it derives its window from the first file it opens, and a zero-band
 read opens nothing), so that case is built directly with `execution.frame.empty_band_wide`
 over a window taken from the raster grid's own geometry instead -- see
 `_grid_read_window` and `execution.plan`'s module docstring, "loose end" paragraph, which
@@ -59,7 +59,7 @@ names this exact construction.
 
 **A point sample that names its pixels, and nothing else, skips the band-wide reader
 entirely.** `io.raster_points.sample_raster_points` samples exactly the named pixels out of
-the underlying files and returns a LONG frame directly -- no window, no VRT, no unpivot of
+the underlying files and returns a LONG frame directly -- no window, no batched scan, no unpivot of
 everything else. `point_sample_reads` is the gate, and `execute` consults it before it
 opens anything; every origin it names is opened through that reader instead of
 `_open_band_wide_input`, and `execute`'s own local copy of `plan.frame_types` records that
@@ -186,7 +186,7 @@ grids (one origin's `straddling_vector_grid` naming grid X, another's naming gri
 different origins straddling two different ones), so `_open_band_wide_join_group` cannot
 attach a single crosswalk to the combined read the way `_open_band_wide_input` attaches
 one to a single origin's read. It resolves one crosswalk per origin that needs one, each
-under its own internal VRT column name (so two different crosswalk files never collide in
+under its own internal scan column name (so two different crosswalk files never collide in
 the one combined `scan_raster` call), and re-aliases each origin's own slice of the result
 back to the canonical `project.ZONE_COLUMN` name -- so a lowering reading any one origin's
 `BandWideFrame` out of `frames` afterward sees the same column name regardless of how many
@@ -840,7 +840,7 @@ def _open_band_wide_join_group(
     origin straddling two grids at once is rejected, at compile time -- see `plan.py`'s own
     conflict check), so this cannot attach one shared crosswalk the way
     `_open_band_wide_input` does for a single origin. Instead it resolves one crosswalk per
-    origin that needs one, each under its own internal VRT column name
+    origin that needs one, each under its own internal scan column name
     (`f"__zone_{name}__"`, guaranteed distinct across origins so two different crosswalk
     files never collide in the one combined `scan_raster` call), and re-aliases each
     origin's own slice back to the canonical `project.ZONE_COLUMN` name -- so a lowering

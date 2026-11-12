@@ -69,7 +69,7 @@ def resolve_raster_bands(selection: InputSelection, *, base_path=None, path_pred
     One row per (file, band) `read_cog` finds on disk, sorted by `read_cog`'s own
     convention (on-path dimensions, then the calendar dimension) -- this row order IS the
     band order a scan built from this frame must honor (`io/raster.py` turns row *i* into
-    VRT source *i* into column `b<i>`, positionally and exactly), so this function does not
+    scan source *i* into column `b<i>`, positionally and exactly), so this function does not
     re-sort or re-shuffle anything `read_cog` already decided.
 
     `base_path` follows `read_cog`'s own default (the real `data-long/` tree) when not

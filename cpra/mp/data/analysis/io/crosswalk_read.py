@@ -3,7 +3,7 @@
 `resolve_raster_crosswalk_path` locates (but does not open) the raster-to-vector
 artifact, since that one is read through `io/raster.py::scan_raster` instead of a plain
 Parquet scan -- see that function's own module docstring for why a crosswalk rides along
-in the same VRT read as an ordinary band.
+in the same scan as an ordinary band.
 
 `read_vector_crosswalk` opens one directed (source grid, destination grid) crosswalk
 artifact as a `pl.LazyFrame` of `(src_id, dst_id, scale_factor)` rows -- one row per
@@ -72,7 +72,7 @@ def resolve_raster_crosswalk_path(raster_grid: str, vector_grid: str) -> Path:
     Resolves only -- does not open or read the file, unlike `read_vector_crosswalk`,
     because this artifact is a GeoTIFF read through `io/raster.py::scan_raster` (a
     windowed, batched raster read, not a single Parquet scan), and that function needs a
-    path to include in its VRT, not an already-opened frame. Reading `config.
+    path to include in its sources, not an already-opened frame. Reading `config.
     CROSSWALKS_PATH` as a module attribute at call time, for the same reason
     `read_vector_crosswalk` does: so `tests/conftest.py`'s `crosswalk_path` fixture, which
     monkeypatches that attribute, actually takes effect.

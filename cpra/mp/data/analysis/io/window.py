@@ -31,8 +31,8 @@ class ReadWindow:
     pixel back on the ground given only its row index, since row order is the only
     positional information a band-wide frame keeps (see `execution/frame.py`).
 
-    `source` is an opaque identity for what was read -- a VRT descriptor, a tuple of
-    constituent file paths, whatever the scan that built this frame decides is enough to
+    `source` is an opaque identity for what was read -- a tuple of constituent
+    (file, band) sources, whatever the scan that built this frame decides is enough to
     tell "the same read" from "a different one" (the only property required of it: `==`
     comparison, for `frame.assert_window_unchanged`). Its concrete shape belongs to
     whatever builds the scan, not to this module.

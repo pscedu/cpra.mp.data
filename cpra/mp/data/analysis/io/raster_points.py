@@ -10,7 +10,7 @@ eventually unpivot it. This module is the other reader, and it is deliberately a
 one rather than a mode of that one: it has no window (a set of scattered pixels is not a
 rectangle), no batching (the answer is a handful of rows, not a memory-bounded stream), no
 decimation (the pixel under a coordinate is the whole answer, and a coarser grid hands back
-a neighbour's value instead), and no VRT (it samples the underlying files directly). Each
+a neighbour's value instead), and no full-window decode (it samples single pixels from each file). Each
 reader therefore has exactly one output shape, fixed at the call, and neither has to
 describe the other's.
 
@@ -83,11 +83,10 @@ def _sample_groups(sources: Sequence[tuple[object, object]]):
     group's band list)` for source *i*.
 
     Grouped by FILE first, which is the whole point -- 52 bands spread over 5 files is 5
-    sample calls, not 52, and each file is opened once instead of once per band the way a
-    VRT assembled from the same sources opens it. Then split again by DTYPE within a file,
-    because a sample call shares `read`'s one-array-per-call constraint and raises
-    `ValueError: more than one 'dtype' found` the moment a single call spans two of them --
-    the same grouping, and the same reason, as `io.raster.scan_raster`'s `read_groups`.
+    sample calls, not 52, and each file is opened once instead of once per band -- the same grouping
+    `io.raster.scan_raster` reads by. Then split again by DTYPE within a file, because a
+    sample call shares `read`'s one-array-per-call constraint and raises
+    `ValueError: more than one 'dtype' found` the moment a single call spans two of them.
     That second split is normally a no-op (a COG this package writes has one dtype for all
     its bands), so this is usually exactly one group per file.
 

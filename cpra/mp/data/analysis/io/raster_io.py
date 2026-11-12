@@ -181,7 +181,7 @@ def raster_blocks_per_batch(n_bands, block_height, block_width, itemsize):
 def batched_windows(src, blocks_per_batch):
     """Window unions over one block row at a time, chunked to `blocks_per_batch` blocks.
 
-    This is where the VRT-based raster scan (`io/raster.py`) reads its batch boundaries
+    This is where the batched raster scan (`io/raster.py`) reads its batch boundaries
     from, so a request over a large raster bounds its per-batch buffer rather than
     unioning a whole block row (tens of thousands of pixels wide regardless of how much
     data a request needs) into one batch.

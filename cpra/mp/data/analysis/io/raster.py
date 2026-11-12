@@ -1,30 +1,36 @@
 """The raster scan: `scan_raster` opens a band-wide dataset as the band-wide triple
-(`execution/frame.py`'s `BandWideFrame`), assembling a per-request VRT rather than reading
-one file at a time.
+(`execution/frame.py`'s `BandWideFrame`), reading each source file directly.
 
-**Why a VRT.** A band-wide frame's columns are files -- `metadata_df` row *i* becomes
-column `b<i>`, and `execution/frame.py`'s band-naming rule is that this correspondence is
-exact and positional. GDAL's own VRT format already expresses "N bands, each sourced from a
-different file (or a different band of the same file), in a declared order" as a single
-virtual dataset, so building one turns "read N band-wide columns in step" into an ordinary
-single-dataset windowed read, with no separate bookkeeping to keep N independent file
-handles' windows in sync batch to batch. `cpra.mp.data.raster.vrt` already builds this XML
-from a `(path, band)` list and needs no change for this -- see that function's own
-docstring for why a bare path means band 1 and a `(path, band)` pair selects a specific
-one.
+**Bands in a declared order, read one file at a time.** A band-wide frame's columns are
+bands of files -- `metadata_df` row *i* becomes column `b<i>`, and `execution/frame.py`'s
+band-naming rule is that this correspondence is exact and positional. Each batch opens
+every distinct file once and reads all the bands the request wants from it in one
+`read(indexes=[...])`, then places each band at its row's position. A bare path in the
+sources means band 1 (a crosswalk is single-band by construction).
 
-The VRT is assembled fresh on every call (no caching -- a cache and the invalidation it
-would need are both deliberately absent) and opened straight out of
-memory via `rasterio.io.MemoryFile`, never written to disk: a VRT's own bytes are pure XML
-referencing the real files by path, so nothing about opening or re-opening one touches a
-temp directory this module would otherwise have to clean up. Confirmed empirically (not
-merely assumed) that a `MemoryFile`-opened VRT reads identically, band for band and window
-for window including per-band NoData, to opening the same sources directly.
+**One read per file.** This scan used to assemble a per-request VRT over the `(path,
+band)` sources and read through it, which kept N files' windows in step for free. It also
+made every read band by band: the COGs this scans are PIXEL-interleaved
+(`cpra.mp.data.raster`'s `compact_cog`), so each band read decompressed every block's bands
+into GDAL's block cache, once per band wanted. A single multi-band read of a file decodes
+each block once, straight into the output, across `GDAL_NUM_THREADS`. Measured over the
+full 16640x5824 `morph_pixel_v002` extent at prod's settings: two bands of one file 7.7 s /
+811 MiB peak through the VRT against 2.0 s / 486 MiB direct; one band from each of two
+files 11.0 s against 6.8 s; 25 bands across two files 15.3 s against 10.2 s. A lone band,
+and all of one file's bands, read about the same either way. Decimated tile reads gain
+little, because GDAL already serves them off overviews, and they come back pixel-identical
+to the VRT's read (checked across tile-sized, unaligned and full-extent windows at
+decimations 1 to 16; `tests/api/test_raster_scan.py` keeps a VRT read as its reference).
+The VRT's metadata open went with it: opening the files directly is 3-4x cheaper.
+
+Reading every file through one window and one `out_shape` requires every source to share
+one grid -- size, transform and CRS. The VRT assumed that silently (it placed each source at
+the full extent); `_require_same_grid` checks it against the first file.
 
 **A crosswalk is read as a band but is NOT a band column.** A raster-to-vector crosswalk is
 co-registered with the raster grid, so reading it is an ordinary windowed read with no
-resampling and it can ride along as one more band of the same VRT -- that is a fact about
-the READ, and this module uses it. What comes back is a different matter: a crosswalk holds
+resampling and it can ride along as one more source of the same scan -- that is a fact
+about the READ, and this module uses it. What comes back is a different matter: a crosswalk holds
 the ID of the vector cell containing each pixel, which is not a measurement, and a band-wide
 frame's non-band columns are exactly the place for it (`execution/frame.py`'s
 `validate_extra_columns` exists for these, and every band-wide lowering names what to carry
@@ -51,8 +57,7 @@ NoData at all, the same convention the old per-file scan used.
 **Batching.** Reads are chunked through `io/raster_io.py`'s `batched_windows`/
 `raster_blocks_per_batch`, a block-row-chunked budget, so a request over a large raster
 does not pull the whole window into memory as one array. Each
-batch reopens the VRT from its own in-memory bytes rather than holding a dataset handle
-open across a `yield`: Polars' streaming engine may resume this generator's `source`
+batch reopens its files rather than holding a dataset handle open across a `yield`: Polars' streaming engine may resume this generator's `source`
 callback from a different thread than the one that entered it, and both `rio.Env` and
 rasterio dataset handles are thread-local, so nothing opened before a `yield` may be
 assumed valid after it.
@@ -97,8 +102,8 @@ from collections.abc import Sequence
 
 import numpy as np
 import polars as pl
+import rasterio
 from polars.io.plugins import register_io_source
-from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.windows import Window
 from rasterio.windows import transform as window_transform
@@ -106,7 +111,6 @@ from rasterio.windows import transform as window_transform
 from cpra.mp.data.analysis.io.raster_io import batched_windows, raster_blocks_per_batch, raster_gdal_env
 from cpra.mp.data.analysis.io.window import ReadWindow
 from cpra.mp.data.analysis.request.pipeline import BAND_NAME_RE, RESERVED_BAND_INDEX_COLUMN
-from cpra.mp.data.raster import vrt
 
 __all__ = ["scan_raster"]
 
@@ -148,6 +152,23 @@ def _validate_crosswalk_names(names: list[str]) -> None:
         seen.add(name)
 
 
+def _require_same_grid(src, ref) -> None:
+    """Reject a source file that is not on `ref`'s grid.
+
+    Every read in a scan uses one window and one `out_shape` across all files, so a file
+    with a different size, transform or CRS would come back as pixels from different ground
+    under the same row, with nothing in the frame's shape to show it. Exact comparison:
+    a grid's data files and its crosswalks are all written from the same grid definition,
+    so they agree bit for bit.
+    """
+    if (src.width, src.height) != (ref.width, ref.height) or src.transform != ref.transform or src.crs != ref.crs:
+        raise ValueError(
+            f"scan_raster: {src.name} is not on the same grid as {ref.name} -- every source "
+            f"must share one size, transform and CRS ({src.width}x{src.height} {src.transform!r} "
+            f"{src.crs} against {ref.width}x{ref.height} {ref.transform!r} {ref.crs})"
+        )
+
+
 def scan_raster(
     metadata_df: pl.DataFrame,
     *,
@@ -156,7 +177,7 @@ def scan_raster(
     decimation: tuple[int, int] = (1, 1),
     mask_nodata: bool = True,
 ) -> tuple[pl.LazyFrame, pl.DataFrame, ReadWindow]:
-    """Open `metadata_df`'s bands as a band-wide triple, via a per-request VRT.
+    """Open `metadata_df`'s bands as a band-wide triple, reading each file directly.
 
     `metadata_df` must carry `path` and `band` columns -- exactly what
     `io/catalog.py::resolve_raster_bands` returns -- and at least one row: a
@@ -169,14 +190,14 @@ def scan_raster(
     `metadata_df` therefore raises `ValueError` rather than guessing at a window.
 
     Band order is `metadata_df`'s own row order, exactly -- row *i* becomes source *i* of
-    the VRT, becomes column `b<i>` (see `execution/frame.py`'s band-naming invariant). This
+    the scan, becomes column `b<i>` (see `execution/frame.py`'s band-naming invariant). This
     module computes `b<i>` names itself rather than importing `band_column_names` (see
     module docstring); the two must never diverge, since the whole contract rests on both
     halves of the walk agreeing on the same convention.
 
     `crosswalks` is a sequence of `(name, path)` pairs, each a crosswalk raster
     co-registered with the rasters `metadata_df` describes (same grid, so it shares their
-    window and needs no resampling). Each is appended to the VRT AFTER every data band --
+    window and needs no resampling). Each is appended to the sources AFTER every data band --
     so band positions, and therefore the `b<i>` names, are unaffected by how many
     crosswalks ride along -- and its pixel values come back in a column called `name`
     rather than `b<something>`. `metadata_df` is returned unchanged: a crosswalk is not a
@@ -229,7 +250,7 @@ def scan_raster(
     crosswalk_names = [str(name) for name, _ in crosswalks]
     _validate_crosswalk_names(crosswalk_names)
 
-    band_sources = list(zip(metadata_df["path"].to_list(), metadata_df["band"].to_list()))
+    band_sources = [(str(path), int(band)) for path, band in zip(metadata_df["path"], metadata_df["band"])]
     band_names = [f"b{i}" for i in range(len(band_sources))]
     # A crosswalk raster is single-band by construction, so band 1. Appended after every
     # data band so that adding one never shifts a `b<i>` name.
@@ -238,25 +259,27 @@ def scan_raster(
     # Data bands honor the flag; crosswalk columns never do -- the two-tier rule.
     mask_this_band = [mask_nodata] * len(band_sources) + [True] * len(crosswalk_names)
 
-    vrt_bytes = vrt(sources).encode("utf-8")
-
-    # Eager, metadata-only open: a VRT's own bytes carry no pixel data, so this costs one
-    # XML parse and one open-per-underlying-file (already paid for by `vrt()` itself just
-    # above), not a read. Everything this function returns immediately (the `ReadWindow`,
-    # the per-band schema) comes from this single open; every batch below reopens fresh
-    # from `vrt_bytes` rather than reusing this handle across a `yield` (see module
-    # docstring).
-    with raster_gdal_env(), MemoryFile(vrt_bytes, ext=".vrt") as memfile, memfile.open() as ref:
-        if ref.count != len(sources):
-            raise ValueError(
-                f"scan_raster: VRT assembled {ref.count} bands from {len(sources)} sources "
-                "-- a source path/band must have resolved to more or fewer bands than "
-                "expected"
-            )
+    # Eager, metadata-only opens, one per distinct file (in first-appearance order), not a
+    # read. Everything this function returns immediately (the `ReadWindow`, the per-band
+    # schema) comes from here; the batches below reopen each file fresh rather than
+    # holding a handle across a `yield` (see module docstring). The first file is the
+    # reference: its grid is the scan's, and every other file must match it.
+    paths = list(dict.fromkeys(path for path, _band in sources))
+    with raster_gdal_env(), rasterio.open(paths[0]) as ref:
+        file_bands = {paths[0]: (ref.count, ref.dtypes, ref.nodatavals)}
+        for path in paths[1:]:
+            with rasterio.open(path) as src:
+                _require_same_grid(src, ref)
+                file_bands[path] = (src.count, src.dtypes, src.nodatavals)
+        dtypes, nodatavals = [], []
+        for path, band in sources:
+            count, file_dtypes, file_nodatavals = file_bands[path]
+            if not 1 <= band <= count:
+                raise ValueError(f"scan_raster: {path} has {count} band(s), so it has no band {band}")
+            dtypes.append(file_dtypes[band - 1])
+            nodatavals.append(file_nodatavals[band - 1])
         raster_transform = ref.transform
         raster_crs = ref.crs
-        dtypes = ref.dtypes
-        nodatavals = ref.nodatavals
         read_window = window if window is not None else Window(0, 0, ref.width, ref.height)
         if window is not None:
             window_list = [window]
@@ -299,19 +322,16 @@ def scan_raster(
 
     schema = pl.Schema({name: NUMPY_TO_POLARS[dt] for name, dt in zip(column_names, dtypes)})
 
-    # Bands grouped by dtype, each group read in one `rasterio` call. A multi-band
-    # `.read()` returns ONE array, so every band it reads at once must share a dtype;
-    # asking for all of them together raises `ValueError: more than one 'dtype' found` the
-    # moment they do not. Bands of one VRT routinely do not: a crosswalk's dtype is chosen
-    # by zone-id range alone, and two variables scanned together are two different
-    # measurements with two different storage types. Grouping (rather than reading every
-    # band separately) keeps the call count at one per distinct dtype -- usually one, at
-    # worst a handful -- and keeps each band's own dtype exactly as `schema` above
-    # declares it, which a single read with a forced common `out_dtype` would not.
-    dtype_groups: dict[str, list[int]] = {}
-    for position, dt in enumerate(dtypes):
-        dtype_groups.setdefault(str(dt), []).append(position)
-    read_groups = [([position + 1 for position in positions], positions) for positions in dtype_groups.values()]
+    # One `rasterio` call per distinct file per batch, asking for every band this request
+    # wants from it at once -- see the module docstring's "One read per file". Files are in
+    # first-appearance order and each keeps the output positions its bands fill, so `b<i>`
+    # order is unaffected. A GeoTIFF's bands all share one dtype, so a per-file read never
+    # has to reconcile two.
+    file_reads: dict[str, tuple[list[int], list[int]]] = {}
+    for position, (path, band) in enumerate(sources):
+        indexes, positions = file_reads.setdefault(path, ([], []))
+        indexes.append(band)
+        positions.append(position)
 
     def source(with_columns, predicate, n_rows, batch_size):
         # Every one of the four arguments MUST be honored here. An IO plugin does not
@@ -323,8 +343,7 @@ def scan_raster(
         # and a `.select("b1")` returned `b0` alongside it.
         #
         # Honoring them here is not a read-side optimization -- the pixels are read either
-        # way, since a projection arrives as column names and this scan's columns are bands
-        # of one already-assembled VRT. It is what makes the scan CORRECT. `n_rows` is the
+        # way, since a projection arrives as column names after every band has been read. It is what makes the scan CORRECT. `n_rows` is the
         # one that does cut the read short, and it is applied last, after the predicate,
         # because it means "the first n rows of what this source produces".
         remaining = n_rows
@@ -333,16 +352,18 @@ def scan_raster(
                 break
 
             # Nothing GDAL-related crosses the `yield` below -- see module docstring.
-            with raster_gdal_env(), MemoryFile(vrt_bytes, ext=".vrt") as memfile, memfile.open() as src:
-                by_position = {}
-                for indexes, positions in read_groups:
-                    # `out_shape` is a 2-tuple even for a multi-band read: rasterio
-                    # broadcasts it across `indexes` and returns `(len(indexes), *out_shape)`.
-                    # `None` (the undecimated case) reads the window at full resolution.
-                    group_data = src.read(indexes=indexes, window=batch_window, out_shape=out_shape)
+            by_position = {}
+            with raster_gdal_env():
+                for path, (indexes, positions) in file_reads.items():
+                    with rasterio.open(path) as src:
+                        # `out_shape` is a 2-tuple even for a multi-band read: rasterio
+                        # broadcasts it across `indexes` and returns
+                        # `(len(indexes), *out_shape)`. `None` (the undecimated case) reads
+                        # the window at full resolution.
+                        file_data = src.read(indexes=indexes, window=batch_window, out_shape=out_shape)
                     for i, position in enumerate(positions):
-                        by_position[position] = group_data[i].ravel()
-                    del group_data
+                        by_position[position] = file_data[i].ravel()
+                    del file_data
 
             cols = {name: by_position[i] for i, name in enumerate(column_names)}
             df = pl.DataFrame(cols, schema=schema)

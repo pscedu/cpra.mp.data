@@ -9,7 +9,7 @@ being applied only after the whole frame comes back.
 Parquet-scan pushdown, safe wherever it applies because it only ever changes WHEN a row or
 column disappears, never WHETHER the final answer contains it. A raster (band-wide) input
 is read through `io.raster.scan_raster`, where the position of a "column" is a band -- a
-band a pipeline never actually reads is a file that VRT construction never has to touch at
+band a pipeline never actually reads is a file the scan never has to open at
 all, which is why band selection (not a per-pixel row filter) is that shape's pushdown
 target; see the module-level note below on why a row predicate does NOT get the same
 treatment there.
@@ -88,7 +88,7 @@ declared on it, and which of each contributing ORIGIN's dimension columns it sti
   joined frame even names is an operand's renamed value column (`join_long`'s doing), not
   a source column, and a spatial one addresses a grid neither operand's read is indexed by
   on its own. A band-wide `join` gets one piece of special handling: since
-  `execution.band_ops.join_band_wide` reads both operands through one shared VRT (see that
+  `execution.band_ops.join_band_wide` reads both operands through one shared scan (see that
   module), the operands' resolved band metadata still needs to be sized as a UNION for the
   `ANALYSIS_BAND_CEILING` check below.
 
@@ -279,9 +279,9 @@ survived pushdown, then checked against `cpra.mp.data.config.ANALYSIS_BAND_CEILI
 (`BandLimitError` if it's exceeded) -- except an origin feeding a recorded band-wide join,
 which is exempted from its own check and instead checked as part of that join's operand
 UNION (`ExecutionPlan.band_wide_join_scans`), matching how `execution.band_ops.
-join_band_wide` actually reads both operands through one shared VRT. An origin
+join_band_wide` actually reads both operands through one shared scan. An origin
 `execution.point_sample.point_sample_reads` hands to the point reader is exempt outright,
-with no limit of its own: the ceiling bounds a VRT, and that reader builds none -- it reads
+with no limit of its own: the ceiling bounds a band-wide scan, and that reader runs none -- it reads
 one pixel per band straight from the files, so a 2,444-band species-by-year sample of one
 cell is cheap. The exemption needs the finished plan (see that function), so this one check
 runs last, after the `ExecutionPlan` is built. A dimension predicate
@@ -327,7 +327,7 @@ them.
 
 There is one loose end there, recorded because it is easy to trip over from either side:
 `io.raster.scan_raster` raises `ValueError` on zero-band metadata, since it derives the
-read's window from the VRT it opens and a zero-band read opens nothing. That is a property
+read's window from the first file it opens and a zero-band read opens nothing. That is a property
 of where `scan_raster` happens to get its window, NOT a real obstacle -- a full-extent,
 undecimated window is fully determined by the raster grid itself, which already carries
 `bounds`, `height`, `width` and `crs` (`cpra.mp.data.grids.RasterGrid`); the transform

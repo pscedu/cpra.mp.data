@@ -1,5 +1,5 @@
-"""Tests for `cpra.mp.data.analysis.io.raster.scan_raster` -- the VRT-based raster scan the
-execution layer opens a band-wide dataset through -- and
+"""Tests for `cpra.mp.data.analysis.io.raster.scan_raster` -- the raster scan the execution
+layer opens a band-wide dataset through -- and
 `cpra.mp.data.analysis.io.catalog.resolve_raster_bands`, the one query that resolves a
 raster `InputSelection` into the ordered band list a scan needs.
 
@@ -44,8 +44,8 @@ from cpra.mp.data.analysis.request.pipeline import InputSelection, parse_pipelin
 from tests.factories import RASTER_KWARGS, raster_array, write_raster_dataset
 
 # Arbitrary but fixed georeferencing -- every synthetic fixture below shares it, since a
-# VRT assembled from sources of differing size/origin is not a shape these tests need to
-# characterize (a real crosswalk/data pair is always co-registered -- see `io/raster.py`'s
+# scan over sources of differing size/origin is rejected outright (`TestSourcesMustBeReadable`),
+# not a shape the other tests need to characterize (a real crosswalk/data pair is always co-registered -- see `io/raster.py`'s
 # module docstring).
 _TRANSFORM = from_origin(0, 10, 1, 1)
 _CRS = "EPSG:4326"
@@ -115,7 +115,7 @@ class TestBandOrderMatchesMetadataRowOrder:
 
 
 class TestCrosswalkIsANonBandColumn:
-    """A crosswalk rides along in the same VRT read, but comes back as a NAMED non-band
+    """A crosswalk rides along in the same scan, but comes back as a NAMED non-band
     column, not as `b<n>` -- see `io/raster.py`'s module docstring. The distinction is not
     cosmetic: `band_column_names(metadata_df)` is what every band-wide lowering reduces
     across, so a crosswalk counted as a band would get folded into the statistic.
@@ -391,6 +391,97 @@ class TestMultibandCogSharedByTwoMetadataRows:
         assert out["b1"].unique().to_list() == [100]
 
 
+class TestFileByFileReadMatchesVrt:
+    """`scan_raster` reads each file directly, one multi-band read per file, where it used
+    to read through a per-request VRT (see the module docstring's "One read per file"). A
+    VRT read of the same sources stays the reference, and the two must agree pixel for
+    pixel. These sources interleave two multi-band files,
+    repeat a band, mix dtypes and carry NoData plus a crosswalk, and the files are tiled
+    PIXEL-interleaved COG-likes with NEAREST overviews like the real ones, so a batched
+    full read and a decimated read both have something to get wrong.
+    """
+
+    _SIZE = (256, 384)  # rows, cols: 2 x 3 blocks of 128
+
+    def _write(self, path, data, nodata):
+        count, height, width = data.shape
+        profile = {
+            "driver": "GTiff",
+            "dtype": data.dtype.name,
+            "count": count,
+            "height": height,
+            "width": width,
+            "crs": _CRS,
+            "transform": _TRANSFORM,
+            "tiled": True,
+            "blockxsize": 128,
+            "blockysize": 128,
+            "interleave": "pixel",
+            "compress": "zstd",
+            "nodata": nodata,
+        }
+        with rio.open(path, "w", **profile) as dst:
+            dst.write(data)
+            dst.build_overviews([2, 4], rio.enums.Resampling.nearest)
+        return path
+
+    def _sources(self, tmp_path):
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 50, size=(4, *self._SIZE)).astype("int32")
+        a[:, :5, :7] = -9999
+        b = rng.random(size=(3, *self._SIZE)).astype("float32")
+        path_a = self._write(tmp_path / "a.tif", a, -9999)
+        path_b = self._write(tmp_path / "b.tif", b, -9999)
+        zones = np.repeat(np.arange(1, 5, dtype="int32"), 96)[None, None, :].repeat(256, axis=1)
+        crosswalk = self._write(tmp_path / "xwalk.tif", zones, 0)
+        rows = [(path_a, 3), (path_b, 2), (path_a, 1), (path_a, 3), (path_b, 1)]
+        return rows, crosswalk
+
+    def _vrt_read(self, rows, crosswalk, window, out_shape=None):
+        from rasterio.io import MemoryFile
+
+        from cpra.mp.data.raster import vrt
+
+        sources = [(str(p), b) for p, b in rows] + [(str(crosswalk), 1)]
+        columns = {}
+        with MemoryFile(vrt(sources).encode(), ext=".vrt") as memfile, memfile.open() as src:
+            for i in range(src.count):
+                data = src.read(i + 1, window=window, out_shape=out_shape).ravel()
+                nodata = src.nodatavals[i]
+                columns["zone" if i == len(rows) else f"b{i}"] = [None if v == nodata else v for v in data.tolist()]
+        return columns
+
+    def test_batched_full_read_matches_the_vrt(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 2)
+        rows, crosswalk = self._sources(tmp_path)
+
+        lf, _, read_window = scan_raster(_metadata(rows), crosswalks=[("zone", crosswalk)])
+        out = lf.collect()
+
+        assert len(read_window.batch_layout) == 4  # 2 block rows x (2 blocks + 1 block)
+        # Rows come back batch by batch, so compare against the VRT batch by batch too.
+        expected = {name: [] for name in out.columns}
+        for col_off, row_off, width, height in read_window.batch_layout:
+            batch = self._vrt_read(rows, crosswalk, Window(col_off, row_off, width, height))
+            for name, values in batch.items():
+                expected[name].extend(values)
+        assert out.to_dict(as_series=False) == expected
+
+    @pytest.mark.parametrize("decimation", [(1, 1), (2, 2), (3, 3), (4, 4), (2, 5)])
+    def test_windowed_read_matches_the_vrt(self, tmp_path, decimation):
+        rows, crosswalk = self._sources(tmp_path)
+        window = Window(col_off=3, row_off=2, width=371, height=250)
+        out_shape = (250 // decimation[0], 371 // decimation[1])
+
+        lf, _, read_window = scan_raster(
+            _metadata(rows), crosswalks=[("zone", crosswalk)], window=window, decimation=decimation
+        )
+
+        assert read_window.read_shape == out_shape
+        expected = self._vrt_read(rows, crosswalk, window, None if decimation == (1, 1) else out_shape)
+        assert lf.collect().to_dict(as_series=False) == expected
+
+
 class TestZeroBandMetadataRaises:
     def test_raises_value_error(self):
         empty = pl.DataFrame({"path": [], "band": []}, schema={"path": pl.String, "band": pl.Int64})
@@ -405,27 +496,29 @@ class TestMissingRequiredColumnsRaises:
             scan_raster(malformed)
 
 
-class TestVrtBandCountMismatchRaises:
-    """Defensive guard against a `vrt()` that resolved a different number of bands than
-    `metadata_df` named -- not reachable through the real `vrt()` (it always emits
-    exactly one output band per source), so exercised here via a routing-knob monkeypatch
-    on `io/raster.py`'s own `vrt` name, mirroring `test_project.py`'s
-    `TestDirectPathMatchesFoldedPath` precedent for pinning an otherwise-unreachable
-    defensive branch.
-    """
+class TestSourcesMustBeReadable:
+    """Every source is read through one window and one `out_shape`, so the scan checks up
+    front what that requires: each named band exists, and every file is on one grid."""
 
-    def test_mismatched_band_count_raises(self, tmp_path, monkeypatch):
-        from cpra.mp.data.analysis.io import raster as raster_module
+    def test_band_past_the_files_count_raises(self, tmp_path):
+        path = _write_tif(tmp_path / "multi.tif", np.zeros((2, 2, 2), dtype="int32"))
+        with pytest.raises(ValueError, match=r"has 2 band\(s\), so it has no band 3"):
+            scan_raster(_metadata([(path, 1), (path, 3)]))
 
-        path_a = _write_tif(tmp_path / "a.tif", np.full((2, 2), 1, dtype="int32"))
-        path_b = _write_tif(tmp_path / "b.tif", np.full((2, 2), 2, dtype="int32"))
-        real_vrt = raster_module.vrt
-        # Silently drops the second source's band, so the assembled VRT has one band
-        # while metadata_df still names two.
-        monkeypatch.setattr(raster_module, "vrt", lambda sources: real_vrt(sources[:1]))
-
-        with pytest.raises(ValueError, match="VRT assembled"):
+    def test_file_on_another_grid_raises(self, tmp_path):
+        path_a = _write_tif(tmp_path / "a.tif", np.zeros((2, 2), dtype="int32"))
+        path_b = _write_tif(tmp_path / "b.tif", np.zeros((2, 3), dtype="int32"))
+        with pytest.raises(ValueError, match="not on the same grid"):
             scan_raster(_metadata([(path_a, 1), (path_b, 1)]))
+
+    def test_crosswalk_on_another_grid_raises(self, tmp_path):
+        data_path = _write_tif(tmp_path / "data.tif", np.zeros((2, 2), dtype="int32"))
+        crosswalk_path = tmp_path / "xwalk.tif"
+        profile = {"driver": "GTiff", "dtype": "int32", "count": 1, "height": 2, "width": 2, "crs": _CRS}
+        with rio.open(crosswalk_path, "w", transform=from_origin(5, 10, 1, 1), **profile) as dst:
+            dst.write(np.ones((1, 2, 2), dtype="int32"))
+        with pytest.raises(ValueError, match="not on the same grid"):
+            scan_raster(_metadata([(data_path, 1)]), crosswalks=[("zone", crosswalk_path)])
 
 
 class TestNRowsTruncation:
@@ -489,7 +582,7 @@ class TestTripleConformsToBandWideInvariants:
         _, _, window_1 = scan_raster(metadata_df)
         _, _, window_2 = scan_raster(metadata_df)
 
-        # A fresh VRT is built per call (no caching) -- this checks that doing so twice
+        # The files are reopened per call (no caching) -- this checks that doing so twice
         # over the identical input still produces the identical window, the property
         # `assert_window_unchanged` exists to check on a real lowering's input/output.
         assert_window_unchanged(window_1, window_2)
@@ -709,10 +802,10 @@ class TestBatchedReadMatchesUnbatched:
 
 class TestBandsOfDifferingDtype:
     """A `rasterio` read of several bands at once returns ONE array, so every band it reads
-    in that call must share a dtype. The bands of one VRT routinely do not: a crosswalk's
+    in that call must share a dtype. The sources of one scan routinely do not: a crosswalk's
     dtype follows its zone-id range alone, and two variables read together are two
-    different measurements stored two different ways. `scan_raster` groups its bands by
-    dtype and reads one group per call; asking for all of them at once raises
+    different measurements stored two different ways. `scan_raster` reads one file per
+    call, and a file has one dtype; asking for all of them at once raises
     `ValueError: more than one 'dtype' found`.
     """
 

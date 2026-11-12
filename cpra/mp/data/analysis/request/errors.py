@@ -67,7 +67,7 @@ class BandLimitError(RequestError):
     far as the declared pipeline lets it -- raised by `execution.plan.compile_plan`. For
     a single raster input this is its own resolved (and possibly dimension-filter-
     narrowed) band count; for a band-wide `join`, both operands are read through one
-    shared VRT, so this is raised against the UNION of the operands' band counts instead
+    shared scan, so this is raised against the UNION of the operands' band counts instead
     of either one alone (see `ANALYSIS_BAND_CEILING`'s own comment in `config.py`). Always
     decidable from the catalog's band listing alone -- no pixel is read to raise this.
     """

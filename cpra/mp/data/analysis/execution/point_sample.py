@@ -6,8 +6,8 @@ absolute `grid_cell` ids -- plus the two `where` readers that decision shares wi
 
 Its own module because two others need the one answer: `execution.execute` picks the reader
 from it, and `execution.plan.compile_plan` exempts exactly the origins it names from
-`ANALYSIS_BAND_CEILING`. That ceiling bounds the VRT a band-wide read builds; the point
-reader builds none (it opens each file once and reads one pixel per band), so an origin it
+`ANALYSIS_BAND_CEILING`. That ceiling bounds a band-wide read, which decodes every band across its
+whole window; the point reader reads one pixel per band (opening each file once), so an origin it
 takes is not what the ceiling guards against -- but an origin it REJECTS falls back to a
 band-wide read and is. The exemption is therefore only as correct as its agreement with the
 reader choice, and sharing the function is what makes the two impossible to diverge. It

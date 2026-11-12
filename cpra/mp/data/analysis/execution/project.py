@@ -157,8 +157,8 @@ input is already a long vector frame (`frames[op.input]`, exactly like the vecto
 direction's own input) -- there is no raster to scan for actual data, only the crosswalk,
 which is why `ReadWindow.source` on this direction's output names the crosswalk file
 itself rather than a data raster (see `scan_raster`'s own module docstring: a co-registered
-crosswalk is an ordinary band of a VRT from the read's point of view, and here it is the
-VRT's only band). Distinct combinations of the input's own dimension columns (excluding
+crosswalk is an ordinary source of the scan from the read's point of view, and here it is
+the scan's only source). Distinct combinations of the input's own dimension columns (excluding
 `grid_cell`/`value`, and `request.pipeline.DATASET_SELECTION_COLUMNS` -- `variable`,
 `time_unit`, `grid` -- the same three `execution.long_ops.join_long` already excludes
 before computing a join's key columns, since they name WHICH DATASET a row came from, not
@@ -707,7 +707,7 @@ def project_vector_to_raster(
     masking (honored by default, `mask_nodata=True`) already nulls it out correctly
     because the crosswalk GeoTIFF's own GDAL profile declares its nodata sentinel
     formally. Either way the returned `ReadWindow.source` names whatever the read actually
-    opened -- the crosswalk alone for the standalone case, the join group's combined VRT
+    opened -- the crosswalk alone for the standalone case, the join group's combined scan
     sources for the shared one. `assert_same_pixel_grid` deliberately excludes `source`
     from its comparison, which is what lets the shared case pass it.
 
