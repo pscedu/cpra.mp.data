@@ -42,7 +42,7 @@ from cpra.mp.data.api.pipeline import (
 )
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.ogc_provider import strip_ogc_params
+from cpra.mp.data.api.ogc_provider import STORAGE_CRS_URI, strip_ogc_params
 from cpra.mp.data.api.qlr import build_qlr, export_legend, items_url, layer_label
 from cpra.mp.data.api.unified import decode_request
 from cpra.mp.data.api.utils import (
@@ -97,6 +97,17 @@ app.add_middleware(
 
 from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
 from pygeoapi.flask_app import APP as pygeoapi_app  # noqa: E402
+
+
+
+@pygeoapi_app.after_request
+def _declare_native_crs(response):
+    """pygeoapi labels a response with CRS84 when the request names no CRS. The provider
+    always returns the native CRS, so the header is corrected to say so."""
+    if response.status_code == 200 and "Content-Crs" in response.headers:
+        response.headers["Content-Crs"] = f"<{STORAGE_CRS_URI}>"
+    return response
+
 
 app.mount("/v1/ogc", WSGIMiddleware(pygeoapi_app))
 

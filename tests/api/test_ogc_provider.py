@@ -62,14 +62,32 @@ class TestItems:
         assert {f["id"]: f["properties"]["value"] for f in found} == {1: 1.0, 2: 2.0, 3: 3.0}
         assert all(f["properties"]["id"] == f["id"] for f in found)
 
-    def test_geometry_is_reprojected_to_longitude_latitude(self, salinity):
-        found = {f["id"]: f for f in features(salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}"))}
-        geometry = found[1]["geometry"]
-        assert geometry["type"] == "Polygon"
-        ring = geometry["coordinates"][0]
-        corners = {tuple(round(c, 6) for c in lng_lat(x, y)) for x, y in CELLS[1].exterior.coords}
-        assert {tuple(round(c, 6) for c in point) for point in ring} == corners
-        assert all(-95 < lng < -88 and 28 < lat < 31 for lng, lat in ring)
+    def test_geometry_stays_in_the_native_crs_and_is_declared(self, salinity):
+        native = "http://www.opengis.net/def/crs/EPSG/0/26915"
+        body = salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}").json()
+        ring = {f["id"]: f for f in body["features"]}[1]["geometry"]["coordinates"][0]
+        assert {tuple(p) for p in ring} == {tuple(c) for c in CELLS[1].exterior.coords}
+        assert body["crs"]["properties"]["name"] == native
+
+    def test_content_crs_header_says_native_without_a_crs_param(self, salinity):
+        response = salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}")
+        assert response.headers["Content-Crs"] == "<http://www.opengis.net/def/crs/EPSG/0/26915>"
+
+    def test_native_crs_param_is_accepted(self, salinity):
+        native = "http://www.opengis.net/def/crs/EPSG/0/26915"
+        response = salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}&crs={native}")
+        assert response.status_code == 200
+        assert response.headers["Content-Crs"] == f"<{native}>"
+
+    @pytest.mark.parametrize("crs", [
+        "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        "http://www.opengis.net/def/crs/EPSG/0/4326",
+        "nonsense",
+    ])
+    def test_any_other_crs_is_a_400(self, salinity, crs):
+        response = salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}&crs={crs}")
+        assert response.status_code == 400
+        assert "26915" in response.text or "not supported" in response.text
 
     def test_the_selection_decides_which_values_come_back(self, salinity):
         found = features(salinity.get(f"{ITEMS}?f=json&{SALINITY}&calendar_day=2030-01-02"))

@@ -26,7 +26,11 @@ _UPPER_LIMIT = 1e9
 # What one items request asks for. A QGIS GeoJSON source has no paging, so this has to
 # cover the largest vector grid in one response; `ogc_config.yaml`'s `max_items` must be at
 # least this (tests/api/test_qlr.py checks).
-ITEMS_LIMIT = 100000
+ITEMS_LIMIT = 150000
+
+# The grids' native CRS; items are requested in it so the layer is not reprojected. Must
+# match `ogc_config.yaml`'s `storage_crs`.
+STORAGE_CRS_URI = "http://www.opengis.net/def/crs/EPSG/0/26915"
 
 OUTLINE_COLOR = "35,35,35,255"
 COLLECTION = "master_plan_data"
@@ -40,7 +44,7 @@ def items_url(items):
     host that serves it.
     """
     base = os.environ["PYGEOAPI_SERVER_URL"].rstrip("/")
-    query = urlencode([("f", "json"), ("limit", ITEMS_LIMIT), *items])
+    query = urlencode([("f", "json"), ("limit", ITEMS_LIMIT), ("crs", STORAGE_CRS_URI), *items])
     return f"{base}/collections/{COLLECTION}/items?{query}"
 
 
@@ -190,7 +194,7 @@ def build_qlr(layer_name, source_url, legend=None):
       <layername>{escape(layer_name)}</layername>
       <srs>
         <spatialrefsys nativeFormat="Wkt">
-          <authid>EPSG:4326</authid>
+          <authid>EPSG:26915</authid>
         </spatialrefsys>
       </srs>
       <provider encoding="UTF-8">ogr</provider>

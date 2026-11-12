@@ -4,7 +4,6 @@ from pygeoapi.provider.base import (
     ProviderInvalidQueryError,
     ProviderItemNotFoundError,
 )
-from pyproj import Transformer
 from shapely.geometry import mapping
 
 from cpra.mp.data.analysis.execution.execute import execute
@@ -22,6 +21,10 @@ _OGC_PARAMS = {
     "filter-crs", "q",
 }
 
+
+# The FlatGeoBuf grids are stored, and always served, in this CRS; `ogc_config.yaml`'s
+# `storage_crs` must match.
+STORAGE_CRS_URI = "http://www.opengis.net/def/crs/EPSG/0/26915"
 
 EXPORT_HINT = (
     "This collection serves one view of the data at a time, so each request must carry "
@@ -61,7 +64,8 @@ class MasterPlanDataProvider(BaseProvider):
     def query(self, offset=0, limit=10, resulttype="results", bbox=[], skip_geometry=False,
               **kwargs):
         path, values = self._prepare()
-        storage_bbox = _to_storage_bbox(bbox, path)
+        # pygeoapi has already moved the bbox into the collection's storage CRS.
+        storage_bbox = tuple(bbox[:4]) if bbox else None
         matched = _count(path, storage_bbox)
 
         if resulttype == "hits":
@@ -77,6 +81,8 @@ class MasterPlanDataProvider(BaseProvider):
         return {
             "type": "FeatureCollection",
             "numberMatched": matched,
+            # GeoJSON assumes CRS84 unless told otherwise; OGR and QGIS read this member.
+            "crs": {"type": "name", "properties": {"name": STORAGE_CRS_URI}},
             "features": _to_features(gdf, values, skip_geometry),
         }
 
@@ -98,6 +104,12 @@ class MasterPlanDataProvider(BaseProvider):
         """
         from flask import request
 
+        crs = request.args.get("crs")
+        if crs is not None and crs != STORAGE_CRS_URI:
+            raise _invalid(
+                f"CRS {crs!r} is not supported. This collection is only served in "
+                f"{STORAGE_CRS_URI}."
+            )
         items = data_request_items(request.args)
         if not items:
             raise _invalid(EXPORT_HINT)
@@ -123,16 +135,6 @@ class MasterPlanDataProvider(BaseProvider):
         return str(config.GRIDS_PATH / f"{grid}.fgb"), values
 
 
-def _to_storage_bbox(bbox, path):
-    """Transform a CRS84 bbox from the request into the FlatGeoBuf's CRS."""
-    if not bbox:
-        return None
-    storage_crs = pyogrio.read_info(path)["crs"]
-    return Transformer.from_crs("OGC:CRS84", storage_crs, always_xy=True).transform_bounds(
-        *bbox[:4]
-    )
-
-
 def _count(path, storage_bbox):
     if storage_bbox is None:
         return pyogrio.read_info(path)["features"]
@@ -142,10 +144,8 @@ def _count(path, storage_bbox):
 
 
 def _to_features(gdf, values, skip_geometry):
-    """Convert a GeoDataFrame in the storage CRS to GeoJSON features in CRS84 carrying
-    each cell's `value`."""
-    if not skip_geometry:
-        gdf = gdf.to_crs("OGC:CRS84")
+    """Convert a GeoDataFrame to GeoJSON features carrying each cell's `value`. Geometry
+    stays in the storage CRS; pygeoapi's `crs_transform_spec` is deliberately ignored."""
     geometries = [None] * len(gdf) if skip_geometry else [mapping(g) for g in gdf.geometry]
     rows = gdf.drop(columns="geometry", errors="ignore").to_dict("records")
     return [

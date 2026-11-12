@@ -174,6 +174,7 @@ class TestItemsUrl:
         assert parse_qsl(parsed.query) == [
             ("f", "json"),
             ("limit", str(ITEMS_LIMIT)),
+            ("crs", "http://www.opengis.net/def/crs/EPSG/0/26915"),
             ("variable", "sal"),
             ("model_group_id", "500"),
         ]

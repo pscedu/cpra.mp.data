@@ -12,10 +12,12 @@ server:
     - en-US
   pretty_print: false
   limits:
-    default_items: 50
+    # Large pages: QGIS's OGC API Features provider pages with this by default, and 50
+    # makes a ~112k-cell grid load in thousands of requests.
+    default_items: 10000
     # A portal export link loads a whole grid in one request, so this must exceed the
-    # largest vector grid's feature count.
-    max_items: 100000
+    # largest vector grid's feature count (CLARA, ~112k cells).
+    max_items: 150000
     max_distance_x: 25
     max_distance_y: 25
     max_distance_units: m
@@ -86,3 +88,8 @@ resources:
         # Geometry is read from GRIDS_PATH/<grid>.fgb, chosen per request.
         data: grids
         id_field: id
+        # Served in the native NAD83 / UTM 15N, never reprojected: the provider ignores the
+        # `crs` parameter's transform. (pygeoapi always also lists CRS84 as supported.)
+        storage_crs: http://www.opengis.net/def/crs/EPSG/0/26915
+        crs:
+          - http://www.opengis.net/def/crs/EPSG/0/26915

@@ -113,13 +113,15 @@ or send one value per dimension.
 For a user who wants to add the data themselves, the same view is available as GeoJSON:
 
 ```
-https://<api-host>/v1/ogc/collections/master_plan_data/items?f=json&limit=100000&<data request>
+https://<api-host>/v1/ogc/collections/master_plan_data/items?f=json&limit=150000&<data request>
 ```
 
 In QGIS: *Layer ▸ Data Source Manager ▸ Vector*, *Source Type* **Protocol: HTTP(S), cloud,
 etc.**, paste the URL into *URI*. The layer arrives in one flat color; the user styles it by
 `value` themselves. `limit` must be at least as large as the grid's feature count, otherwise
-the layer is silently truncated (the default is 50), so always send `limit=100000`. Prefer
+the layer is silently truncated (the server default is 10,000), so always send `limit=150000`. Items
+always come in the grid's native EPSG:26915 (declared in the GeoJSON `crs` member), never
+reprojected. A `crs` parameter other than that EPSG:26915 URI is a `400`. Prefer
 the `.qlr` link in the portal.
 
 ## What is not supported
