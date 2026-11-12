@@ -212,7 +212,13 @@ from cpra.mp.data.analysis.execution.frame import (
     has_no_bands,
     released_band_metadata,
 )
-from cpra.mp.data.analysis.execution.plan import ExecutionPlan, ResolvedInput, ZoneCrosswalk, compile_plan
+from cpra.mp.data.analysis.execution.plan import (
+    ExecutionPlan,
+    ResolvedInput,
+    ZoneCrosswalk,
+    compile_plan,
+    windowed_read_blocker,
+)
 from cpra.mp.data.analysis.execution.point_sample import derive_point_sample_window, point_sample_reads
 from cpra.mp.data.analysis.io.crosswalk_read import resolve_raster_crosswalk_path
 from cpra.mp.data.analysis.io.geography import relabel_raster_grid_cell
@@ -1188,21 +1194,29 @@ def run_to_path(
     is never split or reinterpreted -- whichever caller built it already built it in the
     vocabulary the result's own shape needs.
 
+    A band-wide result is written a strip of rows at a time (`sink.write_raster_strips`)
+    whenever `plan.windowed_read_blocker` finds nothing about the plan that a narrower read
+    would change, which bounds the peak by the strip instead of by the whole result; any
+    other band-wide result is executed whole and written by `sink.write_raster`. Both
+    write the same file.
+
     `execution.sink` is imported inside the function body rather than at this module's top
-    level: `sink.py` imports `LoweringNotImplementedError` from here at ITS top level, so
+    level: `sink.py` imports `execute` from here at ITS top level (`write_raster_strips`), so
     importing it back at the top would close that into a cycle at import time.
     """
     from cpra.mp.data.analysis.execution import sink
 
     plan = compile_plan(pipeline, base_path=base_path)
-    result = execute(plan, base_path=base_path)
+    write_kwargs = dict(profile_options)
+    if dtype is not None:
+        write_kwargs["dtype"] = dtype
+    if nodata is not None:
+        write_kwargs["nodata"] = nodata
+    if windowed_read_blocker(plan) is None:
+        return sink.write_raster_strips(plan, out_path, base_path=base_path, **write_kwargs)
 
+    result = execute(plan, base_path=base_path)
     if isinstance(result, tuple):
-        write_kwargs = dict(profile_options)
-        if dtype is not None:
-            write_kwargs["dtype"] = dtype
-        if nodata is not None:
-            write_kwargs["nodata"] = nodata
         return sink.write_raster(result, out_path, **write_kwargs)
 
     if relabel is not None:

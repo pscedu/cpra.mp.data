@@ -799,6 +799,32 @@ class TestBatchedReadMatchesUnbatched:
         assert sum(width * height for _c, _r, width, height in window.batch_layout) == window.width * window.height
         assert len(covered) == window.width * window.height
 
+    def test_a_window_wider_than_one_batch_reads_the_full_reads_batches_clipped_to_it(self, base_path, monkeypatch):
+        """A download strip is a full-width window many batches big; read as one batch, its
+        buffer would be the strip times every input band. It instead reads the full read's
+        own batches, clipped to the window, and still yields the cells a direct read does.
+        """
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        metadata_df = self._distinct(base_path)
+        strip = Window(col_off=0, row_off=40, width=1052, height=300)
+
+        lf, _, window = scan_raster(metadata_df, window=strip)
+
+        assert window.batch_layout == ((0, 40, 512, 300), (512, 40, 512, 300), (1024, 40, 28, 300))
+        cells = row_major_grid_cell(lf, window).collect().sort("grid_cell")
+        with rio.open(metadata_df["path"][0]) as src:
+            expected = src.read(int(metadata_df["band"][0]), window=strip)
+        assert cells["b0"].to_numpy().reshape(300, 1052).tolist() == expected.tolist()
+
+    def test_a_window_within_one_batch_is_still_read_whole(self, base_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        metadata_df = self._distinct(base_path)
+        tile = Window(col_off=500, row_off=10, width=256, height=256)
+
+        _, _, window = scan_raster(metadata_df, window=tile)
+
+        assert window.batch_layout == ((500, 10, 256, 256),)
+
 
 class TestBandsOfDifferingDtype:
     """A `rasterio` read of several bands at once returns ONE array, so every band it reads

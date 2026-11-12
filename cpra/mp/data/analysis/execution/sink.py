@@ -10,7 +10,8 @@ reference to anything but the arguments they were called with:
   CSV float-precision rule; this only builds the `materialize` closure that expects.
 - `write_raster` -- `tif`, over a `BandWideFrame`. Returns `False` (not a raise) when the
   frame carries no bands, which is what lets a caller tell "no source data" (a 404) apart
-  from every other failure.
+  from every other failure. `write_raster_strips` writes the same file from a compiled
+  plan, a strip of rows at a time, wherever the plan's ops allow it.
 - `render_tile` -- `png`/`jpg`, a single map tile, over the `BandWideFrame` `execute`
   returns for a tile-scoped plan. Warps, colors, encodes: `io.raster_io.
   warp_array_to_tile` for the geometry, `io.output.resolve_legend` /
@@ -37,6 +38,7 @@ at the one place below where the distinction decides what this module does).
 """
 
 import gzip
+import math
 from io import BytesIO
 
 import numpy as np
@@ -48,6 +50,7 @@ from pmtiles.reader import MmapSource, Reader
 from rasterio.windows import Window
 
 from cpra.mp.data import config
+from cpra.mp.data.analysis.execution.execute import execute
 from cpra.mp.data.analysis.execution.frame import (
     RESERVED_BAND_INDEX_COLUMN,
     BandWideFrame,
@@ -56,10 +59,11 @@ from cpra.mp.data.analysis.execution.frame import (
     has_no_bands,
     row_major_grid_cell,
 )
-from cpra.mp.data.analysis.execution.plan import TileRequest
+from cpra.mp.data.analysis.execution.plan import ExecutionPlan, TileRequest, with_read_window
 from cpra.mp.data.analysis.io.output import resolve_legend, stream_tabular, tabular_kwargs
 from cpra.mp.data.analysis.io.raster import NUMPY_TO_POLARS
 from cpra.mp.data.analysis.io.raster_io import warp_array_to_tile
+from cpra.mp.data.analysis.io.window import ReadWindow
 from cpra.mp.data.analysis.request.errors import ShapeError
 
 __all__ = [
@@ -69,6 +73,7 @@ __all__ = [
     "sink_tabular",
     "sink_vector_tile",
     "write_raster",
+    "write_raster_strips",
 ]
 
 #: The sentinel a raster sink falls back to when neither an explicit `nodata=` argument
@@ -258,11 +263,8 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     That matters most for the download path: band order is decided by the walk, and a
     client holding only the bytes has nothing else to read a band's calendar value off.
 
-    Row order in `band_wide`'s `LazyFrame` is the READ's emission order, not necessarily
-    row-major (see `execution/frame.py`'s band-wide invariants): batch after batch, each
-    one row-major over its own sub-rectangle, as `window.batch_layout` records. So the
-    frame is written back the same way, one batch at a time into that batch's window of
-    the file, rather than sorted into raster order first.
+    The frame is written back in its own row order, one read batch at a time
+    (`_write_batches`), rather than sorted into raster order first.
 
     **Memory.** This used to label every row with its `grid_cell`, sort the whole frame
     by it, and collect it with the default in-memory engine, which materializes every
@@ -276,6 +278,9 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
     substitute: on Polars 1.41.2 it returned rows out of order for `lnd_conf_chng` (a
     `calculate` after a band-wide `join`), in different places from run to run, while
     `collect(engine="streaming")` of the same frame matched the in-memory engine exactly.
+    What is left scales with the result, so a many-band download still needs more than a
+    pod has: `write_raster_strips` bounds it by computing the plan a strip at a time, and
+    is what `execute.run_to_path` uses wherever the plan allows.
 
     `dtype`/`nodata` are explicit, caller-supplied parameters rather than derived from a
     `Variable` lookup or a source file's own profile: `band_wide` is the END of a walk
@@ -300,49 +305,173 @@ def write_raster(band_wide: BandWideFrame, out_path, *, dtype=None, nodata=DEFAU
 
     band_names = band_column_names(metadata_df)
     df = lf.select(band_names).collect(engine="streaming")
+    out_dtype = _resolve_write_dtype(df.schema, band_names, dtype)
 
+    with rasterio.open(
+        out_path, "w", **_raster_profile(window, len(band_names), out_dtype, nodata, profile_options)
+    ) as dst:
+        _write_batches(dst, df, band_names, window, (window.col_off, window.row_off), out_dtype, nodata)
+        _describe_bands(dst, metadata_df)
+    return True
+
+
+def write_raster_strips(
+    plan: ExecutionPlan, out_path, *, base_path=None, dtype=None, nodata=DEFAULT_NODATA, **profile_options
+) -> bool:
+    """`write_raster` for a compiled `plan` rather than an executed frame: the same GeoTIFF,
+    computed and written one full-width strip of rows at a time, so the peak is bounded by
+    the strip rather than by the result.
+
+    `write_raster` has to hold the whole result -- every band, every pixel -- because the
+    walk is collected once. That is fine for one band (0.4-0.75 GB for `lnd_conf`), and
+    not for a plain multi-band download: 55 bands of the 16640 x 5824 grid are ~21 GB.
+    Here the plan is executed once per strip instead, with every raster origin's read
+    narrowed to it (`plan.with_read_window`), which is exactly how a tile already runs the
+    walk over less than the raster. That is only the same answer as the full-extent run
+    for a plan whose every op is pixel-local; `plan.windowed_read_blocker` says whether
+    this one is, and the caller (`execute.run_to_path`) falls back to `write_raster`
+    when it is not.
+
+    Strips are full-width because the file is: a GeoTIFF without `tiled=True` is laid out
+    in full-width strips of rows (GDAL picks how many per strip; one, for this grid's
+    width and the default compression), so a full-width strip write completes every file
+    strip it touches, and each is compressed and written exactly once. A narrower write
+    would leave partly filled strips in GDAL's block cache until their neighbours arrived,
+    and one evicted early is written twice -- the first copy left behind as dead space in
+    the file. `_strip_height` sizes the strip to `config.RASTER_WRITE_STRIP_MB` and keeps
+    it a whole number of the output's block rows, and of the source's too when the budget
+    allows (a source block straddling two strips is decompressed twice).
+
+    The first `execute` is over the full extent and reads no pixels -- it only opens each
+    file for its metadata -- and settles what every strip must agree with: the band list
+    (checked again per strip, so a band set that somehow depended on the data raises
+    rather than writing mislabeled bands), the dtype, and the window strips are cut from.
+    Each strip's own result must come back covering exactly that strip at full
+    resolution, which is the check that the window actually reached every read.
+
+    Returns `False` for a result with no bands, as `write_raster` does.
+    """
+    lf, metadata_df, window = execute(plan, base_path=base_path)
+    if has_no_bands(metadata_df):
+        return False
+    if window.decimation != (1, 1):
+        raise ValueError(f"write_raster_strips: the full-extent read is decimated {window.decimation}")
+
+    band_names = band_column_names(metadata_df)
+    schema = lf.select(band_names).collect_schema()
+    out_dtype = _resolve_write_dtype(schema, band_names, dtype)
+    origin = (window.col_off, window.row_off)
+
+    with rasterio.open(
+        out_path, "w", **_raster_profile(window, len(band_names), out_dtype, nodata, profile_options)
+    ) as dst:
+        strip_height = _strip_height(window, len(band_names), dst.block_shapes[0][0])
+        for row_off in range(window.row_off, window.row_off + window.height, strip_height):
+            strip = Window(
+                window.col_off, row_off, window.width, min(strip_height, window.row_off + window.height - row_off)
+            )
+            strip_lf, strip_metadata, strip_window = execute(with_read_window(plan, strip), base_path=base_path)
+            extent = (strip_window.col_off, strip_window.row_off, strip_window.width, strip_window.height)
+            if extent != (strip.col_off, strip.row_off, strip.width, strip.height) or strip_window.decimation != (1, 1):
+                raise ValueError(
+                    f"write_raster_strips: strip {strip} came back as {extent} at decimation "
+                    f"{strip_window.decimation} -- the window did not reach every read"
+                )
+            if not strip_metadata.equals(metadata_df):
+                raise ValueError(
+                    f"write_raster_strips: strip {strip} produced different bands from the full-extent plan"
+                )
+            df = strip_lf.select(band_names).collect(engine="streaming")
+            _write_batches(dst, df, band_names, strip_window, origin, out_dtype, nodata)
+            del df
+        _describe_bands(dst, metadata_df)
+    return True
+
+
+#: Bytes per pixel per band `_strip_height` budgets for: a collected strip is held as
+#: Polars columns of up to 8 bytes (`Float64`/`Int64`), whatever the file's own dtype.
+_STRIP_BYTES_PER_BAND = 8
+
+
+def _strip_height(window: ReadWindow, n_bands: int, output_block_height: int) -> int:
+    """Rows per strip for `write_raster_strips`: as many as `config.RASTER_WRITE_STRIP_MB`
+    holds at `n_bands` bands across `window`'s width, rounded down to a whole number of
+    output block rows -- and of source block rows, whenever the budget covers at least
+    one.
+
+    The source block height is read off the full-extent read's `batch_layout`: a full
+    read is batched a block row at a time (`io.raster.scan_raster`), so its first batch is
+    one block tall. Strips start at the window's top, so whole source block rows keep
+    every strip boundary on a block boundary. A band count too large for even one source
+    block row in the budget gets strips shorter than a block, and some source blocks are
+    decompressed more than once; the budget is what keeps the pod alive, so it wins.
+
+    At least one output block row, whatever the budget, since a strip cannot be smaller.
+    """
+    budget_rows = config.RASTER_WRITE_STRIP_MB * 1024 * 1024 // (window.width * n_bands * _STRIP_BYTES_PER_BAND)
+    source_block_height = window.batch_layout[0][3] if window.batch_layout else 1
+    unit = math.lcm(source_block_height, output_block_height)
+    if budget_rows < unit:
+        unit = output_block_height
+    return max(unit, budget_rows // unit * unit)
+
+
+def _raster_profile(window: ReadWindow, count: int, dtype: str, nodata, profile_options: dict) -> dict:
+    """The write profile both raster sinks open their file with: a GeoTIFF over `window`'s
+    pixels, `**profile_options` layered on top (see `write_raster`)."""
     # `read_shape`, not `height`/`width`: those are the window's SOURCE extent, which is the
     # array's shape only when the read was undecimated. `window.transform` is already scaled
     # to match, so the written file is georeferenced correctly either way.
     read_height, read_width = window.read_shape
-    out_dtype = _resolve_write_dtype(df.schema, band_names, dtype)
+    profile = {
+        "driver": "GTiff",
+        "height": read_height,
+        "width": read_width,
+        "count": count,
+        "dtype": dtype,
+        "crs": window.crs,
+        "transform": window.transform,
+        "nodata": nodata,
+    }
+    profile.update(profile_options)
+    return profile
+
+
+def _write_batches(dst, df: pl.DataFrame, band_names, window: ReadWindow, origin, out_dtype, nodata) -> None:
+    """Write `df` -- `window`'s read, collected in the frame's own row order -- into `dst`
+    one read batch at a time, each into its own window of the file. `origin` is the
+    `(col_off, row_off)` the file's top-left pixel has in `window`'s source pixels.
+
+    Row order is the READ's emission order, not necessarily row-major (see
+    `execution/frame.py`'s band-wide invariants): batch after batch, each one row-major over
+    its own sub-rectangle, as `window.batch_layout` records -- which is why this writes
+    batch by batch rather than sorting the frame into raster order first.
+    """
     # An empty layout is one batch covering the whole read, in array units -- the same
     # fallback `row_major_grid_cell` takes, and the only layout a decimated read has.
+    read_height, read_width = window.read_shape
     layout = window.batch_layout or ((window.col_off, window.row_off, read_width, read_height),)
     if df.height != sum(width * height for _c, _r, width, height in layout):
         raise ValueError(
             f"write_raster: the frame has {df.height} rows, but its window's batch layout covers "
             f"{sum(width * height for _c, _r, width, height in layout)} pixels"
         )
+    origin_col, origin_row = origin
+    offset = 0
+    for col, row, width, height in layout:
+        batch = df.slice(offset, width * height)
+        offset += width * height
+        data = np.stack(
+            [batch.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False) for name in band_names]
+        ).reshape(len(band_names), height, width)
+        dst.write(data, window=Window(col - origin_col, row - origin_row, width, height))
 
-    profile = {
-        "driver": "GTiff",
-        "height": read_height,
-        "width": read_width,
-        "count": len(band_names),
-        "dtype": out_dtype,
-        "crs": window.crs,
-        "transform": window.transform,
-        "nodata": nodata,
-    }
-    profile.update(profile_options)
 
-    with rasterio.open(out_path, "w", **profile) as dst:
-        offset = 0
-        for col, row, width, height in layout:
-            batch = df.slice(offset, width * height)
-            offset += width * height
-            data = np.stack(
-                [
-                    batch.get_column(name).fill_null(nodata).to_numpy().astype(out_dtype, copy=False)
-                    for name in band_names
-                ]
-            ).reshape(len(band_names), height, width)
-            dst.write(data, window=Window(col - window.col_off, row - window.row_off, width, height))
-        for index, description in enumerate(_band_descriptions(metadata_df), start=1):
-            if description:
-                dst.set_band_description(index, description)
-    return True
+def _describe_bands(dst, metadata_df: pl.DataFrame) -> None:
+    """Label each band of `dst` with its own `metadata_df` row (`_band_descriptions`)."""
+    for index, description in enumerate(_band_descriptions(metadata_df), start=1):
+        if description:
+            dst.set_band_description(index, description)
 
 
 # ----------------------------------------------------------------------------------------

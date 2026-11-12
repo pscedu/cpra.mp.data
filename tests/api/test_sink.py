@@ -12,6 +12,8 @@ One class per destination, plus one for the `execution.run_to_path` composition 
   the way a client sees it -- decoded back out of the bytes.
 - `TestSinkVectorTile`: `pbf`, parsed back at the protobuf level to check exactly which
   boundary features gained a `value` tag.
+- `TestWriteRasterStrips`/`TestStripHeight`: the same `tif`, computed a strip of rows at a
+  time, checked against `write_raster` of the full-extent result.
 - `TestRunToPath`: the composition helper, for its two supported output kinds.
 
 Fixture note: raster tests use `RASTER_KWARGS` (`vct` on `veg_grid_cell_v001`, EPSG:26915,
@@ -59,15 +61,18 @@ from cpra.mp.data.analysis.execution.sink import (
     DEFAULT_NODATA,
     _band_descriptions,
     _resolve_write_dtype,
+    _strip_height,
     apply_output_shaping,
     render_tile,
     sink_tabular,
     sink_vector_tile,
     write_raster,
+    write_raster_strips,
 )
 from cpra.mp.data.analysis.io import raster_io
 from cpra.mp.data.analysis.io.raster import scan_raster
 from cpra.mp.data.analysis.io.raster_io import tile_read_shape, tile_source_window, warp_window_to_tile
+from cpra.mp.data.analysis.io.window import ReadWindow
 from cpra.mp.data.analysis.request.ops import validate_shapes
 from cpra.mp.data.analysis.request.pipeline import Output, parse_pipeline
 from cpra.mp.data.grids import GRIDS
@@ -448,6 +453,151 @@ class TestWriteRasterPlacesEveryPixel:
 
         with pytest.raises(ValueError, match="batch layout covers"):
             write_raster((lf.head(10), metadata_df, window), tmp_path / "out.tif")
+
+
+class TestWriteRasterStrips:
+    """`write_raster_strips` -- the same GeoTIFF as `write_raster` over the full-extent
+    result, computed one strip of rows at a time. The reference here is `write_raster` of
+    `execute` on the same plan, compared pixel for pixel, band for band, with every pixel
+    distinct, the strips uneven (100 rows of 365, so a short last one) and each strip read
+    in several batches -- so a strip written to the wrong rows, a batch to the wrong
+    columns, or a band to the wrong position cannot match by accident.
+    """
+
+    @pytest.fixture
+    def joined(self, base_path):
+        # Two variables, two years each, distinct per pixel and per year; joined, then a
+        # `calculate` over both operands -- the shape `collect_batches` misordered.
+        def _data(dtype, scale):
+            return lambda year: (raster_array(grid_name=RASTER_GRID, dtype=dtype) * scale + year).astype(dtype)
+
+        write_raster_dataset(base_path, years=(2030, 2040), variable="vct", data_fn=_data("int32", 3))
+        write_raster_dataset(base_path, years=(2030, 2040), variable="ffibs_score", data_fn=_data("float32", 1))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "a - b"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        return compile_plan(pipeline, base_path=base_path)
+
+    @staticmethod
+    def _read(path):
+        with rasterio.open(path) as src:
+            return src.read(), src.profile, src.descriptions
+
+    def _reference(self, plan, base_path, tmp_path):
+        assert write_raster(execute(plan, base_path=base_path), tmp_path / "reference.tif")
+        return self._read(tmp_path / "reference.tif")
+
+    def test_strips_write_the_same_file_as_the_full_extent(self, joined, base_path, tmp_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "RASTER_BLOCKS_PER_BATCH", 1)
+        monkeypatch.setattr(sink_module, "_strip_height", lambda *_args: 300)
+        executed = []
+        real_execute = sink_module.execute
+
+        def _spy(plan, **kwargs):
+            result = real_execute(plan, **kwargs)
+            executed.append(result[2])
+            return result
+
+        monkeypatch.setattr(sink_module, "execute", _spy)
+
+        assert write_raster_strips(joined, tmp_path / "strips.tif", base_path=base_path)
+
+        # The full-extent probe, then one execution per strip. The 300-row strip is bigger
+        # than one 512x512-block batch, so it reads the full read's batches clipped to it;
+        # the 65-row remainder fits in one.
+        strips = [(w.row_off, w.height) for w in executed[1:]]
+        assert strips == [(0, 300), (300, 65)]
+        assert executed[1].batch_layout == ((0, 0, 512, 300), (512, 0, 512, 300), (1024, 0, 28, 300))
+        assert executed[2].batch_layout == ((0, 300, 1052, 65),)
+
+        data, profile, descriptions = self._read(tmp_path / "strips.tif")
+        ref_data, ref_profile, ref_descriptions = self._reference(joined, base_path, tmp_path)
+        assert data.shape == (2, 365, 1052)
+        np.testing.assert_array_equal(data, ref_data)
+        assert profile == ref_profile
+        assert descriptions == ref_descriptions
+        assert len(np.unique(data[0])) == 365 * 1052  # every pixel distinct: placement is checked
+
+    def test_run_to_path_writes_strips_when_the_plan_allows(self, joined, base_path, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sink_module, "write_raster_strips", lambda *a, **k: calls.append(k) or True)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input(variable="vct"), "b": raster_input(variable="ffibs_score")},
+                "steps": [
+                    {"op": "join", "type": "spatial", "inputs": ["a", "b"], "as": "j"},
+                    {"op": "calculate", "expression": "a - b"},
+                ],
+                "output": {"format": "tif"},
+            }
+        )
+        assert run_to_path(pipeline, tmp_path / "out.tif", base_path=base_path, nodata=0, compress="ZSTD") is True
+        assert calls == [{"base_path": base_path, "nodata": 0, "compress": "ZSTD"}]
+
+    def test_a_strip_the_window_did_not_reach_raises(self, joined, base_path, tmp_path, monkeypatch):
+        # A read that ignores the strip's window comes back as the whole raster -- which,
+        # written as though it were one strip, would be a wrong file rather than an error.
+        monkeypatch.setattr(sink_module, "with_read_window", lambda plan, _window: plan)
+        monkeypatch.setattr(sink_module, "_strip_height", lambda *_args: 100)
+        with pytest.raises(ValueError, match="did not reach every read"):
+            write_raster_strips(joined, tmp_path / "out.tif", base_path=base_path)
+
+    def test_no_bands_returns_false(self, base_path, tmp_path):
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "filter", "input": "a", "where": "calendar_year = 1999"}],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, base_path=base_path)
+        assert write_raster_strips(plan, tmp_path / "out.tif", base_path=base_path) is False
+        assert not (tmp_path / "out.tif").exists()
+
+
+class TestStripHeight:
+    """`_strip_height`: the budget in rows, kept to whole output and source block rows."""
+
+    @staticmethod
+    def _window(width=1000, block_height=128):
+        return ReadWindow(
+            source=(),
+            col_off=0,
+            row_off=0,
+            width=width,
+            height=5000,
+            transform=rasterio.transform.from_origin(0, 0, 1, 1),
+            crs=None,
+            batch_layout=((0, 0, 256, block_height), (256, 0, 256, block_height)),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _one_mb(self, monkeypatch):
+        monkeypatch.setattr(sink_module.config, "RASTER_WRITE_STRIP_MB", 1)
+
+    def test_rounds_the_budget_down_to_whole_source_block_rows(self):
+        # 1 MiB / (1000 px x 1 band x 8 B) = 131 rows -> one 128-row block row.
+        assert _strip_height(self._window(), 1, 1) == 128
+
+    def test_keeps_to_whole_output_block_rows_too(self):
+        # 1 MiB / (250 px x 8 B) = 524 rows; whole rows of both 128 and 48 means 384.
+        assert _strip_height(self._window(width=250), 1, 48) == 384
+
+    def test_a_budget_under_one_source_block_row_cuts_inside_the_block(self):
+        # 1 MiB / (1000 px x 4 bands x 8 B) = 32 rows: the budget wins over block alignment,
+        # in whole output block rows (here 8).
+        assert _strip_height(self._window(), 4, 8) == 32
+
+    def test_never_less_than_one_output_block_row(self):
+        assert _strip_height(self._window(), 1000, 16) == 16
 
 
 class TestBandDescriptions:

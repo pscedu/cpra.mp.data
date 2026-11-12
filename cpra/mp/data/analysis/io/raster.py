@@ -62,9 +62,12 @@ callback from a different thread than the one that entered it, and both `rio.Env
 rasterio dataset handles are thread-local, so nothing opened before a `yield` may be
 assumed valid after it.
 
-`window`, when given, restricts the scan to that single `rasterio.windows.Window` read
-whole, in one batch, rather than tiling the full raster -- a caller specific enough to name
-its own window has already decided how much of it to hold in memory at once. This is
+`window`, when given, restricts the scan to that `rasterio.windows.Window`. One that fits
+in a single batch of the full read's budget -- a map tile, a point sample -- is read whole,
+in one batch; a larger one (a strip of a GeoTIFF download, `execution.sink.
+write_raster_strips`) gets the full read's own batches clipped to it, so a wide window
+bounds its read buffer the same way the full extent does. A decimated window is always
+one batch (see `batch_layout`'s comment below). This is
 plumbing only: nothing in this module computes a window on its own, nor how coarsely to
 read it (both are the caller's decision, not this scan's -- `execution.plan.compile_plan`
 makes them together, since which pixels a tile needs and whether that tile may be served
@@ -281,13 +284,23 @@ def scan_raster(
         raster_transform = ref.transform
         raster_crs = ref.crs
         read_window = window if window is not None else Window(0, 0, ref.width, ref.height)
-        if window is not None:
+        block_height, block_width = ref.block_shapes[0]
+        itemsize = max(np.dtype(dt).itemsize for dt in dtypes)
+        blocks_per_batch = raster_blocks_per_batch(len(sources), block_height, block_width, itemsize)
+        if window is None:
+            window_list = list(batched_windows(ref, blocks_per_batch))
+        elif decimated or int(window.width) * int(window.height) <= blocks_per_batch * block_height * block_width:
             window_list = [window]
         else:
-            block_height, block_width = ref.block_shapes[0]
-            itemsize = max(np.dtype(dt).itemsize for dt in dtypes)
-            blocks_per_batch = raster_blocks_per_batch(len(sources), block_height, block_width, itemsize)
-            window_list = list(batched_windows(ref, blocks_per_batch))
+            # Larger than one batch of a full read: the full read's own batches, clipped to
+            # the window, so a wide window (a download strip) bounds its buffer the same way.
+            window_list = []
+            row_end, col_end = window.row_off + window.height, window.col_off + window.width
+            for batch in batched_windows(ref, blocks_per_batch):
+                top, bottom = max(batch.row_off, window.row_off), min(batch.row_off + batch.height, row_end)
+                left, right = max(batch.col_off, window.col_off), min(batch.col_off + batch.width, col_end)
+                if top < bottom and left < right:
+                    window_list.append(Window(left, top, right - left, bottom - top))
 
     source_height, source_width = int(read_window.height), int(read_window.width)
     out_shape = (max(1, source_height // row_factor), max(1, source_width // col_factor)) if decimated else None

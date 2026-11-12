@@ -273,6 +273,24 @@ Sizing that window opens no file. `io.raster_io.raster_grid_geometry` builds
 raster on that grid is co-registered with exactly -- so this module keeps the "it opens no
 data files" property that the rest of it already has, band resolution aside.
 
+**A window is only safe for a plan whose ops are window-local.** Every extent-limited output
+-- a map tile, a strip of a GeoTIFF download (`execution.sink.write_raster_strips`) -- runs
+the whole op walk over a window rather than the raster, which gives the same pixels as the
+full-extent run only if each output pixel depends on nothing outside the window. Each op is
+classed by `op_window_locality` as `WindowLocality.PIXEL` (the same pixel of each input and
+nothing else), `FEATURE` (every pixel of a vector feature -- a raster-to-vector `project`,
+which is what the straddling-feature widening above exists for), or `EXTENT` (pixels
+anywhere: a global minimum, a quantile, a sum over the whole raster), and a plan is as
+non-local as its least-local op (`plan_window_locality`). No op is `EXTENT` today: the
+expression language rejects every reducing function and subquery
+(`request.expressions.ALLOWED_FUNCTIONS`), and `group` always keeps `grid_cell`, so it
+reduces across bands, never across pixels. The class exists so that one which is cannot
+arrive silently: an op type with no entry raises rather than defaulting to local, and an
+`EXTENT` plan compiled for a tile reads every raster origin whole, at full resolution,
+which the tile sink then warps from like any other window. A strip-wise download goes
+further and requires `PIXEL` outright (`windowed_read_blocker`), since it has no widening
+of its own to offer a `FEATURE` op.
+
 **Band enumeration and its ceiling.** Every raster origin gets `io.catalog.
 resolve_raster_bands` called on it exactly once, narrowed by whatever dimension predicates
 survived pushdown, then checked against `cpra.mp.data.config.ANALYSIS_BAND_CEILING`
@@ -368,6 +386,7 @@ for a pipeline with no raster input and no such projection.
 """
 
 import dataclasses
+import enum
 from collections import Counter
 
 import mercantile
@@ -375,6 +394,7 @@ import polars as pl
 from rasterio.enums import Resampling
 
 from cpra.mp.data.analysis.execution.band_ops import PAIRING_KEY_EXCLUDED_COLUMNS, unify_metadata_parts
+from cpra.mp.data.analysis.execution.frame import has_no_bands
 from cpra.mp.data.analysis.execution.point_sample import point_sample_reads
 from cpra.mp.data.analysis.io.catalog import (
     dataset_dimension_columns,
@@ -409,7 +429,18 @@ from cpra.mp.data.analysis.request.pipeline import InputSelection, Pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
 from cpra.mp.data.grids import GRIDS
 
-__all__ = ["DEFAULT_TILE_SIZE", "ExecutionPlan", "ResolvedInput", "TileRequest", "compile_plan"]
+__all__ = [
+    "DEFAULT_TILE_SIZE",
+    "ExecutionPlan",
+    "ResolvedInput",
+    "TileRequest",
+    "WindowLocality",
+    "compile_plan",
+    "op_window_locality",
+    "plan_window_locality",
+    "windowed_read_blocker",
+    "with_read_window",
+]
 
 #: Pixels across for a map tile whose caller did not say. The web-map convention, and what
 #: `visualizations/map.py` already declares as its layer's `tileSize`.
@@ -748,10 +779,16 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
     `read_window` sized to that tile instead of being read whole, derived here rather than
     at the read (see the module docstring's tile paragraph, and `_resolve_tile_window`).
     The ops, the pushdown decisions, and the band resolution are identical either way -- a
-    tile changes how much of each raster is read, not what is computed over it.
+    tile changes how much of each raster is read, not what is computed over it. The one
+    exception is a plan with an `EXTENT`-local op (`plan_window_locality`), whose origins are
+    read whole regardless; `plan.tile` still records the tile, for the sink.
     """
     ops = compile_ops(pipeline)
     frame_types = annotate_frame_types(pipeline, ops)
+    # An op that needs pixels from anywhere in the raster cannot be computed over the tile's
+    # window -- see the module docstring's window-locality paragraph -- so its reads ignore
+    # the tile and the sink warps from the full-extent, full-resolution result instead.
+    read_tile = tile if plan_window_locality(ops, frame_types) < WindowLocality.EXTENT else None
     origin_kind = {name: GRIDS[selection.grid].grid_type for name, selection in pipeline.inputs.items()}
 
     # Fan-out detection (see module docstring): a name read by more than one op can never
@@ -1354,7 +1391,7 @@ def compile_plan(pipeline: Pipeline, *, base_path=None, tile: TileRequest | None
             target = straddling_vector_grid.get(name)
             permitted = target is None and name not in point_sample_step
             read_window, tile_disjoint, decimation = _resolve_tile_window(
-                tile, selection.grid, target, overview_permitted=permitted
+                read_tile, selection.grid, target, overview_permitted=permitted
             )
             inputs[name] = ResolvedInput(
                 selection=selection,
@@ -1457,3 +1494,138 @@ def _resolve_tile_window(
         return window, False, (1, 1)
     factors = tile_decimation_factors(window, tile.tile_size, buffer_px=resampling_buffer_px(tile.resampling))
     return window, False, factors
+
+
+class WindowLocality(enum.IntEnum):
+    """How much of a raster one output pixel of an op depends on -- see the module
+    docstring's window-locality paragraph. Ordered, so a plan's locality is the `max` of
+    its ops'.
+    """
+
+    #: The same pixel of each input, and nothing else.
+    PIXEL = 0
+    #: Every pixel of the vector feature the output value belongs to.
+    FEATURE = 1
+    #: Pixels anywhere in the raster: computing it over a window gives a different answer.
+    EXTENT = 2
+
+
+#: Every op type but `ProjectOp`, whose locality depends on its direction. Each is `PIXEL`
+#: for a reason that lives elsewhere, so the reason is recorded here: a change there is a
+#: change to this table.
+_OP_WINDOW_LOCALITY: dict[type, WindowLocality] = {
+    # A value or dimension predicate tests the pixel itself; a spatial one selects pixels by
+    # their absolute `grid_cell` id, which a narrower read does not change.
+    FilterOp: WindowLocality.PIXEL,
+    # `calculate`/`case` expressions may only call `request.expressions.ALLOWED_FUNCTIONS`,
+    # all elementwise -- every reducing function and subquery is rejected at parse time.
+    CaseOp: WindowLocality.PIXEL,
+    # `group` keeps `grid_cell`: it reduces across bands and dimensions, never pixels.
+    GroupOp: WindowLocality.PIXEL,
+    # A band-wide join pairs the same pixel of each operand (one shared read); a long join
+    # matches on `grid_cell` and the shared dimensions.
+    JoinOp: WindowLocality.PIXEL,
+    # Reshapes columns into rows, one pixel at a time.
+    UnpivotOp: WindowLocality.PIXEL,
+}
+
+
+def op_window_locality(op: Op, frame_types: dict[str, FrameType]) -> WindowLocality:
+    """`op`'s `WindowLocality`. A raster-to-vector `project` is `FEATURE` (each destination
+    cell aggregates every pixel it covers); every other `project` direction is `PIXEL` --
+    vector-to-raster looks each pixel's zone up in a crosswalk, and vector-to-vector never
+    touches a raster window at all.
+
+    Raises `TypeError` for an op type with no entry, rather than calling it local: a new
+    op is exactly where a whole-extent dependency would arrive, and the cost of answering
+    wrong is a tile or download that is silently different from the full-extent result.
+    """
+    if isinstance(op, ProjectOp):
+        from_kind, to_kind = project_direction(frame_types[op.input], op.to)
+        return WindowLocality.FEATURE if (from_kind, to_kind) == ("raster", "vector") else WindowLocality.PIXEL
+    try:
+        return _OP_WINDOW_LOCALITY[type(op)]
+    except KeyError:
+        raise TypeError(
+            f"{type(op).__name__} has no window locality -- classify it in "
+            "execution.plan._OP_WINDOW_LOCALITY before a tile or strip-wise download can run it"
+        ) from None
+
+
+def plan_window_locality(ops: list[Op], frame_types: dict[str, FrameType]) -> WindowLocality:
+    """The least-local of `ops`' localities -- `PIXEL` for an empty pipeline, which only
+    reads its one input."""
+    return max((op_window_locality(op, frame_types) for op in ops), default=WindowLocality.PIXEL)
+
+
+def _final_output(plan: ExecutionPlan) -> str:
+    """The name of the frame `execute.execute` returns: the last op's output, or the one
+    input of a zero-step pipeline."""
+    if plan.ops:
+        return plan.ops[-1].output
+    (name,) = plan.inputs
+    return name
+
+
+def windowed_read_blocker(plan: ExecutionPlan) -> str | None:
+    """Why `plan`'s band-wide result cannot be computed one window at a time by swapping
+    every raster origin's `read_window` (`with_read_window`) -- or `None` if it can.
+
+    Each condition is something the window swap does not reach, so running per window would
+    give a different raster from the full-extent run, not just a slower one:
+
+    * a tile-scoped plan, whose windows are already the tile's;
+    * a long result, which has no window to split;
+    * any op that is not `PIXEL`-local (module docstring, window-locality paragraph) --
+      including a raster-to-vector `project`, whose widening only the tile path performs;
+    * raster origins on more than one grid, or none at all, since the window is in one
+      grid's pixels;
+    * a zero-band origin, which `execute` reads from the grid whole whatever the window;
+    * a point sample, which narrows its own read;
+    * a vector-to-raster `project` outside a band-wide join, which reads its crosswalk
+      whole (`execution.project.project_vector_to_raster`).
+    """
+    if plan.tile is not None:
+        return "the plan is already scoped to a tile"
+    final = _final_output(plan)
+    if plan.frame_types[final].shape is not Shape.band_wide:
+        return "the result is long, not band-wide"
+    locality = plan_window_locality(plan.ops, plan.frame_types)
+    if locality is not WindowLocality.PIXEL:
+        return f"an op is {locality.name}-local, not PIXEL-local"
+    rasters = {
+        name: resolved for name, resolved in plan.inputs.items() if GRIDS[resolved.selection.grid].grid_type == "raster"
+    }
+    grids = {resolved.selection.grid for resolved in rasters.values()}
+    if len(grids) != 1:
+        return f"the plan reads {len(grids)} raster grids, not 1"
+    for name, resolved in rasters.items():
+        if resolved.band_metadata is None or has_no_bands(resolved.band_metadata):
+            return f"input {name!r} resolves to no bands"
+        if resolved.point_sample_step is not None:
+            return f"input {name!r} is point-sampled"
+    joined_projects = {
+        crosswalk.step_no for crosswalks in plan.band_wide_join_zone_crosswalks.values() for crosswalk in crosswalks
+    }
+    for op in plan.ops:
+        if (
+            isinstance(op, ProjectOp)
+            and project_direction(plan.frame_types[op.input], op.to) == ("vector", "raster")
+            and op.step_no not in joined_projects
+        ):
+            return f"step {op.step_no} projects onto the raster grid outside a join, reading its crosswalk whole"
+    return None
+
+
+def with_read_window(plan: ExecutionPlan, window) -> ExecutionPlan:
+    """`plan` with every raster origin read over `window` (a `rasterio.windows.Window` in
+    the origins' shared grid's pixels) at full resolution. Only meaningful for a plan
+    `windowed_read_blocker` passes; `plan` itself is not modified.
+    """
+    inputs = {
+        name: dataclasses.replace(resolved, read_window=window, tile_disjoint=False, decimation=(1, 1))
+        if GRIDS[resolved.selection.grid].grid_type == "raster"
+        else resolved
+        for name, resolved in plan.inputs.items()
+    }
+    return dataclasses.replace(plan, inputs=inputs)

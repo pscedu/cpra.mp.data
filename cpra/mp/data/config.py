@@ -103,6 +103,13 @@ RASTER_BATCH_BUFFER_MB = int(get_config("RASTER_BATCH_BUFFER_MB", "64"))
 _raster_blocks_per_batch = get_config("RASTER_BLOCKS_PER_BATCH", None)
 RASTER_BLOCKS_PER_BATCH = int(_raster_blocks_per_batch) if _raster_blocks_per_batch else None
 
+# Memory budget, in MB, for one strip of a GeoTIFF download written a strip at a time
+# (analysis.execution.sink.write_raster_strips): the collected strip's rows x width x bands
+# x 8 bytes. It bounds what `tif` downloads hold at once -- the whole result otherwise,
+# 10-17 GiB for a full-extent single-band analysis before the streaming write, and ~21 GB
+# for a plain 55-band download -- at the cost of executing the plan once per strip.
+RASTER_WRITE_STRIP_MB = int(get_config("RASTER_WRITE_STRIP_MB", "256"))
+
 # How many map tiles (`png`/`jpg`/`pbf`, api.pipeline) render at once. Without a cap they
 # share anyio's default 40-thread limiter, and a map view's burst of a few dozen tile
 # requests renders all at once: measured in production at 0.2 -> 5.7 GB of anonymous

@@ -18,6 +18,7 @@ file has to exist to read them from. Everything else about a tile-scoped compile
 window itself included -- comes off the grid registry with nothing opened.
 """
 
+import typing
 from typing import ClassVar
 
 import mercantile
@@ -31,12 +32,17 @@ from cpra.mp.data.analysis.execution.plan import (
     ExecutionPlan,
     ResolvedInput,
     TileRequest,
+    WindowLocality,
     compile_plan,
+    op_window_locality,
+    plan_window_locality,
+    windowed_read_blocker,
+    with_read_window,
 )
 from cpra.mp.data.analysis.execution.point_sample import point_sample_reads
 from cpra.mp.data.analysis.io.raster_io import TILE_CRS, resampling_buffer_px, tile_decimation_factors
 from cpra.mp.data.analysis.request.errors import BandLimitError, ShapeError
-from cpra.mp.data.analysis.request.ops import Shape, validate_shapes
+from cpra.mp.data.analysis.request.ops import CaseOp, Op, ProjectOp, Shape, validate_shapes
 from cpra.mp.data.analysis.request.pipeline import parse_pipeline
 from cpra.mp.data.config import ANALYSIS_BAND_CEILING
 from cpra.mp.data.grids import GRIDS
@@ -2349,3 +2355,111 @@ class TestTileDecimation:
         pipeline = _pipeline({"inputs": {"a": raster_input()}, "steps": [], "output": {"format": "tif"}})
         tile = TileRequest(*_tile_over_the_raster_grid(zoom=6))
         assert compile_plan(pipeline, tile=tile).inputs["a"].decimation == (1, 1)
+
+
+class TestWindowLocality:
+    """`execution.plan`'s window-locality classification, and what it decides: whether a tile
+    reads its own window (`compile_plan`) and whether a download may be written strip by strip
+    (`windowed_read_blocker`). A window is only safe for a plan whose every op computes a
+    pixel from that pixel's own values; anything that needs the whole extent has to be run
+    at full extent and full resolution, then cropped.
+    """
+
+    def test_every_op_is_classified(self):
+        op_types = typing.get_args(typing.get_args(Op)[0])  # Annotated[union, discriminator]
+        assert len(op_types) == 6
+        for op_type in op_types:
+            if op_type is ProjectOp:
+                continue  # classified by direction, against frame_types, not the table
+            assert op_type in plan_module._OP_WINDOW_LOCALITY, op_type.__name__
+
+    def test_an_unclassified_op_is_refused_rather_than_assumed_local(self):
+        class NewOp:
+            pass
+
+        with pytest.raises(TypeError, match="_OP_WINDOW_LOCALITY"):
+            op_window_locality(NewOp(), {})
+
+    def test_a_plan_is_as_non_local_as_its_least_local_op(self):
+        assert plan_window_locality([], {}) is WindowLocality.PIXEL
+
+    def test_an_extent_op_reads_a_tile_at_full_extent_and_resolution(self, monkeypatch):
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
+        monkeypatch.setitem(plan_module._OP_WINDOW_LOCALITY, CaseOp, WindowLocality.EXTENT)
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"}],
+                "output": {"format": "tif"},
+            }
+        )
+        tile = TileRequest(*_tile_over_the_raster_grid())
+        plan = compile_plan(pipeline, tile=tile)
+
+        assert plan.tile is tile  # still a tile render; only its read is widened
+        assert plan.inputs["a"].read_window is None
+        assert plan.inputs["a"].decimation == (1, 1)
+        assert plan.inputs["a"].tile_disjoint is False
+
+    def test_a_pixel_local_tile_still_reads_its_own_window(self, monkeypatch):
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands([{"calendar_year": 2030}]))
+        pipeline = _pipeline(
+            {
+                "inputs": {"a": raster_input()},
+                "steps": [{"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"}],
+                "output": {"format": "tif"},
+            }
+        )
+        plan = compile_plan(pipeline, tile=TileRequest(*_tile_over_the_raster_grid()))
+        assert plan.inputs["a"].read_window is not None
+
+
+class TestWindowedReadBlocker:
+    @staticmethod
+    def _compile(steps, inputs=None, *, tile=None, monkeypatch, rows=({"calendar_year": 2030},), fmt="tif"):
+        monkeypatch.setattr(plan_module, "resolve_raster_bands", _fake_resolve_raster_bands(list(rows)))
+        pipeline = _pipeline({"inputs": inputs or {"a": raster_input()}, "steps": steps, "output": {"format": fmt}})
+        return compile_plan(pipeline, tile=tile)
+
+    _CALCULATE: ClassVar = [{"op": "calculate", "input": "a", "expression": "value * 2", "as": "c"}]
+
+    def test_a_pixel_local_raster_plan_may_be_windowed(self, monkeypatch):
+        assert windowed_read_blocker(self._compile(self._CALCULATE, monkeypatch=monkeypatch)) is None
+
+    def test_a_tile_plan_may_not(self, monkeypatch):
+        plan = self._compile(self._CALCULATE, tile=TileRequest(*_tile_over_the_raster_grid()), monkeypatch=monkeypatch)
+        assert "tile" in windowed_read_blocker(plan)
+
+    def test_an_extent_op_may_not(self, monkeypatch):
+        monkeypatch.setitem(plan_module._OP_WINDOW_LOCALITY, CaseOp, WindowLocality.EXTENT)
+        plan = self._compile(self._CALCULATE, monkeypatch=monkeypatch)
+        assert "EXTENT" in windowed_read_blocker(plan)
+
+    def test_a_raster_input_with_no_bands_may_not(self, monkeypatch):
+        plan = self._compile(self._CALCULATE, rows=(), monkeypatch=monkeypatch)
+        assert "no bands" in windowed_read_blocker(plan)
+
+    def test_a_long_result_may_not(self, monkeypatch):
+        plan = self._compile([], {"a": vector_input()}, monkeypatch=monkeypatch, fmt="csv")
+        assert "long" in windowed_read_blocker(plan)
+
+    def test_a_standalone_vector_to_raster_project_may_not(self, monkeypatch):
+        plan = self._compile(
+            [{"op": "project", "input": "a", "to": RASTER_GRID, "as": "p"}],
+            {"a": vector_input()},
+            monkeypatch=monkeypatch,
+        )
+        assert windowed_read_blocker(plan) == "the plan reads 0 raster grids, not 1"
+
+    def test_with_read_window_sets_every_raster_origins_window_and_nothing_else(self, monkeypatch):
+        from rasterio.windows import Window
+
+        plan = self._compile(self._CALCULATE, monkeypatch=monkeypatch)
+        strip = Window(0, 100, GRIDS[RASTER_GRID].width, 50)
+        windowed = with_read_window(plan, strip)
+
+        assert windowed.inputs["a"].read_window == strip
+        assert windowed.inputs["a"].decimation == (1, 1)
+        assert windowed.inputs["a"].tile_disjoint is False
+        assert plan.inputs["a"].read_window is None  # the original is untouched
+        assert windowed.ops == plan.ops
