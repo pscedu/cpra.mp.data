@@ -100,7 +100,51 @@ def tile_renders_stalled() -> bool:
     )
 
 
-async def _run_tile_render(render):
+async def _run_tile_render(render, receive: Receive | None = None):
+    """Run `render` in a worker thread under the tile limiter, or skip it if the client
+    disconnects first.
+
+    A map that pans or zooms abandons its in-flight tiles (Traefik logs them as 499), and
+    without this every abandoned tile still waited its turn and rendered: 24 tiles
+    cancelled at 0.5 s measured ~18 CPU-seconds of renders nobody received, and those
+    renders delayed the tiles the map asked for next. `receive` is the request's ASGI
+    `receive`. A disconnect read from it while the tile is still queued for a slot drops
+    the tile and returns `None` (the route's 204, which goes nowhere). `None` for
+    `receive` means there is no client to watch.
+
+    A render already running is left to finish: the time goes into GDAL's read and the
+    Polars collect inside `render_tile`, and neither can be interrupted from outside the
+    thread. A checkpoint between `compile_plan` and `render_tile` would only catch a
+    disconnect during the ~60 ms compile.
+
+    The render's own exception is caught and re-raised outside the task group, which
+    would otherwise wrap it in an `ExceptionGroup` that neither the tile routes' `except
+    FileNotFoundError` nor `api.boundary`'s handlers match.
+    """
+    if receive is None:
+        return await _render_in_slot(render)
+    body = error = None
+    with anyio.CancelScope() as client_gone:
+        async with anyio.create_task_group() as watcher:
+            watcher.start_soon(_cancel_on_disconnect, receive, client_gone)
+            try:
+                body = await _render_in_slot(render)
+            except Exception as exc:  # noqa: BLE001 -- re-raised below, outside the task group
+                error = exc
+            watcher.cancel_scope.cancel()
+    if error is not None:
+        raise error
+    return body
+
+
+async def _cancel_on_disconnect(receive: Receive, scope: anyio.CancelScope) -> None:
+    # Tile routes are GETs and never read a body, so nothing else consumes `receive`.
+    while (await receive())["type"] != "http.disconnect":
+        pass
+    scope.cancel()
+
+
+async def _render_in_slot(render):
     global _tiles_in_flight, _last_tile_progress
     async with _tile_limiter():
         _tiles_in_flight += 1
@@ -374,15 +418,18 @@ def _first_input_variable_legend(pipeline):
     return variable.legend if variable is not None else None
 
 
-async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str, *, base_path=None) -> Response:
+async def respond_to_analysis_tile(
+    pipeline, x: int, y: int, z: int, format: str, *, base_path=None, receive: Receive | None = None
+) -> Response:
     """Build the response for `GET /v1/analysis/{z}/{x}/{y}.{format}` (`png`/`jpg`).
 
     Compiles the plan for this one tile (`compile_plan(pipeline, tile=...)`), executes it,
     and renders it (`sink.render_tile`) -- all off the event loop in one `anyio.to_thread.
     run_sync` call, since every step does real file I/O, and under the tile limiter
     (`_run_tile_render`), so a map's burst of tiles queues instead of rendering all at
-    once. A `None` render (nothing to show: see `render_tile`'s own docstring for the two
-    cases this covers) is a BODILESS 204, returned directly as this function's `Response`
+    once, and dropped if the client disconnects while it is still queued (`receive`; see
+    `_run_tile_render`). A `None` render (nothing to show: see `render_tile`'s own
+    docstring for the two cases this covers) is a BODILESS 204, returned directly as this function's `Response`
     rather than as a raised `HTTPException`, which always carries a JSON body and so
     cannot express one.
 
@@ -414,7 +461,7 @@ async def respond_to_analysis_tile(pipeline, x: int, y: int, z: int, format: str
         )
 
     try:
-        body = await _run_tile_render(_render)
+        body = await _run_tile_render(_render, receive)
     except FileNotFoundError:
         body = None
     if body is None:
@@ -440,7 +487,9 @@ def _final_frame_grid(plan, pipeline) -> str:
     return plan.frame_types[final_frame_name(pipeline, plan.ops)].grid
 
 
-async def respond_to_analysis_vector_tile(pipeline, x: int, y: int, z: int, *, base_path=None) -> Response:
+async def respond_to_analysis_vector_tile(
+    pipeline, x: int, y: int, z: int, *, base_path=None, receive: Receive | None = None
+) -> Response:
     """Build the response for `GET /v1/analysis/{z}/{x}/{y}.pbf`.
 
     Unlike the `png`/`jpg` tile route, this compiles `pipeline` WITHOUT a `TileRequest`:
@@ -468,7 +517,7 @@ async def respond_to_analysis_vector_tile(pipeline, x: int, y: int, z: int, *, b
         return sink.sink_vector_tile(result, grid_name, (x, y, z))
 
     try:
-        body = await _run_tile_render(_render)
+        body = await _run_tile_render(_render, receive)
     except FileNotFoundError:
         body = None
     if body is None:

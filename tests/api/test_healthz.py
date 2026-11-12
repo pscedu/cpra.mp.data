@@ -94,3 +94,102 @@ def test_tile_renders_are_capped(monkeypatch):
     anyio.run(burst)
     assert peak == 2
     assert pipeline._tiles_in_flight == 0
+
+
+def _receive_until(disconnected: anyio.Event):
+    """An ASGI `receive` for a bodiless GET whose client hangs up when `disconnected` is set."""
+    sent_request = False
+
+    async def receive():
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+def test_tile_queued_when_client_disconnects_is_not_rendered(monkeypatch):
+    """A tile still waiting for a render slot when its client hangs up (a map panning
+    away: Traefik's 499s) is dropped rather than rendered for nobody."""
+    from cpra.mp.data import config
+    from cpra.mp.data.api import pipeline
+
+    monkeypatch.setattr(config, "TILE_RENDER_CONCURRENCY", 1)
+    release = threading.Event()
+    rendered = []
+
+    def render(name):
+        def _render():
+            release.wait(5)
+            rendered.append(name)
+            return name.encode()
+
+        return _render
+
+    async def scenario():
+        gone = anyio.Event()
+        results = {}
+
+        async def tile(name, receive):
+            results[name] = await pipeline._run_tile_render(render(name), receive)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(tile, "holds-slot", _receive_until(anyio.Event()))
+            await anyio.sleep(0.05)
+            tg.start_soon(tile, "queued", _receive_until(gone))
+            await anyio.sleep(0.05)
+            gone.set()
+            await anyio.sleep(0.05)
+            release.set()
+        return results
+
+    results = anyio.run(scenario)
+    assert rendered == ["holds-slot"]
+    assert results == {"holds-slot": b"holds-slot", "queued": None}
+    assert pipeline._tiles_in_flight == 0
+
+
+def test_tile_already_rendering_finishes_after_disconnect():
+    """A render that has started runs to completion -- the worker thread can't be
+    interrupted -- and its slot is released normally."""
+    from cpra.mp.data.api import pipeline
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def render():
+        started.set()
+        release.wait(5)
+        return b"tile"
+
+    async def scenario():
+        gone = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pipeline._run_tile_render, render, _receive_until(gone))
+            await anyio.to_thread.run_sync(started.wait, 5)
+            gone.set()
+            await anyio.sleep(0.05)
+            release.set()
+
+    anyio.run(scenario)
+    assert release.is_set()
+    assert pipeline._tiles_in_flight == 0
+
+
+def test_tile_render_error_is_not_wrapped_in_exception_group():
+    """Watching for a disconnect puts the render inside a task group; its exception must
+    still come out bare, or the tile routes' `except FileNotFoundError` and
+    `api.boundary`'s handlers would stop matching it."""
+    from cpra.mp.data.api import pipeline
+
+    def render():
+        raise FileNotFoundError("no such dataset")
+
+    async def scenario():
+        await pipeline._run_tile_render(render, _receive_until(anyio.Event()))
+
+    with pytest.raises(FileNotFoundError):
+        anyio.run(scenario)
