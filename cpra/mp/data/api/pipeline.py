@@ -51,7 +51,7 @@ from cpra.mp.data.analysis.execution.execute import execute, run_to_path
 from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.io import output
 from cpra.mp.data.analysis.request.ops import final_frame_name
-from cpra.mp.data.analysis.request.types import CompressionAlgorithm
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
 from cpra.mp.data.api.tabular import StreamingThread, sleep_between_polls
 from cpra.mp.data.variables import VARIABLES
@@ -339,7 +339,7 @@ def _raster_profile_options(compression) -> dict:
     profile_options = {"compress": compression.compression_algorithm.value.upper()}
     level_option = COMPRESSION_LEVEL_OPTIONS.get(compression.compression_algorithm)
     if level_option is not None:
-        profile_options[level_option] = compression.compression_level
+        profile_options[level_option] = compression.level_for(DataFormat.tif)
     return profile_options
 
 

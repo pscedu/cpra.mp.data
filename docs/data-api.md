@@ -53,7 +53,9 @@ a dataset in the path: an analysis that supplies its own inputs has no triple to
 Tabular formats are `csv`, `ndjson`, and `parquet`. Raster output is `tif` (GeoTIFF);
 raster map tiles are `png` or `jpg`; vector map tiles are Mapbox vector tiles (`pbf`).
 Tabular and GeoTIFF responses accept `compression_algorithm` and `compression_level`
-parameters (the accepted algorithms differ by format; `zstd` level 6 is the default).
+parameters (the accepted algorithms differ by format). The default is `zstd`, at level 3
+for GeoTIFFs and level 6 for tabular formats. GeoTIFFs are written in strips of up to 64
+rows.
 
 ## Filter
 

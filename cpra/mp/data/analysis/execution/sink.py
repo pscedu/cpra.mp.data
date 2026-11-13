@@ -408,7 +408,7 @@ def _strip_height(window: ReadWindow, n_bands: int, output_block_height: int) ->
 
     At least one output block row, whatever the budget, since a strip cannot be smaller.
     """
-    budget_rows = config.RASTER_WRITE_STRIP_MB * 1024 * 1024 // (window.width * n_bands * _STRIP_BYTES_PER_BAND)
+    budget_rows = _strip_budget_rows(window.width, n_bands)
     source_block_height = window.batch_layout[0][3] if window.batch_layout else 1
     unit = math.lcm(source_block_height, output_block_height)
     if budget_rows < unit:
@@ -416,9 +416,39 @@ def _strip_height(window: ReadWindow, n_bands: int, output_block_height: int) ->
     return max(unit, budget_rows // unit * unit)
 
 
+def _strip_budget_rows(width: int, n_bands: int) -> int:
+    """How many full-width rows of `n_bands` bands `config.RASTER_WRITE_STRIP_MB` holds."""
+    return config.RASTER_WRITE_STRIP_MB * 1024 * 1024 // (width * n_bands * _STRIP_BYTES_PER_BAND)
+
+
+# Rows per strip of a written GeoTIFF, at most. GDAL's default for a compressed striped file
+# is one row, and a one-row strip is too short for the compressor to find much to work
+# with: 16-64-row strips were 7-15% smaller at the same zstd level and speed, measured on
+# 16640-wide morph_pixel_v002 rasters (`scratch/tif-download-compression-investigation.md`).
+# Strips rather than tiles: a strip is full-width, so `write_raster_strips` completes every
+# strip it touches and none is ever held part-written.
+_OUTPUT_STRIP_ROWS = 64
+
+
+def _output_strip_rows(height: int, width: int, n_bands: int) -> int:
+    """`_OUTPUT_STRIP_ROWS`, unless fewer fit `write_raster_strips`' memory budget -- a strip
+    of the file cannot be taller than a strip of the write (`_strip_height`), so an output
+    strip over budget would put a many-band download over it too -- or the file is shorter.
+    """
+    return max(1, min(_OUTPUT_STRIP_ROWS, _strip_budget_rows(width, n_bands), height))
+
+
 def _raster_profile(window: ReadWindow, count: int, dtype: str, nodata, profile_options: dict) -> dict:
     """The write profile both raster sinks open their file with: a GeoTIFF over `window`'s
-    pixels, `**profile_options` layered on top (see `write_raster`)."""
+    pixels, `**profile_options` layered on top (see `write_raster`).
+
+    Two defaults beyond the georeferencing, either of which `profile_options` overrides:
+    `_output_strip_rows`-row strips (unless `profile_options` asks for tiles), and
+    compression on `config.RASTER_NUM_THREADS` worker threads (GDAL's `NUM_THREADS`
+    creation option; GDAL otherwise compresses on the writing thread alone). Compression
+    is a block at a time, so threads need more than one block in flight to help -- which
+    the multi-row strips are also for.
+    """
     # `read_shape`, not `height`/`width`: those are the window's SOURCE extent, which is the
     # array's shape only when the read was undecimated. `window.transform` is already scaled
     # to match, so the written file is georeferenced correctly either way.
@@ -432,7 +462,10 @@ def _raster_profile(window: ReadWindow, count: int, dtype: str, nodata, profile_
         "crs": window.crs,
         "transform": window.transform,
         "nodata": nodata,
+        "num_threads": config.RASTER_NUM_THREADS,
     }
+    if not profile_options.get("tiled"):
+        profile["blockysize"] = _output_strip_rows(read_height, read_width, count)
     profile.update(profile_options)
     return profile
 

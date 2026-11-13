@@ -61,7 +61,7 @@ def stream_or_write_to_file(source, out_path, format, compression, collect_in_me
         uncompressed = compression.compression_algorithm == CompressionAlgorithm.none
         stream_kwargs = {
             "compression": "uncompressed" if uncompressed else compression.compression_algorithm.value,
-            "compression_level": None if uncompressed else compression.compression_level,
+            "compression_level": None if uncompressed else compression.level_for(format),
         }
 
     # Whatever the source itself needs for this format, on top of the request's own

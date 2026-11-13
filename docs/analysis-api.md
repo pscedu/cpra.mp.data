@@ -123,8 +123,9 @@ time (comma-separated `[-]column`, no empty component, no bare `-`, no `-` prefi
 result is collected.
 
 Compression is **not** part of the pipeline body -- it is a pair of query parameters,
-`compression_algorithm` (default `zstd`) and `compression_level` (default `6`), accepted
-on both `POST /v1/data.{format}` and `GET /v1/data.{format}`. For `tif` output the
+`compression_algorithm` (default `zstd`) and `compression_level` (default `3` for a `tif`
+compressed with `zstd`, otherwise `6`), accepted on both `POST /v1/data.{format}` and
+`GET /v1/data.{format}`. For `tif` output the
 algorithm must be one of `deflate`/`lzw`/`lzma`/`zstd`/`none`; for tabular output, one of
 `gzip`/`lz4`/`zstd`/`none`. There is no `output.compression` field -- an earlier version
 accepted one and then ignored it; it is now rejected like any other unknown output field.

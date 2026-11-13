@@ -20,6 +20,7 @@ from cpra.mp.data.api.pipeline import (
     _TABULAR_MIME_TYPES,
     COMPRESSION_LEVEL_OPTIONS,
     PipelineTabularResponse,
+    _raster_profile_options,
 )
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse, StreamingThread
@@ -288,3 +289,9 @@ class TestCompressionLevelOptions:
     def test_algorithms_without_a_level_option(self):
         assert CompressionAlgorithm.lzw not in COMPRESSION_LEVEL_OPTIONS
         assert CompressionAlgorithm.none not in COMPRESSION_LEVEL_OPTIONS
+
+    def test_tif_profile_defaults_to_zstd_3(self):
+        assert _raster_profile_options(Compression()) == {"compress": "ZSTD", "zstd_level": 3}
+
+    def test_tif_profile_keeps_an_explicit_level(self):
+        assert _raster_profile_options(Compression(compression_level=6)) == {"compress": "ZSTD", "zstd_level": 6}

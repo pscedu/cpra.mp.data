@@ -3,6 +3,8 @@
 from datetime import date
 from enum import Enum
 
+import pytest
+
 from cpra.mp.data.analysis.request.types import (
     AggregateFunction,
     CompressionAlgorithm,
@@ -159,9 +161,29 @@ class TestDataQuery:
 
     def test_compression_defaults_flat(self):
         assert DataQuery().compression_algorithm == CompressionAlgorithm.zstd.value
-        assert DataQuery().compression_level == 6
+        # Unset: the level is resolved per format (`Compression.level_for`).
+        assert DataQuery().compression_level is None
 
     def test_compression_defaults(self):
         compression = Compression()
         assert compression.compression_algorithm == CompressionAlgorithm.zstd
-        assert compression.compression_level == 6
+        assert compression.compression_level is None
+
+    @pytest.mark.parametrize(
+        ("algorithm", "format", "expected"),
+        [
+            # A `tif` compresses whole bands on the request's critical path -- zstd 3 ...
+            (CompressionAlgorithm.zstd, DataFormat.tif, 3),
+            ("zstd", "tif", 3),
+            # ... while the tabular formats, and any other raster algorithm, keep 6.
+            (CompressionAlgorithm.zstd, DataFormat.parquet, 6),
+            (CompressionAlgorithm.gzip, DataFormat.parquet, 6),
+            (CompressionAlgorithm.deflate, DataFormat.tif, 6),
+        ],
+    )
+    def test_level_for_default(self, algorithm, format, expected):
+        assert Compression(compression_algorithm=algorithm).level_for(format) == expected
+
+    @pytest.mark.parametrize("format", [DataFormat.tif, DataFormat.parquet])
+    def test_level_for_explicit_level_wins(self, format):
+        assert Compression(compression_level=9).level_for(format) == 9

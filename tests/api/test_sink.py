@@ -60,6 +60,8 @@ from cpra.mp.data.analysis.execution.plan import TileRequest, compile_plan
 from cpra.mp.data.analysis.execution.sink import (
     DEFAULT_NODATA,
     _band_descriptions,
+    _output_strip_rows,
+    _raster_profile,
     _resolve_write_dtype,
     _strip_height,
     apply_output_shaping,
@@ -598,6 +600,64 @@ class TestStripHeight:
 
     def test_never_less_than_one_output_block_row(self):
         assert _strip_height(self._window(), 1000, 16) == 16
+
+
+class TestRasterProfile:
+    """`_raster_profile`'s defaults beyond georeferencing: multi-row strips, sized within
+    `write_raster_strips`' budget, and `NUM_THREADS` compression -- each overridable."""
+
+    @staticmethod
+    def _window(width=1000, height=5000):
+        return ReadWindow(
+            source=(),
+            col_off=0,
+            row_off=0,
+            width=width,
+            height=height,
+            transform=rasterio.transform.from_origin(0, 0, 1, 1),
+            crs=None,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _one_mb(self, monkeypatch):
+        monkeypatch.setattr(sink_module.config, "RASTER_WRITE_STRIP_MB", 1)
+
+    def test_64_row_strips_when_the_budget_allows(self):
+        # 1 MiB / (1000 px x 1 band x 8 B) = 131 rows.
+        assert _output_strip_rows(5000, 1000, 1) == 64
+
+    def test_fewer_rows_when_the_budget_does_not(self):
+        # 1 MiB / (1000 px x 4 bands x 8 B) = 32 rows -- a 64-row output strip would force
+        # `_strip_height` past the budget, since a write strip is whole output strips.
+        assert _output_strip_rows(5000, 1000, 4) == 32
+        assert _strip_height(self._window(), 4, _output_strip_rows(5000, 1000, 4)) == 32
+
+    def test_never_taller_than_the_file_or_under_one_row(self):
+        assert _output_strip_rows(10, 1000, 1) == 10
+        assert _output_strip_rows(5000, 1000, 1000) == 1
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.setattr(sink_module.config, "RASTER_NUM_THREADS", "4")
+        profile = _raster_profile(self._window(), 1, "int32", -9999, {"compress": "ZSTD"})
+        assert profile["blockysize"] == 64
+        assert profile["num_threads"] == "4"
+        assert profile["compress"] == "ZSTD"
+
+    def test_profile_options_override_the_defaults(self):
+        profile = _raster_profile(self._window(), 1, "int32", -9999, {"blockysize": 16, "num_threads": 1})
+        assert profile["blockysize"] == 16
+        assert profile["num_threads"] == 1
+
+    def test_tiles_get_no_strip_default(self):
+        profile = _raster_profile(self._window(), 1, "int32", -9999, {"tiled": True})
+        assert "blockysize" not in profile
+
+    def test_the_written_file_has_the_strips(self, base_path, tmp_path):
+        write_raster_dataset(base_path, years=(2030,))
+        pipeline = _pipeline({"inputs": {"a": raster_input()}, "output": {"format": "tif"}})
+        assert run_to_path(pipeline, tmp_path / "out.tif", base_path=base_path, compress="ZSTD") is True
+        with rasterio.open(tmp_path / "out.tif") as written:
+            assert written.block_shapes[0] == (min(64, written.height), written.width)
 
 
 class TestBandDescriptions:

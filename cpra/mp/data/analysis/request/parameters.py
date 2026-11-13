@@ -18,7 +18,7 @@ one owns the field sets those vocabularies type.
 
 from pydantic import BaseModel, ConfigDict, create_model
 
-from cpra.mp.data.analysis.request.types import CompressionAlgorithm, dimension_type
+from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat, dimension_type
 from cpra.mp.data.dimensions import DATASET_DIMENSIONS, DIMENSIONS
 
 BaseDatasetDimensions = create_model(
@@ -64,7 +64,23 @@ class Compression(BaseModel):
     """
 
     compression_algorithm: CompressionAlgorithm = CompressionAlgorithm.zstd
-    compression_level: int = 6
+    # `None` = the per-format default, `level_for` -- never read this field directly.
+    compression_level: int | None = None
+
+    def level_for(self, format: DataFormat | str) -> int:
+        """The level to compress a `format` response at: the caller's own
+        `compression_level` if they gave one, else `zstd` 3 for a `tif` and 6 for anything
+        else. `tif` defaults lower because a raster download compresses whole bands of
+        pixels on the request's critical path -- zstd 6 cost about 4 s per continuous
+        16640x5824 band, level 3 about half that, for files at most a few percent larger
+        (`scratch/tif-download-compression-investigation.md`) -- while the tabular formats
+        kept the 6 they always had.
+        """
+        if self.compression_level is not None:
+            return self.compression_level
+        if format == DataFormat.tif and self.compression_algorithm == CompressionAlgorithm.zstd:
+            return 3
+        return 6
 
 
 class DataOptions(BaseModel):
