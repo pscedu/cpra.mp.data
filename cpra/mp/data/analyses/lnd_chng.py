@@ -158,7 +158,8 @@ class LandChange(Analysis):
     @property
     def collapsed_dimensions(self) -> frozenset[str]:
         """Stated here rather than derived, because `base.default_collapsed_dimensions`
-        reads a trailing `group.by` and this pipeline ends on a `calculate`.
+        reads a trailing `group.by` and this pipeline ends on a `join` (then a `calculate`,
+        which that scan looks past).
 
         The answer is also shorter than it used to be. `calendar_year` is no longer in it:
         the result carries one value per (grid cell, selected comparison year), so the

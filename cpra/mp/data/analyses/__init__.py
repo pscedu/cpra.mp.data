@@ -230,9 +230,9 @@ def resolve_analysis_chain(
     structurally from the intermediate pipeline via `default_collapsed_dimensions` at each
     step, because that would be wrong for a chain led by an analysis (e.g. `lnd_type_plus`)
     whose `collapsed_dimensions` is a hand-written override rather than the structural
-    default: `default_collapsed_dimensions` reports `frozenset()` whenever the pipeline's
-    last step isn't a `group`, which is exactly `lnd_type_plus`'s own case (it ends in a
-    `case`), so recomputing structurally after stage 1 would silently forget that
+    default: `default_collapsed_dimensions` reports `frozenset()` whenever the pipeline
+    doesn't end on a `group` (past any trailing `filter`/`calculate`/`case`), which is
+    exactly `lnd_type_plus`'s own case (it ends on a `join`, then a `case`), so recomputing structurally after stage 1 would silently forget that
     `aggregate_type` is already gone. The FINAL published `collapsed_dimensions` (below)
     doesn't have this problem and is recomputed structurally on purpose: the combined
     pipeline by then always ends in a real trailing `group` (every `_dimension_steps`

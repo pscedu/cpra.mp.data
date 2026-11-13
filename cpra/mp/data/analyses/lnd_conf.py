@@ -28,6 +28,14 @@ applies to, so the five arms partition the frame the way `SCENARIO_WEIGHTS` does
 whole ensemble is scaled in one step; it too has no `else`, since the leading `filter`
 pinned `scenario_id` to exactly these five and there is no sixth member to pass through.
 
+**The result is float32.** A trailing `calculate` casts the summed fraction from float64,
+which halves a GeoTIFF download's raw size (the sink writes the frame's own dtype) and
+costs nothing real: the fraction can only take the 17 subset sums of `SCENARIO_WEIGHTS`
+(weights of 2-3 significant digits), which float32 moves by at most 2.1e-8 while they lie
+at least 0.005 apart, and `0.5`, `1.0` and the `-9999` nodata fill all stay exact.
+`lnd_conf_chng` reuses `confidence_steps`, not this cast, so it classifies the float64
+sum as before.
+
 A cell that is nodata in only SOME members is summed over the members it has, so its
 weights no longer total `1.0` and its confidence reads low rather than being rescaled to
 the members that actually reported. That is the arithmetic `group`/`sum` gives; a
@@ -180,6 +188,10 @@ class LandConfidence(Analysis):
         # A pipeline's first step must name its input explicitly; every later step chains
         # from the one before it.
         steps[0]["input"] = "x"
+        # The result as float32 -- see the module docstring. After the `group`, so the
+        # weighted sum itself is still float64. `real`, not `float`: Polars' SQL reads
+        # `float` as Float64.
+        steps.append({"op": "calculate", "expression": "cast(value as real)"})
 
         data = {
             "inputs": {"x": dataset_input_selection(self.dataset)},

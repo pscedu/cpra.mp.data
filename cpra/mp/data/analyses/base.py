@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 from cpra.mp.data.analysis.request.data_query import grid_cell_conjunct
 from cpra.mp.data.analysis.request.expressions import split_top_level_and
-from cpra.mp.data.analysis.request.pipeline import FilterStep, GroupStep, Pipeline
+from cpra.mp.data.analysis.request.pipeline import CalculateStep, CaseStep, FilterStep, GroupStep, Pipeline
 from cpra.mp.data.dimensions import DIMENSIONS
 from cpra.mp.data.grids import GRIDS
 from cpra.mp.data.utils import get_input_data_frame, required_columns
@@ -307,13 +307,15 @@ def default_collapsed_dimensions(pipeline: Pipeline) -> frozenset[str]:
     filter narrows rows; it never collapses a dimension, so it must not hide the `group`
     that did. Reading `steps[-1]` bare would make every selected request report nothing
     collapsed, which `visualizations.base` then turns into a `select` naming a column the
-    read cannot find.
+    read cannot find. A trailing `calculate`/`case` is skipped for the same reason: it
+    rewrites the value in place, row for row and band for band, so the dimensions the
+    `group` before it collapsed stay collapsed (`lnd_conf`'s float32 cast is one).
 
     An empty `steps` is the `download` sentinel's shape -- one input, no ops -- and
     collapses nothing.
     """
     for step in reversed(pipeline.steps):
-        if isinstance(step, FilterStep):
+        if isinstance(step, FilterStep | CalculateStep | CaseStep):
             continue
         if isinstance(step, GroupStep):
             return frozenset(pipeline_input_dimensions(pipeline)) - set(step.by)

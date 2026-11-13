@@ -690,6 +690,24 @@ class TestSharedHelpers:
         pipeline.steps.append(FilterStep(where="grid_cell = 5"))
         assert default_collapsed_dimensions(pipeline) == expected
 
+    def test_default_collapsed_dimensions_sees_past_a_trailing_value_rewrite(self):
+        """A `calculate`/`case` rewrites the value row for row and band for band, so it
+        cannot bring a collapsed dimension back -- `lnd_conf`'s trailing float32 cast is
+        the case that needs this."""
+        analysis = Difference(
+            dataset=SSF_DATASET,
+            filters={"calendar_year": [2030, 2040], "model_group_id": 500, "scenario_id": 7, "percentile": 50},
+            parameters=Difference.Parameters(dimension="calendar_year", order="asc"),
+        )
+        pipeline = analysis.pipeline()
+        expected = default_collapsed_dimensions(pipeline)
+        assert expected
+
+        pipeline.steps.append(CalculateStep(expression="cast(value as real)"))
+        pipeline.steps.append(CaseStep(cases=[{"when": "value < 0", "then": "0"}], else_="value"))
+        pipeline.steps.append(FilterStep(where="model_group_id = 500"))
+        assert default_collapsed_dimensions(pipeline) == expected
+
     def test_default_collapsed_dimensions_empty_for_a_stepless_pipeline(self):
         """The `download` sentinel's shape -- one input, no ops. `steps[-1]` would raise."""
         pipeline = Difference(
@@ -1429,19 +1447,27 @@ class TestLandConfidencePipeline:
 
     def test_the_group_sums_over_every_dimension_but_scenario_id(self):
         analysis, pipeline = self._build()
-        group = pipeline.steps[-1]
+        group = pipeline.steps[4]
         assert isinstance(group, GroupStep)
         assert group.aggregate == "sum"
         assert sorted(group.by) == ["calendar_year", "model_group_id"]
         assert "scenario_id" not in group.by
         assert analysis.collapsed_dimensions == frozenset({"scenario_id"})
 
-    def test_the_step_count_does_not_grow_with_the_member_count(self):
-        # Two filters, the mapping `case`, the weighting `case`, the `group` -- five, no
-        # matter how many members `SCENARIO_WEIGHTS` names, because the members are arms of
-        # one step rather than steps of their own.
+    def test_the_sum_is_cast_to_float32_last(self):
+        # After the `group`, so the weighted sum itself is float64. `real`, because Polars'
+        # SQL reads `float` as Float64 and the cast would silently do nothing.
         _, pipeline = self._build()
-        assert len(pipeline.steps) == 5
+        cast = pipeline.steps[-1]
+        assert isinstance(cast, CalculateStep)
+        assert cast.expression == "cast(value as real)"
+
+    def test_the_step_count_does_not_grow_with_the_member_count(self):
+        # Two filters, the mapping `case`, the weighting `case`, the `group`, the cast --
+        # six, no matter how many members `SCENARIO_WEIGHTS` names, because the members are
+        # arms of one step rather than steps of their own.
+        _, pipeline = self._build()
+        assert len(pipeline.steps) == 6
 
     def test_the_output_format_is_the_one_the_pipeline_can_actually_run_under(self):
         # `Output.format` is required, so `pipeline()` has to set something; every
@@ -1479,7 +1505,7 @@ class TestLandConfidencePipeline:
             params={},
         )
         assert isinstance(resolved, ResolvedAnalysis)
-        assert resolved.pipeline.steps[-1].aggregate == "sum"
+        assert resolved.pipeline.steps[-2].aggregate == "sum"
         assert resolved.collapsed_dimensions == frozenset({"scenario_id"})
 
     def test_a_scenario_id_filter_is_rejected_by_resolve_analysis(self):

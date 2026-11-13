@@ -89,8 +89,8 @@ class LandConfidenceChange(Analysis):
 
     @property
     def collapsed_dimensions(self) -> frozenset[str]:
-        """Stated rather than derived: the pipeline ends on a `calculate`, which
-        `base.default_collapsed_dimensions` reads as collapsing nothing. The ensemble is
+        """Stated rather than derived: the pipeline ends on a `join` (then a `calculate`),
+        which `base.default_collapsed_dimensions` reads as collapsing nothing. The ensemble is
         folded away; `calendar_year` is not -- the result varies over the comparison
         years the caller selected."""
         return frozenset({"scenario_id"})

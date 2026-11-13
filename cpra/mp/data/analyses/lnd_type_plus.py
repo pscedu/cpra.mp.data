@@ -264,7 +264,8 @@ class LndTypePlus(Analysis):
     @property
     def collapsed_dimensions(self) -> frozenset[str]:
         """Stated here rather than derived, because `base.default_collapsed_dimensions`
-        reads a trailing `group.by` and this pipeline ends on a `case`.
+        reads a trailing `group.by` and this pipeline ends on a `join` (then a `case`,
+        which that scan looks past).
 
         The collapse is no less structural for that -- it is just carried by a different
         mechanism. A paired `case` reduces each pairing GROUP to one band, and the groups

@@ -652,6 +652,7 @@ class TestLandConfidenceRoute:
         response = client.get("/v1/data.tif", params=LAND_TYPE_CONFIDENCE_QUERY)
         assert response.status_code == 200, response.text
         with rio.open(io.BytesIO(response.content)) as src:
+            assert src.dtypes == ("float32",)
             band = src.read(1, masked=True)
         assert band.count()
         assert band.compressed() == pytest.approx(1.0)
@@ -671,7 +672,7 @@ class TestLandConfidenceRoute:
         assert expanded.steps[0].where == (
             "calendar_year = 2050 AND model_group_id = 500 AND scenario_id IN (34, 35, 36, 37, 38)"
         )
-        assert expanded.steps[-1].by == ["model_group_id", "calendar_year"]
+        assert expanded.steps[-2].by == ["model_group_id", "calendar_year"]
 
     def test_pipeline_json_publishes_a_resubmittable_pipeline(self, client, ensemble_dataset):
         """`pipeline.json` is the one route that does NOT override `output.format` from a

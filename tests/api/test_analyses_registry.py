@@ -60,6 +60,7 @@ reclassify a depth, and an `else` that hands back one of the operands untouched 
 pixel.
 """
 
+import numpy as np
 import pytest
 import rasterio as rio
 
@@ -495,6 +496,17 @@ class TestLandConfidenceExecution:
             band = src.read(1, masked=True)
             assert band.count(), "the analysis returned no valid pixels at all"
             assert band.compressed() == pytest.approx(expected)
+
+    def test_the_result_is_written_as_float32(self, base_path, tmp_path):
+        # The trailing cast (`lnd_conf.py`'s module docstring): half the raw size of the
+        # float64 the sum would otherwise be written as, and no precision that means
+        # anything -- the value is the float32 nearest the weighted sum.
+        _write_ensemble(base_path, {34: 1, 35: 2, 36: 3, 37: 2, 38: 2})
+        with rio.open(self._run_confidence(base_path, tmp_path)) as src:
+            assert src.dtypes == ("float32",)
+            band = src.read(1, masked=True)
+        assert band.count()
+        assert np.all(band.compressed() == np.float32(SCENARIO_WEIGHTS[34] + SCENARIO_WEIGHTS[36]))
 
     def test_every_member_land_sums_to_one(self, base_path, tmp_path):
         # 1 is a land code, so every member votes land and the weights total 1.0 --
