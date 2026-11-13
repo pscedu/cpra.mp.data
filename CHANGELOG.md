@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.58.1](https://github.com/pscedu/cpra.mp.data/compare/v0.58.0...v0.58.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* use jemalloc in API image ([8348e5d](https://github.com/pscedu/cpra.mp.data/commit/8348e5df9d5feda75caa6db885cc2fe19bae2ae6))
+
+
+### Performance Improvements
+
+* **analyses:** change lnd_conf result data type to Float32 ([2de2962](https://github.com/pscedu/cpra.mp.data/commit/2de2962dc3c59ce5c0a1acfe85d9c784d0264e16))
+* **analysis:** stream raster downloads to avoid OOM ([2a9bc52](https://github.com/pscedu/cpra.mp.data/commit/2a9bc529170ddbe459be4acf88a1d6f1e8bf8658))
+* **analysis:** write GeoTIFF downloads in strips ([c07de37](https://github.com/pscedu/cpra.mp.data/commit/c07de37713f0f355d9c9744bc85771a289b9a7d0))
+* **pipeline:** stop cancelled tile requests ([0786ce6](https://github.com/pscedu/cpra.mp.data/commit/0786ce6a4aa9aa9e41e45d0a744df4d2d34e6291))
+* **raster:** read COGs directly instead of using VRT ([86020b4](https://github.com/pscedu/cpra.mp.data/commit/86020b464fc2f0d2ce14c9ea36e139dc291da73f))
+
 ## [0.58.0](https://github.com/pscedu/cpra.mp.data/compare/v0.57.1...v0.58.0) (2026-11-11)
 
 
