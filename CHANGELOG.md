@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.58.2](https://github.com/pscedu/cpra.mp.data/compare/v0.58.1...v0.58.2) (2026-11-13)
+
+
+### Performance Improvements
+
+* **raster:** improve download performance for multiband GeoTIFFs ([f4d181e](https://github.com/pscedu/cpra.mp.data/commit/f4d181e05a0bc8b877246ac3c338d799ed4620f4))
+
 ## [0.58.1](https://github.com/pscedu/cpra.mp.data/compare/v0.58.0...v0.58.1) (2026-11-13)
 
 
