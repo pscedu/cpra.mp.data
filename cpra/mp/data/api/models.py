@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 from sqlmodel import Field, SQLModel
@@ -269,6 +269,11 @@ class VisualizationQuery(DataQuery):
     show_grid_labels: bool = False
     show_grid_lines: bool = True
     is_overlay: bool = True
+    # Where a vector grid's values meet its geometry: "server" injects them into each tile
+    # (`/v1/data/{z}/{x}/{y}.pbf`); "client" points the source at the bare grid tiles and
+    # names a `/v1/data.csv` URL in the style's metadata for the client to load into
+    # feature state (`Map.chart`). Ignored for raster grids.
+    vector_join: Literal["server", "client"] = "server"
 
 
 # Category 5 of the decoder's partition: the render options, derived rather than listed.

@@ -309,10 +309,7 @@ class Map(DatasetVisualization):
                 "minzoom": 0,
                 "maxzoom": 14,
             }
-        return {
-            "type": "vector",
-            "url": f"{STATIC_TILES_BASE_URL}/{grid_name}",
-        }
+        return self.grid_source(grid_name)
 
     def _tile_url_template(self, format: str) -> str:
         """The `/v1/data/{z}/{x}/{y}.{format}` template this map's tiles are fetched from.
@@ -341,15 +338,37 @@ class Map(DatasetVisualization):
             return f"{base_url}?{urlencode(query_params)}"
         return base_url
 
-    def _legend_fill_expr(self, is_difference: bool) -> list:
-        """Build a MapLibre color expression from the legend using the 'value' property.
+    @staticmethod
+    def grid_source(grid_name: str) -> dict[str, Any]:
+        """A vector source for the grid's bare boundary tiles, as Martin serves them.
+
+        Its URL is the same for every request on the grid, so a client swapping styles
+        keeps the source, and the tiles it has loaded, for as long as the grid is unchanged.
+        The TileJSON carries the archive's own zoom range, so MapLibre overzooms past it.
+        """
+        return {
+            "type": "vector",
+            "url": f"{STATIC_TILES_BASE_URL}/{grid_name}",
+        }
+
+    def _feature_values_url(self) -> str:
+        """The `/v1/data.csv` URL whose `grid_cell`/`value` rows a client joins onto
+        `grid_source`'s features: the same request the `.pbf` tiles would each have run."""
+        base_url = str(self.request.url_for("get_data", format="csv"))
+        query_params = [*self.dataset_params, *self.forward_query(compression=False), ("select", "grid_cell,value")]
+        return f"{base_url}?{urlencode(query_params)}"
+
+    def _legend_fill_expr(self, is_difference: bool, feature_state: bool = False) -> list:
+        """Build a MapLibre color expression from the legend using the 'value' property --
+        of the tile's features, or of their feature state when `feature_state` is set.
 
         Returns a 'case' expression that shows 'transparent' for features with
         no data, and applies a step (or interpolate for difference maps) otherwise.
         """
+        value = ["feature-state", "value"] if feature_state else ["get", "value"]
         if is_difference:
             stops = self._difference_breaks(self.variable)
-            fill_expr: list = ["interpolate", ["linear"], ["get", "value"]] + stops
+            fill_expr: list = ["interpolate", ["linear"], value] + stops
         else:
             legend = self._get_legend()
             if legend is None:
@@ -370,9 +389,11 @@ class Map(DatasetVisualization):
             if not ramp:
                 return "transparent"
 
-            fill_expr = ["step", ["get", "value"]] + ramp
+            fill_expr = ["step", value] + ramp
 
-        return ["case", ["has", "value"], fill_expr, "transparent"]
+        # `has` only tests properties; a feature with no state reads its value as null.
+        has_value = ["==", ["typeof", value], "number"] if feature_state else ["has", "value"]
+        return ["case", has_value, fill_expr, "transparent"]
 
     def projects_source(self, model_group_ids: list[int]) -> dict[str, Any]:
         """Generate a projects source definition.
@@ -889,14 +910,27 @@ class Map(DatasetVisualization):
             )
             data_layers = self.raster_layers("data-layer", "data")
         else:
-            style["sources"]["data"] = self.vector_source(self.grid.name)
-            if self.request:
+            if self.request and self.params.get("vector_join") == "client":
+                # Client-side join: the values are not in the tiles, so the client loads
+                # them from `feature_values.url` into the feature state the fill reads.
+                style["sources"]["data"] = self.grid_source(self.grid.name)
+                style["metadata"] = {
+                    "cpra:feature_values": {
+                        "url": self._feature_values_url(),
+                        "source": "data",
+                        "source_layer": "boundary",
+                    }
+                }
+                fill_color = self._legend_fill_expr(uses_ramp, feature_state=True)
+            elif self.request:
+                style["sources"]["data"] = self.vector_source(self.grid.name)
                 # Dynamic MVT endpoint: colors derived from the 'value' property
                 # embedded in each tile, no global-state lookup needed.
                 fill_color = self._legend_fill_expr(uses_ramp)
             else:
                 # Static PMTiles fallback: pre-compute colors server-side and
                 # pass via global state for the browser to look up per feature.
+                style["sources"]["data"] = self.vector_source(self.grid.name)
                 colors = self.feature_colors
                 max_id = max((int(k) for k in colors), default=0)
                 if colors and max_id < len(colors) * 10:

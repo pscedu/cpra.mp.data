@@ -1524,3 +1524,67 @@ class TestCors:
         assert response.status_code == 200
         assert "GET" in response.headers["access-control-allow-methods"]
         assert "X-Custom" in response.headers["access-control-allow-headers"]
+
+
+class TestClientJoinedMap:
+    """`vector_join=client`: the map style points at the bare grid tiles and names the
+    values for the client to load into feature state."""
+
+    QUERY = f"{VECTOR}&calendar_year=2030&vector_join=client"
+
+    def _style(self, client, query=QUERY):
+        response = client.get(f"/v1/visualizations/map.json?{query}")
+        assert response.status_code == 200
+        return response.json()
+
+    def test_the_source_is_the_bare_grid_tiles_from_martin(self, client, vector_data):
+        source = self._style(client)["sources"]["data"]
+        assert source == {"type": "vector", "url": f"{config.STATIC_TILES_BASE_URL}/ecoregion_v001"}
+
+    def test_the_source_is_the_same_for_every_selection_on_the_grid(self, client, vector_data):
+        """What lets a client keep the loaded tiles across a variable/year switch."""
+        a = self._style(client)["sources"]["data"]
+        b = self._style(client, f"{VECTOR}&calendar_year=2040&vector_join=client")["sources"]["data"]
+        assert a == b
+
+    def test_the_fill_reads_feature_state(self, client, vector_data):
+        (fill,) = [layer for layer in self._style(client)["layers"] if layer["id"] == "data-layer-fill"]
+        expr = json.dumps(fill["paint"]["fill-color"])
+        assert '["feature-state", "value"]' in expr
+        assert '["get", "value"]' not in expr
+
+    def test_the_values_url_is_the_same_request_as_grid_cell_value_rows(self, client, vector_data):
+        feature_values = self._style(client)["metadata"]["cpra:feature_values"]
+        assert (feature_values["source"], feature_values["source_layer"]) == ("data", "boundary")
+
+        url = urlparse(feature_values["url"])
+        assert url.path == "/v1/data.csv"
+        query = parse_qs(url.query)
+        assert query["calendar_year"] == ["2030"]
+        assert query["select"] == ["grid_cell,value"]
+        assert "vector_join" not in query
+
+        response = client.get(f"{url.path}?{url.query}")
+        assert response.status_code == 200
+        df = pl.read_csv(io.BytesIO(response.content))
+        assert df.columns == ["grid_cell", "value"]
+        assert df.height > 0
+
+    def test_the_values_url_carries_the_analysis(self, client, vector_data):
+        style = self._style(
+            client,
+            f"{VECTOR}&analysis=diff&dimension=calendar_year&order=asc"
+            "&calendar_year=2030&calendar_year=2040&vector_join=client",
+        )
+        url = urlparse(style["metadata"]["cpra:feature_values"]["url"])
+        query = parse_qs(url.query)
+        assert query["analysis"] == ["diff"]
+        assert query["dimension"] == ["calendar_year"]
+        response = client.get(f"{url.path}?{url.query}")
+        assert response.status_code == 200
+        assert pl.read_csv(io.BytesIO(response.content)).columns == ["grid_cell", "value"]
+
+    def test_the_server_join_is_still_the_default(self, client, vector_data):
+        style = self._style(client, f"{VECTOR}&calendar_year=2030")
+        assert "/v1/data/{z}/{x}/{y}.pbf" in style["sources"]["data"]["tiles"][0]
+        assert "metadata" not in style
