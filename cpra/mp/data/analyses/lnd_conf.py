@@ -165,7 +165,7 @@ def reject_scenario_selection(name: str, filters: dict[str, Any]) -> None:
 class LandConfidence(Analysis):
     Meta = AnalysisMeta(
         name="lnd_conf",
-        label="Land Confidence",
+        label="Confidence-Weighted Land/Water",
         variables=["lnd_type"],
         legend="lnd_conf",
         result_kind="value",

@@ -231,7 +231,7 @@ class TestDifferenceRampVsNamedLegend:
         metadata = m._get_legend_metadata(m._uses_difference_ramp())
         assert metadata["type"] == "continuous"
         assert [step["value"] for step in metadata["steps"]] == [-1, 0, 1]
-        assert metadata["title"] == "Land Confidence Difference"
+        assert metadata["title"] == "Confidence-Weighted Land/Water Difference"
 
 
 class TestLegendSortOrder:
@@ -347,8 +347,8 @@ class TestChartTitles:
         ("analysis", "title"),
         [
             (None, "Annual Land Type"),
-            ("lnd_conf", "Annual Land Confidence"),
-            ("lnd_conf,diff", "Annual Land Confidence Difference"),
+            ("lnd_conf", "Annual Confidence-Weighted Land/Water"),
+            ("lnd_conf,diff", "Annual Confidence-Weighted Land/Water Difference"),
             ("lnd_conf_chng", "Annual Confidence-Weighted Land Change"),
             ("lnd_chng", "Annual Land Change"),
         ],

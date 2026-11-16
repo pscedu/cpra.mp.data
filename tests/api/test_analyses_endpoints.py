@@ -766,7 +766,7 @@ class TestLandConfidenceLegendRoute:
 
         legend = style["state"]["legend"]["default"]["entries"][0]
         assert legend["type"] == "continuous"
-        assert legend["title"] == "Land Confidence Difference"
+        assert legend["title"] == "Confidence-Weighted Land/Water Difference"
 
 
 class TestLandChangeChainRoute:
