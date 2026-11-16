@@ -59,7 +59,6 @@ from cpra.mp.data.analyses.lnd_conf import (
     WATER_VALUES,
     LandConfidence,
 )
-from cpra.mp.data.analyses.lnd_conf_chng import CONFIDENCE_CLASSES
 from cpra.mp.data.analyses.lnd_type_plus import WATER_LAND_TYPE, LndTypePlus
 from cpra.mp.data.analyses.sal_veg_investigation import SalinityVegInvestigation
 from cpra.mp.data.analysis.execution.sink import DEFAULT_NODATA
@@ -225,9 +224,8 @@ class TestRegistry:
         # nodata sentinel alone (see the module docstring).
         assert all(0.0 <= b <= 1.0 for b in declared), declared
 
-    def test_land_confidence_legend_bands_are_the_change_classes(self):
-        """`lnd_conf`'s map shows the same four classes `lnd_conf_chng` pairs up, so a cell
-        reads the same class in both -- including the float-slack fractions just off `0.5`
+    def test_land_confidence_legend_classes(self):
+        """`lnd_conf`'s four classes, including the float-slack fractions just off `0.5`
         and `1.0`."""
         legend = LEGENDS[ANALYSES["lnd_conf"].Meta.legend]
         weights = SCENARIO_WEIGHTS.values()
@@ -244,29 +242,52 @@ class TestRegistry:
             "1",
             "1",
         ]
-        # And the same classes `lnd_conf_chng`'s `case` assigns.
-        thresholds = [float(when.split()[-1]) for when, _ in CONFIDENCE_CLASSES[:-1]]
-        assert bounds[1:] == thresholds
 
-    def test_land_confidence_change_legend_covers_every_transition_code(self):
-        """Each of the 16 `initial * 10 + current` codes lands in a labelled, opaque band
-        of its own color class -- not the `No Data` band, and not a neighbor's."""
+    def test_lnd_conf_chng_legend_classifies_every_possible_value(self):
+        """Every value `lnd_conf_chng` can produce -- each subset sum of the weights, less `0` from
+        an initially-water cell or `1` from an initially-land one, as the float32 it is
+        written in -- lands in the class the design names for it, never `No Data`."""
         legend = LEGENDS[ANALYSES["lnd_conf_chng"].Meta.legend]
         rows = legend.break_points.to_dicts()
-        codes = [i * 10 + c for i in range(1, 5) for c in range(1, 5)]
-        rgba = legend.colorize_pixels(np.array([[codes]], dtype=float))[0]
-        for code, color in zip(codes, rgba):
-            assert color[3] == 255, code
-        # Upper bounds are exclusive, so code N is in the row whose upper bound is the next
-        # code -- the label for code 14 sits on the row bounded by 21.
-        bounds = [r["upper_bound"] for r in rows]
-        label_of = {c: rows[int(np.digitize(c, [b for b in bounds if b is not None]))]["label"] for c in codes}
-        assert label_of[11] == "Stays Water, High Confidence"
-        assert label_of[14] == "Land Gain, High Confidence"
-        assert label_of[41] == "Land Loss, High Confidence"
-        assert label_of[44] == "Stays Land, High Confidence"
-        assert label_of[23] == "Land Gain, Low Confidence"
-        assert label_of[32] == "Land Loss, Low Confidence"
+        bounds = [r["upper_bound"] for r in rows if r["upper_bound"] is not None]
+        weights = list(SCENARIO_WEIGHTS.values())
+        fractions = sorted(
+            {round(sum(w for i, w in enumerate(weights) if mask >> i & 1), 6) for mask in range(2 ** len(weights))}
+        )
+        assert len(fractions) == 17
+
+        def label(value):
+            return rows[int(np.digitize(np.float32(value), bounds))]["label"]
+
+        def expected(change):
+            magnitude = abs(change)
+            if magnitude == 1:
+                level = "Highest"
+            elif magnitude > 0.5:
+                level = "High"
+            elif magnitude == 0.5:
+                level = "Low"
+            else:
+                level = "Lowest"
+            return f"{level} confidence land {'gain' if change > 0 else 'loss'}"
+
+        for initial in (0, 1):
+            for fraction in fractions:
+                change = round(fraction - initial, 6)
+                got = label(change)
+                if change == 0:
+                    assert got.startswith("Highest confidence no change"), (initial, fraction, got)
+                else:
+                    assert got == expected(change), (initial, fraction, got)
+        # Only the endpoints are the darkest classes.
+        assert label(0.915) == "High confidence land gain"
+        assert label(-0.915) == "High confidence land loss"
+
+    def test_lnd_conf_chng_no_change_is_transparent_and_change_is_not(self):
+        legend = LEGENDS["lnd_conf_chng"]
+        values = np.array([[[0.0, -1e-7, 1e-7, -1.0, -0.5, -0.085, 0.085, 0.5, 1.0]]])
+        alpha = legend.colorize_pixels(values)[0][:, 3]
+        assert alpha.tolist() == [0, 0, 0, 255, 255, 255, 255, 255, 255]
 
     @pytest.mark.parametrize("legend_name", ["lnd_conf", "lnd_conf_chng"])
     def test_the_confidence_legends_render_nodata_transparent(self, legend_name):
@@ -1495,7 +1516,8 @@ class TestLandConfidencePipeline:
         analysis, _ = self._build()
         assert analysis.legend == "lnd_conf"
         assert analysis.result_kind == "value"
-        assert analysis.title_suffix == " Confidence"
+        # Named by its `Meta.label` instead -- see `visualizations.base.result_label`.
+        assert analysis.title_suffix == ""
 
     def test_resolves_through_resolve_analysis(self):
         resolved = resolve_analysis(

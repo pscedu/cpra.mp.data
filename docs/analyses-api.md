@@ -309,23 +309,22 @@ not a signed change in it.
 
 ### `lnd_conf_chng`
 
-`kind="variable"`, reads the caller's dataset, `result_kind="category"`,
-`legend="lnd_conf_chng"`. A land-confidence transition code: `lnd_conf`'s fraction is
-computed for the initial-conditions year and for the selected `calendar_year`, each is
-classified, and the two class digits are concatenated as `initial * 10 + current`:
+`kind="variable"`, reads the caller's dataset, `result_kind="value"`, `legend="lnd_conf_chng"`.
+Confidence-Weighted Land Change: `lnd_conf`'s weighted land fraction in the selected
+`calendar_year`, minus `scenario_id` 34's land (`1`) / water (`0`) state in the
+initial-conditions year, as float32:
 
-| Class | `lnd_conf` fraction | Reading |
+| Initial (S34) | Result | Reading |
 |---|---|---|
-| 1 | `0` | water, high confidence |
-| 2 | `> 0` to `< 0.5` | water, low confidence |
-| 3 | `0.5` to `< 1` | land, low confidence |
-| 4 | `1` | land, high confidence |
+| water | `0` to `1` | `0` stays water; toward `1` land gain, more members agreeing |
+| land | `-1` to `0` | `0` stays land; toward `-1` land loss, more members agreeing |
 
-So `14` is water (high) becoming land (high), `41` the reverse, and `11`/`44` no change.
-The initial-conditions year is derived from the grid exactly as `lnd_chng`'s baseline is
-(`2029` on the MP2029 `_v002` grids). Like `lnd_conf`, it rejects a caller-supplied
-`scenario_id`; like `lnd_chng`, a raster image takes exactly one `calendar_year` (several
-are a series -- add a `grid_cell`).
+The legend classes each side by confidence (`+-1` highest, `> 0.5` high, `0.5` low, below
+`0.5` lowest), and draws both no-change classes transparent. The initial-conditions year
+is derived from the grid exactly as `lnd_chng`'s baseline is (`2029` on the MP2029 `_v002`
+grids). Like `lnd_conf`, it rejects a caller-supplied `scenario_id`; like `lnd_chng`, a
+raster image takes exactly one `calendar_year` (several are a series -- add a
+`grid_cell`).
 
 ```
 GET /v1/data.tif?variable=lnd_type&time_unit=annual&grid=morph_pixel_v002&analysis=lnd_conf_chng&model_group_id=705&calendar_year=2040

@@ -739,16 +739,25 @@ class DatasetVisualization:
     def result_label(self):
         """What this visualization's values are called, for a title or an axis.
 
-        The variable's own label wherever there is one variable. Where there isn't -- an
-        analysis that folds several into one result, so `output_descriptor(...).variable` is
-        `None` -- the analysis's own `Meta.label` is the only thing that names the result,
-        and is exactly the override `descriptor.py` declines to fold in on the grounds that
-        `analyses/` imports `request/` and not the other way round. The last fallback is for
-        neither: a multi-input pipeline written out by hand, which nothing names.
+        A `kind="variable"` analysis (`lnd_conf`) names its own result: it stands in for a
+        variable in the portal's picker, under its `Meta.label`, and its result is no
+        longer the input variable's values. Otherwise the variable's own label wherever
+        there is one variable. Where there isn't -- an analysis that folds several into one
+        result, so `output_descriptor(...).variable` is `None` -- the analysis's own
+        `Meta.label` is the only thing that names the result, and is exactly the override
+        `descriptor.py` declines to fold in on the grounds that `analyses/` imports
+        `request/` and not the other way round. The last fallback is for neither: a
+        multi-input pipeline written out by hand, which nothing names.
+
+        A chain (`lnd_conf,diff`) is named by its FIRST stage's `Meta.label`
+        (`ResolvedAnalysis.meta`), and the later stages say what they did through
+        `difference_suffix`.
         """
+        resolved = self.resolved_analysis
+        if resolved is not None and resolved.meta.kind == "variable":
+            return resolved.meta.label
         if self.variable is not None:
             return self.variable.label
-        resolved = self.resolved_analysis
         return resolved.meta.label if resolved is not None else "Value"
 
     @cached_property

@@ -564,9 +564,9 @@ class TestLandConfidenceExecution:
 
 
 class TestLandConfidenceChangeExecution:
-    """`lnd_conf_chng`: each year's ensemble classified (1 all water, 2 `(0, 0.5)`, 3
-    `[0.5, 1)`, 4 all land) and concatenated as `initial * 10 + current`. The raster
-    stand-in grid is `_v001`, so the initial year is `MP2023_BASELINE_YEAR`.
+    """`lnd_conf_chng`: the comparison year's weighted land fraction minus S34's land (1) / water
+    (0) state in the initial year. The raster stand-in grid is `_v001`, so the initial year
+    is `MP2023_BASELINE_YEAR`.
     """
 
     def _run(self, base_path, tmp_path, initial, current, year=2050):
@@ -579,29 +579,43 @@ class TestLandConfidenceChangeExecution:
             params={},
         )
         validate_shapes(resolved.pipeline)
-        out = tmp_path / "confidence_change.tif"
+        out = tmp_path / "lnd_conf_chng.tif"
         run_to_path(resolved.pipeline, out, base_path=base_path)
         with rio.open(out) as src:
             assert src.count == 1
+            assert src.dtypes[0] == "float32"
             band = src.read(1, masked=True)
         assert band.count(), "the analysis returned no valid pixels at all"
         return band.compressed()
 
-    def test_all_water_to_all_land(self, base_path, tmp_path):
-        codes = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), dict.fromkeys(SCENARIO_WEIGHTS, 1))
-        assert codes == pytest.approx(14)
+    def test_all_water_to_all_land_is_full_gain(self, base_path, tmp_path):
+        values = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), dict.fromkeys(SCENARIO_WEIGHTS, 1))
+        assert values == pytest.approx(1.0)
 
-    def test_flotant_counts_as_land(self, base_path, tmp_path):
-        codes = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 5), dict.fromkeys(SCENARIO_WEIGHTS, 2))
-        assert codes == pytest.approx(41)
+    def test_flotant_to_all_water_is_full_loss(self, base_path, tmp_path):
+        """Flotant marsh (`5`) counts as land."""
+        values = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 5), dict.fromkeys(SCENARIO_WEIGHTS, 2))
+        assert values == pytest.approx(-1.0)
 
-    def test_exactly_half_is_class_3_and_under_half_is_class_2(self, base_path, tmp_path):
-        """`0.33 + 0.085 + 0.085` is exactly the `0.5` boundary on paper and need not be in
-        floating point -- it must still read as class 3. Dropping one `0.085` member
-        (`0.415`) reads as class 2."""
-        half = {34: 1, 35: 1, 36: 1, 37: 2, 38: 2}
-        under_half = {34: 1, 35: 1, 36: 2, 37: 2, 38: 2}
-        assert self._run(base_path, tmp_path, half, under_half) == pytest.approx(32)
+    def test_land_staying_land_is_no_change(self, base_path, tmp_path):
+        values = self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 1), dict.fromkeys(SCENARIO_WEIGHTS, 1))
+        assert values == pytest.approx(0.0, abs=1e-6)
+
+    def test_split_ensemble_is_its_fraction_less_the_initial_state(self, base_path, tmp_path):
+        current = {34: 1, 35: 1, 36: 2, 37: 2, 38: 2}  # 0.33 + 0.085
+        assert self._run(base_path, tmp_path, dict.fromkeys(SCENARIO_WEIGHTS, 2), current) == pytest.approx(0.415)
+
+    def test_only_s34_sets_the_initial_state(self, base_path, tmp_path):
+        """Every other member calling the initial year water makes no difference: S34 says
+        land, so an all-land comparison year is no change."""
+        initial = {34: 1, 35: 2, 36: 2, 37: 2, 38: 2}
+        values = self._run(base_path, tmp_path, initial, dict.fromkeys(SCENARIO_WEIGHTS, 1))
+        assert values == pytest.approx(0.0, abs=1e-6)
+
+    def test_s34_water_with_the_rest_land_reads_from_zero(self, base_path, tmp_path):
+        initial = {34: 2, 35: 1, 36: 1, 37: 1, 38: 1}
+        current = {34: 2, 35: 2, 36: 2, 37: 1, 38: 1}  # 0.25 + 0.25
+        assert self._run(base_path, tmp_path, initial, current) == pytest.approx(0.5)
 
 
 class TestChainedAnalysisExecution:

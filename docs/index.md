@@ -641,34 +641,32 @@ Legends determine the breakpoints and colors used to map a variable.
 
 ### `lnd_conf_chng` Legend
 
-| Label | Color | Upper Bound | Sort | Row |
-| --- | --- | --- | --- | --- |
-| No Data | #00000000 | 11.0 | 0 |  |
-| Stays Water, High Confidence | #FFFFFF | 12.0 | 7 | 3 |
-| Stays Water, Moderate Confidence | #EDEDED | 13.0 | 8 | 3 |
-| Land Gain, Moderate Confidence | #67955A | 14.0 | 5 | 1 |
-| Land Gain, High Confidence | #38552F | 21.0 | 6 | 1 |
-| Stays Water, Moderate Confidence | #EDEDED | 22.0 | 8 | 3 |
-| Stays Water, Low Confidence | #DADADA | 23.0 | 9 | 3 |
-| Land Gain, Low Confidence | #BED9B6 | 24.0 | 4 | 1 |
-| Land Gain, Moderate Confidence | #67955A | 31.0 | 5 | 1 |
-| Land Loss, Moderate Confidence | #0893C6 | 32.0 | 2 | 1 |
-| Land Loss, Low Confidence | #A1DBF0 | 33.0 | 3 | 1 |
-| Stays Land, Low Confidence | #DAC2AF | 34.0 | 10 | 3 |
-| Stays Land, Moderate Confidence | #C9AB91 | 41.0 | 11 | 3 |
-| Land Loss, High Confidence | #005574 | 42.0 | 1 | 1 |
-| Land Loss, Moderate Confidence | #0893C6 | 43.0 | 2 | 1 |
-| Stays Land, Moderate Confidence | #C9AB91 | 44.0 | 11 | 3 |
-| Stays Land, High Confidence | #B38F6F |  | 12 | 3 |
+`Key Color`, where set, is the swatch the legend key shows instead of `Color`: the
+"stays land" class is transparent on the map, so the key shows the basemap land gray it
+reads as.
+
+| Label | Color | Upper Bound | Sort | Row | Key Color |
+| --- | --- | --- | --- | --- | --- |
+| No Data | #00000000 | -1.001 | 0 |  |  |
+| Highest confidence land loss | #153d64 | -0.95 | 5 | 1 |  |
+| High confidence land loss | #215c98 | -0.54 | 4 | 1 |  |
+| Low confidence land loss | #4d93d9 | -0.46 | 3 | 1 |  |
+| Lowest confidence land loss | #94b5d9 | -0.04 | 2 | 1 |  |
+| Highest confidence no change (stays land) | #00000000 | 0.0 | 1 | 1 | #d6d6d6 |
+| Highest confidence no change (stays water) | #00000000 | 0.04 | 6 | 3 |  |
+| Lowest confidence land gain | #daf2d0 | 0.46 | 7 | 3 |  |
+| Low confidence land gain | #8ed973 | 0.54 | 8 | 3 |  |
+| High confidence land gain | #4ea72e | 0.95 | 9 | 3 |  |
+| Highest confidence land gain | #3c7d22 |  | 10 | 3 |  |
 
 
 #### `lnd_conf_chng` Layout
 
 | Row | Kind | Left | Right |
 | --- | --- | --- | --- |
-| 1 | swatches | Land loss | Land gain |
+| 1 | swatches | Stays land | Land loss |
 | 2 | arrows | High confidence | High confidence |
-| 3 | swatches | Stays water | Stays land |
+| 3 | swatches | Stays water | Land gain |
 
 
 ### `lnd_type` Legend

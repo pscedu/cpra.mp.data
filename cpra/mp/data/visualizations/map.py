@@ -21,6 +21,20 @@ COLOR_ARRAY_EXPR = ["coalesce", ["at", ["id"], ["global-state", "colors"]], "tra
 SELECTION_EXPR = ["get", ["to-string", ["id"]], ["global-state", "selectionColors"]]
 
 
+# The basemap's land fill (`get_base_style`'s `state` layer). A legend class drawn
+# transparent over land -- `lnd_conf_chng`'s "stays land" -- shows this through, so its key
+# swatch names this color in `legends.csv`'s `key_color`.
+BASEMAP_LAND_COLOR = "#d6d6d6"
+
+
+def _key_color(break_point: dict[str, Any]) -> str:
+    """The color a break point is KEYED in: `legends.csv`'s optional `key_color` where the
+    tiles' own `color` would misdescribe what the reader sees -- a transparent class reads
+    as whatever the basemap shows through it -- and `color` everywhere else. Only the key
+    reads it; the tiles always colorize by `color`."""
+    return break_point.get("key_color") or break_point["color"]
+
+
 class Map(DatasetVisualization):
     """Map visualization for a dataset using MapLibre GL style specification."""
 
@@ -406,7 +420,7 @@ class Map(DatasetVisualization):
                     "type": "fill",
                     "source": "basemap-vector",
                     "source-layer": "state",
-                    "paint": {"fill-color": "#d6d6d6"},
+                    "paint": {"fill-color": BASEMAP_LAND_COLOR},
                 },
                 {
                     "id": "state-screen",
@@ -1004,13 +1018,11 @@ class Map(DatasetVisualization):
             A dictionary with legend title, unit, type, and color steps.
         """
         # `None` for a result carrying no single presentation variable (`lnd_type_plus`).
-        # Every `display.*` helper below is the identity for it, and `result_label` falls
-        # back to the analysis's own `Meta.label` for the title.
+        # Every `display.*` helper below is the identity for it.
         var = self.variable
         # A `kind="variable"` analysis (`lnd_conf`) names its own result; otherwise the
-        # variable does.
-        resolved = self.resolved_analysis
-        title = resolved.meta.label if resolved is not None and resolved.meta.kind == "variable" else self.result_label
+        # variable does -- see `result_label`.
+        title = self.result_label
 
         if difference:
             # The client renders these as tick labels, so unlike `_difference_breaks` --
@@ -1037,8 +1049,8 @@ class Map(DatasetVisualization):
         if legend is None:
             return {}
 
-        # `legends.csv`'s optional `sort` column orders the KEY only (`lnd_conf_chng`, whose
-        # codes run 11-44 but read as loss/gain/stays-water/stays-land); the tiles still
+        # `legends.csv`'s optional `sort` column orders the KEY only (`lnd_conf_chng`, whose values
+        # run loss to gain but read as stays-land-to-loss, stays-water-to-gain); the tiles still
         # colorize by `upper_bound`, which is why it is applied here and nowhere else. A
         # stable sort, so rows sharing a label keep their relative order and the portal's
         # first-seen dedup still picks the same one.
@@ -1048,7 +1060,7 @@ class Map(DatasetVisualization):
 
         steps = []
         for row in break_points.iter_rows(named=True):
-            step = {"color": row["color"]}
+            step = {"color": _key_color(row)}
             if "label" in row and row["label"] is not None:
                 step["label"] = row["label"]
             if row["upper_bound"] is not None:
@@ -1076,14 +1088,14 @@ class Map(DatasetVisualization):
     @staticmethod
     def _legend_layout(legend: Legend, break_points: pl.DataFrame) -> dict[str, Any]:
         """`legend_layouts.csv`'s arrangement of a legend's key into labelled rows -- the
-        `lnd_conf_chng` design's loss/gain and stays-water/stays-land strips, with an
-        arrow row between them.
+        `lnd_conf_chng` design's stays-land-to-loss and stays-water-to-gain strips, with an arrow
+        row between them.
 
         An ADDITION to `steps`, not a replacement: `type` stays `discrete` and `steps`
         stays the full sorted list, so a client that doesn't know `layout` still draws the
         key as a list. A `swatches` row takes the break points whose `row` names it, in
         `break_points`' (sorted) order and one per label, since the tiles may color
-        several codes one class; a break point naming no row (`No Data`) is in no strip.
+        several bins one class; a break point naming no row (`No Data`) is in no strip.
         An `arrows` row carries only its two end captions.
         """
         rows = []
@@ -1092,7 +1104,7 @@ class Map(DatasetVisualization):
             if layout_row["kind"] == "swatches":
                 swatches = {}
                 for point in break_points.filter(pl.col("row") == layout_row["row"]).iter_rows(named=True):
-                    swatches.setdefault(point["label"], {"color": point["color"], "label": point["label"]})
+                    swatches.setdefault(point["label"], {"color": _key_color(point), "label": point["label"]})
                 row["steps"] = list(swatches.values())
             rows.append(row)
         return {"rows": rows}

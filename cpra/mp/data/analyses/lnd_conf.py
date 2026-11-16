@@ -33,8 +33,7 @@ which halves a GeoTIFF download's raw size (the sink writes the frame's own dtyp
 costs nothing real: the fraction can only take the 17 subset sums of `SCENARIO_WEIGHTS`
 (weights of 2-3 significant digits), which float32 moves by at most 2.1e-8 while they lie
 at least 0.005 apart, and `0.5`, `1.0` and the `-9999` nodata fill all stay exact.
-`lnd_conf_chng` reuses `confidence_steps`, not this cast, so it classifies the float64
-sum as before.
+`lnd_conf_chng` reuses `confidence_steps`, not this cast, and casts its own difference instead.
 
 A cell that is nodata in only SOME members is summed over the members it has, so its
 weights no longer total `1.0` and its confidence reads low rather than being rescaled to
@@ -42,10 +41,10 @@ the members that actually reported. That is the arithmetic `group`/`sum` gives; 
 mean-over-valid-members would need a matching count, which this shape has no way to
 carry.
 
-`legend = "lnd_conf"` colorizes that fraction directly in the four classes
-`lnd_conf_chng` pairs into transition codes -- `0`, `> 0` to `< 0.5`, `0.5` to `< 1`, `1`,
-split at the same float-slack thresholds (`lnd_conf_chng.CONFIDENCE_CLASSES`), so a cell
-reads the same class in both -- water-colored toward `0` and land-colored toward `1`,
+`legend = "lnd_conf"` colorizes that fraction directly in four classes -- `0`, `> 0` to
+`< 0.5`, `0.5` to `< 1`, `1`, split `0.001` inside each boundary as float slack, since a
+float sum of the weights need not land exactly on `0.5` or `1.0` -- water-colored toward
+`0` and land-colored toward `1`,
 under a transparent `No Data` band for everything below `0.0`. Nothing this analysis
 outputs is below `0.0` -- the fraction's domain starts there -- so that band catches
 exactly one thing: the nodata sentinel
@@ -61,8 +60,8 @@ legend classifies absolute values on `[0, 1]`, not a signed change in them, so
 `visualizations.map` draws the synthesized red-white-blue ramp off `lnd_type`'s
 `difference_legend_limit` (`1`), exactly as it does for any other differenced variable.
 
-`analyses/lnd_conf_chng.py` reuses this analysis's steps (`confidence_steps`) to classify
-the fraction in two years and pair the classes into a transition code.
+`analyses/lnd_conf_chng.py` reuses this analysis's steps (`confidence_steps`) for the comparison
+year it measures against S34's initial land/water state.
 """
 
 from typing import Any
@@ -106,8 +105,8 @@ def _value_in(values: tuple[int, ...]) -> str:
 def confidence_steps(filters: dict[str, Any], grid_cell_where: str | None, group_by: list[str]) -> list[dict]:
     """The steps that reduce a `lnd_type` selection to the weighted land fraction, ending
     on the `group` over `group_by` (which must not include `scenario_id`). The first step
-    names no `input`; the caller supplies it. Shared with `lnd_conf_chng`, which runs it
-    once per year it compares.
+    names no `input`; the caller supplies it. Shared with `lnd_conf_chng`, which runs it for the
+    comparison year.
     """
     # Fold the fixed member set in as though the caller had selected it, so it renders
     # through the same sorted-conjunct assembly every other filter does rather than
@@ -203,7 +202,3 @@ class LandConfidence(Analysis):
             "output": {"format": dataset_output_format(self.dataset)},
         }
         return parse_pipeline(data)
-
-    @property
-    def title_suffix(self) -> str:
-        return " Confidence"

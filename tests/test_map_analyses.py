@@ -29,12 +29,13 @@ semantics.
 
 from typing import ClassVar
 
+import numpy as np
 import pytest
 
 from cpra.mp.data import config
 from cpra.mp.data.analyses import DatasetRef
 from cpra.mp.data.legends import LEGENDS
-from cpra.mp.data.visualizations.map import Map
+from cpra.mp.data.visualizations.map import BASEMAP_LAND_COLOR, Map
 from cpra.mp.data.visualizations.stacked_bar import StackedBar
 from cpra.mp.data.visualizations.time_series_line import TimeSeriesLine
 from tests.factories import ANNUAL_KWARGS, write_annual_dataset
@@ -246,39 +247,31 @@ class TestLegendSortOrder:
             calendar_year=[2040],
         )._get_legend_metadata(False)
 
-    def test_land_confidence_change_key_reads_loss_gain_water_land(self):
+    def test_lnd_conf_chng_key_reads_stays_land_to_loss_then_stays_water_to_gain(self):
         metadata = self._metadata("lnd_conf_chng")
-        assert metadata["title"] == "Land Confidence Change"
-        # First-seen labels, as the portal renders them.
-        labels = list(dict.fromkeys(step["label"] for step in metadata["steps"]))
-        assert labels == [
+        assert metadata["title"] == "Confidence-Weighted Land Change"
+        levels = ["Lowest", "Low", "High", "Highest"]
+        assert [step["label"] for step in metadata["steps"]] == [
             "No Data",
-            "Land Loss, High Confidence",
-            "Land Loss, Moderate Confidence",
-            "Land Loss, Low Confidence",
-            "Land Gain, Low Confidence",
-            "Land Gain, Moderate Confidence",
-            "Land Gain, High Confidence",
-            "Stays Water, High Confidence",
-            "Stays Water, Moderate Confidence",
-            "Stays Water, Low Confidence",
-            "Stays Land, Low Confidence",
-            "Stays Land, Moderate Confidence",
-            "Stays Land, High Confidence",
+            "Highest confidence no change (stays land)",
+            *(f"{level} confidence land loss" for level in levels),
+            "Highest confidence no change (stays water)",
+            *(f"{level} confidence land gain" for level in levels),
         ]
 
     def test_sorting_the_key_leaves_the_legend_itself_in_break_point_order(self):
         """Tile colorizing (`colorize_pixels`) and `/v1/legends.json` read
-        `break_points` directly, and need it ascending."""
+        `break_points` directly, and need it ascending -- strictly, since a MapLibre `step`
+        expression rejects a repeated stop."""
         bounds = LEGENDS["lnd_conf_chng"].break_points["upper_bound"].to_list()
-        assert bounds[:-1] == sorted(bounds[:-1])
+        assert bounds[:-1] == sorted(set(bounds[:-1]))
 
     def test_a_legend_without_sort_keeps_its_order(self):
         metadata = self._metadata("lnd_chng")
         expected = [row["label"] for row in LEGENDS["lnd_chng"].break_points.iter_rows(named=True)]
         assert [step["label"] for step in metadata["steps"]] == expected
 
-    def test_land_confidence_change_key_is_laid_out_like_the_design(self):
+    def test_lnd_conf_chng_key_is_laid_out_like_the_design(self):
         metadata = self._metadata("lnd_conf_chng")
         # Still a discrete legend with its full step list, for a client that ignores `layout`.
         assert metadata["type"] == "discrete"
@@ -286,27 +279,102 @@ class TestLegendSortOrder:
 
         rows = metadata["layout"]["rows"]
         assert [(row["kind"], row["left"], row["right"]) for row in rows] == [
-            ("swatches", "Land loss", "Land gain"),
+            ("swatches", "Stays land", "Land loss"),
             ("arrows", "High confidence", "High confidence"),
-            ("swatches", "Stays water", "Stays land"),
+            ("swatches", "Stays water", "Land gain"),
         ]
         assert "steps" not in rows[1]
-        levels = ["High", "Moderate", "Low"]
+        levels = ["Lowest", "Low", "High", "Highest"]
         assert [step["label"] for step in rows[0]["steps"]] == [
-            *(f"Land Loss, {level} Confidence" for level in levels),
-            *(f"Land Gain, {level} Confidence" for level in reversed(levels)),
+            "Highest confidence no change (stays land)",
+            *(f"{level} confidence land loss" for level in levels),
         ]
         assert [step["label"] for step in rows[2]["steps"]] == [
-            *(f"Stays Water, {level} Confidence" for level in levels),
-            *(f"Stays Land, {level} Confidence" for level in reversed(levels)),
+            "Highest confidence no change (stays water)",
+            *(f"{level} confidence land gain" for level in levels),
         ]
+        # "Stays land" is keyed in the basemap's land gray, which is what shows through its
+        # transparent tiles; "stays water" stays transparent.
+        assert rows[0]["steps"][0]["color"] == BASEMAP_LAND_COLOR
+        assert rows[2]["steps"][0]["color"] == "#00000000"
         # Each swatch is one of the key's own steps -- the color the tiles use for it.
         colors = {step["label"]: step["color"] for step in metadata["steps"]}
         for row in (rows[0], rows[2]):
             assert all(step["color"] == colors[step["label"]] for step in row["steps"])
 
+    def test_key_color_changes_the_key_and_not_the_tiles(self):
+        """`key_color` is a legend-key override only: the tiles (`colorize_pixels`, the
+        vector `step` ramp) still draw "stays land" transparent."""
+        legend = LEGENDS["lnd_conf_chng"]
+        assert legend.colorize_pixels(np.array([[[-1e-7]]]))[0][0][3] == 0
+        m = Map(
+            analysis="lnd_conf_chng",
+            variable="lnd_type",
+            grid="morph_pixel_v002",
+            time_unit="annual",
+            model_group_id=[705],
+            calendar_year=[2040],
+        )
+        assert BASEMAP_LAND_COLOR not in m._legend_fill_expr(False)[2]
+        steps = {step["label"]: step["color"] for step in m._get_legend_metadata(False)["steps"]}
+        assert steps["Highest confidence no change (stays land)"] == BASEMAP_LAND_COLOR
+
+    def test_the_basemap_land_color_is_the_one_the_basemap_draws(self):
+        layers = {
+            layer["id"]: layer
+            for layer in Map(variable="lnd_type", grid="morph_pixel_v002", time_unit="annual").get_base_style()[
+                "layers"
+            ]
+        }
+        assert layers["state"]["paint"]["fill-color"] == BASEMAP_LAND_COLOR
+
     def test_a_legend_without_a_layout_has_no_layout_key(self):
         assert "layout" not in self._metadata("lnd_chng")
+
+
+class TestChartTitles:
+    """A `kind="variable"` analysis titles charts with its own `Meta.label`, the same name
+    the map legend and the portal's variable picker give it -- not the input variable's."""
+
+    LND_TYPE: ClassVar[dict] = {
+        "variable": "lnd_type",
+        "grid": "morph_pixel_v002",
+        "time_unit": "annual",
+        "model_group_id": [705],
+    }
+
+    @pytest.mark.parametrize(
+        ("analysis", "title"),
+        [
+            (None, "Annual Land Type"),
+            ("lnd_conf", "Annual Land Confidence"),
+            ("lnd_conf,diff", "Annual Land Confidence Difference"),
+            ("lnd_conf_chng", "Annual Confidence-Weighted Land Change"),
+            ("lnd_chng", "Annual Land Change"),
+        ],
+    )
+    def test_title(self, analysis, title):
+        params = {"analysis": analysis} if analysis else {}
+        if analysis == "lnd_conf,diff":
+            params.update(dimension="calendar_year", order="asc", calendar_year=[2030, 2040])
+        else:
+            params["calendar_year"] = [2040]
+        viz = TimeSeriesLine(**self.LND_TYPE, **params)
+        assert viz.title == title
+        assert viz.variable_label == title.removeprefix("Annual ")
+
+    def test_a_dimension_analysis_keeps_the_variables_name(self):
+        viz = TimeSeriesLine(
+            variable="ssf",
+            grid="ecoregion_v001",
+            time_unit="annual",
+            analysis="diff",
+            dimension="calendar_year",
+            order="asc",
+            calendar_year=[2030, 2040],
+            **{k: v for k, v in COMMON_ANNUAL_FILTER_LISTS.items() if k != "calendar_year"},
+        )
+        assert viz.title == f"Annual {viz.variable.label} Difference"
 
 
 class TestCompareDimensionsExclusion:

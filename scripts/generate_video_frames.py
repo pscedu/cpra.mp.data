@@ -42,14 +42,14 @@ Data layers (--historic-data, the historic persistent-change raster):
 
 Confidence layers (--confidence-data, the multiband COG data directory, with
 --model-group-id):
-  1. Run the lnd_conf_chng named analysis (cpra/mp/data/analyses/lnd_conf_chng.py) over
-     the lnd_type ensemble for each frame's year. It classifies the ensemble's land
-     confidence in the grid's initial-conditions year (2029 for the _v002 grids) and in the
-     frame's year into four classes each, and returns the pair as a two-digit transition
-     code (initial * 10 + current, 11..44).
-  2. Symbolize the codes at their own 30 m resolution with the lnd_conf_chng legend from
-     cpra/mp/data/structure/legends.csv (land loss / land gain / stays water / stays land,
-     each at low, moderate, or high confidence).
+  1. Run the lnd_conf_chng named analysis (cpra/mp/data/analyses/lnd_conf_chng.py) over the lnd_type
+     ensemble for each frame's year. It returns the ensemble's confidence-weighted land
+     fraction in the frame's year minus scenario 34's land (1) / water (0) state in the
+     grid's initial-conditions year (2029 for the _v002 grids): -1 (certain land loss) to
+     1 (certain land gain), 0 for no change.
+  2. Symbolize the values at their own 30 m resolution with the lnd_conf_chng legend from
+     cpra/mp/data/structure/legends.csv (land loss / land gain at four confidence levels,
+     no change transparent).
   3. Resample that image onto the target grid with bicubic interpolation, the same way the
      categorical layers are, and write confidence_<year>.png per year.
 
@@ -195,8 +195,7 @@ def hex_to_rgba(color: str):
 
 
 # --- Land-change confidence layers -----------------------------------------------
-# The lnd_conf_chng analysis returns a categorical transition code per pixel (see its
-# module docstring), colored here with the same legend the portal uses for it, so the
+# The lnd_conf_chng analysis returns a land change value per pixel (see its module docstring), colored here with the same legend the portal uses for it, so the
 # frames and the map stay in step when legends.csv changes.
 CONFIDENCE_LEGEND = LEGENDS[LandConfidenceChange.Meta.legend]
 
@@ -623,8 +622,8 @@ def hex8_to_rgba(color: str):
     return (*hex_to_rgb(h), int(h[6:8], 16) if len(h) == 8 else 255)
 
 
-def confidence_rgba(codes: np.ndarray):
-    """Symbolize lnd_conf_chng transition codes with CONFIDENCE_LEGEND, as (4,H,W) RGBA bands
+def confidence_rgba(values: np.ndarray):
+    """Symbolize lnd_conf_chng values with CONFIDENCE_LEGEND, as (4,H,W) RGBA bands
     to match colorize().
 
     Classified the way the portal's map steps a legend: each row's color covers values
@@ -635,9 +634,9 @@ def confidence_rgba(codes: np.ndarray):
     rows = CONFIDENCE_LEGEND.break_points
     bounds = rows["upper_bound"].drop_nulls().to_numpy()
     colors = np.array([hex8_to_rgba(c) for c in rows["color"]], dtype=np.uint8)
-    rgba = np.zeros((4,) + codes.shape, dtype=np.uint8)
-    valid = ~np.isnan(codes)
-    rgba[:, valid] = colors[np.digitize(codes[valid], bounds)].T
+    rgba = np.zeros((4,) + values.shape, dtype=np.uint8)
+    valid = ~np.isnan(values)
+    rgba[:, valid] = colors[np.digitize(values[valid], bounds)].T
     return rgba
 
 
@@ -676,7 +675,7 @@ def lnd_conf_years(data_path: Path, model_group_id: int):
 
 def run_lnd_conf_chng(data_path: Path, model_group_id: int, year: int, work_dir: Path):
     """Run the lnd_conf_chng analysis for one comparison year and read the result back as
-    (codes, crs, transform), nodata as NaN. The analysis takes exactly one calendar_year on
+    (values, crs, transform), nodata as NaN. The analysis takes exactly one calendar_year on
     a raster grid -- it draws one image per comparison year."""
     resolved = resolve_analysis(
         "lnd_conf_chng",
@@ -696,7 +695,7 @@ def write_confidence_pngs(
     data_path: Path, model_group_id: int, years: tuple[int, ...], output_dir: Path, save_full: bool
 ):
     """Write confidence_<year>.png for each year (every year with lnd_type data, if `years`
-    is empty): lnd_conf_chng's transition from CONFIDENCE_BASE_YEAR to that year,
+    is empty): lnd_conf_chng's change from CONFIDENCE_BASE_YEAR to that year,
     symbolized and resampled."""
     available = lnd_conf_years(data_path, model_group_id)
     if not available:
@@ -715,9 +714,9 @@ def write_confidence_pngs(
         work_dir = Path(tmp)
         for year in sorted(years) or available:
             print(f"Running lnd_conf_chng for {CONFIDENCE_BASE_YEAR} -> {year}...")
-            codes, src_crs, src_transform = run_lnd_conf_chng(data_path, model_group_id, year, work_dir)
+            values, src_crs, src_transform = run_lnd_conf_chng(data_path, model_group_id, year, work_dir)
             print("Symbolizing at source resolution and resampling to target grid (cubic)...")
-            bands = confidence_rgba(codes)
+            bands = confidence_rgba(values)
             if save_full:
                 write_full_tif(output_dir / f"confidence_{year}_full.tif", bands, src_crs, src_transform)
             output_path = output_dir / f"confidence_{year}.png"
