@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.59.0](https://github.com/pscedu/cpra.mp.data/compare/v0.58.1...v0.59.0) (2026-11-17)
+
+
+### Features
+
+* Add OGC support ([4317b10](https://github.com/pscedu/cpra.mp.data/commit/4317b10e7a9050971975593d66738afdb90be469))
+* **analyses:** update lnd_conf_change methodology and colors ([b0d79d6](https://github.com/pscedu/cpra.mp.data/commit/b0d79d647b14695a64f03dd147168cca0c9ad429))
+* **visualizations:** add support for client-side vector data join ([8325bd2](https://github.com/pscedu/cpra.mp.data/commit/8325bd2f2fc78be0daa565418a8ba59773846d63))
+
+
+### Bug Fixes
+
+* **analyses:** update label for lnd_conf ([03609e2](https://github.com/pscedu/cpra.mp.data/commit/03609e2b7e66f329c2854f3e0c377a8f6c66716e))
+
+
+### Performance Improvements
+
+* **api:** add tile cache ([fd7ca77](https://github.com/pscedu/cpra.mp.data/commit/fd7ca77932a65e93ceab0003ba513dcaf6954b59))
+* **raster:** improve download performance for multiband GeoTIFFs ([f4d181e](https://github.com/pscedu/cpra.mp.data/commit/f4d181e05a0bc8b877246ac3c338d799ed4620f4))
+* **raster:** prevent duplicate reads during joins ([e300ae3](https://github.com/pscedu/cpra.mp.data/commit/e300ae398829346c146a7b837128c02140eb73b3))
+
 ## [0.58.1](https://github.com/pscedu/cpra.mp.data/compare/v0.58.0...v0.58.1) (2026-11-13)
 
 
