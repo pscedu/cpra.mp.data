@@ -121,6 +121,12 @@ RASTER_WRITE_STRIP_MB = int(get_config("RASTER_WRITE_STRIP_MB", "256"))
 # overlap with I/O waits pays off; dozens does not), not its request rate.
 TILE_RENDER_CONCURRENCY = int(get_config("TILE_RENDER_CONCURRENCY", "4"))
 
+# On-disk cache of rendered map tiles (api.tile_cache), off unless TILE_CACHE_MAX_GB is
+# positive. Lives beside data/ and catalog/ by default, since it is shared across replicas
+# and outlives a pod; least-recently-used tiles are evicted once the cache passes its size.
+TILE_CACHE_PATH = Path(get_config("TILE_CACHE_PATH", str(BASE_PATH.parent / "tile-cache")))
+TILE_CACHE_MAX_GB = float(get_config("TILE_CACHE_MAX_GB", "0"))
+
 # Ceiling on the number of distinct values `count_by_value` may enumerate (per grid, not
 # per zone -- the probe runs on the source frame's own `value` column, before the
 # crosswalk join, in both analysis.execution.project and analysis.execution.fold).

@@ -457,9 +457,14 @@ async def get_data_tile(format: TileFormat, z: int, x: int, y: int, request: Req
     there is no tile response with a `grid_cell` column left to relabel.
     """
     decoded = await decode_request(request.query_params.multi_items(), format=format.value, allow_compression=False)
+    if_none_match = request.headers.get("if-none-match")
     if format is TileFormat.pbf:
-        return await respond_to_analysis_pipeline_vector_tile(decoded.pipeline, x, y, z, receive=request.receive)
-    return await respond_to_analysis_pipeline_tile(decoded.pipeline, x, y, z, format.value, receive=request.receive)
+        return await respond_to_analysis_pipeline_vector_tile(
+            decoded.pipeline, x, y, z, receive=request.receive, if_none_match=if_none_match
+        )
+    return await respond_to_analysis_pipeline_tile(
+        decoded.pipeline, x, y, z, format.value, receive=request.receive, if_none_match=if_none_match
+    )
 
 
 @app.get("/v1/visualizations.json", tags=["Visualization"])

@@ -35,6 +35,7 @@ caller for `render_tile`/`sink_vector_tile` directly.
   instead; `execution.sink.render_tile`'s docstring records why that changed.
 """
 
+import os
 import tempfile
 import time
 from functools import partial
@@ -54,6 +55,9 @@ from cpra.mp.data.analysis.request.ops import final_frame_name
 from cpra.mp.data.analysis.request.types import CompressionAlgorithm, DataFormat
 from cpra.mp.data.api.boundary import resolve_detail, resolve_status
 from cpra.mp.data.api.tabular import StreamingThread, sleep_between_polls
+from cpra.mp.data.config import get_base_path, get_catalog_path
+from cpra.mp.data.tile_cache import file_fingerprints, get_tile_cache, tile_key
+from cpra.mp.data.utils import dataset_path
 from cpra.mp.data.variables import VARIABLES
 
 # Tile renders get their own limiter rather than anyio's default one, so a burst of tile
@@ -121,20 +125,160 @@ async def _run_tile_render(render, receive: Receive | None = None):
     would otherwise wrap it in an `ExceptionGroup` that neither the tile routes' `except
     FileNotFoundError` nor `api.boundary`'s handlers match.
     """
+    body = await _run_tile_render_or_drop(render, receive)
+    return None if body is _DROPPED else body
+
+
+# What `_run_tile_render_or_drop` returns for a tile dropped before it rendered, where
+# `_run_tile_render` returns `None`: a request sharing that render (`_render_tile_once`)
+# has to tell "nothing to show" from "nobody rendered it".
+_DROPPED = object()
+
+
+async def _run_tile_render_or_drop(render, receive: Receive | None = None):
     if receive is None:
         return await _render_in_slot(render)
+    ran = False
+
+    def _render():
+        nonlocal ran
+        ran = True
+        return render()
+
     body = error = None
     with anyio.CancelScope() as client_gone:
         async with anyio.create_task_group() as watcher:
             watcher.start_soon(_cancel_on_disconnect, receive, client_gone)
             try:
-                body = await _render_in_slot(render)
+                body = await _render_in_slot(_render)
             except Exception as exc:  # noqa: BLE001 -- re-raised below, outside the task group
                 error = exc
             watcher.cancel_scope.cancel()
     if error is not None:
         raise error
-    return body
+    return body if ran else _DROPPED
+
+
+class _TileFlight:
+    """One in-progress render that other requests for the same tile wait on."""
+
+    def __init__(self):
+        self.done = anyio.Event()
+        self.body = _DROPPED
+        self.error: Exception | None = None
+
+
+# Renders in progress, by tile key. A RunVar for the same reason as the limiter.
+_tile_flights: RunVar[dict[str, _TileFlight]] = RunVar("tile_flights")
+
+
+def _in_flight_tiles() -> dict[str, _TileFlight]:
+    try:
+        return _tile_flights.get()
+    except LookupError:
+        flights: dict[str, _TileFlight] = {}
+        _tile_flights.set(flights)
+        return flights
+
+
+async def _render_tile_once(key: str, render, receive: Receive | None):
+    """`_run_tile_render` for the tile `key`, sharing one render among every request for
+    it that arrives while it is in progress -- several maps on one page asking for the
+    same tile at once render it once. A waiter gets the first request's body or its
+    exception. If the first request's client left before its render started, nothing was
+    rendered, so the waiters go around again and one of them renders it instead.
+    """
+    flights = _in_flight_tiles()
+    while (flight := flights.get(key)) is not None:
+        await flight.done.wait()
+        if flight.error is not None:
+            raise flight.error
+        if flight.body is not _DROPPED:
+            return flight.body
+    flight = flights[key] = _TileFlight()
+    try:
+        flight.body = await _run_tile_render_or_drop(render, receive)
+    except Exception as exc:
+        flight.error = exc
+        raise
+    finally:
+        del flights[key]
+        flight.done.set()
+    return None if flight.body is _DROPPED else flight.body
+
+
+def _catalog_files(pipeline) -> list[str]:
+    """The catalog side-table files of every dataset `pipeline` reads -- the cache key's
+    stand-in for the data itself. `raster.write_cog` and `tabular.write_parquet` append to
+    a dataset's catalog partition on every write, and compaction rewrites it, so any of
+    those changes this list or a file's size and mtime. Unlike the data files, these are
+    known from the request alone: finding which COGs a tile reads takes `compile_plan`,
+    which is most of what a cache hit would otherwise cost.
+
+    A dataset changed WITHOUT going through those writers (files copied in by hand) is
+    invisible here; `python -m cpra.mp.data.cli tile-cache clear` covers that.
+    """
+    paths = []
+    for selection in pipeline.inputs.values():
+        directory = dataset_path(
+            get_catalog_path(), variable=selection.variable, time_unit=selection.time_unit, grid=selection.grid
+        )
+        for dirpath, _dirnames, filenames in os.walk(directory):
+            paths.extend(os.path.join(dirpath, name) for name in filenames)
+    return paths
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    if not if_none_match:
+        return False
+    return if_none_match.strip() == "*" or etag in (tag.strip().removeprefix("W/") for tag in if_none_match.split(","))
+
+
+async def _respond_with_cached_tile(
+    pipeline, render, *, x, y, z, format, media_type, base_path, receive, if_none_match
+) -> Response:
+    """The tile routes' shared response path: key the tile (`tile_cache.tile_key`), and
+    answer from the client's own cache (304), the tile cache, or `render`, in that order.
+
+    The key is built from the request and the inputs' catalog files (`_catalog_files`)
+    alone, so a hit never compiles a plan, and the lookup runs in the default thread pool
+    rather than under the tile limiter, so it never queues behind slow renders. Only a
+    miss takes a render slot, and `render` compiles the plan itself. The key is also the
+    response's ETag, so a browser revalidates instead of downloading a tile again, whether
+    or not the server-side cache is on.
+
+    A `FileNotFoundError` from the render is the empty 204 -- see
+    `respond_to_analysis_tile` for why.
+    """
+    cache = get_tile_cache()
+    request_identity = f"{get_base_path(base_path)}\0{pipeline.model_dump_json()}"
+
+    def _look_up():
+        key = tile_key(request_identity, format, z, x, y, file_fingerprints(_catalog_files(pipeline)))
+        return key, cache.get(key, format) if cache is not None else None
+
+    key, cached = await anyio.to_thread.run_sync(_look_up)
+    headers = {"ETag": f'"{key}"', "Cache-Control": "no-cache"}
+    if _etag_matches(if_none_match, headers["ETag"]):
+        return Response(status_code=304, headers=headers)
+
+    if cached is not None:
+        body = cached or None
+    else:
+
+        def _render_and_store():
+            body = render()
+            if cache is not None:
+                cache.put(key, format, body)
+            return body
+
+        try:
+            body = await _render_tile_once(key, _render_and_store, receive)
+        except FileNotFoundError:
+            body = None
+    if body is None:
+        return Response(status_code=204, headers=headers)
+    return Response(content=body, status_code=200, media_type=media_type, headers=headers)
 
 
 async def _cancel_on_disconnect(receive: Receive, scope: anyio.CancelScope) -> None:
@@ -419,22 +563,30 @@ def _first_input_variable_legend(pipeline):
 
 
 async def respond_to_analysis_tile(
-    pipeline, x: int, y: int, z: int, format: str, *, base_path=None, receive: Receive | None = None
+    pipeline,
+    x: int,
+    y: int,
+    z: int,
+    format: str,
+    *,
+    base_path=None,
+    receive: Receive | None = None,
+    if_none_match: str | None = None,
 ) -> Response:
     """Build the response for `GET /v1/analysis/{z}/{x}/{y}.{format}` (`png`/`jpg`).
 
-    Compiles the plan for this one tile (`compile_plan(pipeline, tile=...)`), executes it,
-    and renders it (`sink.render_tile`) -- all off the event loop in one `anyio.to_thread.
-    run_sync` call, since every step does real file I/O, and under the tile limiter
-    (`_run_tile_render`), so a map's burst of tiles queues instead of rendering all at
-    once, and dropped if the client disconnects while it is still queued (`receive`; see
-    `_run_tile_render`). A `None` render (nothing to show: see `render_tile`'s own
+    Answers from the browser's or the server's tile cache if it can
+    (`_respond_with_cached_tile`). Otherwise it compiles the plan for this one tile
+    (`compile_plan(pipeline, tile=...)`), executes it, and renders it (`sink.render_tile`) off the event loop
+    under the tile limiter (`_run_tile_render`), so a map's burst of tiles queues instead
+    of rendering all at once, and dropped if the client disconnects while it is still
+    queued (`receive`; see `_run_tile_render`). A `None` render (nothing to show: see `render_tile`'s own
     docstring for the two cases this covers) is a BODILESS 204, returned directly as this function's `Response`
     rather than as a raised `HTTPException`, which always carries a JSON body and so
     cannot express one.
 
-    A `FileNotFoundError` is caught into the same 204, and is the reason the `try` wraps the
-    thread call rather than living inside `_render`. App-wide it means 404
+    A `FileNotFoundError` is caught into the same 204 (by `_respond_with_cached_tile`, around
+    the render, which includes the compile). App-wide it means 404
     `application/json` (`api.boundary`, which owns that mapping and keeps it for every other
     route); on a tile route it would be the only 404 left on an image URL, and it is not a
     distinction a tile client can act on -- "the file for this dataset is not written yet"
@@ -460,13 +612,18 @@ async def respond_to_analysis_tile(
             band_wide, tile, format, color_map=pipeline.output.color_map, variable_legend=variable_legend
         )
 
-    try:
-        body = await _run_tile_render(_render, receive)
-    except FileNotFoundError:
-        body = None
-    if body is None:
-        return Response(status_code=204)
-    return Response(content=body, status_code=200, media_type=_TILE_MIME_TYPES[format])
+    return await _respond_with_cached_tile(
+        pipeline,
+        _render,
+        x=x,
+        y=y,
+        z=z,
+        format=format,
+        media_type=_TILE_MIME_TYPES[format],
+        base_path=base_path,
+        receive=receive,
+        if_none_match=if_none_match,
+    )
 
 
 def _final_frame_grid(plan, pipeline) -> str:
@@ -488,7 +645,14 @@ def _final_frame_grid(plan, pipeline) -> str:
 
 
 async def respond_to_analysis_vector_tile(
-    pipeline, x: int, y: int, z: int, *, base_path=None, receive: Receive | None = None
+    pipeline,
+    x: int,
+    y: int,
+    z: int,
+    *,
+    base_path=None,
+    receive: Receive | None = None,
+    if_none_match: str | None = None,
 ) -> Response:
     """Build the response for `GET /v1/analysis/{z}/{x}/{y}.pbf`.
 
@@ -516,10 +680,15 @@ async def respond_to_analysis_vector_tile(
         result = execute(plan, base_path=base_path)
         return sink.sink_vector_tile(result, grid_name, (x, y, z))
 
-    try:
-        body = await _run_tile_render(_render, receive)
-    except FileNotFoundError:
-        body = None
-    if body is None:
-        return Response(status_code=204)
-    return Response(content=body, status_code=200, media_type=_VECTOR_TILE_MEDIA_TYPE)
+    return await _respond_with_cached_tile(
+        pipeline,
+        _render,
+        x=x,
+        y=y,
+        z=z,
+        format="pbf",
+        media_type=_VECTOR_TILE_MEDIA_TYPE,
+        base_path=base_path,
+        receive=receive,
+        if_none_match=if_none_match,
+    )
