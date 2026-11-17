@@ -13,6 +13,7 @@ Several APIs that depend on the Python library are implemented in the `cpra.mp.d
 * [Data API](docs/data-api.md)
 * [Analysis API](docs/analysis-api.md)
 * [Named Analyses (Registry) API](docs/analyses-api.md)
+* [GIS export (QGIS layer files and OGC links)](docs/ogc-api.md)
 
 ## Writing Data
 
