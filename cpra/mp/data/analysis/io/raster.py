@@ -355,10 +355,29 @@ def scan_raster(
         # were confirmed directly: a `.filter()` chained onto this scan returned every row,
         # and a `.select("b1")` returned `b0` alongside it.
         #
-        # Honoring them here is not a read-side optimization -- the pixels are read either
-        # way, since a projection arrives as column names after every band has been read. It is what makes the scan CORRECT. `n_rows` is the
-        # one that does cut the read short, and it is applied last, after the predicate,
-        # because it means "the first n rows of what this source produces".
+        # Honoring them is what makes the scan CORRECT; `n_rows` is applied last, after the
+        # predicate, because it means "the first n rows of what this source produces".
+        #
+        # The projection also decides which files are opened at all. A join's operands are
+        # each a `select` of this one scan, and Polars runs the source once per operand
+        # (it does not dedupe a Python source) -- so reading every file regardless made
+        # each operand decode the whole group: lnd_type_plus read every file 3x.
+        if with_columns is None:
+            needed = set(column_names)
+        else:
+            needed = set(with_columns)
+            if predicate is not None:
+                needed |= set(predicate.meta.root_names())
+            if not needed:
+                needed = {column_names[0]}  # zero columns would lose the row count
+        reads = {}
+        for path, (indexes, positions) in file_reads.items():
+            kept = [(index, position) for index, position in zip(indexes, positions) if column_names[position] in needed]
+            if kept:
+                reads[path] = ([index for index, _ in kept], [position for _, position in kept])
+        read_columns = [name for name in column_names if name in needed]
+        read_schema = pl.Schema({name: schema[name] for name in read_columns})
+
         remaining = n_rows
         for batch_window in window_list:
             if remaining is not None and remaining <= 0:
@@ -367,7 +386,7 @@ def scan_raster(
             # Nothing GDAL-related crosses the `yield` below -- see module docstring.
             by_position = {}
             with raster_gdal_env():
-                for path, (indexes, positions) in file_reads.items():
+                for path, (indexes, positions) in reads.items():
                     with rasterio.open(path) as src:
                         # `out_shape` is a 2-tuple even for a multi-band read: rasterio
                         # broadcasts it across `indexes` and returns
@@ -378,14 +397,14 @@ def scan_raster(
                         by_position[position] = file_data[i].ravel()
                     del file_data
 
-            cols = {name: by_position[i] for i, name in enumerate(column_names)}
-            df = pl.DataFrame(cols, schema=schema)
+            cols = {name: by_position[i] for i, name in enumerate(column_names) if name in needed}
+            df = pl.DataFrame(cols, schema=read_schema)
             del by_position, cols
 
             mask_exprs = [
                 pl.when(pl.col(name) == nd).then(None).otherwise(pl.col(name)).alias(name)
                 for name, nd, masked in zip(column_names, nodatavals, mask_this_band)
-                if nd is not None and masked
+                if nd is not None and masked and name in needed
             ]
             if mask_exprs:
                 df = df.with_columns(mask_exprs)
