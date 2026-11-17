@@ -30,6 +30,7 @@ coverage.xml
 /iceberg/
 /iceberg-*/
 /scratch/
+/tile-cache/
 /tiles/
 /.*-scratch/
 /.verify-scratch/
