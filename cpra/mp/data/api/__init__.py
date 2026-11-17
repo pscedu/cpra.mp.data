@@ -35,6 +35,7 @@ from cpra.mp.data.api.models import (
     Visualization,
     VisualizationQuery,
 )
+from cpra.mp.data.api.ogc_provider import STORAGE_CRS_URI, strip_ogc_params
 from cpra.mp.data.api.pipeline import (
     respond_to_analysis as respond_to_analysis_pipeline,
 )
@@ -47,10 +48,9 @@ from cpra.mp.data.api.pipeline import (
 from cpra.mp.data.api.pipeline import (
     tile_renders_stalled,
 )
+from cpra.mp.data.api.qlr import build_qlr, export_legend, items_url, layer_label
 from cpra.mp.data.api.sources import LazyFrameSource
 from cpra.mp.data.api.tabular import PolarsStreamingResponse
-from cpra.mp.data.api.ogc_provider import STORAGE_CRS_URI, strip_ogc_params
-from cpra.mp.data.api.qlr import build_qlr, export_legend, items_url, layer_label
 from cpra.mp.data.api.unified import decode_request
 from cpra.mp.data.api.utils import (
     ANALYSES,
@@ -102,9 +102,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from starlette.middleware.wsgi import WSGIMiddleware  # noqa: E402
-from pygeoapi.flask_app import APP as pygeoapi_app  # noqa: E402
-
+from pygeoapi.flask_app import APP as pygeoapi_app
+from starlette.middleware.wsgi import WSGIMiddleware
 
 
 @pygeoapi_app.after_request

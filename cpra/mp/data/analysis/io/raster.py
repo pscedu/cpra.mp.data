@@ -372,7 +372,9 @@ def scan_raster(
                 needed = {column_names[0]}  # zero columns would lose the row count
         reads = {}
         for path, (indexes, positions) in file_reads.items():
-            kept = [(index, position) for index, position in zip(indexes, positions) if column_names[position] in needed]
+            kept = [
+                (index, position) for index, position in zip(indexes, positions) if column_names[position] in needed
+            ]
             if kept:
                 reads[path] = ([index for index, _ in kept], [position for _, position in kept])
         read_columns = [name for name in column_names if name in needed]

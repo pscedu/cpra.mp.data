@@ -11,6 +11,7 @@ os.environ.setdefault("PYGEOAPI_SERVER_URL", "https://mpdp.coastal.la.gov/v1/ogc
 os.environ.setdefault("PYGEOAPI_CONFIG", "cpra/mp/data/ogc_config.yaml")
 os.environ.setdefault("PYGEOAPI_OPENAPI", "cpra/mp/data/ogc_openapi.yaml")
 
+
 def get_config(name, default_value):
     """Get a config variable from the environment."""
     return os.environ.get(f"CPRA_MP_DATA_{name}", default_value)

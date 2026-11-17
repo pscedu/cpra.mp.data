@@ -1,10 +1,9 @@
 """The QGIS layer file: its builder and the /v1/view.qlr route."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlparse
 from xml.etree import ElementTree
-
-from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -56,9 +55,7 @@ class TestBuildQlr:
     def test_ranges_are_contiguous_and_open_at_both_ends(self):
         """The first class has to catch values below its upper bound (elevation goes
         negative), and the last has no upper bound in a legend at all."""
-        ranges = layer_of(build_qlr("Test", "http://x/items", legend())).findall(
-            "renderer-v2/ranges/range"
-        )
+        ranges = layer_of(build_qlr("Test", "http://x/items", legend())).findall("renderer-v2/ranges/range")
         bounds = [(float(r.get("lower")), float(r.get("upper"))) for r in ranges]
         assert bounds == [(-1e9, 10.0), (10.0, 20.0), (20.0, 1e9)]
 

@@ -8,6 +8,7 @@ matches the map the link was exported from.
 
 import os
 import uuid
+from itertools import pairwise
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
@@ -87,7 +88,7 @@ def difference_legend(variable):
     bounds = [reach * (2 * i - _DIFFERENCE_STEPS + 2) / _DIFFERENCE_STEPS for i in range(_DIFFERENCE_STEPS - 1)]
     shown = [_format_bound(to_display(variable, b)) for b in bounds]
     labels = [f"< {shown[0]}"]
-    labels += [f"{lo} to < {hi}" for lo, hi in zip(shown, shown[1:])]
+    labels += [f"{lo} to < {hi}" for lo, hi in pairwise(shown)]
     labels.append(f">= {shown[-1]}")
     return Legend(
         "difference",
@@ -156,8 +157,7 @@ def _renderer(legend):
     for index, row in enumerate(legend.break_points.to_dicts()):
         upper = _UPPER_LIMIT if row["upper_bound"] is None else row["upper_bound"]
         ranges.append(
-            f'<range render="true" symbol="{index}" lower="{lower}" upper="{upper}" '
-            f"label={quoteattr(row['label'])}/>"
+            f'<range render="true" symbol="{index}" lower="{lower}" upper="{upper}" label={quoteattr(row["label"])}/>'
         )
         symbols.append(_symbol(index, row["color"]))
         lower = upper

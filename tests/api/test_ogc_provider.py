@@ -13,15 +13,16 @@ from tests.factories import daily_frame, write_grid_geometry
 
 ITEMS = "/v1/ogc/collections/master_plan_data/items"
 SALINITY = (
-    "variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=500"
-    "&scenario_id=7&aggregate_type=mean"
+    "variable=sal&time_unit=daily&grid=hydro_compartment_v001&model_group_id=500&scenario_id=7&aggregate_type=mean"
 )
 DAY = "calendar_day=2030-01-01"
 
 # Three 1 km squares in hydro_compartment_v001's own CRS (EPSG:26915), a few km apart.
-CELLS = {1: box(500000, 3300000, 501000, 3301000),
-         2: box(505000, 3300000, 506000, 3301000),
-         3: box(510000, 3300000, 511000, 3301000)}
+CELLS = {
+    1: box(500000, 3300000, 501000, 3301000),
+    2: box(505000, 3300000, 506000, 3301000),
+    3: box(510000, 3300000, 511000, 3301000),
+}
 DAYS = [datetime.date(2030, 1, 1), datetime.date(2030, 1, 2)]
 
 
@@ -51,8 +52,14 @@ def ids(response):
 
 class TestStripOgcParams:
     def test_drops_ogc_params_case_insensitively_and_keeps_the_rest_in_order(self):
-        items = [("variable", "sal"), ("f", "json"), ("LIMIT", "5"), ("scenario_id", "7"),
-                 ("bbox", "1,2,3,4"), ("scenario_id", "8")]
+        items = [
+            ("variable", "sal"),
+            ("f", "json"),
+            ("LIMIT", "5"),
+            ("scenario_id", "7"),
+            ("bbox", "1,2,3,4"),
+            ("scenario_id", "8"),
+        ]
         assert strip_ogc_params(items) == [("variable", "sal"), ("scenario_id", "7"), ("scenario_id", "8")]
 
 
@@ -79,11 +86,14 @@ class TestItems:
         assert response.status_code == 200
         assert response.headers["Content-Crs"] == f"<{native}>"
 
-    @pytest.mark.parametrize("crs", [
-        "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
-        "http://www.opengis.net/def/crs/EPSG/0/4326",
-        "nonsense",
-    ])
+    @pytest.mark.parametrize(
+        "crs",
+        [
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+            "http://www.opengis.net/def/crs/EPSG/0/4326",
+            "nonsense",
+        ],
+    )
     def test_any_other_crs_is_a_400(self, salinity, crs):
         response = salinity.get(f"{ITEMS}?f=json&{SALINITY}&{DAY}&crs={crs}")
         assert response.status_code == 400

@@ -6,19 +6,33 @@ from pygeoapi.provider.base import (
 )
 from shapely.geometry import mapping
 
+from cpra.mp.data import config
 from cpra.mp.data.analysis.execution.execute import execute
 from cpra.mp.data.analysis.execution.plan import compile_plan
 from cpra.mp.data.analysis.request.errors import RequestError
 from cpra.mp.data.api.unified import decode_request_sync
-from cpra.mp.data import config
 from cpra.mp.data.grids import GRIDS
 
 # Query params that belong to the OGC API itself rather than to the data request. They
 # are dropped before the rest of the query string is decoded as a portal data request.
 _OGC_PARAMS = {
-    "f", "lang", "limit", "offset", "startindex", "bbox", "bbox-crs", "crs", "datetime",
-    "resulttype", "skipgeometry", "properties", "sortby", "filter", "filter-lang",
-    "filter-crs", "q",
+    "f",
+    "lang",
+    "limit",
+    "offset",
+    "startindex",
+    "bbox",
+    "bbox-crs",
+    "crs",
+    "datetime",
+    "resulttype",
+    "skipgeometry",
+    "properties",
+    "sortby",
+    "filter",
+    "filter-lang",
+    "filter-crs",
+    "q",
 }
 
 
@@ -61,8 +75,7 @@ class MasterPlanDataProvider(BaseProvider):
     def get_fields(self):
         return {"id": {"type": "integer"}, "label": {"type": "string"}}
 
-    def query(self, offset=0, limit=10, resulttype="results", bbox=[], skip_geometry=False,
-              **kwargs):
+    def query(self, offset=0, limit=10, resulttype="results", bbox=None, skip_geometry=False, **kwargs):
         path, values = self._prepare()
         # pygeoapi has already moved the bbox into the collection's storage CRS.
         storage_bbox = tuple(bbox[:4]) if bbox else None
@@ -106,10 +119,7 @@ class MasterPlanDataProvider(BaseProvider):
 
         crs = request.args.get("crs")
         if crs is not None and crs != STORAGE_CRS_URI:
-            raise _invalid(
-                f"CRS {crs!r} is not supported. This collection is only served in "
-                f"{STORAGE_CRS_URI}."
-            )
+            raise _invalid(f"CRS {crs!r} is not supported. This collection is only served in {STORAGE_CRS_URI}.")
         items = data_request_items(request.args)
         if not items:
             raise _invalid(EXPORT_HINT)
@@ -118,10 +128,7 @@ class MasterPlanDataProvider(BaseProvider):
             decoded = decode_request_sync(items, format="parquet")
             grid = decoded.descriptor.grid
             if GRIDS[grid].grid_type != "vector":
-                raise _invalid(
-                    f"Grid '{grid}' is a raster grid and is not available "
-                    "through the OGC Features API."
-                )
+                raise _invalid(f"Grid '{grid}' is a raster grid and is not available through the OGC Features API.")
             df = execute(compile_plan(decoded.pipeline)).collect()
         except RequestError as exc:
             raise _invalid(str(exc))
@@ -138,9 +145,7 @@ class MasterPlanDataProvider(BaseProvider):
 def _count(path, storage_bbox):
     if storage_bbox is None:
         return pyogrio.read_info(path)["features"]
-    return len(
-        pyogrio.read_dataframe(path, bbox=storage_bbox, columns=["id"], read_geometry=False)
-    )
+    return len(pyogrio.read_dataframe(path, bbox=storage_bbox, columns=["id"], read_geometry=False))
 
 
 def _to_features(gdf, values, skip_geometry):
